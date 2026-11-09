@@ -38,6 +38,9 @@ import "meridian/v1/book.proto";
 // IdentifierUsageReport: a usage report the conductor sent (W3.28, contract
 // v24).
 import "meridian/v1/reference.proto";
+// ComponentReport: each member as it reported itself, which the Resilience
+// page's read answers (W6.39, contract v30).
+import "meridian/v1/accounts.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W6.1 — who has signed in
@@ -1081,4 +1084,218 @@ message StaleReferenceActionsPermittedSetting {
   // The last change; 0 and empty for the default never changed.
   int64 changed_at_ns = 2;
   string changed_by = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.39 — what the deployment survives: the Resilience page and the
+// resilience profile (contract v30;
+// sdk-contract/standing-analytics-and-resilience-contract;
+// spec/a-deployment-scales-out-and-fails-over-by-configuration sections 3, 8,
+// 9, 11 and 12; the reads and records approved by 1057, every other name
+// approved 2026-11-09)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A deployment admin reads the Resilience page (W6.39; step 3c's question
+// 4): each member of each component, each partition and its owner, and the
+// recent history, which names the accounts moved and who moved them, so it
+// is read in the config domain. Changes nothing.
+message ReadResilienceRequest {
+  // A page of the history: 0 for the read's default page.
+  uint32 page_size = 1;
+  // next_cursor from the page before; empty for the first page.
+  string cursor = 2;
+}
+
+message ReadResilienceReply {
+  // Each member of each component as it reported last (ruling 1060): its
+  // mode, zone, lag and partitions are working state, never a record.
+  repeated ComponentReport members = 1;
+  // Each partition of a partitioned store and the member writing it.
+  repeated PartitionOwner partitions = 2;
+  // The recent takeovers, moves, switches and findings, the latest first;
+  // none where nothing has happened.
+  repeated ResilienceHistoryItem history = 3;
+  // Where the history's next page starts; empty on the last page.
+  string next_cursor = 4;
+}
+
+// One partition of a store and its owner (W6.39).
+message PartitionOwner {
+  // The store: lake or bor.
+  string component = 1;
+  // Its partition: a dataset's key, `P0`, `control`. Never an account.
+  string partition = 2;
+  // The writer group that owns it, numbered from 0; 0 where the store has
+  // one writer group.
+  uint32 group = 3;
+  // The member writing it, its pod's name; empty while no member holds the
+  // group's lease.
+  string writer = 4;
+  // The partition's epoch, under which its writer commits. Never zero.
+  uint64 epoch = 5;
+}
+
+// One item of the Resilience page's history: exactly one is set.
+message ResilienceHistoryItem {
+  oneof item {
+    WriterTookOver writer_took_over = 1;
+    PartitionMoved partition_moved = 2;
+    SourceSwitched source_switched = 3;
+    // An account's move, naming who moved it (approved 2026-11-09).
+    AccountMoved account_moved = 4;
+    IntegrityFinding integrity_finding = 5;
+  }
+}
+
+// A standby took a store's writer lease and raised its partitions' epoch, and
+// why (W6.39; the record approved by 1057): its own record in the store's
+// control partition. Never a restart of a pod with no standby.
+message WriterTookOver {
+  // The store: lake, bor, instrument, street, conductor or launcher.
+  string component = 1;
+  // The member that took over, its pod's name as its report names it.
+  string member = 2;
+  // The member that held the lease before; empty where none did.
+  string previous_member = 3;
+  // The partitions it now writes: a dataset's key, `P0`, `control`.
+  repeated string partitions = 4;
+  // The partitions' new epoch, under which the new writer commits.
+  uint64 epoch = 5;
+  TakeoverReason reason = 6;
+  // By the store's clock, at the fence.
+  int64 took_over_at_ns = 7;
+}
+
+// Why a writer took over (contract v30; approved 2026-11-09).
+enum TakeoverReason {
+  // Not known; never sent.
+  TAKEOVER_REASON_UNSPECIFIED = 0;
+  // The writer's lease lapsed.
+  TAKEOVER_REASON_LEASE_LAPSED = 1;
+  // The writer stepped down, its commit refused by the epoch.
+  TAKEOVER_REASON_STEPPED_DOWN = 2;
+  // A partition moved to this member's group.
+  TAKEOVER_REASON_MOVED = 3;
+}
+
+// A store's record found changed where it rests (W6.39, plan 5j; the record
+// approved by 1057): its own record in the store's control partition, a
+// notice in the deployment admin's inbox. Never a guess at the cause.
+message IntegrityFinding {
+  // The store: lake, bor, instrument, street or conductor.
+  string component = 1;
+  // The partition: a dataset's key, `P0`, `control`; empty for a database
+  // page outside any partition.
+  string partition = 2;
+  IntegrityCheck check = 3;
+  // The first bad change's sequence in the partition; 0 for a database page.
+  uint64 first_bad_sequence = 4;
+  // Its committed time; 0 for a database page.
+  int64 first_bad_at_ns = 5;
+  // The latest restore point before it, from the backups and the
+  // off-cluster archive; 0 where there is none. What a restore there would
+  // lose is the record after it; the admin chooses (`meridian restore
+  // --to-time`).
+  int64 restore_point_ns = 6;
+  // Plain words for a person, never a stack trace or a row's body; empty
+  // where the check says enough.
+  string detail = 7;
+  // By the store's clock.
+  int64 found_at_ns = 8;
+}
+
+// Which check found it (contract v30; approved 2026-11-09).
+enum IntegrityCheck {
+  // Not known; never sent.
+  INTEGRITY_CHECK_UNSPECIFIED = 0;
+  // A database page's checksum failed on read.
+  INTEGRITY_CHECK_PAGE_CHECKSUM = 1;
+  // A lake row's digest is not its body's.
+  INTEGRITY_CHECK_ROW_DIGEST = 2;
+  // A journal entry's digest or its previous_digest breaks the partition's
+  // chain.
+  INTEGRITY_CHECK_JOURNAL_CHAIN = 3;
+  // Two members' digests of a partition differ at one sequence.
+  INTEGRITY_CHECK_MEMBER_DIGEST = 4;
+}
+
+// A deployment admin reads the resilience profile (W6.39; on
+// platform.deployment.query.read-resilience-profile, step 3c's question 4):
+// what the configuration meets and what would meet more, computed from the
+// chart's values as the release states them, the members' reports, the
+// nodes and zones, the Leases and the source priorities, never from a
+// preset's name. It carries no account and no person, and changes nothing.
+message ReadResilienceProfileRequest {}
+
+message ReadResilienceProfileReply {
+  // The highest service level the configuration meets (level approved by
+  // 1057). Never a promise.
+  ServiceLevel level = 1;
+  // What the next level lacks; none at Multi-zone.
+  repeated ResilienceChange next_level_changes = 2;
+  // Per failure class, whether the configuration recovers from it: met only
+  // where CI tests the configuration.
+  repeated ResilienceLine failures = 3;
+  // Per tier of the targets by failure, whether the configuration meets it.
+  // Never a public claim of availability.
+  repeated ResilienceLine tiers = 4;
+  // Never blind's properties per live data type in the priorities.
+  repeated NeverBlindLine never_blind = 5;
+  // When the profile was computed.
+  int64 computed_at_ns = 6;
+}
+
+// One line of the profile: a failure class or a tier.
+message ResilienceLine {
+  // What the line is about: "a pod", "a zone's node pool", a tier.
+  string subject = 1;
+  ResilienceState state = 2;
+  // Why the line is in its state.
+  string reason = 3;
+  // What would meet a line not met; none where it is met.
+  repeated ResilienceChange changes = 4;
+}
+
+// One change that would meet more, and what it costs. A change named, never
+// a change made.
+message ResilienceChange {
+  // The change: a chart value and its setting, or nodes to add.
+  string change = 1;
+  // What it costs: pods, volumes, nodes. Never a price.
+  string cost = 2;
+}
+
+// Never blind's properties for one live data type (W6.39).
+message NeverBlindLine {
+  // The data type, by its message's full name (meridian.v1.Quote).
+  string data_type = 1;
+  // Whether a second source stands in the type's priority.
+  bool second_source = 2;
+  // Whether the type's sources run standby pods.
+  bool standby_pods = 3;
+  // Whether the type's pages show each value's age and source.
+  bool age_and_source = 4;
+}
+
+// A deployment's service level (contract v30; the levels' names approved by
+// 1057, the enum's 2026-11-09).
+enum ServiceLevel {
+  // Not known; never sent.
+  SERVICE_LEVEL_UNSPECIFIED = 0;
+  SERVICE_LEVEL_DESKTOP = 1;
+  SERVICE_LEVEL_SINGLE_NODE = 2;
+  SERVICE_LEVEL_MULTI_NODE = 3;
+  SERVICE_LEVEL_MULTI_ZONE = 4;
+}
+
+// Whether a line of the profile is met (contract v30; approved 2026-11-09).
+enum ResilienceState {
+  // Not known; never sent.
+  RESILIENCE_STATE_UNSPECIFIED = 0;
+  // Met by the configuration as it runs, a configuration CI tests.
+  RESILIENCE_STATE_MET = 1;
+  // Met by Kubernetes' restart within the tolerant default's bound.
+  RESILIENCE_STATE_MET_BY_RESTART = 2;
+  // Not met; its changes name what would meet it.
+  RESILIENCE_STATE_NOT_MET = 3;
 }

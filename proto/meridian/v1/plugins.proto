@@ -213,6 +213,19 @@ message LaunchPluginRequest {
   // Through /mcp every launch carries one (W6.20).
   string note = 7;
 
+  // Contract v30, built with 3d (W8.3;
+  // spec/a-deployment-scales-out-and-fails-over-by-configuration section 7;
+  // the launch settings approved by 1057): the instance's shards, pods of
+  // the one instance sharing its subjects by rendezvous hashing, at most the
+  // version's most_shards (0 to 64); one more is refused INVALID_ARGUMENT
+  // naming shards. 0: one pod, as 1 is. Never separate instances.
+  uint32 shards = 8;
+  // Contract v30, built with 3d: true asks for a standby pod, whose sidecar
+  // holds no lease and whose role classes' run() starts only when it takes
+  // the instance's Lease. Recommended for oms, ems, connectivity and live
+  // data instances. A standby shares nothing until it takes over.
+  bool standby = 9;
+
   // Tags, retired with them (decisions/026).
   reserved 5;
   reserved "approved_tags";
@@ -275,6 +288,12 @@ message PluginLaunch {
   // or the pull is not yet acknowledged. The Summary's and the Installed
   // list's warning stands until the instance is stopped or this is set.
   PullAcknowledgement pull_acknowledgement = 22;
+
+  // Contract v30 (W8.3): the shards and standby pod the instance was
+  // launched with, as the launch asked, within the version's most_shards.
+  // Not what runs now, which the members' reports say. 0: one pod.
+  uint32 shards = 23;
+  bool standby = 24;
 
   // Tags, retired with them (decisions/026).
   reserved 6;

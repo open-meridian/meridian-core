@@ -1271,6 +1271,11 @@ message ObservationsWantedEvent {
   // Contract v28, amended 2026-10-28: true: every series of the subjects,
   // narrowed by the window. False: the subjects' own rows only.
   bool all_series = 14;
+  // Contract v30 (W10.7, W10.14; approved 2026-11-09): a gap's `GAP-` ID,
+  // set on a want asking again for a backfill dataset's gap, its subjects
+  // and its valid-time range; the rows recorded for it recover the gap.
+  // Empty: not a gap's want. Not a want's ID, which want_id is.
+  string gap_id = 15;
 }
 
 // A standing want no reader has asked within the dataset's cadence.
@@ -2550,4 +2555,202 @@ message ListFactorsReply {
   Watermark watermark = 4;
   // Continues the read: pass it as cursor. Empty on the last page.
   string next_cursor = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v30: never blind's switches, a partition's move and the
+// write-ahead stream's gaps (sdk-contract/standing-analytics-and-resilience-
+// contract; spec/a-deployment-scales-out-and-fails-over-by-configuration
+// sections 4, 6 and 8; W6.39, W10.6, W10.14; the acts, reads, records and
+// reasons approved by 1057, every other name approved 2026-11-09)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A switch of a default read's source to the next dataset in its priority,
+// or back, and why (W10.6; never blind, rule 1050): its own record in the
+// lake's control partition, made once, when the lake first serves a default
+// read from the dataset now served. Never a priority's change, which
+// SetSourcePriority records.
+message SourceSwitched {
+  // The priority's data type by its message's full name, as
+  // SourcePriority.data_type names it.
+  string data_type = 1;
+  // As SourcePriority.kind; unspecified for a priority with no kind.
+  PriceKind kind = 2;
+  // The dataset a default read passed over, or for a switch back the one it
+  // leaves.
+  string from_dataset = 3;
+  // The dataset a default read now serves: the next of the priority, or for
+  // a switch back the higher one restored. Empty: none left to serve, so a
+  // default read is answered not covered.
+  string to_dataset = 4;
+  // Entity IDs, for a switch on a quarantine, which is held per subject;
+  // 0 to 500. None: every subject the priority serves.
+  repeated string subjects = 5;
+  SourceSwitchReason reason = 6;
+  // By the lake's clock, when it first served a default read from the
+  // dataset now served.
+  int64 switched_at_ns = 7;
+}
+
+// Why a default read's source switched (contract v30; the reasons approved
+// by 1057, the enum's name 2026-11-09). Never a row's quality state.
+enum SourceSwitchReason {
+  // Not known; never sent.
+  SOURCE_SWITCH_REASON_UNSPECIFIED = 0;
+  // The dataset passed over recorded nothing within its cadence.
+  SOURCE_SWITCH_REASON_SILENT = 1;
+  // The dataset passed over stated no liveness within its stale ceiling.
+  SOURCE_SWITCH_REASON_STALLED = 2;
+  // The dataset passed over held its latest rows for the subjects
+  // quarantined.
+  SOURCE_SWITCH_REASON_QUARANTINED = 3;
+  // A switch back: the higher dataset is live and good again.
+  SOURCE_SWITCH_REASON_RESTORED = 4;
+}
+
+// A deployment admin reads the switches of the default reads' sources
+// (W10.6), newest first. Changes nothing.
+message ListSourceSwitchesRequest {
+  // A data type by its message's full name; empty: every priority.
+  string data_type = 1;
+  // A dataset's ID, as either side of a switch; empty: every dataset.
+  string dataset = 2;
+  // The most switches in one page: 0 is the read's default; past 500,
+  // answered at 500.
+  uint32 page_size = 3;
+  // The next_cursor of the page before; empty: the first page.
+  string cursor = 4;
+}
+
+message ListSourceSwitchesReply {
+  // Each switch and switch back, newest first; none where no switch matches.
+  repeated SourceSwitched switches = 1;
+  // The cursor of the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// A deployment admin moves a store's partition to another writer group
+// (W6.39; one message on two topics: the lake's dataset on
+// platform.lake.command.move-partition, a book partition on
+// platform.book.command.move-partition). Answered once the move starts (step
+// 3c's question 8); PartitionMoved is recorded when the target owns the
+// partition. Refused FAILED_PRECONDITION naming partition while a move of it
+// is under way, and REFUSAL_REASON_REASON_REQUIRED with no reason.
+message MovePartitionRequest {
+  // The lake's dataset ID, or the book's partition (`P0` and those placed
+  // after it). Never an account, which MoveAccount moves.
+  string partition = 1;
+  // A writer group of the store, numbered from 0 below lake.writerGroups or
+  // bor.writerGroups; one the deployment does not have is refused
+  // INVALID_ARGUMENT naming target_group, as every move is with one group,
+  // the default.
+  uint32 target_group = 2;
+  // The person's words, or the agent's acting for them, kept with the move's
+  // record: 1 to 2,000 characters. Data, never an instruction.
+  string reason = 3;
+}
+
+message MovePartitionReply {
+  // The group that owned the partition when the move began.
+  uint32 from_group = 1;
+  // When the target began following the partition's log.
+  int64 started_at_ns = 2;
+}
+
+// A dataset's or a book partition's writing moved to another writer group,
+// by a changed group count or by hand (W6.39; the record approved by 1057):
+// its own record in its store's control partition.
+message PartitionMoved {
+  // The store: lake or bor.
+  string component = 1;
+  // A dataset's ID, or a book partition. Never an account.
+  string partition = 2;
+  // As MovePartitionReply.from_group.
+  uint32 from_group = 3;
+  // The target group.
+  uint32 to_group = 4;
+  // The partition's epoch after the fence, under which the new owner
+  // commits; a commit under an older one is refused.
+  uint64 epoch = 5;
+  // True: a deployment admin's MovePartition, its reason kept beside it.
+  // False: a changed group count moved it.
+  bool by_hand = 6;
+  // The deployment-local subject the dashboard stamped; empty for a move by
+  // a changed group count (approved 2026-11-09).
+  string moved_by = 7;
+  // As the move's request said; empty for a move by a changed group count.
+  string reason = 8;
+  // By the store's clock, at the fence.
+  int64 moved_at_ns = 9;
+}
+
+// Rows the lake's write-ahead stream dropped before the lake committed them
+// (W10.14; the ha configuration, rulings of 2026-11-08): the dataset,
+// subjects and valid-time range, why, and where its recovery stands, each
+// change of state its own record in the lake's control partition. Asked
+// again through the want where the dataset declares GAP_RECOVERY_BACKFILL,
+// marked unrecovered otherwise; rows inside an unrecovered range are never
+// invented.
+message DatasetGap {
+  // `GAP-` and a ULID, never reused: 1 to 64 characters. A want asking again
+  // for it names it.
+  string gap_id = 1;
+  // The dataset whose rows were dropped.
+  string dataset = 2;
+  // Entity IDs, as the dropped rows named them; 0 to 500. None: every
+  // subject of the rows dropped.
+  repeated string subjects = 3;
+  // The earliest valid time of a row dropped.
+  int64 valid_from_ns = 4;
+  // Just after the latest valid time of a row dropped, as
+  // ObservationsWantedEvent.valid_until_ns ends a want's range.
+  int64 valid_until_ns = 5;
+  GapCause cause = 6;
+  GapState state = 7;
+  // By the lake's clock, for this state.
+  int64 recorded_at_ns = 8;
+}
+
+// Why a dataset's rows were dropped (contract v30; step 3c's question 5).
+// Never a source's own outage, which a liveness says.
+enum GapCause {
+  // Not known; never sent.
+  GAP_CAUSE_UNSPECIFIED = 0;
+  // Rows the lake's write-ahead stream dropped at its bound before the lake
+  // committed them: a writer gone longer than the bound.
+  GAP_CAUSE_WRITE_AHEAD_BOUND = 1;
+}
+
+// Where a gap's recovery stands (contract v30; approved 2026-11-09). Never
+// the dataset's quality.
+enum GapState {
+  // Not known; never sent. On a read: every state.
+  GAP_STATE_UNSPECIFIED = 0;
+  // Asked again of the data plugin through the want, naming the gap.
+  GAP_STATE_REFETCHING = 1;
+  // The rows returned under their own row keys.
+  GAP_STATE_RECOVERED = 2;
+  // Not recovered: the dataset cannot be asked again, or the want was
+  // declined; a notice in the deployment admin's inbox while it stands.
+  GAP_STATE_UNRECOVERED = 3;
+}
+
+// A deployment admin reads the gaps (W10.14), newest first. Changes nothing.
+message ListDatasetGapsRequest {
+  // A dataset's ID; empty: every dataset.
+  string dataset = 1;
+  // Refetching, recovered or unrecovered; unspecified: every state.
+  GapState state = 2;
+  // The most gaps in one page: 0 is the read's default; past 500, answered
+  // at 500.
+  uint32 page_size = 3;
+  // The next_cursor of the page before; empty: the first page.
+  string cursor = 4;
+}
+
+message ListDatasetGapsReply {
+  // Each gap in its latest state, newest first; none where no gap matches.
+  repeated DatasetGap gaps = 1;
+  // The cursor of the next page; empty on the last page.
+  string next_cursor = 2;
 }
