@@ -1091,12 +1091,16 @@ e2e-cluster-scaled:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
 
 # A live install moved between the profiles (step 3b part 3; spec section
-# 15): installed tolerant, with its key in a Secret as ha needs (1074), then
+# 15): installed tolerant, with its key in a Secret as ha needs (1074),
+# internal TLS turned on by an upgrade with its preflight, then
 # `resilience.profile` set to ha and back by an upgrade, as `meridian
-# upgrade-deployment --set` sets it, under commits through the database's
-# Service: every member in each shape and ready, each store's change log
+# upgrade-deployment --set` sets it (its Helm flags; CI on Helm 4), under
+# commits through the database's Service: every upgrade's migration
+# succeeded, every member in each shape and ready, each store's change log
 # kept as it was, the record's properties held, and every acknowledged
-# commit kept. Three agents in zones, as the HA runs:
+# commit kept. Last, under Patroni with TLS on, backups and the WAL archive
+# turned on by an upgrade and the database restored to a time (step 3b part
+# 6). Three agents in zones, as the HA runs:
 #
 #   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-reconfigure \
 #     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
@@ -2827,6 +2831,31 @@ chart-check:
 		|| { echo "chart-check FAILED: $$(echo "$$ca" | grep -c 'secretName: "db-ca"') pods mount the database's CA, not 9" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q "database-ca" \
 		&& { echo "chart-check FAILED: a database's CA is mounted with database.caSecret empty" >&2; exit 1; }; true
+	@# Every Secret a value names is carried in each backup (step 3b part
+	@# 6): a restored release whose pods name one the backup left behind does
+	@# not start, as database.caSecret's did. The names are read from the
+	@# templates -- each .Values path ending Secret or SecretName, and the WAL
+	@# archive's, reached through its own variable -- so a value added later
+	@# is held to it too: each set, with backups and the archive on, and each
+	@# in the backup Job's list of the chart's or the administrator's.
+	@names="$$( { grep -ohE '\.Values\.[A-Za-z0-9_.]+' deploy/chart/templates/*.yaml deploy/chart/templates/*.tpl \
+		| grep -E '([Ss]ecret|[Ss]ecretName)$$' | sed 's/^\.Values\.//'; \
+		grep -ohE '\$$w\.[A-Za-z]+' deploy/chart/templates/*.yaml deploy/chart/templates/*.tpl \
+		| grep -E '[Ss]ecret$$' | sed 's/^\$$w\./backup.walArchive./'; } | sort -u)"; \
+	[ "$$(echo "$$names" | wc -w)" -ge 20 ] \
+		|| { echo "chart-check FAILED: found $$(echo "$$names" | wc -w) values naming a Secret, fewer than the 20 the chart had, so the check below proves little" >&2; exit 1; }; \
+	sets=""; for name in $$names; do sets="$$sets --set $$name=chk-$$name"; done; \
+	carried="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set key.generate=false \
+		--set backup.recipient=age1check --set backup.path=/var/lib/check --set backup.walArchive.enabled=true \
+		--set backup.walArchive.store=s3 --set backup.walArchive.bucket=b --set backup.walArchive.endpoint=e \
+		--set backup.walArchive.region=r $$sets 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render with every value naming a Secret set" >&2; exit 1; }; \
+	listed=" $$(echo "$$carried" | grep -A1 -E 'name: MERIDIAN_BACKUP_(OPERATOR|CHART)_SECRETS$$' \
+		| sed -n 's/^ *value: //p' | tr -d '"' | tr '\n' ' ') "; \
+	for name in $$names; do \
+		case "$$listed" in *" chk-$$name "*) ;; \
+		*) echo "chart-check FAILED: $$name names a Secret that no backup carries; add it to templates/backup.yaml's operator list" >&2; exit 1;; esac; \
+	done
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs
 	@# nothing until the CLI makes a Job from it. On: the database archives

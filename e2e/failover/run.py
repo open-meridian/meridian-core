@@ -108,6 +108,7 @@ REPLICA_RECLONE = 120
 # Internal TLS (ruling 1084; tls.internal.enabled) in the ha run: every
 # class there is injected with every store, Job and member on TLS, and
 # after the install a plaintext connection is shown refused (internal_tls).
+# The reconfigure run turns it on by an upgrade, before its first move.
 TLS = PROFILE == "ha"
 
 # The live install moved between the profiles, in order (e2e-cluster-
@@ -1848,6 +1849,79 @@ def helm_takes_counts():
     return ["--force-conflicts"] if said.startswith("v4") else []
 
 
+def upgrade(*sets):
+    """An upgrade as `meridian upgrade-deployment --set` runs Helm (meridian-
+    cli, upgrade_deployment.rs): this chart's defaults under the deployment's
+    own values (--reset-then-reuse-values), fifteen minutes for its hooks,
+    no --wait (the CLI waits itself, as this run does after), and under
+    Helm 4 the chart's own counts taken back (--force-conflicts). CI runs it
+    on Helm 4.2.3, the newest the CLI meets and the stricter (ci.yaml)."""
+    values = [arg for value in sets for arg in ("--set", value)]
+    return run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+               "--timeout", "15m", *helm_takes_counts(), *values, check=False)
+
+
+def revision():
+    """The release's revision now."""
+    return int(json.loads(run("helm", "status", RELEASE, "--namespace", NAMESPACE, "-o", "json")
+                          .stdout)["version"])
+
+
+def migrated(s, when):
+    """The migration Job of the revision just applied run to its end, and
+    succeeded: the CLI reports an upgrade whose migration failed as failed,
+    though the components settle (step 3b's CLI rehearsal, ha -> tolerant).
+    Its containers' logs said where it did not."""
+    job = f"{FULL}-migrate-{revision()}"
+
+    def finished():
+        status = json.loads(out("get", "job", job, "-o", "json")).get("status", {})
+        return status.get("succeeded") or status.get("failed")
+    ended = happens(finished, 600, every=2)
+    status = json.loads(out("get", "job", job, "-o", "json", check=False) or "{}").get("status", {})
+    held = ended and bool(status.get("succeeded"))
+    s.check(held, f"{when}: the migration, job/{job}, succeeded"
+            + ("" if held else f" ({'failed' if status.get('failed') else 'never finished'})"))
+    if not held:
+        for pod in out("get", "pods", "-l", f"job-name={job}", "-o", "name", check=False).split():
+            said = kubectl("logs", pod, "--all-containers", "--prefix", "--timestamps", "--tail=40",
+                           check=False).stdout.decode(errors="replace")
+            print(f"R: {pod} said:\n{said}", flush=True)
+        database_said(s, when)
+
+
+def tls_turned_on(s):
+    """Internal TLS turned on by an upgrade, on a database serving in the
+    clear (step 3b part 6): its preflight runs first and passes, connecting
+    as the database serves now -- before, it waited on mounting the CA the
+    same upgrade makes, until it failed -- then every connection over TLS
+    and the plaintext one refused, and the driver acknowledged again."""
+    global TLS
+    print("R: internal TLS turned on by an upgrade, its preflight first", flush=True)
+    began = time.time()
+    with HookLog("preflight") as preflight:
+        upgraded = upgrade("tls.internal.enabled=true")
+    print(f"R: the preflight said:\n{preflight.said or '(nothing read)'}", flush=True)
+    s.check(upgraded.returncode == 0, "internal TLS on: the upgrade applied, its preflight passed first"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        database_said(s, "internal TLS on")
+        raise SystemExit("internal TLS could not be turned on")
+    hooks = run("helm", "get", "hooks", RELEASE, "--namespace", NAMESPACE, check=False).stdout.decode()
+    s.check(f"name: {FULL}-preflight" in hooks,
+            "internal TLS on: the upgrade ran with its preflight, which read the database as it served")
+    migrated(s, "internal TLS on")
+    settled = happens(settled_everywhere, 900, every=5)
+    s.check(settled, f"internal TLS on: every member ready, {time.time() - began:.0f}s after the upgrade")
+    if not settled:
+        raise SystemExit("the deployment did not settle with internal TLS on")
+    TLS = True
+    internal_tls(s)
+    if DRIVEN:
+        s.check(acks_again(int(began * 1000), seconds=180),
+                "internal TLS on: the write driver acknowledged by the book and the lake again")
+
+
 def database_said(s, when):
     """What the database and the preflight said, where an upgrade's hook
     refused: each member's pod, when it was made, its manager and its role
@@ -1986,18 +2060,21 @@ def connections_held(s, when):
 
 def reconfigure(s):
     global SHAPE
+    tls_turned_on(s)
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
     for target in RECONFIGURE:
         before = record_now()
         print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
         began = time.time()
-        upgraded = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
-                       *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+        upgraded = upgrade(f"resilience.profile={target}")
         s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
                 + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
         if upgraded.returncode != 0:
             return
         SHAPE = target
+        # Each upgrade's migration succeeds, the way back included, where
+        # the database's own restart for a start-only setting once cut it.
+        migrated(s, f"reconfigure to {target}")
         if target == "ha":
             # A database alone moves under Patroni first, alone, and is given
             # its standbys by a second upgrade with the same values, as the
@@ -2019,8 +2096,7 @@ def reconfigure(s):
                       flush=True)
                 member_now("before the second upgrade")
                 with HookLog("preflight") as preflight:
-                    again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
-                                *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                    again = upgrade(f"resilience.profile={target}")
                 print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
                       f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
                 print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
@@ -2029,6 +2105,8 @@ def reconfigure(s):
                         + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
                 if again.returncode != 0:
                     database_said(s, "the second upgrade")
+                else:
+                    migrated(s, f"reconfigure to {target}, the second upgrade")
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
@@ -2050,6 +2128,137 @@ def reconfigure(s):
         kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
         s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
         properties(s, f"reconfigure to {target}")
+
+
+# ── reconfigure's last: a restore to a time, under Patroni with TLS on ─────
+
+# Backups on the node, for the WAL archive the restore reads: a directory
+# on member 0's node, which the database and the offline Job beside its
+# volume both mount there. No backup is sealed in this run (its CronJob
+# never runs), so the recipient is never used: a placeholder.
+RESTORE_PATH = "/var/lib/meridian-reconfigure-e2e"
+RESTORE_RECIPIENT = "age1e2ereconfigurerestoretoatimenokeyisused"
+POINT = "e2e_point_in_time"
+
+
+def stopped_everything():
+    """Every component and the database stopped, as `meridian restore
+    --to-time` stops them: their counts, to start them again."""
+    running = {d["metadata"]["name"]: d["spec"].get("replicas", 1) for d in json.loads(out(
+        "get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]}
+    for name in running:
+        kubectl("scale", "deployment", name, "--replicas=0")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
+    # Their pods gone: each Deployment's (a ReplicaSet's, by its template
+    # hash) and the database's members.
+    wait_for("every component and the database to stop", lambda: not [
+        p for p in json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+        if "pod-template-hash" in p["metadata"].get("labels", {})
+        or p["metadata"].get("labels", {}).get("meridian.dev/component") == "database"], seconds=300)
+    return running
+
+
+def offline_act(act, **env):
+    """A Job from the database's offline CronJob with the act named, as the
+    CLI makes it (meridian-cli, offline.rs), run to its end: whether it
+    succeeded, and what it said."""
+    cron = json.loads(out("get", "cronjob", f"{FULL}-database-offline", "-o", "json"))
+    template = cron["spec"]["jobTemplate"]
+    name = f"{FULL}-database-{act}"[:63]
+    job = {"apiVersion": "batch/v1", "kind": "Job",
+           "metadata": {"name": name, "namespace": NAMESPACE, "labels": template["metadata"].get("labels", {})},
+           "spec": template["spec"]}
+    said = {"MERIDIAN_DATABASE_ACT": act, **env}
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    container["env"] = [e for e in container.get("env", []) if e["name"] not in said] + [
+        {"name": k, "value": v} for k, v in said.items()]
+    kubectl("delete", "job", name, "--ignore-not-found", "--wait")
+    kubectl("create", "-f", "-", input=json.dumps(job).encode())
+    wait_for(f"the {act} Job to finish", lambda: any(
+        c["type"] in ("Complete", "Failed") and c["status"] == "True"
+        for c in json.loads(out("get", "job", name, "-o", "json"))["status"].get("conditions", [])), seconds=900)
+    status = json.loads(out("get", "job", name, "-o", "json"))["status"]
+    log = kubectl("logs", f"job/{name}", "--tail=-1", check=False).stdout.decode(errors="replace")
+    for line in log.splitlines():
+        print(f"    | {line}", flush=True)
+    return bool(status.get("succeeded")), log
+
+
+def restored_to_a_time(s):
+    """`meridian restore --to-time` on the database under Patroni with
+    internal TLS on (step 3b part 6): the configuration a base backup
+    restores is Patroni's, naming the certificates only the database's own
+    pods hold, and the offline Job's start of it failed on them. Backups and
+    the WAL archive turned on by an upgrade, its preflight passing on a
+    backup volume the same upgrade makes; a base backup taken; three rows
+    either side of a time; everything stopped as the CLI stops it, the
+    restore run, Patroni's record of the old primary cleared, everything
+    started; and the rows as they stood at the time."""
+    print("R: a restore to a time from the WAL archive, under Patroni with internal TLS on", flush=True)
+    began = time.time()
+    with HookLog("preflight") as preflight:
+        upgraded = upgrade(f"backup.recipient={RESTORE_RECIPIENT}", f"backup.path={RESTORE_PATH}",
+                           "backup.walArchive.enabled=true")
+    print(f"R: the preflight said:\n{preflight.said or '(nothing read)'}", flush=True)
+    s.check(upgraded.returncode == 0, "restore: backups and the WAL archive turned on by an upgrade, "
+            "its preflight passing first" + ("" if upgraded.returncode == 0
+                                              else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        database_said(s, "backups on")
+        return
+    migrated(s, "backups on")
+    s.check(happens(settled_everywhere, 900, every=5),
+            f"restore: every member ready with the archive on, {time.time() - began:.0f}s after the upgrade")
+    member = f"{FULL}-database-0"
+
+    def archive_said(words):
+        return words in kubectl("logs", member, "-c", "archive", "--tail=-1",
+                                check=False).stdout.decode(errors="replace")
+    wait_for("the archive's stanza", lambda: archive_said("the stanza holds this database"), seconds=180)
+    # The base backup the backup Job's archive step takes through the
+    # primary's pgBackRest server, taken here in the archive's own container
+    # beside it, into the same archive: this run loads no backup image.
+    done = kubectl("exec", member, "-c", "archive", "--", "su-exec", "postgres",
+                   "pgbackrest", "--stanza=meridian", "backup", "--type=full", check=False)
+    s.check(done.returncode == 0, "restore: a full base backup taken into the archive"
+            + ("" if done.returncode == 0 else f": {done.stdout.decode(errors='replace')[-300:]}"))
+    if done.returncode != 0:
+        return
+    psql(f"create database {POINT}", database="postgres")
+    psql("create table point (n int primary key, said text not null)", database=POINT)
+    for n in (1, 2, 3):
+        psql(f"insert into point values ({n}, 'before')", database=POINT)
+    time.sleep(1.5)
+    to = psql("select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'",
+              database="postgres")
+    time.sleep(1.5)
+    for n in (4, 5, 6):
+        psql(f"insert into point values ({n}, 'after')", database=POINT)
+    wal = psql("select pg_walfile_name(pg_switch_wal())", database="postgres")
+    wait_for("the last segment to be archived", lambda: psql(
+        "select last_archived_wal from pg_stat_archiver", database="postgres") >= wal, seconds=180)
+    running = stopped_everything()
+    ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to)
+    s.check(ok and "promoted at" in log, f"restore: the offline Job restored the database to {to}, "
+            "starting it without the certificates Patroni's configuration names")
+    if not ok:
+        return
+    # Patroni's record of the old primary, which member 0's restored
+    # position is behind (meridian-cli, offline.rs standbys_to_remake).
+    scope = f"{FULL}-database"[:63].rstrip("-")
+    kubectl("delete", "configmap", "--ignore-not-found",
+            *[f"{scope}-{kind}" for kind in ("leader", "sync", "failover")])
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
+    wait_for("the restored database's primary", lambda: psql(
+        "select not pg_is_in_recovery()", database="postgres") == "t", seconds=300)
+    for name, replicas in running.items():
+        kubectl("scale", "deployment", name, f"--replicas={replicas}")
+    s.check(happens(settled_everywhere, 900, every=5), "restore: every component ready again")
+    rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT)
+    s.check(rows == "1:before,2:before,3:before", f"restore: the rows as they stood at the time ({rows})")
+    timeline = psql("select timeline_id from pg_control_checkpoint()", database="postgres")
+    s.check(timeline not in ("", "1"), f"restore: on a timeline of its own ({timeline})")
+    internal_tls(s)
 
 
 # ── The record's properties, held after every class (ruling 1105) ─────────
@@ -2184,6 +2393,13 @@ def main():
             driver_history(s)
         except SystemExit as stopped:
             s.check(False, f"the write driver's record could not be read: {stopped}")
+    if PROFILE == "reconfigure":
+        # Last: a restore to a time takes back what the driver wrote after
+        # it, which every reading above holds kept.
+        try:
+            restored_to_a_time(s)
+        except SystemExit as stopped:
+            s.check(False, f"restore: {stopped}")
     return verdict(s)
 
 
