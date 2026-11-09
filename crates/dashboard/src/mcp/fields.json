@@ -88,6 +88,10 @@
         {
           "message": "meridian.v1.LifecycleEvent",
           "intent": "a listed option's exercise, assignment or expiry, or a future's day of settlement variation, reported, proposed or released, each its own record (contract v28, W9.16 to W9.19)"
+        },
+        {
+          "message": "meridian.v1.AccountMoved",
+          "intent": "an account continued in another book partition, its closing and opening entries linked by value, in the book's control partition (contract v30, W9.8)"
         }
       ]
     },
@@ -128,6 +132,14 @@
         {
           "message": "meridian.v1.VenueCatalogue",
           "intent": "a venue's offering per venue account code, latest per code, each change its own record: order types, strategies and eligibility (contract v22, W11.20), and from v23 the execution acknowledgement the venue takes"
+        },
+        {
+          "message": "meridian.v1.WriterTookOver",
+          "intent": "a standby took a store's writer lease and raised its partitions' epoch, and why, in the store's control partition (contract v30, W6.39)"
+        },
+        {
+          "message": "meridian.v1.IntegrityFinding",
+          "intent": "a store's record found changed where it rests, by a checksum, a digest, the chain or two members' digests, in the store's control partition (contract v30, W6.39)"
         }
       ]
     },
@@ -307,6 +319,18 @@
         {
           "message": "meridian.v1.QualityAssessment",
           "intent": "a signal plugin's escalation of one row version's quality, its own record, never a rewrite (contract v28, W10.12)"
+        },
+        {
+          "message": "meridian.v1.SourceSwitched",
+          "intent": "a switch of a default read's source to the next dataset in its priority, or back, and why: never blind's record, in the lake's control partition (contract v30, W10.6)"
+        },
+        {
+          "message": "meridian.v1.PartitionMoved",
+          "intent": "a dataset's or a book partition's writing moved to another writer group, by a changed count or by hand, in its store's control partition (contract v30, W6.39)"
+        },
+        {
+          "message": "meridian.v1.DatasetGap",
+          "intent": "rows the lake's write-ahead stream dropped before the lake committed them: the dataset, subjects and valid-time range, why and where its recovery stands, each change of state its own record in the lake's control partition (contract v30, W10.14)"
         }
       ]
     },
@@ -425,6 +449,7 @@
     "ListReportedFacts": "meridian.v1.ListReportedFactsRequest",
     "ListScenarios": "meridian.v1.ListScenariosRequest",
     "ListSeries": "meridian.v1.ListSeriesRequest",
+    "ListSourcePriorities": "meridian.v1.ListSourcePrioritiesRequest",
     "ListStatements": "meridian.v1.ListStatementsRequest",
     "ListStatistics": "meridian.v1.ListStatisticsRequest",
     "ListSyncStatuses": "meridian.v1.ListSyncStatusesRequest",
@@ -3001,7 +3026,7 @@
       "empty": "never unset, except on a time shock",
       "intent": "names the object shocked (ruling 583)",
       "meaning": "a subject ID, or every object of the kind",
-      "not_meaning": "a selection by the compliance language, which v30 brings",
+      "not_meaning": "a selection by the compliance language, which v31 brings (v30 when written, renumbered 2026-11-02)",
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v28",
@@ -3193,10 +3218,207 @@
       "empty": "false: subject_id names the object",
       "intent": "shocks every object of the shock's kind (ruling 583; approved 585)",
       "meaning": "true: every spot, every surface or every rate the job reads; refused beside a subject_id",
-      "not_meaning": "a selection, which v30 brings and which keeps every as its 'all'",
+      "not_meaning": "a selection, which v31 brings (v30 when written, renumbered 2026-11-02) and which keeps every as its 'all'",
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v28",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.Job.standing",
+      "type": "boolean",
+      "empty": "false: a one-off job, answered once",
+      "intent": "asks the component to keep a job's answer current (W12.1; approved by 834)",
+      "meaning": "true: a standing job, keyed by its canonical form and its client's resolved inputs, computed once for every client with that key and recomputed as its inputs change, each measure by its refresh, while a renewal names it (W12.4); its inputs are live, so naming inputs.book_at, inputs.lake_as_of_ns, business_date or what_if is refused INVALID_ARGUMENT naming standing, and one past the deployment's most standing jobs is refused FAILED_PRECONDITION naming standing",
+      "not_meaning": "a record: a standing job's figures are published and never recorded; or a subscription, which SubscribeRequest.job_ids opens",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.MeasureRef.refresh",
+      "type": "enum Refresh",
+      "allowed": [
+        {
+          "value": "REFRESH_UNSPECIFIED",
+          "meaning": "the definition's default refresh; where the definition states none, refused INVALID_ARGUMENT naming the measure's refresh (ruled 2026-11-09); read only on a standing job's measure"
+        },
+        {
+          "value": "REFRESH_PER_CHANGE",
+          "meaning": "recomputed at once when an input it depends on changes, conflated per key"
+        },
+        {
+          "value": "REFRESH_CADENCE",
+          "meaning": "recomputed every cadence_ns, or sooner on a material move"
+        }
+      ],
+      "empty": "unspecified: the definition's default",
+      "intent": "says when a standing job recomputes a measure (W12.1; the field and its two values approved by 834; the enum's name approved 2026-11-09)",
+      "meaning": "the plugin's declaration per figure (803), which wins over a definition's default (the step 3 plan's question 12): FX crosses and spreads and options' IV and greeks per change; realised volatility, correlation, fits, positioning and the volatility index on a cadence",
+      "not_meaning": "a one-off job's timing, which never recomputes",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.MeasureRef.cadence_ns",
+      "type": "integer",
+      "unit": "nanoseconds",
+      "empty": "0: no cadence; set only with REFRESH_CADENCE",
+      "intent": "says how often a cadence measure is recomputed (W12.1; approved by 834)",
+      "meaning": "the least time between two recomputations of a dirty cadence figure, unless a material move comes first",
+      "not_meaning": "a lease, or how often the inputs are read: a standing job hears its inputs as they change",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.MeasureRef.material_move_bp",
+      "type": "integer",
+      "unit": "basis points of the underlying's reference price",
+      "empty": "0: no material move; the cadence alone",
+      "intent": "recomputes a cadence measure early on a material move (W12.1; approved by 834)",
+      "meaning": "a move of the underlying's reference price since the last fit, in basis points, at or past which a dirty cadence figure recomputes before its cadence",
+      "not_meaning": "a move of the figure itself",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.RenewJobsRequest.job_ids",
+      "type": "repeated identifier message",
+      "bounds": {
+        "count": [
+          1,
+          256
+        ]
+      },
+      "empty": "never empty",
+      "intent": "keeps a sidecar's standing jobs held (W12.4; approved by 1057)",
+      "meaning": "each standing job its plugin's open subscriptions name, renewed in one message per lease (analytics.standing.leaseSeconds) and at once for a job newly named; the component keeps each while a renewal names it, and stops one no renewal named within the lease",
+      "not_meaning": "a read, or a registration: an unknown job is registered again by RunJob",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.RenewJobsReply.unknown_job_ids",
+      "type": "repeated identifier message",
+      "empty": "none: every job renewed is held",
+      "intent": "names the renewed jobs the component does not hold (W12.4; approved by 1057)",
+      "meaning": "each job no live coordinator holds -- its coordinator lost or the coordinators changed, or the job lapsed -- which the SDK registers again by RunJob with the job it holds",
+      "not_meaning": "a refusal: the renewal of every other job stands",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.job_id",
+      "type": "identifier message",
+      "empty": "never empty",
+      "intent": "names the standing job a figure is of (W12.4; approved by 1057)",
+      "meaning": "as RunJobReply.job_id, the same for every client holding the job",
+      "not_meaning": "a record",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.client_instance_id",
+      "type": "identifier instance",
+      "empty": "never empty",
+      "intent": "names the instance holding the job that alone hears this event (W12.4; approved 2026-11-09, step 3c's question 2)",
+      "meaning": "one instance holding the job; the component publishes one event per holding instance, as a job's finishing names the instance that ran it",
+      "not_meaning": "the instance that first registered the job",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.values",
+      "type": "repeated message DerivedSeries",
+      "bounds": {
+        "count": [
+          0,
+          4096
+        ]
+      },
+      "empty": "none where every figure recomputed is not evaluated",
+      "intent": "carries a standing job's recomputed figures keyed by subject and series (W12.4; approved by 1057)",
+      "meaning": "each figure recomputed since the last event, its rule the definition and version, its inputs the datasets and the as-of each was read at, conflated per job and figure key; an event never over 512 KiB, split where it would be",
+      "not_meaning": "a recorded row: published, never recorded; or the whole answer, which ReadJobAnswer reads",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.figures",
+      "type": "repeated message Figure",
+      "bounds": {
+        "count": [
+          0,
+          4096
+        ]
+      },
+      "empty": "none where every figure recomputed is keyed by subject and series",
+      "intent": "carries a standing job's recomputed figures over an account, a breakdown or a scenario (W12.4; approved 2026-11-09, step 3c's question 1)",
+      "meaning": "each a Figure as a job's answer carries it -- its measure, account, breakdown, scenario key, value, currency and oldest input -- recomputed since the last event, conflated per job and figure key, beside values; ReadJobAnswer reads both whole",
+      "not_meaning": "a recorded row: published, never recorded",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.not_evaluated",
+      "type": "repeated message NotEvaluated",
+      "bounds": {
+        "count": [
+          0,
+          4096
+        ]
+      },
+      "empty": "none: every figure recomputed was evaluated",
+      "intent": "says which recomputed figures are not evaluated, and why (W12.4; approved by 1057)",
+      "meaning": "each with its reason, as a job's answer says it (requirement 9): an input stale, missing, unentitled or unpriceable",
+      "not_meaning": "zero",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.DerivedSeriesUpdatedEvent.sequence",
+      "type": "integer",
+      "unit": "events in the job's sequence",
+      "empty": "never zero",
+      "intent": "numbers the job's events, so a reader sees a gap (W12.4; approved by 1057)",
+      "meaning": "the job's own sequence, the same for every holder; after a gap or a loss marker the reader reads the job's whole current answer again by ReadJobAnswer and applies events above it",
+      "not_meaning": "a lake row's sequence",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
       "stability": "preview",
       "store": "analytics"
     },
@@ -22994,6 +23216,171 @@
       "store": "bor"
     },
     {
+      "name": "meridian.v1.MoveAccountRequest.account_id",
+      "type": "identifier account",
+      "empty": "never empty",
+      "intent": "names the account moved to another book partition (W6.39, W9.8; the act approved by 1057)",
+      "meaning": "an account of the deployment; refused FAILED_PRECONDITION naming it while a move of it is under way",
+      "not_meaning": "a partition",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.MoveAccountRequest.target_partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the book partition the account moves to (W6.39; approved 2026-11-09)",
+      "meaning": "a partition of the book other than the account's; one the book does not have is refused INVALID_ARGUMENT naming target_partition, as every move is with one partition, the default",
+      "not_meaning": "a writer group",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.MoveAccountRequest.reason",
+      "type": "text",
+      "bounds": {
+        "length": [
+          1,
+          2000
+        ]
+      },
+      "empty": "never empty: refused REFUSAL_REASON_REASON_REQUIRED without one",
+      "intent": "says why an account is moved (W6.39; approved 2026-11-09)",
+      "meaning": "the person's words, or the agent's acting for them, kept with the move's record; at most 2,000 characters",
+      "not_meaning": "an instruction: it is data",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.MoveAccountReply.moved",
+      "type": "message AccountMoved",
+      "empty": "never unset",
+      "intent": "answers the account's move (W6.39; approved 2026-11-09)",
+      "meaning": "the move's record, once both entries are journalled",
+      "not_meaning": "the account's positions, which do not change",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.account_id",
+      "type": "identifier account",
+      "empty": "never empty",
+      "intent": "names the account that moved (W9.8; the record approved by 1057)",
+      "meaning": "the account",
+      "not_meaning": "a partition",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.from_partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the partition the account's chain closed in (W9.8; approved 2026-11-09)",
+      "meaning": "the old partition",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.closing_sequence",
+      "type": "integer",
+      "unit": "changes in the partition",
+      "empty": "never zero",
+      "intent": "names the entry that closed the account's chain (W9.8; approved 2026-11-09)",
+      "meaning": "its sequence in the old partition",
+      "not_meaning": "a count",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.to_partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the partition the account's chain continues in (W9.8; approved 2026-11-09)",
+      "meaning": "the new partition",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.opening_sequence",
+      "type": "integer",
+      "unit": "changes in the partition",
+      "empty": "never zero",
+      "intent": "names the entry that opened the account's chain again (W9.8; approved 2026-11-09)",
+      "meaning": "its sequence in the new partition",
+      "not_meaning": "a count",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.moved_by",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names who moved the account (W9.8; decisions/031; approved 2026-11-09)",
+      "meaning": "the deployment-local subject the dashboard stamped",
+      "not_meaning": "an email address",
+      "filled": "stamped",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.reason",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "says why the account was moved (W9.8; approved 2026-11-09)",
+      "meaning": "as the move's request said",
+      "not_meaning": "an instruction: it is data",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountMoved.moved_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the account's chain continued in the new partition (W9.8; approved 2026-11-09)",
+      "meaning": "by the book's clock, at the opening entry",
+      "not_meaning": "when it was asked",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
       "name": "meridian.v1.AccountRecord.account_id",
       "type": "identifier account",
       "empty": "never empty",
@@ -25054,6 +25441,726 @@
       "store": "conductor"
     },
     {
+      "name": "meridian.v1.ReadResilienceProfileReply.level",
+      "type": "enum ServiceLevel",
+      "allowed": [
+        {
+          "value": "SERVICE_LEVEL_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "SERVICE_LEVEL_DESKTOP",
+          "meaning": "Desktop"
+        },
+        {
+          "value": "SERVICE_LEVEL_SINGLE_NODE",
+          "meaning": "Single node"
+        },
+        {
+          "value": "SERVICE_LEVEL_MULTI_NODE",
+          "meaning": "Multi-node"
+        },
+        {
+          "value": "SERVICE_LEVEL_MULTI_ZONE",
+          "meaning": "Multi-zone"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "names the highest service level the configuration meets (W6.39; level approved by 1057, its enum's name 2026-11-09)",
+      "meaning": "the highest of Desktop, Single node, Multi-node and Multi-zone whose every property the deployment's configuration meets, as it runs; next_level_changes names what the next lacks",
+      "not_meaning": "a preset's name, or a promise",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceProfileReply.next_level_changes",
+      "type": "repeated message ResilienceChange",
+      "empty": "none at Multi-zone",
+      "intent": "names what the next service level lacks (W6.39; approved 2026-11-09)",
+      "meaning": "each change that would meet the next level, with its cost",
+      "not_meaning": "a change made: the read changes nothing",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceProfileReply.failures",
+      "type": "repeated message ResilienceLine",
+      "empty": "never empty",
+      "intent": "answers, per failure class, whether the configuration recovers from it (W6.39; approved 2026-11-09)",
+      "meaning": "one line per class: a pod, a node, a node frozen, a network partition, a NetworkPolicy change, silent bit rot, a torn write, a volume lost, a zone's node pool",
+      "not_meaning": "a test result: a class is met only where CI tests the configuration",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceProfileReply.tiers",
+      "type": "repeated message ResilienceLine",
+      "empty": "never empty",
+      "intent": "answers, per tier of the targets by failure, whether the configuration meets it (W6.39; approved 2026-11-09)",
+      "meaning": "one line per failure and part -- a component or a node, the database primary, a zone, a region; the book, street and order path, the lake, analytics",
+      "not_meaning": "a public claim of availability",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceProfileReply.never_blind",
+      "type": "repeated message NeverBlindLine",
+      "empty": "none: no live data type in the priorities",
+      "intent": "answers never blind's properties per live data type (W6.39; approved 2026-11-09)",
+      "meaning": "one line per live data type the priorities serve",
+      "not_meaning": "a dataset's licence",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceProfileReply.computed_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the profile was computed (W6.39; approved 2026-11-09)",
+      "meaning": "by the conductor's clock, from the reports it held then",
+      "not_meaning": "a CI run's time",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceLine.subject",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names what a line of the profile is about (W6.39; approved 2026-11-09)",
+      "meaning": "a failure class, or a tier's failure and part, in words",
+      "not_meaning": "a component's name alone",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceLine.state",
+      "type": "enum ResilienceState",
+      "allowed": [
+        {
+          "value": "RESILIENCE_STATE_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "RESILIENCE_STATE_MET",
+          "meaning": "met by the configuration as it runs, a configuration CI tests"
+        },
+        {
+          "value": "RESILIENCE_STATE_MET_BY_RESTART",
+          "meaning": "met by Kubernetes' restart within the tolerant default's bound"
+        },
+        {
+          "value": "RESILIENCE_STATE_NOT_MET",
+          "meaning": "not met; changes names what would meet it"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says whether the line is met (W6.39; approved 2026-11-09)",
+      "meaning": "met, met by restart within the tolerant bound, or not met",
+      "not_meaning": "a guarantee",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceLine.reason",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "says why the line is in its state (W6.39; approved 2026-11-09)",
+      "meaning": "in plain words: \"one book writer, no standby\", \"every node in one zone\", \"backups not scheduled\"",
+      "not_meaning": "a log line",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceLine.changes",
+      "type": "repeated message ResilienceChange",
+      "empty": "none where the line is met",
+      "intent": "names what would meet a line not met (W6.39; approved 2026-11-09)",
+      "meaning": "each change and its cost",
+      "not_meaning": "a change made",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceChange.change",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "says one change that would meet more (W6.39; approved 2026-11-09)",
+      "meaning": "a chart value and its value (bor.standby: 1), a node or zone to add, a source to entitle, a standby to launch, applied by meridian upgrade-deployment --set or at the Plugins and Data sources pages",
+      "not_meaning": "a command run: the read changes nothing",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceChange.cost",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "says what the change costs (W6.39; approved 2026-11-09)",
+      "meaning": "pods, memory, a second vendor connection, in words",
+      "not_meaning": "a price",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.NeverBlindLine.data_type",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the live data type a line is about (W6.39; approved 2026-11-09)",
+      "meaning": "by its message's full name",
+      "not_meaning": "a dataset",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.NeverBlindLine.second_source",
+      "type": "boolean",
+      "empty": "false: one source in its priority",
+      "intent": "says whether a second source stands in the type's priority (W6.39; approved 2026-11-09)",
+      "meaning": "true where a default read has another dataset to switch to",
+      "not_meaning": "an entitlement of any one plugin",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.NeverBlindLine.standby_pods",
+      "type": "boolean",
+      "empty": "false: no source of the type runs a standby pod",
+      "intent": "says whether the type's sources run standby pods (W6.39; approved 2026-11-09)",
+      "meaning": "true where every dataset in the priority is served by an instance launched with standby",
+      "not_meaning": "a shard",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.NeverBlindLine.age_and_source",
+      "type": "boolean",
+      "empty": "false: a page of the type shows no age or source",
+      "intent": "says whether the type's pages show each value's age and source (W6.39; approved 2026-11-09)",
+      "meaning": "true where the pages reading the type draw the kit's live cells",
+      "not_meaning": "a page's speed",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceRequest.page_size",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "500"
+        },
+        "past": "capped"
+      },
+      "unit": "history items",
+      "empty": "0: the read's default page",
+      "intent": "bounds a page of the history (W6.39; approved 2026-11-09)",
+      "meaning": "the most history items in one page, newest first; members and partitions are answered whole",
+      "not_meaning": "a total",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceRequest.cursor",
+      "type": "text",
+      "empty": "empty: the first page",
+      "intent": "continues a read of the history (W6.39; approved 2026-11-09)",
+      "meaning": "the next_cursor of the page before",
+      "not_meaning": "a time",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceReply.members",
+      "type": "repeated message ComponentReport",
+      "empty": "never empty",
+      "intent": "answers each member of each component (W6.39; approved 2026-11-09)",
+      "meaning": "the latest report of each: the component, the member, its mode, zone, lag and partitions, version and health",
+      "not_meaning": "a record: a member's mode and lag are working state",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceReply.partitions",
+      "type": "repeated message PartitionOwner",
+      "empty": "never empty",
+      "intent": "answers each partition and its owner (W6.39; approved 2026-11-09)",
+      "meaning": "per store, each partition with its writer group, its writer and its epoch",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceReply.history",
+      "type": "repeated message ResilienceHistoryItem",
+      "empty": "none: nothing has happened",
+      "intent": "answers the recent takeovers, moves, switches and findings (W6.39; approved 2026-11-09)",
+      "meaning": "newest first, paged: takeovers, partitions' and accounts' moves, source switches and findings",
+      "not_meaning": "every record of every store",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadResilienceReply.next_cursor",
+      "type": "text",
+      "empty": "empty: the last page",
+      "intent": "continues the history (W6.39; approved 2026-11-09)",
+      "meaning": "the cursor of the next page",
+      "not_meaning": "a time",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.PartitionOwner.component",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the store a partition is of (W6.39; approved 2026-11-09)",
+      "meaning": "lake, bor, instrument, street, conductor or launcher",
+      "not_meaning": "a member",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.PartitionOwner.partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the partition (W6.39; approved 2026-11-09)",
+      "meaning": "a dataset's ID, a book partition, control, or a store's one partition",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.PartitionOwner.group",
+      "type": "integer",
+      "unit": "writer groups, numbered from 0",
+      "empty": "0 where the store has one writer group",
+      "intent": "names the writer group that owns the partition (W6.39; approved 2026-11-09)",
+      "meaning": "its group, numbered from 0",
+      "not_meaning": "a pod",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.PartitionOwner.writer",
+      "type": "text",
+      "empty": "empty while no member holds the group's lease",
+      "intent": "names the member writing the partition (W6.39; approved 2026-11-09)",
+      "meaning": "the member's name, as its report names it",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.PartitionOwner.epoch",
+      "type": "integer",
+      "unit": "epochs of the partition",
+      "empty": "never zero",
+      "intent": "states the partition's epoch (W6.39; approved 2026-11-09)",
+      "meaning": "the epoch on its head row, raised at each takeover and move",
+      "not_meaning": "a version of its rows",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceHistoryItem.writer_took_over",
+      "type": "message WriterTookOver",
+      "empty": "unset unless the item is a takeover",
+      "intent": "carries a takeover in the history (W6.39; approved 2026-11-09)",
+      "meaning": "the record as its store keeps it",
+      "not_meaning": "a restart of a pod with no standby",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceHistoryItem.partition_moved",
+      "type": "message PartitionMoved",
+      "empty": "unset unless the item is a partition's move",
+      "intent": "carries a partition's move in the history (W6.39; approved 2026-11-09)",
+      "meaning": "the record as the lake or the book keeps it",
+      "not_meaning": "an account's move",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceHistoryItem.source_switched",
+      "type": "message SourceSwitched",
+      "empty": "unset unless the item is a source switch",
+      "intent": "carries a switch of a default read's source in the history (W6.39; approved 2026-11-09)",
+      "meaning": "the record as the lake keeps it",
+      "not_meaning": "a priority's change, which SetSourcePriority records",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceHistoryItem.account_moved",
+      "type": "message AccountMoved",
+      "empty": "unset unless the item is an account's move",
+      "intent": "carries an account's move in the history (W6.39; approved 2026-11-09)",
+      "meaning": "the record as the book keeps it, the account and who moved it shown to a deployment admin only",
+      "not_meaning": "a partition's move",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ResilienceHistoryItem.integrity_finding",
+      "type": "message IntegrityFinding",
+      "empty": "unset unless the item is a finding",
+      "intent": "carries an integrity finding in the history (W6.39; approved 2026-11-09)",
+      "meaning": "the record as its store keeps it",
+      "not_meaning": "a member's lag",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.component",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the store whose writer was taken over (W6.39; the record approved by 1057)",
+      "meaning": "lake, bor, instrument, street, conductor or launcher",
+      "not_meaning": "a plugin",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.member",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the member that took the lease (W6.39; approved 2026-11-09)",
+      "meaning": "its pod's name, as its report names it",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.previous_member",
+      "type": "text",
+      "empty": "empty where no writer held the lease before",
+      "intent": "names the member that wrote before (W6.39; approved 2026-11-09)",
+      "meaning": "its pod's name",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.partitions",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          1,
+          1000
+        ]
+      },
+      "empty": "never empty",
+      "intent": "names the partitions taken over (W6.39; approved 2026-11-09)",
+      "meaning": "the store's partitions, a dataset's key, P0, control",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.epoch",
+      "type": "integer",
+      "unit": "epochs of the partition",
+      "empty": "never zero",
+      "intent": "states the epoch raised (W6.39; approved 2026-11-09)",
+      "meaning": "the partitions' new epoch, under which the new writer commits",
+      "not_meaning": "a count of takeovers",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.reason",
+      "type": "enum TakeoverReason",
+      "allowed": [
+        {
+          "value": "TAKEOVER_REASON_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "TAKEOVER_REASON_LEASE_LAPSED",
+          "meaning": "the writer's lease lapsed"
+        },
+        {
+          "value": "TAKEOVER_REASON_STEPPED_DOWN",
+          "meaning": "the writer stepped down, its commit refused by the epoch"
+        },
+        {
+          "value": "TAKEOVER_REASON_MOVED",
+          "meaning": "a partition moved to this member's group"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says why the writer was taken over (W6.39; approved 2026-11-09)",
+      "meaning": "the lease lapsed, the writer stepped down, or a move",
+      "not_meaning": "a pod's exit code",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.WriterTookOver.took_over_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the new writer took over (W6.39; approved 2026-11-09)",
+      "meaning": "by the store's clock, at the fence",
+      "not_meaning": "when the old writer stopped",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.component",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the store whose record failed a check (W6.39; the record approved by 1057)",
+      "meaning": "lake, bor, instrument, street or conductor",
+      "not_meaning": "a plugin",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.partition",
+      "type": "text",
+      "empty": "empty for a database page outside any partition",
+      "intent": "names the partition found changed (W6.39; approved 2026-11-09)",
+      "meaning": "a dataset's key, P0, control",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.check",
+      "type": "enum IntegrityCheck",
+      "allowed": [
+        {
+          "value": "INTEGRITY_CHECK_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "INTEGRITY_CHECK_PAGE_CHECKSUM",
+          "meaning": "a database page's checksum failed on read"
+        },
+        {
+          "value": "INTEGRITY_CHECK_ROW_DIGEST",
+          "meaning": "a lake row's digest is not its body's"
+        },
+        {
+          "value": "INTEGRITY_CHECK_JOURNAL_CHAIN",
+          "meaning": "a journal entry's digest or its previous_digest breaks the partition's chain"
+        },
+        {
+          "value": "INTEGRITY_CHECK_MEMBER_DIGEST",
+          "meaning": "two members' digests of a partition differ at one sequence"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says which check failed (W6.39; approved 2026-11-09)",
+      "meaning": "a page checksum, a row's digest, the journal's chain, or two members' digests",
+      "not_meaning": "a guess at the cause",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.first_bad_sequence",
+      "type": "integer",
+      "unit": "changes in the partition",
+      "empty": "0 for a database page",
+      "intent": "names the first change found bad (W6.39; approved 2026-11-09)",
+      "meaning": "its sequence in the partition",
+      "not_meaning": "a count",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.first_bad_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "0 for a database page",
+      "intent": "states when the first bad change was committed (W6.39; approved 2026-11-09)",
+      "meaning": "its committed time",
+      "not_meaning": "when it was found",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.restore_point_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "0: no restore point before it",
+      "intent": "names the newest point a restore could go back to before the bad change (W6.39; approved 2026-11-09)",
+      "meaning": "from the backups and the off-cluster archive; what a restore there would lose is the record after it",
+      "not_meaning": "a restore done: the admin chooses (meridian restore --to-time)",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.detail",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          500
+        ]
+      },
+      "empty": "empty where the check says enough",
+      "intent": "says what was found, in a sentence (W6.39; approved 2026-11-09)",
+      "meaning": "plain words for a person",
+      "not_meaning": "a stack trace or a row's body",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.IntegrityFinding.found_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the finding was made (W6.39; approved 2026-11-09)",
+      "meaning": "by the store's clock",
+      "not_meaning": "when the change was made",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
       "name": "meridian.v1.Ticket.filed_by",
       "type": "message TicketAuthor",
       "empty": "never unset",
@@ -26455,6 +27562,19 @@
       "store": "envelope"
     },
     {
+      "name": "meridian.v1.MessageMeta.read_after",
+      "type": "message Watermark",
+      "empty": "unset: the nearest member answers, eventually consistent, its watermark saying how current",
+      "intent": "names the watermark a read must not be answered behind (W4.4; approved by 1057)",
+      "meaning": "the watermark of the plugin's last act or delivery on the store's partitions, which the SDK sets; a member behind it waits up to its bound, then hands the read to the writer, and never answers from behind it",
+      "not_meaning": "a point in time to read as of, which as_of_ns and book_at name; or a demand to read from the writer: a member at or past it answers",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "envelope"
+    },
+    {
       "name": "meridian.v1.Identifier.scheme",
       "type": "text",
       "empty": "never empty",
@@ -27442,6 +28562,18 @@
       "store": "instrument"
     },
     {
+      "name": "meridian.v1.InstrumentValue.bond",
+      "type": "message Bond",
+      "empty": "unset unless the value is a bond's terms",
+      "intent": "carries a bond's terms set or offered for a record (W3.10; contract v30, ruling 433; approved 2026-11-09)",
+      "meaning": "the Bond the record carries, as a source offers it or a deployment admin puts it in force, its source named under INSTRUMENT_FIELD_BOND; refused on a record whose type is not bond",
+      "not_meaning": "a bond's prices, yields or current face, which are the lake's and the engine's",
+      "filled": "entered",
+      "since": "v30",
+      "stability": "preview",
+      "store": "instrument"
+    },
+    {
       "name": "meridian.v1.InstrumentValue.source",
       "type": "text",
       "empty": "never empty on a value a person sets",
@@ -27491,6 +28623,11 @@
           "value": "INSTRUMENT_FIELD_BINARY_EVENT_CONTRACT",
           "meaning": "a binary event contract's attributes",
           "since": "v19"
+        },
+        {
+          "value": "INSTRUMENT_FIELD_BOND",
+          "meaning": "a bond's terms (ruling 433; approved 2026-11-09)",
+          "since": "v30"
         }
       ],
       "empty": "never unspecified on a read",
@@ -27950,6 +29087,19 @@
         }
       ],
       "stability": "stable",
+      "store": "instrument"
+    },
+    {
+      "name": "meridian.v1.ResolveIdentifierRequest.stated_binary_event_contract",
+      "type": "message BinaryEventContract",
+      "empty": "unset is not stated",
+      "intent": "states an event contract's terms as its venue gives them, on resolving it (W3.1; contract v30, ruling 1035; approved by 1057)",
+      "meaning": "the venue's terms of a binary event contract, its category among them, as the record carries them; the instrument store records category the first time it sees the contract and keeps each stated value as an offer thereafter",
+      "not_meaning": "a value in force: a stated term is an offer, as every stated_ field is; or a platform taxonomy",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v30",
+      "stability": "preview",
       "store": "instrument"
     },
     {
@@ -30654,6 +31804,10 @@
         {
           "row": "ReportEventGroup",
           "since": "v27"
+        },
+        {
+          "row": "ResolveIdentifier",
+          "since": "v30"
         }
       ],
       "changes": [
@@ -30663,6 +31817,19 @@
           "what": "a bound a data plugin offers on ReportEventGroup (member_bounds, W3.29) carries its value",
           "was": {
             "required": []
+          }
+        },
+        {
+          "version": "v30",
+          "kind": "narrowed",
+          "what": "a bound a data plugin states on ResolveIdentifier (stated_binary_event_contract, W3.1, ruling 1035) carries its value",
+          "was": {
+            "required": [
+              {
+                "row": "ReportEventGroup",
+                "since": "v27"
+              }
+            ]
           }
         }
       ],
@@ -38888,7 +40055,7 @@
     {
       "name": "meridian.v1.ListDatasetsReply.licences",
       "type": "repeated message DatasetLicence",
-      "empty": "none set: each dataset is kept and read by its catalogue's default",
+      "empty": "none set: each dataset is kept and read by its catalogue's default; from v30, which declares none, kept and read as before, each use right read restrictively (1030)",
       "intent": "says each dataset's licence",
       "meaning": "the deployment's licence of each dataset listed, as a deployment admin set it",
       "not_meaning": "a claim that a deployment meets a vendor's terms",
@@ -39542,6 +40709,11 @@
         {
           "value": "RATE_KIND_COUPON_EQUIVALENT",
           "meaning": "a bill's coupon-equivalent (bond-equivalent) yield"
+        },
+        {
+          "value": "RATE_KIND_BENCHMARK_YIELD",
+          "meaning": "an on-the-run benchmark's yield as its publisher states it, the kind a curve's benchmarks are quoted in (ruling 431; approved 2026-11-09)",
+          "since": "v30"
         }
       ],
       "empty": "unspecified is refused",
@@ -39824,6 +40996,11 @@
         {
           "value": "RATE_KIND_COUPON_EQUIVALENT",
           "meaning": "coupon-equivalent yields"
+        },
+        {
+          "value": "RATE_KIND_BENCHMARK_YIELD",
+          "meaning": "benchmarks' yields",
+          "since": "v30"
         }
       ],
       "empty": "none: every kind",
@@ -45704,6 +46881,705 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.SourceSwitched.data_type",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the priority whose serving dataset switched (W10.6; the record approved by 1057)",
+      "meaning": "the priority's data type by its message's full name, as SourcePriority.data_type names it",
+      "not_meaning": "a row's name",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.kind",
+      "type": "enum PriceKind",
+      "allowed": [
+        {
+          "value": "PRICE_KIND_UNSPECIFIED",
+          "meaning": "for a priority with no kind"
+        },
+        {
+          "value": "PRICE_KIND_CLOSE",
+          "meaning": "closes"
+        },
+        {
+          "value": "PRICE_KIND_LAST",
+          "meaning": "last prices"
+        },
+        {
+          "value": "PRICE_KIND_NAV",
+          "meaning": "net asset values"
+        },
+        {
+          "value": "PRICE_KIND_SETTLEMENT",
+          "meaning": "settlement prices"
+        },
+        {
+          "value": "PRICE_KIND_BID",
+          "meaning": "bids"
+        },
+        {
+          "value": "PRICE_KIND_ASK",
+          "meaning": "asks"
+        },
+        {
+          "value": "PRICE_KIND_MID",
+          "meaning": "mids"
+        }
+      ],
+      "empty": "unspecified for a priority with no kind",
+      "intent": "names the price kind of the priority that switched (W10.6; approved 2026-11-09)",
+      "meaning": "as SourcePriority.kind",
+      "not_meaning": "a basis",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.from_dataset",
+      "type": "identifier dataset",
+      "empty": "never empty",
+      "intent": "names the dataset a default read passed over, or for a switch back the one it leaves (W10.6; approved 2026-11-09)",
+      "meaning": "a dataset of the priority",
+      "not_meaning": "a dataset removed from the priority, which SetSourcePriority records",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.to_dataset",
+      "type": "identifier dataset",
+      "empty": "empty: no dataset left in the priority to serve, so a default read is answered not covered",
+      "intent": "names the dataset a default read now serves (W10.6; approved 2026-11-09)",
+      "meaning": "the next dataset of the priority, or for a switch back the higher one restored",
+      "not_meaning": "an entitlement",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.subjects",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: every subject the priority serves",
+      "intent": "names the subjects a switch is for where it is not all of them (W10.6; approved 2026-11-09)",
+      "meaning": "entity IDs, for a switch on a quarantine, which is held per subject",
+      "not_meaning": "every subject a reader asked",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.reason",
+      "type": "enum SourceSwitchReason",
+      "allowed": [
+        {
+          "value": "SOURCE_SWITCH_REASON_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "SOURCE_SWITCH_REASON_SILENT",
+          "meaning": "the dataset passed over recorded nothing within its cadence"
+        },
+        {
+          "value": "SOURCE_SWITCH_REASON_STALLED",
+          "meaning": "the dataset passed over stated no liveness within its stale ceiling"
+        },
+        {
+          "value": "SOURCE_SWITCH_REASON_QUARANTINED",
+          "meaning": "the dataset passed over held its latest rows for the subjects quarantined"
+        },
+        {
+          "value": "SOURCE_SWITCH_REASON_RESTORED",
+          "meaning": "a switch back: the higher dataset is live and good again"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says why a default read's source switched (W10.6; the reasons approved by 1057, the enum's name approved 2026-11-09)",
+      "meaning": "silent, stalled or quarantined for a switch to the next dataset; restored for a switch back",
+      "not_meaning": "a quality state of a row",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.SourceSwitched.switched_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the switch was made (W10.6; approved 2026-11-09)",
+      "meaning": "by the lake's clock, when it first served a default read from the dataset now served",
+      "not_meaning": "when the source stopped: the last row or liveness is the source's own time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesRequest.data_type",
+      "type": "text",
+      "empty": "empty: every priority",
+      "intent": "narrows the switches read to one priority's data type (W10.6; approved 2026-11-09)",
+      "meaning": "a data type by its message's full name",
+      "not_meaning": "a row's name",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesRequest.dataset",
+      "type": "identifier dataset",
+      "empty": "empty: every dataset",
+      "intent": "narrows the switches read to those passing over or to one dataset (W10.6; approved 2026-11-09)",
+      "meaning": "a dataset's ID",
+      "not_meaning": "an entitlement",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesRequest.page_size",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "500"
+        },
+        "past": "capped"
+      },
+      "unit": "switches",
+      "empty": "0: the read's default page",
+      "intent": "bounds a page of switches (W10.6; approved 2026-11-09)",
+      "meaning": "the most switches answered in one page, newest first",
+      "not_meaning": "a total",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesRequest.cursor",
+      "type": "text",
+      "empty": "empty: the first page",
+      "intent": "continues a read of switches (W10.6; approved 2026-11-09)",
+      "meaning": "the next_cursor of the page before",
+      "not_meaning": "a time",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesReply.switches",
+      "type": "repeated message SourceSwitched",
+      "empty": "none: no switch matches",
+      "intent": "answers the switches recorded (W10.6; approved 2026-11-09)",
+      "meaning": "each switch and switch back, newest first",
+      "not_meaning": "the priorities, which ListSourcePriorities reads",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSourceSwitchesReply.next_cursor",
+      "type": "text",
+      "empty": "empty: the last page",
+      "intent": "continues the read (W10.6; approved 2026-11-09)",
+      "meaning": "the cursor of the next page",
+      "not_meaning": "a time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.MovePartitionRequest.partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the partition a deployment admin moves (W6.39; the act approved by 1057)",
+      "meaning": "the lake's dataset ID, or the book's partition (P0 and those placed after it); refused FAILED_PRECONDITION naming it while a move of it is under way",
+      "not_meaning": "an account, which MoveAccount moves",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.MovePartitionRequest.target_group",
+      "type": "integer",
+      "unit": "writer groups, numbered from 0",
+      "empty": "never empty in a move",
+      "intent": "names the writer group a partition moves to (W6.39; approved 2026-11-09)",
+      "meaning": "a writer group of the store, from 0 below lake.writerGroups or bor.writerGroups; one the deployment does not have is refused INVALID_ARGUMENT naming target_group, as every move is with one group, the default",
+      "not_meaning": "a member or a pod: a group's writer is whoever holds its lease",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.MovePartitionRequest.reason",
+      "type": "text",
+      "bounds": {
+        "length": [
+          1,
+          2000
+        ]
+      },
+      "empty": "never empty: refused REFUSAL_REASON_REASON_REQUIRED without one",
+      "intent": "says why a partition is moved (W6.39; approved 2026-11-09)",
+      "meaning": "the person's words, or the agent's acting for them, kept with the move's record (decisions/031's why); at most 2,000 characters",
+      "not_meaning": "an instruction to anyone who reads it: it is data",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.MovePartitionReply.from_group",
+      "type": "integer",
+      "unit": "writer groups, numbered from 0",
+      "empty": "never empty",
+      "intent": "names the writer group the partition leaves (W6.39; approved 2026-11-09)",
+      "meaning": "the group that owned it when the move began",
+      "not_meaning": "a member",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.MovePartitionReply.started_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the move began (W6.39; approved 2026-11-09)",
+      "meaning": "when the target began following the partition's log; the move's record, PartitionMoved, is written when the target owns it",
+      "not_meaning": "when it ends",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.component",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the store whose partition moved (W6.39; the record approved by 1057)",
+      "meaning": "lake or bor",
+      "not_meaning": "a member",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.partition",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the partition moved (W6.39; approved 2026-11-09)",
+      "meaning": "a dataset's ID, or a book partition",
+      "not_meaning": "an account",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.from_group",
+      "type": "integer",
+      "unit": "writer groups, numbered from 0",
+      "empty": "never empty",
+      "intent": "names the writer group the partition left (W6.39; approved 2026-11-09)",
+      "meaning": "as MovePartitionReply.from_group",
+      "not_meaning": "a member",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.to_group",
+      "type": "integer",
+      "unit": "writer groups, numbered from 0",
+      "empty": "never empty",
+      "intent": "names the writer group that owns the partition now (W6.39; approved 2026-11-09)",
+      "meaning": "the target",
+      "not_meaning": "a member",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.epoch",
+      "type": "integer",
+      "unit": "epochs of the partition",
+      "empty": "never zero",
+      "intent": "states the epoch the move raised (W6.39; approved 2026-11-09)",
+      "meaning": "the partition's epoch after the fence, under which the new owner commits; a commit under an older one is refused",
+      "not_meaning": "a version of the partition's rows",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.by_hand",
+      "type": "boolean",
+      "empty": "false: a changed group count moved it",
+      "intent": "says whether a person moved the partition (W6.39; approved 2026-11-09)",
+      "meaning": "true: a deployment admin's MovePartition, its reason kept beside it",
+      "not_meaning": "an agent's act: one acting for a person is the person's",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.moved_by",
+      "type": "text",
+      "empty": "empty for a move by a changed group count",
+      "intent": "names who moved the partition by hand (W6.39; decisions/031; approved 2026-11-09)",
+      "meaning": "the deployment-local subject the dashboard stamped",
+      "not_meaning": "an email address",
+      "filled": "stamped",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.reason",
+      "type": "text",
+      "empty": "empty for a move by a changed group count",
+      "intent": "says why a person moved the partition (W6.39; approved 2026-11-09)",
+      "meaning": "as the move's request said",
+      "not_meaning": "an instruction: it is data",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.PartitionMoved.moved_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the target came to own the partition (W6.39; approved 2026-11-09)",
+      "meaning": "by the store's clock, at the fence",
+      "not_meaning": "when it was asked",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ObservationsWantedEvent.gap_id",
+      "type": "text",
+      "empty": "empty: not a gap's want",
+      "intent": "names the gap a want asks again for (W10.7, W10.14; approved 2026-11-09)",
+      "meaning": "a gap's ID, set on a want of a backfill dataset's gap's subjects and valid-time range; the rows recorded for it recover the gap",
+      "not_meaning": "a want's ID, which want_id is",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.gap_id",
+      "type": "text",
+      "bounds": {
+        "length": [
+          1,
+          64
+        ]
+      },
+      "empty": "never empty",
+      "intent": "names a gap (W10.14; approved 2026-11-09)",
+      "meaning": "GAP- and a ULID, never reused; a want asking again for it names it",
+      "not_meaning": "a want's ID",
+      "filled": "minted",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.dataset",
+      "type": "identifier dataset",
+      "empty": "never empty",
+      "intent": "names the dataset with a gap (W10.14; the record approved 2026-11-09)",
+      "meaning": "the dataset whose rows were dropped",
+      "not_meaning": "an entitlement",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.subjects",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: every subject of the rows dropped",
+      "intent": "names the subjects a gap is in (W10.14; approved 2026-11-09)",
+      "meaning": "entity IDs, as the dropped rows named them",
+      "not_meaning": "every subject the dataset serves",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.valid_from_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "starts a gap's valid-time range, inclusive (W10.14; the range approved 2026-11-09, its fields' names approved 2026-11-09)",
+      "meaning": "the earliest valid time of a row dropped",
+      "not_meaning": "a recorded time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.valid_until_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "ends a gap's valid-time range, exclusive (W10.14; approved 2026-11-09)",
+      "meaning": "just after the latest valid time of a row dropped, as ObservationsWantedEvent.valid_until_ns ends a want's range",
+      "not_meaning": "a recorded time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.cause",
+      "type": "enum GapCause",
+      "allowed": [
+        {
+          "value": "GAP_CAUSE_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "GAP_CAUSE_WRITE_AHEAD_BOUND",
+          "meaning": "rows the lake's write-ahead stream dropped at its bound before the lake committed them: a writer gone longer than the bound"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says why the gap arose (W10.14; cause, its enum GapCause and its value approved 2026-11-09, step 3c's question 5)",
+      "meaning": "in v30 the write-ahead stream's bound alone",
+      "not_meaning": "a source's own outage, which a liveness says",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.state",
+      "type": "enum GapState",
+      "allowed": [
+        {
+          "value": "GAP_STATE_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "GAP_STATE_REFETCHING",
+          "meaning": "asked again of the data plugin through the want, naming the gap"
+        },
+        {
+          "value": "GAP_STATE_RECOVERED",
+          "meaning": "the rows returned under their own row keys"
+        },
+        {
+          "value": "GAP_STATE_UNRECOVERED",
+          "meaning": "not recovered: the dataset cannot be asked again, or the want was declined; a notice in the deployment admin's inbox while it stands"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says where a gap's recovery stands (W10.14; state and its three values approved 2026-11-09, the enum's name approved 2026-11-09)",
+      "meaning": "refetching, recovered or unrecovered, each change of state its own record",
+      "not_meaning": "the dataset's quality",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.recorded_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the gap's state was recorded (W10.14; approved 2026-11-09)",
+      "meaning": "by the lake's clock, for this state",
+      "not_meaning": "when the rows were dropped",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsRequest.dataset",
+      "type": "identifier dataset",
+      "empty": "empty: every dataset",
+      "intent": "narrows the gaps read to one dataset (W10.14; approved 2026-11-09)",
+      "meaning": "a dataset's ID",
+      "not_meaning": "an entitlement",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsRequest.state",
+      "type": "enum GapState",
+      "allowed": [
+        {
+          "value": "GAP_STATE_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "GAP_STATE_REFETCHING",
+          "meaning": "asked again of the data plugin through the want, naming the gap"
+        },
+        {
+          "value": "GAP_STATE_RECOVERED",
+          "meaning": "the rows returned under their own row keys"
+        },
+        {
+          "value": "GAP_STATE_UNRECOVERED",
+          "meaning": "not recovered: the dataset cannot be asked again, or the want was declined; a notice in the deployment admin's inbox while it stands"
+        }
+      ],
+      "empty": "unspecified: every state",
+      "intent": "narrows the gaps read to one state (W10.14; approved 2026-11-09)",
+      "meaning": "refetching, recovered or unrecovered",
+      "not_meaning": "a quality state",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsRequest.page_size",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "500"
+        },
+        "past": "capped"
+      },
+      "unit": "gaps",
+      "empty": "0: the read's default page",
+      "intent": "bounds a page of gaps (W10.14; approved 2026-11-09)",
+      "meaning": "the most gaps answered in one page, newest first",
+      "not_meaning": "a total",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsRequest.cursor",
+      "type": "text",
+      "empty": "empty: the first page",
+      "intent": "continues a read of gaps (W10.14; approved 2026-11-09)",
+      "meaning": "the next_cursor of the page before",
+      "not_meaning": "a time",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsReply.gaps",
+      "type": "repeated message DatasetGap",
+      "empty": "none: no gap matches",
+      "intent": "answers the gaps recorded (W10.14; approved 2026-11-09)",
+      "meaning": "each gap in its latest state, newest first; rows inside an unrecovered range are never invented",
+      "not_meaning": "the rows themselves",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListDatasetGapsReply.next_cursor",
+      "type": "text",
+      "empty": "empty: the last page",
+      "intent": "continues the read (W10.14; approved 2026-11-09)",
+      "meaning": "the cursor of the next page",
+      "not_meaning": "a time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.Decimal.high",
       "type": "integer",
       "unit": "none: the upper 64 bits of the value's integer",
@@ -45891,6 +47767,10 @@
         {
           "row": "RecordDerivedSeries",
           "since": "v29"
+        },
+        {
+          "row": "ResolveIdentifier",
+          "since": "v30"
         }
       ],
       "empty": "never unset in an amount that is set: the amount is the Money",
@@ -46595,7 +48475,7 @@
       "allowed": [
         {
           "value": "DAY_COUNT_UNSPECIFIED",
-          "meaning": "not stated by the source; refused on an instrument's terms"
+          "meaning": "not stated by the source; refused on an instrument's terms; from v30 accepted on a QuotedYield's convention, the yield kept as quoted and never computed with (433)"
         },
         {
           "value": "DAY_COUNT_ACT_360",
@@ -46805,11 +48685,18 @@
       "type": "message RateConvention",
       "empty": "never unset",
       "intent": "says how the yield compounds and accrues",
-      "meaning": "semi-annual bond-equivalent for a US Treasury, corporate or agency; its day count the instrument's",
+      "meaning": "semi-annual bond-equivalent for a US Treasury, corporate or agency; its day count the instrument's, or from v30 unspecified where the source states none, the yield then kept as quoted and never computed with (433)",
       "not_meaning": "a convention the plugin converted to",
       "filled": "as-reported",
       "filled_by": "data",
       "since": "v29",
+      "changes": [
+        {
+          "version": "v30",
+          "kind": "clarified",
+          "what": "its day_count may be DAY_COUNT_UNSPECIFIED where the source states none (ruling 433), which v29 refused; the yield is kept as quoted and never computed with"
+        }
+      ],
       "stability": "preview",
       "store": "shared"
     },
@@ -47400,7 +49287,7 @@
       "name": "meridian.v1.DatasetDeclaration.licence_default",
       "type": "message DatasetLicence",
       "empty": "unset: the vendor's terms say nothing the platform records",
-      "intent": "carries the vendor's offer: one standard record of its terms for the dataset",
+      "intent": "carried the vendor's offer: one standard record of its terms for the dataset; retired from v30 (ruling 1032), its number 8 reserved",
       "meaning": "from v27 the terms' shape, each part picked from fixed values and never free-form terms: identity and basis, the meters and how each counts, the use rights with derived use's three answers, attribution, and the reporting owed to the vendor; beside them keep or not, the default fields and whether the terms are one person's. The deployment's licence confirms or replaces it, and records the terms_version it accepted (W10.1)",
       "not_meaning": "the deployment's licence, which is enforced; a price, which the registry listing carries; a claim that a deployment meets the vendor's terms",
       "filled": "as-reported",
@@ -47411,8 +49298,33 @@
           "version": "v27",
           "kind": "clarified",
           "what": "the vendor's offer carries the terms' shape (W10.1): identity and basis, meters, use rights with derived use's three answers, attribution and reporting owed; display is read as meters containing display for one release"
+        },
+        {
+          "version": "v30",
+          "kind": "clarified",
+          "what": "retired (ruling 1032): a plugin describes its dataset's terms and pricing in terms_and_pricing instead, and meridian plugin migrate's rule licence-default-described turns an existing licence_default into that text; the deployment admin's DatasetLicence is unchanged"
         }
       ],
+      "retired": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.DatasetDeclaration.terms_and_pricing",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          2000
+        ]
+      },
+      "empty": "empty: the plugin describes none",
+      "intent": "describes a dataset's terms and pricing in plain words (W10.1; contract v30, ruling 1032; approved by 1057)",
+      "meaning": "the vendor's terms and pricing as the plugin describes them -- the sources behind the vendor, what it charges and on what meters, what it forbids -- shown on Data sources and in the plugin's docs, and read by the deployment admin's agent through dashboard__list_datasets for source-priority recommendations",
+      "not_meaning": "a licence, which the deployment admin sets and core enforces; an instruction to any reader: it is the vendor's words, data",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v30",
       "stability": "preview",
       "store": "sidecar"
     },
@@ -51006,6 +52918,25 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.plugin.v1.SubscribeRequest.job_ids",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          64
+        ]
+      },
+      "empty": "none: not a standing job's results",
+      "intent": "selects a standing job's results (W4.3, W12.4; contract v30, approved by 1057)",
+      "meaning": "standing jobs the plugin registered by RunJob with Job.standing, set only with the row DerivedSeriesUpdated; one the plugin did not register is refused NOT_FOUND naming it; while the subscription is open the sidecar renews each in RenewJobs",
+      "not_meaning": "a one-off job, whose finishing JobFinished tells",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "SidecarSubscribe.limit",
       "type": "integer",
       "bounds": {
@@ -53226,6 +55157,19 @@
       "filled": "as-reported",
       "filled_by": "data",
       "since": "v22",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.DatasetDeclaration.sessions_calendar_id",
+      "type": "text",
+      "empty": "empty names none, as before",
+      "intent": "names the trading-sessions calendar a dataset's live rows follow (W10.1; contract v30, ruling 455; approved 2026-11-09)",
+      "meaning": "its `CAL-` ID, beside calendar_id, the settlement calendar; the FX week, Sunday 17:00 to Friday 17:00 New York, is such a calendar in the platform's calendar master, which FX data plugins name; staleness and liveness are judged within its sessions",
+      "not_meaning": "the settlement calendar its business dates follow, which calendar_id names; a rule applied to the rows' values",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v30",
       "stability": "preview",
       "store": "sidecar"
     },
@@ -55860,6 +57804,130 @@
       "filled": "decided",
       "filled_by": "lake",
       "since": "v29",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.Delivery.derived_series_updated",
+      "type": "message DerivedSeriesUpdatedEvent",
+      "empty": "unset unless the delivery is a standing job's figures for this instance",
+      "intent": "delivers a standing job's recomputed figures (W12.4; contract v30)",
+      "meaning": "figures of a job this instance holds, latest first per job and figure key under load; after a gap in the job's sequence or a loss marker the plugin reads the job's answer again (ReadJobAnswer)",
+      "not_meaning": "a recorded row, or the whole answer",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginDeclaration.most_shards",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "64"
+        }
+      },
+      "unit": "pods of one instance",
+      "empty": "0: not shardable, as 1 is",
+      "intent": "declares the most pods of one instance the plugin's vendor allows (W8.1; approved by 1057)",
+      "meaning": "the most shards a deployment admin may launch the instance with; 0 or 1 says the plugin is not shardable; a shard is a pod of the one instance, its datasets, licence, settings, access and records the instance's",
+      "not_meaning": "a count of instances, or a promise the vendor allows it: the vendor's terms are the deployment's to keep",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.LaunchPluginRequest.shards",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "64"
+        }
+      },
+      "unit": "pods of one instance",
+      "empty": "0: one pod, as 1 is",
+      "intent": "asks for an instance's shards (W8.3; the launch setting approved by 1057)",
+      "meaning": "the pods of the instance that share its subjects by rendezvous hashing, at most the version's most_shards; one more is refused INVALID_ARGUMENT naming shards; built with 3d",
+      "not_meaning": "separate instances: a shard is a pod of the one instance",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.LaunchPluginRequest.standby",
+      "type": "boolean",
+      "empty": "false: no standby pod",
+      "intent": "asks for an instance's standby pod (W8.3; the launch setting approved by 1057)",
+      "meaning": "true: a second pod whose sidecar holds no lease and whose role classes' run() starts only when it takes the instance's Lease; recommended for oms, ems, connectivity and live data instances; built with 3d",
+      "not_meaning": "a second instance, or a shard: a standby shares nothing until it takes over",
+      "filled": "entered",
+      "filled_by": "dashboard",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginLaunch.shards",
+      "type": "integer",
+      "unit": "pods of one instance",
+      "empty": "0: one pod",
+      "intent": "records the shards an instance was launched with (W8.3)",
+      "meaning": "as the launch asked, within the version's most_shards",
+      "not_meaning": "the shards running now, which the members' reports say",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginLaunch.standby",
+      "type": "boolean",
+      "empty": "false: no standby pod",
+      "intent": "records whether an instance was launched with a standby pod (W8.3)",
+      "meaning": "as the launch asked",
+      "not_meaning": "which pod holds the lease now",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.DatasetDeclaration.gap_recovery",
+      "type": "enum GapRecovery",
+      "allowed": [
+        {
+          "value": "GAP_RECOVERY_UNSPECIFIED",
+          "meaning": "not declared: read as none, the cautious reading"
+        },
+        {
+          "value": "GAP_RECOVERY_BACKFILL",
+          "meaning": "the vendor serves history: the lake asks again for a gap through the want, naming it"
+        },
+        {
+          "value": "GAP_RECOVERY_STREAM_ONLY",
+          "meaning": "nothing beyond what the stream held can be fetched again"
+        },
+        {
+          "value": "GAP_RECOVERY_NONE",
+          "meaning": "the source cannot be asked again at all"
+        }
+      ],
+      "empty": "unspecified: read as none",
+      "intent": "declares how a gap in the dataset is recovered (W10.1, W10.14; the field and its three values approved 2026-11-09, the enum's name approved 2026-11-09)",
+      "meaning": "backfill, stream_only or none, as the vendor's service allows; a gap the lake's write-ahead stream leaves is asked again only where backfill is declared, and marked otherwise",
+      "not_meaning": "a promise of completeness, or the dataset's history in days, which history says",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v30",
       "stability": "preview",
       "store": "sidecar"
     },

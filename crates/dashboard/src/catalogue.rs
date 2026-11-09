@@ -918,6 +918,8 @@ async fn launch(
         approved_roles: asked.approved_roles,
         live: asked.live,
         note: asked.note,
+        // Contract v30's shards and standby (W8.3), built with 3d.
+        ..Default::default()
     };
     // Longer than the conductor gives the launcher, so its answer arrives.
     let launched: Result<PluginLaunch, String> = ask(

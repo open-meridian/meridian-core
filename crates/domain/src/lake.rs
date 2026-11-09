@@ -992,26 +992,19 @@ pub fn entitled_fields(
         .iter()
         .filter(|e| e.instance == instance && e.allowed)
     {
-        let Some(dataset) = event
+        if !event
             .datasets
             .iter()
-            .find(|d| d.dataset == entitlement.dataset)
-        else {
+            .any(|d| d.dataset == entitlement.dataset)
+        {
             continue;
-        };
+        }
         let fields = if entitlement.fields.is_empty() {
             event
                 .licences
                 .iter()
                 .find(|l| l.dataset == entitlement.dataset)
                 .map(|l| l.default_fields.clone())
-                .or_else(|| {
-                    dataset
-                        .declaration
-                        .as_ref()
-                        .and_then(|d| d.licence_default.as_ref())
-                        .map(|l| l.default_fields.clone())
-                })
                 .unwrap_or_default()
         } else {
             entitlement.fields.clone()
@@ -1022,34 +1015,27 @@ pub fn entitled_fields(
 }
 
 /// The licence enforced (W10.1; spec/the-lake, Q8): the deployment's, or
-/// the catalogue's default until one is set; a dataset declaring none is
-/// kept, with no retention set. The lake keeps by it, and the Data sources
-/// page draws it.
+/// the default until one is set, with no retention set. The lake keeps by
+/// it, and the Data sources page draws it. From contract v30 a catalogue
+/// declares no default terms (ruling 1032 retired licence_default), so the
+/// declaration is not read here.
 pub fn effective_licence(
     dataset: &str,
     set: Option<&DatasetLicence>,
-    declaration: Option<&DatasetDeclaration>,
+    _declaration: Option<&DatasetDeclaration>,
 ) -> DatasetLicence {
     if let Some(licence) = set {
         return licence.clone();
     }
-    declaration
-        .and_then(|d| d.licence_default.clone())
-        .map(|terms| DatasetLicence {
-            dataset: dataset.to_string(),
-            ..terms
-        })
-        .unwrap_or_else(|| {
-            let mut licence = DatasetLicence {
-                dataset: dataset.to_string(),
-                kept: true,
-                display: true,
-                derived_use_terms: DerivedUse::NotRestricted as i32,
-                ..Default::default()
-            };
-            derived_use_both(&mut licence);
-            licence
-        })
+    let mut licence = DatasetLicence {
+        dataset: dataset.to_string(),
+        kept: true,
+        display: true,
+        derived_use_terms: DerivedUse::NotRestricted as i32,
+        ..Default::default()
+    };
+    derived_use_both(&mut licence);
+    licence
 }
 
 /// A licence's derived-data answer as read (contract v27, ruling 479): its
@@ -1309,13 +1295,6 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
                 "{at}.venue_id {:?} is not a venue master ID (VEN-...)",
                 dataset.venue_id
             ));
-        }
-        if let Some(licence) = &dataset.licence_default {
-            if let Some(refused) =
-                licence_refused(licence, Some(dataset), &format!("{at}.licence_default"))
-            {
-                return Some(refused);
-            }
         }
     }
     None

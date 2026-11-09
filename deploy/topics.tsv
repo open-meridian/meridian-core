@@ -4,7 +4,9 @@
 # permissions. Regenerate from meridian-design with `make component-topics`.
 topic	kind	publisher	subscriber
 platform.analytics.command.answer-price-batch	command	pricing	analytics
+platform.analytics.command.renew-jobs	command	sidecar	analytics
 platform.analytics.command.set-model-routing	command	dashboard	conductor
+platform.analytics.event.derived-series-updated	event	analytics	reporting,portfolio,compliance,signal
 platform.analytics.event.job-finished	event	analytics	reporting,portfolio,compliance,signal
 platform.analytics.event.price-batch	event	analytics	pricing
 platform.analytics.query.list-finished-jobs	query	reporting,portfolio,compliance,signal	analytics
@@ -24,6 +26,8 @@ platform.book.command.decide-approval	command	compliance,oms	bor
 platform.book.command.dont-know-execution	command	ems	bor
 platform.book.command.hand-off-booking	command	oms	bor
 platform.book.command.handle-break	command	operations	bor
+platform.book.command.move-account	command	dashboard	bor
+platform.book.command.move-partition	command	dashboard	bor
 platform.book.command.pick-placement-quote	command	ems	bor
 platform.book.command.propose-lifecycle-events	command	servicing	bor
 platform.book.command.propose-order	command	portfolio,oms,ems	bor
@@ -65,7 +69,7 @@ platform.book.event.lifecycle-event-recorded	event	bor	operations,portfolio,repo
 platform.book.event.locate-updated	event	bor	compliance,oms,portfolio
 platform.book.event.order-updated	event	bor	oms,ems,compliance,portfolio,operations,reporting
 platform.book.event.placement-updated	event	bor	connectivity,ems,oms,compliance
-platform.book.event.position-changed	event	bor	portfolio,reporting,compliance,oms,operations
+platform.book.event.position-changed	event	bor	portfolio,reporting,compliance,oms,operations,analytics
 platform.book.event.trading-instruction-changed	event	bor	oms,ems,connectivity,portfolio,compliance,dashboard
 platform.book.event.unplaced-fact-recorded	event	bor	operations
 platform.book.query.list-account-attributes	query	portfolio,reporting,compliance,oms,operations,ems,connectivity,dashboard,analytics	bor
@@ -147,6 +151,7 @@ platform.config.query.prepared-call	query	sidecar	dashboard
 platform.config.query.read-deployment-time-zone	query	bor,dashboard	conductor
 platform.config.query.read-fx-pivot-currencies	query	analytics,dashboard	conductor
 platform.config.query.read-pack	query	dashboard	conductor
+platform.config.query.read-resilience	query	dashboard	conductor
 platform.config.query.read-series-request-rule	query	instrument,dashboard	conductor
 platform.config.query.read-stale-reference-actions-permitted	query	ems,dashboard	conductor
 platform.config.query.registry-packs	query	dashboard	conductor
@@ -157,9 +162,11 @@ platform.custody.*.event.sync-status	event	custody	dashboard,street
 platform.deployment.command.create-plugin	command	conductor	launcher
 platform.deployment.command.remove-plugin	command	conductor	launcher
 platform.deployment.command.report-latency	command	data,connectivity,ems,sidecar,lake,analytics	dashboard
-platform.deployment.event.component-report	event	street,bor,instrument	conductor
+platform.deployment.event.component-report	event	street,bor,instrument,lake,conductor,launcher,dashboard,analytics	conductor
 platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
+platform.deployment.query.read-resilience-profile	query	dashboard	conductor
 platform.lake.command.decline-want	command	data	lake
+platform.lake.command.move-partition	command	dashboard	lake
 platform.lake.command.record-bars	command	data	lake
 platform.lake.command.record-corporate-actions	command	data	lake
 platform.lake.command.record-derived-series	command	signal,data	lake
@@ -186,6 +193,7 @@ platform.lake.event.observations-wanted	event	lake	data
 platform.lake.event.want-withdrawn	event	lake	data
 platform.lake.query.list-bars	query	reporting,portfolio,compliance,signal	lake
 platform.lake.query.list-corporate-actions	query	signal,portfolio,reporting,dashboard,analytics	lake
+platform.lake.query.list-dataset-gaps	query	dashboard	lake
 platform.lake.query.list-datasets	query	reporting,portfolio,compliance,signal,ems,dashboard,data,analytics	lake
 platform.lake.query.list-derived-series	query	signal,portfolio,reporting,compliance,dashboard	lake
 platform.lake.query.list-execution-costs	query	reporting,portfolio,compliance,signal,oms,ems,operations,dashboard	lake
@@ -201,7 +209,8 @@ platform.lake.query.list-rating-actions	query	signal,portfolio,reporting,dashboa
 platform.lake.query.list-reported-facts	query	signal,portfolio,reporting,dashboard	lake
 platform.lake.query.list-scenarios	query	signal,portfolio,reporting,compliance,analytics,dashboard	lake
 platform.lake.query.list-series	query	signal,portfolio,oms,ems,dashboard,analytics,instrument	lake
-platform.lake.query.list-source-priorities	query	dashboard	lake
+platform.lake.query.list-source-priorities	query	dashboard,reporting,portfolio,compliance,signal,ems,oms,operations,servicing	lake
+platform.lake.query.list-source-switches	query	dashboard	lake
 platform.lake.query.list-statistics	query	reporting,portfolio,signal,analytics,dashboard	lake
 platform.lake.query.list-trades	query	signal,ems,data	lake
 platform.lake.query.query-lake	query	reporting,portfolio,compliance,signal,ems,operations,data,dashboard	lake
@@ -211,9 +220,9 @@ platform.lake.{dataset}.event.factors-recorded	event	lake	servicing,portfolio,re
 platform.lake.{dataset}.event.filings-recorded	event	lake	signal,reporting
 platform.lake.{dataset}.event.liveness-recorded	event	lake	reporting,portfolio,compliance,signal,ems
 platform.lake.{dataset}.event.outcomes-recorded	event	lake	reporting,portfolio,compliance,signal,operations
-platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,compliance,signal
-platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems
-platform.lake.{dataset}.event.rates-recorded	event	lake	reporting,portfolio,compliance,signal
+platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,compliance,signal,analytics
+platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems,analytics
+platform.lake.{dataset}.event.rates-recorded	event	lake	reporting,portfolio,compliance,signal,analytics
 platform.lake.{dataset}.event.series-recorded	event	lake	signal,portfolio,oms,ems
 platform.lake.{dataset}.event.statistics-recorded	event	lake	reporting,portfolio,signal
 platform.lake.{dataset}.event.trades-recorded	event	lake	signal,ems

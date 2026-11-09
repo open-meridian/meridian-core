@@ -203,10 +203,9 @@ pub fn set_licence(
         return Err(refused);
     }
     // Contract v28 (W10.1; sdk-contract/a-deployment-counts-its-licensed-
-    // data-use-contract): a person's licence keeps the declared terms -- a
-    // part the request leaves unstated is the catalogue's declared value,
-    // never cleared by an edit of another part.
-    let terms = kept_declared(terms, declaration.licence_default.as_ref());
+    // data-use-contract) kept a catalogue's declared terms in the parts a
+    // person left unstated; from contract v30 a catalogue declares none
+    // (ruling 1032 retired licence_default), so the licence is as stated.
     let mut licence = DatasetLicence {
         dataset: request.dataset.clone(),
         updated_by: author.by.clone(),

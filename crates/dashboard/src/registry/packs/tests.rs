@@ -180,25 +180,19 @@ fn the_checklist_answers_each_launched_members_setup_href() {
 }
 
 #[test]
-fn a_members_terms_basis_is_licensed_where_any_dataset_is() {
-    use meridian_pb::v1::{
-        AccessBasis, Catalogue, DatasetDeclaration, DatasetLicence, PluginDeclaration,
-    };
-    let declaring = |bases: &[AccessBasis]| ListedVersion {
+fn a_members_terms_basis_is_none_once_licence_default_is_retired() {
+    // Contract v30 (ruling 1032): a catalogue declares no default terms, so
+    // no access basis is read from a member's declaration.
+    use meridian_pb::v1::{Catalogue, DatasetDeclaration, PluginDeclaration};
+    let declaring = ListedVersion {
         metadata: Some(PluginMetadata {
             declaration: Some(PluginDeclaration {
                 catalogue: Some(Catalogue {
-                    datasets: bases
-                        .iter()
-                        .map(|basis| DatasetDeclaration {
-                            key: "rates".into(),
-                            licence_default: Some(DatasetLicence {
-                                access_basis: *basis as i32,
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        })
-                        .collect(),
+                    datasets: vec![DatasetDeclaration {
+                        key: "rates".into(),
+                        terms_and_pricing: "Open data, free of charge.".into(),
+                        ..Default::default()
+                    }],
                 }),
                 ..Default::default()
             }),
@@ -206,15 +200,7 @@ fn a_members_terms_basis_is_licensed_where_any_dataset_is() {
         }),
         ..Default::default()
     };
-    assert_eq!(
-        access_basis(&declaring(&[AccessBasis::Open, AccessBasis::Licensed])),
-        "Licensed"
-    );
-    assert_eq!(
-        access_basis(&declaring(&[AccessBasis::Open, AccessBasis::PublicDomain])),
-        "Open"
-    );
-    assert_eq!(access_basis(&declaring(&[])), "");
+    assert_eq!(access_basis(&declaring), "");
     assert_eq!(access_basis(&ListedVersion::default()), "");
 }
 

@@ -131,4 +131,11 @@ mod tests {
 #[allow(clippy::all)]
 pub mod v1 {
     include!("v1.rs");
+
+    // journal.proto moved into meridian-schema at contract v30, so the
+    // envelope's `MessageMeta.read_after` can name a Watermark: its package,
+    // messages and numbers unchanged, generated there and referred to here.
+    // Named here as before, so every reader of `meridian_domain::v1` keeps
+    // its paths.
+    pub use meridian_pb::v1::{ChangeCause, JournalRef, PartitionSequence, Watermark};
 }

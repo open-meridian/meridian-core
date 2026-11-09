@@ -210,7 +210,9 @@ pub fn field_from_wire(value: i32) -> Option<Field> {
         InstrumentField::InstrumentType => Some(Field::InstrumentType),
         InstrumentField::MoneyMarketFund => Some(Field::MoneyMarketFund),
         InstrumentField::BinaryEventContract => Some(Field::BinaryEventContract),
-        InstrumentField::Unspecified => None,
+        // Contract v30's bond terms (ruling 433): no field of the record
+        // until core's stage commits name one (step 3c).
+        InstrumentField::Bond | InstrumentField::Unspecified => None,
     }
 }
 

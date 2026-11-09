@@ -1762,7 +1762,7 @@ mod chain_page {
     use meridian_lake::row::Observation;
     use meridian_lake::service;
     use meridian_lake::{PostgresStore, Store};
-    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+    use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
     use prost::Message;
 
     /// The reader: a plugin's instance, as its sidecar asks.
@@ -1875,10 +1875,6 @@ mod chain_page {
                     ],
                     modes: vec![ObservationMode::Pull as i32],
                     cadence: 60,
-                    licence_default: Some(DatasetLicence {
-                        kept: true,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

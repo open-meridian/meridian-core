@@ -76,7 +76,9 @@ pub struct QuotedYield {
     #[prost(message, optional, tag = "1")]
     pub value: ::core::option::Option<UnitValue>,
     /// Semi-annual bond-equivalent for a US Treasury, corporate or agency; its day
-    /// count the instrument's. Never unset.
+    /// count the instrument's, or from contract v30 unspecified where the source
+    /// states none (ruling 433), the yield then kept as quoted and never
+    /// computed with. Never unset.
     #[prost(message, optional, tag = "2")]
     pub convention: ::core::option::Option<RateConvention>,
     /// To maturity, call, put or worst, current, or discount. Unspecified is
@@ -152,7 +154,9 @@ impl ValueUnit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum DayCount {
-    /// Not stated by the source; refused on an instrument's terms.
+    /// Not stated by the source; refused on an instrument's terms. From contract
+    /// v30 accepted on a QuotedYield's convention (ruling 433), the yield kept
+    /// as quoted and never computed with.
     Unspecified = 0,
     /// Actual days over 360 (FIX CouponDayCount 1950 = 6; CDM ACT/360).
     Act360 = 1,
@@ -400,7 +404,10 @@ pub struct BinaryEventContract {
     /// What one contract pays if the event happens, naming its cash instrument:
     /// 1 USD at Kalshi, 1 in the venue's USDC instrument at Polymarket. A
     /// contract's price divided by this is its implied probability, a reader's
-    /// computation, never stored.
+    /// computation, never stored. Optional from contract v30 (W3.1, ruling
+    /// 1035): a data plugin's stated_binary_event_contract may state its
+    /// category and not its payout, unset then not stated; on the record a
+    /// payout is never unset. The wire is unchanged.
     #[prost(message, optional, tag = "1")]
     pub payout: ::core::option::Option<Money>,
     /// When trading in it closes, as the venue states it; 0 when it states none.
@@ -642,7 +649,7 @@ pub struct InstrumentValue {
     /// person sets.
     #[prost(string, tag = "5")]
     pub source: ::prost::alloc::string::String,
-    #[prost(oneof = "instrument_value::Value", tags = "1, 2, 3, 4, 6, 7, 8")]
+    #[prost(oneof = "instrument_value::Value", tags = "1, 2, 3, 4, 6, 7, 8, 9")]
     pub value: ::core::option::Option<instrument_value::Value>,
 }
 /// Nested message and enum types in `InstrumentValue`.
@@ -669,6 +676,14 @@ pub mod instrument_value {
         /// Contract v19: on a binary event contract only, its payout stated.
         #[prost(message, tag = "8")]
         BinaryEventContract(super::BinaryEventContract),
+        /// Contract v30 (W3.10; ruling 433, with core #84's term offers;
+        /// approved 2026-11-09): a bond's terms as a source offers them or a
+        /// deployment admin puts them in force, its source named under
+        /// INSTRUMENT_FIELD_BOND; refused on a record whose type is not bond.
+        /// Never a bond's prices, yields or current face, which are the lake's
+        /// and the engine's.
+        #[prost(message, tag = "9")]
+        Bond(super::Bond),
     }
 }
 /// Where a value in force on a deployment's record came from (W3,
@@ -1376,6 +1391,13 @@ pub struct ResolveIdentifierRequest {
     /// currency supplied or derived never narrows a symbol match.
     #[prost(message, repeated, tag = "9")]
     pub provenance: ::prost::alloc::vec::Vec<::meridian_pb::v1::Provenance>,
+    /// Contract v30 (W3.1; ruling 1035, with 954; approved by 1057): a binary
+    /// event contract's terms as its venue gives them, its category among them.
+    /// The store records category the first time it sees the contract and keeps
+    /// each stated term as an offer thereafter. Unset is not stated; never a
+    /// value in force, as no stated_ field is.
+    #[prost(message, optional, tag = "10")]
+    pub stated_binary_event_contract: ::core::option::Option<BinaryEventContract>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveIdentifierReply {
@@ -4333,6 +4355,8 @@ pub enum InstrumentField {
     MoneyMarketFund = 6,
     /// Contract v19.
     BinaryEventContract = 7,
+    /// Contract v30 (ruling 433; approved 2026-11-09): a bond's terms.
+    Bond = 8,
 }
 impl InstrumentField {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -4349,6 +4373,7 @@ impl InstrumentField {
             Self::InstrumentType => "INSTRUMENT_FIELD_INSTRUMENT_TYPE",
             Self::MoneyMarketFund => "INSTRUMENT_FIELD_MONEY_MARKET_FUND",
             Self::BinaryEventContract => "INSTRUMENT_FIELD_BINARY_EVENT_CONTRACT",
+            Self::Bond => "INSTRUMENT_FIELD_BOND",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -4362,6 +4387,7 @@ impl InstrumentField {
             "INSTRUMENT_FIELD_INSTRUMENT_TYPE" => Some(Self::InstrumentType),
             "INSTRUMENT_FIELD_MONEY_MARKET_FUND" => Some(Self::MoneyMarketFund),
             "INSTRUMENT_FIELD_BINARY_EVENT_CONTRACT" => Some(Self::BinaryEventContract),
+            "INSTRUMENT_FIELD_BOND" => Some(Self::Bond),
             _ => None,
         }
     }
@@ -7028,56 +7054,6 @@ impl DelegationScope {
         }
     }
 }
-/// Where a change sits in its store's record (spec/plugins-hear-and-read, Q1
-/// as clarified 2026-10-01).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct JournalRef {
-    /// The partition the change was made in: the street store's one, or a
-    /// book partition.
-    #[prost(string, tag = "1")]
-    pub partition: ::prost::alloc::string::String,
-    /// Its number there: the partition's next, taken in the change's own
-    /// transaction, so the numbers have no holes.
-    #[prost(uint64, tag = "2")]
-    pub sequence: u64,
-    /// The number of the previous change the same row made for the same
-    /// account, 0 for its first: what a plugin hearing only some accounts
-    /// checks for a gap in its own.
-    #[prost(uint64, tag = "3")]
-    pub previous_sequence: u64,
-}
-/// Who caused a change, as the store recorded it when it committed (Q3).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ChangeCause {
-    /// The instance that sent the command, as its sidecar stamped it.
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// The person it was sent for (W4.9); empty when the plugin acted as itself.
-    #[prost(string, tag = "2")]
-    pub acting_for_subject: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub correlation_id: ::prost::alloc::string::String,
-    /// The command's message_id.
-    #[prost(string, tag = "4")]
-    pub causation_id: ::prost::alloc::string::String,
-    #[prost(int64, tag = "5")]
-    pub committed_at_ns: i64,
-}
-/// A point in a store's record: a sequence per partition. What a read
-/// answers it was read at, and what a read of changes since takes.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Watermark {
-    #[prost(message, repeated, tag = "1")]
-    pub partitions: ::prost::alloc::vec::Vec<PartitionSequence>,
-}
-/// One partition's sequence within a watermark.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PartitionSequence {
-    #[prost(string, tag = "1")]
-    pub partition: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub sequence: u64,
-}
 /// How fresh a connected account's data is, as reported by the rail.
 ///
 /// And why, when it is not current. Published so an operator can tell stale
@@ -7521,9 +7497,9 @@ pub struct StatementRecordedEvent {
     /// with the statements before it, and who caused it: the row whose landing
     /// completed it (W2.5, W4.3).
     #[prost(message, optional, tag = "11")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "12")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
     /// The account as the rail knows it, and the institution holding it, as
     /// the statement named them: with the source and a segment, what a margin
     /// agreement is keyed by and an opening balance names as its source. Empty
@@ -7558,9 +7534,9 @@ pub struct CustodialPositionUpdatedEvent {
     /// The change's number in the street's partition, chained per account with
     /// the positions changed before it, and who caused it (W2.4, W4.3).
     #[prost(message, optional, tag = "5")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "6")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// What the custodian says an account holds of an instrument, on one side,
 /// right now. Keyed by all three: an account may hold an instrument long and
@@ -7615,7 +7591,7 @@ pub struct CustodialPosition {
     pub margin_requirement: ::core::option::Option<Money>,
     /// Its last change: a delivery at or below it is already in it.
     #[prost(message, optional, tag = "17")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// A tombstone (W2.6, W3.9): returned only to a read since a watermark,
     /// and delivered once.
     #[prost(bool, tag = "18")]
@@ -7662,7 +7638,7 @@ pub struct ListCustodialPositionsRequest {
     pub cursor: ::prost::alloc::string::String,
     /// Only the positions whose last change is above it, tombstones included.
     #[prost(message, optional, tag = "5")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListCustodialPositionsReply {
@@ -7675,7 +7651,7 @@ pub struct ListCustodialPositionsReply {
     pub next_cursor: ::prost::alloc::string::String,
     /// The point in the store's record the page was read at.
     #[prost(message, optional, tag = "4")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// A holding the deployment received but could not name.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7720,7 +7696,7 @@ pub struct ListStatementsRequest {
     pub as_of_date: ::prost::alloc::string::String,
     /// Only statements completed after it.
     #[prost(message, optional, tag = "3")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "4")]
     pub page_size: i32,
     /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
@@ -7736,7 +7712,7 @@ pub struct ListStatementsReply {
     pub next_cursor: ::prost::alloc::string::String,
     /// The point in the store's record the page was read at.
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// One activity on an account, as the custodian states it: a purchase, a
 /// sale, a reinvested dividend, a dividend or interest, a fee or a tax, a
@@ -7862,9 +7838,9 @@ pub struct ActivityRecordedEvent {
     /// The record's number in the street's partition, chained per account with
     /// the activities before it, and who caused it (W2.12, W4.3).
     #[prost(message, optional, tag = "7")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "8")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// Read an account's activity (W2.11), by trade date, paged.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7879,7 +7855,7 @@ pub struct ListActivitiesRequest {
     pub trade_date_to: ::prost::alloc::string::String,
     /// Only activities recorded after it.
     #[prost(message, optional, tag = "4")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "5")]
     pub page_size: i32,
     /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
@@ -7895,7 +7871,7 @@ pub struct ListActivitiesReply {
     pub next_cursor: ::prost::alloc::string::String,
     /// The point in the store's record the page was read at.
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// The first date the source can read the named account's activity from,
     /// as its sync status last said (W2.1): an opening balance older than it
     /// has no activity to explain it. Empty where the request names no account
@@ -7983,7 +7959,7 @@ pub struct ActivityReResolution {
     /// Its own number in the street's partition, chained per account with the
     /// re-resolutions before it.
     #[prost(message, optional, tag = "6")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// An activity was re-resolved (W2.16): the re-resolution whole, so a
 /// reconciliation whose break waited on an unresolved code re-runs its
@@ -7998,9 +7974,9 @@ pub struct ActivityReResolvedEvent {
     /// Who caused it, and its number: the re-resolution's journal, at the top
     /// as every delivered record carries it (W4.3).
     #[prost(message, optional, tag = "3")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
     #[prost(message, optional, tag = "4")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// A sync status was recorded (W2.13): the street heard a custody plugin's
 /// sync status (W2.1) and kept it, so operations tells a connection that needs
@@ -8018,9 +7994,9 @@ pub struct SyncStatusRecordedEvent {
     /// The record's number in the street's partition, chained per account with
     /// the sync statuses before it, and who caused it (W2.13, W4.3).
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// Read the latest sync status of each account in scope, or those recorded
 /// since a watermark (W2.14), paged.
@@ -8032,7 +8008,7 @@ pub struct ListSyncStatusesRequest {
     /// Only sync statuses recorded after it, every one in the order recorded;
     /// unset, the latest per account.
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "3")]
     pub page_size: i32,
     /// Opaque: the previous reply's `next_cursor`, or empty for the first page.
@@ -8048,7 +8024,7 @@ pub struct ListSyncStatusesReply {
     pub next_cursor: ::prost::alloc::string::String,
     /// The point in the store's record the page was read at.
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// Every external account a connection reaches, as the connector sees it now.
 ///
@@ -8721,7 +8697,7 @@ pub struct BookPosition {
     #[prost(string, tag = "10")]
     pub effective_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "11")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// A tombstone, after a merged record's move (W9.9): returned only to a
     /// read since a watermark, and delivered once.
     #[prost(bool, tag = "12")]
@@ -8773,7 +8749,7 @@ pub struct Encumbrance {
     #[prost(string, tag = "9")]
     pub since_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "10")]
-    pub set_by: ::core::option::Option<JournalRef>,
+    pub set_by: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// One position's encumbrances, as a statement states them: the whole set,
 /// empty when the statement reports none.
@@ -8827,11 +8803,11 @@ pub struct Lot {
     #[prost(message, optional, tag = "4")]
     pub terms: ::core::option::Option<LotTerms>,
     #[prost(message, optional, tag = "5")]
-    pub opened_by: ::core::option::Option<JournalRef>,
+    pub opened_by: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, repeated, tag = "6")]
-    pub relieved_by: ::prost::alloc::vec::Vec<JournalRef>,
+    pub relieved_by: ::prost::alloc::vec::Vec<::meridian_pb::v1::JournalRef>,
     #[prost(message, repeated, tag = "7")]
-    pub adjusted_by: ::prost::alloc::vec::Vec<JournalRef>,
+    pub adjusted_by: ::prost::alloc::vec::Vec<::meridian_pb::v1::JournalRef>,
     /// Its position's sleeve (contract v22); empty for the unsleeved part.
     #[prost(string, tag = "8")]
     pub sleeve: ::prost::alloc::string::String,
@@ -8854,7 +8830,7 @@ pub struct Lot {
 pub struct LotRelief {
     /// The entry that relieved it, also listed in Lot.relieved_by.
     #[prost(message, optional, tag = "1")]
-    pub relieved_by: ::core::option::Option<JournalRef>,
+    pub relieved_by: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// The quantity relieved, positive.
     #[prost(message, optional, tag = "2")]
     pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
@@ -8891,7 +8867,7 @@ pub struct StreetRecordRef {
     pub statement_id: ::prost::alloc::string::String,
     /// The custodial position's change, where one was compared or used.
     #[prost(message, optional, tag = "2")]
-    pub change: ::core::option::Option<JournalRef>,
+    pub change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// ISO 8601: the custodian's as-of date.
     #[prost(string, tag = "3")]
     pub as_of_date: ::prost::alloc::string::String,
@@ -8967,7 +8943,7 @@ pub struct OpeningBalance {
     #[prost(message, optional, tag = "4")]
     pub recorded_by: ::core::option::Option<Actor>,
     #[prost(message, optional, tag = "5")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// The reason the person gave.
     #[prost(string, tag = "6")]
     pub reason: ::prost::alloc::string::String,
@@ -9045,7 +9021,7 @@ pub mod break_cause {
         #[prost(message, tag = "2")]
         StreetRecord(super::StreetRecordRef),
         #[prost(message, tag = "3")]
-        BookEntry(super::JournalRef),
+        BookEntry(::meridian_pb::v1::JournalRef),
         #[prost(message, tag = "4")]
         PendingSettlement(super::PendingSettlementRef),
         /// A corporate action's reference, as reported.
@@ -9089,7 +9065,7 @@ pub struct ActivityRef {
     pub activity_id: ::prost::alloc::string::String,
     /// Its record in the street's partition.
     #[prost(message, optional, tag = "2")]
-    pub change: ::core::option::Option<JournalRef>,
+    pub change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// ISO 8601: the activity's trade date, as the custodian stated it.
     #[prost(string, tag = "3")]
     pub trade_date: ::prost::alloc::string::String,
@@ -9112,7 +9088,7 @@ pub struct BreakHandling {
 pub struct BreakResolution {
     /// Resolved: the entries that corrected the book.
     #[prost(message, repeated, tag = "1")]
-    pub entries: ::prost::alloc::vec::Vec<JournalRef>,
+    pub entries: ::prost::alloc::vec::Vec<::meridian_pb::v1::JournalRef>,
     /// Closed: the explanation, no entry.
     #[prost(string, tag = "2")]
     pub explanation: ::prost::alloc::string::String,
@@ -9136,7 +9112,7 @@ pub struct Break {
     #[prost(message, repeated, tag = "6")]
     pub differences: ::prost::alloc::vec::Vec<BreakDifference>,
     #[prost(message, optional, tag = "7")]
-    pub book_watermark: ::core::option::Option<Watermark>,
+    pub book_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(message, optional, tag = "8")]
     pub street: ::core::option::Option<StreetRecordRef>,
     /// ISO 8601 business dates; age is derived from them, never stored.
@@ -9157,7 +9133,7 @@ pub struct Break {
     #[prost(message, optional, tag = "16")]
     pub recorded_by: ::core::option::Option<Actor>,
     #[prost(message, optional, tag = "17")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// An unrecognized security's identifiers, as the street row carries them
     /// (W9.3, contract v25): what an open break of that category is matched
     /// on, scheme and value in any order, with its category and account.
@@ -9190,7 +9166,7 @@ pub struct RecordBreakRequest {
     #[prost(message, repeated, tag = "6")]
     pub differences: ::prost::alloc::vec::Vec<BreakDifference>,
     #[prost(message, optional, tag = "7")]
-    pub book_watermark: ::core::option::Option<Watermark>,
+    pub book_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(message, optional, tag = "8")]
     pub street: ::core::option::Option<StreetRecordRef>,
     /// The reconciliation's business date: first seen for a new break, last
@@ -9405,7 +9381,7 @@ pub struct AccountFigures {
     #[prost(message, optional, tag = "6")]
     pub source: ::core::option::Option<StreetRecordRef>,
     #[prost(message, optional, tag = "7")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BookEntryReply {
@@ -9416,7 +9392,7 @@ pub struct BookEntryReply {
     /// The entry's place in its partition: the number of the first change it
     /// made.
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// Each record the entry changed, as it stands after it.
     #[prost(message, repeated, tag = "3")]
     pub positions: ::prost::alloc::vec::Vec<BookPosition>,
@@ -9438,9 +9414,9 @@ pub struct PositionChangedEvent {
     #[prost(message, optional, tag = "3")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "4")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "5")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BreakChangedEvent {
@@ -9450,9 +9426,9 @@ pub struct BreakChangedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountFiguresRecordedEvent {
@@ -9461,9 +9437,9 @@ pub struct AccountFiguresRecordedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListPositionsRequest {
@@ -9472,13 +9448,13 @@ pub struct ListPositionsRequest {
     pub account_id: ::prost::alloc::string::String,
     /// Only positions whose last change is above it, tombstones included.
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// The positions at the end of this business date (Q22), as known at
     /// `at`, or now; served by replay. Neither with `since`.
     #[prost(string, tag = "3")]
     pub business_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "4")]
-    pub at: ::core::option::Option<Watermark>,
+    pub at: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "5")]
     pub page_size: i32,
     #[prost(string, tag = "6")]
@@ -9491,7 +9467,7 @@ pub struct ListPositionsReply {
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListBreaksRequest {
@@ -9501,7 +9477,7 @@ pub struct ListBreaksRequest {
     #[prost(enumeration = "BreakState", repeated, tag = "2")]
     pub states: ::prost::alloc::vec::Vec<i32>,
     #[prost(message, optional, tag = "3")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "4")]
     pub page_size: i32,
     #[prost(string, tag = "5")]
@@ -9514,7 +9490,7 @@ pub struct ListBreaksReply {
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListAccountFiguresRequest {
@@ -9529,9 +9505,9 @@ pub struct ListAccountFiguresRequest {
     #[prost(string, tag = "4")]
     pub to_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(message, optional, tag = "6")]
-    pub at: ::core::option::Option<Watermark>,
+    pub at: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "7")]
     pub page_size: i32,
     #[prost(string, tag = "8")]
@@ -9544,7 +9520,7 @@ pub struct ListAccountFiguresReply {
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountAttributes {
@@ -9557,7 +9533,7 @@ pub struct AccountAttributes {
     #[prost(enumeration = "LotReliefMethod", tag = "3")]
     pub lot_relief_default: i32,
     #[prost(message, optional, tag = "4")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// The standing opening balance, set by the book when it journals W9.1;
     /// unset while none stands (Q21 of the sample operations plugin, ruled
     /// 2026-10-01).
@@ -9626,7 +9602,7 @@ pub struct AccountAttributeReply {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountAttributeChangedEvent {
@@ -9635,16 +9611,16 @@ pub struct AccountAttributeChangedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListAccountAttributesRequest {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "3")]
     pub page_size: i32,
     #[prost(string, tag = "4")]
@@ -9657,7 +9633,7 @@ pub struct ListAccountAttributesReply {
     #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// An order (W11.1, W11.2): its identity (account, instrument, side) never
 /// changes (Q20); each field set by its owner (step 5, "The order's fields").
@@ -9792,7 +9768,7 @@ pub struct Order {
     #[prost(message, repeated, tag = "38")]
     pub charges: ::prost::alloc::vec::Vec<Charge>,
     #[prost(message, optional, tag = "39")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// Contract v24 (W11.1; the order-path plan's v24 item 6): on a block
     /// order, its members as proposed -- released orders of one instrument and
     /// side, each in no other live block. Empty on any other order.
@@ -10202,7 +10178,7 @@ pub struct Placement {
     #[prost(message, optional, tag = "23")]
     pub rejection_as_reported: ::core::option::Option<::meridian_pb::v1::AsReported>,
     #[prost(message, optional, tag = "24")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// Every venue order ID it has had, in order, the current last
     /// (requirement 34): external references, never keys.
     #[prost(string, repeated, tag = "25")]
@@ -10374,7 +10350,7 @@ pub struct Execution {
     #[prost(message, optional, tag = "30")]
     pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
     #[prost(message, optional, tag = "31")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// On a correction: the date it takes effect, beside the journal's own
     /// sequence.
     #[prost(string, tag = "32")]
@@ -10592,10 +10568,10 @@ pub struct UnplacedFact {
     pub venue_account_code: ::prost::alloc::string::String,
     /// The entry that placed it, once a later record claimed it.
     #[prost(message, optional, tag = "12")]
-    pub placed_by: ::core::option::Option<JournalRef>,
+    pub placed_by: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// Its latest entry: the one that kept it, or the one that placed it.
     #[prost(message, optional, tag = "13")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// The fact as it arrived, named by fact_kind.
     #[prost(oneof = "unplaced_fact::Fact", tags = "7, 8, 9, 11, 14, 15")]
     pub fact: ::core::option::Option<unplaced_fact::Fact>,
@@ -10644,7 +10620,7 @@ pub struct TradingInstruction {
     pub entry: ::core::option::Option<EntryMeta>,
     /// Its latest entry, which a catch-up reads it by (W11.16).
     #[prost(message, optional, tag = "7")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// What an instruction names: a deployment admin's an account, All accounts,
 /// a plugin, a person, a service account or a user group; a plugin admin's
@@ -10695,7 +10671,7 @@ pub struct Locate {
     #[prost(message, optional, tag = "9")]
     pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
     #[prost(message, optional, tag = "10")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// The prime's answer.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11450,7 +11426,7 @@ pub struct OrderReply {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// On a change request: the one it opened.
     #[prost(string, tag = "4")]
     pub change_request_id: ::prost::alloc::string::String,
@@ -11462,7 +11438,7 @@ pub struct PlacementReply {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(string, tag = "4")]
     pub change_request_id: ::prost::alloc::string::String,
 }
@@ -11482,7 +11458,7 @@ pub struct FactReply {
     #[prost(message, optional, tag = "6")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "7")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// An accept's answer (W11.23): each execution matched, the order and the
 /// placement it linked them to.
@@ -11495,7 +11471,7 @@ pub struct AcceptExecutionReply {
     #[prost(message, optional, tag = "3")]
     pub placement: ::core::option::Option<Placement>,
     #[prost(message, optional, tag = "4")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// A DK's answer (W11.24).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11503,14 +11479,14 @@ pub struct DontKnowExecutionReply {
     #[prost(message, repeated, tag = "1")]
     pub executions: ::prost::alloc::vec::Vec<Execution>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TradingInstructionReply {
     #[prost(message, optional, tag = "1")]
     pub instruction: ::core::option::Option<TradingInstruction>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LocateReply {
@@ -11519,7 +11495,7 @@ pub struct LocateReply {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OrderUpdatedEvent {
@@ -11531,9 +11507,9 @@ pub struct OrderUpdatedEvent {
     #[prost(message, optional, tag = "3")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "4")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "5")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// To the `ems`, `oms` and `compliance` within scope, and to the
 /// connectivity plugin it names, alone of its role (matrix/directed.tsv).
@@ -11546,9 +11522,9 @@ pub struct PlacementUpdatedEvent {
     #[prost(message, optional, tag = "3")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "4")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "5")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// W9's PositionChanged follows for each position it moved.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11558,9 +11534,9 @@ pub struct ExecutionRecordedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnplacedFactRecordedEvent {
@@ -11569,9 +11545,9 @@ pub struct UnplacedFactRecordedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// To every subscriber, without an account scope.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11579,9 +11555,9 @@ pub struct TradingInstructionChangedEvent {
     #[prost(message, optional, tag = "1")]
     pub instruction: ::core::option::Option<TradingInstruction>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "3")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LocateUpdatedEvent {
@@ -11590,9 +11566,9 @@ pub struct LocateUpdatedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// The orders in the reader's scope, as of now or changed since a watermark;
 /// a connectivity plugin's, those behind placements naming its instance.
@@ -11604,7 +11580,7 @@ pub struct ListOrdersRequest {
     /// Only records whose last change is above it, as every record catch-up
     /// reads (W4.3); unset, every record in scope as of now.
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "3")]
     pub page_size: i32,
     #[prost(string, tag = "4")]
@@ -11624,7 +11600,7 @@ pub struct ListOrdersReply {
     #[prost(message, repeated, tag = "1")]
     pub orders: ::prost::alloc::vec::Vec<Order>,
     #[prost(message, optional, tag = "2")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "4")]
@@ -11663,7 +11639,7 @@ pub struct OrderHistoryReply {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListTradingInstructionsRequest {
     #[prost(message, optional, tag = "1")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "2")]
     pub page_size: i32,
     #[prost(string, tag = "3")]
@@ -11679,7 +11655,7 @@ pub struct ListTradingInstructionsReply {
     #[prost(uint64, tag = "2")]
     pub control_sequence: u64,
     #[prost(message, optional, tag = "3")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "4")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -11689,7 +11665,7 @@ pub struct ListLocatesRequest {
     pub account_id: ::prost::alloc::string::String,
     /// Only locates whose last change is above it (W4.3).
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "3")]
     pub page_size: i32,
     #[prost(string, tag = "4")]
@@ -11700,7 +11676,7 @@ pub struct ListLocatesReply {
     #[prost(message, repeated, tag = "1")]
     pub locates: ::prost::alloc::vec::Vec<Locate>,
     #[prost(message, optional, tag = "2")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -11735,7 +11711,7 @@ pub struct Booking {
     pub held_reason: ::prost::alloc::string::String,
     /// Its latest entry, which a catch-up reads it by (W4.3).
     #[prost(message, optional, tag = "8")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// One account's part of a booking (W11.27).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11919,7 +11895,7 @@ pub struct Alert {
     pub due_by: i64,
     /// Its latest entry, which a catch-up reads it by (W4.3).
     #[prost(message, optional, tag = "8")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// What an alert is about: a booking and its allocation, or for
 /// `compliance`'s own an order or a position.
@@ -12125,21 +12101,21 @@ pub struct BookingReply {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SleeveCrossReply {
     #[prost(message, optional, tag = "1")]
     pub sleeve_cross: ::core::option::Option<SleeveCross>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AlertReply {
     #[prost(message, optional, tag = "1")]
     pub alert: ::core::option::Option<Alert>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
 }
 /// W11.30: to `operations`, `oms`, `compliance`, `portfolio` and `reporting`
 /// within scope, by the account the booking is in.
@@ -12151,9 +12127,9 @@ pub struct BookingUpdatedEvent {
     #[prost(message, optional, tag = "2")]
     pub entry: ::core::option::Option<EntryMeta>,
     #[prost(message, optional, tag = "3")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "4")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// W11.35: to `compliance`, `reporting`, `oms` and `operations` within scope.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -12161,9 +12137,9 @@ pub struct AlertChangedEvent {
     #[prost(message, optional, tag = "1")]
     pub alert: ::core::option::Option<Alert>,
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     #[prost(message, optional, tag = "3")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// W11.31: the bookings in the reader's scope, as of now or changed since a
 /// watermark, filtered by state.
@@ -12174,7 +12150,7 @@ pub struct ListBookingsRequest {
     pub account_id: ::prost::alloc::string::String,
     /// Only records whose last change is above it (W4.3).
     #[prost(message, optional, tag = "2")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Unspecified: every state.
     #[prost(enumeration = "BookingState", tag = "3")]
     pub state: i32,
@@ -12188,7 +12164,7 @@ pub struct ListBookingsReply {
     #[prost(message, repeated, tag = "1")]
     pub bookings: ::prost::alloc::vec::Vec<Booking>,
     #[prost(message, optional, tag = "2")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -12204,7 +12180,7 @@ pub struct ListAlertsRequest {
     pub state: i32,
     /// Only records whose last change is above it (W4.3).
     #[prost(message, optional, tag = "3")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int32, tag = "4")]
     pub page_size: i32,
     #[prost(string, tag = "5")]
@@ -12218,7 +12194,7 @@ pub struct ListAlertsReply {
     #[prost(message, repeated, tag = "1")]
     pub alerts: ::prost::alloc::vec::Vec<Alert>,
     #[prost(message, optional, tag = "2")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -12285,7 +12261,7 @@ pub struct LifecycleEvent {
     pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
     /// Its journal entry. Unset on a request.
     #[prost(message, optional, tag = "15")]
-    pub last_change: ::core::option::Option<JournalRef>,
+    pub last_change: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// Contract v29: maturity, full call, partial call, put or sinking-fund draw,
     /// as the custodian states it; a partial call by lottery can only be reported,
     /// never derived. Unspecified on any kind but redemption.
@@ -12410,11 +12386,11 @@ pub struct LifecycleEventRecordedEvent {
     /// after it commits (W9's invariants; amendment to DESIGN28, 2026-10-24).
     /// Never unset.
     #[prost(message, optional, tag = "2")]
-    pub journal: ::core::option::Option<JournalRef>,
+    pub journal: ::core::option::Option<::meridian_pb::v1::JournalRef>,
     /// The message that caused it, its instance and its identifiers, as every
     /// delivery's cause (W9.8). Never unset.
     #[prost(message, optional, tag = "3")]
-    pub cause: ::core::option::Option<ChangeCause>,
+    pub cause: ::core::option::Option<::meridian_pb::v1::ChangeCause>,
 }
 /// Contract v28 (W9.19): ListLifecycleEvents's request.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -12440,7 +12416,7 @@ pub struct ListLifecycleEventsRequest {
     /// to DESIGN28, 2026-10-24: a record row is caught up by watermark, as the
     /// book's other records are). Unset is everything.
     #[prost(message, optional, tag = "6")]
-    pub since: ::core::option::Option<Watermark>,
+    pub since: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// How many events a page holds at most. 0 is 100; past 500, answered at 500.
     #[prost(uint32, tag = "7")]
     pub page_size: u32,
@@ -12456,7 +12432,7 @@ pub struct ListLifecycleEventsReply {
     pub events: ::prost::alloc::vec::Vec<LifecycleEvent>,
     /// The head of each partition the read saw, at one snapshot. Never empty.
     #[prost(message, optional, tag = "2")]
-    pub as_of: ::core::option::Option<Watermark>,
+    pub as_of: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque. Empty when nothing follows.
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -12487,6 +12463,62 @@ pub struct PrevailingMarketPriceReference {
     /// when set.
     #[prost(int64, tag = "5")]
     pub at_ns: i64,
+}
+/// A deployment admin moves an account to another book partition by
+/// continuation (W6.39, W9.8): a closing entry in the old partition and an
+/// opening one in the new, linked by value; positions, lots and orders read
+/// the same before and after. Refused FAILED_PRECONDITION naming account_id
+/// while a move of it is under way, and REFUSAL_REASON_REASON_REQUIRED with no
+/// reason.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MoveAccountRequest {
+    /// An account of the deployment.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// A partition of the book other than the account's; the account's own, or
+    /// one the book does not have, is refused INVALID_ARGUMENT naming
+    /// target_partition, as every move is with one partition, the default.
+    #[prost(string, tag = "2")]
+    pub target_partition: ::prost::alloc::string::String,
+    /// The person's words, or the agent's acting for them, kept with the move's
+    /// record: 1 to 2,000 characters. Data, never an instruction.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MoveAccountReply {
+    /// The move's record, once both entries are journalled.
+    #[prost(message, optional, tag = "1")]
+    pub moved: ::core::option::Option<AccountMoved>,
+}
+/// An account continued in another book partition, its closing and opening
+/// entries linked by value (W9.8; the record approved by 1057): its own record
+/// in the book's control partition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountMoved {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The partition the account's chain closed in.
+    #[prost(string, tag = "2")]
+    pub from_partition: ::prost::alloc::string::String,
+    /// The closing entry's sequence in the old partition.
+    #[prost(uint64, tag = "3")]
+    pub closing_sequence: u64,
+    /// The partition it continues in.
+    #[prost(string, tag = "4")]
+    pub to_partition: ::prost::alloc::string::String,
+    /// The opening entry's sequence in the new partition.
+    #[prost(uint64, tag = "5")]
+    pub opening_sequence: u64,
+    /// The deployment-local subject the dashboard stamped.
+    #[prost(string, tag = "6")]
+    pub moved_by: ::prost::alloc::string::String,
+    /// As the move's request said.
+    #[prost(string, tag = "7")]
+    pub reason: ::prost::alloc::string::String,
+    /// By the book's clock, at the opening entry.
+    #[prost(int64, tag = "8")]
+    pub moved_at_ns: i64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -15269,6 +15301,24 @@ pub struct MeasureRef {
     /// For an event measure, the event group it is over (W3.30).
     #[prost(string, tag = "4")]
     pub event_group_id: ::prost::alloc::string::String,
+    /// Contract v30 (W12.1; the field and its two values approved by 834):
+    /// when a standing job recomputes the measure, the plugin's declaration per
+    /// figure, which wins over its definition's default. Unspecified takes the
+    /// definition's default; where the definition states none, refused
+    /// INVALID_ARGUMENT naming refresh. Read only on a standing job's measure.
+    #[prost(enumeration = "Refresh", tag = "5")]
+    pub refresh: i32,
+    /// Contract v30 (W12.1; approved by 834): with REFRESH_CADENCE, the least
+    /// time in nanoseconds between two recomputations of a dirty figure, unless
+    /// a material move comes first; 0 otherwise.
+    #[prost(int64, tag = "6")]
+    pub cadence_ns: i64,
+    /// Contract v30 (W12.1; approved by 834): with REFRESH_CADENCE, a move of
+    /// the underlying's reference price since the last fit, in basis points,
+    /// at or past which a dirty figure recomputes before its cadence; 0: the
+    /// cadence alone.
+    #[prost(uint32, tag = "7")]
+    pub material_move_bp: u32,
 }
 /// Contract v28 (ScenarioAxis.steps): lists an axis's steps in order.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -15352,6 +15402,43 @@ pub struct ShockTarget {
     /// beside a subject_id. False: subject_id names the object.
     #[prost(bool, tag = "2")]
     pub every: bool,
+}
+/// When a standing job recomputes a measure (contract v30; the values
+/// approved by 834, the enum's name 2026-11-09). A one-off job never
+/// recomputes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Refresh {
+    /// The definition's default refresh.
+    Unspecified = 0,
+    /// Recomputed at once when an input it depends on changes, conflated per
+    /// key: FX crosses and spreads, options' implied volatility and greeks.
+    PerChange = 1,
+    /// Recomputed every cadence_ns, or sooner on a material move: realised
+    /// volatility, correlation, fits, positioning, the volatility index.
+    Cadence = 2,
+}
+impl Refresh {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REFRESH_UNSPECIFIED",
+            Self::PerChange => "REFRESH_PER_CHANGE",
+            Self::Cadence => "REFRESH_CADENCE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REFRESH_UNSPECIFIED" => Some(Self::Unspecified),
+            "REFRESH_PER_CHANGE" => Some(Self::PerChange),
+            "REFRESH_CADENCE" => Some(Self::Cadence),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -16020,7 +16107,7 @@ pub struct ListRatesReply {
     #[prost(message, repeated, tag = "3")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -16239,7 +16326,7 @@ pub struct RecordObservationsReply {
     pub unchanged: u32,
     /// The dataset's sequence once the batch committed.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// A price the lake recorded, on its dataset's subject: one row, with its
 /// version and sequence. Delivered latest value first per subject, dataset,
@@ -16360,7 +16447,7 @@ pub struct ListPricesReply {
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     /// The sequence per dataset partition the read was answered at.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Empty when the read is exhausted.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -16402,7 +16489,7 @@ pub struct ListBarsReply {
     #[prost(message, repeated, tag = "3")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -16425,7 +16512,7 @@ pub struct ListTradesRequest {
     /// The watermark the reader last saw: the rows each dataset partition it
     /// names recorded after its sequence there.
     #[prost(message, optional, tag = "5")]
-    pub after_watermark: ::core::option::Option<Watermark>,
+    pub after_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// The recorded-time cut-off, 0 for now: what the lake knew then.
     #[prost(int64, tag = "6")]
     pub as_of_ns: i64,
@@ -16480,7 +16567,7 @@ pub struct ListTradesReply {
     #[prost(message, repeated, tag = "3")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -16547,7 +16634,7 @@ pub struct ListQuotesReply {
     #[prost(message, repeated, tag = "3")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
 }
@@ -16563,7 +16650,7 @@ pub struct ListOutcomesRequest {
     /// The watermark the reader last saw: the versions each dataset partition
     /// it names recorded after its sequence there.
     #[prost(message, optional, tag = "2")]
-    pub after_watermark: ::core::option::Option<Watermark>,
+    pub after_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// The recorded-time cut-off, 0 for now: what the lake knew then.
     #[prost(int64, tag = "3")]
     pub as_of_ns: i64,
@@ -16573,7 +16660,7 @@ pub struct ListOutcomesReply {
     #[prost(message, repeated, tag = "1")]
     pub outcomes: ::prost::alloc::vec::Vec<Outcome>,
     #[prost(message, optional, tag = "2")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// What the lake asks of the instance serving a dataset. Coalesced: readers'
 /// identical wants are one.
@@ -16627,6 +16714,12 @@ pub struct ObservationsWantedEvent {
     /// narrowed by the window. False: the subjects' own rows only.
     #[prost(bool, tag = "14")]
     pub all_series: bool,
+    /// Contract v30 (W10.7, W10.14; approved 2026-11-09): a gap's `GAP-` ID,
+    /// set on a want asking again for a backfill dataset's gap, its subjects
+    /// and its valid-time range; the rows recorded for it recover the gap.
+    /// Empty: not a gap's want. Not a want's ID, which want_id is.
+    #[prost(string, tag = "15")]
+    pub gap_id: ::prost::alloc::string::String,
 }
 /// A standing want no reader has asked within the dataset's cadence.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -16783,6 +16876,10 @@ pub struct SetSourcePriorityRequest {
     #[prost(int64, tag = "5")]
     pub against_updated_at_ns: i64,
 }
+/// Read by a deployment admin, and from contract v30 by the eight roles that
+/// read the lake (W10.2; ruling 454, step 3c's question 7), read-only: each
+/// priority answered with the datasets the asker is entitled to, a dataset it
+/// may not read left out, a priority with none left not answered.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ListSourcePrioritiesRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -16866,7 +16963,7 @@ pub struct QueryLakeReply {
     #[prost(message, repeated, tag = "7")]
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     #[prost(message, optional, tag = "8")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// More rows matched than row_limit: the reply is cut at it, never paged.
     #[prost(bool, tag = "9")]
     pub truncated: bool,
@@ -16981,7 +17078,7 @@ pub struct ListSeriesReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17035,7 +17132,7 @@ pub struct ListExpirationsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// Contract v28: a value per contract per trading date as its source publishes
 /// it: open interest, volume, block volume (contract v28).
@@ -17151,7 +17248,7 @@ pub struct ListStatisticsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17403,7 +17500,7 @@ pub struct ListFilingsRequest {
     /// unconflated row is caught up after a watermark, as trades and outcomes
     /// are). Unset: a read by dates, or as of as_of_ns.
     #[prost(message, optional, tag = "10")]
-    pub after_watermark: ::core::option::Option<Watermark>,
+    pub after_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// Contract v28 (W10.6): ListFilings's answer.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -17422,7 +17519,7 @@ pub struct ListFilingsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17534,7 +17631,7 @@ pub struct ListReportedFactsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17657,7 +17754,7 @@ pub struct ListHoldingsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17757,7 +17854,7 @@ pub struct ListCorporateActionsRequest {
     /// unconflated row is caught up after a watermark, as trades and outcomes
     /// are). Unset: a read by dates, or as of as_of_ns.
     #[prost(message, optional, tag = "10")]
-    pub after_watermark: ::core::option::Option<Watermark>,
+    pub after_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// Contract v28 (W10.6): ListCorporateActions's answer.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -17776,7 +17873,7 @@ pub struct ListCorporateActionsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -17863,7 +17960,7 @@ pub struct ListRatingActionsReply {
     /// The sequence per partition the answer holds, from which a reader hears
     /// what follows. Never unset on an answer.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Opaque, passed back as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
@@ -18010,7 +18107,7 @@ pub struct ListFactorsRequest {
     /// trades, outcomes and corporate actions are). Unset: a read by dates, or as
     /// of as_of_ns.
     #[prost(message, optional, tag = "8")]
-    pub after_watermark: ::core::option::Option<Watermark>,
+    pub after_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
 }
 /// Contract v29 (W10.6): ListFactors's answer.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -18027,9 +18124,200 @@ pub struct ListFactorsReply {
     pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
     /// States the read's watermark: as every read. Never unset.
     #[prost(message, optional, tag = "4")]
-    pub watermark: ::core::option::Option<Watermark>,
+    pub watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// Continues the read: pass it as cursor. Empty on the last page.
     #[prost(string, tag = "5")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// A switch of a default read's source to the next dataset in its priority,
+/// or back, and why (W10.6; never blind, rule 1050): its own record in the
+/// lake's control partition, made once, when the lake first serves a default
+/// read from the dataset now served. Never a priority's change, which
+/// SetSourcePriority records.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceSwitched {
+    /// The priority's data type by its message's full name, as
+    /// SourcePriority.data_type names it.
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    /// As SourcePriority.kind; unspecified for a priority with no kind.
+    #[prost(enumeration = "PriceKind", tag = "2")]
+    pub kind: i32,
+    /// The dataset a default read passed over, or for a switch back the one it
+    /// leaves.
+    #[prost(string, tag = "3")]
+    pub from_dataset: ::prost::alloc::string::String,
+    /// The dataset a default read now serves: the next of the priority, or for
+    /// a switch back the higher one restored. Empty: none left to serve, so a
+    /// default read is answered not covered.
+    #[prost(string, tag = "4")]
+    pub to_dataset: ::prost::alloc::string::String,
+    /// Entity IDs, for a switch on a quarantine, which is held per subject;
+    /// 0 to 500. None: every subject the priority serves.
+    #[prost(string, repeated, tag = "5")]
+    pub subjects: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "SourceSwitchReason", tag = "6")]
+    pub reason: i32,
+    /// By the lake's clock, when it first served a default read from the
+    /// dataset now served.
+    #[prost(int64, tag = "7")]
+    pub switched_at_ns: i64,
+}
+/// A deployment admin reads the switches of the default reads' sources
+/// (W10.6), newest first. Changes nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSourceSwitchesRequest {
+    /// A data type by its message's full name; empty: every priority.
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    /// A dataset's ID, as either side of a switch; empty: every dataset.
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The most switches in one page: 0 is the read's default; past 500,
+    /// answered at 500.
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
+    /// The next_cursor of the page before; empty: the first page.
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSourceSwitchesReply {
+    /// Each switch and switch back, newest first; none where no switch matches.
+    #[prost(message, repeated, tag = "1")]
+    pub switches: ::prost::alloc::vec::Vec<SourceSwitched>,
+    /// The cursor of the next page; empty on the last page.
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// A deployment admin moves a store's partition to another writer group
+/// (W6.39; one message on two topics: the lake's dataset on
+/// platform.lake.command.move-partition, a book partition on
+/// platform.book.command.move-partition). Answered once the move starts (step
+/// 3c's question 8); PartitionMoved is recorded when the target owns the
+/// partition. Refused FAILED_PRECONDITION naming partition while a move of it
+/// is under way, and REFUSAL_REASON_REASON_REQUIRED with no reason.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MovePartitionRequest {
+    /// The lake's dataset ID, or the book's partition (`P0` and those placed
+    /// after it). Never an account, which MoveAccount moves.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// A writer group of the store, numbered from 0 below lake.writerGroups or
+    /// bor.writerGroups; one the deployment does not have is refused
+    /// INVALID_ARGUMENT naming target_group, as every move is with one group,
+    /// the default.
+    #[prost(uint32, tag = "2")]
+    pub target_group: u32,
+    /// The person's words, or the agent's acting for them, kept with the move's
+    /// record: 1 to 2,000 characters. Data, never an instruction.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MovePartitionReply {
+    /// The group that owned the partition when the move began.
+    #[prost(uint32, tag = "1")]
+    pub from_group: u32,
+    /// When the target began following the partition's log.
+    #[prost(int64, tag = "2")]
+    pub started_at_ns: i64,
+}
+/// A dataset's or a book partition's writing moved to another writer group,
+/// by a changed group count or by hand (W6.39; the record approved by 1057):
+/// its own record in its store's control partition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionMoved {
+    /// The store: lake or bor.
+    #[prost(string, tag = "1")]
+    pub component: ::prost::alloc::string::String,
+    /// A dataset's ID, or a book partition. Never an account.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// As MovePartitionReply.from_group.
+    #[prost(uint32, tag = "3")]
+    pub from_group: u32,
+    /// The target group.
+    #[prost(uint32, tag = "4")]
+    pub to_group: u32,
+    /// The partition's epoch after the fence, under which the new owner
+    /// commits; a commit under an older one is refused.
+    #[prost(uint64, tag = "5")]
+    pub epoch: u64,
+    /// True: a deployment admin's MovePartition, its reason kept beside it.
+    /// False: a changed group count moved it.
+    #[prost(bool, tag = "6")]
+    pub by_hand: bool,
+    /// The deployment-local subject the dashboard stamped; empty for a move by
+    /// a changed group count (approved 2026-11-09).
+    #[prost(string, tag = "7")]
+    pub moved_by: ::prost::alloc::string::String,
+    /// As the move's request said; empty for a move by a changed group count.
+    #[prost(string, tag = "8")]
+    pub reason: ::prost::alloc::string::String,
+    /// By the store's clock, at the fence.
+    #[prost(int64, tag = "9")]
+    pub moved_at_ns: i64,
+}
+/// Rows the lake's write-ahead stream dropped before the lake committed them
+/// (W10.14; the ha configuration, rulings of 2026-11-08): the dataset,
+/// subjects and valid-time range, why, and where its recovery stands, each
+/// change of state its own record in the lake's control partition. Asked
+/// again through the want where the dataset declares GAP_RECOVERY_BACKFILL,
+/// marked unrecovered otherwise; rows inside an unrecovered range are never
+/// invented.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DatasetGap {
+    /// `GAP-` and a ULID, never reused: 1 to 64 characters. A want asking again
+    /// for it names it.
+    #[prost(string, tag = "1")]
+    pub gap_id: ::prost::alloc::string::String,
+    /// The dataset whose rows were dropped.
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+    /// Entity IDs, as the dropped rows named them; 0 to 500. None: every
+    /// subject of the rows dropped.
+    #[prost(string, repeated, tag = "3")]
+    pub subjects: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The earliest valid time of a row dropped.
+    #[prost(int64, tag = "4")]
+    pub valid_from_ns: i64,
+    /// Just after the latest valid time of a row dropped, as
+    /// ObservationsWantedEvent.valid_until_ns ends a want's range.
+    #[prost(int64, tag = "5")]
+    pub valid_until_ns: i64,
+    #[prost(enumeration = "GapCause", tag = "6")]
+    pub cause: i32,
+    #[prost(enumeration = "GapState", tag = "7")]
+    pub state: i32,
+    /// By the lake's clock, for this state.
+    #[prost(int64, tag = "8")]
+    pub recorded_at_ns: i64,
+}
+/// A deployment admin reads the gaps (W10.14), newest first. Changes nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDatasetGapsRequest {
+    /// A dataset's ID; empty: every dataset.
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// Refetching, recovered or unrecovered; unspecified: every state.
+    #[prost(enumeration = "GapState", tag = "2")]
+    pub state: i32,
+    /// The most gaps in one page: 0 is the read's default; past 500, answered
+    /// at 500.
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
+    /// The next_cursor of the page before; empty: the first page.
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDatasetGapsReply {
+    /// Each gap in its latest state, newest first; none where no gap matches.
+    #[prost(message, repeated, tag = "1")]
+    pub gaps: ::prost::alloc::vec::Vec<DatasetGap>,
+    /// The cursor of the next page; empty on the last page.
+    #[prost(string, tag = "2")]
     pub next_cursor: ::prost::alloc::string::String,
 }
 /// Which of the source's clocks a timestamp is.
@@ -18416,6 +18704,10 @@ pub enum RateKind {
     Discount = 6,
     /// A bill's coupon-equivalent (bond-equivalent) yield.
     CouponEquivalent = 7,
+    /// Contract v30 (ruling 431; approved 2026-11-09): an on-the-run
+    /// benchmark's yield as its publisher states it, the kind a curve's
+    /// benchmarks are quoted in.
+    BenchmarkYield = 8,
 }
 impl RateKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -18432,6 +18724,7 @@ impl RateKind {
             Self::Zero => "RATE_KIND_ZERO",
             Self::Discount => "RATE_KIND_DISCOUNT",
             Self::CouponEquivalent => "RATE_KIND_COUPON_EQUIVALENT",
+            Self::BenchmarkYield => "RATE_KIND_BENCHMARK_YIELD",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -18445,6 +18738,7 @@ impl RateKind {
             "RATE_KIND_ZERO" => Some(Self::Zero),
             "RATE_KIND_DISCOUNT" => Some(Self::Discount),
             "RATE_KIND_COUPON_EQUIVALENT" => Some(Self::CouponEquivalent),
+            "RATE_KIND_BENCHMARK_YIELD" => Some(Self::BenchmarkYield),
             _ => None,
         }
     }
@@ -19037,6 +19331,119 @@ impl QualityReason {
         }
     }
 }
+/// Why a default read's source switched (contract v30; the reasons approved
+/// by 1057, the enum's name 2026-11-09). Never a row's quality state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SourceSwitchReason {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// The dataset passed over recorded nothing within its cadence.
+    Silent = 1,
+    /// The dataset passed over stated no liveness within its stale ceiling.
+    Stalled = 2,
+    /// The dataset passed over held its latest rows for the subjects
+    /// quarantined.
+    Quarantined = 3,
+    /// A switch back: the higher dataset is live and good again.
+    Restored = 4,
+}
+impl SourceSwitchReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SOURCE_SWITCH_REASON_UNSPECIFIED",
+            Self::Silent => "SOURCE_SWITCH_REASON_SILENT",
+            Self::Stalled => "SOURCE_SWITCH_REASON_STALLED",
+            Self::Quarantined => "SOURCE_SWITCH_REASON_QUARANTINED",
+            Self::Restored => "SOURCE_SWITCH_REASON_RESTORED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SOURCE_SWITCH_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "SOURCE_SWITCH_REASON_SILENT" => Some(Self::Silent),
+            "SOURCE_SWITCH_REASON_STALLED" => Some(Self::Stalled),
+            "SOURCE_SWITCH_REASON_QUARANTINED" => Some(Self::Quarantined),
+            "SOURCE_SWITCH_REASON_RESTORED" => Some(Self::Restored),
+            _ => None,
+        }
+    }
+}
+/// Why a dataset's rows were dropped (contract v30; step 3c's question 5).
+/// Never a source's own outage, which a liveness says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GapCause {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// Rows the lake's write-ahead stream dropped at its bound before the lake
+    /// committed them: a writer gone longer than the bound.
+    WriteAheadBound = 1,
+}
+impl GapCause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GAP_CAUSE_UNSPECIFIED",
+            Self::WriteAheadBound => "GAP_CAUSE_WRITE_AHEAD_BOUND",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GAP_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "GAP_CAUSE_WRITE_AHEAD_BOUND" => Some(Self::WriteAheadBound),
+            _ => None,
+        }
+    }
+}
+/// Where a gap's recovery stands (contract v30; approved 2026-11-09). Never
+/// the dataset's quality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GapState {
+    /// Not known; never sent. On a read: every state.
+    Unspecified = 0,
+    /// Asked again of the data plugin through the want, naming the gap.
+    Refetching = 1,
+    /// The rows returned under their own row keys.
+    Recovered = 2,
+    /// Not recovered: the dataset cannot be asked again, or the want was
+    /// declined; a notice in the deployment admin's inbox while it stands.
+    Unrecovered = 3,
+}
+impl GapState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GAP_STATE_UNSPECIFIED",
+            Self::Refetching => "GAP_STATE_REFETCHING",
+            Self::Recovered => "GAP_STATE_RECOVERED",
+            Self::Unrecovered => "GAP_STATE_UNRECOVERED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GAP_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "GAP_STATE_REFETCHING" => Some(Self::Refetching),
+            "GAP_STATE_RECOVERED" => Some(Self::Recovered),
+            "GAP_STATE_UNRECOVERED" => Some(Self::Unrecovered),
+            _ => None,
+        }
+    }
+}
 /// A job (W12.1): what to compute, over what, against which inputs, named by
 /// reference. A read: it changes no record.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -19078,6 +19485,19 @@ pub struct Job {
     /// scenario_set. Unset: no saved scenario.
     #[prost(message, optional, tag = "9")]
     pub scenario_ref: ::core::option::Option<ScenarioRef>,
+    /// Contract v30 (W12.1, W12.4; spec/one-data-access-model section 4;
+    /// approved by 834): true asks the component to keep the answer current, a
+    /// standing job keyed by its canonical form and its client's resolved
+    /// inputs, computed once for every client with that key and recomputed as
+    /// its inputs change, each measure by its refresh, while a renewal names it
+    /// (RenewJobs). Its inputs are live: naming inputs.book_at,
+    /// inputs.lake_as_of_ns, business_date or what_if is refused
+    /// INVALID_ARGUMENT naming standing, and one past the deployment's most
+    /// standing jobs FAILED_PRECONDITION naming standing. Its figures are
+    /// published (DerivedSeriesUpdated), never recorded. False: a one-off job,
+    /// answered once.
+    #[prost(bool, tag = "10")]
+    pub standing: bool,
 }
 /// A job's inputs, by reference (requirement 3): one watermark and one as-of
 /// for the whole job (requirements 7, 8).
@@ -19086,7 +19506,7 @@ pub struct InputRefs {
     /// The book's watermark; unset for now, which the component resolves to
     /// the watermark it read and answers in the provenance.
     #[prost(message, optional, tag = "1")]
-    pub book_at: ::core::option::Option<Watermark>,
+    pub book_at: ::core::option::Option<::meridian_pb::v1::Watermark>,
     /// The lake's recorded-time cut-off; 0 for now, resolved likewise.
     #[prost(int64, tag = "2")]
     pub lake_as_of_ns: i64,
@@ -19265,7 +19685,7 @@ pub struct NotEvaluated {
 pub struct AnswerProvenance {
     /// The watermark and the as-of the job read at.
     #[prost(message, optional, tag = "1")]
-    pub book_watermark: ::core::option::Option<Watermark>,
+    pub book_watermark: ::core::option::Option<::meridian_pb::v1::Watermark>,
     #[prost(int64, tag = "2")]
     pub lake_as_of_ns: i64,
     /// Each dataset read, as the lake's replies named them.
@@ -19532,6 +19952,62 @@ pub struct ListPriceBatchesReply {
     pub batches: ::prost::alloc::vec::Vec<PriceBatchRequest>,
     /// The sequence read to.
     #[prost(int64, tag = "2")]
+    pub sequence: i64,
+}
+/// A sidecar's renewal of the standing jobs its plugin's open subscriptions
+/// name (W12.4; approved by 1057): one message per lease
+/// (analytics.standing.leaseSeconds), whatever the number of pages, and at
+/// once for a job newly named. The component keeps each while a renewal
+/// names it, and stops one no renewal named within the lease. Interest, not
+/// a read: nothing is read or recorded.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewJobsRequest {
+    /// `JOB-` IDs, 1 to 256; an empty list is refused naming job_ids.
+    #[prost(string, repeated, tag = "1")]
+    pub job_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewJobsReply {
+    /// The renewed jobs no live coordinator holds -- its coordinator lost or
+    /// the coordinators changed, or the job lapsed -- which the SDK registers
+    /// again by RunJob with the job it holds. Not a refusal: the renewal of
+    /// every other job stands. None: every job renewed is held.
+    #[prost(string, repeated, tag = "1")]
+    pub unknown_job_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A standing job's recomputed figures (W12.4; approved by 1057 and
+/// 2026-11-09), published to each instance holding the job, one event per
+/// holding instance, which alone hears it (matrix/directed.tsv), conflated
+/// per job and figure key. Published, never recorded; never over 512 KiB,
+/// split where it would be. After a gap in the job's sequence or a loss
+/// marker the reader reads the job's whole answer again (ReadJobAnswer) and
+/// applies the events above it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DerivedSeriesUpdatedEvent {
+    /// The standing job, as RunJobReply.job_id: the same for every holder.
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    /// The instance holding the job that alone hears this event (step 3c's
+    /// question 2).
+    #[prost(string, tag = "2")]
+    pub client_instance_id: ::prost::alloc::string::String,
+    /// The figures recomputed since the last event, keyed by subject and
+    /// series, each naming its rule and its inputs with the as-of each was read
+    /// at; 0 to 4,096.
+    #[prost(message, repeated, tag = "3")]
+    pub values: ::prost::alloc::vec::Vec<DerivedSeries>,
+    /// The figures recomputed since the last event over an account, a
+    /// breakdown or a scenario, each as a job's answer carries it, beside
+    /// values (step 3c's question 1); 0 to 4,096.
+    #[prost(message, repeated, tag = "4")]
+    pub figures: ::prost::alloc::vec::Vec<Figure>,
+    /// The recomputed figures not evaluated, each with its reason, never zero;
+    /// 0 to 4,096.
+    #[prost(message, repeated, tag = "5")]
+    pub not_evaluated: ::prost::alloc::vec::Vec<NotEvaluated>,
+    /// The job's own sequence, the same for every holder, so a reader sees a
+    /// gap. Never zero.
+    #[prost(int64, tag = "6")]
     pub sequence: i64,
 }
 /// A job answered later has finished (W12.4), heard by the instance that ran
@@ -20323,6 +20799,20 @@ pub struct LaunchPluginRequest {
     /// Through /mcp every launch carries one (W6.20).
     #[prost(string, tag = "7")]
     pub note: ::prost::alloc::string::String,
+    /// Contract v30, built with 3d (W8.3;
+    /// spec/a-deployment-scales-out-and-fails-over-by-configuration section 7;
+    /// the launch settings approved by 1057): the instance's shards, pods of
+    /// the one instance sharing its subjects by rendezvous hashing, at most the
+    /// version's most_shards (0 to 64); one more is refused INVALID_ARGUMENT
+    /// naming shards. 0: one pod, as 1 is. Never separate instances.
+    #[prost(uint32, tag = "8")]
+    pub shards: u32,
+    /// Contract v30, built with 3d: true asks for a standby pod, whose sidecar
+    /// holds no lease and whose role classes' run() starts only when it takes
+    /// the instance's Lease. Recommended for oms, ems, connectivity and live
+    /// data instances. A standby shares nothing until it takes over.
+    #[prost(bool, tag = "9")]
+    pub standby: bool,
 }
 /// A launch, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -20388,6 +20878,13 @@ pub struct PluginLaunch {
     /// list's warning stands until the instance is stopped or this is set.
     #[prost(message, optional, tag = "22")]
     pub pull_acknowledgement: ::core::option::Option<PullAcknowledgement>,
+    /// Contract v30 (W8.3): the shards and standby pod the instance was
+    /// launched with, as the launch asked, within the version's most_shards.
+    /// Not what runs now, which the members' reports say. 0: one pod.
+    #[prost(uint32, tag = "23")]
+    pub shards: u32,
+    #[prost(bool, tag = "24")]
+    pub standby: bool,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -23145,8 +23642,10 @@ pub struct PluginConfigurationChangedEvent {
     pub changed_at_ns: i64,
 }
 /// A deployment admin licenses a dataset: confirms or replaces the terms its
-/// catalogue declares (DatasetDeclaration.licence_default). Answered by the
-/// licence as recorded.
+/// catalogue declares -- until contract v30 as DatasetDeclaration's retired
+/// licence_default, from v30 described in its terms_and_pricing (ruling
+/// 1032), each use right of a dataset nobody has licensed read restrictively
+/// (1030). Answered by the licence as recorded.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetDatasetLicenceRequest {
     #[prost(string, tag = "1")]
@@ -23558,6 +24057,214 @@ pub struct StaleReferenceActionsPermittedSetting {
     #[prost(string, tag = "3")]
     pub changed_by: ::prost::alloc::string::String,
 }
+/// A deployment admin reads the Resilience page (W6.39; step 3c's question
+/// 4): each member of each component, each partition and its owner, and the
+/// recent history, which names the accounts moved and who moved them, so it
+/// is read in the config domain. Changes nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadResilienceRequest {
+    /// A page of the history: 0 for the read's default page.
+    #[prost(uint32, tag = "1")]
+    pub page_size: u32,
+    /// next_cursor from the page before; empty for the first page.
+    #[prost(string, tag = "2")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadResilienceReply {
+    /// Each member of each component as it reported last (ruling 1060): its
+    /// mode, zone, lag and partitions are working state, never a record.
+    #[prost(message, repeated, tag = "1")]
+    pub members: ::prost::alloc::vec::Vec<ComponentReport>,
+    /// Each partition of a partitioned store and the member writing it.
+    #[prost(message, repeated, tag = "2")]
+    pub partitions: ::prost::alloc::vec::Vec<PartitionOwner>,
+    /// The recent takeovers, moves, switches and findings, the latest first;
+    /// none where nothing has happened.
+    #[prost(message, repeated, tag = "3")]
+    pub history: ::prost::alloc::vec::Vec<ResilienceHistoryItem>,
+    /// Where the history's next page starts; empty on the last page.
+    #[prost(string, tag = "4")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// One partition of a store and its owner (W6.39).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionOwner {
+    /// The store: lake or bor.
+    #[prost(string, tag = "1")]
+    pub component: ::prost::alloc::string::String,
+    /// Its partition: a dataset's key, `P0`, `control`. Never an account.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// The writer group that owns it, numbered from 0; 0 where the store has
+    /// one writer group.
+    #[prost(uint32, tag = "3")]
+    pub group: u32,
+    /// The member writing it, its pod's name; empty while no member holds the
+    /// group's lease.
+    #[prost(string, tag = "4")]
+    pub writer: ::prost::alloc::string::String,
+    /// The partition's epoch, under which its writer commits. Never zero.
+    #[prost(uint64, tag = "5")]
+    pub epoch: u64,
+}
+/// One item of the Resilience page's history: exactly one is set.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResilienceHistoryItem {
+    #[prost(oneof = "resilience_history_item::Item", tags = "1, 2, 3, 4, 5")]
+    pub item: ::core::option::Option<resilience_history_item::Item>,
+}
+/// Nested message and enum types in `ResilienceHistoryItem`.
+pub mod resilience_history_item {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Item {
+        #[prost(message, tag = "1")]
+        WriterTookOver(super::WriterTookOver),
+        #[prost(message, tag = "2")]
+        PartitionMoved(super::PartitionMoved),
+        #[prost(message, tag = "3")]
+        SourceSwitched(super::SourceSwitched),
+        /// An account's move, naming who moved it (approved 2026-11-09).
+        #[prost(message, tag = "4")]
+        AccountMoved(super::AccountMoved),
+        #[prost(message, tag = "5")]
+        IntegrityFinding(super::IntegrityFinding),
+    }
+}
+/// A standby took a store's writer lease and raised its partitions' epoch, and
+/// why (W6.39; the record approved by 1057): its own record in the store's
+/// control partition. Never a restart of a pod with no standby.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriterTookOver {
+    /// The store: lake, bor, instrument, street, conductor or launcher.
+    #[prost(string, tag = "1")]
+    pub component: ::prost::alloc::string::String,
+    /// The member that took over, its pod's name as its report names it.
+    #[prost(string, tag = "2")]
+    pub member: ::prost::alloc::string::String,
+    /// The member that held the lease before; empty where none did.
+    #[prost(string, tag = "3")]
+    pub previous_member: ::prost::alloc::string::String,
+    /// The partitions it now writes: a dataset's key, `P0`, `control`.
+    #[prost(string, repeated, tag = "4")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The partitions' new epoch, under which the new writer commits.
+    #[prost(uint64, tag = "5")]
+    pub epoch: u64,
+    #[prost(enumeration = "TakeoverReason", tag = "6")]
+    pub reason: i32,
+    /// By the store's clock, at the fence.
+    #[prost(int64, tag = "7")]
+    pub took_over_at_ns: i64,
+}
+/// A store's record found changed where it rests (W6.39, plan 5j; the record
+/// approved by 1057): its own record in the store's control partition, a
+/// notice in the deployment admin's inbox. Never a guess at the cause.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IntegrityFinding {
+    /// The store: lake, bor, instrument, street or conductor.
+    #[prost(string, tag = "1")]
+    pub component: ::prost::alloc::string::String,
+    /// The partition: a dataset's key, `P0`, `control`; empty for a database
+    /// page outside any partition.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(enumeration = "IntegrityCheck", tag = "3")]
+    pub check: i32,
+    /// The first bad change's sequence in the partition; 0 for a database page.
+    #[prost(uint64, tag = "4")]
+    pub first_bad_sequence: u64,
+    /// Its committed time; 0 for a database page.
+    #[prost(int64, tag = "5")]
+    pub first_bad_at_ns: i64,
+    /// The latest restore point before it, from the backups and the
+    /// off-cluster archive; 0 where there is none. What a restore there would
+    /// lose is the record after it; the admin chooses (`meridian restore
+    /// --to-time`).
+    #[prost(int64, tag = "6")]
+    pub restore_point_ns: i64,
+    /// Plain words for a person, never a stack trace or a row's body; empty
+    /// where the check says enough.
+    #[prost(string, tag = "7")]
+    pub detail: ::prost::alloc::string::String,
+    /// By the store's clock.
+    #[prost(int64, tag = "8")]
+    pub found_at_ns: i64,
+}
+/// A deployment admin reads the resilience profile (W6.39; on
+/// platform.deployment.query.read-resilience-profile, step 3c's question 4):
+/// what the configuration meets and what would meet more, computed from the
+/// chart's values as the release states them, the members' reports, the
+/// nodes and zones, the Leases and the source priorities, never from a
+/// preset's name. It carries no account and no person, and changes nothing.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadResilienceProfileRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadResilienceProfileReply {
+    /// The highest service level the configuration meets (level approved by
+    /// 1057). Never a promise.
+    #[prost(enumeration = "ServiceLevel", tag = "1")]
+    pub level: i32,
+    /// What the next level lacks; none at Multi-zone.
+    #[prost(message, repeated, tag = "2")]
+    pub next_level_changes: ::prost::alloc::vec::Vec<ResilienceChange>,
+    /// Per failure class, whether the configuration recovers from it: met only
+    /// where CI tests the configuration.
+    #[prost(message, repeated, tag = "3")]
+    pub failures: ::prost::alloc::vec::Vec<ResilienceLine>,
+    /// Per tier of the targets by failure, whether the configuration meets it.
+    /// Never a public claim of availability.
+    #[prost(message, repeated, tag = "4")]
+    pub tiers: ::prost::alloc::vec::Vec<ResilienceLine>,
+    /// Never blind's properties per live data type in the priorities.
+    #[prost(message, repeated, tag = "5")]
+    pub never_blind: ::prost::alloc::vec::Vec<NeverBlindLine>,
+    /// When the profile was computed.
+    #[prost(int64, tag = "6")]
+    pub computed_at_ns: i64,
+}
+/// One line of the profile: a failure class or a tier.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResilienceLine {
+    /// What the line is about: "a pod", "a zone's node pool", a tier.
+    #[prost(string, tag = "1")]
+    pub subject: ::prost::alloc::string::String,
+    #[prost(enumeration = "ResilienceState", tag = "2")]
+    pub state: i32,
+    /// Why the line is in its state.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    /// What would meet a line not met; none where it is met.
+    #[prost(message, repeated, tag = "4")]
+    pub changes: ::prost::alloc::vec::Vec<ResilienceChange>,
+}
+/// One change that would meet more, and what it costs. A change named, never
+/// a change made.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResilienceChange {
+    /// The change: a chart value and its setting, or nodes to add.
+    #[prost(string, tag = "1")]
+    pub change: ::prost::alloc::string::String,
+    /// What it costs: pods, volumes, nodes. Never a price.
+    #[prost(string, tag = "2")]
+    pub cost: ::prost::alloc::string::String,
+}
+/// Never blind's properties for one live data type (W6.39).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NeverBlindLine {
+    /// The data type, by its message's full name (meridian.v1.Quote).
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    /// Whether a second source stands in the type's priority.
+    #[prost(bool, tag = "2")]
+    pub second_source: bool,
+    /// Whether the type's sources run standby pods.
+    #[prost(bool, tag = "3")]
+    pub standby_pods: bool,
+    /// Whether the type's pages show each value's age and source.
+    #[prost(bool, tag = "4")]
+    pub age_and_source: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum AccountState {
@@ -23716,6 +24423,160 @@ impl BorrowStatus {
             "BORROW_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
             "BORROW_STATUS_EASY_TO_BORROW" => Some(Self::EasyToBorrow),
             "BORROW_STATUS_HARD_TO_BORROW" => Some(Self::HardToBorrow),
+            _ => None,
+        }
+    }
+}
+/// Why a writer took over (contract v30; approved 2026-11-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TakeoverReason {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// The writer's lease lapsed.
+    LeaseLapsed = 1,
+    /// The writer stepped down, its commit refused by the epoch.
+    SteppedDown = 2,
+    /// A partition moved to this member's group.
+    Moved = 3,
+}
+impl TakeoverReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TAKEOVER_REASON_UNSPECIFIED",
+            Self::LeaseLapsed => "TAKEOVER_REASON_LEASE_LAPSED",
+            Self::SteppedDown => "TAKEOVER_REASON_STEPPED_DOWN",
+            Self::Moved => "TAKEOVER_REASON_MOVED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TAKEOVER_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "TAKEOVER_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
+            "TAKEOVER_REASON_STEPPED_DOWN" => Some(Self::SteppedDown),
+            "TAKEOVER_REASON_MOVED" => Some(Self::Moved),
+            _ => None,
+        }
+    }
+}
+/// Which check found it (contract v30; approved 2026-11-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum IntegrityCheck {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// A database page's checksum failed on read.
+    PageChecksum = 1,
+    /// A lake row's digest is not its body's.
+    RowDigest = 2,
+    /// A journal entry's digest or its previous_digest breaks the partition's
+    /// chain.
+    JournalChain = 3,
+    /// Two members' digests of a partition differ at one sequence.
+    MemberDigest = 4,
+}
+impl IntegrityCheck {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INTEGRITY_CHECK_UNSPECIFIED",
+            Self::PageChecksum => "INTEGRITY_CHECK_PAGE_CHECKSUM",
+            Self::RowDigest => "INTEGRITY_CHECK_ROW_DIGEST",
+            Self::JournalChain => "INTEGRITY_CHECK_JOURNAL_CHAIN",
+            Self::MemberDigest => "INTEGRITY_CHECK_MEMBER_DIGEST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTEGRITY_CHECK_UNSPECIFIED" => Some(Self::Unspecified),
+            "INTEGRITY_CHECK_PAGE_CHECKSUM" => Some(Self::PageChecksum),
+            "INTEGRITY_CHECK_ROW_DIGEST" => Some(Self::RowDigest),
+            "INTEGRITY_CHECK_JOURNAL_CHAIN" => Some(Self::JournalChain),
+            "INTEGRITY_CHECK_MEMBER_DIGEST" => Some(Self::MemberDigest),
+            _ => None,
+        }
+    }
+}
+/// A deployment's service level (contract v30; the levels' names approved by
+/// 1057, the enum's 2026-11-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ServiceLevel {
+    /// Not known; never sent.
+    Unspecified = 0,
+    Desktop = 1,
+    SingleNode = 2,
+    MultiNode = 3,
+    MultiZone = 4,
+}
+impl ServiceLevel {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SERVICE_LEVEL_UNSPECIFIED",
+            Self::Desktop => "SERVICE_LEVEL_DESKTOP",
+            Self::SingleNode => "SERVICE_LEVEL_SINGLE_NODE",
+            Self::MultiNode => "SERVICE_LEVEL_MULTI_NODE",
+            Self::MultiZone => "SERVICE_LEVEL_MULTI_ZONE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SERVICE_LEVEL_UNSPECIFIED" => Some(Self::Unspecified),
+            "SERVICE_LEVEL_DESKTOP" => Some(Self::Desktop),
+            "SERVICE_LEVEL_SINGLE_NODE" => Some(Self::SingleNode),
+            "SERVICE_LEVEL_MULTI_NODE" => Some(Self::MultiNode),
+            "SERVICE_LEVEL_MULTI_ZONE" => Some(Self::MultiZone),
+            _ => None,
+        }
+    }
+}
+/// Whether a line of the profile is met (contract v30; approved 2026-11-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ResilienceState {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// Met by the configuration as it runs, a configuration CI tests.
+    Met = 1,
+    /// Met by Kubernetes' restart within the tolerant default's bound.
+    MetByRestart = 2,
+    /// Not met; its changes name what would meet it.
+    NotMet = 3,
+}
+impl ResilienceState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RESILIENCE_STATE_UNSPECIFIED",
+            Self::Met => "RESILIENCE_STATE_MET",
+            Self::MetByRestart => "RESILIENCE_STATE_MET_BY_RESTART",
+            Self::NotMet => "RESILIENCE_STATE_NOT_MET",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RESILIENCE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "RESILIENCE_STATE_MET" => Some(Self::Met),
+            "RESILIENCE_STATE_MET_BY_RESTART" => Some(Self::MetByRestart),
+            "RESILIENCE_STATE_NOT_MET" => Some(Self::NotMet),
             _ => None,
         }
     }

@@ -410,9 +410,11 @@ fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
                     version: 1,
                     breakdowns: breakdowns.iter().map(|b| b.to_string()).collect(),
                     event_group_id: group.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             what_if: None,
+            standing: false,
         }),
     }
 }

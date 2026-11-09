@@ -17,7 +17,7 @@ use meridian_domain::v1::{
     SourceChoice, SourceTime, SourceTimeKind, SubjectRef, Tenor, TenorUnit, UnansweredReason,
     UnitValue, ValueUnit,
 };
-use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
 use prost::Message;
 
 use crate::row::Observation;
@@ -115,10 +115,6 @@ fn configuration() -> EntitlementsChangedEvent {
                 modes: vec![ObservationMode::Pull as i32],
                 cadence: 86_400,
                 day_time_zone: "America/New_York".into(),
-                licence_default: Some(DatasetLicence {
-                    kept: true,
-                    ..Default::default()
-                }),
                 ..Default::default()
             }),
             ..Default::default()

@@ -980,20 +980,6 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                     },
                     modes: vec![1, 2],
                     cadence: 86_400,
-                    licence_default: Some(DatasetLicence {
-                        kept: k != 1,
-                        retention_days: if k == 2 { 3650 } else { 0 },
-                        personal_use: n == 2,
-                        // Contract 28, amended 2026-10-31 (ruling 896): the
-                        // source behind the vendor, one long enough to be cut.
-                        underlying_source: match n {
-                            5 => "Nasdaq, NYSE and Cboe summary feeds, consolidated by the aggregator"
-                                .into(),
-                            6 => "US equity SIPs (CTA, UTP)".into(),
-                            _ => String::new(),
-                        },
-                        ..Default::default()
-                    }),
                     day_time_zone: "America/New_York".into(),
                     // Ruling 906: each class, and not stated.
                     price_source_class: (n % 5) as i32,
@@ -1012,6 +998,26 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 invalid_count: if k == 1 { (n + 1) as u64 * 2 } else { 0 },
                 ..Default::default()
             });
+            // The deployment's licence of each (contract v30 retired a
+            // catalogue's licence_default, ruling 1032), kraken-1:daily's
+            // below.
+            if dataset != "kraken-1:daily" {
+                reply.licences.push(DatasetLicence {
+                    dataset: dataset.clone(),
+                    kept: k != 1,
+                    retention_days: if k == 2 { 3650 } else { 0 },
+                    personal_use: n == 2,
+                    // Contract 28, amended 2026-10-31 (ruling 896): the
+                    // source behind the vendor, one long enough to be cut.
+                    underlying_source: match n {
+                        5 => "Nasdaq, NYSE and Cboe summary feeds, consolidated by the aggregator"
+                            .into(),
+                        6 => "US equity SIPs (CTA, UTP)".into(),
+                        _ => String::new(),
+                    },
+                    ..Default::default()
+                });
+            }
             if n < 2 || (n == 2 && k == 0) {
                 for reader in ["sample-reporting-1", "board-1", "compliance-1"] {
                     reply.entitlements.push(DatasetEntitlement {
@@ -2942,7 +2948,7 @@ fn registry_versions() -> Vec<meridian_domain::v1::PluginVersion> {
 /// The starter packs' members as the catalogue's copy holds them (v28):
 /// each a listing of one version, its roles and its datasets' terms.
 fn pack_listings() -> Vec<meridian_domain::v1::PluginListing> {
-    use meridian_pb::v1::{AccessBasis, Catalogue, DatasetDeclaration, DatasetLicence};
+    use meridian_pb::v1::{AccessBasis, Catalogue, DatasetDeclaration};
     let member = |listing: &str, title: &str, version: &str, roles: &[&str], basis: AccessBasis| {
         let mut declaration = documented_declaration();
         declaration.interface = Some(meridian_pb::v1::InterfaceDeclaration {
@@ -2951,12 +2957,10 @@ fn pack_listings() -> Vec<meridian_domain::v1::PluginListing> {
         });
         if basis != AccessBasis::Unspecified {
             declaration.catalogue = Some(Catalogue {
+                // A dataset's access basis went with licence_default
+                // (contract v30, ruling 1032): the member shows none.
                 datasets: vec![DatasetDeclaration {
                     key: "daily".into(),
-                    licence_default: Some(DatasetLicence {
-                        access_basis: basis as i32,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }],
             });

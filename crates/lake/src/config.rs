@@ -141,12 +141,15 @@ mod tests {
                     key: "daily".into(),
                     data_types: vec![lake::PRICE.into(), lake::BAR.into()],
                     modes: vec![ObservationMode::Pull as i32],
-                    licence_default: Some(DatasetLicence {
-                        kept: false,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }),
+                ..Default::default()
+            }],
+            // Not kept by the deployment's licence (contract v30 retired a
+            // catalogue's licence_default, ruling 1032).
+            licences: vec![DatasetLicence {
+                dataset: "coinbase-1:daily".into(),
+                kept: false,
                 ..Default::default()
             }],
             entitlements: vec![
@@ -169,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_reads_what_it_is_entitled_to_and_the_catalogues_terms_apply_until_licensed() {
+    fn a_reader_reads_what_it_is_entitled_to_and_the_licence_applies() {
         let config = config();
         let one = Reader::Plugin("reporting-1".into());
         assert_eq!(
@@ -189,7 +192,7 @@ mod tests {
             .is_empty());
         assert!(
             !config.licence("coinbase-1:daily").kept,
-            "the catalogue's default"
+            "the deployment's licence"
         );
         assert!(config.declared_by("coinbase-1:daily", "coinbase-1"));
         assert!(!config.declared_by("coinbase-1:daily", "kraken-1"));

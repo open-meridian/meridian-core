@@ -2997,6 +2997,10 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         pull_acknowledgement: row.get::<_, Option<Vec<u8>>>(20).and_then(|bytes| {
             <meridian_domain::v1::PullAcknowledgement as prost::Message>::decode(&bytes[..]).ok()
         }),
+        // Contract v30's shards and standby (W8.3), built with 3d: not yet
+        // kept, so one pod and no standby.
+        shards: 0,
+        standby: false,
     }
 }
 

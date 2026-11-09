@@ -2254,6 +2254,9 @@ impl Lake {
                             expiration_to: window_to.clone(),
                             series_keys: ask.series_keys.clone(),
                             all_series: ask.all_series,
+                            // Contract v30's gap_id (W10.14): a gap's want,
+                            // asked by core's stage E (step 3c); none here.
+                            gap_id: String::new(),
                         };
                         wants.open.insert(
                             id.clone(),

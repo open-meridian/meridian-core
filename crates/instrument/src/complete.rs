@@ -319,6 +319,17 @@ fn complete_one(
                     }
                 }
             }
+            // Contract v30's bond terms as a value (W3.10, ruling 433): put in
+            // force by core's stage commits (step 3c); refused until then,
+            // naming the field, never applied in part.
+            instrument_value::Value::Bond(_) => {
+                problems.push((
+                    RefusalReason::Incomplete,
+                    path("bond"),
+                    "a bond's terms are not yet set as a value in this version".into(),
+                ));
+                continue;
+            }
             instrument_value::Value::Identifier(identifier) => {
                 let asked = asked_from_wire(identifier);
                 if asked.scheme.is_empty() || asked.value.is_empty() {

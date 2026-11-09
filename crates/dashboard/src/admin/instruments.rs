@@ -1338,6 +1338,8 @@ fn field_of(value: &InstrumentValue) -> i32 {
         Some(instrument_value::Value::BinaryEventContract(_)) => {
             InstrumentField::BinaryEventContract
         }
+        // Contract v30 (ruling 433).
+        Some(instrument_value::Value::Bond(_)) => InstrumentField::Bond,
         None => InstrumentField::Unspecified,
     }) as i32
 }
@@ -1355,6 +1357,8 @@ fn value_words(value: &InstrumentValue) -> String {
         Some(instrument_value::Value::BinaryEventContract(contract)) => {
             instrument_type::contract_words(&instrument_type::contract_to_text(contract))
         }
+        // Contract v30 (ruling 433): drawn on the Terms tab, not as words.
+        Some(instrument_value::Value::Bond(_)) => "a bond's terms".to_string(),
         None => String::new(),
     }
 }

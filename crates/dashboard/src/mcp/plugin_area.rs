@@ -2509,6 +2509,8 @@ impl Context<'_> {
                     approved_roles,
                     live,
                     note,
+                    // Contract v30's shards and standby (W8.3), built with 3d.
+                    ..Default::default()
                 },
                 RESTARTING,
             )

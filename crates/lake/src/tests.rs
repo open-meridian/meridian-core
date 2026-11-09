@@ -106,7 +106,7 @@ fn harness() -> Harness {
     }
 }
 
-fn declaration(key: &str, cadence: u32, kept: bool) -> DatasetDeclaration {
+fn declaration(key: &str, cadence: u32) -> DatasetDeclaration {
     DatasetDeclaration {
         key: key.into(),
         vendor: "Coinbase".into(),
@@ -115,10 +115,6 @@ fn declaration(key: &str, cadence: u32, kept: bool) -> DatasetDeclaration {
         cadence,
         history: 3650,
         day_time_zone: "Etc/UTC".into(),
-        licence_default: Some(DatasetLicence {
-            kept,
-            ..Default::default()
-        }),
         ..Default::default()
     }
 }
@@ -130,7 +126,7 @@ fn configuration(kept: bool, bar_fields: &[&str]) -> EntitlementsChangedEvent {
         dataset: format!("{instance}:{key}"),
         instance: instance.into(),
         vendor: "Coinbase".into(),
-        declaration: Some(declaration(key, 0, kept)),
+        declaration: Some(declaration(key, 0)),
         ..Default::default()
     };
     let entitled = |dataset: &str, fields: &[&str]| DatasetEntitlement {
@@ -140,9 +136,20 @@ fn configuration(kept: bool, bar_fields: &[&str]) -> EntitlementsChangedEvent {
         fields: fields.iter().map(|f| f.to_string()).collect(),
         ..Default::default()
     };
+    // Not kept is the deployment's licence (contract v30 retired a
+    // catalogue's licence_default, ruling 1032); kept is the default.
+    let licence = |dataset: &str| DatasetLicence {
+        dataset: dataset.into(),
+        kept,
+        ..Default::default()
+    };
     EntitlementsChangedEvent {
         datasets: vec![dataset("coinbase-1", "daily"), dataset("kraken-1", "daily")],
-        licences: vec![],
+        licences: if kept {
+            vec![]
+        } else {
+            vec![licence("coinbase-1:daily"), licence("kraken-1:daily")]
+        },
         entitlements: vec![
             entitled("coinbase-1:daily", bar_fields),
             entitled("kraken-1:daily", &[]),

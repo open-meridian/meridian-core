@@ -736,6 +736,8 @@ pub(super) async fn launch(
                 .collect(),
             live: false,
             note: field(&fields, "note").into(),
+            // Contract v30's shards and standby (W8.3), built with 3d.
+            ..Default::default()
         },
         std::time::Duration::from_secs(40),
     )

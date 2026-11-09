@@ -339,6 +339,7 @@ mod tests {
             version,
             breakdowns: vec!["sector".into()],
             event_group_id: group.into(),
+            ..Default::default()
         }
     }
 

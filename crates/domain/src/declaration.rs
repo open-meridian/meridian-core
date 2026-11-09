@@ -11,10 +11,9 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    AlgorithmDeclaration, Catalogue, CopyrightClass, DataEligibility, DataUse, DatasetDeclaration,
-    DatasetLicence, Decimal, DerivedUse, NotCarried, NotCarriedReason, ObservationMode,
-    PluginDeclaration, PriceSourceClass, PricingModelDeclaration, RawRecordKind, Redistribution,
-    StorageDeclaration,
+    AlgorithmDeclaration, Catalogue, CopyrightClass, DatasetDeclaration, DerivedUse, NotCarried,
+    NotCarriedReason, ObservationMode, PluginDeclaration, PriceSourceClass,
+    PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
 };
 
 /// The declaration as the CLI sends it, in JSON.
@@ -111,8 +110,9 @@ pub struct DeclaredDataset {
     pub cadence: u32,
     #[serde(default)]
     pub history: u32,
-    #[serde(default)]
-    pub licence_default: Option<DeclaredLicence>,
+    // licence_default, retired at contract v30 (ruling 1032): an upload
+    // from an SDK before it still carries it, read and dropped as any key
+    // the declaration does not name.
     #[serde(default)]
     pub day_time_zone: String,
     #[serde(default)]
@@ -131,145 +131,6 @@ pub struct DeclaredDataset {
     /// enum's name; empty or absent for not stated.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub price_source_class: String,
-}
-
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct DeclaredLicence {
-    #[serde(default)]
-    pub kept: bool,
-    #[serde(default)]
-    pub retention_days: u32,
-    #[serde(default)]
-    pub derived_use: bool,
-    /// The terms' derived-data answer (contract v27, ruling 479), by its
-    /// word (`internal_only`) or the enum's name; empty reads `derived_use`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub derived_use_terms: String,
-    #[serde(default)]
-    pub display: bool,
-    #[serde(default)]
-    pub default_fields: Vec<String>,
-    #[serde(default)]
-    pub personal_use: bool,
-    /// The attribution and redistribution terms (contract v27, §1c and §1d
-    /// of spec/every-data-source-is-licensed-on-the-same-terms), as the SDK
-    /// uploads them from 0.32.2 (`not_affiliated_notice` from 0.32.3): the
-    /// two answers by their words (`allowed_with_attribution`,
-    /// `public_domain`) or the enums' names, empty for not stated.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub redistribution: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub attribution_required: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub attribution_text: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub copyright_class: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub no_more_restrictive_terms: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub not_affiliated_notice: String,
-    /// The source behind the vendor, or whose aggregate it serves (ruling
-    /// 387; contract 28, amended 2026-10-31, ruling 896), as the SDK uploads
-    /// it: the plugin's words, absent where none is declared.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub underlying_source: String,
-    /// Who may take the dataset under its terms (contract v28, rulings 491
-    /// and 597), as the SDK uploads it from 0.33.0: absent where the terms
-    /// state none. Without it here, a registration carrying it differed from
-    /// its uploaded declaration and was refused.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eligibility: Option<DeclaredEligibility>,
-}
-
-/// A licence's eligibility as the SDK's `DataEligibility._to_json` writes
-/// it: the uses by their words, each bound a decimal string (`None` for
-/// none), and the bounds' ISO 4217 code.
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct DeclaredEligibility {
-    #[serde(default)]
-    pub uses: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buyer_revenue_below: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buyer_revenue_at_least: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub buyer_revenue_currency_code: String,
-}
-
-/// A use by its word (`personal`) or the enum's name.
-fn data_use_of(text: &str) -> Option<DataUse> {
-    DataUse::from_str_name(text)
-        .or_else(|| DataUse::from_str_name(&format!("DATA_USE_{}", text.to_ascii_uppercase())))
-        .filter(|used| *used != DataUse::Unspecified)
-}
-
-fn data_use_word(used: i32) -> &'static str {
-    match DataUse::try_from(used) {
-        Ok(DataUse::Personal) => "personal",
-        Ok(DataUse::Commercial) => "commercial",
-        _ => "unspecified",
-    }
-}
-
-/// A decimal as the SDK writes it (`str(Decimal)`: `1000000`, `2.5E+6`,
-/// `1E-7`) on the wire as the SDK sends it: the integer and the scale it
-/// was stated with, an exponent above zero folded into the integer, as
-/// `meridian.operations._decimal` does.
-fn wire_decimal(text: &str) -> Option<Decimal> {
-    let (mantissa, exponent) = match text.find(['e', 'E']) {
-        Some(at) => (&text[..at], text[at + 1..].parse::<i64>().ok()?),
-        None => (text, 0),
-    };
-    let stated: crate::exact::Exact = mantissa.parse().ok()?;
-    let scale = i64::from(stated.scale()) - exponent;
-    let exact = if scale >= 0 {
-        crate::exact::Exact::new(stated.integer(), u32::try_from(scale).ok()?).ok()?
-    } else {
-        let factor = 10i128.checked_pow(u32::try_from(-scale).ok()?)?;
-        crate::exact::Exact::new(stated.integer().checked_mul(factor)?, 0).ok()?
-    };
-    Some(exact.to_wire())
-}
-
-fn eligibility_from_json(
-    declared: &DeclaredEligibility,
-    at: &str,
-) -> Result<DataEligibility, String> {
-    let mut uses = Vec::new();
-    for (j, word) in declared.uses.iter().enumerate() {
-        let used = data_use_of(word)
-            .ok_or_else(|| format!("{at}.uses[{j}] {word:?} is none of personal and commercial"))?;
-        uses.push(used as i32);
-    }
-    let bound = |value: &Option<String>, name: &str| -> Result<Option<Decimal>, String> {
-        value
-            .as_deref()
-            .map(|text| {
-                wire_decimal(text).ok_or_else(|| format!("{at}.{name} {text:?} is not a decimal"))
-            })
-            .transpose()
-    };
-    Ok(DataEligibility {
-        uses,
-        buyer_revenue_below: bound(&declared.buyer_revenue_below, "buyer_revenue_below")?,
-        buyer_revenue_at_least: bound(&declared.buyer_revenue_at_least, "buyer_revenue_at_least")?,
-        buyer_revenue_currency_code: declared.buyer_revenue_currency_code.clone(),
-    })
-}
-
-fn eligibility_json(eligibility: &DataEligibility) -> serde_json::Value {
-    let bound = |value: &Option<Decimal>| {
-        value
-            .as_ref()
-            .and_then(|wire| crate::exact::Exact::from_wire(wire).ok())
-            .map(|exact| exact.to_string())
-    };
-    serde_json::json!({
-        "uses": eligibility.uses.iter().map(|u| data_use_word(*u)).collect::<Vec<_>>(),
-        "buyer_revenue_below": bound(&eligibility.buyer_revenue_below),
-        "buyer_revenue_at_least": bound(&eligibility.buyer_revenue_at_least),
-        "buyer_revenue_currency_code": eligibility.buyer_revenue_currency_code,
-    })
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -426,6 +287,9 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 model_version: model.model_version,
             })
             .collect(),
+        // Contract v30's most_shards (W8.1): not yet read from an upload;
+        // core's stage commits read it (step 3c).
+        most_shards: 0,
     })
 }
 
@@ -544,67 +408,6 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     dataset.price_source_class
                 )
             })?;
-        let licence_default = match &dataset.licence_default {
-            None => None,
-            Some(l) => {
-                let terms = derived_use_of(&l.derived_use_terms).ok_or_else(|| {
-                    format!(
-                        "declaration.catalogue.datasets[{i}].licence_default.derived_use_terms \
-                         {:?} is none of not_restricted, internal_only and \
-                         redistribution_needs_licence",
-                        l.derived_use_terms
-                    )
-                })?;
-                let redistribution = redistribution_of(&l.redistribution).ok_or_else(|| {
-                    format!(
-                        "declaration.catalogue.datasets[{i}].licence_default.redistribution {:?} \
-                         is none of not_allowed, licence_required and allowed_with_attribution",
-                        l.redistribution
-                    )
-                })?;
-                let copyright_class = copyright_class_of(&l.copyright_class).ok_or_else(|| {
-                    format!(
-                        "declaration.catalogue.datasets[{i}].licence_default.copyright_class \
-                         {:?} is none of public_domain, copyright_citation_required and \
-                         copyright_preapproval_required",
-                        l.copyright_class
-                    )
-                })?;
-                let eligibility = l
-                    .eligibility
-                    .as_ref()
-                    .map(|e| {
-                        eligibility_from_json(
-                            e,
-                            &format!(
-                                "declaration.catalogue.datasets[{i}].licence_default.eligibility"
-                            ),
-                        )
-                    })
-                    .transpose()?;
-                #[allow(deprecated)]
-                let mut licence = DatasetLicence {
-                    kept: l.kept,
-                    retention_days: l.retention_days,
-                    derived_use: l.derived_use,
-                    derived_use_terms: terms as i32,
-                    display: l.display,
-                    default_fields: l.default_fields.clone(),
-                    personal_use: l.personal_use,
-                    redistribution: redistribution as i32,
-                    attribution_required: l.attribution_required,
-                    attribution_text: l.attribution_text.clone(),
-                    copyright_class: copyright_class as i32,
-                    no_more_restrictive_terms: l.no_more_restrictive_terms,
-                    not_affiliated_notice: l.not_affiliated_notice.clone(),
-                    underlying_source: l.underlying_source.clone(),
-                    eligibility,
-                    ..Default::default()
-                };
-                crate::lake::derived_use_both(&mut licence);
-                Some(licence)
-            }
-        };
         datasets.push(DatasetDeclaration {
             key: dataset.key.clone(),
             vendor: dataset.vendor.clone(),
@@ -613,24 +416,21 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             modes,
             cadence: dataset.cadence,
             history: dataset.history,
-            licence_default,
             day_time_zone: dataset.day_time_zone.clone(),
             day_end_minute: dataset.day_end_minute,
             venue_id: dataset.venue_id.clone(),
             calendar_id: dataset.calendar_id.clone(),
             declared_delay_ns: dataset.declared_delay_ns,
             price_source_class: price_source_class as i32,
+            // Contract v30's terms and pricing, sessions calendar and gap
+            // recovery (W10.1): not yet read from an upload; core's stage
+            // commits read them (step 3c).
+            terms_and_pricing: String::new(),
+            sessions_calendar_id: String::new(),
+            gap_recovery: 0,
         });
     }
     Ok(Catalogue { datasets })
-}
-
-/// A licence's JSON with its eligibility, where it states one.
-fn licence_json(licence: &DatasetLicence, mut json: serde_json::Value) -> serde_json::Value {
-    if let Some(eligibility) = &licence.eligibility {
-        json["eligibility"] = eligibility_json(eligibility);
-    }
-    json
 }
 
 /// A dataset's catalogue entry as JSON, its modes in their words.
@@ -643,22 +443,6 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "modes": dataset.modes.iter().map(|m| mode_word(*m)).collect::<Vec<_>>(),
         "cadence": dataset.cadence,
         "history": dataset.history,
-        "licence_default": dataset.licence_default.as_ref().map(|l| licence_json(l, serde_json::json!({
-            "kept": l.kept,
-            "retention_days": l.retention_days,
-            "derived_use": crate::lake::derived_use_bool(l),
-            "derived_use_terms": derived_use_word(crate::lake::derived_use_terms(l) as i32),
-            "display": l.display,
-            "default_fields": l.default_fields,
-            "personal_use": l.personal_use,
-            "redistribution": redistribution_word(l.redistribution),
-            "attribution_required": l.attribution_required,
-            "attribution_text": l.attribution_text,
-            "copyright_class": copyright_class_word(l.copyright_class),
-            "no_more_restrictive_terms": l.no_more_restrictive_terms,
-            "not_affiliated_notice": l.not_affiliated_notice,
-            "underlying_source": l.underlying_source,
-        }))),
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
         "venue_id": dataset.venue_id,
@@ -775,9 +559,13 @@ mod tests {
             dataset.modes,
             vec![ObservationMode::Pull as i32, ObservationMode::Push as i32]
         );
-        assert!(dataset.licence_default.as_ref().unwrap().personal_use);
+        // An upload from an SDK before contract v30 still carries
+        // licence_default (ruling 1032 retired it): read and dropped.
         let back = to_json(&declaration);
         assert_eq!(back["catalogue"]["datasets"][0]["modes"][1], "push");
+        assert!(back["catalogue"]["datasets"][0]
+            .get("licence_default")
+            .is_none());
         let mut bad = declared.clone();
         bad.catalogue.as_mut().unwrap().datasets[0].modes[0] = "poll".into();
         assert!(from_json(&bad)
@@ -785,81 +573,10 @@ mod tests {
             .contains("catalogue.datasets[0].modes[0]"));
     }
 
-    #[test]
-    fn a_licences_attribution_terms_travel_as_the_sdk_uploads_them() {
-        // SDK 0.32.2's DatasetLicence._to_json (contract v27, §1c and §1d).
-        let declared: Declared = serde_json::from_value(serde_json::json!({
-            "catalogue": {"datasets": [{
-                "key": "rates", "vendor": "ECB", "modes": ["pull"],
-                "licence_default": {
-                    "kept": true, "retention_days": 0, "derived_use": true,
-                    "derived_use_terms": "not_restricted", "display": true,
-                    "default_fields": [], "personal_use": false,
-                    "redistribution": "allowed_with_attribution",
-                    "attribution_required": true,
-                    "attribution_text": "Source: ECB statistics",
-                    "copyright_class": "copyright_citation_required",
-                    "no_more_restrictive_terms": true,
-                    "not_affiliated_notice": "Not affiliated with or endorsed by the ECB."
-                }
-            }]}
-        }))
-        .unwrap();
-        let declaration = from_json(&declared).unwrap();
-        let licence = declaration.catalogue.as_ref().unwrap().datasets[0]
-            .licence_default
-            .clone()
-            .unwrap();
-        assert_eq!(
-            licence.redistribution,
-            Redistribution::AllowedWithAttribution as i32
-        );
-        assert!(licence.attribution_required && licence.no_more_restrictive_terms);
-        assert_eq!(licence.attribution_text, "Source: ECB statistics");
-        assert_eq!(
-            licence.not_affiliated_notice,
-            "Not affiliated with or endorsed by the ECB."
-        );
-        assert_eq!(
-            licence.copyright_class,
-            CopyrightClass::CopyrightCitationRequired as i32
-        );
-        // Printed back by the same words, so a second read is the same.
-        let back = to_json(&declaration);
-        let printed = &back["catalogue"]["datasets"][0]["licence_default"];
-        assert_eq!(printed["redistribution"], "allowed_with_attribution");
-        assert_eq!(printed["copyright_class"], "copyright_citation_required");
-        let again: Declared = serde_json::from_value(back).unwrap();
-        assert_eq!(from_json(&again).unwrap(), declaration);
-        // The enums' names read as their words; anything else is refused.
-        let mut named = declared.clone();
-        named.catalogue.as_mut().unwrap().datasets[0]
-            .licence_default
-            .as_mut()
-            .unwrap()
-            .copyright_class = "COPYRIGHT_CLASS_PUBLIC_DOMAIN".into();
-        assert_eq!(
-            from_json(&named).unwrap().catalogue.unwrap().datasets[0]
-                .licence_default
-                .as_ref()
-                .unwrap()
-                .copyright_class,
-            CopyrightClass::PublicDomain as i32
-        );
-        let mut bad = declared.clone();
-        bad.catalogue.as_mut().unwrap().datasets[0]
-            .licence_default
-            .as_mut()
-            .unwrap()
-            .redistribution = "sometimes".into();
-        assert!(from_json(&bad)
-            .unwrap_err()
-            .contains("licence_default.redistribution"));
-    }
-
-    /// Contract 28, amended 2026-10-31 (rulings 896 and 906): a dataset's
-    /// class of source and its terms' underlying source travel as the SDK
-    /// uploads them, so a registration carrying them matches its upload.
+    /// Contract 28, amended 2026-10-31 (ruling 906): a dataset's class of
+    /// source travels as the SDK uploads it, so a registration carrying it
+    /// matches its upload. Its terms' underlying source went with
+    /// licence_default (contract v30, ruling 1032).
     #[test]
     fn a_datasets_class_of_source_and_underlying_source_travel_as_the_sdk_uploads_them() {
         let declared: Declared = serde_json::from_value(serde_json::json!({
@@ -882,18 +599,10 @@ mod tests {
             dataset.price_source_class,
             PriceSourceClass::Composite as i32
         );
-        assert_eq!(
-            dataset.licence_default.as_ref().unwrap().underlying_source,
-            "Pyth's aggregate of its publishers"
-        );
         // Printed back by the same words, so a second read is the same.
         let back = to_json(&declaration);
         let printed = &back["catalogue"]["datasets"][0];
         assert_eq!(printed["price_source_class"], "composite");
-        assert_eq!(
-            printed["licence_default"]["underlying_source"],
-            "Pyth's aggregate of its publishers"
-        );
         let again: Declared = serde_json::from_value(back).unwrap();
         assert_eq!(from_json(&again).unwrap(), declaration);
         // Each word and the enum's name; absent or empty is not stated.
@@ -916,133 +625,5 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("catalogue.datasets[0].price_source_class"));
-    }
-
-    /// SDK 0.33.x's DatasetLicence._to_json with an eligibility (contract
-    /// v28, rulings 491 and 597), as plugin-massive declares one.
-    fn with_eligibility(eligibility: serde_json::Value) -> Declared {
-        serde_json::from_value(serde_json::json!({
-            "catalogue": {"datasets": [{
-                "key": "stocks", "vendor": "Massive", "modes": ["pull"],
-                "licence_default": {
-                    "kept": true, "retention_days": 0, "derived_use": true,
-                    "derived_use_terms": "internal_only", "display": true,
-                    "default_fields": [], "personal_use": true,
-                    "redistribution": "not_allowed",
-                    "eligibility": eligibility
-                }
-            }]}
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn a_licences_eligibility_travels_as_the_sdk_uploads_and_registers_it() {
-        let declared = with_eligibility(serde_json::json!({
-            "uses": ["personal"], "buyer_revenue_below": "1000000",
-            "buyer_revenue_at_least": null, "buyer_revenue_currency_code": "USD"
-        }));
-        let declaration = from_json(&declared).unwrap();
-        let eligibility = declaration.catalogue.as_ref().unwrap().datasets[0]
-            .licence_default
-            .as_ref()
-            .unwrap()
-            .eligibility
-            .clone()
-            .unwrap();
-        // What the SDK registers for the same declaration, its
-        // DataEligibility._wire: so the upload and the registration agree,
-        // and the sidecar does not refuse the catalogue as differing.
-        assert_eq!(
-            eligibility,
-            DataEligibility {
-                uses: vec![DataUse::Personal as i32],
-                buyer_revenue_below: Some(Decimal {
-                    high: 0,
-                    low: 1_000_000,
-                    scale: 0
-                }),
-                buyer_revenue_at_least: None,
-                buyer_revenue_currency_code: "USD".into(),
-            }
-        );
-        // Printed back by the same words, so a second read is the same.
-        let back = to_json(&declaration);
-        let printed = &back["catalogue"]["datasets"][0]["licence_default"]["eligibility"];
-        assert_eq!(printed["uses"], serde_json::json!(["personal"]));
-        assert_eq!(printed["buyer_revenue_below"], "1000000");
-        let again: Declared = serde_json::from_value(back).unwrap();
-        assert_eq!(from_json(&again).unwrap(), declaration);
-        // None stated, none carried, and none printed.
-        let mut none = declared.clone();
-        none.catalogue.as_mut().unwrap().datasets[0]
-            .licence_default
-            .as_mut()
-            .unwrap()
-            .eligibility = None;
-        let plain = from_json(&none).unwrap();
-        assert!(plain.catalogue.as_ref().unwrap().datasets[0]
-            .licence_default
-            .as_ref()
-            .unwrap()
-            .eligibility
-            .is_none());
-        assert!(
-            to_json(&plain)["catalogue"]["datasets"][0]["licence_default"]
-                .get("eligibility")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn an_eligibilitys_decimals_keep_the_scale_the_sdk_sends_and_bad_words_are_refused() {
-        let declared = with_eligibility(serde_json::json!({
-            "uses": ["DATA_USE_COMMERCIAL", "personal"],
-            "buyer_revenue_below": "2.5E+6", "buyer_revenue_at_least": "1000.50",
-            "buyer_revenue_currency_code": "USD"
-        }));
-        let eligibility = from_json(&declared).unwrap().catalogue.unwrap().datasets[0]
-            .licence_default
-            .clone()
-            .unwrap()
-            .eligibility
-            .unwrap();
-        assert_eq!(
-            eligibility.uses,
-            [DataUse::Commercial as i32, DataUse::Personal as i32]
-        );
-        // Python's Decimal("2.5E+6"): 25 * 10^5 at scale 0; "1000.50" at scale 2.
-        assert_eq!(
-            eligibility.buyer_revenue_below,
-            Some(Decimal {
-                high: 0,
-                low: 2_500_000,
-                scale: 0
-            })
-        );
-        assert_eq!(
-            eligibility.buyer_revenue_at_least,
-            Some(Decimal {
-                high: 0,
-                low: 100_050,
-                scale: 2
-            })
-        );
-        assert_eq!(
-            wire_decimal("1E-7"),
-            Some(Decimal {
-                high: 0,
-                low: 1,
-                scale: 7
-            })
-        );
-        let refused = from_json(&with_eligibility(serde_json::json!({"uses": ["anyone"]})));
-        assert!(refused
-            .unwrap_err()
-            .contains("licence_default.eligibility.uses[0]"));
-        let refused = from_json(&with_eligibility(
-            serde_json::json!({"uses": [], "buyer_revenue_below": "lots"}),
-        ));
-        assert!(refused.unwrap_err().contains("buyer_revenue_below"));
     }
 }

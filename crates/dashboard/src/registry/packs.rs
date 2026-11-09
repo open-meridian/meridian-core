@@ -270,33 +270,11 @@ pub fn pack_state_key(status: &PackStatus) -> &'static str {
 }
 
 /// A member's terms access basis (requirement 17, ruling 356): "Licensed"
-/// where any dataset it declares is licensed, "Open" where every one is open
-/// or public domain, nothing where it declares none.
-pub fn access_basis(version: &ListedVersion) -> &'static str {
-    use meridian_pb::v1::AccessBasis;
-    let bases: Vec<i32> = version
-        .metadata
-        .as_ref()
-        .and_then(|m| m.declaration.as_ref())
-        .and_then(|d| d.catalogue.as_ref())
-        .map(|c| {
-            c.datasets
-                .iter()
-                .filter_map(|d| d.licence_default.as_ref().map(|l| l.access_basis))
-                .collect()
-        })
-        .unwrap_or_default();
-    if bases.contains(&(AccessBasis::Licensed as i32)) {
-        "Licensed"
-    } else if !bases.is_empty()
-        && bases
-            .iter()
-            .all(|b| *b == AccessBasis::Open as i32 || *b == AccessBasis::PublicDomain as i32)
-    {
-        "Open"
-    } else {
-        ""
-    }
+/// or "Open" as its datasets' declared default terms said, until contract
+/// v30 retired them (ruling 1032): a catalogue now describes its terms in
+/// words (terms_and_pricing), so no basis is read from it and none is shown.
+pub fn access_basis(_version: &ListedVersion) -> &'static str {
+    ""
 }
 
 fn members_of(pack: &PluginPack) -> &[PackMember] {

@@ -536,6 +536,9 @@ impl Bus {
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),
             account_scope_applies: stamp.account_scope.is_some(),
+            // Contract v30's read_after (W4.4): set from a plugin's read by
+            // core's stage B (step 3c); unset reads from the nearest member.
+            read_after: None,
         }
     }
 }

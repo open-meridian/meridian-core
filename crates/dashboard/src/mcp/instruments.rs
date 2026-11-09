@@ -1036,6 +1036,10 @@ fn value_json(value: &InstrumentValue) -> Value {
         Some(instrument_value::Value::BinaryEventContract(c)) => {
             json!({"binary_event_contract": contract_json(c)})
         }
+        // Contract v30 (ruling 433): a bond's terms as a value.
+        Some(instrument_value::Value::Bond(b)) => {
+            json!({"bond": meridian_domain::debt::bond_json(b)})
+        }
         None => json!({}),
     };
     out["source"] = value.source.clone().into();

@@ -770,11 +770,6 @@ mod tests {
                     vendor: "Coinbase".into(),
                     data_types: vec![lake::PRICE.into(), lake::BAR.into()],
                     modes: vec![ObservationMode::Pull as i32],
-                    licence_default: Some(DatasetLicence {
-                        kept: true,
-                        personal_use,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }),
                 unconverted_count: 2,
@@ -783,7 +778,14 @@ mod tests {
                 outside_coverage_count: 1,
                 ..Default::default()
             }],
-            licences: vec![],
+            // The deployment's licence (contract v30 retired a catalogue's
+            // licence_default, ruling 1032).
+            licences: vec![DatasetLicence {
+                dataset: "coinbase-1:daily".into(),
+                kept: true,
+                personal_use,
+                ..Default::default()
+            }],
             entitlements: vec![DatasetEntitlement {
                 dataset: "coinbase-1:daily".into(),
                 instance: crate::tickets::tests::OPS.into(),
@@ -843,11 +845,7 @@ mod tests {
         let mut reply = listed(false);
         let declaration = reply.datasets[0].declaration.as_mut().unwrap();
         declaration.price_source_class = meridian_pb::v1::PriceSourceClass::Composite as i32;
-        declaration
-            .licence_default
-            .as_mut()
-            .unwrap()
-            .underlying_source = "Pyth's aggregate of its publishers".into();
+        reply.licences[0].underlying_source = "Pyth's aggregate of its publishers".into();
         let body = page(
             &Ok(reply),
             &Ok(ListSourcePrioritiesReply::default()),
