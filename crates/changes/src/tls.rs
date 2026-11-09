@@ -11,6 +11,12 @@
 //! names no `sslmode` connects as it always has, in the clear, and one that
 //! names one is held to it, the server verified against the public roots.
 //!
+//! A database somebody else runs under a private CA (ruled 2026-11-08): the
+//! chart's `database.caSecret` names a Secret holding that CA, mounted at
+//! [`DATABASE_CA_VAR`]; with it, every connection to the database is over
+//! TLS or not at all, the server verified against that CA and the name
+//! connected to (libpq's verify-full).
+//!
 //! One connector, cached for the process, rather than one per call site: the
 //! stores, the dashboard, the probe and the Jobs each open the same database
 //! the same way.
@@ -22,6 +28,10 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 /// Where the chart puts the internal CA's certificate, when
 /// `tls.internal.enabled` is on: a PEM file of one or more certificates.
 pub const CA_VAR: &str = meridian_bus::INTERNAL_TLS_CA;
+
+/// Where the chart puts an external database's private CA, when
+/// `database.caSecret` names one: a PEM file of one or more certificates.
+pub const DATABASE_CA_VAR: &str = "MERIDIAN_DATABASE_CA";
 
 /// A server's own certificate chain and key, where a component serves TLS
 /// itself (a sidecar's front door): PEM files.
@@ -36,6 +46,13 @@ pub type DatabaseTls = MakeRustlsConnect;
 /// The internal CA's file, when internal TLS is on.
 pub fn internal_ca() -> Option<String> {
     std::env::var(CA_VAR)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+}
+
+/// The external database's private CA's file, when the chart names one.
+pub fn database_ca() -> Option<String> {
+    std::env::var(DATABASE_CA_VAR)
         .ok()
         .filter(|path| !path.trim().is_empty())
 }
@@ -85,7 +102,8 @@ pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// A client's TLS configuration: the internal CA where internal TLS is on,
-/// the public roots otherwise.
+/// the public roots otherwise; and an external database's private CA beside
+/// either, where the chart names one.
 pub fn client_config() -> Result<rustls::ClientConfig, String> {
     let roots = match internal_roots()? {
         Some(roots) => roots,
@@ -93,6 +111,27 @@ pub fn client_config() -> Result<rustls::ClientConfig, String> {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         },
     };
+    config_with(roots, database_ca().as_deref())
+}
+
+/// A client's TLS configuration from `roots`, with the certificates in
+/// `database_ca` beside them.
+pub fn config_with(
+    mut roots: rustls::RootCertStore,
+    database_ca: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+    if let Some(path) = database_ca {
+        let mut added = 0;
+        for certificate in certificates(path)? {
+            roots
+                .add(certificate)
+                .map_err(|failed| format!("the database's CA at {path} is not one: {failed}"))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!("the database's CA at {path} holds no certificate"));
+        }
+    }
     Ok(rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|failed| failed.to_string())?
@@ -108,14 +147,15 @@ pub fn database_tls() -> Result<DatabaseTls, std::io::Error> {
         .map_err(std::io::Error::other)
 }
 
-/// The `sslmode` a connection is held to. With internal TLS on, `require`:
-/// TLS or no connection, the server verified. Off, a URL that names a mode
+/// The `sslmode` a connection is held to. With internal TLS on, or an
+/// external database's CA named, `require`: TLS or no connection, the server
+/// verified against the CA and by its name. Otherwise a URL that names a mode
 /// keeps it, and one that does not connects in the clear as before (the
 /// driver's own default, `prefer`, would try TLS against any server that
 /// offers it, which this connector, unlike `NoTls`, would then hold to a
 /// certificate).
 pub fn database_tls_mode(config: &mut postgres::Config, named: bool) {
-    if internal() {
+    if internal() || database_ca().is_some() {
         config.ssl_mode(postgres::config::SslMode::Require);
     } else if !named {
         config.ssl_mode(postgres::config::SslMode::Disable);
@@ -177,6 +217,35 @@ mod tests {
         let mut named: postgres::Config = "postgres://a@b/c?sslmode=require".parse().unwrap();
         database_tls_mode(&mut named, true);
         assert_eq!(named.get_ssl_mode(), postgres::config::SslMode::Require);
+    }
+
+    /// A self-signed CA made for this test alone, its key thrown away.
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBeDCCAR6gAwIBAgIUGQBkycjDx48xA4hMWMZrJt9431UwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWZGIuZXhhbXBsZS5pbnRlcm5hbCBDQTAgFw0yNjExMDgyMTA5
+MDdaGA8yMTI2MTAxNTIxMDkwN1owITEfMB0GA1UEAwwWZGIuZXhhbXBsZS5pbnRl
+cm5hbCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAUkc8gi7U1P1NmYOENS
+1MB1YoOndLH269MqTmKYLkv2rbtXuc4q2AYVAPF6jEv5tKyjNnRc+INMw9NAUlgm
+Fj+jMjAwMB0GA1UdDgQWBBR7Hx9Qzr5TrXS5SoIJnRA+LLXx+DAPBgNVHRMBAf8E
+BTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCTkeL63SnUpzerOhKUJyWHWIUp2Nys
++KdnbiCEBy9xUwIgb8kR7J2o+DvNS1v1qlpmR7giLlxS3DhMA/LyIMnXkyo=
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn an_external_databases_ca_is_trusted_beside_the_roots() {
+        let dir = std::env::temp_dir().join(format!("meridian-database-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.crt");
+        std::fs::write(&path, TEST_CA).unwrap();
+        let empty = dir.join("empty.crt");
+        std::fs::write(&empty, "").unwrap();
+        let roots = || rustls::RootCertStore::empty();
+        assert!(config_with(roots(), Some(path.to_str().unwrap())).is_ok());
+        let said = config_with(roots(), Some(empty.to_str().unwrap())).unwrap_err();
+        assert!(said.contains("holds no certificate"), "{said}");
+        assert!(config_with(roots(), None).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

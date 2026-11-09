@@ -622,6 +622,9 @@ E2E_CLUSTER_NAMESPACE ?= meridian-e2e
 E2E_EXTERNAL_CONTAINER ?= meridian-e2e-database
 E2E_EXTERNAL_PORT ?= 15440
 E2E_EXTERNAL_PASSWORD ?= e2e-dev-only
+# The name the cluster reaches it by, which its certificate carries.
+E2E_EXTERNAL_HOST ?= host.docker.internal
+E2E_EXTERNAL_CA ?=
 # Its own name: E2E_DB_ROUTE is the compose run's and defaults to `external`
 # there, so sharing it would have made `make e2e-cluster` quietly take the
 # route nobody asked it for.
@@ -684,6 +687,7 @@ e2e-cluster: network runtime-image analytics-image
 	 E2E_UPGRADE_FROM=$(E2E_UPGRADE_FROM) E2E_UPGRADE_VERSION=$(E2E_UPGRADE_VERSION) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
 	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) E2E_CLUSTER_HTTP_PORT=$(E2E_CLUSTER_HTTP_PORT) \
+	 E2E_EXTERNAL_HOST=$(E2E_EXTERNAL_HOST) E2E_EXTERNAL_CA=$(E2E_EXTERNAL_CA) \
 		$(PY) e2e/cluster/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
@@ -700,12 +704,27 @@ e2e-cluster: network runtime-image analytics-image
 # managed one from a cloud and one in Docker all look like from in here: a
 # host and a port with two roles already on it. The roles are made before any
 # of this, by the statements a firm's database administrator would run, which
-# is the half of this route the deployment never does.
+# is the half of this route the deployment never does. It serves TLS under a
+# private CA made now and trusted by nothing, which the deployment is given
+# in database.caSecret (ruled 2026-11-08) and verifies the server against,
+# by the name it is reached at.
 e2e-cluster-external:
 	@docker rm -f $(E2E_EXTERNAL_CONTAINER) >/dev/null 2>&1 || true
+	@rm -rf .e2e-external-tls && mkdir -p .e2e-external-tls
+	@docker run --rm --entrypoint sh -v "$(CURDIR)/.e2e-external-tls":/ca -w /ca alpine/openssl:3.3.2 -c '\
+		openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=A private CA" -keyout ca.key -out ca.crt && \
+		openssl req -newkey rsa:2048 -nodes -subj "/CN=$(E2E_EXTERNAL_HOST)" -keyout server.key -out server.csr && \
+		printf "subjectAltName=DNS:$(E2E_EXTERNAL_HOST)\n" > ext.cnf && \
+		openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile ext.cnf -out server.crt && \
+		chmod 644 server.key' >/dev/null 2>&1
 	@docker run -d --name $(E2E_EXTERNAL_CONTAINER) \
 		-e POSTGRES_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
-		-p $(E2E_EXTERNAL_PORT):5432 postgres:16-alpine >/dev/null
+		-v "$(CURDIR)/.e2e-external-tls":/tls:ro --entrypoint sh \
+		-p $(E2E_EXTERNAL_PORT):5432 postgres:16-alpine -c '\
+		mkdir -p /run/tls && cp /tls/server.crt /tls/server.key /run/tls/ && \
+		chown postgres /run/tls/server.crt /run/tls/server.key && chmod 0600 /run/tls/server.key && \
+		exec docker-entrypoint.sh postgres -c ssl=on \
+			-c ssl_cert_file=/run/tls/server.crt -c ssl_key_file=/run/tls/server.key' >/dev/null
 	@# Over TCP, not the socket. The image initialises behind a server that
 	@# listens on its socket alone, says ready there, and then restarts; a
 	@# check on the socket passes during that first one, and the statements
@@ -721,7 +740,8 @@ e2e-cluster-external:
 		-c "grant usage on schema public to meridian_app, meridian_migrate" \
 		-c "grant create on schema public to meridian_migrate" \
 		-c "revoke create on schema public from meridian_app, public" >/dev/null
-	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_ROUTE=external; \
+	@$(MAKE) --no-print-directory e2e-cluster E2E_CLUSTER_ROUTE=external \
+		E2E_EXTERNAL_CA="$(CURDIR)/.e2e-external-tls/ca.crt"; \
 	  held=$$?; \
 	  docker rm -f $(E2E_EXTERNAL_CONTAINER) >/dev/null 2>&1 || true; \
 	  exit $$held
@@ -2793,6 +2813,20 @@ chart-check:
 		&& { echo "chart-check FAILED: Patroni's REST API is given TLS with internal TLS off" >&2; exit 1; }; \
 	echo "$$plain" | grep -qF 'value: "$$(POD_IP):8008"' \
 		|| { echo "chart-check FAILED: without internal TLS Patroni's members no longer reach each other by address" >&2; exit 1; }
+	@# An external database's private CA (database.caSecret, ruled
+	@# 2026-11-08): its Secret's ca.crt mounted, and named to the runtime,
+	@# in every pod that connects to the database -- the five stores, the
+	@# dashboard, the migration's six containers, the preflight and the
+	@# first run -- and in none by default.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	ca="$$($(HELM_TEMPLATE) check deploy/chart $$base --set database.caSecret=db-ca 2>/dev/null)" \
+		|| { echo "chart-check FAILED: database.caSecret=db-ca did not render" >&2; exit 1; }; \
+	[ "$$(echo "$$ca" | grep -c 'name: MERIDIAN_DATABASE_CA$$')" = 14 ] \
+		|| { echo "chart-check FAILED: $$(echo "$$ca" | grep -c 'name: MERIDIAN_DATABASE_CA$$') containers are told the database's CA, not 14" >&2; exit 1; }; \
+	[ "$$(echo "$$ca" | grep -c 'secretName: "db-ca"')" = 9 ] \
+		|| { echo "chart-check FAILED: $$(echo "$$ca" | grep -c 'secretName: "db-ca"') pods mount the database's CA, not 9" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q "database-ca" \
+		&& { echo "chart-check FAILED: a database's CA is mounted with database.caSecret empty" >&2; exit 1; }; true
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs
 	@# nothing until the CLI makes a Job from it. On: the database archives

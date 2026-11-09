@@ -71,6 +71,9 @@ EXTERNAL_HOST = os.environ.get("E2E_EXTERNAL_HOST", "host.docker.internal")
 EXTERNAL_PORT = os.environ.get("E2E_EXTERNAL_PORT", "15440")
 EXTERNAL_CONTAINER = os.environ.get("E2E_EXTERNAL_CONTAINER", "meridian-e2e-database")
 EXTERNAL_PASSWORD = os.environ.get("E2E_EXTERNAL_PASSWORD", "e2e-dev-only")
+# The external database's private CA, where it serves TLS under one: given to
+# the deployment in a Secret named by database.caSecret (ruled 2026-11-08).
+EXTERNAL_CA = os.environ.get("E2E_EXTERNAL_CA", "")
 
 # How people sign in, which is the other half of what the wizard asks. The
 # database route and this are independent: each branch is the same install
@@ -623,6 +626,12 @@ def main():
             "--set", f"deployment.enrolmentCode={enrolment_code}",
             "--set", f"platform.address={PLATFORM_FROM_POD}",
         ]
+        if ROUTE != "brought" and EXTERNAL_CA:
+            # The firm's database under its own CA: the CA in a Secret of
+            # the firm's, named to the chart.
+            run("kubectl", "--namespace", NAMESPACE, "create", "secret", "generic",
+                "e2e-database-ca", f"--from-file=ca.crt={EXTERNAL_CA}")
+            values += ["--set", "database.caSecret=e2e-database-ca"]
         chart = [CHART]
         if UPGRADE_FROM:
             # The published chart, with the image it was published beside:
@@ -754,6 +763,22 @@ def main():
             kubectl("get", "pods", "-l", "meridian.dev/component=database", "--no-headers") == "",
             "the Postgres this chart could have brought was left at zero, unasked for",
         )
+    if ROUTE != "brought" and EXTERNAL_CA:
+        # Every connection the deployment holds to it is over TLS, verified
+        # against the CA it was given by the name it reached the server at;
+        # none in the clear.
+        def counted():
+            said = psql(
+                "select count(*) filter (where s.ssl) || '|' || count(*) filter (where not s.ssl) "
+                "from pg_stat_activity a join pg_stat_ssl s using (pid) "
+                "where a.usename like 'meridian\\_%' and a.client_addr is not null")
+            return said if said and not said.startswith("0|") else ""
+
+        wait_for("the deployment's connections to the external database", counted, seconds=120)
+        secured, clear = (int(n) for n in counted().split("|"))
+        s.check(secured > 0 and clear == 0,
+                f"the external database under a private CA: {secured} connections over TLS, "
+                f"verified by database.caSecret's CA, {clear} in the clear")
     roles = psql("select rolname from pg_roles where rolname like 'meridian\\_%'")
     s.note(f"roles: {roles.split()}")
     s.check(

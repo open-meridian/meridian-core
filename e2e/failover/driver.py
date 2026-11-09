@@ -366,7 +366,12 @@ class Book:
             done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
                 account_id=account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
                 quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
-                time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY,
+                # Good till cancelled, never a day order: an unreleased day
+                # order expires at the deployment's day end, a change of its
+                # own, and the reads below order the list by each order's
+                # last change -- a run crossing midnight read its lists
+                # reordered (CI run 42536769361). Nothing else changes these.
+                time_in_force=ops.TimeInForce.TIME_IN_FORCE_GOOD_TILL_CANCELLED,
                 venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
                 idempotency_key=f"drive-{number}", acting_for=self.person.assertion())))
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
@@ -480,7 +485,8 @@ class Desk:
 
     async def place(self, number, order_id):
         done = await bounded(self.stub.CreatePlacement(ops.CreatePlacementParams(
-            order_id=order_id, quantity=decimal("1"), time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY,
+            order_id=order_id, quantity=decimal("1"),
+            time_in_force=ops.TimeInForce.TIME_IN_FORCE_GOOD_TILL_CANCELLED,
             placement_type=ops.PlacementType.PLACEMENT_TYPE_MANUAL, destination=VENUE,
             idempotency_key=f"desk-place-{number}", acting_for=self.person.assertion())))
         say(f"PLACED {done.placement.placement_id} {order_id}")
@@ -499,7 +505,10 @@ class Desk:
                 done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
                     account_id=self.account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
                     quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
-                    time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY, venue_order_id=str(number),
+                    # Good till cancelled, as the book's appends: a day
+                    # order and its placement end at the day's end.
+                    time_in_force=ops.TimeInForce.TIME_IN_FORCE_GOOD_TILL_CANCELLED,
+                    venue_order_id=str(number),
                     origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED, idempotency_key=f"desk-{number}",
                     acting_for=self.person.assertion())))
                 acked("order", done.order.order_id)

@@ -51,6 +51,13 @@ database:
   # deployment waiting at its wizard rather than a failed release.
   existingSecret: ""
   key: url
+  # A Secret holding the private CA of a database somebody else runs, at
+  # its `ca.crt` (ruled 2026-11-08): every connection to the database is
+  # then over TLS or not at all, its server verified against that CA by the
+  # name in the URL (sslmode verify-full). Empty, a database somebody else
+  # runs is verified against the public roots, or the internal CA where
+  # tls.internal is on.
+  caSecret: ""
 
   # A Postgres this chart can bring, for evaluating the product and for a
   # laptop. Rendered at zero replicas: until somebody chooses it in the

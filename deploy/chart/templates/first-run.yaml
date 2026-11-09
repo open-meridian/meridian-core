@@ -186,12 +186,15 @@ spec:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.tls.internal.enabled }}
+          {{- if or .Values.tls.internal.enabled .Values.database.caSecret }}
           volumeMounts:
             {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaMount" $) }}{{ . | nindent 12 }}{{- end }}
       volumes:
         {{- with (include "meridian-runtime.internalTlsVolume" $) }}{{ . | nindent 8 }}{{- end }}
+        {{- with (include "meridian-runtime.databaseCaVolume" $) }}{{ . | nindent 8 }}{{- end }}
           {{- end }}
 {{- end }}

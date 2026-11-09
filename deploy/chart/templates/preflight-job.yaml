@@ -143,7 +143,8 @@ spec:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
-          {{- if or (and $backups $b.path) .Values.tls.internal.enabled }}
+            {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
+          {{- if or (and $backups $b.path) .Values.tls.internal.enabled .Values.database.caSecret }}
           volumeMounts:
             {{- if and $backups $b.path }}
             - name: backups
@@ -151,10 +152,11 @@ spec:
               readOnly: true
             {{- end }}
             {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaMount" $) }}{{ . | nindent 12 }}{{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if or (and $backups $b.path) .Values.tls.internal.enabled }}
+      {{- if or (and $backups $b.path) .Values.tls.internal.enabled .Values.database.caSecret }}
       volumes:
         {{- if and $backups $b.path }}
         {{/* Only the chart's own backup volume, a node directory every pod
@@ -166,5 +168,6 @@ spec:
             readOnly: true
         {{- end }}
         {{- with (include "meridian-runtime.internalTlsVolume" $) }}{{ . | nindent 8 }}{{- end }}
+        {{- with (include "meridian-runtime.databaseCaVolume" $) }}{{ . | nindent 8 }}{{- end }}
       {{- end }}
 {{- end }}

@@ -296,6 +296,7 @@ spec:
                   readOnly: true
                 {{- end }}
                 {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 16 }}{{- end }}
+                {{- with (include "meridian-runtime.databaseCaMount" .) }}{{ . | nindent 16 }}{{- end }}
               resources:
                 requests:
                   cpu: 50m
@@ -367,4 +368,5 @@ spec:
                 optional: true
             {{- end }}
             {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaVolume" .) }}{{ . | nindent 12 }}{{- end }}
 {{- end }}
