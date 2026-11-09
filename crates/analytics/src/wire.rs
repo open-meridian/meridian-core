@@ -294,5 +294,8 @@ pub fn job_answer(job_id: &str, answer: &Answer) -> Result<JobAnswer, String> {
         provenance: Some(provenance(&answer.provenance)),
         // Whole: the coordinator pages it as it is read (ruling 794).
         next_cursor: String::new(),
+        // Contract v30: a standing job's values, filled and paged by core's
+        // stage A (step 3c); a one-off job's answer carries none.
+        values: Vec::new(),
     })
 }

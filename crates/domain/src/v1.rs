@@ -19571,6 +19571,13 @@ pub struct JobAnswer {
     /// (contract v28's amendment, ruling 794).
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
+    /// Contract v30 (W12.4; approved 2026-11-09): a standing job's figures keyed
+    /// by subject and series, each as DerivedSeriesUpdatedEvent.values carries
+    /// it, set only for a standing job, so a catch-up after a gap or a loss
+    /// marker returns what the events carry. Paged after the figures, before
+    /// what was not evaluated. None for a one-off job.
+    #[prost(message, repeated, tag = "6")]
+    pub values: ::prost::alloc::vec::Vec<DerivedSeries>,
 }
 /// One figure (requirement 5; the first release's Q13 and Q14).
 #[derive(Clone, PartialEq, ::prost::Message)]

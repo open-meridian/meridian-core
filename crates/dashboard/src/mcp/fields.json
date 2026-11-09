@@ -943,6 +943,19 @@
       "store": "analytics"
     },
     {
+      "name": "meridian.v1.JobAnswer.values",
+      "type": "repeated message DerivedSeries",
+      "empty": "none for a one-off job, and for a standing job none of whose figures is keyed by subject and series",
+      "intent": "carries a standing job's figures keyed by subject and series, as its events carry them (W12.4; contract v30, approved 2026-11-09)",
+      "meaning": "each a DerivedSeries as DerivedSeriesUpdatedEvent.values carries it -- its rule the definition and version, its inputs the datasets and the as-of each was read at -- set only for a standing job, so a catch-up after a gap or a loss marker returns what the events carry; read in ReadJobAnswer's pages, the figures first, then these, then what was not evaluated",
+      "not_meaning": "a recorded row: published, never recorded; or a one-off job's figures, which figures carries",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v30",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
       "name": "meridian.v1.JobAnswer.next_cursor",
       "type": "text",
       "empty": "empty when nothing follows, and on an answer given inline, which is always whole",
@@ -27566,10 +27579,10 @@
       "type": "message Watermark",
       "empty": "unset: the nearest member answers, eventually consistent, its watermark saying how current",
       "intent": "names the watermark a read must not be answered behind (W4.4; approved by 1057)",
-      "meaning": "the watermark of the plugin's last act or delivery on the store's partitions, which the SDK sets; a member behind it waits up to its bound, then hands the read to the writer, and never answers from behind it",
-      "not_meaning": "a point in time to read as of, which as_of_ns and book_at name; or a demand to read from the writer: a member at or past it answers",
-      "filled": "as-reported",
-      "filled_by": "plugin",
+      "meaning": "the highest watermark the plugin's sidecar has seen for that instance on the store's partitions, from its own acknowledged writes and the deliveries it passed on, stamped by the sidecar, never by the plugin (approved 2026-11-09): session consistency, read-your-writes and monotonic reads for the instance; a member behind it waits up to its bound, then hands the read to the writer, and never answers from behind it",
+      "not_meaning": "a point in time to read as of, which as_of_ns and book_at name; a plugin-facing field; or a demand to read from the writer: a member at or past it answers",
+      "filled": "stamped",
+      "filled_by": "sidecar",
       "since": "v30",
       "stability": "preview",
       "store": "envelope"
