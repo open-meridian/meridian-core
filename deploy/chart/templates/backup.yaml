@@ -53,9 +53,13 @@
 {{- $chart = concat $chart (list (printf "%s-broker" $full) (printf "%s-broker-passwords" $full) (printf "%s-broker-launched" $full)) }}
 {{- end }}
 {{/* The administrator's own, named in these values: theirs to have made, and
-     a restore needs them as much as the chart's. */}}
+     a restore needs them as much as the chart's -- a pod naming a Secret
+     that is not there does not start, as a restored release's did with
+     database.caSecret's left behind (#105). Every Secret a value names is
+     here; chart-check holds the list to the templates. */}}
 {{- $archive := include "meridian-runtime.walArchive" . }}
-{{- $operator := list (ternary ((.Values.backup.walArchive | default dict).cipherSecret | default "") "" (not (empty $archive))) .Values.database.existingSecret .Values.migrate.existingSecret .Values.migrate.streetSecret .Values.migrate.configSecret .Values.migrate.borSecret .Values.migrate.lakeSecret .Values.conductor.database.existingSecret .Values.street.database.existingSecret .Values.bor.database.existingSecret .Values.lake.database.existingSecret .Values.broker.existingSecret .Values.firstRun.directorySecretName .Values.dashboard.oidc.existingSecret .Values.key.existingSecret .Values.ingress.tls.secretName .Values.ingress.tls.pluginsSecretName }}
+{{- $w := .Values.backup.walArchive | default dict }}
+{{- $operator := list (ternary ($w.cipherSecret | default "") "" (not (empty $archive))) (ternary ($w.existingSecret | default "") "" (not (empty $archive))) .Values.database.existingSecret .Values.database.caSecret .Values.deployment.enrolmentCodeSecret .Values.migrate.existingSecret .Values.migrate.streetSecret .Values.migrate.configSecret .Values.migrate.borSecret .Values.migrate.lakeSecret .Values.conductor.database.existingSecret .Values.street.database.existingSecret .Values.bor.database.existingSecret .Values.lake.database.existingSecret .Values.broker.existingSecret .Values.firstRun.directorySecretName .Values.dashboard.oidc.existingSecret .Values.key.existingSecret .Values.ingress.tls.secretName .Values.ingress.tls.pluginsSecretName }}
 {{- range .Values.sidecars }}
 {{- with .plugin }}
 {{- $operator = append $operator (.existingSecret | default "") }}

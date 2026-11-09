@@ -17,8 +17,13 @@
 #                     volume, once it is shut down cleanly (started and
 #                     stopped once if it was not). Proportional to its size.
 #
-# Under Patroni the CLI runs it on the primary's volume, member 0's, the
-# primary switched there first, and makes the standbys again from it after.
+# Under Patroni the CLI runs it on member 0's volume. For enable-checksums it
+# switches the primary to member 0 first; restore-to-time does not switch
+# the primary first -- every member is stopped, and the archive, not a
+# member, is what is restored from. After either act the CLI deletes the
+# standbys' volumes, which Patroni makes again from member 0, and after a
+# restore it clears Patroni's leader, sync and failover records, which name
+# the primary and the position from before it.
 # Never prints the passphrase, a credential or a row.
 set -eu
 say() { echo "database-offline: $*"; }
@@ -38,8 +43,12 @@ chown postgres:postgres /tmp/pgbackrest /var/run/postgresql
 
 # The database as it starts here: on its socket alone, and archiving as it
 # does in its pod where the archive is on, so no segment it completes is
-# recycled unarchived.
-options="-c listen_addresses='' -c unix_socket_directories=/var/run/postgresql"
+# recycled unarchived. Without TLS: a socket needs none, and the
+# configuration a base backup restores -- Patroni's, under internal TLS
+# (tls.internal) -- names the certificates its pod copies to /run/meridian-
+# tls, which this Job has not got, and Postgres will not start on a
+# certificate it cannot load.
+options="-c listen_addresses='' -c unix_socket_directories=/var/run/postgresql -c ssl=off"
 if [ -n "$archive" ]; then
 	options="$options -c archive_mode=on -c archive_command='pgbackrest --stanza=meridian archive-push %p'"
 fi

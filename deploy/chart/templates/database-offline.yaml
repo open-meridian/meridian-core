@@ -16,9 +16,16 @@
   It holds no RBAC and changes nothing in the cluster: what changes the
   cluster is the person's, with their own rights (decisions/016).
 
-  On member 0's volume: under Patroni the CLI makes member 0 the primary
-  first, and after the act deletes the standbys' volumes, which Patroni
-  makes again from it.
+  On member 0's volume. Under Patroni the CLI makes member 0 the primary
+  first for enable-checksums; restore-to-time does not switch the primary
+  first, since every member is stopped and the archive is restored from,
+  not a member. After either act it deletes the standbys' volumes, which
+  Patroni makes again from member 0, and after a restore it clears
+  Patroni's leader, sync and failover records, which name the primary and
+  the position from before it. The act starts the database on its socket
+  alone and without TLS (files/database-offline.sh): the configuration a
+  base backup restores can name internal TLS's certificates, which only
+  the database's own pods hold.
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-database" $full }}

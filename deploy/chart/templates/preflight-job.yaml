@@ -17,7 +17,12 @@
   40423226625); and because a database member just made answers nobody
   through its Service until it is ready, as after the upgrade that moves the
   database under Patroni; every component waits for its database the same way.
-  Its pod carries the release's labels, which that policy admits. Its report
+  Its pod carries the release's labels, which that policy admits. It
+  connects as the database serves now, over internal TLS only where the
+  server serves it today (databaseServesTls in _helpers.tpl): an upgrade
+  turning internal TLS on had it mount a CA that the same upgrade makes
+  after this hook, so it waited on the mount until it failed, and would
+  then have asked TLS of a server offering none yet. Its report
   is one JSON object, the last line of its log: a blocked run's Job stays
   until the next upgrade's hook replaces it, so why it stopped can be read;
   one that passed goes when it succeeds, as every hook here does.
@@ -33,7 +38,20 @@
   person.
 */}}
 {{- $b := .Values.backup | default dict }}
-{{- $backups := and $b.recipient (or $b.path $b.existingClaim) }}
+{{- /* Backups as they are now, as internal TLS below: where a cluster
+       answers (every namespace has its `default` ServiceAccount), only if
+       their claim is there already -- an upgrade turning backups on makes
+       it after this hook, which would wait on mounting it as on the CA,
+       and finds none written yet. With nothing to ask (`helm template`),
+       as the values say. */}}
+{{- $claimNow := true }}
+{{- if lookup "v1" "ServiceAccount" .Release.Namespace "default" }}
+{{- $claimNow = lookup "v1" "PersistentVolumeClaim" .Release.Namespace ($b.existingClaim | default (printf "%s-backup" (include "meridian-runtime.fullname" .))) }}
+{{- end }}
+{{- $backups := and $b.recipient (or $b.path $b.existingClaim) $claimNow }}
+{{- /* Internal TLS as the database serves it now, not as this upgrade
+       will make it (see above). */}}
+{{- $tls := dict "top" . "on" (include "meridian-runtime.databaseServesTls" . | eq "true") }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -142,21 +160,21 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
-            {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.internalTlsClientEnv" $tls) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
-          {{- if or (and $backups $b.path) .Values.tls.internal.enabled .Values.database.caSecret }}
+          {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret }}
           volumeMounts:
             {{- if and $backups $b.path }}
             - name: backups
               mountPath: /backups
               readOnly: true
             {{- end }}
-            {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.internalTlsClientMount" $tls) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaMount" $) }}{{ . | nindent 12 }}{{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if or (and $backups $b.path) .Values.tls.internal.enabled .Values.database.caSecret }}
+      {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret }}
       volumes:
         {{- if and $backups $b.path }}
         {{/* Only the chart's own backup volume, a node directory every pod
@@ -167,7 +185,7 @@ spec:
             claimName: {{ printf "%s-backup" (include "meridian-runtime.fullname" .) }}
             readOnly: true
         {{- end }}
-        {{- with (include "meridian-runtime.internalTlsVolume" $) }}{{ . | nindent 8 }}{{- end }}
+        {{- with (include "meridian-runtime.internalTlsClientVolume" $tls) }}{{ . | nindent 8 }}{{- end }}
         {{- with (include "meridian-runtime.databaseCaVolume" $) }}{{ . | nindent 8 }}{{- end }}
       {{- end }}
 {{- end }}

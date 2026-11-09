@@ -373,15 +373,15 @@ spec:
   # Once chosen, its members: the primary and database.brought.standbys
   # (step 3b), so turning the profile up or down is a scale.
   #
-  # A database turned up from alone to standbys moves under Patroni in two
-  # upgrades (step 3b part 3, found by e2e-cluster-reconfigure): the first
-  # runs member 0 alone under Patroni, which takes its existing data as the
-  # cluster's; the second adds the standbys, which clone from it. Added in
-  # the same upgrade, they started before member 0 was moved, and the first
-  # of them made a new, empty cluster that the Service then followed.
-  # The second runs once the first has rolled out: the Service routes to
-  # member 0 only once Patroni says it is ready, and a second upgrade
-  # started before then meets its preflight refused (NOTES.txt says so).
+  # The database moves under Patroni in two upgrades: this one moves member
+  # 0, alone; a second with the same values adds its standbys, which clone
+  # from it. `meridian upgrade-deployment` runs both under one approval, the
+  # second once this one has rolled out and member 0 is ready. With helm
+  # directly, wait for `kubectl rollout status statefulset/<db>` and upgrade
+  # again with the same values (NOTES.txt says so). In one upgrade, the
+  # standbys started before member 0 was moved, and the first of them made
+  # a new, empty cluster that the Service then followed (step 3b part 3,
+  # found by e2e-cluster-reconfigure).
   replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys }}{{ end }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:

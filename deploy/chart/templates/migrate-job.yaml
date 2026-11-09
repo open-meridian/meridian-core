@@ -103,6 +103,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
@@ -139,6 +140,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
@@ -171,6 +173,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
@@ -203,6 +206,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
@@ -243,6 +247,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
@@ -287,6 +292,7 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
