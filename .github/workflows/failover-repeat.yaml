@@ -142,9 +142,11 @@ jobs:
       - name: k3d
         run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-amd64" /usr/local/bin/k3d
 
+      # Reconfigure's upgrades on Helm 4, with `meridian upgrade-deployment`'s
+      # flags, as ci.yaml's e2e-cluster-reconfigure runs them.
       - uses: azure/setup-helm@v4
         with:
-          version: v3.16.2
+          version: ${{ inputs.profile == 'reconfigure' && 'v4.2.3' || 'v3.16.2' }}
 
       - name: make e2e-cluster-k3d
         working-directory: workspace/meridian-core

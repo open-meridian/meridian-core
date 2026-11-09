@@ -218,22 +218,109 @@ pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
 /// at once: the Job runs with no retries so that a failed migration stops the
 /// release rather than being tried again into it, and waiting on one would
 /// undo that.
+///
+/// And, on the database the chart brings, the server this release starts:
+/// one allowing the connections the release gives it ([`BROUGHT_DATABASE`]).
+/// An upgrade that moves that database between profiles replaces its
+/// primary after it has let its standbys go, and a migration that reached
+/// the one being replaced was cut there: on the move from ha back to
+/// tolerant, its grant waited on a synchronous standby that had gone and
+/// ended with the primary (step 3b part 6). The server that replaces it
+/// starts on the count its data was last run with, and restarts once on
+/// the lower one (files/database.sh): the count is what tells them apart.
 pub fn migrate_once_it_answers<S>(
     what: &str,
     url: &str,
     connect: impl Fn(&str) -> Result<S, String>,
     migrate: impl FnOnce(S) -> Result<(), String>,
 ) -> Result<(), String> {
+    let brought = brought_database();
     migrate_once_connected(
         what,
         MIGRATION_WAITS_AT_MOST,
         WAIT_AGAIN_AFTER,
         || {
-            database_answers(url)?;
+            database_as_released(url, brought.as_ref())?;
             connect(url).map_err(Wait::NotYet)
         },
         migrate,
     )
+}
+
+/// The database the chart brings, where it runs, and the connections this
+/// release gives it, as the chart sets them on the migration: its Service's
+/// name, `=`, the count (`<release>-meridian-runtime-database=82`).
+pub const BROUGHT_DATABASE: &str = "MERIDIAN_BROUGHT_DATABASE";
+
+/// [`BROUGHT_DATABASE`], read: the Service's name and the count.
+pub fn brought_database() -> Option<(String, u32)> {
+    let said = std::env::var(BROUGHT_DATABASE).ok()?;
+    let (name, count) = said.trim().split_once('=')?;
+    Some((name.to_string(), count.parse().ok()?)).filter(|(name, _)| !name.is_empty())
+}
+
+/// Whether `host` is the brought database's Service, `name`, by any of the
+/// names the cluster gives it (`name`, `name.<namespace>`, ... `.svc.cluster.local`).
+fn is_brought(host: &str, name: &str) -> bool {
+    host == name
+        || host
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether the server reached allows what this release gives it: `Ok` where
+/// the URL is not the brought database's or the counts agree, and why it is
+/// waited for where they do not.
+fn as_released(
+    hosts: &[String],
+    brought: Option<&(String, u32)>,
+    allows: Option<&str>,
+) -> Result<(), String> {
+    let Some((name, given)) = brought else {
+        return Ok(());
+    };
+    if !hosts.iter().any(|host| is_brought(host, name)) {
+        return Ok(());
+    }
+    match allows {
+        Some(allowed) if allowed.trim() == given.to_string() => Ok(()),
+        allowed => Err(format!(
+            "the database allows {} connections and this release gives it {given}: the server \
+             this release starts has not taken over yet",
+            allowed.unwrap_or("an unknown number of")
+        )),
+    }
+}
+
+/// [`database_answers`], and on the database the chart brings, the server
+/// this release starts ([`as_released`]): one connection, made and closed.
+fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<(), Wait> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|failed| Wait::Refused(format!("the database URL is unreadable: {failed}")))?;
+    config.connect_timeout(Duration::from_secs(5));
+    let hosts: Vec<String> = config
+        .get_hosts()
+        .iter()
+        .filter_map(|host| match host {
+            postgres::config::Host::Tcp(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let (config, tls) =
+        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
+            .map_err(|failed| Wait::Refused(format!("the database's TLS: {failed}")))?;
+    let mut client = config
+        .connect(tls)
+        .map_err(|failed| Wait::NotYet(failed.to_string()))?;
+    if as_released(&hosts, brought, None).is_ok() {
+        return Ok(());
+    }
+    let allows: String = client
+        .query_one("show max_connections", &[])
+        .map_err(|failed| Wait::NotYet(failed.to_string()))?
+        .get(0);
+    as_released(&hosts, brought, Some(&allows)).map_err(Wait::NotYet)
 }
 
 fn migrate_once_connected<S>(
@@ -1126,6 +1213,50 @@ mod tests {
             !cancelled.load(Ordering::SeqCst),
             "the loop ran on into the runtime's shutdown: its blocking work was cancelled under it"
         );
+    }
+
+    /// The migration reaches the server its release starts, on the database
+    /// the chart brings: one still allowing another release's connections is
+    /// the one being replaced (step 3b part 6, ha -> tolerant), and is
+    /// waited past; any other database is the administrator's own.
+    #[test]
+    fn a_migration_waits_for_the_brought_database_this_release_starts() {
+        let brought = ("fo-meridian-runtime-database".to_string(), 82);
+        let at = |host: &str| vec![host.to_string()];
+        let full = at("fo-meridian-runtime-database.ns.svc.cluster.local");
+        assert_eq!(
+            super::as_released(&full, Some(&brought), Some("82")),
+            Ok(())
+        );
+        assert_eq!(
+            super::as_released(
+                &at("fo-meridian-runtime-database"),
+                Some(&brought),
+                Some("82")
+            ),
+            Ok(())
+        );
+        let older = super::as_released(&full, Some(&brought), Some("213")).unwrap_err();
+        assert!(
+            older.contains("allows 213 connections") && older.contains("gives it 82"),
+            "{older}"
+        );
+        assert!(super::as_released(&full, Some(&brought), None).is_err());
+        // Not the brought database: another's, or one named like it.
+        assert_eq!(
+            super::as_released(&at("db.example.com"), Some(&brought), Some("500")),
+            Ok(())
+        );
+        assert_eq!(
+            super::as_released(
+                &at("fo-meridian-runtime-database-replica"),
+                Some(&brought),
+                Some("500")
+            ),
+            Ok(())
+        );
+        // Nothing said: no brought database running.
+        assert_eq!(super::as_released(&full, None, Some("500")), Ok(()));
     }
 
     #[test]

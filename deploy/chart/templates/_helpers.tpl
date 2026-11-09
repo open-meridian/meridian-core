@@ -724,6 +724,30 @@ found as connections refused while the new pods start. Takes the chart.
 {{- end -}}
 
 {{/*
+The brought database as this release runs it, for the migration
+(MERIDIAN_BROUGHT_DATABASE; meridian_runtime::migrate_once_it_answers): its
+Service's name and the connections this release gives it, where it runs.
+The migration waits for a server allowing that count, so it migrates on the
+server this release starts and not on one an upgrade is about to replace:
+moving from ha back to tolerant, the primary is replaced only after its
+standbys have gone, and a migration that reached it there was cut (step 3b
+part 6); its replacement starts on the count it last ran with, and restarts
+once on a lower one (files/database.sh). Nothing where the database is not brought or not running (an
+install, before first run chooses it): the migration's database is then
+another's, or none yet.
+*/}}
+{{- define "meridian-runtime.broughtDatabaseEnv" -}}
+{{- if .Values.database.brought.enabled }}
+{{- $name := printf "%s-database" (include "meridian-runtime.fullname" .) }}
+{{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
+{{- if gt (int (dig "spec" "replicas" 0 (default (dict) $live))) 0 }}
+- name: MERIDIAN_BROUGHT_DATABASE
+  value: {{ printf "%s=%s" $name (include "meridian-runtime.databaseMaxConnections" .) | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Patroni's dynamic settings for the brought database (step 3b, section 4):
 the timings set for the database tier (1048: a primary lost answered for
 within 30 s -- the leader key's 20 s, Patroni's least, then a promotion),
@@ -970,29 +994,72 @@ three beside its others. A server's certificate and key are its own pods'
 alone (internalTlsServerVolume, by server: database, broker, sidecars).
 */}}
 {{- define "meridian-runtime.internalTlsEnv" -}}
-{{- if .Values.tls.internal.enabled }}
+{{- include "meridian-runtime.internalTlsClientEnv" (dict "top" . "on" .Values.tls.internal.enabled) -}}
+{{- end -}}
+
+{{- define "meridian-runtime.internalTlsMount" -}}
+{{- include "meridian-runtime.internalTlsClientMount" (dict "top" . "on" .Values.tls.internal.enabled) -}}
+{{- end -}}
+
+{{- define "meridian-runtime.internalTlsVolume" -}}
+{{- include "meridian-runtime.internalTlsClientVolume" (dict "top" . "on" .Values.tls.internal.enabled) -}}
+{{- end -}}
+
+{{/* The same three, on where `on` is: a dict, top and on. The preflight's
+are on where the database serves TLS today (databaseServesTls), whatever
+the upgrade it checks is about to make of it. */}}
+{{- define "meridian-runtime.internalTlsClientEnv" -}}
+{{- if .on }}
 - name: MERIDIAN_INTERNAL_TLS_CA
   value: /etc/meridian-internal-tls/ca.crt
 {{- end }}
 {{- end -}}
 
-{{- define "meridian-runtime.internalTlsMount" -}}
-{{- if .Values.tls.internal.enabled }}
+{{- define "meridian-runtime.internalTlsClientMount" -}}
+{{- if .on }}
 - name: internal-tls-ca
   mountPath: /etc/meridian-internal-tls
   readOnly: true
 {{- end }}
 {{- end -}}
 
-{{- define "meridian-runtime.internalTlsVolume" -}}
-{{- if .Values.tls.internal.enabled }}
+{{- define "meridian-runtime.internalTlsClientVolume" -}}
+{{- if .on }}
 - name: internal-tls-ca
   secret:
-    secretName: {{ include "meridian-runtime.fullname" . }}-internal-tls-ca
+    secretName: {{ include "meridian-runtime.fullname" .top }}-internal-tls-ca
     items:
       - key: ca.crt
         path: ca.crt
 {{- end }}
+{{- end -}}
+
+{{/*
+Whether the database is reached over internal TLS as it serves now, before
+the upgrade being rendered changes anything: "true", or nothing. The
+brought database's StatefulSet, read live, serves it where its pods mount
+their server certificate (templates/database.yaml), and the internal CA
+that signed it is then there to mount, made with it. A database not brought,
+not running, or not readable (`helm template`, a dry run) is taken to serve
+as these values say. For the upgrade's preflight, which runs before
+anything changes: an upgrade turning internal TLS on finds a server that
+does not offer it yet, and one turning it off finds a server that refuses
+anything else, so the preflight connects as the server serves today. The
+upgrade's own clients -- the migration, every component -- connect as the
+values say once the server serves so, and are what prove it does.
+*/}}
+{{- define "meridian-runtime.databaseServesTls" -}}
+{{- $tls := .Values.tls.internal.enabled -}}
+{{- if .Values.database.brought.enabled -}}
+{{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-database" (include "meridian-runtime.fullname" .)) -}}
+{{- if and $live (gt (int (dig "spec" "replicas" 0 $live)) 0) -}}
+{{- $tls = false -}}
+{{- range (dig "spec" "template" "spec" "volumes" (list) $live) -}}
+{{- if eq (.name | default "") "internal-tls-server" }}{{ $tls = true }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $tls }}true{{ end -}}
 {{- end -}}
 
 {{/* A server's own certificate, key and the CA: a dict, top and server. */}}

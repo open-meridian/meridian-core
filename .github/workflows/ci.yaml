@@ -835,12 +835,16 @@ jobs:
       - name: k3d
         run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-amd64" /usr/local/bin/k3d
 
-      # Helm 4 for the upgrade: its --wait waits for every resource a release
-      # names to exist, and failed an upgrade that Helm 3's passed. The
-      # installs keep the version they were proven on.
+      # Helm 4 for the upgrades: its --wait waits for every resource a
+      # release names to exist, and failed an upgrade that Helm 3's passed;
+      # and reconfigure's upgrades run as `meridian upgrade-deployment` runs
+      # them on Helm 4 (step 3b's CLI rehearsal), whose server-side apply
+      # refuses a member count first run's scale owns unless the chart takes
+      # it back (--force-conflicts): the newest Helm the CLI meets, and the
+      # stricter. The installs keep the version they were proven on.
       - uses: azure/setup-helm@v4
         with:
-          version: ${{ matrix.target == 'e2e-cluster-upgrade' && 'v4.2.3' || 'v3.16.2' }}
+          version: ${{ (matrix.target == 'e2e-cluster-upgrade' || matrix.target == 'e2e-cluster-reconfigure') && 'v4.2.3' || 'v3.16.2' }}
 
       - name: make e2e-cluster-k3d
         working-directory: workspace/meridian-core

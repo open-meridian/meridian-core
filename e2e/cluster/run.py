@@ -1409,10 +1409,14 @@ def upgraded(s):
     """
     print("U: upgraded in place, to the chart and the image this checkout builds", flush=True)
     repository, _, tag = IMAGE.rpartition(":")
+    # Under Helm 4, whose server-side apply refuses a field another manager
+    # owns -- the database's member count, which first run's scale set --
+    # the chart takes back its own, as `meridian upgrade-deployment` does.
+    conflicts = ["--force-conflicts"] if run(HELM, "version", "--short").startswith("v4") else []
     started = time.time()
     done = subprocess.run(
         [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE,
-         "--reset-then-reuse-values", "--wait", "--timeout", "10m",
+         "--reset-then-reuse-values", "--wait", "--timeout", "10m", *conflicts,
          "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
         capture_output=True, text=True,
     )
