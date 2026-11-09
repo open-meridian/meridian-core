@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
-use crate::row::Observation;
+use crate::row::{DataType, Observation};
 use crate::store::{
     as_assessed, as_flagged, closed_reason, counted, force_order, matches, Assessment,
     ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale, Store, WantChange,
@@ -257,6 +257,29 @@ impl Store for MemoryStore {
         };
         as_flagged(&mut out, &held.amendments, query.as_of_ns);
         as_assessed(&mut out, &held.assessments, query.as_of_ns);
+        Ok(out)
+    }
+
+    fn rows_at(
+        &self,
+        data_type: DataType,
+        places: &[(String, u64)],
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let by_place: BTreeMap<(&str, u64), &Observation> = held
+            .rows
+            .iter()
+            .filter(|row| row.data_type() == data_type)
+            .map(|row| ((row.dataset(), row.meta().sequence), row))
+            .collect();
+        let mut out: Vec<Observation> = places
+            .iter()
+            .filter_map(|(dataset, sequence)| by_place.get(&(dataset.as_str(), *sequence)))
+            .map(|row| (*row).clone())
+            .collect();
+        as_flagged(&mut out, &held.amendments, as_of_ns);
+        as_assessed(&mut out, &held.assessments, as_of_ns);
         Ok(out)
     }
 

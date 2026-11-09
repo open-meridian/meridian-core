@@ -37,6 +37,7 @@
 //! back to. A suspicious row is served, flagged.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use meridian_domain::date::Date;
 use meridian_domain::v1::{
@@ -298,6 +299,17 @@ fn strip_for(row: &mut Observation, allowed: &BTreeSet<String>, read: &Read) -> 
     removed
 }
 
+/// A row read again for a held answer's page, stripped as the read stripped
+/// it when it was answered: each field its reader may not read, and each
+/// field the read did not ask for.
+pub fn strip_answered(row: &mut Observation, read: &Read, against: &Against<'_>) {
+    let allowed = against
+        .config
+        .fields_for(row.dataset(), &read.reader)
+        .unwrap_or_default();
+    strip_for(row, &allowed, read);
+}
+
 /// What a read of the filings slice keeps besides its subjects, kinds and
 /// dates (contract v28, W10.6), before a page is cut: a reported fact's
 /// concepts, none for every concept; and a holding's reports, by dataset
@@ -383,14 +395,14 @@ pub fn by_priority(
     }
 }
 
-/// Whether a dataset's latest row for a subject is older than its cadence:
-/// silent (W10.2).
-fn silent(row: &Observation, against: &Against<'_>) -> bool {
+/// Whether a dataset's latest row for a subject, recorded then, is older
+/// than its cadence: silent (W10.2).
+fn silent_at(dataset: &str, recorded_at_ns: i64, against: &Against<'_>) -> bool {
     let cadence = against
         .config
-        .declaration(row.dataset())
+        .declaration(dataset)
         .map_or(0, |d| i64::from(d.cadence));
-    cadence > 0 && row.meta().recorded_at_ns < against.now_ns - cadence * 1_000_000_000
+    cadence > 0 && recorded_at_ns < against.now_ns - cadence * 1_000_000_000
 }
 
 /// A fixed zone's offset from UTC, where the zone never moves its clocks:
@@ -577,11 +589,415 @@ pub fn quarantine_refused(sources: &SourceChoice) -> Result<(), String> {
     Ok(())
 }
 
-/// Answer a read from the store, as the reader may read it.
+/// Where a row of an answer is, and so how the page carrying it reads it.
+#[derive(Debug, Clone)]
+pub enum Place {
+    /// A row the lake keeps, by its dataset and sequence: read again from
+    /// the record with the page that carries it ([`Store::rows_at`]).
+    Kept(Arc<str>, u64),
+    /// A row held as it was read and stripped: one served and not kept
+    /// (W10.7; ruling 734), which nothing could read again; or, while its
+    /// answer holds no more than [`HELD_INLINE_MOST`], one the lake keeps.
+    Held(Box<Observation>),
+}
+
+/// The most an answer holds of its rows themselves while it is chosen;
+/// past it, every row the lake keeps is held by its [`Place`] alone, a few
+/// dozen bytes a row. Found on dev 2026-11-09: a chain's statistics over
+/// its dates, 49,412 rows in force, chosen from every row decoded, took
+/// half a GiB a page, and the lake past its 1 GiB at the second reader. An
+/// answer of a page or two -- what a live page reads, from memory -- is
+/// held whole and read again from nowhere.
+pub const HELD_INLINE_MOST: usize = 4 * 1024 * 1024;
+
+/// A row as a read chooses among rows (W10.2, W10.6): where it is, and
+/// what the choice and the answer's order read of it -- never the row
+/// itself past [`HELD_INLINE_MOST`].
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub place: Place,
+    /// Whether the store answered it, so its place reads it again.
+    kept: bool,
+    subject: Arc<str>,
+    subjects: Arc<[Arc<str>]>,
+    dataset: Arc<str>,
+    kind: i32,
+    series: Arc<str>,
+    valid_from_ns: i64,
+    sequence: u64,
+    recorded_at_ns: i64,
+    /// The fields stripped from it as its reader may read them.
+    stripped: Box<[&'static str]>,
+}
+
+impl Candidate {
+    pub fn subjects(&self) -> &[Arc<str>] {
+        &self.subjects
+    }
+
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    fn order(&self) -> (&str, &str, i32, i64, u64) {
+        (
+            &self.subject,
+            &self.dataset,
+            self.kind,
+            self.valid_from_ns,
+            self.sequence,
+        )
+    }
+}
+
+/// Each text an answer's candidates name, held once.
+#[derive(Default)]
+struct Names {
+    texts: std::collections::HashSet<Arc<str>>,
+    lists: BTreeMap<Vec<Arc<str>>, Arc<[Arc<str>]>>,
+}
+
+impl Names {
+    fn of(&mut self, text: &str) -> Arc<str> {
+        if let Some(held) = self.texts.get(text) {
+            return Arc::clone(held);
+        }
+        let held: Arc<str> = Arc::from(text);
+        self.texts.insert(Arc::clone(&held));
+        held
+    }
+
+    fn list(&mut self, texts: Vec<String>) -> Arc<[Arc<str>]> {
+        let named: Vec<Arc<str>> = texts.iter().map(|text| self.of(text)).collect();
+        if let Some(held) = self.lists.get(&named) {
+            return Arc::clone(held);
+        }
+        let held: Arc<[Arc<str>]> = Arc::from(named.clone());
+        self.lists.insert(named, Arc::clone(&held));
+        held
+    }
+}
+
+/// What a row held whole costs, as a held answer counts it.
+fn held_cost(row: &Observation) -> usize {
+    crate::pages::row_bytes(row)
+}
+
+/// A read, chosen: its rows by their candidates, in the answer's order, and
+/// what it could not answer and would ask.
+#[derive(Debug, Clone, Default)]
+pub struct Chosen {
+    pub rows: Vec<Candidate>,
+    pub not_served: Vec<NotServed>,
+    pub asks: Vec<Ask>,
+}
+
+type LatestKey = (Arc<str>, Arc<str>, i32, Arc<str>, i64, Arc<str>, Arc<str>);
+
+/// The rows a read is chosen from, gathered one at a time as the store
+/// reads them: each narrowed as the read narrows it, then held as its
+/// [`Candidate`] alone, so choosing among rows holds a few dozen bytes a
+/// row, never every row read.
+struct Gather<'a, 'b> {
+    read: &'a Read,
+    against: &'a Against<'b>,
+    names: Names,
+    /// Each subject and dataset a rate read held, and those holding a tenor
+    /// asked (W10.4, a-tenor-not-published).
+    tenor_seen: BTreeSet<(String, String)>,
+    tenor_asked: BTreeSet<(String, String)>,
+    /// Each subject, dataset and kind with a row left out invalid, and with
+    /// one not (W10.6; rulings 421, 422 and 619).
+    invalid_seen: BTreeSet<(String, String, i32)>,
+    valid_seen: BTreeSet<(String, String, i32)>,
+    /// A read of the latest: the latest in force per key so far.
+    latest: Option<BTreeMap<LatestKey, Candidate>>,
+    rows: Vec<Candidate>,
+    held_bytes: usize,
+    /// Past [`HELD_INLINE_MOST`]: every row kept is held by its place.
+    placing: bool,
+}
+
+impl<'a, 'b> Gather<'a, 'b> {
+    fn new(read: &'a Read, against: &'a Against<'b>) -> Self {
+        Gather {
+            read,
+            against,
+            names: Names::default(),
+            tenor_seen: BTreeSet::new(),
+            tenor_asked: BTreeSet::new(),
+            invalid_seen: BTreeSet::new(),
+            valid_seen: BTreeSet::new(),
+            latest: matches!(read.when, When::Latest { .. }).then(BTreeMap::new),
+            rows: Vec::new(),
+            held_bytes: 0,
+            placing: false,
+        }
+    }
+
+    fn alias_of(&self, subject: &str) -> String {
+        alias_of(self.read, self.against, subject)
+    }
+
+    /// One row read: narrowed, then held as its candidate.
+    fn admit(&mut self, row: Observation) {
+        let read = self.read;
+        // A chain's rows only to a read that asks for series (contract v28,
+        // W10.6): a listed series is always keyed by one, and read by ListSeries.
+        if !series_kept(read, &row) {
+            return;
+        }
+        if let Some((from, to)) = &read.dates {
+            if !Date::parse(&row.date()).is_ok_and(|date| &date >= from && &date <= to) {
+                return;
+            }
+        }
+        // A fact's concepts, a holding's reports (contract v28, W10.6).
+        if !read.narrowed.concepts.is_empty() {
+            if let Observation::ReportedFact(fact) = &row {
+                if !read.narrowed.concepts.contains(&fact.concept) {
+                    return;
+                }
+            }
+        }
+        if let Some(reports) = &read.narrowed.reports {
+            if let Observation::Holding(holding) = &row {
+                if !reports.contains(&(row.dataset().to_string(), holding.report_row_key.clone())) {
+                    return;
+                }
+            }
+        }
+        // A subject asked in a role (contract v28, W10.6): a row naming it in
+        // another is not its; an unspecified role on a row reads as `subject`.
+        if !read.roles.is_empty()
+            && !row.meta().subjects.iter().any(|named| {
+                let subject = self.alias_of(&named.entity_id);
+                read.subjects.contains(&subject)
+                    && read
+                        .roles
+                        .iter()
+                        .all(|(entity, role)| entity != &subject || named.role.max(1) == *role)
+            })
+        {
+            return;
+        }
+        // A rate read narrowed by tenor: a row with no tenor (a fixing, a
+        // point named by maturity) is no tenor asked. A dataset that holds
+        // the subject for the time asked and none of the tenors asked did
+        // not publish them: source silent, never asked again (W10.4,
+        // a-tenor-not-published).
+        if !read.tenors.is_empty() {
+            let held = (self.alias_of(row.subject()), row.dataset().to_string());
+            self.tenor_seen.insert(held.clone());
+            let asked = match &row {
+                Observation::Rate(rate) => rate
+                    .tenor
+                    .as_ref()
+                    .is_some_and(|tenor| read.tenors.contains(tenor)),
+                _ => true,
+            };
+            if !asked {
+                return;
+            }
+            self.tenor_asked.insert(held);
+        }
+        // Quarantine (contract v28, W10.6; rulings 421, 422 and 619): a row
+        // whose effective state is invalid is left out before the one in
+        // force is chosen, so a subject's last valid row stands, unless the
+        // read names its datasets with `include_quarantined`.
+        if !read.sources.include_quarantined {
+            let held = (
+                self.alias_of(row.subject()),
+                row.dataset().to_string(),
+                row.kind(),
+            );
+            if invalid(&row) {
+                self.invalid_seen.insert(held);
+                return;
+            }
+            self.valid_seen.insert(held);
+        }
+        let latest_key = self.latest.is_some().then(|| {
+            (
+                self.names.of(row.subject()),
+                self.names.of(row.dataset()),
+                row.kind(),
+                self.names.of(row.venue()),
+                row.interval_ns(),
+                self.names.of(&row.asset()),
+                self.names.of(&row.point()),
+            )
+        });
+        let candidate = self.candidate(row, true);
+        match (latest_key, self.latest.as_mut()) {
+            (Some(key), Some(latest)) => {
+                let later = |held: &Candidate| {
+                    (candidate.valid_from_ns, candidate.sequence)
+                        > (held.valid_from_ns, held.sequence)
+                };
+                match latest.get(&key) {
+                    Some(held) if !later(held) => {
+                        let gone = held_bytes_of(&candidate);
+                        self.held_bytes -= gone;
+                    }
+                    _ => {
+                        if let Some(replaced) = latest.insert(key, candidate) {
+                            self.held_bytes -= held_bytes_of(&replaced);
+                        }
+                    }
+                }
+            }
+            _ => self.rows.push(candidate),
+        }
+    }
+
+    /// A row's candidate: what the choice reads of it, its fields stripped
+    /// as its reader may read them (W10.1), and the row itself only while
+    /// the answer is small.
+    fn candidate(&mut self, mut row: Observation, kept: bool) -> Candidate {
+        let subject = self.names.of(row.subject());
+        let subjects = self.names.list(row.subjects());
+        let dataset = self.names.of(row.dataset());
+        let series = self.names.of(&row.series());
+        let meta = row.meta();
+        let (valid_from_ns, sequence, recorded_at_ns) =
+            (meta.valid_from_ns, meta.sequence, meta.recorded_at_ns);
+        let kind = row.kind();
+        let allowed = self
+            .against
+            .config
+            .fields_for(&dataset, &self.read.reader)
+            .unwrap_or_default();
+        let stripped = strip_for(&mut row, &allowed, self.read).into_boxed_slice();
+        let cost = held_cost(&row);
+        if kept && !self.placing && self.held_bytes + cost > HELD_INLINE_MOST {
+            self.by_place();
+        }
+        let place = if !kept || !self.placing {
+            self.held_bytes += cost;
+            Place::Held(Box::new(row))
+        } else {
+            Place::Kept(Arc::clone(&dataset), sequence)
+        };
+        Candidate {
+            place,
+            kept,
+            subject,
+            subjects,
+            dataset,
+            kind,
+            series,
+            valid_from_ns,
+            sequence,
+            recorded_at_ns,
+            stripped,
+        }
+    }
+
+    /// The answer has passed [`HELD_INLINE_MOST`]: every row the lake keeps
+    /// held so far is held by its place from now.
+    fn by_place(&mut self) {
+        self.placing = true;
+        let mut placed = |candidate: &mut Candidate| {
+            if candidate.kept && matches!(candidate.place, Place::Held(_)) {
+                candidate.place = Place::Kept(Arc::clone(&candidate.dataset), candidate.sequence);
+            }
+        };
+        self.rows.iter_mut().for_each(&mut placed);
+        if let Some(latest) = self.latest.as_mut() {
+            latest.values_mut().for_each(&mut placed);
+        }
+        self.held_bytes = self
+            .rows
+            .iter()
+            .chain(self.latest.iter().flat_map(|latest| latest.values()))
+            .map(held_bytes_of)
+            .sum();
+    }
+}
+
+/// What a candidate holds of its row.
+fn held_bytes_of(candidate: &Candidate) -> usize {
+    match &candidate.place {
+        Place::Held(row) => held_cost(row),
+        Place::Kept(..) => 0,
+    }
+}
+
+fn alias_of(read: &Read, against: &Against<'_>, subject: &str) -> String {
+    against
+        .aliases
+        .get(subject)
+        .filter(|stays| read.subjects.contains(stays))
+        .cloned()
+        .unwrap_or_else(|| subject.to_string())
+}
+
+/// Answer a read from the store, as the reader may read it: every row
+/// chosen, read whole. A paged read takes [`choose`] and reads its page's
+/// rows alone ([`rows_of`]).
 pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<Answered, String> {
+    let chosen = choose(store, read, against)?;
+    let places: Vec<Place> = chosen.rows.into_iter().map(|c| c.place).collect();
+    let rows = rows_of(store, read, against, &places)?
+        .ok_or("a row the answer chose is no longer kept; read it again")?;
+    Ok(Answered {
+        rows,
+        not_served: chosen.not_served,
+        asks: chosen.asks,
+    })
+}
+
+/// The rows at these places, in order: each the lake keeps read again from
+/// the record as the read answered it -- its flag and quality as of the
+/// read's cut-off ([`Store::rows_at`]), its fields stripped as its reader
+/// may read them and as it asked -- and each held, as held. `None` where a
+/// row kept is no longer (retention removed it since it was chosen).
+pub fn rows_of(
+    store: &dyn Store,
+    read: &Read,
+    against: &Against<'_>,
+    places: &[Place],
+) -> Result<Option<Vec<Observation>>, String> {
+    let kept: Vec<(String, u64)> = places
+        .iter()
+        .filter_map(|place| match place {
+            Place::Kept(dataset, sequence) => Some((dataset.to_string(), *sequence)),
+            Place::Held(_) => None,
+        })
+        .collect();
+    let mut found = if kept.is_empty() {
+        Vec::new()
+    } else {
+        store
+            .rows_at(read.data_type, &kept, read.as_of_ns)
+            .map_err(|failed| failed.to_string())?
+    }
+    .into_iter();
+    if found.len() != kept.len() {
+        return Ok(None);
+    }
+    let mut rows = Vec::with_capacity(places.len());
+    for place in places {
+        match place {
+            Place::Kept(..) => {
+                let mut row = found.next().expect("counted");
+                strip_answered(&mut row, read, against);
+                rows.push(row);
+            }
+            Place::Held(row) => rows.push((**row).clone()),
+        }
+    }
+    Ok(Some(rows))
+}
+
+/// Choose a read's answer from the store, as the reader may read it: each
+/// row as its [`Candidate`], gathered as the store reads it, so what is held
+/// while choosing is a few dozen bytes a row past [`HELD_INLINE_MOST`].
+pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<Chosen, String> {
     quarantine_refused(&read.sources)?;
     let config = against.config;
-    let mut out = Answered::default();
+    let mut out = Chosen::default();
     let readable = config.readable(&read.reader, read.data_type);
 
     // Named datasets the reader may not read, or that are no dataset.
@@ -642,119 +1058,58 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             asked.push(replaced.clone());
         }
     }
-    let alias_of = |subject: &str| -> String {
-        against
-            .aliases
-            .get(subject)
-            .filter(|stays| read.subjects.contains(stays))
-            .cloned()
-            .unwrap_or_else(|| subject.to_string())
-    };
+    let alias_of = |subject: &str| -> String { alias_of(read, against, subject) };
 
-    let mut rows = store
-        .read(&Query {
-            datasets: candidates.clone(),
-            subjects: asked,
-            data_type: read.data_type,
-            kinds: read.kinds.clone(),
-            interval_ns: read.interval_ns,
-            when: read.when.clone(),
-            as_of_ns: read.as_of_ns,
-            published_as_of_ns: read.published_as_of_ns,
-            // Only where nothing narrows the rows before the latest is
-            // chosen but what commutes with it -- a series and a tenor are
-            // in the point, an invalid row's successor is answered beside
-            // it -- may the store choose it.
-            latest_only: matches!(read.when, When::Latest { .. })
-                && read.published_as_of_ns == 0
-                && read.dates.is_none()
-                && read.roles.is_empty()
-                && read.narrowed == Narrowed::default(),
-        })
-        .map_err(|failed| failed.to_string())?;
+    let query = Query {
+        datasets: candidates.clone(),
+        subjects: asked,
+        data_type: read.data_type,
+        kinds: read.kinds.clone(),
+        interval_ns: read.interval_ns,
+        when: read.when.clone(),
+        as_of_ns: read.as_of_ns,
+        published_as_of_ns: read.published_as_of_ns,
+        // Only where nothing narrows the rows before the latest is
+        // chosen but what commutes with it -- a series and a tenor are
+        // in the point, an invalid row's successor is answered beside
+        // it -- may the store choose it.
+        latest_only: matches!(read.when, When::Latest { .. })
+            && read.published_as_of_ns == 0
+            && read.dates.is_none()
+            && read.roles.is_empty()
+            && read.narrowed == Narrowed::default(),
+    };
+    let mut gather = Gather::new(read, against);
     if read.published_as_of_ns != 0 {
-        rows = as_published(rows, read.published_as_of_ns);
-    }
-    // A chain's rows only to a read that asks for series (contract v28,
-    // W10.6): a listed series is always keyed by one, and read by ListSeries.
-    rows.retain(|row| series_kept(read, row));
-    if let Some((from, to)) = &read.dates {
-        rows.retain(|row| Date::parse(&row.date()).is_ok_and(|date| &date >= from && &date <= to));
-    }
-    // A fact's concepts, a holding's reports (contract v28, W10.6).
-    if !read.narrowed.concepts.is_empty() {
-        rows.retain(|row| match row {
-            Observation::ReportedFact(fact) => read.narrowed.concepts.contains(&fact.concept),
-            _ => true,
-        });
-    }
-    if let Some(reports) = &read.narrowed.reports {
-        rows.retain(|row| match row {
-            Observation::Holding(holding) => {
-                reports.contains(&(row.dataset().to_string(), holding.report_row_key.clone()))
-            }
-            _ => true,
-        });
-    }
-    // A subject asked in a role (contract v28, W10.6): a row naming it in
-    // another is not its; an unspecified role on a row reads as `subject`.
-    if !read.roles.is_empty() {
-        rows.retain(|row| {
-            row.meta().subjects.iter().any(|named| {
-                let subject = alias_of(&named.entity_id);
-                read.subjects.contains(&subject)
-                    && read
-                        .roles
-                        .iter()
-                        .all(|(entity, role)| entity != &subject || named.role.max(1) == *role)
+        // A rate read as published by a time: each row key's version in
+        // force by then, chosen of every version read.
+        let rows = store.read(&query).map_err(|failed| failed.to_string())?;
+        for row in as_published(rows, read.published_as_of_ns) {
+            gather.admit(row);
+        }
+    } else {
+        store
+            .read_each(&query, &mut |row| {
+                gather.admit(row);
+                Ok(())
             })
-        });
+            .map_err(|failed| failed.to_string())?;
     }
-    // A rate read narrowed by tenor: a row with no tenor (a fixing, a point
-    // named by maturity) is no tenor asked. A dataset that holds the subject
-    // for the time asked and none of the tenors asked did not publish them:
-    // source silent, never asked again (W10.4, a-tenor-not-published).
-    let mut tenor_silent: BTreeSet<(String, String)> = BTreeSet::new();
-    if !read.tenors.is_empty() {
-        let asked_tenor = |row: &Observation| match row {
-            Observation::Rate(rate) => rate
-                .tenor
-                .as_ref()
-                .is_some_and(|tenor| read.tenors.contains(tenor)),
-            _ => true,
-        };
-        for row in &rows {
-            tenor_silent.insert((alias_of(row.subject()), row.dataset().to_string()));
-        }
-        rows.retain(asked_tenor);
-        for row in &rows {
-            tenor_silent.remove(&(alias_of(row.subject()), row.dataset().to_string()));
-        }
-    }
-    // Quarantine (contract v28, W10.6; rulings 421, 422 and 619): a row
-    // whose effective state is invalid is left out before the one in force
-    // is chosen, so a subject's last valid row stands, unless the read
-    // names its datasets with `include_quarantined`. A dataset left with
-    // nothing for a subject and kind is source silent: asked nothing, and
-    // never fallen back to.
-    let mut left_out: BTreeSet<(String, String, i32)> = BTreeSet::new();
-    if !read.sources.include_quarantined {
-        for row in rows.iter().filter(|row| invalid(row)) {
-            left_out.insert((
-                alias_of(row.subject()),
-                row.dataset().to_string(),
-                row.kind(),
-            ));
-        }
-        rows.retain(|row| !invalid(row));
-        for row in &rows {
-            left_out.remove(&(
-                alias_of(row.subject()),
-                row.dataset().to_string(),
-                row.kind(),
-            ));
-        }
-    }
+    let Gather {
+        tenor_seen,
+        tenor_asked,
+        invalid_seen,
+        valid_seen,
+        latest,
+        mut rows,
+        ..
+    } = gather;
+    let tenor_silent: BTreeSet<(String, String)> =
+        tenor_seen.difference(&tenor_asked).cloned().collect();
+    // A dataset left with nothing for a subject and kind is source silent:
+    // asked nothing, and never fallen back to.
+    let left_out: BTreeSet<(String, String, i32)> =
+        invalid_seen.difference(&valid_seen).cloned().collect();
     let why_not = |dataset: &str, subject: &str, kind: i32| {
         if left_out.contains(&(subject.to_string(), dataset.to_string(), kind)) {
             // Contract v29 (619 (1); W10.6): a dataset whose only rows for
@@ -767,8 +1122,8 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             why_not(read, against, dataset, subject)
         }
     };
-    if matches!(read.when, When::Latest { .. }) {
-        rows = latest_in_force(rows);
+    if let Some(latest) = latest {
+        rows = latest.into_values().collect();
     }
 
     // By the subject asked about, then kind. A row of the filings slice
@@ -776,21 +1131,18 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     // its issuer, a holding its holder and what is held, a rating action
     // the rated and the rater (contract v28, W10.4) -- and is the answer to
     // whichever of them was asked first, once.
-    let mut by_subject: BTreeMap<(String, i32), Vec<Observation>> = BTreeMap::new();
+    let mut by_subject: BTreeMap<(String, i32), Vec<Candidate>> = BTreeMap::new();
     for row in rows {
         let subject = if read.data_type.filings() {
-            row.subjects()
+            row.subjects
                 .iter()
                 .map(|s| alias_of(s))
                 .find(|s| read.subjects.contains(s))
-                .unwrap_or_else(|| alias_of(row.subject()))
+                .unwrap_or_else(|| alias_of(&row.subject))
         } else {
-            alias_of(row.subject())
+            alias_of(&row.subject)
         };
-        by_subject
-            .entry((subject, row.kind()))
-            .or_default()
-            .push(row);
+        by_subject.entry((subject, row.kind)).or_default().push(row);
     }
     let kinds_asked: Vec<i32> = if read.kinds.is_empty() {
         vec![]
@@ -799,9 +1151,10 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     };
 
     let mut asks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut chosen: Vec<Observation> = Vec::new();
+    let mut chosen: Vec<Candidate> = Vec::new();
     let catching_up = matches!(read.when, When::After(_));
     let series_asked = read.all_series || !read.series_keys.is_empty();
+    let silent = |row: &Candidate| silent_at(&row.dataset, row.recorded_at_ns, against);
     // How many times each subject is still to be answered: its rows move
     // into the answer at its last, and are copied only for one asked twice.
     let mut still: BTreeMap<&String, usize> = BTreeMap::new();
@@ -859,10 +1212,9 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             }
             if read.sources.side_by_side {
                 for dataset in &order {
-                    let (of, rest): (Vec<Observation>, Vec<Observation>) =
-                        std::mem::take(&mut held)
-                            .into_iter()
-                            .partition(|r| r.dataset() == dataset);
+                    let (of, rest): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut held)
+                        .into_iter()
+                        .partition(|r| &*r.dataset == dataset);
                     held = rest;
                     if of.is_empty() {
                         let (reason, ask) = why_not(dataset, subject, kind);
@@ -890,11 +1242,14 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             // another each answer, one source per series, never mixed
             // within one. A dataset holding the subject's other series is
             // not named for this one; it answered what it holds.
-            let holding: BTreeSet<String> = held.iter().map(|r| r.dataset().to_string()).collect();
-            let groups: Vec<Vec<Observation>> = if series_asked && !held.is_empty() {
-                let mut by_series: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
+            let holding: BTreeSet<Arc<str>> = held.iter().map(|r| Arc::clone(&r.dataset)).collect();
+            let groups: Vec<Vec<Candidate>> = if series_asked && !held.is_empty() {
+                let mut by_series: BTreeMap<Arc<str>, Vec<Candidate>> = BTreeMap::new();
                 for row in held {
-                    by_series.entry(row.series()).or_default().push(row);
+                    by_series
+                        .entry(Arc::clone(&row.series))
+                        .or_default()
+                        .push(row);
                 }
                 by_series.into_values().collect()
             } else {
@@ -906,17 +1261,16 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             let mut fallen: Vec<NotServed> = Vec::new();
             for mut group in groups {
                 let mut answered = false;
-                let mut first_silent: Option<Vec<Observation>> = None;
+                let mut first_silent: Option<Vec<Candidate>> = None;
                 for dataset in &order {
-                    let (of, rest): (Vec<Observation>, Vec<Observation>) =
-                        std::mem::take(&mut group)
-                            .into_iter()
-                            .partition(|r| r.dataset() == dataset);
+                    let (of, rest): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut group)
+                        .into_iter()
+                        .partition(|r| &*r.dataset == dataset);
                     group = rest;
                     let latest_silent = !of.is_empty()
                         && matches!(read.when, When::Latest { .. })
-                        && of.iter().all(|r| silent(r, against));
-                    if of.is_empty() && holding.contains(dataset) {
+                        && of.iter().all(silent);
+                    if of.is_empty() && holding.contains(dataset.as_str()) {
                         continue;
                     }
                     if of.is_empty() || latest_silent {
@@ -986,38 +1340,21 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
 
     // Fields the reader may not read, stripped and named once per dataset.
     let mut named_fields: BTreeSet<(String, String)> = BTreeSet::new();
-    for row in chosen.iter_mut() {
-        let dataset = row.dataset().to_string();
-        let allowed = config
-            .fields_for(&dataset, &read.reader)
-            .unwrap_or_default();
-        for field in strip_for(row, &allowed, read) {
-            if named_fields.insert((dataset.clone(), field.to_string())) {
+    for row in &chosen {
+        for field in row.stripped.iter() {
+            if named_fields.insert((row.dataset.to_string(), field.to_string())) {
                 out.not_served.push(NotServed {
                     subject: String::new(),
-                    dataset: dataset.clone(),
+                    dataset: row.dataset.to_string(),
                     field: field.to_string(),
                     reason: UnansweredReason::NotEntitled,
                 });
             }
         }
     }
-    chosen.sort_by(|a, b| {
-        (
-            a.subject(),
-            a.dataset(),
-            a.kind(),
-            a.meta().valid_from_ns,
-            a.meta().sequence,
-        )
-            .cmp(&(
-                b.subject(),
-                b.dataset(),
-                b.kind(),
-                b.meta().valid_from_ns,
-                b.meta().sequence,
-            ))
-    });
+    chosen.sort_by(|a, b| a.order().cmp(&b.order()));
+    // Held at what it holds, not at the room its vector grew to.
+    chosen.shrink_to_fit();
     out.rows = chosen;
 
     // A pool's or a class's factor is wanted standing (contract v29, W10.7):
@@ -1067,23 +1404,17 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
 pub fn with_served(
     read: &Read,
     against: &Against<'_>,
-    answered: &mut Answered,
+    answered: &mut Chosen,
     served: BTreeMap<String, Vec<Observation>>,
 ) {
     let config = against.config;
-    let alias_of = |subject: &str| -> String {
-        against
-            .aliases
-            .get(subject)
-            .filter(|stays| read.subjects.contains(stays))
-            .cloned()
-            .unwrap_or_else(|| subject.to_string())
-    };
+    let alias_of = |subject: &str| -> String { alias_of(read, against, subject) };
     let mut held: BTreeSet<(String, i32)> = answered
         .rows
         .iter()
-        .map(|row| (alias_of(row.subject()), row.kind()))
+        .map(|row| (alias_of(&row.subject), row.kind))
         .collect();
+    let mut gather = Gather::new(read, against);
     let mut added = false;
     for (dataset, rows) in served {
         let mut rows: Vec<Observation> = rows
@@ -1098,15 +1429,13 @@ pub fn with_served(
             rows = latest_in_force(rows);
         }
         let mut answering: BTreeSet<(String, i32)> = BTreeSet::new();
-        for mut row in rows {
+        for row in rows {
             let key = (alias_of(row.subject()), row.kind());
             if !read.sources.side_by_side && held.contains(&key) && !answering.contains(&key) {
                 continue;
             }
-            let allowed = config
-                .fields_for(&dataset, &read.reader)
-                .unwrap_or_default();
-            for field in strip_for(&mut row, &allowed, read) {
+            let candidate = gather.candidate(row, false);
+            for field in candidate.stripped.iter() {
                 let said = NotServed {
                     subject: String::new(),
                     dataset: dataset.clone(),
@@ -1118,7 +1447,7 @@ pub fn with_served(
                 }
             }
             answering.insert(key);
-            answered.rows.push(row);
+            answered.rows.push(candidate);
             added = true;
         }
         let subjects: BTreeSet<String> = answering.iter().map(|(s, _)| s.clone()).collect();
@@ -1135,21 +1464,6 @@ pub fn with_served(
         }
     }
     if added {
-        answered.rows.sort_by(|a, b| {
-            (
-                a.subject(),
-                a.dataset(),
-                a.kind(),
-                a.meta().valid_from_ns,
-                a.meta().sequence,
-            )
-                .cmp(&(
-                    b.subject(),
-                    b.dataset(),
-                    b.kind(),
-                    b.meta().valid_from_ns,
-                    b.meta().sequence,
-                ))
-        });
+        answered.rows.sort_by(|a, b| a.order().cmp(&b.order()));
     }
 }
