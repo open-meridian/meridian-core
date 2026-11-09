@@ -798,6 +798,44 @@ SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
                     WHERE a.dataset = r.dataset AND a.sequence = r.sequence
                       AND a.state = 3 AND a.at_ns <= $3)";
 
+/// How many rows a read takes from the database at once, decoded and
+/// handed on before the next.
+const READ_CHUNK: i32 = 1_000;
+
+/// A read's rows, every version the read would load, in the order
+/// recorded: where every version is answered (`every_version`).
+const EVERY_VERSION: &str = "
+SELECT body FROM lake_row
+ WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+   AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
+   AND ($5::bigint = 0 OR interval_ns = $5)
+   AND recorded_at_ns <= $6
+   AND ($7::text IS NULL OR business_date = $7::text::date)
+   AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+ ORDER BY dataset, sequence";
+
+/// A read's rows, each row key at its version in force among those the read
+/// would load: its latest by published time, then by version
+/// ([`crate::store::force_order`]; `lake_row.published_at_ns`, which only a
+/// rate's row carries), as `as_of` chooses of every version. Chosen by the
+/// database from the keys' columns, the bodies read only of the rows in
+/// force (found on dev 2026-11-09: a chain's statistics over its dates, 49,412
+/// rows in force of 358,688 versions, every version read and decoded to
+/// choose them, a page at a time, took the lake past its 1 GiB twice).
+const IN_FORCE: &str = "
+SELECT r.body FROM lake_row r
+  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence
+          FROM lake_row
+         WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+           AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
+           AND ($5::bigint = 0 OR interval_ns = $5)
+           AND recorded_at_ns <= $6
+           AND ($7::text IS NULL OR business_date = $7::text::date)
+           AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+         ORDER BY dataset, row_key, COALESCE(published_at_ns, 0) DESC, version DESC) AS f
+    ON r.dataset = f.dataset AND r.sequence = f.sequence
+ ORDER BY r.dataset, r.sequence";
+
 impl Store for PostgresStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         // Adopted before a connection is taken: one store never waits on
@@ -888,6 +926,19 @@ impl Store for PostgresStore {
     }
 
     fn read(&self, query: &Query) -> Result<Vec<Observation>> {
+        let mut out = Vec::new();
+        self.read_each(query, &mut |row| {
+            out.push(row);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn read_each(
+        &self,
+        query: &Query,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn
             .build_transaction()
@@ -926,8 +977,8 @@ impl Store for PostgresStore {
                 .map_err(unavailable)?;
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let body: Vec<u8> = row.get(0);
-                out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
+                let body: &[u8] = row.get(0);
+                out.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
             }
             let amendments = amendments_of(&mut tx, &query.datasets)?;
             let mut out = if crate::store::every_version(query) {
@@ -939,7 +990,10 @@ impl Store for PostgresStore {
             tx.commit().map_err(unavailable)?;
             as_flagged(&mut out, &amendments, query.as_of_ns);
             as_assessed(&mut out, &assessments, query.as_of_ns);
-            return Ok(out);
+            for row in out {
+                each(row)?;
+            }
+            return Ok(());
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
         let cut_off = if query.as_of_ns == 0 {
@@ -966,9 +1020,9 @@ impl Store for PostgresStore {
         // The latest chosen in SQL where the read lets it (found on dev
         // 2026-10-26: every row a chain's dataset kept was loaded to choose
         // a few hundred); never where every version is answered.
-        let latest = query.latest_only
-            && matches!(query.when, When::Latest { .. })
-            && !crate::store::every_version(query);
+        let every_version = crate::store::every_version(query);
+        let latest =
+            query.latest_only && matches!(query.when, When::Latest { .. }) && !every_version;
         if latest {
             // Its plan is a few hundred index probes, estimated as if each
             // ran a key's whole history: compiled, it took a second more
@@ -976,51 +1030,104 @@ impl Store for PostgresStore {
             tx.batch_execute("SET LOCAL jit = off")
                 .map_err(unavailable)?;
         }
-        let rows = tx
+        // Every row the database answers is a row key's version in force,
+        // or one of every version where every one is asked: none is chosen
+        // here, so each is handed on as it is read.
+        let sql = if latest && query.data_type == DataType::Rate {
+            LATEST_BY_PUBLISHED.as_str()
+        } else if latest {
+            LATEST.as_str()
+        } else if every_version {
+            EVERY_VERSION
+        } else {
+            IN_FORCE
+        };
+        let code = query.data_type.code();
+        let params: [&(dyn postgres::types::ToSql + Sync); 10] = [
+            &query.datasets,
+            &query.subjects,
+            &code,
+            &kinds,
+            &query.interval_ns,
+            &cut_off,
+            &date,
+            &from,
+            &until,
+            &at,
+        ];
+        let amendments = amendments_of(&mut tx, &query.datasets)?;
+        // A chunk at a time from one portal, each chunk's assessments read
+        // beside it, each row handed on as it is decoded: never the whole
+        // result held, as the database sent it or decoded (found on dev
+        // 2026-11-09: the lake OOMKilled at 1 GiB, twice, by a chain's
+        // statistics read a page at a time, each page every version).
+        let portal = tx.bind(sql, &params).map_err(unavailable)?;
+        loop {
+            let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut chunk = Vec::with_capacity(rows.len());
+            for row in rows {
+                let body: &[u8] = row.get(0);
+                chunk.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
+            }
+            let assessments = assessments_of(&mut tx, &chunk)?;
+            as_flagged(&mut chunk, &amendments, query.as_of_ns);
+            as_assessed(&mut chunk, &assessments, query.as_of_ns);
+            for row in chunk {
+                each(row)?;
+            }
+        }
+        drop(portal);
+        tx.commit().map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn rows_at(
+        &self,
+        data_type: DataType,
+        places: &[(String, u64)],
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        if places.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (datasets, sequences): (Vec<String>, Vec<i64>) = places
+            .iter()
+            .map(|(dataset, sequence)| (dataset.clone(), *sequence as i64))
+            .unzip();
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let code = data_type.code();
+        let found = tx
             .query(
-                if latest && query.data_type == DataType::Rate {
-                    LATEST_BY_PUBLISHED.as_str()
-                } else if latest {
-                    LATEST.as_str()
-                } else {
-                    "SELECT body FROM lake_row
-                  WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
-                    AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
-                    AND ($5::bigint = 0 OR interval_ns = $5)
-                    AND recorded_at_ns <= $6
-                    AND ($7::text IS NULL OR business_date = $7::text::date)
-                    AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
-                  ORDER BY dataset, sequence"
-                },
-                &[
-                    &query.datasets,
-                    &query.subjects,
-                    &query.data_type.code(),
-                    &kinds,
-                    &query.interval_ns,
-                    &cut_off,
-                    &date,
-                    &from,
-                    &until,
-                    &at,
-                ],
+                "SELECT r.body
+                   FROM unnest($1::text[], $2::bigint[]) WITH ORDINALITY AS p(dataset, sequence, n)
+                   JOIN lake_row r ON r.dataset = p.dataset AND r.sequence = p.sequence
+                  WHERE r.data_type = $3
+                  ORDER BY p.n",
+                &[&datasets, &sequences, &code],
             )
             .map_err(unavailable)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let body: Vec<u8> = row.get(0);
-            out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
+        let mut out = Vec::with_capacity(found.len());
+        for row in found {
+            let body: &[u8] = row.get(0);
+            out.push(Observation::decode(data_type, body).map_err(unreadable)?);
         }
-        let amendments = amendments_of(&mut tx, &query.datasets)?;
-        let mut out = if crate::store::every_version(query) {
-            crate::store::recorded_by(out, query.as_of_ns)
-        } else {
-            as_of(out, query.as_of_ns)
-        };
+        let mut named: Vec<String> = datasets;
+        named.sort();
+        named.dedup();
+        let amendments = amendments_of(&mut tx, &named)?;
         let assessments = assessments_of(&mut tx, &out)?;
         tx.commit().map_err(unavailable)?;
-        as_flagged(&mut out, &amendments, query.as_of_ns);
-        as_assessed(&mut out, &assessments, query.as_of_ns);
+        as_flagged(&mut out, &amendments, as_of_ns);
+        as_assessed(&mut out, &assessments, as_of_ns);
         Ok(out)
     }
 
