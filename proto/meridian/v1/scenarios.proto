@@ -37,6 +37,35 @@ message MeasureRef {
   repeated string breakdowns = 3;
   // For an event measure, the event group it is over (W3.30).
   string event_group_id = 4;
+  // Contract v30 (W12.1; the field and its two values approved by 834):
+  // when a standing job recomputes the measure, the plugin's declaration per
+  // figure, which wins over its definition's default. Unspecified takes the
+  // definition's default; where the definition states none, refused
+  // INVALID_ARGUMENT naming refresh. Read only on a standing job's measure.
+  Refresh refresh = 5;
+  // Contract v30 (W12.1; approved by 834): with REFRESH_CADENCE, the least
+  // time in nanoseconds between two recomputations of a dirty figure, unless
+  // a material move comes first; 0 otherwise.
+  int64 cadence_ns = 6;
+  // Contract v30 (W12.1; approved by 834): with REFRESH_CADENCE, a move of
+  // the underlying's reference price since the last fit, in basis points,
+  // at or past which a dirty figure recomputes before its cadence; 0: the
+  // cadence alone.
+  uint32 material_move_bp = 7;
+}
+
+// When a standing job recomputes a measure (contract v30; the values
+// approved by 834, the enum's name 2026-11-09). A one-off job never
+// recomputes.
+enum Refresh {
+  // The definition's default refresh.
+  REFRESH_UNSPECIFIED = 0;
+  // Recomputed at once when an input it depends on changes, conflated per
+  // key: FX crosses and spreads, options' implied volatility and greeks.
+  REFRESH_PER_CHANGE = 1;
+  // Recomputed every cadence_ns, or sooner on a material move: realised
+  // volatility, correlation, fits, positioning, the volatility index.
+  REFRESH_CADENCE = 2;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

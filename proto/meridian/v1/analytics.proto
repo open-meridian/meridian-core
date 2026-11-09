@@ -67,6 +67,18 @@ message Job {
   // Contract v28: its row key and version in the lake (W12.8); refused beside
   // scenario_set. Unset: no saved scenario.
   ScenarioRef scenario_ref = 9;
+  // Contract v30 (W12.1, W12.4; spec/one-data-access-model section 4;
+  // approved by 834): true asks the component to keep the answer current, a
+  // standing job keyed by its canonical form and its client's resolved
+  // inputs, computed once for every client with that key and recomputed as
+  // its inputs change, each measure by its refresh, while a renewal names it
+  // (RenewJobs). Its inputs are live: naming inputs.book_at,
+  // inputs.lake_as_of_ns, business_date or what_if is refused
+  // INVALID_ARGUMENT naming standing, and one past the deployment's most
+  // standing jobs FAILED_PRECONDITION naming standing. Its figures are
+  // published (DerivedSeriesUpdated), never recorded. False: a one-off job,
+  // answered once.
+  bool standing = 10;
 }
 
 // A job's inputs, by reference (requirement 3): one watermark and one as-of
@@ -497,6 +509,60 @@ message ListPriceBatchesReply {
   repeated PriceBatchRequest batches = 1;
   // The sequence read to.
   int64 sequence = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.4 — a standing job kept current (contract v30;
+// sdk-contract/standing-analytics-and-resilience-contract with
+// standing-analytics-compute-once; spec/one-data-access-model section 4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A sidecar's renewal of the standing jobs its plugin's open subscriptions
+// name (W12.4; approved by 1057): one message per lease
+// (analytics.standing.leaseSeconds), whatever the number of pages, and at
+// once for a job newly named. The component keeps each while a renewal
+// names it, and stops one no renewal named within the lease. Interest, not
+// a read: nothing is read or recorded.
+message RenewJobsRequest {
+  // `JOB-` IDs, 1 to 256; an empty list is refused naming job_ids.
+  repeated string job_ids = 1;
+}
+
+message RenewJobsReply {
+  // The renewed jobs no live coordinator holds -- its coordinator lost or
+  // the coordinators changed, or the job lapsed -- which the SDK registers
+  // again by RunJob with the job it holds. Not a refusal: the renewal of
+  // every other job stands. None: every job renewed is held.
+  repeated string unknown_job_ids = 1;
+}
+
+// A standing job's recomputed figures (W12.4; approved by 1057 and
+// 2026-11-09), published to each instance holding the job, one event per
+// holding instance, which alone hears it (matrix/directed.tsv), conflated
+// per job and figure key. Published, never recorded; never over 512 KiB,
+// split where it would be. After a gap in the job's sequence or a loss
+// marker the reader reads the job's whole answer again (ReadJobAnswer) and
+// applies the events above it.
+message DerivedSeriesUpdatedEvent {
+  // The standing job, as RunJobReply.job_id: the same for every holder.
+  string job_id = 1;
+  // The instance holding the job that alone hears this event (step 3c's
+  // question 2).
+  string client_instance_id = 2;
+  // The figures recomputed since the last event, keyed by subject and
+  // series, each naming its rule and its inputs with the as-of each was read
+  // at; 0 to 4,096.
+  repeated DerivedSeries values = 3;
+  // The figures recomputed since the last event over an account, a
+  // breakdown or a scenario, each as a job's answer carries it, beside
+  // values (step 3c's question 1); 0 to 4,096.
+  repeated Figure figures = 4;
+  // The recomputed figures not evaluated, each with its reason, never zero;
+  // 0 to 4,096.
+  repeated NotEvaluated not_evaluated = 5;
+  // The job's own sequence, the same for every holder, so a reader sees a
+  // gap. Never zero.
+  int64 sequence = 6;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
