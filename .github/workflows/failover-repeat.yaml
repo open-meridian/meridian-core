@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: The profile installed (tolerant; ha on three agents in three zones; or reconfigure, a live install moved tolerant -> ha -> tolerant, as e2e-cluster-reconfigure runs)
+        description: The profile installed (tolerant; ha on three agents in three zones; or reconfigure, a live install moved tolerant -> ha -> tolerant -> ha and restored to a time, as e2e-cluster-reconfigure runs)
         type: choice
         options: [ha, tolerant, reconfigure]
         default: ha
