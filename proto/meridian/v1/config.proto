@@ -668,8 +668,10 @@ message PluginConfigurationChangedEvent {
 // sent to the platform (spec/the-lake, requirements 12 to 14).
 
 // A deployment admin licenses a dataset: confirms or replaces the terms its
-// catalogue declares (DatasetDeclaration.licence_default). Answered by the
-// licence as recorded.
+// catalogue declares -- until contract v30 as DatasetDeclaration's retired
+// licence_default, from v30 described in its terms_and_pricing (ruling
+// 1032), each use right of a dataset nobody has licensed read restrictively
+// (1030). Answered by the licence as recorded.
 message SetDatasetLicenceRequest {
   string dataset = 1;
 

@@ -161,8 +161,11 @@ message BinaryEventContract {
   // What one contract pays if the event happens, naming its cash instrument:
   // 1 USD at Kalshi, 1 in the venue's USDC instrument at Polymarket. A
   // contract's price divided by this is its implied probability, a reader's
-  // computation, never stored.
-  Money payout = 1;
+  // computation, never stored. Optional from contract v30 (W3.1, ruling
+  // 1035): a data plugin's stated_binary_event_contract may state its
+  // category and not its payout, unset then not stated; on the record a
+  // payout is never unset. The wire is unchanged.
+  optional Money payout = 1;
 
   // When trading in it closes, as the venue states it; 0 when it states none.
   int64 closes_at_ns = 2;
@@ -433,6 +436,8 @@ enum InstrumentField {
   INSTRUMENT_FIELD_MONEY_MARKET_FUND = 6;
   // Contract v19.
   INSTRUMENT_FIELD_BINARY_EVENT_CONTRACT = 7;
+  // Contract v30 (ruling 433; approved 2026-11-09): a bond's terms.
+  INSTRUMENT_FIELD_BOND = 8;
 }
 
 // One value for a deployment's record, set or offered, with where it came
@@ -452,6 +457,13 @@ message InstrumentValue {
     MoneyMarketFund money_market_fund = 7;
     // Contract v19: on a binary event contract only, its payout stated.
     BinaryEventContract binary_event_contract = 8;
+    // Contract v30 (W3.10; ruling 433, with core #84's term offers;
+    // approved 2026-11-09): a bond's terms as a source offers them or a
+    // deployment admin puts them in force, its source named under
+    // INSTRUMENT_FIELD_BOND; refused on a record whose type is not bond.
+    // Never a bond's prices, yields or current face, which are the lake's
+    // and the engine's.
+    Bond bond = 9;
   }
 
   // Where the value came from, in words: a statement, a prospectus, "ISO
@@ -1102,6 +1114,13 @@ message ResolveIdentifierRequest {
   // records. None where the source stated it. Kept with the offer; a
   // currency supplied or derived never narrows a symbol match.
   repeated Provenance provenance = 9;
+
+  // Contract v30 (W3.1; ruling 1035, with 954; approved by 1057): a binary
+  // event contract's terms as its venue gives them, its category among them.
+  // The store records category the first time it sees the contract and keeps
+  // each stated term as an offer thereafter. Unset is not stated; never a
+  // value in force, as no stated_ field is.
+  BinaryEventContract stated_binary_event_contract = 10;
 }
 
 message ResolveIdentifierReply {

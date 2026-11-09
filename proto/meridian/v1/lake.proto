@@ -624,6 +624,10 @@ enum RateKind {
   RATE_KIND_DISCOUNT = 6;
   // A bill's coupon-equivalent (bond-equivalent) yield.
   RATE_KIND_COUPON_EQUIVALENT = 7;
+  // Contract v30 (ruling 431; approved 2026-11-09): an on-the-run
+  // benchmark's yield as its publisher states it, the kind a curve's
+  // benchmarks are quoted in.
+  RATE_KIND_BENCHMARK_YIELD = 8;
 }
 
 // RateConvention, DayCount and Compounding: declared in amounts.proto from
@@ -1415,6 +1419,10 @@ message SetSourcePriorityRequest {
   int64 against_updated_at_ns = 5;
 }
 
+// Read by a deployment admin, and from contract v30 by the eight roles that
+// read the lake (W10.2; ruling 454, step 3c's question 7), read-only: each
+// priority answered with the datasets the asker is entitled to, a dataset it
+// may not read left out, a priority with none left not answered.
 message ListSourcePrioritiesRequest {}
 
 message ListSourcePrioritiesReply {
