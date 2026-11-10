@@ -2457,3 +2457,468 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         assert!(models.contains(&model), "{models:?}");
     }
 }
+
+// ── The coordinator's memory, bounded (core's store memory audit, item 2) ──
+
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Counting;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let at = unsafe { System.realloc(ptr, layout, new_size) };
+            if !at.is_null() {
+                if new_size > layout.size() {
+                    let live = LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed)
+                        + (new_size - layout.size());
+                    PEAK.fetch_max(live, Ordering::Relaxed);
+                } else {
+                    LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+                }
+            }
+            at
+        }
+    }
+
+    /// Live and peak MiB; the peak starts again from now.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.load(Ordering::Relaxed);
+        let peak = PEAK.swap(live, Ordering::Relaxed);
+        (live as f64 / 1048576.0, peak as f64 / 1048576.0)
+    }
+}
+
+/// The test binary's allocator counts what it holds, for the coordinator's
+/// memory bounds below; nextest runs each test as its own process.
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;
+
+/// [`serve_store`], the stamps it heard not kept: a test that measures
+/// what the coordinator holds holds nothing of its own per request.
+fn serve_quiet<Req, Rep, F>(
+    stores: &Stores,
+    topic: &'static str,
+    reply_type: &'static str,
+    answer: F,
+) where
+    Req: Message + Default,
+    Rep: Message,
+    F: Fn(Req) -> Rep + Send + Sync + 'static,
+{
+    stores.bus.serve(topic, move |envelope| {
+        let request = Req::decode(&envelope.payload[..]).map_err(|e| e.to_string())?;
+        Ok((reply_type.to_string(), answer(request).encode_to_vec()))
+    });
+}
+
+/// An account of `n` equities, each priced: its market value by instrument
+/// answers `n` figures. Every price read waits `delay` -- a job holding its
+/// positions and records meanwhile -- and the most price reads at once are
+/// counted.
+fn wide_stores(n: usize, delay: Duration) -> (Stores, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let stores = Stores {
+        bus: Arc::new(Bus::single(
+            crate::INSTANCE,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(ManualClock::at(NOW)),
+        )),
+        heard: Arc::default(),
+        routing: Arc::new(Mutex::new(Vec::new())),
+        quarantined: Arc::default(),
+        quarantined_quote: Arc::default(),
+    };
+    let wide = |i: usize| format!("INS-WIDE{i:06}");
+    serve_quiet(
+        &stores,
+        topics::LIST_ACCOUNT_ATTRIBUTES,
+        "meridian.v1.ListAccountAttributesReply",
+        |request: ListAccountAttributesRequest| ListAccountAttributesReply {
+            attributes: vec![AccountAttributes {
+                account_id: request.account_id,
+                base_currency_code: "USD".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    serve_quiet(
+        &stores,
+        topics::LIST_POSITIONS,
+        "meridian.v1.ListPositionsReply",
+        move |request: ListPositionsRequest| ListPositionsReply {
+            positions: (0..n)
+                .map(|i| BookPosition {
+                    account_id: request.account_id.clone(),
+                    instrument_id: wide(i),
+                    side: HoldingSide::Long as i32,
+                    trade_date_quantity: d(&format!("{}", 1 + i % 97)),
+                    ..Default::default()
+                })
+                .chain([BookPosition {
+                    account_id: request.account_id.clone(),
+                    instrument_id: USD.into(),
+                    side: HoldingSide::Long as i32,
+                    trade_date_quantity: d("5000"),
+                    ..Default::default()
+                }])
+                .collect(),
+            next_cursor: String::new(),
+            as_of: Some(Watermark {
+                partitions: vec![PartitionSequence {
+                    partition: request.account_id,
+                    sequence: 1,
+                }],
+            }),
+        },
+    );
+    serve_quiet(
+        &stores,
+        topics::RESOLVE_INSTRUMENT,
+        "meridian.v1.ResolveInstrumentReply",
+        |request: ResolveInstrumentRequest| {
+            let found = if request.instrument_id == USD {
+                record(USD, AssetClass::Cash, "USD", "TPL-cash")
+            } else {
+                record(
+                    &request.instrument_id,
+                    AssetClass::Equity,
+                    "USD",
+                    "TPL-equity",
+                )
+            };
+            ResolveInstrumentReply {
+                found: true,
+                instrument: Some(found),
+            }
+        },
+    );
+    serve_quiet(
+        &stores,
+        topics::READ_TEMPLATE,
+        "meridian.v1.ReadTemplateReply",
+        |request: ReadTemplateRequest| {
+            let (model, inputs): (&str, &[&str]) = match request.template_id.as_str() {
+                "TPL-cash" => ("cash", &["fx"]),
+                _ => ("quoted_price", &["close", "fx"]),
+            };
+            ReadTemplateReply {
+                template: Some(SecurityTemplate {
+                    template_id: request.template_id,
+                    template_version: request.template_version,
+                    calculation_package: Some(CalculationPackage {
+                        model_id: model.into(),
+                        model_version: 1,
+                        pricing_inputs: inputs.iter().map(|i| i.to_string()).collect(),
+                        calculation_version: "1".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }
+        },
+    );
+    serve_quiet(
+        &stores,
+        topics::LIST_EVENT_GROUPS,
+        "meridian.v1.ListEventGroupsReply",
+        |_request: ListEventGroupsRequest| ListEventGroupsReply::default(),
+    );
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let (flying, counted) = (Arc::clone(&in_flight), Arc::clone(&most));
+    serve_quiet(
+        &stores,
+        topics::LIST_PRICES,
+        "meridian.v1.ListPricesReply",
+        move |request: ListPricesRequest| {
+            let now = flying.fetch_add(1, Ordering::SeqCst) + 1;
+            counted.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            flying.fetch_sub(1, Ordering::SeqCst);
+            ListPricesReply {
+                prices: request
+                    .subjects
+                    .iter()
+                    .filter(|s| s.entity_id.starts_with("INS-WIDE"))
+                    .map(|s| {
+                        price(
+                            &s.entity_id,
+                            PriceKind::Close,
+                            "101.25",
+                            USD,
+                            "alpaca-1:daily",
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        },
+    );
+    serve_quiet(
+        &stores,
+        topics::LIST_OUTCOMES,
+        "meridian.v1.ListOutcomesReply",
+        |_request: ListOutcomesRequest| ListOutcomesReply::default(),
+    );
+    serve_quiet(
+        &stores,
+        topics::LIST_MODEL_ROUTING,
+        "meridian.v1.ListModelRoutingReply",
+        |_request: ListModelRoutingRequest| ListModelRoutingReply {
+            version: 1,
+            routes: Vec::new(),
+        },
+    );
+    (stores, most)
+}
+
+fn wide_job() -> RunJobRequest {
+    job(&[("market_value", &["instrument"], "")])
+}
+
+/// A job run, answered inline or later; its answer read whole, every page.
+async fn run_and_read(stores: &Stores, request: RunJobRequest) -> Result<JobAnswer, String> {
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        request,
+        &["ACC-1"],
+    )
+    .await?;
+    if let Some(answer) = reply.answer {
+        return Ok(answer);
+    }
+    for _ in 0..600 {
+        match read_every_page(&stores.bus, &reply.job_id, 0).await {
+            Ok(pages) => return Ok(reassembled(&pages)),
+            Err(not_yet) if not_yet.contains("still running") => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(refused) => return Err(refused),
+        }
+    }
+    Err(format!("{} never finished", reply.job_id))
+}
+
+/// Found 2026-11-09 (core's store memory audit, item 2): the coordinator
+/// kept a thousand finished answers by count alone, never by size or age
+/// -- a chain answer about 1.2 MB, up to about 1.2 GB of its 2 GiB. Now
+/// the answers kept are counted in bytes, as encoded, and by age.
+///
+/// Answers of about 300 KB each, one job after another, against a
+/// coordinator keeping 4 MiB: what the coordinator holds after them grows
+/// by at most [`KEPT_HEAP_MOST_MIB`], however many ran; the latest answer
+/// is still read whole, an early one has left the cache and says so, and
+/// an answer kept longer than its time has left too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answers_kept_are_bounded_by_bytes_and_age_not_count_alone() {
+    let (stores, _) = wide_stores(1_500, Duration::ZERO);
+    let clock = Arc::new(ManualClock::at(NOW));
+    let handle = tokio::runtime::Handle::current();
+    let config = Config {
+        engine_version: "0.1.0".into(),
+        answers_kept_bytes: 4 * 1024 * 1024,
+        ..Config::default()
+    };
+    let coordinator = Coordinator::new(
+        Arc::clone(&stores.bus),
+        handle,
+        clock.clone(),
+        config.clone(),
+        service::local(),
+    );
+    service::serve(&stores.bus, &coordinator);
+    let first = run_and_read(&stores, wide_job()).await.unwrap();
+    let size = first.encoded_len();
+    assert!(
+        size > 200 * 1024 && size < crate::pages::PAGE_BUDGET,
+        "an answer of a few hundred KB, given inline: {size}"
+    );
+    let (before, _) = counted::take();
+    let mut ids = Vec::new();
+    for _ in 0..40 {
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            wide_job(),
+            &["ACC-1"],
+        )
+        .await
+        .unwrap();
+        assert!(reply.answered_inline);
+        ids.push(reply.job_id);
+    }
+    let (after, peak) = counted::take();
+    println!(
+        "KEPT answers=40 answer_bytes={size} heap_before_mib={before:.1} heap_after_mib={after:.1} heap_peak_mib={peak:.1}"
+    );
+    assert!(
+        after - before <= KEPT_HEAP_MOST_MIB,
+        "the coordinator holds {:.1} MiB more after 40 answers of {size} bytes; it keeps {} bytes",
+        after - before,
+        config.answers_kept_bytes
+    );
+    // The latest is read whole; the first has left the cache.
+    let latest = read_every_page(&stores.bus, ids.last().unwrap(), 0)
+        .await
+        .unwrap();
+    let mut latest = reassembled(&latest);
+    latest.job_id = first.job_id.clone();
+    assert_eq!(latest, first, "the same answer, kept and read again");
+    let Err(gone) = read_every_page(&stores.bus, &ids[0], 0).await else {
+        panic!("the first answer has left the cache");
+    };
+    assert!(gone.contains("left the component's cache"), "{gone}");
+    // Kept past its time: gone too.
+    clock.advance(config.answers_kept_for.as_nanos() as i64 + 1);
+    let Err(expired) = read_every_page(&stores.bus, ids.last().unwrap(), 0).await else {
+        panic!("an answer kept past its time has left the cache");
+    };
+    assert!(expired.contains("left the component's cache"), "{expired}");
+}
+
+/// What the answers kept may add to the coordinator's heap, in MiB: the
+/// 4 MiB they are kept within, and room for what the bus and the test
+/// hold beside them.
+const KEPT_HEAP_MOST_MIB: f64 = 8.0;
+
+/// Found 2026-11-09 (core's store memory audit, item 2): each job ran on
+/// a thread of its own with no bound, each holding its inputs while it
+/// ran, so a burst of jobs held every job's inputs at once. Now
+/// `jobs_at_once` run at once and the rest wait their turn, answered later;
+/// past `jobs_waiting` waiting, a job is refused, saying so, and the
+/// coordinator carries on.
+///
+/// Sixteen jobs at once, each holding 1,500 positions' inputs while its
+/// prices are read: the heap's peak stays within [`BURST_JOBS_MOST`] times
+/// what one job alone takes, at most two are reading at once, and every
+/// job answers what one alone does. Then, with no room to wait, a burst past the bound is refused
+/// with FAILED_PRECONDITION, and the jobs taken still answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
+    let (stores, most) = wide_stores(1_500, Duration::from_millis(300));
+    // One job alone, and what it takes at its peak.
+    let (alone, one) = {
+        let (alone, _) = wide_stores(1_500, Duration::ZERO);
+        coordinator(&alone, Config::default(), false);
+        let (before, _) = counted::take();
+        let answer = run_and_read(&alone, wide_job()).await.unwrap();
+        let (_, peak) = counted::take();
+        (answer, peak - before)
+    };
+    let config = Config {
+        jobs_at_once: 2,
+        jobs_waiting: 64,
+        ..Config::default()
+    };
+    coordinator(&stores, config, false);
+    let (before, _) = counted::take();
+    let mut running = Vec::new();
+    for _ in 0..16 {
+        let stores = Stores {
+            bus: Arc::clone(&stores.bus),
+            heard: Arc::clone(&stores.heard),
+            routing: Arc::clone(&stores.routing),
+            quarantined: Arc::clone(&stores.quarantined),
+            quarantined_quote: Arc::clone(&stores.quarantined_quote),
+        };
+        running.push(tokio::spawn(async move {
+            run_and_read(&stores, wide_job()).await
+        }));
+    }
+    let mut answers = Vec::new();
+    for job in running {
+        answers.push(job.await.unwrap().unwrap());
+    }
+    let (_, peak) = counted::take();
+    let at_once = most.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "BURST jobs=16 at_once={at_once} one_job_mib={one:.1} heap_before_mib={before:.1} heap_peak_mib={peak:.1}"
+    );
+    assert!(
+        peak - before <= BURST_JOBS_MOST * one,
+        "sixteen jobs at once peaked {:.1} MiB above where they started, one alone {one:.1} MiB; \
+         the bound is {BURST_JOBS_MOST} jobs' worth",
+        peak - before
+    );
+    assert!(at_once <= 2, "{at_once} jobs read their prices at once");
+    for mut answer in answers {
+        answer.job_id = alone.job_id.clone();
+        assert_eq!(answer, alone, "every job answers what one alone does");
+    }
+
+    // No room to wait: two run, the rest of a burst refused, saying so.
+    let full = {
+        let (full, _) = wide_stores(1_500, Duration::from_millis(300));
+        coordinator(
+            &full,
+            Config {
+                jobs_at_once: 2,
+                jobs_waiting: 0,
+                ..Config::default()
+            },
+            false,
+        );
+        full
+    };
+    let mut asked = Vec::new();
+    for _ in 0..6 {
+        let bus = Arc::clone(&full.bus);
+        asked.push(tokio::spawn(async move {
+            ask_as::<RunJobReply>(
+                &bus,
+                topics::RUN_JOB,
+                "meridian.v1.RunJobRequest",
+                wide_job(),
+                &["ACC-1"],
+            )
+            .await
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut taken = 0;
+    let mut refused = 0;
+    for reply in asked {
+        match reply.await.unwrap() {
+            Ok(_) => taken += 1,
+            Err(said) => {
+                assert!(
+                    said.contains("[refusal-status failed-precondition")
+                        && said.contains("run the job again"),
+                    "{said}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert!(
+        taken >= 2 && refused >= 1,
+        "taken {taken}, refused {refused}"
+    );
+    // The coordinator carries on: a job after the burst answers.
+    let after = run_and_read(&full, wide_job()).await.unwrap();
+    assert_eq!(after.figures.len(), alone.figures.len());
+}
+
+/// What sixteen jobs at once may add to the heap at their peak, in jobs
+/// alone: the two running, and the answers kept and read as they finish.
+const BURST_JOBS_MOST: f64 = 5.0;

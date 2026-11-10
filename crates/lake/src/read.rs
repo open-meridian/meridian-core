@@ -574,6 +574,55 @@ pub fn as_published(rows: Vec<Observation>, published_as_of_ns: i64) -> Vec<Obse
     out
 }
 
+/// [`as_published`] over rows read a row key at a time -- each key's
+/// versions together, as a store reads them in key order -- holding the
+/// key's version in force so far, one row, never every version (found
+/// 2026-11-09: a read as published by a time collected every version in
+/// its window to choose from; Treasury's par curve keeps about 100,000 rows
+/// for its one subject). Chooses what [`as_published`] chooses.
+#[derive(Debug)]
+pub struct ByPublished {
+    published_as_of_ns: i64,
+    held: Option<Observation>,
+}
+
+impl ByPublished {
+    pub fn new(published_as_of_ns: i64) -> Self {
+        ByPublished {
+            published_as_of_ns,
+            held: None,
+        }
+    }
+
+    /// One row read: the last key's version in force, where this row starts
+    /// another key.
+    pub fn admit(&mut self, row: Observation) -> Option<Observation> {
+        let published = published_at(&row);
+        if published > self.published_as_of_ns {
+            return None;
+        }
+        let Some(held) = self.held.take() else {
+            self.held = Some(row);
+            return None;
+        };
+        let same = held.dataset() == row.dataset()
+            && held.data_type() == row.data_type()
+            && held.meta().row_key == row.meta().row_key;
+        if !same {
+            self.held = Some(row);
+            return Some(held);
+        }
+        let later = (published, row.meta().version) > (published_at(&held), held.meta().version);
+        self.held = Some(if later { row } else { held });
+        None
+    }
+
+    /// The last key's version in force.
+    pub fn finish(self) -> Option<Observation> {
+        self.held
+    }
+}
+
 /// Contract v28 (W10.6; rulings 421 and 619): `include_quarantined` on a
 /// read that names no dataset -- a default or a side-by-side read -- is
 /// refused naming it.
@@ -1087,51 +1136,44 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
             && read.roles.is_empty()
             && read.narrowed == Narrowed::default(),
     };
+    // A read as published by a time is answered each row key's version in
+    // force by then, chosen as the store reads (`published_as_of_ns`).
+    // Its working memory reserved from the rows as it holds them (stage M;
+    // the resilience spec's section 10a): a read the budget has no room
+    // for, or one the shed line cancelled, stops reading and is refused for
+    // load, never grown past the budget.
     let mut gather = Gather::new(read, against);
-    if read.published_as_of_ns != 0 {
-        // A rate read as published by a time: each row key's version in
-        // force by then, chosen of every version read.
-        let rows = store.read(&query).map_err(|failed| failed.to_string())?;
-        for row in as_published(rows, read.published_as_of_ns) {
-            gather.admit(row);
-        }
-    } else {
-        // Its working memory reserved from the rows as it holds them (stage
-        // M; the resilience spec's section 10a): a read the budget has no
-        // room for, or one the shed line cancelled, stops reading and is
-        // refused for load, never grown past the budget.
-        let mut refused = None;
-        let mut reserved = 0usize;
-        let mut since_check = 0u32;
-        let stopped = store.read_each(&query, &mut |row| {
-            gather.admit(row);
-            since_check += 1;
-            let held = gather.held_bytes;
-            let over = if held >= reserved + RESERVE_STEP {
-                let grown = meridian_budget::grow((held - reserved) as u64);
-                reserved = held;
-                grown.err()
-            } else if since_check >= CHECK_EVERY {
-                since_check = 0;
-                meridian_budget::check().err()
-            } else {
-                None
-            };
-            match over {
-                None => Ok(()),
-                Some(over) => {
-                    refused = Some(over);
-                    Err(crate::store::StoreError::Unavailable(
-                        "refused for load".into(),
-                    ))
-                }
+    let mut refused = None;
+    let mut reserved = 0usize;
+    let mut since_check = 0u32;
+    let stopped = store.read_each(&query, &mut |row| {
+        gather.admit(row);
+        since_check += 1;
+        let held = gather.held_bytes;
+        let over = if held >= reserved + RESERVE_STEP {
+            let grown = meridian_budget::grow((held - reserved) as u64);
+            reserved = held;
+            grown.err()
+        } else if since_check >= CHECK_EVERY {
+            since_check = 0;
+            meridian_budget::check().err()
+        } else {
+            None
+        };
+        match over {
+            None => Ok(()),
+            Some(over) => {
+                refused = Some(over);
+                Err(crate::store::StoreError::Unavailable(
+                    "refused for load".into(),
+                ))
             }
-        });
-        if let Some(over) = refused {
-            return Err(meridian_bus::overloaded(&over));
         }
-        stopped.map_err(|failed| failed.to_string())?;
+    });
+    if let Some(over) = refused {
+        return Err(meridian_bus::overloaded(&over));
     }
+    stopped.map_err(|failed| failed.to_string())?;
     let Gather {
         tenor_seen,
         tenor_asked,

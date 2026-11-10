@@ -62,9 +62,10 @@ pub struct Query {
     pub when: When,
     /// The recorded-time cut-off.
     pub as_of_ns: i64,
-    /// A rate's published-time cut-off (contract v27, W10.6); 0 for none.
-    /// Given, the store answers every version recorded by `as_of_ns`, and
-    /// the read chooses the version in force by published time.
+    /// A published-time cut-off (contract v27, W10.6); 0 for none. Given,
+    /// the store answers each row key at its version in force by then, of
+    /// those recorded by `as_of_ns` ([`crate::read::as_published`]), chosen
+    /// as it reads: never every version held to choose from.
     pub published_as_of_ns: i64,
     /// A read of the latest that narrows its rows no further before the
     /// latest is chosen: the store may answer, of the rows it would, only
@@ -552,9 +553,19 @@ pub trait Store: Send + Sync {
     /// The first and last business date a dataset's kept rows name.
     fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>>;
 
-    /// Every kept row of a dataset, every version, dated on one of `dates`,
-    /// each with its flag as known now.
-    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>>;
+    /// A dataset's kept rows, every version, dated on one of `dates`, each
+    /// with its flag as known now: at most `most` of them, those after
+    /// sequence `after`, in sequence order. A calendar's re-check reads a
+    /// dataset this way, [`READ_CHUNK`] at a time, never holding it whole
+    /// (found 2026-11-09: a chain's dataset kept about 565,000 dated rows,
+    /// about 216 MB of bodies, every one read and decoded at once).
+    fn dated_on(
+        &self,
+        dataset: &str,
+        dates: &[String],
+        after: u64,
+        most: usize,
+    ) -> Result<Vec<Observation>>;
 
     /// Journal re-checks beside their rows.
     fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()>;
@@ -585,11 +596,15 @@ pub trait Store: Send + Sync {
     /// as of a recorded time (0 for now), whatever its subject: how the
     /// account-scoped execution costs are read (contract v27, W10.11), their
     /// subject the execution's instrument, which a reader does not name.
+    /// Given a published-time cut (0 for none), each row key at its version
+    /// in force by then of those recorded by `as_of_ns`
+    /// ([`crate::read::as_published`]), chosen as the store reads.
     fn read_dataset(
         &self,
         dataset: &str,
         data_type: DataType,
         as_of_ns: i64,
+        published_as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
 
     /// [`Store::read_dataset`], each row handed on as it is read, in
@@ -604,7 +619,7 @@ pub trait Store: Send + Sync {
         as_of_ns: i64,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        for row in self.read_dataset(dataset, data_type, as_of_ns)? {
+        for row in self.read_dataset(dataset, data_type, as_of_ns, 0)? {
             each(row)?;
         }
         Ok(())
@@ -659,13 +674,19 @@ pub trait Store: Send + Sync {
     ) -> std::result::Result<ReadChangesReply, ReadError>;
 }
 
+/// How many rows a store reads from its database at once, decoded and
+/// handed on before the next: a streamed read's chunk, and a re-check's.
+pub const READ_CHUNK: usize = 1_000;
+
 /// Whether a query answers every version it finds, not each row key's
 /// latest: an outcome's catch-up after a watermark, since every version is
 /// delivered and none conflated (contract v23, the lake plan's vL1c, item
 /// 4), so a reader that lost some reads each stage it lost.
 ///
-/// A published-time read of rates (contract v27, W10.6) takes every version
-/// too: which is in force by published time is the read's to choose.
+/// A read as published by a time (contract v27, W10.6) is never the
+/// latest's: which version is in force by then is chosen from every one
+/// the read would load, by the store as it reads
+/// ([`Query::published_as_of_ns`]), never by a latest read's index.
 ///
 /// From contract v28 a declared corporate action and a filing are caught up
 /// the same way (the amendment of 2026-10-24: an unconflated row is caught

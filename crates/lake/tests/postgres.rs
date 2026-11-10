@@ -488,7 +488,7 @@ fn a_whole_datasets_read_hands_on_a_chunk_at_a_time() {
         .unwrap();
     let (_, peak) = counted::take();
     assert_eq!(answered, ROWS, "each row key once");
-    let whole = store.read_dataset(&dataset, DataType::Trade, 0).unwrap();
+    let whole = store.read_dataset(&dataset, DataType::Trade, 0, 0).unwrap();
     assert_eq!(whole.len(), ROWS, "the rows read_dataset answers");
     assert_eq!(
         whole.iter().filter(|row| row.meta().version == 2).count(),
@@ -642,9 +642,14 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
         .unwrap();
     assert_eq!(store.closed_day_counts().unwrap()[&dataset], (2, 1));
     let on = store
-        .dated_on(&dataset, &["2026-10-13".to_string()])
+        .dated_on(&dataset, &["2026-10-13".to_string()], 0, usize::MAX)
         .unwrap();
     assert_eq!(on.len(), 1);
+    // A chunk at a time, by sequence: nothing after the last.
+    assert!(store
+        .dated_on(&dataset, &["2026-10-13".to_string()], tuesday, 1)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         on[0].meta().closed_day.as_ref().unwrap().holiday_name,
         "A closure"
@@ -926,7 +931,7 @@ fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].by_instance, "signal-1");
     assert_eq!(
-        store.read_dataset(&dataset, DataType::Price, 0).unwrap()[0]
+        store.read_dataset(&dataset, DataType::Price, 0, 0).unwrap()[0]
             .meta()
             .quality,
         QualityState::Invalid as i32
@@ -4061,4 +4066,743 @@ fn each_row_keeps_its_digest_and_the_scrub_names_one_changed_beneath_the_lake() 
         .unwrap()
         .get(0);
     assert!(filled, "the row kept before digests now has its own");
+}
+
+/// The lake's whole-dataset reads, each bounded by a chunk (found on dev
+/// 2026-11-09, core's store memory audit, items 1 and 5): a calendar's
+/// re-check read a dataset following it whole, every version; a read as
+/// published by a time read every version in its window to choose each
+/// row key's in force. Each test here measures the read under the counting
+/// allocator, each its own process (the gate's nextest), against what the
+/// set would take decoded whole, and checks the answer row by row.
+mod bounded {
+    use std::sync::Arc;
+
+    use meridian_bus::{Bus, MemoryBackend, Stamp};
+    use meridian_clock::{Clock, SystemClock};
+    use meridian_domain::v1::{
+        AssetClass, CalendarAppliedEvent, CalendarCoverage, CalendarDay, CalendarDayKind,
+        CalendarWeekend, DatasetEntitlement, DatasetRef, EntitlementsChangedEvent,
+        InstrumentRecord, ObservationMeta, Rate, RateKind, ReadCalendarReply,
+        ResolveIdentifierReply, ResolveInstrumentReply, Source, SourceChoice, SourceTime,
+        SourceTimeKind, Statistic, StatisticKind, SubjectRef, Tenor, TenorUnit, UnitValue,
+        ValueUnit, Weekday,
+    };
+    use meridian_lake::row::Observation;
+    use meridian_lake::service;
+    use meridian_lake::store::Store;
+    use meridian_lake::PostgresStore;
+    use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
+    use prost::Message;
+
+    pub const READER: &str = "sample-bounded";
+    pub const DAY: i64 = 86_400 * 1_000_000_000;
+    pub const HOUR: i64 = 3_600 * 1_000_000_000;
+
+    /// A size from the environment, for measuring at another scale.
+    pub fn sized(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(default)
+    }
+
+    pub fn decimal(units: u64, scale: u32) -> Option<Decimal> {
+        Some(Decimal {
+            high: 0,
+            low: units,
+            scale,
+        })
+    }
+
+    /// The lake served on an in-process bus over the store for one dataset
+    /// of these data types, following `calendar` where one is named; the
+    /// instrument store stood in, and the calendar's every read answered
+    /// `reply`.
+    pub fn serve(
+        store: Arc<PostgresStore>,
+        dataset: &str,
+        data_types: &[&str],
+        calendar: Option<ReadCalendarReply>,
+    ) -> (Arc<Bus>, Arc<service::Lake>) {
+        let bus = Arc::new(Bus::single(
+            READER,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(SystemClock),
+        ));
+        bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
+            let asked =
+                meridian_domain::v1::ResolveInstrumentRequest::decode(&envelope.payload[..])
+                    .unwrap_or_default();
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: asked.instrument_id,
+                        asset_class: AssetClass::Equity as i32,
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        bus.serve(service::RESOLVE_IDENTIFIER, |_| {
+            Ok((
+                "meridian.v1.ResolveIdentifierReply".into(),
+                ResolveIdentifierReply::default().encode_to_vec(),
+            ))
+        });
+        bus.serve(service::PLUGIN_CATALOGUE, |_| {
+            Ok((
+                "meridian.v1.PluginCatalogue".into(),
+                meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
+            ))
+        });
+        let calendar_id = calendar
+            .as_ref()
+            .map(|reply| reply.calendar_id.clone())
+            .unwrap_or_default();
+        if let Some(reply) = calendar {
+            bus.serve(service::READ_CALENDAR, move |_| {
+                Ok((
+                    "meridian.v1.ReadCalendarReply".into(),
+                    reply.encode_to_vec(),
+                ))
+            });
+        }
+        let store: Arc<dyn Store> = store;
+        let lake = service::serve(bus.clone(), store, Arc::new(SystemClock));
+        let (instance, key) = dataset.split_once(':').unwrap();
+        lake.configured(&EntitlementsChangedEvent {
+            datasets: vec![DatasetRef {
+                dataset: dataset.into(),
+                instance: instance.into(),
+                vendor: "Bounded".into(),
+                declaration: Some(DatasetDeclaration {
+                    key: key.into(),
+                    vendor: "Bounded".into(),
+                    data_types: data_types.iter().map(|t| t.to_string()).collect(),
+                    modes: vec![ObservationMode::Pull as i32],
+                    cadence: 86_400,
+                    calendar_id,
+                    // Kept: no licence says otherwise (contract v30 retired
+                    // a catalogue's licence_default, ruling 1032).
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            licences: vec![],
+            entitlements: vec![DatasetEntitlement {
+                dataset: dataset.into(),
+                instance: READER.into(),
+                allowed: true,
+                ..Default::default()
+            }],
+            changed_at_ns: SystemClock.now_ns(),
+        });
+        (bus, lake)
+    }
+
+    /// Asked as the reader's sidecar asks.
+    pub async fn ask<Q: Message, R: Message + Default>(
+        bus: &Bus,
+        topic: &str,
+        kind: &str,
+        q: Q,
+    ) -> R {
+        let stamp = Stamp {
+            account_scope: Some(vec![]),
+            ..Default::default()
+        };
+        let (_, payload) = bus
+            .call_stamped(
+                topic,
+                kind,
+                q.encode_to_vec(),
+                None,
+                Some(std::time::Duration::from_secs(120)),
+                &stamp,
+            )
+            .await
+            .unwrap_or_else(|failed| panic!("{topic}: {failed}"));
+        R::decode(&payload[..]).unwrap()
+    }
+
+    /// A calendar closing the weekends and every `holiday_every`-th date
+    /// from `first`, covering `first` to `last`.
+    pub fn calendar(
+        calendar_id: &str,
+        first: &str,
+        last: &str,
+        holidays: &[String],
+    ) -> ReadCalendarReply {
+        ReadCalendarReply {
+            found: true,
+            calendar_id: calendar_id.into(),
+            version: 2,
+            days: holidays
+                .iter()
+                .map(|date| CalendarDay {
+                    date: date.clone(),
+                    kind: CalendarDayKind::Closed as i32,
+                    name: "A closure".into(),
+                    source: String::new(),
+                })
+                .collect(),
+            weekends: vec![CalendarWeekend {
+                weekdays: vec![Weekday::Saturday as i32, Weekday::Sunday as i32],
+                valid_from_date: "2000-01-01".into(),
+            }],
+            coverage: Some(CalendarCoverage {
+                from_date: first.into(),
+                to_date: last.into(),
+            }),
+            sources: vec![],
+            trading_sessions: None,
+        }
+    }
+
+    pub fn statistic(
+        dataset: &str,
+        key: &str,
+        subject: &str,
+        date: &str,
+        at: i64,
+        value: u64,
+    ) -> Observation {
+        Observation::Statistic(Statistic {
+            meta: Some(ObservationMeta {
+                row_key: format!("{key}:{date}"),
+                subjects: vec![SubjectRef {
+                    entity_id: subject.into(),
+                    ..Default::default()
+                }],
+                source: Some(Source {
+                    instance: "bounded".into(),
+                    dataset: dataset.into(),
+                    ..Default::default()
+                }),
+                valid_from_ns: at,
+                business_date: date.into(),
+                ..Default::default()
+            }),
+            kind: StatisticKind::OpenInterest as i32,
+            value: Some(UnitValue {
+                value: decimal(value, 0),
+                unit: ValueUnit::Count as i32,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// A par yield of `subject` at a tenor on a date, `value` hundredths
+    /// of a percent, published at `published_ns`.
+    pub fn par(
+        dataset: &str,
+        subject: &str,
+        months: i32,
+        date: &str,
+        at: i64,
+        value: u64,
+        published_ns: i64,
+    ) -> Observation {
+        Observation::Rate(Box::new(Rate {
+            meta: Some(ObservationMeta {
+                row_key: format!("{date}:{months}M"),
+                subjects: vec![SubjectRef {
+                    entity_id: subject.into(),
+                    ..Default::default()
+                }],
+                source: Some(Source {
+                    instance: "us-treasury".into(),
+                    dataset: dataset.into(),
+                    ..Default::default()
+                }),
+                valid_from_ns: at,
+                business_date: date.into(),
+                source_times: vec![SourceTime {
+                    kind: SourceTimeKind::Published as i32,
+                    at_ns: published_ns,
+                }],
+                ..Default::default()
+            }),
+            kind: RateKind::ParYield as i32,
+            value: Some(UnitValue {
+                value: decimal(value, 2),
+                unit: ValueUnit::Percent as i32,
+                ..Default::default()
+            }),
+            tenor: Some(Tenor {
+                count: months,
+                unit: TenorUnit::Month as i32,
+            }),
+            ..Default::default()
+        }))
+    }
+
+    /// What `rows` take held decoded, as a held answer counts a row.
+    pub fn whole_mib(rows: &[Observation], of: usize) -> f64 {
+        let per_row = rows
+            .iter()
+            .map(|row| {
+                meridian_lake::pages::Whole {
+                    rows: vec![row.clone()],
+                    not_served: Vec::new(),
+                }
+                .held_bytes()
+            })
+            .sum::<usize>()
+            / rows.len().max(1);
+        (of * per_row) as f64 / 1048576.0
+    }
+
+    pub fn applied(calendar_id: &str) -> CalendarAppliedEvent {
+        CalendarAppliedEvent {
+            calendar_id: calendar_id.into(),
+            version: 2,
+            rule: None,
+            applied_at_ns: 0,
+        }
+    }
+
+    pub fn now() -> i64 {
+        SystemClock.now_ns()
+    }
+
+    pub fn default_sources() -> Option<SourceChoice> {
+        Some(SourceChoice {
+            default: true,
+            ..Default::default()
+        })
+    }
+}
+
+/// Found on dev 2026-11-09 (core's store memory audit, item 1): a
+/// calendar's new version re-checked every dataset following it by reading
+/// the dataset's dated rows whole, every version and data type, decoded in
+/// one query -- a chain's dataset following its venue's calendar kept about
+/// 565,000 such rows, about 216 MB of bodies -- and held every amendment it
+/// made until the last. Now a chunk of [`meridian_lake::store::READ_CHUNK`]
+/// rows at a time, each chunk's re-checks journalled before the next.
+///
+/// A dataset of `MERIDIAN_BOUNDED_KEYS` keys over `MERIDIAN_BOUNDED_DAYS`
+/// dates, each restated `MERIDIAN_BOUNDED_VERSIONS` times, recorded
+/// unflagged; a calendar's version closing the weekends and every fifth
+/// date: the heap's peak across the re-check stays within
+/// [`RECHECK_HEAP_MOST_MIB`] and resident memory's high-water mark within
+/// [`RECHECK_RESIDENT_MOST_MIB`] of where it started; every row on a closed
+/// date, every version, is amended once, with the day's reason, and no
+/// other; the same version again amends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_calendars_recheck_holds_a_chunk_never_the_dataset() {
+    use bounded::*;
+    use chain_page::{memory, restart_high_water};
+    let keys = sized("MERIDIAN_BOUNDED_KEYS", 400);
+    let days = sized("MERIDIAN_BOUNDED_DAYS", 25);
+    let versions = sized("MERIDIAN_BOUNDED_VERSIONS", 5);
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let tag = unique("recheck");
+    let dataset = format!("bounded:{tag}");
+    let subject = format!("INS-{tag}").to_uppercase();
+    let calendar_id = format!("CAL-{tag}").to_uppercase();
+    let first = now() - (days as i64 + 1) * DAY;
+    let dates: Vec<String> = (0..days)
+        .map(|day| Date::of_utc_instant(first + day as i64 * DAY).to_string())
+        .collect();
+    tokio::task::block_in_place(|| {
+        for version in 0..versions {
+            let rows: Vec<Observation> = dates
+                .iter()
+                .enumerate()
+                .flat_map(|(day, date)| {
+                    let (dataset, subject) = (&dataset, &subject);
+                    (0..keys).map(move |k| {
+                        statistic(
+                            dataset,
+                            &format!("K{k}"),
+                            subject,
+                            date,
+                            first + day as i64 * DAY,
+                            (k + day + version) as u64,
+                        )
+                    })
+                })
+                .collect();
+            for chunk in rows.chunks(5000) {
+                store.record(&dataset, chunk.to_vec(), now()).unwrap();
+            }
+        }
+    });
+    let holidays: Vec<String> = dates.iter().step_by(5).cloned().collect();
+    let reply = calendar(&calendar_id, &dates[0], &dates[days - 1], &holidays);
+    let closed: std::collections::BTreeMap<String, Option<meridian_domain::v1::DateCheck>> = dates
+        .iter()
+        .map(|date| {
+            (
+                date.clone(),
+                meridian_domain::lake::closed_day(&reply, Date::parse(date).unwrap()),
+            )
+        })
+        .collect();
+    let closed_dates = closed.values().filter(|check| check.is_some()).count();
+    assert!(
+        closed_dates > 0 && closed_dates < days,
+        "some days closed, some open"
+    );
+    let (_, lake) = tokio::task::block_in_place(|| {
+        serve(
+            Arc::clone(&store),
+            &dataset,
+            &["meridian.v1.Statistic"],
+            Some(reply),
+        )
+    });
+    // What the dataset takes decoded whole: what a re-check held before.
+    let sample = tokio::task::block_in_place(|| {
+        store.read(&Query {
+            datasets: vec![dataset.clone()],
+            subjects: vec![subject.clone()],
+            data_type: DataType::Statistic,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::BusinessDate(Date::parse(&dates[0]).unwrap()),
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+    })
+    .unwrap();
+    let rows = keys * days * versions;
+    let whole = whole_mib(&sample, rows);
+
+    let (rss_before, _) = memory();
+    let high_water = restart_high_water();
+    counted::take();
+    tokio::task::block_in_place(|| lake.recheck(&applied(&calendar_id)));
+    let (_, peak) = counted::take();
+    let (_, hwm) = memory();
+    println!(
+        "RECHECK rows={rows} heap_peak_mib={peak:.1} rss_before_mib={rss_before:.0} hwm_mib={hwm:.0} whole_set_mib={whole:.0}"
+    );
+
+    // Every row on a closed date, every version, amended once with its
+    // day's check; none on an open date.
+    let amendments: Vec<_> = tokio::task::block_in_place(|| store.closed_day_amendments())
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.dataset == dataset)
+        .collect();
+    assert_eq!(amendments.len(), closed_dates * keys * versions);
+    let read = tokio::task::block_in_place(|| {
+        store.read(&Query {
+            datasets: vec![dataset.clone()],
+            subjects: vec![subject.clone()],
+            data_type: DataType::Statistic,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Range {
+                from_ns: 0,
+                until_ns: 0,
+            },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+    })
+    .unwrap();
+    assert_eq!(read.len(), keys * days, "each key on each date, in force");
+    for row in &read {
+        let expected = &closed[&row.meta().business_date];
+        assert_eq!(
+            row.meta()
+                .closed_day
+                .as_ref()
+                .map(|c| (c.reason, c.holiday_name.clone())),
+            expected
+                .as_ref()
+                .map(|c| (c.reason, c.holiday_name.clone())),
+            "{}",
+            row.meta().business_date
+        );
+    }
+    // The same version again: nothing differs, nothing amended.
+    tokio::task::block_in_place(|| lake.recheck(&applied(&calendar_id)));
+    let again = tokio::task::block_in_place(|| store.closed_day_amendments())
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.dataset == dataset)
+        .count();
+    assert_eq!(again, amendments.len());
+
+    assert!(
+        whole >= 2.0 * RECHECK_HEAP_MOST_MIB,
+        "the dataset decoded whole, {whole:.0} MiB, is what the bound tells apart"
+    );
+    assert!(
+        peak <= RECHECK_HEAP_MOST_MIB,
+        "the re-check's heap peaked at {peak:.1} MiB; it holds a chunk, and the bound is {RECHECK_HEAP_MOST_MIB} MiB"
+    );
+    if high_water && hwm > 0.0 {
+        assert!(
+            hwm - rss_before <= RECHECK_RESIDENT_MOST_MIB,
+            "resident memory rose {:.0} MiB across the re-check; the bound is {RECHECK_RESIDENT_MOST_MIB} MiB",
+            hwm - rss_before
+        );
+    }
+}
+
+/// The most a calendar's re-check's heap may peak at, in MiB: a chunk of
+/// rows decoded and its amendments.
+const RECHECK_HEAP_MOST_MIB: f64 = 8.0;
+
+/// The most resident memory may rise across a re-check, in MiB.
+const RECHECK_RESIDENT_MOST_MIB: f64 = 48.0;
+
+/// Found on dev 2026-11-09 (core's store memory audit, item 5): a read as
+/// published by a time collected every version in its window, decoded, to
+/// choose each row key's version in force by then; Treasury's par curve
+/// keeps 100,048 rows for its one subject, about 100 to 200 MB a reader.
+/// Now a rate's rows in force are chosen by the database
+/// (`lake_row.published_at_ns`) and streamed as every other read is.
+///
+/// A par curve of `MERIDIAN_BOUNDED_TENORS` tenors over
+/// `MERIDIAN_BOUNDED_RATE_DAYS` dates, each restated
+/// `MERIDIAN_BOUNDED_VERSIONS` times -- version v published v hours after
+/// the first, the last a late-arriving older publication -- read as
+/// published by a time between the versions, a page of 500 at a time: the
+/// heap's peak across the read stays within [`PUBLISHED_HEAP_MOST_MIB`] and
+/// resident memory within [`PUBLISHED_RESIDENT_MOST_MIB`]; every row key is
+/// answered once, at the version in force by then -- the latest published
+/// by the cut, never the late older one, never one published after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_as_published_holds_its_page_never_every_version() {
+    use bounded::*;
+    use chain_page::{memory, restart_high_water};
+    use meridian_domain::v1::{ListRatesReply, ListRatesRequest};
+    let tenors = sized("MERIDIAN_BOUNDED_TENORS", 12);
+    let days = sized("MERIDIAN_BOUNDED_RATE_DAYS", 600);
+    let versions = sized("MERIDIAN_BOUNDED_VERSIONS", 5).max(3);
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let tag = unique("published");
+    let dataset = format!("us-treasury:{tag}");
+    let subject = format!("INS-{tag}").to_uppercase();
+    let first = now() - (days as i64 + 1) * DAY;
+    let base = first - DAY;
+    // Version v (1-based) published v hours after `base`; the last
+    // version a late-arriving older publication, half an hour after it.
+    let published = |version: usize| {
+        if version == versions {
+            base + HOUR / 2
+        } else {
+            base + version as i64 * HOUR
+        }
+    };
+    let value =
+        |tenor: usize, day: usize, version: usize| (100 + tenor * 7 + day + version * 1000) as u64;
+    tokio::task::block_in_place(|| {
+        for version in 1..=versions {
+            let rows: Vec<Observation> = (0..days)
+                .flat_map(|day| {
+                    let date = Date::of_utc_instant(first + day as i64 * DAY).to_string();
+                    let (dataset, subject) = (&dataset, &subject);
+                    (0..tenors).map(move |tenor| {
+                        par(
+                            dataset,
+                            subject,
+                            1 + tenor as i32,
+                            &date,
+                            first + day as i64 * DAY,
+                            value(tenor, day, version),
+                            published(version),
+                        )
+                    })
+                })
+                .collect();
+            for chunk in rows.chunks(5000) {
+                store.record(&dataset, chunk.to_vec(), now()).unwrap();
+            }
+        }
+    });
+    // Published by the cut: versions 1 to versions-2, and the late older
+    // last; in force, versions-2, the latest by published time.
+    let cut = published(versions - 2) + HOUR / 4;
+    let in_force = versions - 2;
+    let (bus, _lake) = tokio::task::block_in_place(|| {
+        serve(Arc::clone(&store), &dataset, &["meridian.v1.Rate"], None)
+    });
+    let rows = tenors * days * versions;
+    let sample = vec![par(&dataset, &subject, 1, "2026-01-01", first, 1, 1)];
+    let whole = whole_mib(&sample, rows);
+
+    let (rss_before, _) = memory();
+    let high_water = restart_high_water();
+    counted::take();
+    let mut answered = Vec::new();
+    let mut cursor = String::new();
+    let mut pages = 0;
+    loop {
+        let reply: ListRatesReply = ask(
+            &bus,
+            meridian_lake::service::LIST_RATES,
+            "meridian.v1.ListRatesRequest",
+            ListRatesRequest {
+                subjects: vec![meridian_domain::v1::SubjectRef {
+                    entity_id: subject.clone(),
+                    ..Default::default()
+                }],
+                kinds: vec![meridian_domain::v1::RateKind::ParYield as i32],
+                sources: default_sources(),
+                valid_from_ns: first,
+                valid_until_ns: first + days as i64 * DAY,
+                published_as_of_ns: cut,
+                page_size: 500,
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        pages += 1;
+        answered.extend(reply.rates);
+        cursor = reply.next_cursor;
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    let (_, peak) = counted::take();
+    let (_, hwm) = memory();
+    println!(
+        "PUBLISHED rows={rows} pages={pages} answered={} heap_peak_mib={peak:.1} rss_before_mib={rss_before:.0} hwm_mib={hwm:.0} whole_set_mib={whole:.0}",
+        answered.len()
+    );
+
+    assert_eq!(answered.len(), tenors * days, "every row key once");
+    let mut seen = std::collections::BTreeSet::new();
+    for rate in &answered {
+        let meta = rate.meta.as_ref().unwrap();
+        assert!(seen.insert(meta.row_key.clone()), "{} twice", meta.row_key);
+        assert_eq!(meta.version as usize, in_force, "{}", meta.row_key);
+        let tenor = rate.tenor.as_ref().unwrap().count as usize - 1;
+        let day = ((meta.valid_from_ns - first) / DAY) as usize;
+        assert_eq!(
+            rate.value.as_ref().unwrap().value.as_ref().unwrap().low,
+            value(tenor, day, in_force),
+            "{}",
+            meta.row_key
+        );
+    }
+
+    assert!(
+        whole >= 2.0 * PUBLISHED_HEAP_MOST_MIB,
+        "the versions decoded whole, {whole:.0} MiB, are what the bound tells apart"
+    );
+    assert!(
+        peak <= PUBLISHED_HEAP_MOST_MIB,
+        "the read's heap peaked at {peak:.1} MiB; it holds its page, and the bound is {PUBLISHED_HEAP_MOST_MIB} MiB"
+    );
+    if high_water && hwm > 0.0 {
+        assert!(
+            hwm - rss_before <= PUBLISHED_RESIDENT_MOST_MIB,
+            "resident memory rose {:.0} MiB across the read; the bound is {PUBLISHED_RESIDENT_MOST_MIB} MiB",
+            hwm - rss_before
+        );
+    }
+}
+
+/// The most a read as published by a time may peak at, in MiB: a chunk of
+/// rows read, its candidates and at most `read::HELD_INLINE_MOST` of rows.
+const PUBLISHED_HEAP_MOST_MIB: f64 = 16.0;
+
+/// The most resident memory may rise across it, in MiB.
+const PUBLISHED_RESIDENT_MOST_MIB: f64 = 64.0;
+
+/// Item 5's second half (core's store memory audit, 2026-11-09): the
+/// holdings reports a read as published by a time chose from were every
+/// version of every report in the dataset (`read_dataset_versions`), held
+/// decoded to choose each report's in force. Now the store reads each
+/// report's versions together, a chunk at a time, and keeps one row a
+/// report as it reads.
+///
+/// `MERIDIAN_BOUNDED_REPORTS` reports each restated
+/// `MERIDIAN_BOUNDED_REPORT_VERSIONS` times, version v published v hours in, the
+/// last a late-arriving older publication: read as published between the
+/// versions, the answer is the one every version chosen whole gave, row
+/// for row, and the heap's peak is at most half what choosing from every
+/// version took, measured beside it.
+#[test]
+fn a_dataset_read_as_published_keeps_a_row_a_key_never_every_version() {
+    use bounded::*;
+    use meridian_domain::v1::{HoldingsReport, HoldingsReportKind};
+    let reports = sized("MERIDIAN_BOUNDED_REPORTS", 4000);
+    let versions = sized("MERIDIAN_BOUNDED_REPORT_VERSIONS", 8).max(3);
+    let store = store();
+    let dataset = format!("sec:{}", unique("reports"));
+    let base = now() - 30 * DAY;
+    let published = |version: usize| {
+        if version == versions {
+            base + HOUR / 2
+        } else {
+            base + version as i64 * HOUR
+        }
+    };
+    for version in 1..=versions {
+        let rows: Vec<Observation> = (0..reports)
+            .map(|r| {
+                Observation::HoldingsReport(HoldingsReport {
+                    meta: Some(ObservationMeta {
+                        row_key: format!("0001067983-26-{r:06}"),
+                        subjects: vec![SubjectRef {
+                            entity_id: format!("ENT-HOLDER{}", r % 50),
+                            ..Default::default()
+                        }],
+                        source: Some(Source {
+                            instance: "sec".into(),
+                            dataset: dataset.clone(),
+                            ..Default::default()
+                        }),
+                        valid_from_ns: base,
+                        source_times: vec![meridian_domain::v1::SourceTime {
+                            kind: meridian_domain::v1::SourceTimeKind::Published as i32,
+                            at_ns: published(version),
+                        }],
+                        ..Default::default()
+                    }),
+                    kind: HoldingsReportKind::Form13f as i32,
+                    report_date: format!("2026-09-{:02}", 1 + (r + version) % 28),
+                    complete: true,
+                    filing: None,
+                })
+            })
+            .collect();
+        for chunk in rows.chunks(5000) {
+            store.record(&dataset, chunk.to_vec(), now()).unwrap();
+        }
+    }
+    let cut = published(versions - 2) + HOUR / 4;
+
+    counted::take();
+    let every = store
+        .read_dataset_versions(&dataset, DataType::HoldingsReport)
+        .unwrap();
+    let before =
+        meridian_lake::read::as_published(meridian_lake::store::recorded_by(every, 0), cut);
+    let (_, whole_peak) = counted::take();
+    let after = store
+        .read_dataset(&dataset, DataType::HoldingsReport, 0, cut)
+        .unwrap();
+    let (_, peak) = counted::take();
+    println!(
+        "REPORTS rows={} in_force={} every_version_peak_mib={whole_peak:.1} heap_peak_mib={peak:.1}",
+        reports * versions,
+        after.len()
+    );
+    assert_eq!(after.len(), reports);
+    assert!(after
+        .iter()
+        .all(|row| row.meta().version as usize == versions - 2));
+    assert_eq!(after, before, "the answer, row for row");
+    assert!(
+        peak * 2.0 <= whole_peak,
+        "the read's heap peaked at {peak:.1} MiB, choosing from every version {whole_peak:.1} MiB"
+    );
 }

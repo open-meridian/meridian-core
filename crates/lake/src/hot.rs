@@ -876,8 +876,14 @@ impl Store for HotStore {
         self.inner.dated_range(dataset)
     }
 
-    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
-        self.inner.dated_on(dataset, dates)
+    fn dated_on(
+        &self,
+        dataset: &str,
+        dates: &[String],
+        after: u64,
+        most: usize,
+    ) -> Result<Vec<Observation>> {
+        self.inner.dated_on(dataset, dates, after, most)
     }
 
     fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>> {
@@ -893,8 +899,10 @@ impl Store for HotStore {
         dataset: &str,
         data_type: DataType,
         as_of_ns: i64,
+        published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
-        self.inner.read_dataset(dataset, data_type, as_of_ns)
+        self.inner
+            .read_dataset(dataset, data_type, as_of_ns, published_as_of_ns)
     }
 
     fn read_dataset_each(
