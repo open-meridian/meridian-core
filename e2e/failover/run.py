@@ -824,6 +824,20 @@ def driver_fixtures(s):
         with open(path, encoding="utf-8") as held:
             psql(held.read())
     s.check(True, "the driver's accounts, grant and instrument written")
+    # Written behind the instrument store, as e2e-book writes them before it
+    # starts: its hot layer holds the answer to every ID asked, a record not
+    # held among them, and the drivers start asking for the instrument as
+    # soon as they are up -- in tolerant before these were written (CI
+    # 42755783823: every price refused, "no record the deployment holds").
+    # Its members start again, as after an install, and read the record.
+    members = pods("instrument")
+    for pod in members:
+        kubectl("delete", "pod", pod["metadata"]["name"], "--wait=false")
+    restarted = happens(lambda: len([p for p in pods("instrument") if ready(p)]) >= len(members)
+                        and not ({p["metadata"]["name"] for p in pods("instrument")}
+                                 & {p["metadata"]["name"] for p in members})
+                        and answering("instrument") is not None, 300, every=2)
+    s.check(restarted, "the instrument store started again over the records written behind it")
     writing = happens(lambda: all(driver_acked().get(kind) for kind in ("price", "order")), 300, every=3)
     s.check(writing, "the write driver writing through the stores: prices to the lake, orders to the book "
             f"({', '.join(f'{k} {len(v)}' for k, v in sorted(driver_acked().items())) or 'nothing acknowledged'})")
@@ -2494,6 +2508,10 @@ def flood(s, failure, mode, reason, component):
     flood_set(mode)
     time.sleep(FLOOD_SECONDS)
     acked_during = {kind: len(ids) for kind, ids in driver_acked().items()}
+    # What the flooder heard is read from its log from here: a calm before
+    # this one (memory-pressure's, before noisy-plugin) never stands for
+    # this one's. The flood's own END is written after the calm is set.
+    kubectl("exec", driver_pod(FLOOD), "-c", "plugin", "--", "sh", "-c", ": > /tmp/flood.log")
     flood_set("calm")
     ended = happens(lambda: flood_heard(mode, ended=True), 60, every=2)
     heard = flood_heard(mode, ended=True)

@@ -679,9 +679,44 @@ async def drive_flood(plugin):
             say(line)
             kept("/tmp/flood.log", line)
 
+    async def calm():
+        """After a flood, one reader asking one page a second, as a plugin
+        does, waiting out each refusal's retry-after: each read says what
+        it was -- `answered` the reads answered since the last refusal, and
+        the last refusal's reason 1 where the last read was refused -- so
+        the runner sees the flooder answered again (the plan's Track 7)."""
+        while flood_mode() == "calm" and not stopped():
+            last = {"answered": 0, "overloaded": 0, "rate_limited": 0, "other": 0}
+            wait = 1.0
+            try:
+                await bounded(stub.ListPrices(asked("", 1)))
+                streak[0] += 1
+                last["answered"] = streak[0]
+            except asyncio.TimeoutError:
+                streak[0] = 0
+                last["other"] = 1
+            except grpc.aio.AioRpcError as failed:
+                streak[0] = 0
+                reason, retry = refusal_of(failed)
+                if failed.code() == grpc.StatusCode.RESOURCE_EXHAUSTED and reason == OVERLOADED:
+                    last["overloaded"] = 1
+                elif failed.code() == grpc.StatusCode.RESOURCE_EXHAUSTED and reason == RATE_LIMITED:
+                    last["rate_limited"] = 1
+                else:
+                    last["other"] = 1
+                wait = max(wait, float(retry))
+            line = (f"FLOOD calm answered={last['answered']} overloaded={last['overloaded']} "
+                    f"rate_limited={last['rate_limited']} other={last['other']} retry_after_min=0")
+            kept("/tmp/flood.log", line)
+            await asyncio.sleep(wait)
+
+    streak = [0]
     while not stopped():
         mode = flood_mode()
-        if mode in ("pressure", "noisy"):
+        if mode == "calm":
+            streak[0] = 0
+            await calm()
+        elif mode in ("pressure", "noisy"):
             for key in heard:
                 heard[key] = 0
             least[0] = 0
