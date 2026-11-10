@@ -519,6 +519,30 @@ mod health_tests {
     }
 
     #[test]
+    fn the_clusters_word_names_a_members_restarts_and_the_last_ones_reason() {
+        let pods = serde_json::json!({"items": [
+            {"metadata": {"name": "meridian-lake-0"}, "status": {"containerStatuses": [
+                {"restartCount": 2, "lastState": {"terminated": {"reason": "Error", "finishedAt": "2026-11-09T10:00:00Z"}}},
+                {"restartCount": 1, "lastState": {"terminated": {"reason": "OOMKilled", "finishedAt": "2026-11-09T11:00:00Z"}}}
+            ]}},
+            {"metadata": {"name": "meridian-bor-0"}, "status": {"containerStatuses": [{"restartCount": 0, "lastState": {}}]}}
+        ]});
+        let said = crate::restarts_of(&pods);
+        assert_eq!(said["meridian-lake-0"], (3, "OOMKilled".to_string()));
+        assert_eq!(said["meridian-bor-0"], (0, String::new()));
+        let report = meridian_domain::v1::ComponentReport {
+            member: "meridian-lake-0".into(),
+            restarts: 1,
+            ..Default::default()
+        };
+        let told = crate::with_restarts(report, &said);
+        assert_eq!(
+            (told.restarts, told.last_restart_reason.as_str()),
+            (3, "OOMKilled")
+        );
+    }
+
+    #[test]
     fn the_report_carries_the_budgets_accounting_and_defaults_with_none_installed() {
         let said = health();
         // No budget installed in a test: nothing reserved, refused or shed.

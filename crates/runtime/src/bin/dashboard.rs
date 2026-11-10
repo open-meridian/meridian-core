@@ -588,6 +588,13 @@ fn run() -> Result<(), String> {
         meridian_runtime::keep(meridian_dashboard::latency::notices::judge_forever(
             Arc::clone(&app),
         ));
+        // Each component's and plugin's health, asked of the conductor each
+        // minute and judged (W6.40; stage M): a restart, a crossed budget,
+        // a shed, restarts again and again, memory climbing, each a notice
+        // to the people who look after it.
+        meridian_runtime::keep(meridian_dashboard::component_health::judge_forever(
+            Arc::clone(&app),
+        ));
         // The prepared change a page was opened from, and a person's own
         // settings (W4.14, W6.31, contract v20).
         meridian_dashboard::prepared::serve(Arc::clone(&app));

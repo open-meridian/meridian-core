@@ -24,6 +24,7 @@ pub mod area;
 pub mod brand;
 pub mod catalogue;
 pub mod clock;
+pub mod component_health;
 pub mod custody;
 pub mod data_use;
 pub mod database;

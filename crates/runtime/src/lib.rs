@@ -755,6 +755,151 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
     heard
 }
 
+/// The conductor's read of every member's health (W6.40; contract v30).
+pub const READ_COMPONENT_HEALTH_TOPIC: &str = "platform.deployment.query.read-component-health";
+
+/// Every member's latest report, whole, by component and member (W6.40;
+/// stage M): what the conductor answers `ReadComponentHealth` with. A
+/// member not heard for ten of its report intervals is let go, so a member
+/// gone holds nothing.
+pub fn members_heard(bus: &Bus) -> MembersHeard {
+    use prost::Message as _;
+    let heard: MembersHeard = Arc::new(Mutex::new(BTreeMap::new()));
+    let collecting = Arc::clone(&heard);
+    let mut inward = bus.subscribe_every(COMPONENT_REPORT_TOPIC);
+    let clock = bus.clock();
+    tokio::spawn(async move {
+        let stale_ns = 10 * REPORT_INWARD_EVERY.as_nanos() as i64;
+        while let Some(delivery) = inward.recv().await {
+            let Ok(report) =
+                meridian_domain::v1::ComponentReport::decode(&delivery.envelope.payload[..])
+            else {
+                continue;
+            };
+            let now = clock.now_ns();
+            let key = format!("{}/{}", report.component, report.member);
+            let mut held = collecting.lock().expect("member reports poisoned");
+            held.insert(key, (report, now));
+            held.retain(|_, (_, heard_at)| *heard_at >= now - stale_ns);
+        }
+    });
+    heard
+}
+
+/// Every member's latest report, and when it was heard.
+pub type MembersHeard = Arc<Mutex<BTreeMap<String, (meridian_domain::v1::ComponentReport, i64)>>>;
+
+/// What the cluster says of each pod's restarts: by pod name, its
+/// containers' restarts together and the last one's reason (OOMKilled,
+/// Error, Completed).
+pub type PodRestarts = Arc<Mutex<BTreeMap<String, (u32, String)>>>;
+
+/// Each pod's restarts and the last one's reason, from a pod list.
+pub fn restarts_of(pods: &serde_json::Value) -> BTreeMap<String, (u32, String)> {
+    let mut said = BTreeMap::new();
+    for pod in pods["items"].as_array().into_iter().flatten() {
+        let Some(name) = pod["metadata"]["name"].as_str() else {
+            continue;
+        };
+        let mut restarts = 0u32;
+        let mut last: Option<(String, String)> = None;
+        for container in pod["status"]["containerStatuses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            restarts += container["restartCount"].as_u64().unwrap_or(0) as u32;
+            let ended = &container["lastState"]["terminated"];
+            if let (Some(reason), Some(at)) =
+                (ended["reason"].as_str(), ended["finishedAt"].as_str())
+            {
+                // RFC 3339 in UTC sorts as text.
+                if last.as_ref().is_none_or(|(_, before)| at > before.as_str()) {
+                    last = Some((reason.to_string(), at.to_string()));
+                }
+            }
+        }
+        said.insert(
+            name.to_string(),
+            (restarts, last.map(|(reason, _)| reason).unwrap_or_default()),
+        );
+    }
+    said
+}
+
+/// The cluster's word on each member's restarts, read every minute by the
+/// conductor where its Role lets it (W6.40; read-only `get` and `list` on
+/// pods, approved 2026-11-10). Where it may not, nothing is filled and
+/// `meridian status` and `doctor` read the reasons themselves.
+pub async fn pod_restarts_forever(api: meridian_first_run::cluster::ApiServer, held: PodRestarts) {
+    loop {
+        match api.pods().await {
+            Ok(pods) => {
+                if let Ok(mut held) = held.lock() {
+                    *held = restarts_of(&pods);
+                }
+            }
+            Err(failed) => {
+                tracing::debug!("the pods were not read for their restarts: {}", failed.0)
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// A member's report with what the cluster says of its restarts: the more
+/// of the two counts, and the last one's reason.
+pub fn with_restarts(
+    mut report: meridian_domain::v1::ComponentReport,
+    pods: &BTreeMap<String, (u32, String)>,
+) -> meridian_domain::v1::ComponentReport {
+    if let Some((restarts, reason)) = pods.get(&report.member) {
+        report.restarts = report.restarts.max(*restarts);
+        if !reason.is_empty() {
+            report.last_restart_reason = reason.clone();
+        }
+    }
+    report
+}
+
+/// Answer `ReadComponentHealth` (W6.40): every member heard, and this
+/// conductor's own member's report beside them.
+pub fn serve_component_health(
+    bus: &Bus,
+    heard: MembersHeard,
+    pods: PodRestarts,
+    own: impl Fn() -> meridian_domain::v1::ComponentReport + Send + Sync + 'static,
+) {
+    use prost::Message as _;
+    let clock = bus.clock();
+    bus.serve(READ_COMPONENT_HEALTH_TOPIC, move |_| {
+        let mut members = vec![own()];
+        members.extend(
+            heard
+                .lock()
+                .map_err(|_| "the member reports' lock".to_string())?
+                .values()
+                .map(|(report, _)| report.clone()),
+        );
+        let pods = pods
+            .lock()
+            .map_err(|_| "the pods' restarts' lock".to_string())?
+            .clone();
+        let members = members
+            .into_iter()
+            .map(|report| with_restarts(report, &pods))
+            .collect();
+        Ok((
+            "meridian.v1.ReadComponentHealthReply".into(),
+            meridian_domain::v1::ReadComponentHealthReply {
+                members,
+                read_at_ns: clock.now_ns(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+}
+
 /// Tell the platform what this component is running, now and every interval.
 ///
 /// One component per process now, where the runtime reported two. Failing to

@@ -2673,6 +2673,21 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
 	done
+	@# Stage M (W6.40; approved 2026-11-10): the conductor runs under its own
+	@# account, whose Role is exactly get and list on pods -- nothing written,
+	@# no other resource -- in both profiles.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null)"; \
+		role="$$(echo "$$said" | awk '/^kind: Role$$/{on=1} on&&/^---/{exit} on')"; \
+		echo "$$role" | grep -q 'name: check-meridian-runtime-conductor$$' \
+			|| { echo "chart-check FAILED: the conductor has no Role of its own ($${profile:-tolerant})" >&2; exit 1; }; \
+		[ "$$(echo "$$role" | grep -c 'resources:')" = 1 ] && echo "$$role" | grep -q 'resources: \["pods"\]' \
+			&& echo "$$role" | grep -q 'verbs: \["get", "list"\]$$' && [ "$$(echo "$$role" | grep -c 'verbs:')" = 1 ] \
+			|| { echo "chart-check FAILED: the conductor's Role is not exactly get and list on pods ($${profile:-tolerant})" >&2; exit 1; }; \
+		echo "$$said" | grep -q 'serviceAccountName: check-meridian-runtime-conductor$$' \
+			|| { echo "chart-check FAILED: the conductor does not run under its own account ($${profile:-tolerant})" >&2; exit 1; }; \
+	done
 	@# Stage M (the resilience spec's section 10a): every component and every
 	@# sidecar is told its container's limit, memory.budgetPercent and
 	@# memory.shedPercent and glibc's settings; a percent out of range, or a

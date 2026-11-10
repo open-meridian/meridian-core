@@ -163,6 +163,14 @@ impl ApiServer {
         serde_json::from_str(&body).map_err(|failed| ClusterError(format!("GET {path}: {failed}")))
     }
 
+    /// The pods in this namespace, as a list: read only, for the conductor's
+    /// members' restarts and their reasons (W6.40; its Role's `get` and
+    /// `list` on pods, approved 2026-11-10).
+    pub async fn pods(&self) -> Result<serde_json::Value, ClusterError> {
+        self.get_json(&format!("/api/v1/namespaces/{}/pods", self.namespace))
+            .await
+    }
+
     /// The Deployments in this namespace carrying `selector`, as a list.
     pub async fn deployments(&self, selector: &str) -> Result<serde_json::Value, ClusterError> {
         self.get_json(&format!(

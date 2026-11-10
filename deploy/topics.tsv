@@ -164,6 +164,7 @@ platform.deployment.command.remove-plugin	command	conductor	launcher
 platform.deployment.command.report-latency	command	data,connectivity,ems,sidecar,lake,analytics	dashboard
 platform.deployment.event.component-report	event	street,bor,instrument,lake,conductor,launcher,dashboard,analytics	conductor
 platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
+platform.deployment.query.read-component-health	query	dashboard	conductor
 platform.deployment.query.read-resilience-profile	query	dashboard	conductor
 platform.lake.command.decline-want	command	data	lake
 platform.lake.command.move-partition	command	dashboard	lake

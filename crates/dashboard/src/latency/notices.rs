@@ -148,6 +148,12 @@ fn store() -> Arc<dyn NoticeStore> {
     Arc::clone(STORE.get_or_init(|| Arc::new(InMemory::default())))
 }
 
+/// Keep notices made elsewhere on this path: a component's or a plugin's
+/// health (W6.40; stage M), read beside the latency judge's.
+pub fn keep(notices: &[Notice]) -> Result<(), String> {
+    store().notify(notices)
+}
+
 /// A person's latest latency notices, newest first.
 pub async fn of(subject: &str) -> Vec<Notice> {
     let subject = subject.to_string();
@@ -309,10 +315,15 @@ pub fn rows(notices: &[Notice]) -> String {
         .map(|notice| {
             // One word a badge, so it fits a phone; the series, and backlog
             // or p99, in the line beside it.
-            let (badge, tone) = if notice.kind.ends_with("breached") {
-                ("Breached", " warn")
-            } else {
-                ("Recovered", "")
+            let (badge, tone) = match notice.kind.as_str() {
+                kind if kind.ends_with("breached") => ("Breached", " warn"),
+                // A component's or a plugin's health (W6.40; stage M).
+                kind if kind.ends_with("-restarted") => ("Restarted", " warn"),
+                kind if kind.ends_with("-over-budget") => ("Over budget", " warn"),
+                kind if kind.ends_with("-shedding") => ("Shedding", " warn"),
+                kind if kind.ends_with("-restarting-repeatedly") => ("Restarting", " warn"),
+                kind if kind.ends_with("-memory-climbing") => ("Climbing", " warn"),
+                _ => ("Recovered", ""),
             };
             format!(
                 "<tr data-kind=\"{kind}\" data-plugin=\"{instance}\"><td><span class=\"badge{tone}\" title=\"{kind}\">{badge}</span></td>\

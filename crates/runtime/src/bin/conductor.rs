@@ -441,6 +441,22 @@ fn run() -> Result<(), String> {
         let reporting = Arc::clone(&platform);
         let collecting = Arc::clone(&bus);
         let schema = meridian_config::migrations::latest();
+        // Every member's health, and this conductor's own, for the
+        // dashboard's judge (W6.40; stage M).
+        let started_at_ns = now_ns();
+        let pods: meridian_runtime::PodRestarts = Default::default();
+        if let Ok(api) = meridian_first_run::cluster::ApiServer::in_cluster(clock()) {
+            meridian_runtime::background(meridian_runtime::pod_restarts_forever(
+                api,
+                Arc::clone(&pods),
+            ));
+        }
+        meridian_runtime::serve_component_health(
+            &bus,
+            meridian_runtime::members_heard(&bus),
+            pods,
+            move || meridian_runtime::member::member_report("conductor", schema, started_at_ns),
+        );
         meridian_runtime::background(async move {
             report_forever(reporting, collecting, "conductor", schema).await
         });

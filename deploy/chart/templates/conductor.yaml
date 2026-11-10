@@ -13,7 +13,64 @@
   it did not until 2026-09-21. The objection to a control process with a store
   was that nobody would write its migrations; this one has a history from its
   first commit, applied by the migrate job, and a start only verifies it.
+
+  Its own account, whose one right of its own is to read the pods in this
+  namespace -- `get` and `list`, nothing written, no other resource
+  (approved 2026-11-10) -- so each member's health names its restarts and
+  why: an OOM kill named a defect (W6.40; stage M). With a standby, the
+  members' Lease right is bound to it too, as to every member.
 */}}
+{{- $account := printf "%s-conductor" (include "meridian-runtime.fullname" .) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $account }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $account }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $account }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $account }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $account }}
+  apiGroup: rbac.authorization.k8s.io
+---
+{{- if include "meridian-runtime.leased" (dict "top" $ "component" "conductor" "values" .Values.conductor) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $account }}-member
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $account }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "meridian-runtime.fullname" . }}-member
+  apiGroup: rbac.authorization.k8s.io
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,7 +109,8 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "conductor" "values" $.Values.conductor) | nindent 6 }}
+      serviceAccountName: {{ $account }}
+      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "conductor" "values" $.Values.conductor "account" true) | nindent 6 }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}

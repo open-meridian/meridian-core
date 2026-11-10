@@ -24239,6 +24239,24 @@ pub struct IntegrityFinding {
     #[prost(int64, tag = "8")]
     pub found_at_ns: i64,
 }
+/// The dashboard reads every member's health (W6.40; contract v30, stage M;
+/// platform.deployment.query.read-component-health, approved 2026-11-09):
+/// the latest report of each member the conductor holds, the conductor's own
+/// among them, to judge and tell who looks after it. Counts and sizes only:
+/// never an account, an instrument, a person or a payload.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadComponentHealthRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadComponentHealthReply {
+    /// Each member's latest report: its memory against its budget and limit
+    /// with its peak, what it reserved, its refusals for load by reason, its
+    /// sheds, and its restarts with the last's reason and time.
+    #[prost(message, repeated, tag = "1")]
+    pub members: ::prost::alloc::vec::Vec<ComponentReport>,
+    /// When the conductor read them, by its clock.
+    #[prost(int64, tag = "2")]
+    pub read_at_ns: i64,
+}
 /// A deployment admin reads the resilience profile (W6.39; on
 /// platform.deployment.query.read-resilience-profile, step 3c's question 4):
 /// what the configuration meets and what would meet more, computed from the
