@@ -28,7 +28,7 @@ concurrency:
 jobs:
   licence:
     if: ${{ !github.event.issue.pull_request }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: open-meridian/meridian-core/.github/actions/licence-check@main

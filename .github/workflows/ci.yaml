@@ -54,7 +54,7 @@ jobs:
   # request's where any job did not succeed.
   tier:
     name: ci-tier
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       full: ${{ steps.plan.outputs.full }}
@@ -86,7 +86,7 @@ jobs:
   # The two stages that need no image: beside the builds, not after them.
   static:
     name: ci-local (${{ matrix.stage }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -152,7 +152,7 @@ jobs:
   # the make targets build, the cargo caches put into it.
   images:
     name: ci-local (${{ matrix.stage }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -401,7 +401,7 @@ jobs:
   # handed on as the run's artifact.
   compile:
     name: ci-local (${{ matrix.stage }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       matrix:
@@ -480,7 +480,7 @@ jobs:
     # Run even when a build failed, to fail by name here rather than be
     # skipped: GitHub counts a skipped required check as passed.
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -608,7 +608,7 @@ jobs:
     name: ci-local
     needs: [tier, static, images, compile, stages, e2e-harness, e2e-cluster-k3d, e2e-cluster-arm64]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # The stages, every run. And -- because a skipped job passes a
@@ -646,7 +646,7 @@ jobs:
     # the queue; on a pull request, those its paths select. Run unless the
     # plan says none, so a plan that could not be read fails it.
     if: ${{ !cancelled() && needs.tier.outputs.harness_any != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -705,7 +705,7 @@ jobs:
   e2e-harness-left:
     needs: tier
     if: ${{ needs.tier.outputs.harness_left_any == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
       matrix: ${{ fromJSON(needs.tier.outputs.harness_left) }}
@@ -750,7 +750,7 @@ jobs:
     # skipped: GitHub counts a skipped required check as passed. A plan
     # that could not be read fails it too.
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       fail-fast: false
@@ -961,7 +961,7 @@ jobs:
   e2e-cluster-left:
     needs: tier
     if: ${{ needs.tier.outputs.clusters_left_any == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
       matrix: ${{ fromJSON(needs.tier.outputs.clusters_left) }}
@@ -1181,7 +1181,7 @@ jobs:
     if: >-
       success() && needs.images.outputs.runtime != '' && needs.e2e-cluster-arm64.outputs.runtime != ''
       && needs.images.outputs.version == needs.e2e-cluster-arm64.outputs.version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1222,7 +1222,7 @@ jobs:
   footprint-judge:
     needs: e2e-cluster-k3d
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -1247,7 +1247,7 @@ jobs:
     # queue's (and a pull request's whose plan is everything); a failover
     # run on a pull request holds its own claims to their bounds itself.
     if: ${{ !cancelled() && needs.tier.outputs.full != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

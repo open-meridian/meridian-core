@@ -40,7 +40,7 @@ jobs:
   # them (make runtime-image analytics-image), over the release build's cargo
   # caches main keeps (cargo-cache.yaml); read, never written, here.
   failover-images:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
       runs: ${{ steps.runs.outputs.runs }}
@@ -124,7 +124,7 @@ jobs:
   failover-repeat:
     name: failover-repeat (${{ inputs.profile }}, run ${{ matrix.run }})
     needs: [failover-images]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.profile == 'tolerant' && 45 || 70 }}
     strategy:
       fail-fast: false
@@ -217,7 +217,7 @@ jobs:
     name: failover-repeat (every run green)
     needs: [failover-images, failover-repeat]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Every run green

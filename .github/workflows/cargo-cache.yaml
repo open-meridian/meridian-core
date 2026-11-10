@@ -31,7 +31,7 @@ jobs:
     # on both.
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
@@ -91,7 +91,7 @@ jobs:
         run: make runtime-image
 
       - name: make tests-image
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-24.04'
         env:
           DOCKER_BUILDKIT: "1"
         run: make tests-image && grep -E -m3 'Compile requests|Cache hits|Cache misses' .tests-image.log | cut -c1-120 || true
@@ -109,12 +109,12 @@ jobs:
 
       - name: The CLI's commit
         id: cli
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-24.04'
         run: echo "sha=$(git -C ../meridian-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Restore the CLI's image
         id: cli-image
-        if: matrix.runner == 'ubuntu-latest'
+        if: matrix.runner == 'ubuntu-24.04'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cli-image
@@ -122,7 +122,7 @@ jobs:
           lookup-only: true
 
       - name: make backup-cli-image
-        if: matrix.runner == 'ubuntu-latest' && steps.cli-image.outputs.cache-hit != 'true'
+        if: matrix.runner == 'ubuntu-24.04' && steps.cli-image.outputs.cache-hit != 'true'
         env:
           DOCKER_BUILDKIT: "1"
         run: |
@@ -130,7 +130,7 @@ jobs:
           tools/ci-images.sh save "$RUNNER_TEMP/cli-image" backup-cli
 
       - name: Keep the CLI's image
-        if: matrix.runner == 'ubuntu-latest' && steps.cli-image.outputs.cache-hit != 'true'
+        if: matrix.runner == 'ubuntu-24.04' && steps.cli-image.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/cli-image
