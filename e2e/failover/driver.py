@@ -274,34 +274,39 @@ class Recording(data.Role):
     seed = False
 
     async def on_observations_wanted(self, heard):
-        # The data instance records unasked. The flood instance's dataset
-        # served, not kept, is asked of it: each subject's price served for
-        # the want, which the lake hands to the read waiting on it.
-        want = heard.message
-        if ROLE != "flood":
-            return
-        kept("/tmp/unkept-wants.log", f"WANT {want.want_id} {want.dataset} {len(want.subjects)}")
-        if want.dataset != f"{self.plugin.identity.instance_id}:{UNKEPT_KEY}":
-            return
-        now = time.time_ns()
-        prices = [ops.Price(
-            meta=ops.ObservationMeta(
-                row_key=f"unkept-{subject.entity_id}-{now}",
-                subjects=[ops.SubjectRef(entity_id=subject.entity_id)],
-                source=ops.Source(dataset=want.dataset), valid_from_ns=now,
-                source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
-                                             at_ns=now)],
-                raw=self.plugin.raw_record(f"unkept/{now}")),
-            kind=ops.PriceKind.PRICE_KIND_LAST,
-            price=ops.Money(amount=decimal("101.25"), instrument_id=USD),
-            basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT) for subject in want.subjects]
-        try:
-            await bounded(self._operations().RecordPrices(
-                ops.RecordPricesParams(prices=prices, want_id=want.want_id)))
-            kept("/tmp/unkept-wants.log", f"SERVED {want.want_id}")
-        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
-            kept("/tmp/unkept-wants.log", f"REFUSED {want.want_id} {words(failed)[:200]}")
-            say(f"driver: flood: want {want.want_id} not served ({words(failed)})")
+        # Nothing is asked of it: it records unasked. (`connect` starts no
+        # stream; the flood instance hears its wants itself, below.)
+        pass
+
+
+async def serve_want(plugin, heard):
+    """The flood instance's dataset served, not kept, is asked of it: each
+    subject's price served for the want, which the lake hands to the read
+    waiting on it. Each want heard, and whether it was served, kept in
+    /tmp/unkept-wants.log."""
+    want = heard.message
+    kept("/tmp/unkept-wants.log", f"WANT {want.want_id} {want.dataset} {len(want.subjects)}")
+    if want.dataset != f"{plugin.identity.instance_id}:{UNKEPT_KEY}":
+        return
+    now = time.time_ns()
+    prices = [ops.Price(
+        meta=ops.ObservationMeta(
+            row_key=f"unkept-{subject.entity_id}-{now}",
+            subjects=[ops.SubjectRef(entity_id=subject.entity_id)],
+            source=ops.Source(dataset=want.dataset), valid_from_ns=now,
+            source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                         at_ns=now)],
+            raw=plugin.raw_record(f"unkept/{now}")),
+        kind=ops.PriceKind.PRICE_KIND_LAST,
+        price=ops.Money(amount=decimal("101.25"), instrument_id=USD),
+        basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT) for subject in want.subjects]
+    try:
+        await bounded(plugin._operations().RecordPrices(
+            ops.RecordPricesParams(prices=prices, want_id=want.want_id)))
+        kept("/tmp/unkept-wants.log", f"SERVED {want.want_id}")
+    except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+        kept("/tmp/unkept-wants.log", f"REFUSED {want.want_id} {words(failed)[:200]}")
+        say(f"driver: flood: want {want.want_id} not served ({words(failed)})")
 
 
 async def drive_data(plugin, gen):
@@ -660,6 +665,14 @@ async def flood_seed(plugin, dataset):
 
 async def drive_flood(plugin):
     dataset = f"{plugin.identity.instance_id}:{DATASET_KEY}"
+    # Its wants heard on the one stream, as `meridian.run` hears a role's
+    # events (`connect` starts none): each served (contract v30, stage B).
+    from meridian.receive import follow
+    hearing = asyncio.create_task(
+        follow(plugin, {"ObservationsWanted": lambda heard: serve_want(plugin, heard)}, seed=False))
+    hearing.add_done_callback(
+        lambda done: done.cancelled() or not done.exception()
+        or say(f"driver: flood: its wants no longer heard ({done.exception()})"))
     await flood_seed(plugin, dataset)
     stub = plugin._operations()
     heard = {"answered": 0, "overloaded": 0, "rate_limited": 0, "other": 0}
