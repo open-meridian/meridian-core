@@ -1580,3 +1580,141 @@ fn an_entry_kept_before_digests_is_chained_by_migrate_even_one_the_book_cannot_r
     let scrubbed = store.scrub().expect("scrubs");
     assert!(scrubbed.findings.is_empty(), "{:?}", scrubbed.findings);
 }
+
+/// Stage M (the store memory audit of 2026-11-09, item 7): a keyed page --
+/// locates, trading instructions, bookings, alerts -- reads its own rows
+/// from the database, after its cursor and in its key's order, never every
+/// row decoded and sorted for one page. 3,000 instructions, each with a long
+/// reason, read ten at a time: every one once, in order, and a page's heap
+/// a small part of the whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_page_reads_its_own_rows_never_every_row() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    let tag = unique("plugin");
+    let reason = "a pause set for the memory bound of a page of instructions ".repeat(6);
+    for n in 0..3_000 {
+        let set = SetTradingInstructionRequest {
+            target: Some(TradingInstructionTarget {
+                // Sorted after every other test's targets, which read
+                // their first page and look for their own on it.
+                instance_id: format!("zz-{tag}-{n:05}"),
+                ..Default::default()
+            }),
+            value: TradingInstructionValue::Pause as i32,
+            reason: reason.clone(),
+            setter_level: SetterLevel::PluginAdmin as i32,
+        };
+        send_order(&bus, SET_TRADING_INSTRUCTION, &set, Some(PERSON), None)
+            .await
+            .unwrap();
+    }
+    let page = |cursor: &str, limit: usize| {
+        let cursor = cursor.to_string();
+        let store = Arc::clone(&store);
+        blocking(move || {
+            store
+                .instructions(&meridian_bor::store::InstructionsRead {
+                    since: None,
+                    limit,
+                    cursor,
+                })
+                .unwrap()
+        })
+    };
+    // Warm the pool's connections, then measured.
+    page("", 10);
+    let first = tokio::task::block_in_place(|| {
+        counted::take();
+        let first = store
+            .instructions(&meridian_bor::store::InstructionsRead {
+                since: None,
+                limit: 10,
+                cursor: String::new(),
+            })
+            .unwrap();
+        (first, counted::take().1)
+    });
+    let (first, peak) = first;
+    assert_eq!(first.records.len(), 10);
+    let whole_mib = 3_000.0 * reason.len() as f64 / 1048576.0;
+    println!("KEYED heap_peak_mib={peak:.2} reasons_alone_mib={whole_mib:.2}");
+    assert!(
+        peak * 4.0 < whole_mib,
+        "a page's heap peaked at {peak:.2} MiB; the reasons alone are {whole_mib:.2} MiB"
+    );
+    // Every instruction of the run, once, in order, ten at a time.
+    let mut seen = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let read = page(&cursor, 10);
+        for held in &read.records {
+            let named = held
+                .target
+                .as_ref()
+                .map(|t| t.instance_id.clone())
+                .unwrap_or_default();
+            if named.starts_with(&format!("zz-{tag}")) {
+                seen.push(named);
+            }
+        }
+        if read.next_cursor.is_empty() {
+            break;
+        }
+        cursor = read.next_cursor;
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(seen.len(), 3_000, "every one once");
+    assert_eq!(seen, sorted, "in the key's order");
+}
+
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /// Counted on the thread that allocates, so what a read holds is told
+    /// apart from what the book's own background work does meanwhile.
+    pub struct Counting;
+
+    std::thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn by(change: isize) {
+        let _ = LIVE.try_with(|live| {
+            live.set(live.get() + change);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(live.get())));
+        });
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                by(layout.size() as isize);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(at, layout) };
+            by(-(layout.size() as isize));
+        }
+    }
+
+    /// This thread's heap peak since the last take, above where it stood
+    /// then, in MiB; and where it stands now.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.with(Cell::get);
+        let peak = PEAK.with(|peak| peak.replace(live));
+        (
+            live as f64 / 1048576.0,
+            (peak - live).max(0) as f64 / 1048576.0,
+        )
+    }
+}
+
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;

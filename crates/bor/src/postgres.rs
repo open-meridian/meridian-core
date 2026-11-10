@@ -2154,6 +2154,11 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone, after its cursor, in its key's order (stage
+        // M; the store memory audit of 2026-11-09, item 7): never every row
+        // decoded and sorted for one page.
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2162,9 +2167,12 @@ impl Store for PostgresStore {
                           WHERE ($1::text[] IS NULL OR account_id = ANY($1))
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
-                            AND {filter}"
+                            AND {filter}
+                            AND ($5 = '' OR (account_id || chr(31) || locate_record_id) COLLATE \"C\" > $5)
+                          ORDER BY (account_id || chr(31) || locate_record_id) COLLATE \"C\"
+                          LIMIT $6"
                     ),
-                    &[&scope, &read.account_id, &partitions, &sequences],
+                    &[&scope, &read.account_id, &partitions, &sequences, &after, &rows_read],
                 )
                 .map_err(unavailable)?;
             let mut records = Vec::new();
@@ -2191,11 +2199,20 @@ impl Store for PostgresStore {
         } else {
             "$1::text[] IS NOT NULL AND $2::bigint[] IS NOT NULL".to_string()
         };
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
-                    &format!("SELECT instruction_key, record FROM book_instruction WHERE {filter}"),
-                    &[&partitions, &sequences],
+                    &format!(
+                        "SELECT instruction_key, record FROM book_instruction
+                          WHERE {filter}
+                            AND ($3 = '' OR instruction_key COLLATE \"C\" > $3)
+                          ORDER BY instruction_key COLLATE \"C\"
+                          LIMIT $4"
+                    ),
+                    &[&partitions, &sequences, &after, &rows_read],
                 )
                 .map_err(unavailable)?;
             let mut records = Vec::new();
@@ -2246,6 +2263,9 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2255,7 +2275,10 @@ impl Store for PostgresStore {
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
-                            AND {filter}"
+                            AND {filter}
+                            AND ($6 = '' OR (account_id || chr(31) || booking_id) COLLATE \"C\" > $6)
+                          ORDER BY (account_id || chr(31) || booking_id) COLLATE \"C\"
+                          LIMIT $7"
                     ),
                     &[
                         &scope,
@@ -2263,6 +2286,8 @@ impl Store for PostgresStore {
                         &partitions,
                         &sequences,
                         &read.state,
+                        &after,
+                        &rows_read,
                     ],
                 )
                 .map_err(unavailable)?;
@@ -2289,6 +2314,9 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2299,7 +2327,10 @@ impl Store for PostgresStore {
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
                             AND ($6 = 0 OR kind = $6)
-                            AND {filter}"
+                            AND {filter}
+                            AND ($7 = '' OR (account_id || chr(31) || alert_id) COLLATE \"C\" > $7)
+                          ORDER BY (account_id || chr(31) || alert_id) COLLATE \"C\"
+                          LIMIT $8"
                     ),
                     &[
                         &scope,
@@ -2308,6 +2339,8 @@ impl Store for PostgresStore {
                         &sequences,
                         &read.state,
                         &read.kind,
+                        &after,
+                        &rows_read,
                     ],
                 )
                 .map_err(unavailable)?;

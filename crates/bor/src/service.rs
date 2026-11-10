@@ -888,7 +888,16 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
                 vec![request.account_id.clone()]
             };
             let since_mark = crate::store::mark_of(request.since.as_ref());
-            let mut all = Vec::new();
+            let limit = crate::store::page_limit(
+                request.page_size as i32,
+                bounds::LIST_LIFECYCLE_EVENTS_REQUEST_PAGE_SIZE_RANGE,
+            );
+            let offset: usize = request.cursor.parse().unwrap_or(0);
+            // Each account's events counted as its book is read, and only
+            // the page's kept (stage M; the store memory audit of
+            // 2026-11-09, item 7): never every account's events held.
+            let mut page: Vec<LifecycleEvent> = Vec::new();
+            let mut counted = 0usize;
             let mut partitions = Vec::new();
             for account in &accounts {
                 let book = reading
@@ -898,24 +907,23 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
                     .as_ref()
                     .and_then(|mark| mark.get(&book.partition).copied())
                     .unwrap_or(0);
-                all.extend(crate::lifecycle::listed(
+                for event in crate::lifecycle::listed(
                     &book,
                     &request.instrument_id,
                     &request.kinds,
                     &request.from_date,
                     &request.to_date,
                     since,
-                ));
+                ) {
+                    if counted >= offset && page.len() < limit {
+                        page.push(event);
+                    }
+                    counted += 1;
+                }
                 if !partitions.contains(&book.partition) {
                     partitions.push(book.partition.clone());
                 }
             }
-            let limit = crate::store::page_limit(
-                request.page_size as i32,
-                bounds::LIST_LIFECYCLE_EVENTS_REQUEST_PAGE_SIZE_RANGE,
-            );
-            let offset: usize = request.cursor.parse().unwrap_or(0);
-            let page: Vec<LifecycleEvent> = all.iter().skip(offset).take(limit).cloned().collect();
             let next = offset + page.len();
             let heads = reading.heads().map_err(|failed| failed.on_the_bus())?;
             let mut as_of = crate::store::Mark::new();
@@ -927,7 +935,7 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let mut reply = ListLifecycleEventsReply {
                 events: page,
                 as_of: Some(crate::store::watermark_of(&as_of)),
-                next_cursor: if next < all.len() {
+                next_cursor: if next < counted {
                     next.to_string()
                 } else {
                     String::new()
