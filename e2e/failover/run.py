@@ -2461,6 +2461,9 @@ def properties(s, after):
 
 FLOOD = "drive-flood"
 FLOOD_DATASET = f"{FLOOD}:drive"
+# Its dataset asked of it, licensed here as served, not kept: what a lake
+# reader hands to its writer (contract v30, stage B; reader_hands_on).
+FLOOD_UNKEPT = f"{FLOOD}:unkept"
 FLOOD_SECONDS = 60
 # Every other instance within its band during a flood: the data driver
 # records a price every half second and the oms driver an order about every
@@ -2584,18 +2587,25 @@ def text_field(number, value):
 
 
 def flood_entitled(s):
-    """The flood instance entitled to its own dataset, as a deployment admin
-    entitles a reader (W10.1): its DatasetEntitlement recorded where the
-    conductor keeps it, which the conductor publishes whole within a minute.
-    Once a run."""
+    """The flood instance entitled to its own datasets, as a deployment admin
+    entitles a reader (W10.1), and the one asked of it licensed as served,
+    not kept (W10.9): its DatasetEntitlements and that DatasetLicence
+    recorded where the conductor keeps them, which the conductor publishes
+    whole within a minute. Once a run."""
     if FLOOD_ENTITLED:
         return
     now = time.time_ns()
-    entitlement = (text_field(1, FLOOD_DATASET) + text_field(2, FLOOD) + varint(3 << 3) + varint(1)
-                   + text_field(5, ADMIN) + varint(6 << 3) + varint(now)
-                   + text_field(9, "the memory and isolation classes read it"))
-    psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
-         f"VALUES ('{FLOOD_DATASET}', '{FLOOD}', decode('{entitlement.hex()}', 'hex'), {now})")
+    for dataset, why in ((FLOOD_DATASET, "the memory and isolation classes read it"),
+                         (FLOOD_UNKEPT, "a lake reader hands its read to the writer")):
+        entitlement = (text_field(1, dataset) + text_field(2, FLOOD) + varint(3 << 3) + varint(1)
+                       + text_field(5, ADMIN) + varint(6 << 3) + varint(now) + text_field(9, why))
+        psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
+             f"VALUES ('{dataset}', '{FLOOD}', decode('{entitlement.hex()}', 'hex'), {now})")
+    # Served, not kept: `kept` (2) false, so left out.
+    licence = (text_field(1, FLOOD_UNKEPT) + text_field(8, ADMIN) + varint(9 << 3) + varint(now)
+               + text_field(12, "served when asked, not kept: the reader-hands-on step"))
+    psql("INSERT INTO config_dataset_licence_change (dataset, licence, changed_at_ns) "
+         f"VALUES ('{FLOOD_UNKEPT}', decode('{licence.hex()}', 'hex'), {now})")
     seeded = happens(lambda: "SEEDED" in driver_file(FLOOD, "/tmp/seeded"), 300, every=5)
     s.check(seeded, f"the flood instance's {FLOOD_DATASET} recorded")
     # The conductor publishes the data configuration every minute.
@@ -2669,9 +2679,9 @@ def flood(s, failure, mode, reason, component):
 
 # ── A reader held behind (contract v30, stage B) ──────────────────────────
 
-def reader_log(pod_name, said, since="10m"):
+def reader_log(pod_name, said, since="10m", container="bor"):
     """How many times the reader's log says `said`, in the last `since`."""
-    logs = kubectl("logs", pod_name, "-c", "bor", f"--since={since}", check=False, quiet=True)
+    logs = kubectl("logs", pod_name, "-c", container, f"--since={since}", check=False, quiet=True)
     return logs.stdout.decode(errors="replace").count(said) if logs.returncode == 0 else 0
 
 
@@ -2714,6 +2724,55 @@ def reader_held(s):
             "reader held: let go, it caught up and answers from its own record again")
     probe_said = (probe(reader, "bor") or {}).get("member", {})
     s.check(probe_said.get("mode") == "reader", f"reader held: still a reader ({probe_said.get('mode')})")
+
+
+HANDED_ON = "a read handed to the writer: answered by it"
+# Reads of the flood's dataset served, not kept, each answered the price
+# served for it: enough that the broker's queue group gives the lake's
+# reader some (each read goes to one of two members).
+UNKEPT_READS = 20
+
+
+def unkept_heard():
+    """The flood's last word on its reads of the dataset served, not kept."""
+    said = {}
+    for line in driver_file(FLOOD, "/tmp/unkept.log").splitlines():
+        parts = line.split()
+        if parts and parts[0] == "UNKEPT":
+            said = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+    return {k: int(v) for k, v in said.items() if v.isdigit()}
+
+
+def reader_hands_on(s):
+    """A read whose answer depends on the lake writer's own acts, taken by
+    the lake's reader: the flood instance reads its dataset served, not kept,
+    a price at a time, each read raising a want -- the writer's recorded act
+    -- that the instance serves. The reader takes some of them (the queue
+    group), hands each to the writer on platform.lake.internal.read-from-
+    writer and answers its reply, so every read is answered the price served
+    for it, whichever member took it (the spec's section 5, approved
+    2026-11-10)."""
+    print("R: a lake reader hands its writer a read that depends on it", flush=True)
+    readers = pods("lake-reader")
+    if not readers:
+        s.check(False, "reader hands on: the lake has no reader")
+        return
+    reader = readers[0]["metadata"]["name"]
+    flood_entitled(s)
+    before = reader_log(reader, HANDED_ON, container="lake")
+    flood_set("unkept")
+    try:
+        enough = happens(lambda: unkept_heard().get("answered", 0) >= UNKEPT_READS, 180, every=3)
+    finally:
+        flood_set("")
+    heard = unkept_heard()
+    s.check(enough, f"reader hands on: the flood read its dataset served, not kept ({heard})")
+    s.check(heard.get("answered", 0) > 0 and heard.get("served", 0) == heard.get("answered", 0)
+            and heard.get("other", 0) == 0,
+            f"reader hands on: every read answered the price served for its want, whichever member took it "
+            f"({heard.get('served', 0)} of {heard.get('answered', 0)}, {heard.get('other', 0)} failed)")
+    handed = reader_log(reader, HANDED_ON, container="lake") - before
+    s.check(handed > 0, f"reader hands on: the lake's reader handed {handed} of them to the writer")
 
 
 FAILURES = {
@@ -2779,6 +2838,10 @@ def main():
             reader_held(s)
         except SystemExit as stopped:
             s.check(False, f"reader held: {stopped}")
+        try:
+            reader_hands_on(s)
+        except SystemExit as stopped:
+            s.check(False, f"reader hands on: {stopped}")
     if PROFILE == "reconfigure":
         try:
             reconfigure(s)

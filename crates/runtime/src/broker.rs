@@ -74,8 +74,10 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// From contract v30 (W12.4; the step 3 plan's question 13), the analytics
 /// coordinators' own: each says it is live on `members` and hears the
 /// others there, and is handed a standing job's question by another on
-/// `standing.{member}`, its pod's name (approved 2026-11-10).
-const COMPONENT_TOPICS: [(&str, &str); 15] = [
+/// `standing.{member}`, its pod's name (approved 2026-11-10); and the lake's
+/// `read-from-writer`, on which a lake reader hands its writer a read that
+/// depends on the writer's own acts (stage B, approved 2026-11-10).
+const COMPONENT_TOPICS: [(&str, &str); 16] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
     ("analytics", "platform.analytics.internal.members"),
     ("analytics", "platform.analytics.internal.standing.*"),
@@ -83,6 +85,7 @@ const COMPONENT_TOPICS: [(&str, &str); 15] = [
     ("analytics", "$JS.ACK.>"),
     ("lake", "platform.lake.internal.read-changes"),
     ("lake", "platform.lake.internal.changes.*"),
+    ("lake", "platform.lake.internal.read-from-writer"),
     ("bor", "platform.book.internal.read-changes"),
     ("bor", "platform.book.internal.changes.*"),
     ("instrument", "platform.reference.internal.read-changes"),

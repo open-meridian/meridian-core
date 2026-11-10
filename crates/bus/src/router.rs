@@ -594,6 +594,28 @@ impl Bus {
         answered
     }
 
+    /// Hand `envelope` on, unchanged, to whoever serves `topic` in another
+    /// process, and answer with their answer: one member of a component
+    /// handing a request to the member that must answer it (topics.md,
+    /// "Component topics": a lake reader's read that depends on the writer's
+    /// own acts, contract v30 stage B). Nothing is stamped: who asked, their
+    /// scope and their `read_after` stay the original caller's, and its
+    /// topic the public one it was asked on. Never answered in this process,
+    /// which is the one handing it on.
+    pub async fn hand_on(
+        &self,
+        topic: &str,
+        envelope: Envelope,
+        timeout: Option<Duration>,
+    ) -> crate::Result<(String, Vec<u8>)> {
+        let timeout = timeout.unwrap_or(self.default_timeout);
+        let answered = self
+            .backend_for(topic)
+            .request(topic, envelope, timeout)
+            .await?;
+        Ok((answered.payload_type, answered.payload))
+    }
+
     /// Tell `observer` of every call this bus asks from now on (ruling 798).
     pub fn observe_calls(&self, observer: CallObserver) {
         *self.observer.write().expect("observer poisoned") = Some(observer);

@@ -24,6 +24,7 @@ use crate::MemoryStore;
 mod changes;
 mod hot;
 mod quality;
+mod read_from_writer;
 mod reader;
 
 const NOW: i64 = 1_791_417_600_000_000_000; // 2026-10-08T00:00Z

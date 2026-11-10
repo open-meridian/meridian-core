@@ -25,7 +25,10 @@ DRIVER_ROLE says which of its instances it is:
 - `flood`: holding data and reporting, the memory-pressure and noisy-plugin
   classes' subject (stage M, below): its own dataset recorded once, then
   read past the lake's budget, or past its own share at its sidecar, as
-  /tmp/flood says.
+  /tmp/flood says. It declares a second dataset too (`<instance>:unkept`,
+  asked of it, which the run licenses as served, not kept): each want of it
+  served, and in the `unkept` mode read, so a lake reader that takes the read
+  hands it to the writer (contract v30, stage B).
 
 Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
 <id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
@@ -68,6 +71,9 @@ INSTRUMENT = os.environ.get("DRIVER_INSTRUMENT", "")
 # and this run has no platform.
 USD = os.environ.get("DRIVER_CASH", "")
 DATASET_KEY = "drive"
+# The flood instance's dataset asked of it, served and not kept (the run
+# licenses it so): what a lake reader hands to its writer (contract v30).
+UNKEPT_KEY = "unkept"
 # Every call bounded: a stop is heard within this, whatever the stores do.
 CALL_SECONDS = 10
 # A key takes this many appends at most, so a read of it is one page.
@@ -268,8 +274,29 @@ class Recording(data.Role):
     seed = False
 
     async def on_observations_wanted(self, heard):
-        # Nothing is asked of it: it records unasked.
-        pass
+        # The data instance records unasked. The flood instance's dataset
+        # served, not kept, is asked of it: each subject's price served for
+        # the want, which the lake hands to the read waiting on it.
+        want = heard.message
+        if ROLE != "flood" or want.dataset != f"{self.plugin.identity.instance_id}:{UNKEPT_KEY}":
+            return
+        now = time.time_ns()
+        prices = [ops.Price(
+            meta=ops.ObservationMeta(
+                row_key=f"unkept-{subject.entity_id}-{now}",
+                subjects=[ops.SubjectRef(entity_id=subject.entity_id)],
+                source=ops.Source(dataset=want.dataset), valid_from_ns=now,
+                source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                             at_ns=now)],
+                raw=self.plugin.raw_record(f"unkept/{now}")),
+            kind=ops.PriceKind.PRICE_KIND_LAST,
+            price=ops.Money(amount=decimal("101.25"), instrument_id=USD),
+            basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT) for subject in want.subjects]
+        try:
+            await bounded(self._operations().RecordPrices(
+                ops.RecordPricesParams(prices=prices, want_id=want.want_id)))
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            say(f"driver: flood: want {want.want_id} not served ({words(failed)})")
 
 
 async def drive_data(plugin, gen):
@@ -715,10 +742,36 @@ async def drive_flood(plugin):
             kept("/tmp/flood.log", line)
             await asyncio.sleep(wait)
 
+    async def unkept():
+        """Its dataset served, not kept, read a price at a time: each read
+        raises a want, which this instance serves, and is answered the price
+        served -- whichever of the lake's members took it, a reader handing
+        it to the writer (contract v30, stage B). Each read says what it was,
+        as `UNKEPT answered=N served=N other=N` in /tmp/unkept.log: `served`
+        the reads answered with the price served for them."""
+        named = f"{plugin.identity.instance_id}:{UNKEPT_KEY}"
+        said = {"answered": 0, "served": 0, "other": 0}
+        while flood_mode() == "unkept" and not stopped():
+            try:
+                listed = await bounded(stub.ListPrices(ops.ListPricesParams(
+                    subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+                    sources=ops.SourceChoice(named=[named]))))
+                said["answered"] += 1
+                if any(p.meta.row_key.startswith("unkept-") for p in listed.prices):
+                    said["served"] += 1
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                said["other"] += 1
+                say(f"driver: flood: a read of {named} failed ({words(failed)})")
+            kept("/tmp/unkept.log",
+                 f"UNKEPT answered={said['answered']} served={said['served']} other={said['other']}")
+            await asyncio.sleep(0.5)
+
     streak = [0]
     while not stopped():
         mode = flood_mode()
-        if mode == "calm":
+        if mode == "unkept":
+            await unkept()
+        elif mode == "calm":
             streak[0] = 0
             await calm()
         elif mode in ("pressure", "noisy"):
@@ -785,13 +838,20 @@ async def drive_standing(role):
 
 def declaration():
     if ROLE in ("data", "flood"):
-        return Declaration(catalogue=[DatasetDeclaration(
+        catalogue = [DatasetDeclaration(
             key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
             modes=["push"],
             # Contract v30 (ruling 1032): the vendor's terms in words; the
             # licence is the deployment admin's.
             terms_and_pricing="A test-only driver's own prices, written for the run and kept by it.",
-            day_time_zone="Etc/UTC")])
+            day_time_zone="Etc/UTC")]
+        if ROLE == "flood":
+            catalogue.append(DatasetDeclaration(
+                key=UNKEPT_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
+                modes=["pull"],
+                terms_and_pricing="A test-only driver's prices, served when asked and not kept.",
+                day_time_zone="Etc/UTC"))
+        return Declaration(catalogue=catalogue)
     return Declaration()
 
 

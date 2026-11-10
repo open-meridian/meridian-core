@@ -147,6 +147,14 @@ pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution
 pub const LIST_EXECUTION_COSTS: &str = "platform.lake.query.list-execution-costs";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
+/// A lake read handed on, unchanged, by a reader member to the writer, which
+/// alone serves it, and the writer's reply (contract v30, stage B; topics.md,
+/// "Component topics"; approved 2026-11-10): a read whose answer depends on
+/// the writer's own acts or memory -- one that raises a want, which is the
+/// writer's recorded act, or whose answer says what a source declined or a
+/// dataset's liveness, which only the writer's commands set. The answer
+/// never depends on which member takes the read.
+pub const READ_FROM_WRITER: &str = "platform.lake.internal.read-from-writer";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -387,6 +395,9 @@ pub struct Lake {
     /// 3b): what an assessment, an amendment, a priority or an alias
     /// committed after it is published from.
     control_published: Mutex<u64>,
+    /// Each public read's handler by its topic: what a read handed on by a
+    /// reader member ([`READ_FROM_WRITER`]) is answered by on the writer.
+    read_handlers: RwLock<BTreeMap<&'static str, meridian_bus::Handler>>,
 }
 
 /// The lake's change log, read from its store.
@@ -536,6 +547,7 @@ impl Lake {
                     .read_changes(meridian_changes::CONTROL, i64::MAX as u64, 1)
                     .map_or(0, |at| at.head),
             ),
+            read_handlers: RwLock::new(BTreeMap::new()),
             store,
         })
     }
@@ -2982,6 +2994,15 @@ impl Lake {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answered = read::choose(self.store.as_ref(), read, against)?;
         drop(building);
+        // A reader member's read that would ask a source -- a want, the
+        // writer's recorded act, and where a dataset is served, not kept, the
+        // rows served for it -- or whose answer would say what a source
+        // declined, which the writer alone holds: the writer's to answer
+        // (contract v30, stage B; approved 2026-11-10). A declined subject is
+        // one this member would ask for, holding no decline.
+        if self.reads_only && !answered.asks.is_empty() {
+            return Err(to_the_writer());
+        }
         // A dataset served, not kept (W10.7; ruling 734): the read that
         // asked hears what is served within its wait; any other is told it
         // is not kept, never asked forever.
@@ -4059,6 +4080,11 @@ impl Lake {
     }
 
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
+        // Each dataset's liveness, which only the writer's commands set and
+        // only it holds: the writer's to answer (contract v30, stage B).
+        if self.reads_only {
+            return Err(to_the_writer());
+        }
         let reader = reader_of(envelope);
         let config = self.config();
         // The rows carrying a value as reported, and those flagged on a closed
@@ -5482,20 +5508,29 @@ fn serve_on<Req, Rep, F>(
     F: Fn(&Lake, Req, &Envelope) -> Result<Rep, String> + Send + Sync + 'static,
 {
     let (request_type, reply_type) = types;
+    let registry = Arc::clone(lake);
     let lake = Arc::clone(lake);
     // A read's line (ruling 798): its topic and kind, the rows its whole
     // answer held and the rows its page carried, the bytes answered and its
     // time; never a row, a subject or who asked.
     let read = topic.contains(".query.");
-    bus.serve(topic, move |envelope| {
+    let handler: meridian_bus::Handler = Arc::new(move |envelope: Envelope| {
         let started = std::time::Instant::now();
         if read {
             READ_NOTED.with(|noted| noted.set(None));
             crate::hot::noted::begin();
             crate::reader::begin();
+            HANDED_ON.with(|handed| handed.set(false));
         }
         let request: Req = decode(&envelope, request_type)?;
         let answered = handle(&lake, request, &envelope);
+        // A reader's read whose answer depends on the writer's own acts or
+        // memory (contract v30, stage B): handed on, unchanged, and answered
+        // with the writer's reply.
+        if read && HANDED_ON.with(|handed| handed.replace(false)) {
+            let _ = crate::hot::noted::take();
+            return lake.hand_to_writer(topic, envelope, started);
+        }
         if read {
             let noted = READ_NOTED.with(std::cell::Cell::take);
             let (kind, whole, page) = noted
@@ -5523,6 +5558,112 @@ fn serve_on<Req, Rep, F>(
         let reply = answered?;
         Ok((reply_type.to_string(), reply.encode_to_vec()))
     });
+    if read {
+        registry
+            .read_handlers
+            .write()
+            .expect("read handlers poisoned")
+            .insert(topic, Arc::clone(&handler));
+    }
+    bus.serve(topic, move |envelope| handler(envelope));
+}
+
+thread_local! {
+    /// Set by a reader member's read whose answer depends on the writer's
+    /// own acts or memory: the read is handed on to the writer.
+    static HANDED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a reader member's read answers where the writer must answer it
+/// ([`READ_FROM_WRITER`]): the read is marked to be handed on, and these
+/// words are never the caller's.
+fn to_the_writer() -> String {
+    HANDED_ON.with(|handed| handed.set(true));
+    "handed on to the lake's writer".to_string()
+}
+
+/// What a read handed to the writer leaves of its caller's deadline for its
+/// answer's way back from the writer through this member.
+const HANDED_BACK: Duration = Duration::from_millis(250);
+
+impl Lake {
+    /// A reader member's read of `topic` handed on, unchanged, to the writer
+    /// on [`READ_FROM_WRITER`], and the writer's reply answered with: its
+    /// rows, or its refusal word for word. A writer that does not answer --
+    /// none serving, mid-failover, or past the caller's deadline -- is
+    /// refused UNAVAILABLE, which the caller may ask again.
+    fn hand_to_writer(
+        &self,
+        topic: &'static str,
+        envelope: Envelope,
+        started: std::time::Instant,
+    ) -> meridian_bus::HandlerReply {
+        let unavailable = |why: String| {
+            refusal_with_status(
+                RefusalStatus::Unavailable,
+                &[],
+                format!("{topic} is the lake writer's to answer, and {why}; ask again"),
+            )
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| unavailable("this member has no runtime to hand it on".into()))?;
+        // What the caller's deadline leaves, less the answer's way back.
+        let timeout = meridian_bus::read_after::deadline().map(|deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(HANDED_BACK)
+        });
+        if timeout.is_some_and(|left| left.is_zero()) {
+            return Err(unavailable(
+                "the caller's deadline left no time to ask it".into(),
+            ));
+        }
+        let answered = handle.block_on(self.bus.hand_on(READ_FROM_WRITER, envelope, timeout));
+        let ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3);
+        match answered {
+            Ok(reply) => {
+                tracing::info!(topic, ms, "a read handed to the writer: answered by it");
+                Ok(reply)
+            }
+            Err(meridian_bus::BusError::HandlerFailed { detail, .. }) => {
+                tracing::info!(topic, ms, "a read handed to the writer: refused by it");
+                Err(detail)
+            }
+            Err(failed) => {
+                tracing::warn!(topic, ms, %failed, "a read handed to the writer: not answered");
+                Err(unavailable(format!("it did not answer ({failed})")))
+            }
+        }
+    }
+
+    /// A read a reader member handed on ([`READ_FROM_WRITER`]): answered by
+    /// the public read's own handler, its topic the one it was asked on,
+    /// held to its `read_after` as every read is. Served by the writer alone.
+    fn answer_handed_on(&self, envelope: Envelope) -> meridian_bus::HandlerReply {
+        let topic = envelope
+            .meta
+            .as_ref()
+            .map(|meta| meta.topic.clone())
+            .unwrap_or_default();
+        let handler = self
+            .read_handlers
+            .read()
+            .expect("read handlers poisoned")
+            .get(topic.as_str())
+            .cloned()
+            .ok_or_else(|| format!("{topic:?} is no lake read: only a lake read is handed on"))?;
+        match envelope
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.read_after.clone())
+        {
+            Some(asked) => self
+                .bus
+                .reads_after()
+                .answer(&topic, &asked, || handler(envelope)),
+            None => handler(envelope),
+        }
+    }
 }
 
 /// Register every handler, and subscribe to every event the lake hears,
@@ -6242,6 +6383,16 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         ),
         |lake, request: RenewWantsRequest, envelope| lake.renew_wants(request, envelope),
     );
+
+    // A reader member's reads that depend on this writer's acts or memory,
+    // handed on (contract v30, stage B). A reader serves reads alone, so it
+    // never serves this.
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(READ_FROM_WRITER, move |envelope| {
+            lake.answer_handed_on(envelope)
+        });
+    }
 
     // Heard, subscribed before this returns.
     let mut configuration = bus.subscribe_every(ENTITLEMENTS_CHANGED);

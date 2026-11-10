@@ -406,6 +406,14 @@ fn each_stores_change_log_is_held_by_its_members_and_no_plugin() {
         ));
     }
     assert!(!holds(analytics, "platform.street.internal.changes.*"));
+    // A lake reader hands its writer a read on the lake's own topic
+    // (contract v30, stage B): the lake's members alone.
+    assert!(holds(runtime, "platform.lake.internal.read-from-writer"));
+    assert!(!holds(analytics, "platform.lake.internal.read-from-writer"));
+    assert!(!holds(
+        instrument,
+        "platform.lake.internal.read-from-writer"
+    ));
     for other in users
         .iter()
         .filter(|u| !["runtime", "instrument", "analytics"].contains(&u.user.as_str()))
