@@ -49,7 +49,7 @@ import uuid
 from decimal import Decimal
 
 import grpc
-from meridian import DatasetDeclaration, DatasetLicence, Declaration
+from meridian import DatasetDeclaration, Declaration
 from meridian.client import connect
 from meridian.plugin.v1 import operations_pb2 as ops
 from meridian.roles import data, ems, oms, reporting
@@ -702,7 +702,10 @@ def declaration():
     if ROLE in ("data", "flood"):
         return Declaration(catalogue=[DatasetDeclaration(
             key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
-            modes=["push"], licence_default=DatasetLicence(kept=True, display=True),
+            modes=["push"],
+            # Contract v30 (ruling 1032): the vendor's terms in words; the
+            # licence is the deployment admin's.
+            terms_and_pricing="A test-only driver's own prices, written for the run and kept by it.",
             day_time_zone="Etc/UTC")])
     return Declaration()
 
