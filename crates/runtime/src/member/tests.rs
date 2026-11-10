@@ -183,6 +183,45 @@ async fn a_reader_applies_each_change_in_order_from_the_heads_it_started_at() {
     assert!(applied.resets.lock().unwrap().is_empty());
 }
 
+/// A reader started before its writer served, and so before the writer
+/// published its tail: a partition written meanwhile is held from the
+/// primary's head as soon as the writer answers, and one it held behind is
+/// read from the writer -- never left unfollowed, every read naming it
+/// waiting out its bound (CI 42868480584).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_holds_what_the_primary_holds_as_soon_as_its_writer_answers() {
+    let bus = Arc::new(Bus::single(
+        "member-test-reconcile",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    // Written before the reader followed, no page of it heard.
+    let log = Arc::new(Log {
+        head: AtomicU64::new(3),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    let primary = log.clone();
+    let heads = meridian_bus::read_after::AllHeads(move || {
+        Ok(std::collections::BTreeMap::from([(
+            "P0".to_string(),
+            primary.head.load(Ordering::SeqCst),
+        )]))
+    });
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    // Started knowing nothing of P0.
+    let followed = crate::member::Followed::from_heads([]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(heads))
+        .unwrap();
+    until("P0 held from the primary's head", || {
+        followed.heads().get("P0") == Some(&3)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
+    assert!(applied.changes.lock().unwrap().is_empty());
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");

@@ -239,7 +239,7 @@ impl Member {
         let reads = bus.reads_after();
         reads.set_bound(self.ready_lag);
         reads.keep(domain, Arc::clone(&followed) as Arc<_>);
-        reads.keep_primary(domain, primary);
+        reads.keep_primary(domain, Arc::clone(&primary));
         tokio::spawn(follow(
             Arc::clone(bus),
             domain,
@@ -247,6 +247,7 @@ impl Member {
             Some(Following {
                 followed: Arc::clone(&followed),
                 apply,
+                primary,
             }),
         ));
         tracing::info!(
@@ -722,10 +723,12 @@ where
     }
 }
 
-/// A reader's following: where it has applied to, and what applies.
+/// A reader's following: where it has applied to, what applies, and its
+/// store's primary, which it reconciles with as its writer answers it.
 struct Following {
     followed: Arc<Followed>,
     apply: Arc<dyn Apply>,
+    primary: Arc<dyn meridian_bus::read_after::Position>,
 }
 
 /// How often a standby asks its writer, which is also its interest in the
@@ -756,6 +759,9 @@ async fn follow(
     // writer last failed to answer. The lag is the longer.
     let mut gap_since: Option<Instant> = None;
     let mut unanswered_since: Option<Instant> = None;
+    // Whether the writer has answered yet: a reader reconciles with the
+    // primary the first time it does, and again after each time it did not.
+    let mut answered = false;
     let mut ask = tokio::time::interval(ASK_EVERY);
     loop {
         tokio::select! {
@@ -844,7 +850,13 @@ async fn follow(
             }
             _ = ask.tick() => {
                 match ask_writer(&bus, domain).await {
-                    Ok(()) => unanswered_since = None,
+                    Ok(()) => {
+                        let again = unanswered_since.take().is_some() || !answered;
+                        answered = true;
+                        if let (true, Some(following)) = (again, &following) {
+                            reconcile(&bus, domain, following, &mut at, &mut chains).await;
+                        }
+                    }
                     Err(failed) => {
                         if unanswered_since.is_none() {
                             tracing::warn!(domain, %failed, "the writer's change log did not answer");
@@ -863,6 +875,68 @@ async fn follow(
             }
         }
     }
+}
+
+/// A reader reconciled with its store's primary, as its writer answers it
+/// for the first time or again: the writer publishes its change log's tail
+/// only while a follower asks (ruling 1062), so what it committed before --
+/// a reader started before its writer, or a writer restarted -- was never
+/// heard. Each partition the primary holds that the reader does not is held
+/// from its head, as one first heard is; one it is behind on is read from
+/// the writer, as any gap is. Without this a partition written only then
+/// was never followed, and every read naming it waited out its bound and
+/// was answered from the primary (CI 42868480584, the book's reader).
+async fn reconcile(
+    bus: &Bus,
+    domain: &'static str,
+    following: &Following,
+    at: &mut HashMap<String, u64>,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+) {
+    let Some(heads) = following.primary.all_heads() else {
+        return;
+    };
+    let heads = match heads {
+        Ok(heads) => heads,
+        Err(failed) => {
+            tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
+            return;
+        }
+    };
+    for (partition, head) in heads {
+        let reached = match at.get(&partition).copied() {
+            Some(held) if held >= head => continue,
+            Some(held) => {
+                match catch_up(
+                    bus,
+                    domain,
+                    &partition,
+                    held,
+                    chains,
+                    Some(following.apply.as_ref()),
+                )
+                .await
+                {
+                    Ok(reached) => reached.max(held),
+                    Err(failed) if meridian_changes::is_behind(&failed) => {
+                        following.apply.reset(&partition);
+                        head
+                    }
+                    Err(failed) => {
+                        tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be read");
+                        continue;
+                    }
+                }
+            }
+            None => {
+                following.apply.reset(&partition);
+                head
+            }
+        };
+        at.insert(partition.clone(), reached);
+        following.followed.set(&partition, reached);
+    }
+    said().set_partitions(at.keys().cloned().collect());
 }
 
 /// Whether a reader is held behind on purpose: TEST ONLY, by the file

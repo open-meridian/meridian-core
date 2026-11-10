@@ -43,6 +43,13 @@ pub trait Position: Send + Sync {
     /// The head of each of `partitions` in this member's record; a partition
     /// it does not hold is absent.
     fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String>;
+
+    /// Every partition's head in this member's record, where it reads them
+    /// whole: what a reader reconciles with each time its writer answers it
+    /// again. None where its record cannot list them.
+    fn all_heads(&self) -> Option<Result<HashMap<String, u64>, String>> {
+        None
+    }
 }
 
 /// A position read whole -- every partition's head in one look, as a store's
@@ -59,6 +66,10 @@ where
             .iter()
             .filter_map(|partition| all.get(partition).map(|head| (partition.clone(), *head)))
             .collect())
+    }
+
+    fn all_heads(&self) -> Option<Result<HashMap<String, u64>, String>> {
+        Some((self.0)().map(|all| all.into_iter().collect()))
     }
 }
 
