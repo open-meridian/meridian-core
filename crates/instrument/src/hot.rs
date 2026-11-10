@@ -483,6 +483,63 @@ mod tests {
         assert_eq!(primary.by_id(&id).unwrap().unwrap().version, 2);
     }
 
+    /// Contract v30, stage B (the resilience spec's section 5, approved
+    /// 2026-11-10): a reader answers at the position it was answered at --
+    /// its own applied position from its hot layer, the primary's past its
+    /// wait. The instrument store's replies carry no store position of their
+    /// own (no reference reply has a watermark; a list's `sequence` is the
+    /// last item it read), so what a reply says is the record it answers.
+    #[test]
+    fn an_instrument_readers_answer_is_at_its_own_position_or_the_primarys_past_its_wait() {
+        use meridian_bus::read_after::{Position, Reads};
+        use meridian_pb::v1::{PartitionSequence, Watermark};
+        struct At(u64);
+        impl Position for At {
+            fn heads(
+                &self,
+                _: &[String],
+            ) -> std::result::Result<std::collections::HashMap<String, u64>, String> {
+                Ok([("instruments".to_string(), self.0)].into())
+            }
+        }
+        let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let id = minted(primary.as_ref(), 1);
+        let hot = Arc::new(HotStore::new(Arc::clone(&primary), DEFAULT_BYTES));
+        let reader = crate::reader::ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        // The writer writes at 2; the reader has applied to 1.
+        primary
+            .write(record(&id, "S1", 2), 1, entry(&id, 2))
+            .unwrap();
+        let reads = Reads::default();
+        reads.keep("reference", Arc::new(At(1)));
+        reads.keep_primary("reference", Arc::new(At(2)));
+        reads.set_bound(std::time::Duration::from_millis(20));
+        let at = |sequence| Watermark {
+            partitions: vec![PartitionSequence {
+                partition: "instruments".into(),
+                sequence,
+            }],
+        };
+        let version = |asked: u64| {
+            reads
+                .answer(
+                    "platform.reference.query.resolve-instrument",
+                    &at(asked),
+                    || reader.by_id(&id).map_err(|failed| failed.to_string()),
+                )
+                .unwrap()
+                .unwrap()
+                .version
+        };
+        assert_eq!(version(1), 1, "at its own position: its hot layer's");
+        assert_eq!(
+            version(2),
+            2,
+            "past its wait: the primary's, never its own behind it"
+        );
+    }
+
     /// Step 3a: the same answer as the record, before and after each write,
     /// under a bound small enough to evict.
     #[test]

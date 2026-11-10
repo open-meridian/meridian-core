@@ -2367,7 +2367,8 @@ async fn a_readers_books_follow_the_change_log_and_it_acts_on_nothing() {
     serve(bus.clone(), writer, bus.clock());
     resolving(&bus);
     open(&bus).await;
-    let reader = crate::reader::ReaderStore::new(store.clone(), None, 1 << 20);
+    let reader =
+        crate::reader::ReaderStore::new(store.clone(), None, 1 << 20, Arc::new(Default::default));
     let before = reader.book(ACC).unwrap();
     assert_eq!(reader.held().0, 1, "held once read");
     let head = Store::heads(store.as_ref()).unwrap()["P0"];
@@ -2397,4 +2398,117 @@ async fn a_readers_books_follow_the_change_log_and_it_acts_on_nothing() {
     // Every act the writer's.
     assert!(reader.rebuild().is_err());
     assert!(reader.adopt().is_err());
+}
+
+/// A book reader's reply carries the position it was answered at (contract
+/// v30, stage B; the resilience spec's section 5, approved 2026-11-10): for
+/// a read from the books it holds, what it has applied of the writer's
+/// change log, never the primary's heads beyond it; past its wait, from the
+/// primary, the primary's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_book_readers_reply_says_the_position_it_was_answered_at() {
+    use meridian_bus::read_after::AllHeads;
+    use meridian_domain::v1::{ListLifecycleEventsReply, ListLifecycleEventsRequest};
+
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+    ));
+    let store = Arc::new(MemoryStore::new());
+    let writer: Arc<dyn Store> = Arc::new(crate::writer::Writer::new(store.clone(), bus.clone()));
+    serve(bus.clone(), writer, bus.clock());
+    resolving(&bus);
+    open(&bus).await;
+    let applied_to = Store::heads(store.as_ref()).unwrap();
+    let partition = applied_to
+        .keys()
+        .find(|p| p.as_str() != crate::store::CONTROL_PARTITION)
+        .unwrap()
+        .clone();
+    send(
+        &bus,
+        RECORD_BREAK,
+        "meridian.v1.RecordBreakRequest",
+        &aapl_break(),
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    let ahead = Store::heads(store.as_ref()).unwrap()[&partition];
+    assert!(
+        ahead > applied_to[&partition],
+        "the writer committed past what the reader applied"
+    );
+
+    // The reader: the book's reads alone, on its own bus, applied to before
+    // the break.
+    let reading_bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        bus.clock(),
+    ));
+    reading_bus.serve_only(meridian_bus::read_after::is_read);
+    let applied = applied_to.clone();
+    let reader: Arc<dyn Store> = Arc::new(crate::reader::ReaderStore::new(
+        store.clone(),
+        None,
+        1 << 20,
+        Arc::new(move || applied.clone()),
+    ));
+    serve(reading_bus.clone(), reader, bus.clock());
+    let primary = store.clone();
+    reading_bus.reads_after().keep_primary(
+        crate::writer::DOMAIN,
+        Arc::new(AllHeads(move || {
+            Store::heads(primary.as_ref()).map_err(|failed| failed.to_string())
+        })),
+    );
+    reading_bus
+        .reads_after()
+        .set_bound(std::time::Duration::from_millis(50));
+    let events = |read_after: Option<u64>| {
+        let reading_bus = reading_bus.clone();
+        let partition = partition.clone();
+        async move {
+            let stamp = Stamp {
+                read_after: read_after.map(|sequence| meridian_pb::v1::Watermark {
+                    partitions: vec![meridian_pb::v1::PartitionSequence {
+                        partition: partition.clone(),
+                        sequence,
+                    }],
+                }),
+                ..Default::default()
+            };
+            let (_, reply) = reading_bus
+                .call_stamped(
+                    LIST_LIFECYCLE_EVENTS,
+                    "meridian.v1.ListLifecycleEventsRequest",
+                    ListLifecycleEventsRequest {
+                        account_id: ACC.into(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                    None,
+                    None,
+                    &stamp,
+                )
+                .await
+                .unwrap();
+            let reply = ListLifecycleEventsReply::decode(&reply[..]).unwrap();
+            reply
+                .as_of
+                .unwrap()
+                .partitions
+                .iter()
+                .find(|p| p.partition == partition)
+                .map(|p| p.sequence)
+                .unwrap()
+        }
+    };
+    // From the books it holds: its own applied position.
+    assert_eq!(events(None).await, applied_to[&partition]);
+    // Naming the writer's head, past its wait: from the primary, the
+    // primary's.
+    assert_eq!(events(Some(ahead)).await, ahead);
 }

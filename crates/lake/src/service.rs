@@ -5492,6 +5492,7 @@ fn serve_on<Req, Rep, F>(
         if read {
             READ_NOTED.with(|noted| noted.set(None));
             crate::hot::noted::begin();
+            crate::reader::begin();
         }
         let request: Req = decode(&envelope, request_type)?;
         let answered = handle(&lake, request, &envelope);

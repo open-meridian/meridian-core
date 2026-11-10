@@ -217,27 +217,25 @@ impl Member {
     }
 
     /// Serve as a reader (contract v30, stage B): its reads held to their
-    /// `read_after` by what it has applied of the change log, from `start`
-    /// -- the primary's heads as it started, before its hot layer held
-    /// anything -- and answered from the primary, at `primary`, past their
-    /// wait. Following, each change applied to `apply` in order; ready while
+    /// `read_after` by what it has applied of the change log, `followed`,
+    /// from where it starts -- the primary's heads as it started, before its
+    /// hot layer held anything ([`Followed::from_heads`]) -- and answered
+    /// from the primary, at `primary`, past their wait. Following, each
+    /// change applied to `apply` in order, then `followed` moved; ready while
     /// its lag is under its bound. Called once the store's reads are
     /// registered, the bus serving its reads alone.
     pub fn read(
         &self,
         bus: &Arc<Bus>,
-        start: HashMap<String, u64>,
+        followed: Arc<Followed>,
         apply: Arc<dyn Apply>,
         primary: Arc<dyn meridian_bus::read_after::Position>,
-    ) -> Result<Arc<Followed>, String> {
+    ) -> Result<(), String> {
         let domain = self
             .domain
             .ok_or_else(|| format!("{} keeps no store to read", self.component))?;
         said().set_mode(Mode::Reader);
-        said().set_partitions(start.keys().cloned().collect());
-        let followed = Arc::new(Followed {
-            at: Mutex::new(start),
-        });
+        said().set_partitions(followed.heads().into_keys().collect());
         let reads = bus.reads_after();
         reads.set_bound(self.ready_lag);
         reads.keep(domain, Arc::clone(&followed) as Arc<_>);
@@ -256,7 +254,7 @@ impl Member {
             member = %member_name(),
             "a reader: serving reads, following the writer's change log"
         );
-        Ok(followed)
+        Ok(())
     }
 
     pub fn leased(&self) -> bool {
@@ -667,6 +665,16 @@ pub struct Followed {
 }
 
 impl Followed {
+    /// A reader's position as it starts: the primary's heads, read before
+    /// its hot layer holds anything. Made before its store, which stamps
+    /// each answer from its hot layer with it (spec section 5: a reader's
+    /// reply carries its own applied position).
+    pub fn from_heads(start: impl IntoIterator<Item = (String, u64)>) -> Arc<Self> {
+        Arc::new(Self {
+            at: Mutex::new(start.into_iter().collect()),
+        })
+    }
+
     fn set(&self, partition: &str, head: u64) {
         self.at
             .lock()

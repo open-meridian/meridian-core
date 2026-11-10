@@ -1,13 +1,14 @@
 //! A reader member's store (contract v30, stage B): latest reads from a hot
 //! layer the change log keeps current, the record's past from a read replica
 //! that has reached the read's `read_after`, everything from the primary
-//! past the read's wait, and nothing written.
+//! past the read's wait, nothing written, and each reply's watermark the
+//! position it was answered at.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use meridian_bus::read_after::{Position, Reads};
+use meridian_bus::read_after::{AllHeads, Position, Reads};
 use meridian_pb::v1::{PartitionSequence, Watermark};
 
 use super::*;
@@ -62,6 +63,11 @@ fn mark(sequence: u64) -> Watermark {
     }
 }
 
+/// A reader whose replies' watermarks these tests do not read.
+fn nothing_applied() -> crate::reader::Applied {
+    Arc::new(std::collections::BTreeMap::new)
+}
+
 /// A member at a fixed position.
 struct At(u64);
 
@@ -78,7 +84,12 @@ fn a_readers_hot_layer_is_kept_current_by_the_writers_change_log() {
         .record(LIVE, vec![quote_at("q1", NOW, "100")], NOW)
         .unwrap();
     let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
-    let reader = ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+    let reader = ReaderStore::new(
+        Arc::clone(&hot),
+        Arc::clone(&primary),
+        None,
+        nothing_applied(),
+    );
     assert_eq!(bids(&reader.read(&latest_query(0)).unwrap()), bid("100"));
     hot.load_wanted();
     let head = primary.heads().unwrap()[LIVE];
@@ -105,7 +116,7 @@ fn a_readers_hot_layer_is_kept_current_by_the_writers_change_log() {
 fn a_reader_writes_nothing() {
     let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
-    let reader = ReaderStore::new(hot, Arc::clone(&primary), None);
+    let reader = ReaderStore::new(hot, Arc::clone(&primary), None, nothing_applied());
     assert!(reader
         .record(LIVE, vec![quote_at("q1", NOW, "100")], NOW)
         .is_err());
@@ -131,7 +142,12 @@ fn the_records_past_is_the_replicas_once_it_has_reached_the_read_else_the_primar
     let behind = replica.heads().unwrap()[LIVE];
     assert!(ahead > behind);
     let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
-    let reader = ReaderStore::new(hot, Arc::clone(&primary), Some(Arc::clone(&replica)));
+    let reader = ReaderStore::new(
+        hot,
+        Arc::clone(&primary),
+        Some(Arc::clone(&replica)),
+        nothing_applied(),
+    );
     let past = latest_query(NOW + 10_000_000_000);
     let reads = Reads::default();
     reads.keep("lake", Arc::new(At(ahead)));
@@ -160,7 +176,12 @@ fn past_its_wait_a_readers_read_is_the_primarys_every_part() {
         .record(LIVE, vec![quote_at("q1", NOW, "100")], NOW)
         .unwrap();
     let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
-    let reader = ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+    let reader = ReaderStore::new(
+        Arc::clone(&hot),
+        Arc::clone(&primary),
+        None,
+        nothing_applied(),
+    );
     reader.read(&latest_query(0)).unwrap();
     hot.load_wanted();
     assert_eq!(bids(&reader.read(&latest_query(0)).unwrap()), bid("100"));
@@ -195,4 +216,140 @@ fn past_its_wait_a_readers_read_is_the_primarys_every_part() {
         })
         .unwrap();
     assert_eq!(bids(&answered), bid("100"));
+}
+
+/// A member at a fixed position of one partition.
+struct AtHead(&'static str, u64);
+
+impl Position for AtHead {
+    fn heads(&self, _: &[String]) -> std::result::Result<HashMap<String, u64>, String> {
+        Ok([(self.0.to_string(), self.1)].into())
+    }
+}
+
+const DAILY: &str = "coinbase-1:daily";
+
+fn daily_at(sequence: u64) -> Watermark {
+    Watermark {
+        partitions: vec![PartitionSequence {
+            partition: DAILY.into(),
+            sequence,
+        }],
+    }
+}
+
+fn kept_close(store: &dyn Store, row_key: &str, date: &str, amount: &str) {
+    store
+        .record(
+            DAILY,
+            vec![Observation::Price(Box::new(close(
+                "coinbase-1",
+                row_key,
+                BTC,
+                date,
+                amount,
+            )))],
+            NOW,
+        )
+        .unwrap();
+}
+
+fn answered_at(answer: &service::ReadAnswer) -> u64 {
+    answer
+        .watermark
+        .partitions
+        .iter()
+        .find(|p| p.partition == DAILY)
+        .map(|p| p.sequence)
+        .unwrap()
+}
+
+/// A reader's reply carries the position it was answered at: what it has
+/// applied, never the primary's heads beyond it; the primary's for an answer
+/// from the primary past its wait; and no further than a read replica that
+/// answered it had reached. (The lake cuts every read off at its own now, so
+/// a reader's latest read is the record's past here, the replica's.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_readers_reply_says_the_position_it_was_answered_at() {
+    let clock = Arc::new(ManualClock::at(NOW));
+    let bus = Arc::new(Bus::single(
+        "lake-1",
+        Arc::new(MemoryBackend::new()),
+        clock.clone(),
+    ));
+    stand_ins(&bus);
+    bus.serve_only(meridian_bus::read_after::is_read);
+    let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let replica: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    kept_close(primary.as_ref(), "k1", "2026-10-07", "5");
+    kept_close(replica.as_ref(), "k1", "2026-10-07", "5");
+    kept_close(primary.as_ref(), "k2", "2026-10-06", "6");
+    let (behind, ahead) = (
+        replica.heads().unwrap()[DAILY],
+        primary.heads().unwrap()[DAILY],
+    );
+    assert!(behind < ahead);
+    // The member has applied the writer's change log to `behind`.
+    let applied = Arc::new(Mutex::new(BTreeMap::from([(DAILY.to_string(), behind)])));
+    let reading = {
+        let applied = Arc::clone(&applied);
+        ReaderStore::new(
+            HotStore::new(Arc::clone(&primary), Bounds::DEFAULT),
+            Arc::clone(&primary),
+            Some(Arc::clone(&replica)),
+            Arc::new(move || applied.lock().unwrap().clone()),
+        )
+    };
+    let store = Arc::new(MemoryStore::new());
+    let lake = service::serve(bus.clone(), reading, clock.clone());
+    lake.configured(&configuration(true, &[]));
+    let h = Harness {
+        bus: bus.clone(),
+        store,
+        clock,
+        lake,
+    };
+    let latest = || {
+        crate::reader::begin();
+        read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0)
+    };
+    // Its own position, though the primary is ahead.
+    let answer = latest();
+    assert!(!answer.rows.is_empty());
+    assert_eq!(answered_at(&answer), behind, "its own applied position");
+
+    // Past its wait, from the primary: the primary's.
+    let reads = bus.reads_after();
+    reads.keep_primary(
+        "lake",
+        Arc::new(AllHeads({
+            let primary = Arc::clone(&primary);
+            move || primary.heads().map_err(|failed| failed.to_string())
+        })),
+    );
+    reads.keep("lake", Arc::new(AtHead(DAILY, behind)));
+    reads.set_bound(Duration::from_millis(50));
+    let answer = reads
+        .answer(service::LIST_PRICES, &daily_at(ahead), || Ok(latest()))
+        .unwrap();
+    assert_eq!(answered_at(&answer), ahead, "the primary's");
+
+    // Applied to the head, a past read the replica answers says no more than
+    // the replica had reached.
+    *applied.lock().unwrap() = BTreeMap::from([(DAILY.to_string(), ahead)]);
+    crate::reader::begin();
+    let past = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    assert_eq!(past.rows.len(), 1);
+    assert_eq!(
+        answered_at(&past),
+        behind,
+        "the replica's, behind what it applied"
+    );
 }

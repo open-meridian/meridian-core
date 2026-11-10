@@ -190,7 +190,7 @@ fn run() -> Result<(), String> {
             InstrumentService::new(bus.clone(), reading, clock()).serve_reads();
             member.read(
                 &bus,
-                Default::default(),
+                meridian_runtime::member::Followed::from_heads([]),
                 Arc::new(RecordsFollow(hot.clone())),
                 Arc::new(meridian_runtime::member::LogHeads(postgres.clone())),
             )?;

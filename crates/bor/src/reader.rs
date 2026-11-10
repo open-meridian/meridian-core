@@ -13,6 +13,10 @@
 //!   read's `read_after`; from the primary otherwise.
 //! - **Past its wait**, a read still behind its `read_after` is answered from
 //!   the primary, every part of it.
+//! - **Its reply's watermark** is the position it was answered at (section 5,
+//!   approved 2026-11-10): a page read from the primary or the replica says
+//!   that store's own; a read from the books it holds, the member's applied
+//!   position, never the primary's heads; past its wait, the primary's.
 //! - **Nothing written**: every act is the writer's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,8 +33,12 @@ use crate::store::{
 };
 use crate::writer::Books;
 
+/// A reader member's applied position: each partition's head as far as it
+/// has applied the writer's change log.
+pub type Applied = Arc<dyn Fn() -> Mark + Send + Sync>;
+
 /// A reader member's book: its books held over the primary, the primary,
-/// and the read replica where one is set.
+/// the read replica where one is set, and the position it has applied to.
 pub struct ReaderStore {
     primary: Arc<dyn Store>,
     replica: Option<Arc<dyn Store>>,
@@ -38,16 +46,23 @@ pub struct ReaderStore {
     bound: usize,
     /// Moved as each book is forgotten: a load begun before is not held.
     forgotten: AtomicU64,
+    applied: Applied,
 }
 
 impl ReaderStore {
-    pub fn new(primary: Arc<dyn Store>, replica: Option<Arc<dyn Store>>, bound: usize) -> Self {
+    pub fn new(
+        primary: Arc<dyn Store>,
+        replica: Option<Arc<dyn Store>>,
+        bound: usize,
+        applied: Applied,
+    ) -> Self {
         Self {
             primary,
             replica,
             books: Mutex::new(Books::default()),
             bound,
             forgotten: AtomicU64::new(0),
+            applied,
         }
     }
 
@@ -202,8 +217,16 @@ impl Store for ReaderStore {
         self.now().accounts()
     }
 
+    /// The position a read was answered at, where the read says its own
+    /// (an account's lifecycle events, read from the books it holds): what
+    /// this member has applied -- each book it holds at or past it -- and
+    /// the primary's past the read's wait. A page read from a store carries
+    /// that store's own.
     fn heads(&self) -> Result<Mark> {
-        self.now().heads()
+        if answering_from_primary() {
+            return self.primary.heads();
+        }
+        Ok((self.applied)())
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {

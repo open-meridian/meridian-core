@@ -190,19 +190,22 @@ fn run() -> Result<(), String> {
             };
             let start =
                 tokio::task::block_in_place(|| meridian_bor::Store::heads(postgres.as_ref()))
-                    .map_err(|failed| format!("the book's heads could not be read: {failed}"))?
-                    .into_iter()
-                    .collect();
+                    .map_err(|failed| format!("the book's heads could not be read: {failed}"))?;
+            let followed = meridian_runtime::member::Followed::from_heads(start);
+            // Its replies' watermarks: what it has applied, for a read from
+            // the books it holds (spec section 5).
+            let applied = Arc::clone(&followed);
             let reading = Arc::new(meridian_bor::reader::ReaderStore::new(
                 postgres.clone(),
                 replica,
                 books_bound,
+                Arc::new(move || applied.heads().into_iter().collect()),
             ));
             meridian_bor::service::serve(bus.clone(), reading.clone(), clock());
             let primary = postgres.clone();
             member.read(
                 &bus,
-                start,
+                followed,
                 Arc::new(BookFollows(reading)),
                 Arc::new(meridian_bus::read_after::AllHeads(move || {
                     meridian_bor::Store::heads(primary.as_ref())

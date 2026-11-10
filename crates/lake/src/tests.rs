@@ -47,6 +47,21 @@ fn harness() -> Harness {
         Arc::new(MemoryBackend::new()),
         clock.clone(),
     ));
+    stand_ins(&bus);
+    let store = Arc::new(MemoryStore::new());
+    let lake = service::serve(bus.clone(), store.clone(), clock.clone());
+    lake.configured(&configuration(true, &[]));
+    Harness {
+        bus,
+        store,
+        clock,
+        lake,
+    }
+}
+
+/// The instrument store and the conductor, stood in on `bus`: four records,
+/// USD by its code, and one plugin launched.
+fn stand_ins(bus: &Bus) {
     // The instrument store, stood in: four records, USD by its code.
     bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
@@ -96,15 +111,6 @@ fn harness() -> Harness {
             .encode_to_vec(),
         ))
     });
-    let store = Arc::new(MemoryStore::new());
-    let lake = service::serve(bus.clone(), store.clone(), clock.clone());
-    lake.configured(&configuration(true, &[]));
-    Harness {
-        bus,
-        store,
-        clock,
-        lake,
-    }
 }
 
 fn declaration(key: &str, cadence: u32) -> DatasetDeclaration {

@@ -13,8 +13,14 @@
 //! - **Past its wait**, a read still behind its `read_after` is answered from
 //!   the store's primary database, every part of it
 //!   ([`meridian_bus::read_after::answering_from_primary`]).
+//! - **Its reply's watermark** is the position it was answered at (section 5,
+//!   approved 2026-11-10): the member's own applied position for an answer
+//!   from its hot layer, never the primary's heads; the primary's for an
+//!   answer from the primary; and never past what a read replica that
+//!   answered part of it had reached.
 //! - **Nothing written**: every write is refused, the writer's alone.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -29,25 +35,45 @@ use crate::store::{
     StoreError, WantChange,
 };
 
-/// A reader member's store: its hot layer over the primary, the primary, and
-/// the read replica where one is set.
+/// A reader member's applied position: each partition's head as far as it
+/// has applied the writer's change log.
+pub type Applied = Arc<dyn Fn() -> BTreeMap<String, u64> + Send + Sync>;
+
+thread_local! {
+    /// The read replica's heads where it answered part of the read this
+    /// thread answers, as it was first looked at for it: the read's
+    /// watermark is held to them.
+    static REPLICA_ANSWERED: RefCell<Option<BTreeMap<String, u64>>> = const { RefCell::new(None) };
+}
+
+/// A read begins on this thread: no replica has answered any of it yet.
+pub fn begin() {
+    REPLICA_ANSWERED.with(|held| held.borrow_mut().take());
+}
+
+/// A reader member's store: its hot layer over the primary, the primary, the
+/// read replica where one is set, and the position it has applied to.
 pub struct ReaderStore {
     hot: Arc<HotStore>,
     primary: Arc<dyn Store>,
     replica: Option<Arc<dyn Store>>,
+    applied: Applied,
 }
 
 impl ReaderStore {
-    /// `hot` is the hot layer over `primary`; `replica`, the read replica.
+    /// `hot` is the hot layer over `primary`; `replica`, the read replica;
+    /// `applied`, the member's applied position.
     pub fn new(
         hot: Arc<HotStore>,
         primary: Arc<dyn Store>,
         replica: Option<Arc<dyn Store>>,
+        applied: Applied,
     ) -> Arc<Self> {
         Arc::new(Self {
             hot,
             primary,
             replica,
+            applied,
         })
     }
 
@@ -62,30 +88,36 @@ impl ReaderStore {
     }
 
     /// Where a read of the record's past is answered: the read replica, where
-    /// set and at or past the read's `read_after`; the primary otherwise.
+    /// set and at or past the read's `read_after`, its heads kept for the
+    /// read's watermark; the primary otherwise.
     fn past(&self) -> &dyn Store {
-        match &self.replica {
-            Some(replica) if !answering_from_primary() && reached(replica.as_ref()) => {
+        let Some(replica) = self.replica.as_ref().filter(|_| !answering_from_primary()) else {
+            return self.primary.as_ref();
+        };
+        match replica.heads() {
+            Ok(heads) if reached(&heads) => {
+                REPLICA_ANSWERED.with(|held| {
+                    held.borrow_mut().get_or_insert(heads);
+                });
                 replica.as_ref()
             }
-            _ => self.primary.as_ref(),
+            Ok(_) => self.primary.as_ref(),
+            Err(failed) => {
+                tracing::warn!(%failed, "the read replica could not be read; the primary answers");
+                self.primary.as_ref()
+            }
         }
     }
 }
 
-/// Whether the replica has reached the read's `read_after`: always, for a
-/// read naming none.
-fn reached(replica: &dyn Store) -> bool {
+/// Whether the replica, at `heads`, has reached the read's `read_after`:
+/// always, for a read naming none.
+fn reached(heads: &BTreeMap<String, u64>) -> bool {
     let Some(asked) = answering_after() else {
         return true;
     };
-    match replica.heads() {
-        Ok(heads) => behind(&asked, &heads.into_iter().collect::<HashMap<_, _>>()).is_empty(),
-        Err(failed) => {
-            tracing::warn!(%failed, "the read replica could not be read; the primary answers");
-            false
-        }
-    }
+    let heads: HashMap<String, u64> = heads.iter().map(|(p, s)| (p.clone(), *s)).collect();
+    behind(&asked, &heads).is_empty()
 }
 
 /// Whether a read is of now -- the latest in force, recorded by now -- which
@@ -154,8 +186,23 @@ impl Store for ReaderStore {
         }
     }
 
+    /// The position a read was answered at, which its reply's watermark
+    /// says: the primary's past the read's wait; otherwise what this member
+    /// has applied, lowered to a read replica's where one answered part of
+    /// the read.
     fn heads(&self) -> Result<BTreeMap<String, u64>> {
-        self.now().heads()
+        if answering_from_primary() {
+            return self.primary.heads();
+        }
+        let mut at = (self.applied)();
+        REPLICA_ANSWERED.with(|held| {
+            if let Some(replica) = held.borrow().as_ref() {
+                for (partition, sequence) in at.iter_mut() {
+                    *sequence = (*sequence).min(replica.get(partition).copied().unwrap_or(0));
+                }
+            }
+        });
+        Ok(at)
     }
 
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {

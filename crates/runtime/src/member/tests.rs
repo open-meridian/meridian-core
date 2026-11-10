@@ -151,13 +151,9 @@ async fn a_reader_applies_each_change_in_order_from_the_heads_it_started_at() {
     }
     let member = Member::reader_of("bor", "book", Duration::from_secs(5));
     assert!(member.is_reader());
-    let followed = member
-        .read(
-            &bus,
-            [("P0".to_string(), 2)].into(),
-            applied.clone(),
-            Arc::new(Primary),
-        )
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(Primary))
         .unwrap();
     until("the reader's interest", || {
         meridian_changes::followed(&bus, "book")

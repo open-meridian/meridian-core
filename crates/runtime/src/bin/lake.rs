@@ -181,20 +181,23 @@ fn run() -> Result<(), String> {
             // Where it starts following from: the primary's heads before its
             // hot layer holds anything.
             let start = tokio::task::block_in_place(|| record.heads())
-                .map_err(|failed| format!("the lake's heads could not be read: {failed}"))?
-                .into_iter()
-                .collect();
+                .map_err(|failed| format!("the lake's heads could not be read: {failed}"))?;
+            let followed = meridian_runtime::member::Followed::from_heads(start);
+            // Its replies' watermarks: what it has applied, for an answer
+            // from its hot layer (spec section 5).
+            let applied = Arc::clone(&followed);
             let reading = meridian_lake::reader::ReaderStore::new(
                 Arc::clone(&hot),
                 Arc::clone(&record),
                 replica,
+                Arc::new(move || applied.heads().into_iter().collect()),
             );
             let lake = meridian_lake::service::serve(bus.clone(), reading, clock());
             lake.build_at_most(answers_at_once);
             let primary = Arc::clone(&record);
             member.read(
                 &bus,
-                start,
+                followed,
                 Arc::new(LakeFollows(Arc::clone(&hot))),
                 Arc::new(meridian_bus::read_after::AllHeads(move || {
                     primary.heads().map_err(|failed| failed.to_string())
