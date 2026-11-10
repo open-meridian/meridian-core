@@ -415,7 +415,7 @@ message ComponentReport {
   uint64 reserved_bytes = 16;
   // Requests it refused for load since it started, by reason
   // (REFUSAL_REASON_OVERLOADED, REFUSAL_REASON_RATE_LIMITED), each a count.
-  map<string, uint64> refusals = 17;
+  repeated RefusalCount refusals = 17;
   // Requests it cancelled above its shed line since it started.
   uint64 sheds = 18;
   // How many times it has restarted, the last restart's reason (as the
@@ -424,6 +424,13 @@ message ComponentReport {
   uint32 restarts = 19;
   string last_restart_reason = 20;
   int64 last_restart_at_ns = 21;
+}
+
+// One reason a member refused requests for load, and how many since it
+// started (W6.40; stage M): the reason a RefusalReason's name.
+message RefusalCount {
+  string reason = 1;
+  uint64 count = 2;
 }
 
 message ReportDeploymentComponentsRequest {

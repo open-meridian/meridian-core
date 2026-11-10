@@ -31,7 +31,9 @@ impl Class {
     /// The class a request on `topic` is in: the book's commands are the
     /// order path's and the venue's facts (decisions/024).
     pub fn of_topic(topic: &str) -> Self {
-        if topic.starts_with("platform.book.command.") {
+        let mut parts = topic.split('.');
+        let (domain, kind) = (parts.nth(1), parts.next());
+        if domain == Some("book") && kind == Some("command") {
             Class::First
         } else {
             Class::Rest

@@ -6095,8 +6095,8 @@ pub struct ComponentReport {
     pub reserved_bytes: u64,
     /// Requests it refused for load since it started, by reason
     /// (REFUSAL_REASON_OVERLOADED, REFUSAL_REASON_RATE_LIMITED), each a count.
-    #[prost(map = "string, uint64", tag = "17")]
-    pub refusals: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
+    #[prost(message, repeated, tag = "17")]
+    pub refusals: ::prost::alloc::vec::Vec<RefusalCount>,
     /// Requests it cancelled above its shed line since it started.
     #[prost(uint64, tag = "18")]
     pub sheds: u64,
@@ -6109,6 +6109,15 @@ pub struct ComponentReport {
     pub last_restart_reason: ::prost::alloc::string::String,
     #[prost(int64, tag = "21")]
     pub last_restart_at_ns: i64,
+}
+/// One reason a member refused requests for load, and how many since it
+/// started (W6.40; stage M): the reason a RefusalReason's name.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefusalCount {
+    #[prost(string, tag = "1")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReportDeploymentComponentsRequest {

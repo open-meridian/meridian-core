@@ -441,14 +441,14 @@ pub fn member_report(
 pub fn health() -> meridian_domain::v1::ComponentReport {
     let said = meridian_budget::installed().map(meridian_budget::Process::accounting);
     let said = said.unwrap_or_default();
-    let mut refusals = std::collections::HashMap::new();
+    let mut refusals = Vec::new();
     if said.refused > 0 {
-        refusals.insert(
-            meridian_pb::v1::RefusalReason::Overloaded
+        refusals.push(meridian_domain::v1::RefusalCount {
+            reason: meridian_pb::v1::RefusalReason::Overloaded
                 .as_str_name()
                 .to_string(),
-            said.refused,
-        );
+            count: said.refused,
+        });
     }
     let (restarts, last_restart_at_ns) = restarts_counted();
     meridian_domain::v1::ComponentReport {

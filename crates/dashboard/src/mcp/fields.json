@@ -25737,6 +25737,33 @@
       "store": "conductor"
     },
     {
+      "name": "meridian.v1.ReadComponentHealthReply.members",
+      "type": "repeated message ComponentReport",
+      "empty": "never empty: the conductor reports itself",
+      "intent": "answers each member's latest health (W6.40; approved 2026-11-09)",
+      "meaning": "the latest report of each member the conductor holds: its memory against its budget and limit with its peak, what it reserved, its refusals for load by reason, its sheds, and its restarts with the last's reason and time",
+      "not_meaning": "a record, or a history: the dashboard's judge keeps 24 hours of it",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ReadComponentHealthReply.read_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the conductor read its members' reports (W6.40; approved 2026-11-09)",
+      "meaning": "by the conductor's clock",
+      "not_meaning": "when any member reported",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
       "name": "meridian.v1.ReadResilienceReply.members",
       "type": "repeated message ComponentReport",
       "empty": "never empty",
