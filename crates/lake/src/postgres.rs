@@ -287,6 +287,25 @@ fn amendments_of(
     rows.iter().map(amendment_of).collect()
 }
 
+/// Every closed-day re-check of these rows of one dataset, in order.
+fn amendments_at(
+    client: &mut impl GenericClient,
+    dataset: &str,
+    sequences: &[i64],
+) -> Result<Vec<ClosedDayAmendment>> {
+    if sequences.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query(
+            "SELECT dataset, sequence, closed_day, why, at_ns FROM lake_closed_day
+              WHERE dataset = $1 AND sequence = ANY($2) ORDER BY amendment_id",
+            &[&dataset, &sequences],
+        )
+        .map_err(unavailable)?;
+    rows.iter().map(amendment_of).collect()
+}
+
 /// The assessments of these rows (contract v28, W10.12), in the order
 /// journalled.
 fn assessments_of(
@@ -799,8 +818,8 @@ SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
                       AND a.state = 3 AND a.at_ns <= $3)";
 
 /// How many rows a read takes from the database at once, decoded and
-/// handed on before the next.
-const READ_CHUNK: i32 = 1_000;
+/// handed on before the next ([`crate::store::READ_CHUNK`]).
+const READ_CHUNK: i32 = crate::store::READ_CHUNK as i32;
 
 /// A read's rows, every version the read would load, in the order
 /// recorded: where every version is answered (`every_version`).
@@ -835,6 +854,44 @@ SELECT r.body FROM lake_row r
          ORDER BY dataset, row_key, COALESCE(published_at_ns, 0) DESC, version DESC) AS f
     ON r.dataset = f.dataset AND r.sequence = f.sequence
  ORDER BY r.dataset, r.sequence";
+
+/// [`IN_FORCE`] as published by a time (contract v27, W10.6): a rate's row
+/// keys each at its version in force among those published by `$11`, by
+/// `lake_row.published_at_ns` -- its published time, else when the lake
+/// recorded it, as [`crate::read::published_at`] reads it -- then by
+/// version, as [`crate::read::as_published`] chooses. Chosen by the
+/// database, the bodies read only of the rows in force (found 2026-11-09:
+/// every version in the read's window was read, decoded and held to
+/// choose them; Treasury's par curve keeps about 100,000 rows for its one
+/// subject).
+const IN_FORCE_PUBLISHED: &str = "
+SELECT r.body FROM lake_row r
+  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence
+          FROM lake_row
+         WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+           AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
+           AND ($5::bigint = 0 OR interval_ns = $5)
+           AND recorded_at_ns <= $6
+           AND ($7::text IS NULL OR business_date = $7::text::date)
+           AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+           AND published_at_ns <= $11
+         ORDER BY dataset, row_key, published_at_ns DESC, version DESC) AS f
+    ON r.dataset = f.dataset AND r.sequence = f.sequence
+ ORDER BY r.dataset, r.sequence";
+
+/// [`EVERY_VERSION`] a row key at a time, each key's versions together:
+/// what a read as published by a time chooses from where the published
+/// time is in the row's body alone (every data type but a rate), keeping
+/// one row a key as it reads ([`crate::read::ByPublished`]).
+const EVERY_VERSION_BY_KEY: &str = "
+SELECT body FROM lake_row
+ WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+   AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
+   AND ($5::bigint = 0 OR interval_ns = $5)
+   AND recorded_at_ns <= $6
+   AND ($7::text IS NULL OR business_date = $7::text::date)
+   AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+ ORDER BY dataset, row_key, version";
 
 impl Store for PostgresStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
@@ -986,6 +1043,9 @@ impl Store for PostgresStore {
             } else {
                 as_of(out, query.as_of_ns)
             };
+            if query.published_as_of_ns != 0 {
+                out = crate::read::as_published(out, query.published_as_of_ns);
+            }
             let assessments = assessments_of(&mut tx, &out)?;
             tx.commit().map_err(unavailable)?;
             as_flagged(&mut out, &amendments, query.as_of_ns);
@@ -1033,17 +1093,28 @@ impl Store for PostgresStore {
         // Every row the database answers is a row key's version in force,
         // or one of every version where every one is asked: none is chosen
         // here, so each is handed on as it is read.
+        // A read as published by a time: a rate's rows in force by then
+        // chosen by the database; any other's, whose published time only
+        // its body holds, chosen here a row key at a time as they are read.
+        let published = query.published_as_of_ns != 0;
+        let mut by_published = (published && query.data_type != DataType::Rate)
+            .then(|| crate::read::ByPublished::new(query.published_as_of_ns));
+        let cut_published = published && by_published.is_none();
         let sql = if latest && query.data_type == DataType::Rate {
             LATEST_BY_PUBLISHED.as_str()
         } else if latest {
             LATEST.as_str()
+        } else if cut_published {
+            IN_FORCE_PUBLISHED
+        } else if published {
+            EVERY_VERSION_BY_KEY
         } else if every_version {
             EVERY_VERSION
         } else {
             IN_FORCE
         };
         let code = query.data_type.code();
-        let params: [&(dyn postgres::types::ToSql + Sync); 10] = [
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
             &query.datasets,
             &query.subjects,
             &code,
@@ -1055,13 +1126,16 @@ impl Store for PostgresStore {
             &until,
             &at,
         ];
+        if cut_published {
+            params.push(&query.published_as_of_ns);
+        }
         let amendments = amendments_of(&mut tx, &query.datasets)?;
         // A chunk at a time from one portal, each chunk's assessments read
         // beside it, each row handed on as it is decoded: never the whole
         // result held, as the database sent it or decoded (found on dev
         // 2026-11-09: the lake OOMKilled at 1 GiB, twice, by a chain's
         // statistics read a page at a time, each page every version).
-        let portal = tx.bind(sql, &params).map_err(unavailable)?;
+        let portal = tx.bind(sql, &params[..]).map_err(unavailable)?;
         loop {
             let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
             if rows.is_empty() {
@@ -1076,11 +1150,21 @@ impl Store for PostgresStore {
             as_flagged(&mut chunk, &amendments, query.as_of_ns);
             as_assessed(&mut chunk, &assessments, query.as_of_ns);
             for row in chunk {
-                each(row)?;
+                match by_published.as_mut() {
+                    Some(choosing) => {
+                        if let Some(chosen) = choosing.admit(row) {
+                            each(chosen)?;
+                        }
+                    }
+                    None => each(row)?,
+                }
             }
         }
         drop(portal);
         tx.commit().map_err(unavailable)?;
+        if let Some(chosen) = by_published.and_then(crate::read::ByPublished::finish) {
+            each(chosen)?;
+        }
         Ok(())
     }
 
@@ -1582,9 +1666,50 @@ impl Store for PostgresStore {
         dataset: &str,
         data_type: crate::row::DataType,
         as_of_ns: i64,
+        published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
         let mut conn = self.conn()?;
+        if published_as_of_ns != 0 {
+            // Each row key's versions together, a chunk at a time, each
+            // key's version in force by the published-time cut kept as
+            // they are read: never every version held (found 2026-11-09).
+            let mut tx = conn
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .map_err(unavailable)?;
+            let code = data_type.code();
+            let portal = tx
+                .bind(
+                    "SELECT body FROM lake_row
+                      WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                      ORDER BY row_key, version",
+                    &[&dataset, &code, &cut_off],
+                )
+                .map_err(unavailable)?;
+            let mut choosing = crate::read::ByPublished::new(published_as_of_ns);
+            let mut out = Vec::new();
+            loop {
+                let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    let body: &[u8] = row.get(0);
+                    let row = Observation::decode(data_type, body).map_err(unreadable)?;
+                    out.extend(choosing.admit(row));
+                }
+            }
+            drop(portal);
+            out.extend(choosing.finish());
+            out.sort_by_key(|row| row.meta().sequence);
+            let assessments = assessments_of(&mut tx, &out)?;
+            tx.commit().map_err(unavailable)?;
+            as_assessed(&mut out, &assessments, as_of_ns);
+            return Ok(out);
+        }
         let rows = conn
             .query(
                 "SELECT body FROM lake_row
@@ -1628,7 +1753,13 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
-    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
+    fn dated_on(
+        &self,
+        dataset: &str,
+        dates: &[String],
+        after: u64,
+        most: usize,
+    ) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
         let mut tx = conn
             .build_transaction()
@@ -1636,23 +1767,35 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // By the key, from where the last chunk ended: each chunk an index
+        // range, never the dataset sorted again.
         let rows = tx
             .query(
                 "SELECT data_type, body FROM lake_row
-                  WHERE dataset = $1 AND business_date = ANY($2::text[]::date[])
-                  ORDER BY sequence",
-                &[&dataset, &dates],
+                  WHERE dataset = $1 AND sequence > $2
+                    AND business_date = ANY($3::text[]::date[])
+                  ORDER BY sequence
+                  LIMIT $4",
+                &[
+                    &dataset,
+                    &(after as i64),
+                    &dates,
+                    &i64::try_from(most).unwrap_or(i64::MAX),
+                ],
             )
             .map_err(unavailable)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let code: i16 = row.get(0);
-            let body: Vec<u8> = row.get(1);
+            let body: &[u8] = row.get(1);
             let data_type = crate::row::DataType::from_code(code)
                 .ok_or_else(|| StoreError::Unavailable(format!("data type {code} unknown")))?;
-            out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
+            out.push(Observation::decode(data_type, body).map_err(unreadable)?);
         }
-        let amendments = amendments_of(&mut tx, &[dataset.to_string()])?;
+        // The re-checks of these rows alone, never every one the dataset's
+        // rows have had.
+        let sequences: Vec<i64> = out.iter().map(|row| row.meta().sequence as i64).collect();
+        let amendments = amendments_at(&mut tx, dataset, &sequences)?;
         tx.commit().map_err(unavailable)?;
         as_flagged(&mut out, &amendments, 0);
         Ok(out)

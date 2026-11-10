@@ -255,6 +255,9 @@ impl Store for MemoryStore {
         } else {
             as_of(rows, query.as_of_ns)
         };
+        if query.published_as_of_ns != 0 {
+            out = crate::read::as_published(out, query.published_as_of_ns);
+        }
         as_flagged(&mut out, &held.amendments, query.as_of_ns);
         as_assessed(&mut out, &held.assessments, query.as_of_ns);
         Ok(out)
@@ -465,6 +468,7 @@ impl Store for MemoryStore {
         dataset: &str,
         data_type: crate::row::DataType,
         as_of_ns: i64,
+        published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let held = self.lock();
         let rows = held
@@ -473,7 +477,14 @@ impl Store for MemoryStore {
             .filter(|row| row.dataset() == dataset && row.data_type() == data_type)
             .cloned()
             .collect::<Vec<_>>();
-        let mut out = as_of(rows, as_of_ns);
+        let mut out = if published_as_of_ns != 0 {
+            crate::read::as_published(
+                crate::store::recorded_by(rows, as_of_ns),
+                published_as_of_ns,
+            )
+        } else {
+            as_of(rows, as_of_ns)
+        };
         as_assessed(&mut out, &held.assessments, as_of_ns);
         Ok(out)
     }
@@ -495,14 +506,26 @@ impl Store for MemoryStore {
         Ok(rows)
     }
 
-    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
+    fn dated_on(
+        &self,
+        dataset: &str,
+        dates: &[String],
+        after: u64,
+        most: usize,
+    ) -> Result<Vec<Observation>> {
         let held = self.lock();
         let mut rows: Vec<Observation> = held
             .rows
             .iter()
-            .filter(|row| row.dataset() == dataset && dates.contains(&row.meta().business_date))
+            .filter(|row| {
+                row.dataset() == dataset
+                    && row.meta().sequence > after
+                    && dates.contains(&row.meta().business_date)
+            })
             .cloned()
             .collect();
+        rows.sort_by_key(|row| row.meta().sequence);
+        rows.truncate(most);
         as_flagged(&mut rows, &held.amendments, 0);
         Ok(rows)
     }
