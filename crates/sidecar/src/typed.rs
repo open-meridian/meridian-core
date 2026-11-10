@@ -1573,6 +1573,9 @@ pub(crate) fn refused(failed: BusError) -> Status {
                     meridian_bus::RefusalStatus::PermissionDenied => Code::PermissionDenied,
                     meridian_bus::RefusalStatus::NotFound => Code::NotFound,
                     meridian_bus::RefusalStatus::FailedPrecondition => Code::FailedPrecondition,
+                    // Contract v30 (W4.4, ruled 2026-11-10): a read whose
+                    // read_after its store cannot reach, to be asked again.
+                    meridian_bus::RefusalStatus::Unavailable => Code::Unavailable,
                 },
                 words.to_string(),
                 RefusalReason::Unspecified,

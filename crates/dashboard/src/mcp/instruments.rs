@@ -1248,6 +1248,7 @@ pub(super) async fn ask<R: Message + Default>(
                     meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
                     meridian_bus::RefusalStatus::NotFound => "not_found",
                     meridian_bus::RefusalStatus::FailedPrecondition => "failed_precondition",
+                    meridian_bus::RefusalStatus::Unavailable => "unavailable",
                 }
                 .into(),
                 words.to_string(),

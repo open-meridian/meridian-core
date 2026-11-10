@@ -998,6 +998,7 @@ fn registry_refused(reason: &str) -> Response {
                 meridian_bus::RefusalStatus::NotFound => StatusCode::NOT_FOUND,
                 // Contract v29 (616): as the deployment stands, nothing moved.
                 meridian_bus::RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
+                meridian_bus::RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             },
             serde_json::json!({"error": words, "fields": fields}),
         ),

@@ -961,6 +961,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         crate::writer::DOMAIN,
         Arc::new(crate::writer::Log(Arc::clone(&store))),
     );
+    // Its reads held to their `read_after` by every partition's head in one
+    // look (contract v30, stage B), not one look a partition.
+    let heads = Arc::clone(&store);
+    bus.reads_after().keep(
+        crate::writer::DOMAIN,
+        Arc::new(meridian_bus::read_after::AllHeads(move || {
+            heads.heads().map_err(|failed| failed.to_string())
+        })),
+    );
     {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(RECORD_OPENING_BALANCE, move |envelope| {

@@ -5518,6 +5518,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     // The change log, asked a page at a time by the lake's own members and
     // the analytics component (step 3a; topics.md, "Component topics").
     meridian_changes::serve(&bus, "lake", Arc::new(LakeLog(Arc::clone(&lake.store))));
+    // Its reads held to their `read_after` by every dataset's head in one
+    // look (contract v30, stage B), not one look a dataset.
+    let heads = Arc::clone(&lake.store);
+    bus.reads_after().keep(
+        "lake",
+        Arc::new(meridian_bus::read_after::AllHeads(move || {
+            heads.heads().map_err(|failed| failed.to_string())
+        })),
+    );
     serve_on(
         &bus,
         &lake,

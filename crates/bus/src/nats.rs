@@ -45,6 +45,12 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 /// answer's shape and a refusal is not an answer of that shape.
 const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
+/// How long a request's caller waits for its answer, in milliseconds, carried
+/// beside the request as gRPC's own `grpc-timeout` is: relative, so no two
+/// clocks are compared. The answering side holds a read to its `read_after`
+/// no longer than its caller waits (contract v30, ruled 2026-11-10).
+const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
+
 /// How often a client asks its server to hand a message back to it, and how
 /// long it waits for it before moving to another server (step 3b): the
 /// servers' 2 s rule for a client, said from the client's side. A server
@@ -376,6 +382,12 @@ impl Backend for NatsBackend {
                     subject.clone(),
                     async_nats::Request::new()
                         .payload(question.into())
+                        .headers({
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers
+                                .insert(TIMEOUT_HEADER, timeout.as_millis().to_string().as_str());
+                            headers
+                        })
                         .timeout(Some(timeout)),
                 ),
             )
@@ -534,6 +546,15 @@ impl NatsBackend {
                     continue;
                 };
 
+                // When its caller stops waiting, from what it said as it
+                // asked, counted from now (contract v30, ruled 2026-11-10).
+                let deadline = message
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| headers.get(TIMEOUT_HEADER))
+                    .and_then(|said| said.to_string().parse::<u64>().ok())
+                    .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+
                 let asked = match Envelope::decode(message.payload) {
                     Ok(envelope) => envelope,
                     Err(failed) => {
@@ -555,7 +576,7 @@ impl NatsBackend {
                 // HANDLERS_AT_ONCE answering at once -- and its working memory
                 // reserved; or refused for load with a retry-after.
                 tokio::spawn(async move {
-                    let answered = crate::router::admitted(&topic, asked, handler).await;
+                    let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
 
                     let (payload_type, payload, refusal) = match answered {
                         Ok(Ok((payload_type, payload))) => (payload_type, payload, None),
@@ -707,7 +728,7 @@ mod bounded_tests {
                 payload: Vec::new(),
             };
             tasks.push(tokio::spawn(async move {
-                crate::router::admitted("platform.lake.query.list-quotes", asked, handler)
+                crate::router::admitted("platform.lake.query.list-quotes", asked, handler, None)
                     .await
                     .unwrap()
                     .unwrap()

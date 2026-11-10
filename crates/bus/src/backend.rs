@@ -159,6 +159,12 @@ pub enum RefusalStatus {
     /// deployment stands -- an install of a withdrawn pack, an update whose
     /// member's source registry is not taken -- naming what is missing.
     FailedPrecondition,
+    /// Contract v30 (W4.4; the resilience spec's section 5, ruled
+    /// 2026-11-10): a read whose `read_after` the store cannot reach -- its
+    /// writer still behind it at its bound, after a database failover that
+    /// lost acknowledged rows -- refused with no reason code, which the caller
+    /// may ask again.
+    Unavailable,
 }
 
 impl RefusalStatus {
@@ -168,6 +174,7 @@ impl RefusalStatus {
             RefusalStatus::PermissionDenied => "permission-denied",
             RefusalStatus::NotFound => "not-found",
             RefusalStatus::FailedPrecondition => "failed-precondition",
+            RefusalStatus::Unavailable => "unavailable",
         }
     }
 }
@@ -210,6 +217,7 @@ pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, 
         "permission-denied" => RefusalStatus::PermissionDenied,
         "not-found" => RefusalStatus::NotFound,
         "failed-precondition" => RefusalStatus::FailedPrecondition,
+        "unavailable" => RefusalStatus::Unavailable,
         _ => return None,
     };
     Some((status, fields, words))

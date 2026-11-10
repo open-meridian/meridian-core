@@ -139,6 +139,7 @@ pub(crate) async fn admitted(
     topic: &str,
     envelope: Envelope,
     handler: Handler,
+    deadline: Option<std::time::Instant>,
 ) -> std::result::Result<HandlerReply, tokio::task::JoinError> {
     let class = meridian_budget::Class::of_topic(topic);
     let caller = caller_of(envelope.meta.as_ref());
@@ -162,7 +163,11 @@ pub(crate) async fn admitted(
             Ok(Err(crate::backend::overloaded(&over)))
         }
         Ok(admitted) => {
-            tokio::task::spawn_blocking(move || admitted.within(|| handler(envelope))).await
+            tokio::task::spawn_blocking(move || {
+                admitted
+                    .within(|| crate::read_after::within_deadline(deadline, || handler(envelope)))
+            })
+            .await
         }
     }
 }
@@ -406,10 +411,10 @@ impl Bus {
         let reads = Arc::clone(&self.reads);
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
-            if let Some(asked) = envelope.meta.as_ref().and_then(|m| m.read_after.as_ref()) {
-                reads.hold(&topic, asked)?;
+            match envelope.meta.as_ref().and_then(|m| m.read_after.clone()) {
+                Some(asked) => reads.answer(&topic, &asked, || handler(envelope)),
+                None => handler(envelope),
             }
-            handler(envelope)
         })
     }
 
@@ -590,9 +595,14 @@ impl Bus {
         // gate: its callers are other processes, which the broker's path
         // admits (section 10a), and a question it asks itself while
         // answering one would otherwise wait on its own turn.
+        // Its deadline known to it, so a read held to its read_after waits no
+        // longer than its caller does (ruled 2026-11-10).
+        let deadline = std::time::Instant::now() + timeout;
         let joined = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || handler(envelope)),
+            tokio::task::spawn_blocking(move || {
+                crate::read_after::within_deadline(Some(deadline), || handler(envelope))
+            }),
         )
         .await;
 

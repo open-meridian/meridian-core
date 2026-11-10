@@ -1,24 +1,35 @@
 //! `MessageMeta.read_after` (contract v30, step 3c stage B; W4.4;
 //! spec/a-deployment-scales-out-and-fails-over-by-configuration section 5;
-//! approved 2026-11-09).
+//! approved 2026-11-09, the product owner's rulings of 2026-11-10).
 //!
 //! **Stamped by the sidecar, never by the plugin.** A plugin's sidecar keeps
 //! a [`Session`] on its bus: the highest sequence it has seen on each of a
-//! store's partitions, from the plugin's acknowledged writes and the
-//! deliveries it passed on. Every read it asks of that store names them as
-//! `read_after`, so read-your-writes and monotonic reads hold for the
-//! instance with no plugin-facing field: session consistency.
+//! store's partitions, from the plugin's acknowledged writes, the deliveries
+//! it passed on and the watermark each of its reads was answered at. Every
+//! read it asks of that store names them as `read_after`, so read-your-writes
+//! and monotonic reads hold for the instance with no plugin-facing field:
+//! session consistency.
 //!
 //! **Never answered from behind it.** A member serving a store's reads keeps
 //! its [`Position`] on its bus. A read naming a watermark the member's record
 //! has not reached waits for it, up to the member's bound (its
-//! `<store>.readyLagMs`), and is refused rather than answered from behind it
-//! where the bound passes. The waits are bounded in number too: a read past
-//! [`WAITING_MOST`] waiting at once is refused for load, with its
-//! retry-after, as every component's overload is (section 10a). A read naming
-//! nothing is answered at once, eventually consistent, its reply's watermark
-//! saying how current it is.
+//! `<store>.readyLagMs`) or the call's remaining deadline less [`MARGIN`],
+//! whichever is sooner, so the caller is told the answer or the refusal and
+//! never runs out its own deadline. Where the wait ends behind it:
+//!
+//! - a **reader** member answers from the store's primary database (its
+//!   primary's position kept by [`Reads::keep_primary`]), the handler told
+//!   so by [`answering_from_primary`] -- once the primary has reached it;
+//! - a **writer**, whose record is the primary, refuses UNAVAILABLE with no
+//!   reason code: it can be behind only after a database failover that lost
+//!   acknowledged rows, and the caller may ask again.
+//!
+//! The waits are bounded in number too: a read past [`WAITING_MOST`] waiting
+//! at once is refused for load, with its retry-after, as every component's
+//! overload is (section 10a). A read naming nothing is answered at once,
+//! eventually consistent, its reply's watermark saying how current it is.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,6 +43,23 @@ pub trait Position: Send + Sync {
     /// The head of each of `partitions` in this member's record; a partition
     /// it does not hold is absent.
     fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String>;
+}
+
+/// A position read whole -- every partition's head in one look, as a store's
+/// own `heads` answers -- and narrowed to the partitions asked.
+pub struct AllHeads<F>(pub F);
+
+impl<F> Position for AllHeads<F>
+where
+    F: Fn() -> Result<std::collections::BTreeMap<String, u64>, String> + Send + Sync,
+{
+    fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String> {
+        let all = (self.0)()?;
+        Ok(partitions
+            .iter()
+            .filter_map(|partition| all.get(partition).map(|head| (partition.clone(), *head)))
+            .collect())
+    }
 }
 
 /// A sidecar's session: what it has seen for its instance, and what each of
@@ -58,9 +86,73 @@ pub const BOUND_DEFAULT: Duration = Duration::from_millis(5_000);
 /// and the rest keep being answered. One more is refused for load.
 pub const WAITING_MOST: usize = meridian_budget::HANDLERS_AT_ONCE / 2;
 
+/// How long a head this member's record was seen at answers for it without
+/// a look at the record again: a record only moves forward, but after a
+/// database failover that lost acknowledged rows it moved back, and a read
+/// past what it holds then is refused within this long.
+const LOOKED_FOR: Duration = Duration::from_secs(1);
+
 /// How often a waiting read looks at its member's position again: at first
 /// soon, then less often, never less often than this.
 const LOOK_MOST: Duration = Duration::from_millis(100);
+
+/// What a read's wait leaves of the call's deadline (ruled 2026-11-10): one
+/// second, for a reader's answer from the primary and the answer's way back
+/// to the caller. At the default 5 s bound and 5 s call timeout a read waits
+/// at most 4 s, so its caller hears the answer or the refusal, never
+/// DEADLINE_EXCEEDED.
+pub const MARGIN: Duration = Duration::from_secs(1);
+
+thread_local! {
+    /// When the call being answered on this thread stops being waited for:
+    /// set from its timeout as it arrives, before its turn at the gate.
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+
+    /// The read being answered on this thread: the watermark it named, and
+    /// whether it is answered from the store's primary database.
+    static ANSWERING: RefCell<Option<(Watermark, bool)>> = const { RefCell::new(None) };
+}
+
+/// Run `answer` with the call's deadline known to it, the deadline being
+/// when its caller stops waiting.
+pub fn within_deadline<R>(deadline: Option<Instant>, answer: impl FnOnce() -> R) -> R {
+    let before = DEADLINE.with(|held| held.replace(deadline));
+    let answered = answer();
+    DEADLINE.with(|held| held.set(before));
+    answered
+}
+
+/// The deadline of the call this thread answers, where its caller said one.
+pub fn deadline() -> Option<Instant> {
+    DEADLINE.with(Cell::get)
+}
+
+/// The `read_after` of the read this thread answers, where it named one.
+pub fn answering_after() -> Option<Watermark> {
+    ANSWERING.with(|held| held.borrow().as_ref().map(|(asked, _)| asked.clone()))
+}
+
+/// Whether the read this thread answers is answered from the store's primary
+/// database: a reader member behind its `read_after` past its wait.
+pub fn answering_from_primary() -> bool {
+    ANSWERING.with(|held| held.borrow().as_ref().is_some_and(|(_, primary)| *primary))
+}
+
+fn answering<R>(asked: &Watermark, from_primary: bool, answer: impl FnOnce() -> R) -> R {
+    let before = ANSWERING.with(|held| held.replace(Some((asked.clone(), from_primary))));
+    let answered = answer();
+    ANSWERING.with(|held| *held.borrow_mut() = before);
+    answered
+}
+
+/// Where a read held to its `read_after` is answered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// This member's own record, at or past it.
+    Here,
+    /// The store's primary database: a reader still behind it.
+    FromPrimary,
+}
 
 /// The store a topic belongs to: `platform.<domain>.…`.
 pub fn domain_of(topic: &str) -> Option<&str> {
@@ -114,14 +206,25 @@ pub fn behind(asked: &Watermark, heads: &HashMap<String, u64>) -> Vec<(String, u
         .collect()
 }
 
+/// The heads a store's record was seen at, per partition, and when.
+type Looked = HashMap<String, (u64, Instant)>;
+
 /// A bus's part in `read_after`: the positions of the stores it serves the
 /// reads of, the bound they wait up to, and the sidecar's session where it
 /// is one.
 pub struct Reads {
     positions: RwLock<HashMap<String, Arc<dyn Position>>>,
+    /// A reader member's store's primary database, per store: where a read
+    /// still behind its `read_after` at the end of its wait is answered.
+    primaries: RwLock<HashMap<String, Arc<dyn Position>>>,
     /// What this process has itself committed, per store and partition: a
     /// read naming no more than these is answered with no look at the record.
     committed: Mutex<HashMap<String, HashMap<String, u64>>>,
+    /// The heads its record was last seen at, per store and partition, and
+    /// when: a read naming no more is answered with no look for
+    /// [`LOOKED_FOR`], so reads that keep naming a session's watermark cost
+    /// the record one look a second, not one each.
+    looked: Mutex<HashMap<String, Looked>>,
     bound_ms: AtomicU64,
     waiting: AtomicUsize,
     session: RwLock<Option<Arc<dyn Session>>>,
@@ -131,7 +234,9 @@ impl Default for Reads {
     fn default() -> Self {
         Self {
             positions: RwLock::new(HashMap::new()),
+            primaries: RwLock::new(HashMap::new()),
             committed: Mutex::new(HashMap::new()),
+            looked: Mutex::new(HashMap::new()),
             bound_ms: AtomicU64::new(BOUND_DEFAULT.as_millis() as u64),
             waiting: AtomicUsize::new(0),
             session: RwLock::new(None),
@@ -147,6 +252,16 @@ impl Reads {
             .write()
             .expect("positions poisoned")
             .insert(domain.to_string(), position);
+    }
+
+    /// A reader member's store's primary database, `primary` its position:
+    /// a read of `domain` still behind its `read_after` when its wait ends is
+    /// answered from it, where it has reached it.
+    pub fn keep_primary(&self, domain: &str, primary: Arc<dyn Position>) {
+        self.primaries
+            .write()
+            .expect("primaries poisoned")
+            .insert(domain.to_string(), primary);
     }
 
     /// The member's bound: how long a read waits for its `read_after`.
@@ -177,18 +292,21 @@ impl Reads {
     }
 
     /// Hold a read of `topic` naming `asked` until the member's record has
-    /// reached it: at once where it has, waiting up to the bound where not,
-    /// and refused where the bound passes or too many already wait. Never
-    /// answered from behind it. A blocking wait, on the handler's thread.
-    pub fn hold(&self, topic: &str, asked: &Watermark) -> Result<(), String> {
+    /// reached it: at once where it has, waiting where not -- up to the
+    /// bound or the call's remaining deadline less [`MARGIN`], whichever is
+    /// sooner -- and then answered from the primary by a reader, or refused
+    /// UNAVAILABLE by a writer; refused for load where too many already wait.
+    /// Never answered from behind it. A blocking wait, on the handler's
+    /// thread.
+    pub fn hold(&self, topic: &str, asked: &Watermark) -> Result<Held, String> {
         if asked.partitions.is_empty() {
-            return Ok(());
+            return Ok(Held::Here);
         }
         let Some(domain) = domain_of(topic) else {
-            return Ok(());
+            return Ok(Held::Here);
         };
-        if self.reached_by_own_commits(domain, asked) {
-            return Ok(());
+        if self.reached_by_own_commits(domain, asked) || self.reached_lately(domain, asked) {
+            return Ok(Held::Here);
         }
         let position = self
             .positions
@@ -199,7 +317,7 @@ impl Reads {
         // A process that keeps no position of the store answers nothing
         // of it but what it serves itself, which is never a store's record.
         let Some(position) = position else {
-            return Ok(());
+            return Ok(Held::Here);
         };
         let partitions: Vec<String> = asked
             .partitions
@@ -208,51 +326,137 @@ impl Reads {
             .collect();
         let look = |position: &Arc<dyn Position>| -> Result<Vec<(String, u64, u64)>, String> {
             let heads = position.heads(&partitions)?;
+            self.saw_heads(domain, &heads);
             Ok(behind(asked, &heads))
         };
         let mut still = look(&position)?;
         if still.is_empty() {
-            return Ok(());
+            return Ok(Held::Here);
         }
-        // Behind: wait, if there is room to.
-        let waiting = self.waiting.fetch_add(1, Ordering::AcqRel) + 1;
-        let _left = Leave(&self.waiting);
+        // Behind: wait the bound, or what the call's deadline leaves less
+        // the margin, whichever is sooner (ruled 2026-11-10).
         let bound = self.bound();
-        if waiting > WAITING_MOST {
-            return Err(crate::backend::overloaded(&meridian_budget::Overloaded {
-                retry_after_seconds: bound.as_secs().clamp(1, 30) as u32,
-                words: format!(
-                    "overloaded: {topic} waits behind its read_after, and {WAITING_MOST} reads already wait"
-                ),
-            }));
+        let wait = match deadline() {
+            Some(deadline) => bound.min(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(MARGIN),
+            ),
+            None => bound,
+        };
+        if !wait.is_zero() {
+            let waiting = self.waiting.fetch_add(1, Ordering::AcqRel) + 1;
+            let _left = Leave(&self.waiting);
+            if waiting > WAITING_MOST {
+                return Err(crate::backend::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: bound.as_secs().clamp(1, 30) as u32,
+                    words: format!(
+                        "overloaded: {topic} waits behind its read_after, and {WAITING_MOST} reads already wait"
+                    ),
+                }));
+            }
+            let started = Instant::now();
+            let mut every = Duration::from_millis(5);
+            loop {
+                let left = wait.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(every.min(left));
+                every = (every * 2).min(LOOK_MOST);
+                still = look(&position)?;
+                if still.is_empty() {
+                    return Ok(Held::Here);
+                }
+            }
         }
-        let started = Instant::now();
-        let mut every = Duration::from_millis(5);
-        loop {
-            let left = bound.saturating_sub(started.elapsed());
-            if left.is_zero() {
-                let (partition, wanted, at) = still[0].clone();
+        self.past_the_wait(topic, domain, asked, &partitions, &still, wait)
+    }
+
+    /// The wait ended with the member still behind: a reader's read answered
+    /// from the store's primary database where it has reached the watermark;
+    /// otherwise refused UNAVAILABLE, with no reason code.
+    fn past_the_wait(
+        &self,
+        topic: &str,
+        domain: &str,
+        asked: &Watermark,
+        partitions: &[String],
+        still: &[(String, u64, u64)],
+        waited: Duration,
+    ) -> Result<Held, String> {
+        let (partition, wanted, at) = still[0].clone();
+        let primary = self
+            .primaries
+            .read()
+            .expect("primaries poisoned")
+            .get(domain)
+            .cloned();
+        if let Some(primary) = primary {
+            let heads = primary.heads(partitions)?;
+            if behind(asked, &heads).is_empty() {
                 tracing::info!(
                     topic,
                     partition,
                     wanted,
                     at,
-                    bound_ms = bound.as_millis() as u64,
-                    "a read refused: this member is behind its read_after past its bound"
+                    waited_ms = waited.as_millis() as u64,
+                    "a reader behind its read_after past its wait: answered from the primary"
                 );
-                return Err(format!(
-                    "behind read_after: partition {partition} is at {at} here, the read names {wanted}; \
-                     not answered from behind it (waited {} ms)",
-                    bound.as_millis()
-                ));
-            }
-            std::thread::sleep(every.min(left));
-            every = (every * 2).min(LOOK_MOST);
-            still = look(&position)?;
-            if still.is_empty() {
-                return Ok(());
+                return Ok(Held::FromPrimary);
             }
         }
+        tracing::info!(
+            topic,
+            partition,
+            wanted,
+            at,
+            waited_ms = waited.as_millis() as u64,
+            "a read refused: the store has not reached its read_after"
+        );
+        Err(crate::backend::refusal_with_status(
+            crate::backend::RefusalStatus::Unavailable,
+            &[],
+            format!(
+                "behind read_after: partition {partition} is at {at} here, the read names {wanted}; \
+                 not answered from behind it (waited {} ms); ask again",
+                waited.as_millis()
+            ),
+        ))
+    }
+
+    /// Answer `handler`'s read of `topic` held to `asked`: what [`Bus::serve`]
+    /// wraps each store's read in.
+    ///
+    /// [`Bus::serve`]: crate::Bus::serve
+    pub fn answer<R>(
+        &self,
+        topic: &str,
+        asked: &Watermark,
+        handler: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        let held = self.hold(topic, asked)?;
+        answering(asked, held == Held::FromPrimary, handler)
+    }
+
+    fn saw_heads(&self, domain: &str, heads: &HashMap<String, u64>) {
+        let now = Instant::now();
+        let mut looked = self.looked.lock().expect("looked poisoned");
+        let held = looked.entry(domain.to_string()).or_default();
+        for (partition, head) in heads {
+            held.insert(partition.clone(), (*head, now));
+        }
+    }
+
+    fn reached_lately(&self, domain: &str, asked: &Watermark) -> bool {
+        let looked = self.looked.lock().expect("looked poisoned");
+        let Some(held) = looked.get(domain) else {
+            return false;
+        };
+        asked.partitions.iter().all(|wanted| {
+            held.get(&wanted.partition)
+                .is_some_and(|(head, at)| *head >= wanted.sequence && at.elapsed() < LOOKED_FOR)
+        })
     }
 
     fn reached_by_own_commits(&self, domain: &str, asked: &Watermark) -> bool {
@@ -381,6 +585,13 @@ mod tests {
             .unwrap_err();
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(refused.contains("behind read_after"), "{refused}");
+        // A writer behind its read_after refuses UNAVAILABLE, no reason code
+        // (ruled 2026-11-10).
+        assert_eq!(
+            crate::backend::read_refusal_status(&refused).map(|(status, _, _)| status),
+            Some(crate::backend::RefusalStatus::Unavailable)
+        );
+        assert_eq!(crate::backend::read_refusal(&refused), None);
         // A partition the member does not hold is behind any sequence.
         let refused = reads
             .hold("platform.book.query.list-positions", &mark("P9", 1))
@@ -437,6 +648,122 @@ mod tests {
             );
         }
         assert_eq!(reads.waiting.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_reader_behind_past_its_wait_answers_from_the_primary() {
+        let reads = Reads::default();
+        reads.keep(
+            "lake",
+            Arc::new(Lagging(Mutex::new([("fx".to_string(), 3)].into()))),
+        );
+        reads.keep_primary(
+            "lake",
+            Arc::new(Lagging(Mutex::new([("fx".to_string(), 9)].into()))),
+        );
+        reads.set_bound(Duration::from_millis(150));
+        let started = Instant::now();
+        let from_primary = reads
+            .answer("platform.lake.query.list-quotes", &mark("fx", 7), || {
+                Ok((answering_from_primary(), answering_after()))
+            })
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(from_primary, (true, Some(mark("fx", 7))));
+        // Told only while it answers.
+        assert!(!answering_from_primary());
+        // A read it has reached is its own, from memory.
+        let here = reads
+            .answer("platform.lake.query.list-quotes", &mark("fx", 3), || {
+                Ok(answering_from_primary())
+            })
+            .unwrap();
+        assert!(!here);
+    }
+
+    #[test]
+    fn a_reader_whose_primary_is_behind_too_refuses_unavailable() {
+        let reads = Reads::default();
+        reads.keep("lake", Arc::new(Lagging(Mutex::new(HashMap::new()))));
+        reads.keep_primary(
+            "lake",
+            Arc::new(Lagging(Mutex::new([("fx".to_string(), 4)].into()))),
+        );
+        reads.set_bound(Duration::from_millis(50));
+        let refused = reads
+            .answer("platform.lake.query.list-quotes", &mark("fx", 5), || {
+                Ok::<_, String>(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            crate::backend::read_refusal_status(&refused).map(|(status, _, _)| status),
+            Some(crate::backend::RefusalStatus::Unavailable)
+        );
+    }
+
+    #[test]
+    fn the_wait_ends_at_the_calls_deadline_less_the_margin_when_that_is_sooner() {
+        let reads = Reads::default();
+        reads.keep(
+            "book",
+            Arc::new(Lagging(Mutex::new([("P0".to_string(), 1)].into()))),
+        );
+        reads.set_bound(Duration::from_secs(5));
+        // The caller waits 1.3 s in all: the read waits 0.3 s, not 5.
+        let deadline = Instant::now() + MARGIN + Duration::from_millis(300);
+        let started = Instant::now();
+        let refused = within_deadline(Some(deadline), || {
+            reads.hold("platform.book.query.list-positions", &mark("P0", 2))
+        });
+        let took = started.elapsed();
+        assert!(refused.is_err());
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(900),
+            "{took:?}"
+        );
+        // A deadline already inside the margin waits not at all.
+        let started = Instant::now();
+        let refused = within_deadline(Some(Instant::now() + MARGIN / 2), || {
+            reads.hold("platform.book.query.list-positions", &mark("P0", 2))
+        });
+        assert!(refused.is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(deadline_now_unset(), None);
+    }
+
+    fn deadline_now_unset() -> Option<Instant> {
+        deadline()
+    }
+
+    #[test]
+    fn a_head_seen_answers_for_a_second_and_a_whole_position_is_narrowed() {
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&looks);
+        let reads = Reads::default();
+        reads.keep(
+            "lake",
+            Arc::new(AllHeads(move || {
+                counting.fetch_add(1, Ordering::Relaxed);
+                Ok([("fx".to_string(), 9), ("rates".to_string(), 4)].into())
+            })),
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                reads.hold("platform.lake.query.list-quotes", &mark("fx", 8)),
+                Ok(Held::Here)
+            );
+        }
+        assert_eq!(looks.load(Ordering::Relaxed), 1, "one look a second");
+        // Past what was seen: looked at again.
+        reads.set_bound(Duration::from_millis(20));
+        assert!(reads
+            .hold("platform.lake.query.list-quotes", &mark("fx", 10))
+            .is_err());
+        assert!(looks.load(Ordering::Relaxed) > 1);
+        let narrowed = AllHeads(|| Ok([("fx".to_string(), 9)].into()))
+            .heads(&["fx".to_string(), "absent".to_string()])
+            .unwrap();
+        assert_eq!(narrowed, [("fx".to_string(), 9)].into());
     }
 
     #[test]
