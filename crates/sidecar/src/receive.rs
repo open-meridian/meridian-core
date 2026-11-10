@@ -569,6 +569,11 @@ async fn deliver(
     let mut key = None;
     let said = crate::lake::said(&envelope.payload_type, &envelope.payload);
     let lake_row = said.is_some();
+    // Where a lake row sits in its dataset, for `read_after` (contract v30).
+    let lake_at = said
+        .as_ref()
+        .filter(|said| !said.is_want && said.sequence > 0)
+        .map(|said| (said.dataset.clone(), said.sequence));
     if let Some(said) = said {
         if said.is_want {
             if !by_stream || meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
@@ -683,6 +688,19 @@ async fn deliver(
                 waiting.lose(Some(1), Some(row.name));
                 return;
             }
+        }
+    }
+    // Passed on: the session's `read_after` counts it, so the plugin's next
+    // read of the store is never answered from behind it (contract v30,
+    // stage B; approved 2026-11-09).
+    if let Some(session) = configuration.bus().reads_after().session() {
+        let at = lake_at.or_else(|| {
+            read.journal
+                .as_ref()
+                .map(|journal| (journal.partition.clone(), journal.sequence))
+        });
+        if let Some((partition, sequence)) = at {
+            session.delivered(row.topic, &partition, sequence);
         }
     }
     let meta = envelope.meta.unwrap_or_default();

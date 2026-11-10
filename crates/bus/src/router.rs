@@ -27,7 +27,7 @@ pub use crate::backend::HandlerReply;
 /// What a sidecar stamps on a question it asks for its plugin, and a core
 /// component never does (decisions/014): the person it is asked for, and the
 /// plugin's read scope.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stamp {
     /// The person a command is sent for; empty when the plugin acts as itself.
     pub acting_for_subject: String,
@@ -97,6 +97,12 @@ pub struct Stamp {
     /// store reads it only from the analytics component; empty everywhere
     /// else.
     pub on_behalf_of_instance_id: String,
+
+    /// The watermark a read must not be answered behind (contract v30, W4.4):
+    /// stamped by the sidecar's session on its plugin's reads (see
+    /// [`crate::read_after`]), never by a plugin. `None` reads from the
+    /// nearest member, eventually consistent.
+    pub read_after: Option<meridian_pb::v1::Watermark>,
 }
 
 /// Who a request is asked by, for its component's fair shares (the
@@ -182,6 +188,10 @@ pub struct Bus {
     /// (ruling 798): a sidecar's front door names the calls its plugin made
     /// while a page was being answered.
     observer: RwLock<Option<CallObserver>>,
+
+    /// `read_after` (contract v30, stage B): the positions of the stores this
+    /// process serves the reads of, and a sidecar's session.
+    reads: Arc<crate::read_after::Reads>,
 }
 
 /// What [`Bus::observe_calls`] is told of each call: its topic, when it was
@@ -264,6 +274,7 @@ impl Bus {
             default_timeout: Duration::from_secs(5),
             clock,
             observer: RwLock::new(None),
+            reads: Arc::default(),
         }
     }
 
@@ -365,7 +376,7 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
-        let handler: Handler = Arc::new(handler);
+        let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -379,6 +390,29 @@ impl Bus {
             .serve(topic, &self.instance_id, handler);
     }
 
+    /// This process's part in `read_after` (contract v30, stage B): a store's
+    /// member keeps its position here, a sidecar its session.
+    pub fn reads_after(&self) -> &Arc<crate::read_after::Reads> {
+        &self.reads
+    }
+
+    /// A store's read held to its `read_after` (W4.4): never answered from
+    /// behind the watermark it names, whichever member answers it. Every
+    /// other topic's handler as it was.
+    fn held_to_read_after(&self, topic: &str, handler: Handler) -> Handler {
+        if !crate::read_after::is_read(topic) {
+            return handler;
+        }
+        let reads = Arc::clone(&self.reads);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            if let Some(asked) = envelope.meta.as_ref().and_then(|m| m.read_after.as_ref()) {
+                reads.hold(&topic, asked)?;
+            }
+            handler(envelope)
+        })
+    }
+
     /// Register a handler, and signal once each answer has been delivered.
     ///
     /// For the one component that replies and then stops: first run applies a
@@ -390,7 +424,7 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
-        let handler: Handler = Arc::new(handler);
+        let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -468,9 +502,31 @@ impl Bus {
         stamp: &Stamp,
     ) -> crate::Result<(String, Vec<u8>)> {
         let started = std::time::Instant::now();
+        // A sidecar's session (contract v30, stage B): each read of a store
+        // names the highest it has seen of that store for its instance, and
+        // each answer is seen.
+        let session = self.reads.session();
+        let stamped;
+        let mut stamp = stamp;
+        if let Some(session) = &session {
+            if stamp.read_after.is_none() && crate::read_after::is_read(topic) {
+                if let Some(seen) = crate::read_after::domain_of(topic)
+                    .and_then(|domain| session.read_after(domain))
+                {
+                    stamped = Stamp {
+                        read_after: Some(seen),
+                        ..stamp.clone()
+                    };
+                    stamp = &stamped;
+                }
+            }
+        }
         let answered = self
             .asked(topic, payload_type, payload, correlation_id, timeout, stamp)
             .await;
+        if let (Some(session), Ok((reply_type, reply))) = (&session, &answered) {
+            session.answered(topic, reply_type, reply);
+        }
         let took = started.elapsed();
         let _ = TIMED.try_with(|calls| {
             calls.lock().expect("timed calls poisoned").push(TimedCall {
@@ -601,9 +657,9 @@ impl Bus {
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),
             account_scope_applies: stamp.account_scope.is_some(),
-            // Contract v30's read_after (W4.4): set from a plugin's read by
-            // core's stage B (step 3c); unset reads from the nearest member.
-            read_after: None,
+            // Contract v30's read_after (W4.4): a sidecar's session stamps
+            // its plugin's reads (stage B); unset reads from the nearest member.
+            read_after: stamp.read_after.clone(),
         }
     }
 }
@@ -915,6 +971,7 @@ mod tests {
             default_timeout: Duration::from_secs(5),
             clock: Arc::new(ManualClock::at(NOW)),
             observer: RwLock::new(None),
+            reads: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

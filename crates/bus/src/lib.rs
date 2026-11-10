@@ -21,6 +21,7 @@
 //! bus as messages. Plugins make calls through their sidecar and never serve
 //! them, so nothing outside this process needs a way to answer one.
 
+pub mod read_after;
 pub mod topic;
 
 mod backend;

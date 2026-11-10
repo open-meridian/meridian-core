@@ -274,6 +274,8 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         account_scope: None,
         // The analytics component's alone (W12.2); a sidecar never sets it.
         on_behalf_of_instance_id: String::new(),
+        // Named by the bus's session as the read is asked (contract v30).
+        read_after: None,
     }
 }
 

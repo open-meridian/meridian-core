@@ -138,6 +138,10 @@ pub(crate) struct Said {
     /// none: what a subscription's series and window are held to (contract
     /// v28, amended 2026-10-30).
     pub series: Vec<meridian_domain::v1::Identifier>,
+    /// Its place in its dataset's partition, as the lake recorded it (0
+    /// for a want, a withdrawal or a liveness): what the sidecar's
+    /// `read_after` counts as delivered (contract v30, stage B).
+    pub sequence: u64,
 }
 
 /// A row's series key as a key's last part (contract v28, ruling 561): a
@@ -179,13 +183,14 @@ pub(crate) fn meta_entry(payload_type: &str) -> Option<&'static str> {
     meridian_domain::lake::fields_of(data_type).first().copied()
 }
 
-fn meta_said(meta: Option<&ObservationMeta>) -> (String, Vec<String>, String) {
+fn meta_said(meta: Option<&ObservationMeta>) -> (String, Vec<String>, String, u64) {
     let meta = meta.cloned().unwrap_or_default();
     let source = meta.source.unwrap_or_default();
     (
         source.dataset,
         meta.subjects.into_iter().map(|s| s.entity_id).collect(),
         source.venue_id,
+        meta.sequence,
     )
 }
 
@@ -237,7 +242,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
     match payload_type {
         "meridian.v1.PricesRecordedEvent" => {
             let price = PricesRecordedEvent::decode(payload).ok()?.price?;
-            let (dataset, subjects, venue) = meta_said(price.meta.as_ref());
+            let (dataset, subjects, venue, sequence) = meta_said(price.meta.as_ref());
             let asset = meridian_domain::lake::asset_key(price.price.as_ref());
             let series = series_said(price.meta.as_ref());
             Some(Said {
@@ -249,13 +254,14 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(price.meta.as_ref()),
             })
         }
         "meridian.v1.BarsRecordedEvent" => {
             let bar = BarsRecordedEvent::decode(payload).ok()?.bar?;
             let from = bar.meta.as_ref().map_or(0, |m| m.valid_from_ns);
-            let (dataset, subjects, venue) = meta_said(bar.meta.as_ref());
+            let (dataset, subjects, venue, sequence) = meta_said(bar.meta.as_ref());
             let series = series_said(bar.meta.as_ref());
             Some(Said {
                 key: Some(format!(
@@ -265,17 +271,19 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(bar.meta.as_ref()),
             })
         }
         "meridian.v1.TradesRecordedEvent" => {
             let trade = TradesRecordedEvent::decode(payload).ok()?.trade?;
-            let (dataset, subjects, _) = meta_said(trade.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(trade.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(trade.meta.as_ref()),
             })
         }
@@ -286,12 +294,13 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
             let action = CorporateActionsRecordedEvent::decode(payload)
                 .ok()?
                 .action?;
-            let (dataset, subjects, _) = meta_said(action.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(action.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: Vec::new(),
             })
         }
@@ -299,12 +308,13 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         // the subjects a receive names, its filer's or another's.
         "meridian.v1.FilingsRecordedEvent" => {
             let filing = FilingsRecordedEvent::decode(payload).ok()?.filing?;
-            let (dataset, subjects, _) = meta_said(filing.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(filing.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: Vec::new(),
             })
         }
@@ -312,30 +322,32 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         // the pools and classes a receive names.
         "meridian.v1.FactorsRecordedEvent" => {
             let factor = FactorsRecordedEvent::decode(payload).ok()?.factor?;
-            let (dataset, subjects, _) = meta_said(factor.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(factor.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: Vec::new(),
             })
         }
         // Every version of an outcome, never conflated (contract v23).
         "meridian.v1.OutcomesRecordedEvent" => {
             let outcome = OutcomesRecordedEvent::decode(payload).ok()?.outcome?;
-            let (dataset, subjects, _) = meta_said(outcome.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(outcome.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: Vec::new(),
             })
         }
         "meridian.v1.QuotesRecordedEvent" => {
             let quote = QuotesRecordedEvent::decode(payload).ok()?.quote?;
-            let (dataset, subjects, venue) = meta_said(quote.meta.as_ref());
+            let (dataset, subjects, venue, sequence) = meta_said(quote.meta.as_ref());
             let asset = meridian_domain::lake::quote_asset(&quote);
             let series = series_said(quote.meta.as_ref());
             Some(Said {
@@ -346,13 +358,14 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(quote.meta.as_ref()),
             })
         }
         // Contract v27, the rates slice (W10.5).
         "meridian.v1.RatesRecordedEvent" => {
             let rate = RatesRecordedEvent::decode(payload).ok()?.rate?;
-            let (dataset, subjects, _) = meta_said(rate.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(rate.meta.as_ref());
             Some(Said {
                 key: Some(format!(
                     "rate|{}|{dataset}|{}|{}",
@@ -363,6 +376,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: Vec::new(),
             })
         }
@@ -370,7 +384,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         // date.
         "meridian.v1.StatisticsRecordedEvent" => {
             let statistic = StatisticsRecordedEvent::decode(payload).ok()?.statistic?;
-            let (dataset, subjects, _) = meta_said(statistic.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(statistic.meta.as_ref());
             let date = statistic
                 .meta
                 .as_ref()
@@ -386,6 +400,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(statistic.meta.as_ref()),
             })
         }
@@ -399,6 +414,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: alive.dataset,
                 subjects: Vec::new(),
                 is_want: false,
+                sequence: 0,
                 series: Vec::new(),
             })
         }
@@ -406,7 +422,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         // listed series, conflated per subject, dataset and series key.
         "meridian.v1.SeriesRecordedEvent" => {
             let series = SeriesRecordedEvent::decode(payload).ok()?.series?;
-            let (dataset, subjects, _) = meta_said(series.meta.as_ref());
+            let (dataset, subjects, _, sequence) = meta_said(series.meta.as_ref());
             Some(Said {
                 key: Some(format!(
                     "series|{}|{dataset}{}",
@@ -416,6 +432,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                sequence,
                 series: series_text(series.meta.as_ref()),
             })
         }
@@ -426,6 +443,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: want.dataset,
                 subjects: Vec::new(),
                 is_want: true,
+                sequence: 0,
                 series: Vec::new(),
             })
         }
@@ -436,6 +454,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: withdrawn.dataset,
                 subjects: Vec::new(),
                 is_want: true,
+                sequence: 0,
                 series: Vec::new(),
             })
         }

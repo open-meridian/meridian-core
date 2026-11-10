@@ -213,3 +213,101 @@ async fn read_changes_is_served_on_its_component_topic() {
         .unwrap_err();
     assert!(refused.to_string().contains("no partition P9"), "{refused}");
 }
+
+/// A store's record whose head moves when told: a member behind its writer.
+struct Behind(std::sync::Mutex<u64>);
+
+impl ChangeLog for Behind {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
+        if partition != "P0" {
+            return Err(ReadError::UnknownPartition(partition.into()));
+        }
+        let head = *self.0.lock().unwrap();
+        check_kept(after, 1, head)?;
+        let mut page = Page::new(most);
+        for s in (after.min(head) + 1)..=head {
+            page.take(change(s, 10));
+        }
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept: 1,
+            epoch: 1,
+            after_sequence: 0,
+        })
+    }
+}
+
+async fn read_after(bus: &Bus, sequence: u64) -> Result<(String, Vec<u8>), meridian_bus::BusError> {
+    let stamp = meridian_bus::Stamp {
+        read_after: Some(meridian_domain::v1::Watermark {
+            partitions: vec![meridian_domain::v1::PartitionSequence {
+                partition: "P0".into(),
+                sequence,
+            }],
+        }),
+        ..Default::default()
+    };
+    bus.call_stamped(
+        "platform.book.query.list-positions",
+        "t",
+        vec![],
+        None,
+        None,
+        &stamp,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stores_reads_are_held_to_read_after_by_its_change_logs_heads() {
+    let bus = Arc::new(Bus::single(
+        "bor",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Behind(std::sync::Mutex::new(4)));
+    serve(&bus, "book", log.clone());
+    bus.reads_after()
+        .set_bound(std::time::Duration::from_millis(300));
+    let answered = Arc::new(AtomicU64::new(0));
+    let noting = Arc::clone(&answered);
+    let reading = log.clone();
+    bus.serve("platform.book.query.list-positions", move |_| {
+        noting.store(*reading.0.lock().unwrap(), Ordering::SeqCst);
+        Ok(("t".into(), Vec::new()))
+    });
+    // At its head: answered at once.
+    read_after(&bus, 4).await.unwrap();
+    assert_eq!(answered.load(Ordering::SeqCst), 4);
+    // Behind, catching up within the bound: answered once caught up.
+    let catching = log.clone();
+    let caught = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        *catching.0.lock().unwrap() = 6;
+    });
+    read_after(&bus, 6).await.unwrap();
+    caught.join().unwrap();
+    assert_eq!(answered.load(Ordering::SeqCst), 6);
+    // Behind past the bound: refused, never answered from behind.
+    answered.store(0, Ordering::SeqCst);
+    let refused = read_after(&bus, 9).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("behind read_after"),
+        "{refused}"
+    );
+    assert_eq!(answered.load(Ordering::SeqCst), 0);
+    // What this process committed answers with no look at the record.
+    publish(&bus, "book", 6, &[change(9, 10)]);
+    read_after(&bus, 9).await.unwrap();
+    assert_eq!(
+        answered.load(Ordering::SeqCst),
+        6,
+        "answered by its own commit"
+    );
+}

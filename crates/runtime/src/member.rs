@@ -180,6 +180,10 @@ impl Member {
     /// lag is under its bound, looking at the lease twice a renew, until it
     /// takes it. The member reports as a standby meanwhile.
     pub async fn wait_to_write(&self, bus: &Arc<Bus>) -> Result<Holding, String> {
+        // A read naming a `read_after` this member has not reached waits up
+        // to its bound, `<store>.readyLagMs`, and is never answered from
+        // behind it (contract v30, stage B; spec section 5).
+        bus.reads_after().set_bound(self.ready_lag);
         let Some(settings) = self.lease.clone() else {
             said().set_mode(Mode::Writer);
             return Ok(Holding {

@@ -227,6 +227,8 @@ impl Sidecar {
                 "launched with roles that are refused: {refusal}"
             );
         }
+        // Its plugin's reads named by what it has seen (contract v30, stage B).
+        crate::read_after::Seen::keep_on(&bus);
         let configuration = crate::configuration::Configuration::new(
             Arc::clone(&bus),
             identity.instance_id.clone(),
