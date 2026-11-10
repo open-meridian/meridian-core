@@ -430,7 +430,105 @@ pub fn member_report(
         lag_ms: said().lag_ms(),
         partitions: said().partitions(),
         member: member_name(),
+        ..health()
     }
+}
+
+/// Its memory, what its budget did and its restarts (stage M; the resilience
+/// spec's section 10a; spec/a-deployment-is-observable-by-open-standards,
+/// ruled item 2), from the one place the component keeps them: its budget's
+/// accounting, and the restarts its pod's own scratch has counted.
+pub fn health() -> meridian_domain::v1::ComponentReport {
+    let said = meridian_budget::installed().map(meridian_budget::Process::accounting);
+    let said = said.unwrap_or_default();
+    let mut refusals = std::collections::HashMap::new();
+    if said.refused > 0 {
+        refusals.insert(
+            meridian_pb::v1::RefusalReason::Overloaded
+                .as_str_name()
+                .to_string(),
+            said.refused,
+        );
+    }
+    let (restarts, last_restart_at_ns) = restarts_counted();
+    meridian_domain::v1::ComponentReport {
+        memory_bytes: said.resident.unwrap_or(0),
+        memory_limit_bytes: said.limit.unwrap_or(0),
+        memory_budget_bytes: said.working.unwrap_or(0),
+        memory_peak_bytes: said.peak_resident,
+        reserved_bytes: said.reserved,
+        refusals,
+        sheds: said.shed,
+        restarts,
+        last_restart_reason: String::new(),
+        last_restart_at_ns,
+        ..Default::default()
+    }
+}
+
+/// Where a container's starts are counted: beside its ready file, in its
+/// pod's own scratch, which outlives a container's restart and not its pod.
+fn starts_file() -> Option<std::path::PathBuf> {
+    let ready = crate::var("MERIDIAN_READY_FILE")?;
+    Some(std::path::Path::new(&ready).parent()?.join("starts"))
+}
+
+static STARTS: std::sync::OnceLock<(u32, i64)> = std::sync::OnceLock::new();
+
+/// Count this start (stage M): the starts before it in this pod are its
+/// restarts, and the last of them when it restarted. Once a process; a
+/// component with no ready file counts none.
+pub fn count_this_start(now_ns: i64) -> (u32, i64) {
+    *STARTS.get_or_init(|| match starts_file() {
+        Some(path) => counted_start(&path, now_ns),
+        None => (0, 0),
+    })
+}
+
+/// This start counted in `path`: the starts before it, and when this one
+/// was, where there were any.
+fn counted_start(path: &std::path::Path, now_ns: i64) -> (u32, i64) {
+    let before = std::fs::read_to_string(path).unwrap_or_default();
+    let starts: u32 = before
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(path, format!("{} {now_ns}\n", starts + 1));
+    if starts == 0 {
+        (0, 0)
+    } else {
+        (starts, now_ns)
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn a_containers_starts_are_counted_in_its_pods_scratch_and_the_first_is_no_restart() {
+        let dir = std::env::temp_dir().join(format!("starts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("starts");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(counted_start(&path, 10), (0, 0), "the first start");
+        assert_eq!(counted_start(&path, 20), (1, 20), "restarted once, at 20");
+        assert_eq!(counted_start(&path, 30), (2, 30));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_report_carries_the_budgets_accounting_and_defaults_with_none_installed() {
+        let said = health();
+        // No budget installed in a test: nothing reserved, refused or shed.
+        assert_eq!((said.reserved_bytes, said.sheds), (0, 0));
+        assert!(said.refusals.is_empty());
+    }
+}
+
+fn restarts_counted() -> (u32, i64) {
+    STARTS.get().copied().unwrap_or((0, 0))
 }
 
 /// How often a standby asks its writer, which is also its interest in the

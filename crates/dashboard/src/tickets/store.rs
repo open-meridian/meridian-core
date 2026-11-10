@@ -50,6 +50,11 @@ pub trait TicketStore: Send + Sync {
     /// computed per read, from the access fold.
     fn tickets(&self) -> Result<Vec<Ticket>, String>;
 
+    /// The tickets named, without notes: what a person's unread notices are
+    /// of (stage M; the store memory audit of 2026-11-09, item 9), so the
+    /// count every open page asks for reads those, never the whole table.
+    fn tickets_named(&self, ticket_ids: &[String]) -> Result<Vec<Ticket>, String>;
+
     /// How many tickets a person filed, at a page or through a client, since
     /// `since_ns`: their rate (requirement 60).
     fn filed_since(&self, subject: &str, since_ns: i64) -> Result<usize, String>;
@@ -187,6 +192,15 @@ impl TicketStore for InMemory {
             .tickets
             .values()
             .rev()
+            .map(without_notes)
+            .collect())
+    }
+
+    fn tickets_named(&self, ticket_ids: &[String]) -> Result<Vec<Ticket>, String> {
+        let held = self.lock();
+        Ok(ticket_ids
+            .iter()
+            .filter_map(|id| held.tickets.get(id))
             .map(without_notes)
             .collect())
     }
@@ -732,6 +746,25 @@ impl TicketStore for InPostgres {
             .query(
                 &format!("SELECT {TICKET_COLUMNS} FROM dashboard_ticket t ORDER BY ticket_id DESC"),
                 &[],
+            )
+            .map_err(said)?;
+        let mut found: Vec<Ticket> = rows.iter().map(ticket_of).collect();
+        with_references(&mut *conn, &mut found)?;
+        Ok(found)
+    }
+
+    fn tickets_named(&self, ticket_ids: &[String]) -> Result<Vec<Ticket>, String> {
+        if ticket_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.database.conn()?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT {TICKET_COLUMNS} FROM dashboard_ticket t WHERE ticket_id = ANY($1)
+                      ORDER BY ticket_id DESC"
+                ),
+                &[&ticket_ids],
             )
             .map_err(said)?;
         let mut found: Vec<Ticket> = rows.iter().map(ticket_of).collect();

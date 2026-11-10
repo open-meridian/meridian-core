@@ -6068,6 +6068,47 @@ pub struct ComponentReport {
     /// report; the conductor keeps the latest of each.
     #[prost(string, tag = "11")]
     pub member: ::prost::alloc::string::String,
+    /// Stage M (the resilience spec's section 10a; spec/a-deployment-is-
+    /// observable-by-open-standards, ruled item 2): its memory and what its
+    /// budget did, read from one place in the component (its accounting), so
+    /// the conductor can say a component crossed its budget, is shedding or
+    /// keeps climbing. Counts and sizes only, never a record. Names proposed
+    /// 2026-11-09 for the product owner's ruling, aligned with `meridian status
+    /// --json`.
+    ///
+    /// Its resident memory now, in bytes; 0 where the platform does not say.
+    #[prost(uint64, tag = "12")]
+    pub memory_bytes: u64,
+    /// Its container's memory limit, in bytes; 0 where it has none.
+    #[prost(uint64, tag = "13")]
+    pub memory_limit_bytes: u64,
+    /// Its working budget (the limit times memory.budgetPercent, less its hot
+    /// layer's and held answers' bounds), in bytes; 0 where it has no limit.
+    #[prost(uint64, tag = "14")]
+    pub memory_budget_bytes: u64,
+    /// The most resident memory it has had, in bytes: since it started, as the
+    /// member says it; the conductor keeps the last 24 hours' across starts.
+    #[prost(uint64, tag = "15")]
+    pub memory_peak_bytes: u64,
+    /// What its requests in flight have reserved against its budget now.
+    #[prost(uint64, tag = "16")]
+    pub reserved_bytes: u64,
+    /// Requests it refused for load since it started, by reason
+    /// (REFUSAL_REASON_OVERLOADED, REFUSAL_REASON_RATE_LIMITED), each a count.
+    #[prost(map = "string, uint64", tag = "17")]
+    pub refusals: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
+    /// Requests it cancelled above its shed line since it started.
+    #[prost(uint64, tag = "18")]
+    pub sheds: u64,
+    /// How many times it has restarted, the last restart's reason (as the
+    /// platform names it: OOMKilled, Error, Completed) and when; filled where
+    /// they are known, 0 and empty where not.
+    #[prost(uint32, tag = "19")]
+    pub restarts: u32,
+    #[prost(string, tag = "20")]
+    pub last_restart_reason: ::prost::alloc::string::String,
+    #[prost(int64, tag = "21")]
+    pub last_restart_at_ns: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReportDeploymentComponentsRequest {

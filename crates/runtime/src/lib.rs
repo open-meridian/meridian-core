@@ -586,6 +586,8 @@ pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
 /// component stopped, where they leave nothing to answer with -- as the
 /// chart refuses such a configuration before it is applied.
 pub fn install_budget(component: &str, held: u64) -> Result<(), String> {
+    // Its start counted beside its ready file, for its report's restarts.
+    member::count_this_start(clock().now_ns());
     meridian_budget::install(component, held, meridian_budget::permits_from_env()).map(|_| ())
 }
 

@@ -706,10 +706,22 @@ impl Tickets {
     pub async fn unread(&self, reader: &Reader) -> Result<usize, Refused> {
         let subject = reader.subject.clone();
         let unread = self.blocking(move |store| store.unread(&subject)).await?;
-        let tickets = self.visible_by_id(reader).await?;
+        // Only the tickets the notices are of, each held to who may see it
+        // now (stage M; audit item 9: every ticket was read, with its
+        // references, each time an open page asked).
+        let mut named: Vec<String> = unread.iter().map(|n| n.ticket_id.clone()).collect();
+        named.sort();
+        named.dedup();
+        let visible: std::collections::BTreeSet<String> = self
+            .blocking(move |store| store.tickets_named(&named))
+            .await?
+            .into_iter()
+            .filter(|t| visibility::may_see(reader, t))
+            .map(|t| t.ticket_id)
+            .collect();
         Ok(unread
             .iter()
-            .filter(|n| tickets.contains_key(&n.ticket_id))
+            .filter(|n| visible.contains(&n.ticket_id))
             .count())
     }
 
