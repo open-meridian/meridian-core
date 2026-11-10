@@ -265,9 +265,10 @@ fn answered_at(answer: &service::ReadAnswer) -> u64 {
 }
 
 /// A reader's reply carries the position it was answered at: what it has
-/// applied, never the primary's heads beyond it; the primary's for an answer
-/// from the primary past its wait; and no further than a read replica that
-/// answered it had reached.
+/// applied for an answer from its hot layer, never the primary's heads
+/// beyond it; the primary's for an answer from the primary, a key its hot
+/// layer did not hold or past its wait; and no further than a read replica
+/// that answered it had reached.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_readers_reply_says_the_position_it_was_answered_at() {
     let clock = Arc::new(ManualClock::at(NOW));
@@ -290,10 +291,11 @@ async fn a_readers_reply_says_the_position_it_was_answered_at() {
     assert!(behind < ahead);
     // The member has applied the writer's change log to `behind`.
     let applied = Arc::new(Mutex::new(BTreeMap::from([(DAILY.to_string(), behind)])));
+    let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
     let reading = {
         let applied = Arc::clone(&applied);
         ReaderStore::new(
-            HotStore::new(Arc::clone(&primary), Bounds::DEFAULT),
+            Arc::clone(&hot),
             Arc::clone(&primary),
             Some(Arc::clone(&replica)),
             Arc::new(move || applied.lock().unwrap().clone()),
@@ -312,7 +314,13 @@ async fn a_readers_reply_says_the_position_it_was_answered_at() {
         crate::reader::begin();
         read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0)
     };
-    // Its own position, though the primary is ahead.
+    // A key its hot layer does not yet hold: read from the primary, so the
+    // primary's, though it did not wait.
+    let answer = latest();
+    assert!(!answer.rows.is_empty());
+    assert_eq!(answered_at(&answer), ahead, "the primary's, which answered");
+    // Held: its own position, though the primary is ahead.
+    hot.load_wanted();
     let answer = latest();
     assert!(!answer.rows.is_empty());
     assert_eq!(answered_at(&answer), behind, "its own applied position");
@@ -433,4 +441,53 @@ async fn a_readers_plain_latest_read_is_its_hot_layers_and_a_callers_as_of_the_r
         (vec!["5".to_string()], behind, false),
         "the replica's"
     );
+}
+
+/// A reader that answers from the primary without waiting -- the record's
+/// past with no read replica set -- says the primary's position, never its
+/// own applied one behind it (contract v30, stage B; spec section 5, "the
+/// primary's for an answer from the primary"): a session's next read must
+/// not be answered behind what it was told.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_answering_from_the_primary_unwaited_says_the_primarys_position() {
+    let clock = Arc::new(ManualClock::at(NOW));
+    let bus = Arc::new(Bus::single(
+        "lake-1",
+        Arc::new(MemoryBackend::new()),
+        clock.clone(),
+    ));
+    stand_ins(&bus);
+    bus.serve_only(meridian_bus::read_after::is_read);
+    let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    kept_close(primary.as_ref(), "k1", "2026-10-07", "5");
+    let applied_to = primary.heads().unwrap()[DAILY];
+    kept_close(primary.as_ref(), "k2", "2026-10-06", "6");
+    let ahead = primary.heads().unwrap()[DAILY];
+    assert!(applied_to < ahead);
+    let reading = ReaderStore::new(
+        HotStore::new(Arc::clone(&primary), Bounds::DEFAULT),
+        Arc::clone(&primary),
+        None,
+        Arc::new(move || BTreeMap::from([(DAILY.to_string(), applied_to)])),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let lake = service::serve(bus.clone(), reading, clock.clone());
+    lake.configured(&configuration(true, &[]));
+    let h = Harness {
+        bus: bus.clone(),
+        store,
+        clock,
+        lake,
+    };
+    crate::reader::begin();
+    let past = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-06",
+        SourceChoice::default(),
+        0,
+    );
+    assert_eq!(past.rows.len(), 1);
+    assert_eq!(answered_at(&past), ahead, "the primary's, which answered");
 }

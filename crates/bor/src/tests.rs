@@ -2403,8 +2403,8 @@ async fn a_readers_books_follow_the_change_log_and_it_acts_on_nothing() {
 /// A book reader's reply carries the position it was answered at (contract
 /// v30, stage B; the resilience spec's section 5, approved 2026-11-10): for
 /// a read from the books it holds, what it has applied of the writer's
-/// change log, never the primary's heads beyond it; past its wait, from the
-/// primary, the primary's.
+/// change log, never the primary's heads beyond it; for a read the primary
+/// answered -- a book not held, or past its wait -- the primary's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_book_readers_reply_says_the_position_it_was_answered_at() {
     use meridian_bus::read_after::AllHeads;
@@ -2506,6 +2506,9 @@ async fn a_book_readers_reply_says_the_position_it_was_answered_at() {
                 .unwrap()
         }
     };
+    // A book it does not hold yet: loaded from the primary, so the primary's,
+    // though it did not wait (a session's next read never behind it).
+    assert_eq!(events(None).await, ahead);
     // From the books it holds: its own applied position.
     assert_eq!(events(None).await, applied_to[&partition]);
     // Naming the writer's head, past its wait: from the primary, the

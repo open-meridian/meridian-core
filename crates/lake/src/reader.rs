@@ -18,15 +18,19 @@
 //! - **Its reply's watermark** is the position it was answered at (section 5,
 //!   approved 2026-11-10): the member's own applied position for an answer
 //!   from its hot layer, never the primary's heads; the primary's for an
-//!   answer from the primary; and never past what a read replica that
-//!   answered part of it had reached.
+//!   answer from the primary, past its wait or not -- the record's past with
+//!   no read replica reached, or a key its hot layer did not hold -- so a
+//!   session's next read is never answered behind it; and never past what a
+//!   read replica that answered part of it had reached.
 //! - **Nothing written**: every write is refused, the writer's alone.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use meridian_bus::read_after::{answering_after, answering_from_primary, behind};
+use meridian_bus::read_after::{
+    answered_by_primary, answering_after, answering_from_primary, behind, primary_answered_part,
+};
 use meridian_changes::{ReadChangesReply, ReadError};
 use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
@@ -53,12 +57,13 @@ thread_local! {
     static OWN_CUT_OFF: Cell<Option<i64>> = const { Cell::new(None) };
 }
 
-/// A read begins on this thread: no replica has answered any of it yet, and
-/// the lake has cut it off nowhere.
+/// A read begins on this thread: no replica or primary has answered any of
+/// it yet, and the lake has cut it off nowhere.
 pub fn begin() {
     REPLICA_ANSWERED.with(|held| held.borrow_mut().take());
     OWN_CUT_OFF.with(|held| held.set(None));
     crate::hot::noted::begin();
+    meridian_bus::read_after::begin_read();
 }
 
 /// The lake cut the read this thread answers off at `as_of_ns`, its own now,
@@ -113,10 +118,11 @@ impl ReaderStore {
 
     /// Where a read of the record's past is answered: the read replica, where
     /// set and at or past the read's `read_after`, its heads kept for the
-    /// read's watermark; the primary otherwise.
+    /// read's watermark; the primary otherwise, which the read's watermark
+    /// then says.
     fn past(&self) -> &dyn Store {
         let Some(replica) = self.replica.as_ref().filter(|_| !answering_from_primary()) else {
-            return self.primary.as_ref();
+            return self.primary_answers();
         };
         match replica.heads() {
             Ok(heads) if reached(&heads) => {
@@ -125,12 +131,19 @@ impl ReaderStore {
                 });
                 replica.as_ref()
             }
-            Ok(_) => self.primary.as_ref(),
+            Ok(_) => self.primary_answers(),
             Err(failed) => {
                 tracing::warn!(%failed, "the read replica could not be read; the primary answers");
-                self.primary.as_ref()
+                self.primary_answers()
             }
         }
+    }
+
+    /// The primary, answering part of the read: its reply's watermark is the
+    /// primary's.
+    fn primary_answers(&self) -> &dyn Store {
+        primary_answered_part();
+        self.primary.as_ref()
     }
 }
 
@@ -211,14 +224,21 @@ impl Store for ReaderStore {
     }
 
     /// The position a read was answered at, which its reply's watermark
-    /// says: the primary's past the read's wait; otherwise what this member
-    /// has applied, lowered to a read replica's where one answered part of
-    /// the read.
+    /// says: the primary's past the read's wait; the primary's too where it
+    /// answered any part of the read without one (the record's past with no
+    /// replica reached, or a key the hot layer did not hold, read from the
+    /// primary it loads from); otherwise what this member has applied. Either
+    /// lowered to a read replica's where one answered part of the read.
     fn heads(&self) -> Result<BTreeMap<String, u64>> {
         if answering_from_primary() {
             return self.primary.heads();
         }
-        let mut at = (self.applied)();
+        let from_record = crate::hot::noted::peek().1 == "record";
+        let mut at = if answered_by_primary() || from_record {
+            self.primary.heads()?
+        } else {
+            (self.applied)()
+        };
         REPLICA_ANSWERED.with(|held| {
             if let Some(replica) = held.borrow().as_ref() {
                 for (partition, sequence) in at.iter_mut() {

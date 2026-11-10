@@ -16,13 +16,17 @@
 //! - **Its reply's watermark** is the position it was answered at (section 5,
 //!   approved 2026-11-10): a page read from the primary or the replica says
 //!   that store's own; a read from the books it holds, the member's applied
-//!   position, never the primary's heads; past its wait, the primary's.
+//!   position, never the primary's heads; a read the primary answered any
+//!   part of -- a book not held, loaded from it, or the record's past with no
+//!   replica reached -- or past its wait, the primary's.
 //! - **Nothing written**: every act is the writer's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use meridian_bus::read_after::{answering_after, answering_from_primary, behind};
+use meridian_bus::read_after::{
+    answered_by_primary, answering_after, answering_from_primary, behind, primary_answered_part,
+};
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break};
 
 use crate::journal::Entry;
@@ -103,13 +107,17 @@ impl ReaderStore {
     }
 
     /// Where a read of the record's past is answered: the read replica, where
-    /// set and at or past the read's `read_after`; the primary otherwise.
+    /// set and at or past the read's `read_after`; the primary otherwise,
+    /// which the read's watermark then says.
     fn past(&self) -> &dyn Store {
         match &self.replica {
             Some(replica) if !answering_from_primary() && reached(replica.as_ref()) => {
                 replica.as_ref()
             }
-            _ => self.primary.as_ref(),
+            _ => {
+                primary_answered_part();
+                self.primary.as_ref()
+            }
         }
     }
 }
@@ -186,6 +194,9 @@ impl Store for ReaderStore {
         if let Some(held) = self.books().get(account_id) {
             return Ok(held);
         }
+        // Not held: the primary's book, and the read's watermark the
+        // primary's.
+        primary_answered_part();
         let before = self.forgotten.load(Ordering::SeqCst);
         let book = self.primary.book(account_id)?;
         let mut books = self.books();
@@ -220,10 +231,11 @@ impl Store for ReaderStore {
     /// The position a read was answered at, where the read says its own
     /// (an account's lifecycle events, read from the books it holds): what
     /// this member has applied -- each book it holds at or past it -- and
-    /// the primary's past the read's wait. A page read from a store carries
-    /// that store's own.
+    /// the primary's where the primary answered any of it, a book not held
+    /// or past the read's wait. A page read from a store carries that
+    /// store's own.
     fn heads(&self) -> Result<Mark> {
-        if answering_from_primary() {
+        if answered_by_primary() {
             return self.primary.heads();
         }
         Ok((self.applied)())

@@ -456,6 +456,7 @@ impl Bus {
         let reads = Arc::clone(&self.reads);
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
+            crate::read_after::begin_read();
             match envelope.meta.as_ref().and_then(|m| m.read_after.clone()) {
                 Some(asked) => reads.answer(&topic, &asked, || handler(envelope)),
                 None => handler(envelope),

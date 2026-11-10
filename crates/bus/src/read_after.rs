@@ -122,6 +122,12 @@ thread_local! {
     /// The read being answered on this thread: the watermark it named, and
     /// whether it is answered from the store's primary database.
     static ANSWERING: RefCell<Option<(Watermark, bool)>> = const { RefCell::new(None) };
+
+    /// Whether the store's primary database answered any part of the read
+    /// being answered on this thread without its wait: a reader's record
+    /// past with no read replica reached, or what its hot layer did not
+    /// hold.
+    static PRIMARY_ANSWERED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `answer` with the call's deadline known to it, the deadline being
@@ -147,6 +153,30 @@ pub fn answering_after() -> Option<Watermark> {
 /// database: a reader member behind its `read_after` past its wait.
 pub fn answering_from_primary() -> bool {
     ANSWERING.with(|held| held.borrow().as_ref().is_some_and(|(_, primary)| *primary))
+}
+
+/// A read begins on this thread: nothing of it answered from the primary
+/// yet. [`Bus::serve`] calls it before each store's read; a store's own
+/// tests, answering a read with no bus, call it too.
+///
+/// [`Bus::serve`]: crate::Bus::serve
+pub fn begin_read() {
+    PRIMARY_ANSWERED.with(|held| held.set(false));
+}
+
+/// Part of the read this thread answers was answered from the store's
+/// primary database, though it did not wait: a reader member's reply then
+/// carries the primary's watermark (spec section 5, "the primary's for an
+/// answer from the primary").
+pub fn primary_answered_part() {
+    PRIMARY_ANSWERED.with(|held| held.set(true));
+}
+
+/// Whether the store's primary database answered the read this thread
+/// answers, in whole past its wait or in part without one: its reply's
+/// watermark is then the primary's.
+pub fn answered_by_primary() -> bool {
+    answering_from_primary() || PRIMARY_ANSWERED.with(Cell::get)
 }
 
 fn answering<R>(asked: &Watermark, from_primary: bool, answer: impl FnOnce() -> R) -> R {
