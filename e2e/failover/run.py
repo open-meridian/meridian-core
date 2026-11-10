@@ -2733,14 +2733,30 @@ HANDED_ON = "a read handed to the writer: answered by it"
 UNKEPT_READS = 20
 
 
-def unkept_heard():
-    """The flood's last word on its reads of the dataset served, not kept."""
+def unkept_said():
+    """The flood's last word on its reads of the dataset served, not kept,
+    as it wrote it."""
     said = {}
     for line in driver_file(FLOOD, "/tmp/unkept.log").splitlines():
         parts = line.split()
         if parts and parts[0] == "UNKEPT":
             said = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
-    return {k: int(v) for k, v in said.items() if v.isdigit()}
+    return said
+
+
+def unkept_heard():
+    """Its counts."""
+    return {k: int(v) for k, v in unkept_said().items() if v.isdigit()}
+
+
+def handed_list_prices(pod_name, since_s):
+    """The lake reader's list-prices reads handed to the writer and
+    answered by it, in the last `since_s` seconds."""
+    logs = kubectl("logs", pod_name, "-c", "lake", f"--since={since_s}s", check=False, quiet=True)
+    if logs.returncode != 0:
+        return 0
+    return sum(1 for line in logs.stdout.decode(errors="replace").splitlines()
+               if HANDED_ON in line and "platform.lake.query.list-prices" in line)
 
 
 def reader_hands_on(s):
@@ -2759,20 +2775,24 @@ def reader_hands_on(s):
         return
     reader = readers[0]["metadata"]["name"]
     flood_entitled(s)
-    before = reader_log(reader, HANDED_ON, container="lake")
+    started = time.time()
     flood_set("unkept")
     try:
-        enough = happens(lambda: unkept_heard().get("answered", 0) >= UNKEPT_READS, 180, every=3)
+        # Until the licence and entitlement the run recorded are in force and
+        # the reads are served (the conductor publishes within a minute).
+        enough = happens(lambda: unkept_heard().get("served", 0) >= UNKEPT_READS, 240, every=3)
     finally:
         flood_set("")
+    said = unkept_said()
     heard = unkept_heard()
-    s.check(enough, f"reader hands on: the flood read its dataset served, not kept ({heard})")
-    s.check(heard.get("answered", 0) > 0 and heard.get("served", 0) == heard.get("answered", 0)
-            and heard.get("other", 0) == 0,
-            f"reader hands on: every read answered the price served for its want, whichever member took it "
-            f"({heard.get('served', 0)} of {heard.get('answered', 0)}, {heard.get('other', 0)} failed)")
-    handed = reader_log(reader, HANDED_ON, container="lake") - before
-    s.check(handed > 0, f"reader hands on: the lake's reader handed {handed} of them to the writer")
+    wants = driver_file(FLOOD, "/tmp/unkept-wants.log").splitlines()
+    s.note(f"reader hands on: the flood's last read said {said}; it heard {len(wants)} want line(s), "
+           f"the last {wants[-3:]}")
+    s.check(enough, f"reader hands on: {UNKEPT_READS} reads of the flood's dataset served, not kept, "
+                    f"each answered the price served for its want ({heard})")
+    handed = handed_list_prices(reader, int(time.time() - started) + 5)
+    s.check(handed > 0, f"reader hands on: the lake's reader handed {handed} of those reads to the writer, "
+                        f"each answered by it")
 
 
 FAILURES = {

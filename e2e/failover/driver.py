@@ -278,7 +278,10 @@ class Recording(data.Role):
         # served, not kept, is asked of it: each subject's price served for
         # the want, which the lake hands to the read waiting on it.
         want = heard.message
-        if ROLE != "flood" or want.dataset != f"{self.plugin.identity.instance_id}:{UNKEPT_KEY}":
+        if ROLE != "flood":
+            return
+        kept("/tmp/unkept-wants.log", f"WANT {want.want_id} {want.dataset} {len(want.subjects)}")
+        if want.dataset != f"{self.plugin.identity.instance_id}:{UNKEPT_KEY}":
             return
         now = time.time_ns()
         prices = [ops.Price(
@@ -295,7 +298,9 @@ class Recording(data.Role):
         try:
             await bounded(self._operations().RecordPrices(
                 ops.RecordPricesParams(prices=prices, want_id=want.want_id)))
+            kept("/tmp/unkept-wants.log", f"SERVED {want.want_id}")
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            kept("/tmp/unkept-wants.log", f"REFUSED {want.want_id} {words(failed)[:200]}")
             say(f"driver: flood: want {want.want_id} not served ({words(failed)})")
 
 
@@ -747,11 +752,14 @@ async def drive_flood(plugin):
         raises a want, which this instance serves, and is answered the price
         served -- whichever of the lake's members took it, a reader handing
         it to the writer (contract v30, stage B). Each read says what it was,
-        as `UNKEPT answered=N served=N other=N` in /tmp/unkept.log: `served`
-        the reads answered with the price served for them."""
+        as `UNKEPT answered=N served=N other=N ms=N why=<dataset>/<reason>,...`
+        in /tmp/unkept.log: `served` the reads answered with the price served
+        for them; the last read's time and what it said it could not answer."""
         named = f"{plugin.identity.instance_id}:{UNKEPT_KEY}"
         said = {"answered": 0, "served": 0, "other": 0}
         while flood_mode() == "unkept" and not stopped():
+            began = time.monotonic()
+            why = ""
             try:
                 listed = await bounded(stub.ListPrices(ops.ListPricesParams(
                     subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
@@ -759,11 +767,15 @@ async def drive_flood(plugin):
                 said["answered"] += 1
                 if any(p.meta.row_key.startswith("unkept-") for p in listed.prices):
                     said["served"] += 1
+                why = ",".join(f"{u.dataset}/{u.reason}" for u in listed.unanswered)
             except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
                 said["other"] += 1
+                why = words(failed)[:120].replace(" ", "_")
                 say(f"driver: flood: a read of {named} failed ({words(failed)})")
+            ms = int((time.monotonic() - began) * 1000)
             kept("/tmp/unkept.log",
-                 f"UNKEPT answered={said['answered']} served={said['served']} other={said['other']}")
+                 f"UNKEPT answered={said['answered']} served={said['served']} other={said['other']} "
+                 f"ms={ms} why={why or '-'}")
             await asyncio.sleep(0.5)
 
     streak = [0]
