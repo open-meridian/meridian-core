@@ -959,40 +959,58 @@ impl Store for PostgresStore {
             } else {
                 query.as_of_ns
             };
-            let rows = tx
-                .query(
-                    "SELECT body FROM lake_row
+            // A chunk at a time from one portal, in the order the rows were
+            // recorded, each handed on as it is decoded (stage M; the store
+            // memory audit of 2026-11-09, item 4): a catch-up from an old
+            // watermark is the whole dataset, and was read whole, decoded
+            // and sorted before the first row was handed on. The version in
+            // force of each row key among those after the watermark is
+            // chosen by the database, by the order versions take force in
+            // (ruling 1006 (b): published time, then version), as
+            // `memory::as_of` chose it; every version where the read asks
+            // for every one, by the time each was recorded.
+            let chosen = if crate::store::every_version(query) {
+                "SELECT body FROM lake_row
+                   JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
+                     ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
+                  WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
+                  ORDER BY lake_row.dataset, sequence"
+            } else {
+                "SELECT body FROM (
+                     SELECT DISTINCT ON (lake_row.dataset, row_key) body,
+                            lake_row.dataset AS in_dataset, sequence AS at_sequence
+                       FROM lake_row
                        JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
                          ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
                       WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
-                      ORDER BY lake_row.dataset, sequence",
-                    &[
-                        &datasets,
-                        &after,
-                        &query.subjects,
-                        &query.data_type.code(),
-                        &cut_off,
-                    ],
-                )
-                .map_err(unavailable)?;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let body: &[u8] = row.get(0);
-                out.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
-            }
-            let amendments = amendments_of(&mut tx, &query.datasets)?;
-            let mut out = if crate::store::every_version(query) {
-                crate::store::recorded_by(out, query.as_of_ns)
-            } else {
-                as_of(out, query.as_of_ns)
+                      ORDER BY lake_row.dataset, row_key,
+                               COALESCE(published_at_ns, 0) DESC, version DESC
+                 ) AS in_force
+                 ORDER BY in_dataset, at_sequence"
             };
-            let assessments = assessments_of(&mut tx, &out)?;
-            tx.commit().map_err(unavailable)?;
-            as_flagged(&mut out, &amendments, query.as_of_ns);
-            as_assessed(&mut out, &assessments, query.as_of_ns);
-            for row in out {
-                each(row)?;
+            let data_type = query.data_type.code();
+            let params: [&(dyn postgres::types::ToSql + Sync); 5] =
+                [&datasets, &after, &query.subjects, &data_type, &cut_off];
+            let amendments = amendments_of(&mut tx, &query.datasets)?;
+            let portal = tx.bind(chosen, &params).map_err(unavailable)?;
+            loop {
+                let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let mut chunk = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let body: &[u8] = row.get(0);
+                    chunk.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
+                }
+                let assessments = assessments_of(&mut tx, &chunk)?;
+                as_flagged(&mut chunk, &amendments, query.as_of_ns);
+                as_assessed(&mut chunk, &assessments, query.as_of_ns);
+                for row in chunk {
+                    each(row)?;
+                }
             }
+            tx.commit().map_err(unavailable)?;
             return Ok(());
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();

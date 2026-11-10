@@ -283,6 +283,74 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
     assert_eq!(store.lowest_kept(&unique("none")).unwrap(), None);
 }
 
+/// Stage M (the store memory audit of 2026-11-09, item 4): a catch-up from
+/// an old watermark -- the whole dataset -- is handed on a chunk at a time as
+/// the database answers it, each row key at its version in force and in the
+/// order recorded, never read whole first. Its heap holds a chunk: well under
+/// a tenth of the set decoded whole.
+#[test]
+fn a_catch_up_from_an_old_watermark_holds_a_chunk_never_the_dataset() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    const ROWS: usize = 40_000;
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                trade(
+                    &dataset,
+                    &format!("t{}", batch * 500 + n),
+                    &subject,
+                    1_000 + n as i64,
+                )
+            })
+            .collect();
+        store.record(&dataset, rows, 1_000 + batch as i64).unwrap();
+    }
+    // Ten row keys restated: each answered once, at its later version.
+    let restated: Vec<Observation> = (0..10)
+        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .collect();
+    store.record(&dataset, restated, 5_000).unwrap();
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Trade,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::After([(dataset.clone(), 0)].into()),
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    let mut whole_bytes = 0usize;
+    let mut answered = 0usize;
+    let mut last_sequence = 0u64;
+    let mut versions_two = 0usize;
+    counted::take();
+    store
+        .read_each(&query, &mut |row| {
+            whole_bytes += meridian_lake::pages::row_bytes(&row);
+            answered += 1;
+            assert!(row.meta().sequence > last_sequence, "in the order recorded");
+            last_sequence = row.meta().sequence;
+            if row.meta().version == 2 {
+                versions_two += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(answered, ROWS, "each row key once");
+    assert_eq!(versions_two, 10, "a restated key at its version in force");
+    let whole_mib = whole_bytes as f64 / 1048576.0;
+    println!("CATCH_UP heap_peak_mib={peak:.1} whole_set_mib={whole_mib:.1}");
+    assert!(
+        peak * 10.0 < whole_mib,
+        "the catch-up's heap peaked at {peak:.1} MiB against the set's {whole_mib:.1} MiB decoded"
+    );
+}
+
 fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation {
     Observation::Outcome(Box::new(meridian_domain::v1::Outcome {
         meta: Some(ObservationMeta {
