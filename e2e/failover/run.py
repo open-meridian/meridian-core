@@ -36,7 +36,11 @@ probe names the path and its address, and it heals with no restart);
 once; every store answers again from another zone within the zone tier);
 `order-plugin` (the ems stand-in's pod's processes killed outright mid-flow:
 found not ready, registered again, and the book's orders and placements
-held to what it was told, none lost and none twice).
+held to what it was told, none lost and none twice); `memory-pressure` and
+`noisy-plugin` (stage M, the resilience spec's section 10a: the flood
+instance reads past the lake's budget, or past its own share at its
+sidecar, and is refused for load alone, with a retry-after, every other
+instance within its band, nothing restarted and nothing OOMKilled).
 
 The write driver (driver.py, step 3b part 5) writes through the stores for
 the whole run, from test-only plugin instances in the chart's sidecars[]
@@ -124,11 +128,14 @@ RECONFIGURE = ["ha", "tolerant", "ha"]
 # the ems stand-in (desk). What a class lost is read in the stores' own rows
 # against what each acknowledged.
 DRIVEN = PROFILE in ("tolerant", "ha", "reconfigure")
-DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk"}
+DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk", "drive-flood": "flood"}
 # What each instance is launched with: the ems stand-in (desk) holds oms and
 # ems, as e2e/orders/stand_in.py's desk does; it is the order-plugin class's
 # subject.
-DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"]}
+DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"],
+                # The memory and isolation classes' subject (stage M): it
+                # records its own dataset and reads it.
+                "flood": ["data", "reporting"]}
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
 DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
@@ -149,10 +156,11 @@ HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
-                 "bit-rot", "torn-write", "order-plugin"],
+                 "bit-rot", "torn-write", "order-plugin", "memory-pressure", "noisy-plugin"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
-           "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin"],
+           "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin",
+           "memory-pressure", "noisy-plugin"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -766,7 +774,7 @@ def driver_values():
             "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
                     "DRIVER_ACCOUNTS": DESK_ACCOUNT if role == "desk" else ",".join(DRIVER_ACCOUNTS)},
         }})
-        if role != "data":
+        if role in ("oms", "desk"):
             sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
     path = os.path.join(tempfile.mkdtemp(prefix="failover-driver-"), "driver.json")
     with open(path, "w", encoding="utf-8") as kept:
@@ -2390,6 +2398,128 @@ def properties(s, after):
             f"each epoch one recorded takeover{': ' + '; '.join(broken) if broken else ''}")
 
 
+# ── Memory and isolation (stage M; the resilience spec's section 10a) ───────
+#
+# `memory-pressure`: the flood instance reads its whole dataset with many
+# readers at once, past the lake's budget; `noisy-plugin`: it asks one page
+# at a time, as fast as it can, past its own share at its sidecar. Either
+# way, for FLOOD_SECONDS: refusals typed for load, each with a retry-after,
+# to the flooder alone (REFUSAL_REASON_OVERLOADED, REFUSAL_REASON_RATE_LIMITED);
+# every other instance writing within its band all the while; no pod
+# restarted and none OOMKilled; and the flooder answered again as the
+# flood ends (the plan's Track 7 table).
+
+FLOOD = "drive-flood"
+FLOOD_DATASET = f"{FLOOD}:drive"
+FLOOD_SECONDS = 60
+# Every other instance within its band during a flood: the data driver
+# records a price every half second and the oms driver an order about every
+# quarter to whole second, so each acknowledges at least this many in a
+# minute's flood, about a quarter of what each does unflooded.
+FLOOD_BAND = {"price": 25, "order": 15}
+# How soon the flooder is answered again once it stops (the tolerant pod
+# bound; nothing restarts, so it is the refusals' retry-after that counts).
+FLOOD_RECOVERED = 30
+FLOOD_ENTITLED = []
+
+
+def varint(n):
+    said = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            said.append(byte | 0x80)
+        else:
+            said.append(byte)
+            return bytes(said)
+
+
+def text_field(number, value):
+    data = value.encode()
+    return varint(number << 3 | 2) + varint(len(data)) + data
+
+
+def flood_entitled(s):
+    """The flood instance entitled to its own dataset, as a deployment admin
+    entitles a reader (W10.1): its DatasetEntitlement recorded where the
+    conductor keeps it, which the conductor publishes whole within a minute.
+    Once a run."""
+    if FLOOD_ENTITLED:
+        return
+    now = time.time_ns()
+    entitlement = (text_field(1, FLOOD_DATASET) + text_field(2, FLOOD) + varint(3 << 3) + varint(1)
+                   + text_field(5, ADMIN) + varint(6 << 3) + varint(now)
+                   + text_field(9, "the memory and isolation classes read it"))
+    psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
+         f"VALUES ('{FLOOD_DATASET}', '{FLOOD}', decode('{entitlement.hex()}', 'hex'), {now})")
+    seeded = happens(lambda: "SEEDED" in driver_file(FLOOD, "/tmp/seeded"), 300, every=5)
+    s.check(seeded, f"the flood instance's {FLOOD_DATASET} recorded")
+    # The conductor publishes the data configuration every minute.
+    time.sleep(75)
+    FLOOD_ENTITLED.append(True)
+
+
+def flood_set(mode):
+    pod = driver_pod(FLOOD)
+    kubectl("exec", pod, "-c", "plugin", "--", "sh", "-c", f"echo {mode} > /tmp/flood")
+
+
+def flood_heard(mode, ended=False):
+    """The flood's last count for `mode`, or the one it gave at its end."""
+    said = {}
+    for line in driver_file(FLOOD, "/tmp/flood.log").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "FLOOD" and parts[1] == mode and (not ended or parts[-1] == "END"):
+            said = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
+    return {k: int(v) for k, v in said.items() if v.isdigit()}
+
+
+def restarted_pods():
+    """Every pod's restarts, and each container's last ending reason."""
+    pods_now = json.loads(out("get", "pods", "-o", "json"))["items"]
+    said = {}
+    for pod in pods_now:
+        for container in pod["status"].get("containerStatuses", []):
+            reason = (container.get("lastState", {}).get("terminated") or {}).get("reason", "")
+            said[f"{pod['metadata']['name']}/{container['name']}"] = (container.get("restartCount", 0), reason)
+    return said
+
+
+def flood(s, failure, mode, reason, component):
+    print(f"F: {failure}: {FLOOD} floods {component} ({mode}) for {FLOOD_SECONDS}s", flush=True)
+    flood_entitled(s)
+    before = restarted_pods()
+    acked_before = {kind: len(ids) for kind, ids in driver_acked().items()}
+    flood_set(mode)
+    time.sleep(FLOOD_SECONDS)
+    acked_during = {kind: len(ids) for kind, ids in driver_acked().items()}
+    flood_set("calm")
+    ended = happens(lambda: flood_heard(mode, ended=True), 60, every=2)
+    heard = flood_heard(mode, ended=True)
+    s.check(ended, f"{failure}: the flood ended and said what it heard ({heard})")
+    s.check(heard.get(reason, 0) > 0,
+            f"{failure}: the flooder was refused for load, {reason} {heard.get(reason, 0)} time(s)")
+    s.check(heard.get("retry_after_min", 0) >= 1,
+            f"{failure}: every refusal for load carried a retry-after, the least {heard.get('retry_after_min', 0)} s")
+    for kind, band in FLOOD_BAND.items():
+        rose = acked_during.get(kind, 0) - acked_before.get(kind, 0)
+        s.check(rose >= band, f"{failure}: the other instances within their band, {rose} {kind}(s) "
+                f"acknowledged during the flood (at least {band})")
+    after = restarted_pods()
+    again = sorted(name for name, (count, _) in after.items() if count > before.get(name, (0, ""))[0])
+    killed = sorted(name for name, (_, why) in after.items() if why == "OOMKilled")
+    s.check(not again, f"{failure}: no pod restarted ({', '.join(again) or 'none'})")
+    s.check(not killed, f"{failure}: nothing OOMKilled ({', '.join(killed) or 'none'})")
+    began = time.time()
+    answered = happens(lambda: flood_heard("calm").get("answered", 0) > 0
+                       and flood_heard("calm").get(reason, 0) == 0, FLOOD_RECOVERED * 2, every=1)
+    flood_set("")
+    claim(s, failure, component, time.time() - began if answered else FLOOD_RECOVERED * 2, FLOOD_RECOVERED,
+          {"refused": heard.get(reason, 0), "answered": heard.get("answered", 0),
+           "retry_after_min_s": heard.get("retry_after_min", 0)})
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -2409,6 +2539,8 @@ FAILURES = {
     "zone": zone_lost,
     "replica-rot": replica_rot,
     "order-plugin": order_plugin,
+    "memory-pressure": lambda s: flood(s, "memory-pressure", "pressure", "overloaded", "lake"),
+    "noisy-plugin": lambda s: flood(s, "noisy-plugin", "noisy", "rate_limited", "sidecar"),
 }
 
 

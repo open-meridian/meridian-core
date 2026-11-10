@@ -16,7 +16,11 @@ DRIVER_ROLE says which of its instances it is:
   accounts read back through the book's writer (ListOrders), by two
   workers at once;
 - `desk`: the ems stand-in, holding oms and ems, the order-plugin class's
-  subject (below): orders recorded in its own account and placed.
+  subject (below): orders recorded in its own account and placed;
+- `flood`: holding data and reporting, the memory-pressure and noisy-plugin
+  classes' subject (stage M, below): its own dataset recorded once, then
+  read past the lake's budget, or past its own share at its sidecar, as
+  /tmp/flood says.
 
 Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
 <id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
@@ -48,7 +52,7 @@ import grpc
 from meridian import DatasetDeclaration, DatasetLicence, Declaration
 from meridian.client import connect
 from meridian.plugin.v1 import operations_pb2 as ops
-from meridian.roles import data, ems, oms
+from meridian.roles import data, ems, oms, reporting
 from meridian.v1 import sidecar_pb2
 
 ROLE = os.environ.get("DRIVER_ROLE", "")
@@ -532,11 +536,170 @@ async def drive_desk(plugin):
             await asyncio.sleep(1.0)
 
 
+# ── flood -> lake: stage M's memory-pressure and noisy-plugin subject ───────
+#
+# DRIVER_ROLE=flood holds `data` and `reporting`: it records FLOOD_ROWS
+# prices into its own dataset once (`<instance>:drive`, kept across a
+# restart by /tmp/seeded), then reads them as /tmp/flood says, until it says
+# nothing:
+#
+# - `pressure`: FLOOD_PRESSURE readers at once, each reading the whole of its
+#   dataset by valid time, page after page -- reads past the lake's budget
+#   (the resilience spec's section 10a), refused REFUSAL_REASON_OVERLOADED;
+# - `noisy`: FLOOD_NOISY readers at once, each asking for one page as fast
+#   as it is answered -- past this plugin's share at its sidecar, refused
+#   REFUSAL_REASON_RATE_LIMITED.
+#
+# Every five seconds it says what it heard, as `FLOOD <mode> answered=N
+# overloaded=N rate_limited=N other=N retry_after_min=S`, kept in
+# /tmp/flood.log: answered reads, each refusal for load by its reason, and
+# the least retry-after a refusal carried.
+
+FLOOD_ROWS = 20000
+FLOOD_PRESSURE = 32
+FLOOD_NOISY = 160
+FLOOD_MODE = "/tmp/flood"
+REFUSAL_METADATA = "meridian-refusal-bin"
+# RefusalReason REFUSAL_REASON_OVERLOADED and REFUSAL_REASON_RATE_LIMITED
+# (contract v30), by number: read whatever the image's generated code holds.
+OVERLOADED = 32
+RATE_LIMITED = 33
+
+
+class Reporting(reporting.Role):
+    seed = False
+
+
+def flood_mode():
+    try:
+        with open(FLOOD_MODE, encoding="utf-8") as held:
+            return held.read().strip()
+    except OSError:
+        return ""
+
+
+def refusal_of(failed):
+    """The reason a refusal names, and its retry-after, from its trailing
+    metadata (W4.4): none where it names none."""
+    if not isinstance(failed, grpc.aio.AioRpcError):
+        return None, 0
+    for key, value in failed.trailing_metadata() or ():
+        if key == REFUSAL_METADATA:
+            said = sidecar_pb2.Refusal.FromString(value)
+            return said.reason, said.retry_after_seconds
+    return None, 0
+
+
+async def flood_seed(plugin, dataset):
+    if os.path.exists("/tmp/seeded"):
+        return
+    stub = plugin._operations()
+    began = time.time_ns() - FLOOD_ROWS * 1_000_000
+    for batch in range(FLOOD_ROWS // 500):
+        prices = []
+        for n in range(500):
+            at = began + (batch * 500 + n) * 1_000_000
+            key = f"flood-{batch}-{n}"
+            prices.append(ops.Price(
+                meta=ops.ObservationMeta(
+                    row_key=key, subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+                    source=ops.Source(dataset=dataset), valid_from_ns=at,
+                    source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                                 at_ns=at)],
+                    raw=plugin.raw_record(f"flood/{key}")),
+                kind=ops.PriceKind.PRICE_KIND_LAST,
+                price=ops.Money(amount=decimal(f"{100 + n % 50}.25"), instrument_id=USD),
+                basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT))
+        while True:
+            try:
+                await bounded(stub.RecordPrices(ops.RecordPricesParams(prices=prices)))
+                break
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                say(f"driver: flood: seeding batch {batch} again ({words(failed)})")
+                await asyncio.sleep(1.0)
+    kept("/tmp/seeded", "SEEDED")
+    say(f"driver: flood: {FLOOD_ROWS} rows recorded in {dataset}")
+
+
+async def drive_flood(plugin):
+    dataset = f"{plugin.identity.instance_id}:{DATASET_KEY}"
+    await flood_seed(plugin, dataset)
+    stub = plugin._operations()
+    heard = {"answered": 0, "overloaded": 0, "rate_limited": 0, "other": 0}
+    least = [0]
+
+    def refused(failed):
+        reason, retry = refusal_of(failed)
+        if failed.code() == grpc.StatusCode.RESOURCE_EXHAUSTED and reason == OVERLOADED:
+            heard["overloaded"] += 1
+        elif failed.code() == grpc.StatusCode.RESOURCE_EXHAUSTED and reason == RATE_LIMITED:
+            heard["rate_limited"] += 1
+        else:
+            heard["other"] += 1
+            return
+        least[0] = retry if not least[0] else min(least[0], retry)
+
+    def asked(cursor, page):
+        return ops.ListPricesParams(
+            subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+            sources=ops.SourceChoice(named=[dataset]),
+            valid_from_ns=1, valid_until_ns=time.time_ns(), page_size=page, cursor=cursor)
+
+    async def whole(mode):
+        while flood_mode() == mode:
+            cursor = ""
+            try:
+                while flood_mode() == mode:
+                    listed = await bounded(stub.ListPrices(asked(cursor, 500)))
+                    cursor = listed.next_cursor
+                    if not cursor:
+                        break
+                heard["answered"] += 1
+            except asyncio.TimeoutError:
+                heard["other"] += 1
+            except grpc.aio.AioRpcError as failed:
+                refused(failed)
+                await asyncio.sleep(0.05)
+
+    async def one_page(mode):
+        while flood_mode() == mode:
+            try:
+                await bounded(stub.ListPrices(asked("", 1)))
+                heard["answered"] += 1
+            except asyncio.TimeoutError:
+                heard["other"] += 1
+            except grpc.aio.AioRpcError as failed:
+                refused(failed)
+
+    async def said(mode):
+        while flood_mode() == mode:
+            await asyncio.sleep(5)
+            line = (f"FLOOD {mode} answered={heard['answered']} overloaded={heard['overloaded']} "
+                    f"rate_limited={heard['rate_limited']} other={heard['other']} retry_after_min={least[0]}")
+            say(line)
+            kept("/tmp/flood.log", line)
+
+    while not stopped():
+        mode = flood_mode()
+        if mode in ("pressure", "noisy"):
+            for key in heard:
+                heard[key] = 0
+            least[0] = 0
+            readers = [whole(mode) for _ in range(FLOOD_PRESSURE)] if mode == "pressure" else \
+                [one_page(mode) for _ in range(FLOOD_NOISY)]
+            await asyncio.gather(said(mode), *readers)
+            line = (f"FLOOD {mode} answered={heard['answered']} overloaded={heard['overloaded']} "
+                    f"rate_limited={heard['rate_limited']} other={heard['other']} retry_after_min={least[0]} END")
+            say(line)
+            kept("/tmp/flood.log", line)
+        await asyncio.sleep(1.0)
+
+
 # ── Start ───────────────────────────────────────────────────────────────────
 
 
 def declaration():
-    if ROLE == "data":
+    if ROLE in ("data", "flood"):
         return Declaration(catalogue=[DatasetDeclaration(
             key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
             modes=["push"], licence_default=DatasetLicence(kept=True, display=True),
@@ -545,13 +708,14 @@ def declaration():
 
 
 async def main():
-    if ROLE not in ("data", "oms", "desk") or not INSTRUMENT or (
-            ROLE != "data" and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
+    if ROLE not in ("data", "oms", "desk", "flood") or not INSTRUMENT or (
+            ROLE in ("oms", "desk") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
         raise SystemExit("driver: DRIVER_ROLE is data, oms or desk, with DRIVER_INSTRUMENT (and, for oms and "
                          "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
-    roles = {"data": [Recording()], "oms": [Managing()], "desk": [Desking(), Managing()]}[ROLE]
+    roles = {"data": [Recording()], "oms": [Managing()], "desk": [Desking(), Managing()],
+             "flood": [Recording(), Reporting()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
     while not stopped():
@@ -560,7 +724,7 @@ async def main():
                 say(f"driver: registered as {plugin.identity.instance_id}")
                 kept("/tmp/registered", f"REGISTERED {int(time.time() * 1000)}")
                 await {"data": lambda: drive_data(plugin, gen), "oms": lambda: drive_oms(plugin, gen),
-                       "desk": lambda: drive_desk(plugin)}[ROLE]()
+                       "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin)}[ROLE]()
             break
         except Exception as failed:  # noqa: BLE001 - every start failure is waited out
             say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")

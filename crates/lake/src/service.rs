@@ -347,8 +347,11 @@ pub struct Lake {
     /// them, since the lake keeps none of it to read again.
     waiting: Mutex<BTreeMap<String, Vec<std::sync::mpsc::Sender<Heard>>>>,
     /// What a source declined, by dataset, subject and the date or range its
-    /// want asked (contract v19): its reason and when.
-    declined: Mutex<read::Declined>,
+    /// want asked (contract v19): its reason and when. Shared, so a read
+    /// takes it without copying it, and replaced whole by a decline, which
+    /// lets go of every one that no longer stands (stage M; the store
+    /// memory audit of 2026-11-09, item 11).
+    declined: Mutex<Arc<read::Declined>>,
     /// Trades recorded since the band last read them.
     trades_recorded: std::sync::atomic::AtomicU64,
     /// Each record the instrument store said it holds, with its asset class
@@ -510,7 +513,7 @@ impl Lake {
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
             waiting: Mutex::new(BTreeMap::new()),
-            declined: Mutex::new(BTreeMap::new()),
+            declined: Mutex::new(Arc::new(BTreeMap::new())),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
             unsettled: Mutex::new(BTreeMap::new()),
@@ -2700,7 +2703,7 @@ impl Lake {
             .store
             .priorities()
             .map_err(|failed| failed.to_string())?;
-        let declined = self.declined.lock().expect("declined poisoned").clone();
+        let declined = Arc::clone(&self.declined.lock().expect("declined poisoned"));
         let aliases = self.store.aliases().map_err(|failed| failed.to_string())?;
         let mut read = Read {
             reader: reader.clone(),
@@ -4550,6 +4553,12 @@ impl Lake {
         Ok(RenewWantsReply {})
     }
 
+    /// How many declines it holds (stage M).
+    #[cfg(test)]
+    pub(crate) fn declines_held(&self) -> usize {
+        self.declined.lock().expect("declined poisoned").len()
+    }
+
     pub(crate) fn decline(
         &self,
         request: DeclineWantRequest,
@@ -4594,13 +4603,19 @@ impl Lake {
         {
             // For the date or range the want asked, or the latest, alone
             // (contract v19, approved 2026-10-10).
-            let mut declined = self.declined.lock().expect("declined poisoned");
+            let mut held = self.declined.lock().expect("declined poisoned");
+            let mut declined: read::Declined = held
+                .iter()
+                .filter(|(_, (_, at))| now - at < read::DECLINE_STANDS_NS)
+                .map(|(key, said)| (key.clone(), *said))
+                .collect();
             for subject in &subjects {
                 declined.insert(
                     (dataset.clone(), subject.clone(), asked.clone()),
                     (reason, now),
                 );
             }
+            *held = Arc::new(declined);
         }
         self.settle(
             &request.want_id,

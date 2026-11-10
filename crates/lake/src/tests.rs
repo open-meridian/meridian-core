@@ -2906,3 +2906,43 @@ async fn a_read_past_its_budget_is_refused_for_load_and_answered_with_room() {
     let answered = read_within(&roomy).expect("answered with room");
     assert!(!answered.rows.is_empty(), "rows answered");
 }
+
+/// Stage M (the store memory audit of 2026-11-09, item 11): the declines the
+/// lake holds are those that still stand; one past its day is let go when
+/// the next is recorded, so a source declining for months holds a day's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decline_past_its_day_is_let_go_when_the_next_is_recorded() {
+    let h = harness();
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut decline_for = |date: &str| {
+        read(&h, "reporting-1", &[AAPL], date, SourceChoice::default(), 0);
+        let want = futures_lite_recv(&mut wanted);
+        tokio::task::block_in_place(|| {
+            h.lake.decline(
+                DeclineWantRequest {
+                    want_id: want.want_id,
+                    subjects: vec![SubjectRef {
+                        entity_id: AAPL.into(),
+                        ..Default::default()
+                    }],
+                    reason: UnansweredReason::NotCovered as i32,
+                },
+                &envelope("coinbase-1", true, ""),
+            )
+        })
+        .unwrap();
+    };
+    decline_for("2026-10-07");
+    decline_for("2026-10-06");
+    assert_eq!(h.lake.declines_held(), 2);
+    h.clock.advance(2 * 86_400 * 1_000_000_000);
+    decline_for("2026-10-05");
+    assert_eq!(h.lake.declines_held(), 1, "the two past their day let go");
+}
+
+fn futures_lite_recv(heard: &mut meridian_bus::Subscription) -> ObservationsWantedEvent {
+    let delivery =
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(heard.recv()))
+            .unwrap();
+    ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap()
+}
