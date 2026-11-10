@@ -213,7 +213,10 @@ fn run() -> Result<(), String> {
             meridian_changes::set_clock(clock());
             let store = Arc::new(store);
             logged = Some((url, Arc::clone(&store)));
-            store as Arc<dyn meridian_config::Store>
+            // One snapshot shared per change (stage M; audit item 8).
+            Arc::new(meridian_config::shared::Shared::new(
+                store as Arc<dyn meridian_config::Store>,
+            )) as Arc<dyn meridian_config::Store>
         }
         None => {
             tracing::info!(

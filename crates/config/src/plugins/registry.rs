@@ -59,12 +59,13 @@ impl Plugins {
             .snapshot()?
             .catalogue
             .versions
-            .into_iter()
+            .iter()
             .find(|held| {
                 held.metadata
                     .as_ref()
                     .is_some_and(|m| m.name == name && m.version == version)
-            }))
+            })
+            .cloned())
     }
 
     pub(super) fn list_registry_plugins(

@@ -260,6 +260,19 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
+    fn launches(&self) -> Result<Vec<PluginLaunch>> {
+        Ok(self
+            .conn()?
+            .query(
+                &format!("SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch ORDER BY launch_id"),
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(launch_from)
+            .collect())
+    }
+
     fn snapshot(&self) -> Result<Snapshot> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -577,9 +590,16 @@ impl Store for PostgresStore {
             });
         }
 
+        // Each instance's latest launch alone, in the order made (stage M;
+        // audit item 8): every launch ever is `launches`.
         for row in tx
             .query(
-                &format!("SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch ORDER BY launch_id"),
+                &format!(
+                    "SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch
+                      WHERE launch_id IN (SELECT max(launch_id) FROM config_plugin_launch
+                                           GROUP BY instance_id)
+                      ORDER BY launch_id"
+                ),
                 &[],
             )
             .map_err(unavailable)?

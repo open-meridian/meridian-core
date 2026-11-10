@@ -434,7 +434,10 @@ pub struct Snapshot {
     pub records: AccessRecords,
     pub links: Vec<ExternalAccountLink>,
     pub plugins: Vec<KnownPlugin>,
-    /// Every plugin version uploaded and every launch, live or ended (W8).
+    /// Every plugin version uploaded, and each instance's latest launch,
+    /// live or ended (W8): every launch ever is read on its own
+    /// ([`Store::launches`]; stage M, the store memory audit of 2026-11-09,
+    /// item 8), so a snapshot does not grow with each launch and stop.
     pub catalogue: PluginCatalogue,
     /// What each plugin declared when it last registered, by instance (W4.8):
     /// what a setting is checked against, and how a secret is told.
@@ -764,6 +767,17 @@ pub enum Withdrawal {
 
 pub trait Store: Send + Sync {
     fn snapshot(&self) -> Result<Snapshot>;
+
+    /// The snapshot, shared: by default a snapshot of its own; a store
+    /// wrapped in [`crate::shared::Shared`] answers one per change.
+    fn snapshot_shared(&self) -> Result<std::sync::Arc<Snapshot>> {
+        self.snapshot().map(std::sync::Arc::new)
+    }
+
+    /// Every launch ever made, live or ended, in the order made: the
+    /// catalogue's history and what names a version, read on its own, never
+    /// in every snapshot (stage M; audit item 8).
+    fn launches(&self) -> Result<Vec<PluginLaunch>>;
 
     /// Insert or replace, by identifier.
     fn put_account(&self, account: &AccountRecord) -> Result<()>;

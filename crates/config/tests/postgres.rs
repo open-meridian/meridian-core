@@ -680,9 +680,20 @@ fn one_live_launch_per_instance_and_it_ends_once() {
         "free again"
     );
 
-    let launches = store.snapshot().unwrap().catalogue.launches;
+    // Every launch, read on its own (stage M; audit item 8); a snapshot
+    // holds each instance's latest.
+    let launches = store.launches().unwrap();
     assert_eq!(launches.len(), 3);
     assert_eq!(launches[0], stop.applied_to(&launch("snaptrade-1")));
+    let latest = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(
+        latest
+            .iter()
+            .filter(|l| l.instance_id == "snaptrade-1")
+            .count(),
+        1,
+        "the snapshot holds each instance's latest launch"
+    );
     // The stop names its delegation and client, and keeps its note
     // (contract v17).
     assert_eq!(launches[0].stopped_through_delegation, "DLG-9");
@@ -2748,4 +2759,44 @@ fn an_administrative_acts_record_is_kept_as_written() {
         .unwrap()
         .get(0);
     assert_eq!(kept, 30, "the record is as it was written");
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 8): a snapshot holds
+/// each instance's latest launch, so it does not grow with every launch and
+/// stop; every launch is read on its own. One instance launched and stopped
+/// 300 times: one launch in the snapshot, all 300 in its history.
+#[test]
+fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_own() {
+    let store = store("latest_launch");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let instance = "cycled-1".to_string();
+    let stop = Ending {
+        prepared_call_id: Default::default(),
+        state: PluginLaunchState::Stopped,
+        by: "local|ada".into(),
+        delegation: String::new(),
+        client: String::new(),
+        note: "Relaunched.".into(),
+        at_ns: 3,
+        failure: String::new(),
+    };
+    for _ in 0..300 {
+        assert!(store.begin_launch(&launch(&instance), "").unwrap());
+        store
+            .end_launch(&instance, &stop)
+            .unwrap()
+            .expect("was live");
+    }
+    let latest = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(
+        latest.iter().filter(|l| l.instance_id == instance).count(),
+        1
+    );
+    let history = store.launches().unwrap();
+    assert_eq!(
+        history.iter().filter(|l| l.instance_id == instance).count(),
+        300
+    );
 }

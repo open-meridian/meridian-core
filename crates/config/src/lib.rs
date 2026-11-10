@@ -35,6 +35,7 @@ pub mod registries;
 pub mod rules;
 pub mod sealing;
 pub mod service;
+pub mod shared;
 pub mod store;
 
 mod memory;

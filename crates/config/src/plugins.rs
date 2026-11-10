@@ -574,8 +574,12 @@ pub fn launch<'a>(
 // ── Serving them ────────────────────────────────────────────────────────────
 
 impl Plugins {
-    fn snapshot(&self) -> Result<Snapshot, String> {
-        self.store.snapshot().map_err(|failed| failed.to_string())
+    /// The configuration, shared until it changes (stage M; audit item 8):
+    /// one snapshot answers every question asked meanwhile.
+    fn snapshot(&self) -> Result<std::sync::Arc<Snapshot>, String> {
+        self.store
+            .snapshot_shared()
+            .map_err(|failed| failed.to_string())
     }
 
     /// Ask the launcher, from a handler's blocking thread.
@@ -1114,9 +1118,10 @@ impl Plugins {
         // history, and the lake's rows and the book's entries it recorded
         // name the version through it (the lake stamps each row's source
         // with the version its instance was launched at).
-        let mut naming: Vec<String> = snapshot
-            .catalogue
-            .launches
+        // Every launch ever, not the snapshot's latest per instance: an
+        // instance that ran this version once still names it.
+        let launches = self.store.launches().map_err(|failed| failed.to_string())?;
+        let mut naming: Vec<String> = launches
             .iter()
             .filter(|launch| launch.name == request.name && launch.version == request.version)
             .map(|launch| {
@@ -1396,8 +1401,13 @@ pub fn serve_plugins_and_registries(
         |plugins, request: PluginCatalogueRequest, _| -> Result<PluginCatalogue, String> {
             // A retired version is no longer listed (W8.15, contract v25);
             // its record is kept.
-            let mut catalogue = plugins.snapshot()?.catalogue;
+            let mut catalogue = plugins.snapshot()?.catalogue.clone();
             catalogue.versions.retain(|held| held.retired_at_ns == 0);
+            // Every launch, live or ended: the catalogue's history.
+            catalogue.launches = plugins
+                .store
+                .launches()
+                .map_err(|failed| failed.to_string())?;
             // One page of it (contract v28's amendment, ruling 696).
             catalogue::page(catalogue, &request)
         },
