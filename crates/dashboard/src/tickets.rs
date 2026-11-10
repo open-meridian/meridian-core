@@ -1473,11 +1473,40 @@ impl Filter {
 
 /// The tickets the reader may see now, newest first, cut by `filter`.
 pub async fn list(app: &App, reader: &Reader, filter: &Filter) -> Result<Vec<Ticket>, Refused> {
-    let all = app.tickets.blocking(|store| store.tickets()).await?;
-    Ok(all
-        .into_iter()
-        .filter(|t| visibility::may_see(reader, t) && filter.admits(reader, t))
-        .collect())
+    let mut kept = Vec::new();
+    each_ticket(app, |t| {
+        if visibility::may_see(reader, &t) && filter.admits(reader, &t) {
+            kept.push(t);
+        }
+    })
+    .await?;
+    Ok(kept)
+}
+
+/// How many tickets [`each_ticket`] reads at once.
+const TICKETS_AT_ONCE: usize = 500;
+
+/// Every ticket, newest first, a chunk at a time (stage M; the store memory
+/// audit of 2026-11-09, item 9): a reader keeps what it answers -- the
+/// tickets it may see, a count -- never the table and its references whole.
+pub async fn each_ticket(app: &App, mut each: impl FnMut(Ticket)) -> Result<(), Refused> {
+    let mut before = String::new();
+    loop {
+        let after = before.clone();
+        let chunk = app
+            .tickets
+            .blocking(move |store| store.tickets_before(&after, TICKETS_AT_ONCE))
+            .await?;
+        let Some(last) = chunk.last().map(|t| t.ticket_id.clone()) else {
+            return Ok(());
+        };
+        let full = chunk.len() == TICKETS_AT_ONCE;
+        chunk.into_iter().for_each(&mut each);
+        if !full {
+            return Ok(());
+        }
+        before = last;
+    }
 }
 
 /// One ticket with its notes, if the reader may see it; one they may not is
@@ -1502,7 +1531,12 @@ pub async fn count(app: &App, reader: &Reader, by: &[String]) -> Result<Value, R
     let by_concerns = by.iter().any(|b| b == "concerns");
     let by_state = by.iter().any(|b| b == "state");
     let mut counted: BTreeMap<(String, &'static str), i64> = BTreeMap::new();
-    for ticket in list(app, reader, &Filter::default()).await? {
+    // Counted as read, a chunk at a time: never the tickets held (stage M).
+    let filter = Filter::default();
+    each_ticket(app, |ticket| {
+        if !(visibility::may_see(reader, &ticket) && filter.admits(reader, &ticket)) {
+            return;
+        }
         let key = (
             if by_concerns {
                 ticket.concerns.named().to_string()
@@ -1512,7 +1546,8 @@ pub async fn count(app: &App, reader: &Reader, by: &[String]) -> Result<Value, R
             if by_state { ticket.state.as_str() } else { "" },
         );
         *counted.entry(key).or_default() += 1;
-    }
+    })
+    .await?;
     let counts: Vec<Value> = counted
         .into_iter()
         .map(|((concerns, state), tickets)| {
