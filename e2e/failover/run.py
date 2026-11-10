@@ -836,7 +836,12 @@ def driver_fixtures(s):
     restarted = happens(lambda: len([p for p in pods("instrument") if ready(p)]) >= len(members)
                         and not ({p["metadata"]["name"] for p in pods("instrument")}
                                  & {p["metadata"]["name"] for p in members})
-                        and answering("instrument") is not None, 300, every=2)
+                        and answering("instrument") is not None
+                        # With a lease (ha), held by a member started again:
+                        # the gone writer's runs out first (CI 42760537409).
+                        and holder("instrument") in ({""} | {p["metadata"]["name"]
+                                                            for p in pods("instrument")}),
+                        300, every=2)
     s.check(restarted, "the instrument store started again over the records written behind it")
     writing = happens(lambda: all(driver_acked().get(kind) for kind in ("price", "order")), 300, every=3)
     s.check(writing, "the write driver writing through the stores: prices to the lake, orders to the book "
