@@ -1117,7 +1117,7 @@ impl Lake {
         let mut scenarios = Vec::new();
         for dataset in config.readable(&reader, DataType::Scenario) {
             let rows = if request.version == 0 {
-                self.store.read_dataset(&dataset, DataType::Scenario, 0)
+                self.store.read_dataset(&dataset, DataType::Scenario, 0, 0)
             } else {
                 self.store
                     .read_dataset_versions(&dataset, DataType::Scenario)
@@ -1775,6 +1775,7 @@ impl Lake {
                 lake::EXECUTION_COST_DATASET,
                 DataType::ExecutionCost,
                 request.as_of_ns,
+                0,
             )
             .map_err(|failed| failed.to_string())?
             .into_iter()
@@ -1937,47 +1938,73 @@ impl Lake {
             dates.push(date.to_string());
             day = date.next();
         }
-        let rows = self
-            .store
-            .dated_on(dataset, &dates)
-            .map_err(|failed| failed.to_string())?;
         let status = |flag: Option<&meridian_domain::v1::DateCheck>| {
             flag.map(|check| (check.reason, check.holiday_name.clone()))
         };
-        let amendments: Vec<crate::store::ClosedDayAmendment> = rows
-            .iter()
-            .filter(|row| row.data_type().dated())
-            .filter_map(|row| {
-                let date = Date::parse(&row.meta().business_date).ok()?;
-                let now_flag = lake::closed_day(&reply, date);
-                (status(now_flag.as_ref()) != status(row.meta().closed_day.as_ref())).then(|| {
-                    crate::store::ClosedDayAmendment {
-                        dataset: dataset.to_string(),
-                        sequence: row.meta().sequence,
-                        closed_day: now_flag,
-                        why: format!(
-                            "calendar {} version {} applied",
-                            event.calendar_id, reply.version
-                        ),
-                        at_ns: now,
-                    }
+        // A chunk of the dataset's dated rows at a time, its re-checks
+        // journalled before the next is read, so what is held is a chunk,
+        // never the dataset (found 2026-11-09: a chain's dataset following
+        // its venue's calendar kept about 565,000 dated rows, every version
+        // read and decoded at once on each new version). A chunk journalled
+        // stands if a later one fails; the next version re-checks every row
+        // again, and amends only what still differs.
+        let mut amended = 0;
+        let mut after = 0;
+        let checked = loop {
+            let rows = match self
+                .store
+                .dated_on(dataset, &dates, after, crate::store::READ_CHUNK)
+            {
+                Ok(rows) => rows,
+                Err(failed) => break Err(failed.to_string()),
+            };
+            let Some(last) = rows.last() else {
+                break Ok(());
+            };
+            after = last.meta().sequence;
+            let whole = rows.len() < crate::store::READ_CHUNK;
+            let amendments: Vec<crate::store::ClosedDayAmendment> = rows
+                .iter()
+                .filter(|row| row.data_type().dated())
+                .filter_map(|row| {
+                    let date = Date::parse(&row.meta().business_date).ok()?;
+                    let now_flag = lake::closed_day(&reply, date);
+                    (status(now_flag.as_ref()) != status(row.meta().closed_day.as_ref())).then(
+                        || crate::store::ClosedDayAmendment {
+                            dataset: dataset.to_string(),
+                            sequence: row.meta().sequence,
+                            closed_day: now_flag,
+                            why: format!(
+                                "calendar {} version {} applied",
+                                event.calendar_id, reply.version
+                            ),
+                            at_ns: now,
+                        },
+                    )
                 })
-            })
-            .collect();
-        if !amendments.is_empty() {
-            self.store
-                .amend_closed_day(&amendments)
-                .map_err(|failed| failed.to_string())?;
+                .collect();
+            drop(rows);
+            if !amendments.is_empty() {
+                if let Err(failed) = self.store.amend_closed_day(&amendments) {
+                    break Err(failed.to_string());
+                }
+                amended += amendments.len();
+            }
+            if whole {
+                break Ok(());
+            }
+        };
+        if amended > 0 {
             self.publish_control();
             tracing::info!(
                 dataset,
                 calendar_id = event.calendar_id,
                 version = reply.version,
-                amended = amendments.len(),
+                amended,
                 "the closed-day flag re-checked on a calendar's new version"
             );
         }
-        Ok(amendments.len())
+        checked.map(|()| amended)
     }
 
     fn publish(&self, dataset: &str, row: &Observation) {

@@ -653,20 +653,18 @@ impl Lake {
         let config = self.config();
         let mut reports = BTreeMap::new();
         for dataset in config.readable(reader, DataType::HoldingsReport) {
-            let rows = if published_as_of_ns != 0 {
-                let every = self
-                    .store
-                    .read_dataset_versions(&dataset, DataType::HoldingsReport)
-                    .map_err(|failed| failed.to_string())?;
-                read::as_published(
-                    crate::store::recorded_by(every, as_of_ns),
+            // Each report's version in force by the published-time cut,
+            // chosen as the store reads, never every version held (found
+            // 2026-11-09).
+            let rows = self
+                .store
+                .read_dataset(
+                    &dataset,
+                    DataType::HoldingsReport,
+                    as_of_ns,
                     published_as_of_ns,
                 )
-            } else {
-                self.store
-                    .read_dataset(&dataset, DataType::HoldingsReport, as_of_ns)
-                    .map_err(|failed| failed.to_string())?
-            };
+                .map_err(|failed| failed.to_string())?;
             let allowed = config.fields_for(&dataset, reader).unwrap_or_default();
             for mut row in rows {
                 if !include_quarantined && crate::store::invalid(&row) {
