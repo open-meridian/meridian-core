@@ -2454,10 +2454,26 @@ FLOOD_BAND = {"price": 25, "order": 15}
 STANDING_BACK = 30
 
 
+def standing_lines():
+    """The standing driver's job IDs, each with when it was held (ms)."""
+    said = []
+    for line in driver_file("drive-standing", "/tmp/standing.log").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "HELD" and parts[2].isdigit():
+            said.append((parts[1], int(parts[2])))
+    return said
+
+
 def standing_held():
     """The standing driver's job IDs, in the order it was held under each."""
-    return [line.split()[1] for line in driver_file("drive-standing", "/tmp/standing.log").splitlines()
-            if line.startswith("HELD ")]
+    return [job for job, _ in standing_lines()]
+
+
+def standing_settled(seconds=45):
+    """Its job held for `seconds` without moving: two renewals at least, so
+    the coordinators' set has settled after whatever came before."""
+    lines = standing_lines()
+    return bool(lines) and time.time() * 1000 - lines[-1][1] >= seconds * 1000
 
 
 def standing_holder(job_id):
@@ -2471,19 +2487,35 @@ def standing_holder(job_id):
     return ""
 
 
+def coordinators_said():
+    """Each coordinator's restarts and its last standing lines, for a check
+    that found none holding the job."""
+    said = []
+    for pod in pods("analytics-coordinator"):
+        name = pod["metadata"]["name"]
+        logs = kubectl("logs", name, "-c", "analytics-coordinator", check=False).stdout.decode(
+            errors="replace").splitlines()
+        standing = [line for line in logs if "standing" in line][-3:]
+        said.append(f"{name} restarts={restarts(name)} lines={len(logs)} standing={standing}")
+    return "; ".join(said)
+
+
 def standing_coordinator(s):
     print("F: standing-coordinator: the coordinator holding a standing job killed", flush=True)
-    held = happens(lambda: standing_held(), 300, every=2)
-    s.check(held, f"standing-coordinator: the driver holds a standing job ({standing_held()[-1:]})")
-    if not held:
+    settled = happens(standing_settled, 300, every=3)
+    s.check(settled, f"standing-coordinator: the driver holds a standing job, settled ({standing_held()[-1:]})")
+    if not settled:
         return
-    job_id = standing_held()[-1]
-    holder = ""
-    found = happens(lambda: bool(standing_holder(job_id)), 60, every=2)
-    if found:
+    holder, job_id = "", ""
+
+    def found():
+        nonlocal holder, job_id
+        job_id = standing_held()[-1]
         holder = standing_holder(job_id)
-    s.check(found, f"standing-coordinator: {job_id} held by {holder or 'no coordinator found'}")
-    if not found:
+        return bool(holder)
+    located = happens(found, 60, every=2)
+    s.check(located, f"standing-coordinator: {job_id} held by {holder or 'no coordinator found: ' + coordinators_said()}")
+    if not located:
         return
     began = time.time()
     kubectl("delete", "pod", holder, "--grace-period=0", "--force", "--wait=false", check=False)
