@@ -587,18 +587,33 @@ async def drive_desk(plugin):
 #
 # - `pressure`: FLOOD_PRESSURE readers at once, each reading the whole of its
 #   dataset by valid time, page after page -- reads past the lake's budget
-#   (the resilience spec's section 10a), refused REFUSAL_REASON_OVERLOADED;
+#   (the resilience spec's section 10a), refused REFUSAL_REASON_OVERLOADED.
+#   Each reader is impatient, as a client in a retry storm is: a read not
+#   answered within FLOOD_PATIENCE is given up and asked again at once. What
+#   the lake already took keeps its turn there, so the flood's demand on
+#   each member answering it is no longer capped by the flooder's own 32 in
+#   flight at its sidecar (`sidecar.limits.inFlight`), which, split over the
+#   lake's writer and its reader in ha, matched their 16 turns each
+#   (MERIDIAN_HANDLERS_AT_ONCE) and was refused only as the split ran
+#   uneven (8, 23 and 0 times in part 3's three runs); no bound is changed;
 # - `noisy`: FLOOD_NOISY readers at once, each asking for one page as fast
 #   as it is answered -- past this plugin's share at its sidecar, refused
 #   REFUSAL_REASON_RATE_LIMITED.
 #
 # Every five seconds it says what it heard, as `FLOOD <mode> answered=N
-# overloaded=N rate_limited=N other=N retry_after_min=S`, kept in
-# /tmp/flood.log: answered reads, each refusal for load by its reason, and
-# the least retry-after a refusal carried.
+# overloaded=N rate_limited=N other=N retry_after_min=S other_<why>=N...`,
+# kept in /tmp/flood.log: answered reads, each refusal for load by its
+# reason, the least retry-after a refusal carried, and what each `other` was
+# -- `other_timeout` a read given up, `other_<CODE>` a gRPC status (with
+# `_<reason>` where it named a refusal reason that is not for load).
 
 FLOOD_ROWS = 20000
 FLOOD_PRESSURE = 32
+# How long a pressure reader waits for a read before it gives it up and asks
+# again, in seconds: past a page's answer at the lake's guarded read rate
+# unloaded, well short of what sixteen waiting for two answers built at once
+# take.
+FLOOD_PATIENCE = 2
 FLOOD_NOISY = 160
 FLOOD_MODE = "/tmp/flood"
 REFUSAL_METADATA = "meridian-refusal-bin"
@@ -676,7 +691,13 @@ async def drive_flood(plugin):
     await flood_seed(plugin, dataset)
     stub = plugin._operations()
     heard = {"answered": 0, "overloaded": 0, "rate_limited": 0, "other": 0}
+    # What each `other` was: a read given up, or a status not for load.
+    others = {}
     least = [0]
+
+    def other(why):
+        heard["other"] += 1
+        others[why] = others.get(why, 0) + 1
 
     def refused(failed):
         reason, retry = refusal_of(failed)
@@ -685,9 +706,14 @@ async def drive_flood(plugin):
         elif failed.code() == grpc.StatusCode.RESOURCE_EXHAUSTED and reason == RATE_LIMITED:
             heard["rate_limited"] += 1
         else:
-            heard["other"] += 1
+            other(failed.code().name + (f"_{reason}" if reason else ""))
             return
         least[0] = retry if not least[0] else min(least[0], retry)
+
+    def what_heard(mode):
+        said = (f"FLOOD {mode} answered={heard['answered']} overloaded={heard['overloaded']} "
+                f"rate_limited={heard['rate_limited']} other={heard['other']} retry_after_min={least[0]}")
+        return said + "".join(f" other_{why}={n}" for why, n in sorted(others.items()))
 
     def asked(cursor, page):
         return ops.ListPricesParams(
@@ -700,13 +726,14 @@ async def drive_flood(plugin):
             cursor = ""
             try:
                 while flood_mode() == mode:
-                    listed = await bounded(stub.ListPrices(asked(cursor, 500)))
+                    listed = await asyncio.wait_for(
+                        stub.ListPrices(asked(cursor, 500)), FLOOD_PATIENCE)
                     cursor = listed.next_cursor
                     if not cursor:
                         break
                 heard["answered"] += 1
             except asyncio.TimeoutError:
-                heard["other"] += 1
+                other("timeout")
             except grpc.aio.AioRpcError as failed:
                 refused(failed)
                 await asyncio.sleep(0.05)
@@ -717,15 +744,14 @@ async def drive_flood(plugin):
                 await bounded(stub.ListPrices(asked("", 1)))
                 heard["answered"] += 1
             except asyncio.TimeoutError:
-                heard["other"] += 1
+                other("timeout")
             except grpc.aio.AioRpcError as failed:
                 refused(failed)
 
     async def said(mode):
         while flood_mode() == mode:
             await asyncio.sleep(5)
-            line = (f"FLOOD {mode} answered={heard['answered']} overloaded={heard['overloaded']} "
-                    f"rate_limited={heard['rate_limited']} other={heard['other']} retry_after_min={least[0]}")
+            line = what_heard(mode)
             say(line)
             kept("/tmp/flood.log", line)
 
@@ -802,12 +828,12 @@ async def drive_flood(plugin):
         elif mode in ("pressure", "noisy"):
             for key in heard:
                 heard[key] = 0
+            others.clear()
             least[0] = 0
             readers = [whole(mode) for _ in range(FLOOD_PRESSURE)] if mode == "pressure" else \
                 [one_page(mode) for _ in range(FLOOD_NOISY)]
             await asyncio.gather(said(mode), *readers)
-            line = (f"FLOOD {mode} answered={heard['answered']} overloaded={heard['overloaded']} "
-                    f"rate_limited={heard['rate_limited']} other={heard['other']} retry_after_min={least[0]} END")
+            line = what_heard(mode) + " END"
             say(line)
             kept("/tmp/flood.log", line)
         await asyncio.sleep(1.0)
