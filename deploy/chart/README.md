@@ -204,6 +204,19 @@ each still overridable by its own value:
 | `dashboard.replicaCount` | 1 | 2 |
 | `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount` | 1 | 2 |
 
+Reader members are a value of their own, in either profile:
+`<store>.readers` (lake, bor, instrument; 0 by default) runs that many of the
+store's own image in a reads-only mode, as a Deployment `<store>-reader`
+beside the writer's. A reader serves the store's reads in its query queue
+group, its hot layer kept current by following the writer's change log, and
+is ready while its lag is under `<store>.readyLagMs`. A read naming a
+watermark the reader has not reached waits up to that bound or the call's
+deadline less a second, then is answered from the primary database.
+`<store>.database.readExistingSecret` names a Secret holding a Postgres read
+replica's URL, under the store's database key: a reader answers the record's
+past (as of a time, ranges, past dates, history) from it once the replica has
+reached the read's watermark, and from the primary otherwise.
+
 `ha` needs the deployment's key in a Kubernetes Secret named by
 `key.existingSecret`: the conductor's standby runs on another node, and a key
 the conductor generated into a volume is mounted on one node at a time. The

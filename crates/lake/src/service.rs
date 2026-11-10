@@ -338,6 +338,10 @@ struct Wants {
 /// The lake, serving.
 pub struct Lake {
     bus: Arc<Bus>,
+    /// A reader member (contract v30, stage B): it serves reads alone, and
+    /// does none of the writer's acts -- no want asked or kept, nothing heard
+    /// kept, no sweep or retention -- holding what it hears in memory only.
+    reads_only: bool,
     store: Arc<dyn Store>,
     pub(crate) clock: Arc<dyn Clock>,
     config: RwLock<DataConfig>,
@@ -507,8 +511,10 @@ impl Lake {
             .flatten()
             .map(|event| DataConfig::from_event(&event))
             .unwrap_or_default();
+        let reads_only = bus.reads_only();
         Arc::new(Lake {
             bus,
+            reads_only,
             clock,
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
@@ -2192,6 +2198,11 @@ impl Lake {
     /// read may still hear its want served: the want published by this
     /// read, or by another within [`SERVED_WAIT`] (ruling 734).
     fn want(&self, asks: Vec<read::Ask>, reader: &Reader) -> Vec<Waiting> {
+        // A want is the writer's act, asked and kept by it (decisions/031):
+        // a reader answers what the record holds and asks for nothing.
+        if self.reads_only {
+            return Vec::new();
+        }
         let mut waitings = Vec::new();
         let now = self.clock.now_ns();
         let config = self.config();
@@ -4673,6 +4684,10 @@ impl Lake {
         *self.config.write().expect("config poisoned") = DataConfig::from_event(event);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A reader holds it; the writer keeps it.
+        if self.reads_only {
+            return;
+        }
         if let Err(failed) = self.store.keep_configuration(event) {
             tracing::warn!(%failed, "the data configuration was not kept");
         }
@@ -6255,7 +6270,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             every.tick().await;
             let lake = Arc::clone(&sweeping);
             let _ = tokio::task::spawn_blocking(move || {
-                lake.sweep_wants();
+                if !lake.reads_only {
+                    lake.sweep_wants();
+                }
                 lake.return_freed();
             })
             .await;
@@ -6272,6 +6289,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     });
     let keeping = Arc::clone(&lake);
     tokio::spawn(async move {
+        if keeping.reads_only {
+            return;
+        }
         let mut every = tokio::time::interval(RETENTION_EVERY);
         loop {
             every.tick().await;
@@ -6299,13 +6319,16 @@ impl Lake {
                     let said = (record.asset_class, record.instrument_type);
                     let stays = record.instrument_id;
                     if !event.replaced_instrument_id.is_empty() && !stays.is_empty() {
-                        if let Err(failed) =
-                            self.store
-                                .keep_alias(&event.replaced_instrument_id, &stays, now)
-                        {
-                            tracing::warn!(%failed, "a replacement was not kept");
+                        // A reader holds what it heard; the writer keeps it.
+                        if !self.reads_only {
+                            if let Err(failed) =
+                                self.store
+                                    .keep_alias(&event.replaced_instrument_id, &stays, now)
+                            {
+                                tracing::warn!(%failed, "a replacement was not kept");
+                            }
+                            self.publish_control();
                         }
-                        self.publish_control();
                         self.unsettled
                             .lock()
                             .expect("unsettled poisoned")
@@ -6314,6 +6337,12 @@ impl Lake {
                     }
                 }
             }
+            // Counted and re-checked by the writer alone (a reader keeps
+            // nothing).
+            "meridian.v1.MissingInstrumentDetectedEvent"
+            | "meridian.v1.MissingVenueDetectedEvent"
+            | "meridian.v1.CalendarAppliedEvent"
+                if self.reads_only => {}
             "meridian.v1.MissingInstrumentDetectedEvent" => {
                 if let Ok(event) = MissingInstrumentDetectedEvent::decode(&envelope.payload[..]) {
                     self.miss(&event.publisher_instance_id, now);

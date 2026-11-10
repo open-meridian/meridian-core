@@ -1219,3 +1219,43 @@ A plugin's share at its sidecar (stage M; section 10a): the chart's
 {{- end }}
 {{- end }}
 {{- end -}}
+
+{{/*
+A store's reader members (contract v30, stage B; spec/a-deployment-scales-
+out-and-fails-over-by-configuration sections 1, 5 and 11): `<store>.readers`
+of them, 0 by default, for the lake, the book and the instrument store. The
+store's own Deployment again, rendered as `rendered`, in a reads-only mode
+(MERIDIAN_MEMBER_MODE=reader): its own name and component label
+(`<store>-reader`), so the writer's selector never counts it, and the same
+instance, so it joins the store's query queue group; ready while its lag
+behind the writer's change log is under `<store>.readyLagMs`. With
+`<store>.database.readExistingSecret` set, the record's past is read from
+that read replica (its URL under the store's database key); unset, from the
+primary. Takes a dict: top, component, values, readUrl, rendered.
+*/}}
+{{- define "meridian-runtime.readers" -}}
+{{- $readers := index .values "readers" | default 0 -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $readers)) -}}
+{{- fail (printf "%s.readers is %v; a whole number of reader members, 0 for none" .component $readers) -}}
+{{- end -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
+{{- $read := dig "database" "readExistingSecret" "" .values -}}
+{{- if and (gt (int $readers) 0) (gt (int $count) 0) }}
+{{- $out := .rendered -}}
+{{- $out = regexReplaceAll "(?m)^  name: (\\S+)$" $out "  name: ${1}-reader" -}}
+{{- $out = regexReplaceAll (printf "(?m)^(\\s+)meridian.dev/component: %s$" .component) $out (printf "${1}meridian.dev/component: %s-reader" .component) -}}
+{{- $out = regexReplaceAll "(?m)^  replicas: .*$" $out (printf "  replicas: %d" (int $readers)) -}}
+{{- $env := "${1}  - name: MERIDIAN_MEMBER_MODE\n${1}    value: reader\n" -}}
+{{- if not (contains "MERIDIAN_READY_LAG_MS" $out) -}}
+{{- $env = printf "%s${1}  - name: MERIDIAN_READY_LAG_MS\n${1}    value: %s\n" $env (index .values "readyLagMs" | default 5000 | toString | quote) -}}
+{{- end -}}
+{{- if $read -}}
+{{- $key := dig "database" "key" "" .values | default .top.Values.database.key -}}
+{{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n" $env .readUrl $read $key -}}
+{{- end -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+)env:$" $out (printf "${1}env:\n%s" (trimSuffix "\n" $env)) }}
+---
+{{ $out }}
+{{- end }}
+{{- end -}}

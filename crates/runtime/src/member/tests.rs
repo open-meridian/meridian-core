@@ -83,7 +83,12 @@ async fn a_standby_follows_its_writers_tail_and_reads_a_page_it_missed() {
     meridian_changes::publish(&bus, "book", 0, &[change(1)]);
     assert!(meridian_changes::TAIL_WITHHELD.load(Ordering::SeqCst) > withheld);
 
-    let following = tokio::spawn(follow(Arc::clone(&bus), "book", Duration::from_secs(5)));
+    let following = tokio::spawn(follow(
+        Arc::clone(&bus),
+        "book",
+        Duration::from_secs(5),
+        None,
+    ));
     until("the standby's interest", || {
         meridian_changes::followed(&bus, "book")
     })
@@ -102,6 +107,84 @@ async fn a_standby_follows_its_writers_tail_and_reads_a_page_it_missed() {
     meridian_changes::publish(&bus, "book", 5, &[change(6)]);
     until("caught up after the gap", || said().lag_ms() == 0).await;
     following.abort();
+}
+
+/// What a reader applied, in order, and what it reset.
+#[derive(Default)]
+struct Applied {
+    changes: Mutex<Vec<u64>>,
+    resets: Mutex<Vec<String>>,
+}
+
+impl Apply for Applied {
+    fn apply(&self, _: &str, changes: &[Change]) {
+        self.changes
+            .lock()
+            .unwrap()
+            .extend(changes.iter().map(|c| c.sequence));
+    }
+    fn reset(&self, partition: &str) {
+        self.resets.lock().unwrap().push(partition.to_string());
+    }
+}
+
+/// A reader follows from the heads it started at, applying each change once
+/// and in order, a gap read from the writer; its position is what it has
+/// applied, and a partition first heard is reset and held from its head.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_applies_each_change_in_order_from_the_heads_it_started_at() {
+    let bus = Arc::new(Bus::single(
+        "member-test-reader",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Log {
+        head: AtomicU64::new(2),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    struct Primary;
+    impl meridian_bus::read_after::Position for Primary {
+        fn heads(&self, _: &[String]) -> Result<HashMap<String, u64>, String> {
+            Ok([("P0".to_string(), 99)].into())
+        }
+    }
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    assert!(member.is_reader());
+    let followed = member
+        .read(
+            &bus,
+            [("P0".to_string(), 2)].into(),
+            applied.clone(),
+            Arc::new(Primary),
+        )
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.head.store(3, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 2, &[change(3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+    // 4 and 5 missed, then 6: read from the writer, applied in order.
+    log.head.store(6, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 5, &[change(6)]);
+    until("6 applied", || followed.heads().get("P0") == Some(&6)).await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5, 6]);
+    // Its reads are held to what it applied.
+    assert_eq!(
+        bus.reads_after().hold(
+            "platform.book.query.list-positions",
+            &meridian_pb::v1::Watermark {
+                partitions: vec![meridian_pb::v1::PartitionSequence {
+                    partition: "P0".into(),
+                    sequence: 6,
+                }],
+            },
+        ),
+        Ok(meridian_bus::read_after::Held::Here)
+    );
+    assert!(applied.resets.lock().unwrap().is_empty());
 }
 
 #[test]

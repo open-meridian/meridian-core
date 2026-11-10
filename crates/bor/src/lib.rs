@@ -63,6 +63,7 @@ pub mod order_reads;
 pub mod order_service;
 pub mod orders;
 pub mod postgres;
+pub mod reader;
 pub mod reads;
 pub mod service;
 pub mod snapshot;

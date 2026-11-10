@@ -32,6 +32,7 @@ pub mod ids;
 pub mod list;
 pub mod one_id;
 pub mod postgres;
+pub mod reader;
 pub mod reask;
 pub mod record;
 pub mod replace;
@@ -71,6 +72,14 @@ pub struct InstrumentService {
 impl InstrumentService {
     pub fn new(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn service::Clock>) -> Self {
         Self { bus, store, clock }
+    }
+
+    /// A reader member's (contract v30, stage B): the handlers alone, the
+    /// bus serving the reads it was told to; none of the writer's keeping,
+    /// reacting or asking the platform again.
+    pub fn serve_reads(self) {
+        let writing = Arc::new(Mutex::new(()));
+        service::serve_all(&self.bus, self.store, self.clock, writing);
     }
 
     /// Subscribe, register the handlers, and hand back the loop to run.

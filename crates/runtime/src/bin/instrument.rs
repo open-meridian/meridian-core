@@ -33,6 +33,33 @@ fn main() {
     }
 }
 
+/// What a reader of the instrument store serves: its reads that write
+/// nothing and ask nothing of the platform. Every other is the writer's.
+const READER_SERVES: &[&str] = &[
+    meridian_instrument::service::RESOLVE_INSTRUMENT,
+    "platform.reference.query.read-instrument-history",
+    "platform.reference.query.list-replacements",
+    "platform.reference.query.list-calendars",
+    "platform.reference.query.read-calendar",
+    "platform.reference.query.list-templates",
+    "platform.reference.query.read-template",
+    "platform.reference.query.list-event-groups",
+    "platform.reference.query.compute-date",
+];
+
+/// An instrument reader's following: its hot layer emptied by each change.
+struct RecordsFollow(Arc<meridian_instrument::hot::HotStore>);
+
+impl meridian_runtime::member::Apply for RecordsFollow {
+    fn apply(&self, _: &str, _: &[meridian_changes::Change]) {
+        self.0.follow();
+    }
+
+    fn reset(&self, _: &str) {
+        self.0.follow();
+    }
+}
+
 fn run() -> Result<(), String> {
     // Every path this member needs, probed from inside its pod: what
     // `meridian status` and `doctor` read (step 3b).
@@ -114,9 +141,11 @@ fn run() -> Result<(), String> {
         records_mib = bound >> 20,
         "the instrument store's hot layer is bounded"
     );
-    let store: Arc<dyn meridian_instrument::Store> = Arc::new(
-        meridian_instrument::hot::HotStore::new(postgres.clone(), bound),
-    );
+    let hot = Arc::new(meridian_instrument::hot::HotStore::new(
+        postgres.clone(),
+        bound,
+    ));
+    let store: Arc<dyn meridian_instrument::Store> = hot.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "instrument-1".into());
     // The analytics component, whose resolves are read-only (contract v28's
@@ -131,6 +160,51 @@ fn run() -> Result<(), String> {
         // Its working budget (stage M), less the hot layer's bound.
         meridian_runtime::install_budget("instrument", bound as u64)?;
         let bus = bus_from_env(&instance_id).await?;
+        // A reader member (contract v30, stage B): records by ID, what each
+        // became and their history, never writing or asking the platform.
+        if member.is_reader() {
+            bus.serve_only(|topic| READER_SERVES.contains(&topic));
+            let replica = match var("MERIDIAN_INSTRUMENT_READ_DATABASE_URL") {
+                None => None,
+                Some(read_url) => {
+                    let replica = Arc::new(wait_for_store(
+                        "the instrument store's read replica",
+                        &read_url,
+                        |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+                        |store| {
+                            store
+                                .verify()
+                                .map_err(|failed| Wait::NotYet(failed.to_string()))
+                        },
+                    )?);
+                    let at: Arc<dyn meridian_bus::read_after::Position> =
+                        Arc::new(meridian_runtime::member::LogHeads(replica.clone()));
+                    Some((replica as Arc<dyn meridian_instrument::Store>, at))
+                }
+            };
+            let reading = Arc::new(meridian_instrument::reader::ReaderStore::new(
+                hot.clone(),
+                postgres.clone(),
+                replica,
+            ));
+            InstrumentService::new(bus.clone(), reading, clock()).serve_reads();
+            member.read(
+                &bus,
+                Default::default(),
+                Arc::new(RecordsFollow(hot.clone())),
+                Arc::new(meridian_runtime::member::LogHeads(postgres.clone())),
+            )?;
+            meridian_runtime::background(async move {
+                report_inward_forever(bus, "instrument", 0).await
+            });
+            tracing::info!(
+                instance_id,
+                "the instrument store is serving reads, as a reader"
+            );
+            shutdown().await;
+            tracing::info!("stopping");
+            return Ok(());
+        }
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.

@@ -343,7 +343,7 @@ fn pruned(rows: Vec<Observation>) -> Vec<Observation> {
 /// Whether a read is one memory may answer: the latest in force at the
 /// latest valid time, as recorded by now or by a cut-off at or after every
 /// row each key held reflects (checked key by key).
-fn answers_latest(query: &Query) -> bool {
+pub(crate) fn answers_latest(query: &Query) -> bool {
     query.latest_only
         && matches!(query.when, When::Latest { at_ns: 0 })
         && query.published_as_of_ns == 0
@@ -599,6 +599,61 @@ impl HotStore {
             if key.0 == dataset {
                 loading.spoiled = true;
             }
+        }
+        layer.counts = Counts::default();
+    }
+
+    /// A reader member's following (contract v30, stage B): changes the
+    /// writer committed to `partition`, applied to what is held as the
+    /// writer's own commit applies them -- a dataset's rows added, anything
+    /// else that could change what its keys answer evicting the dataset --
+    /// and a closed day's amendment or an assessment, which can change any
+    /// dataset's rows, evicting everything held.
+    pub fn follow(&self, partition: &str, changes: &[meridian_changes::Change]) {
+        if partition == meridian_changes::CONTROL {
+            let amended = changes.iter().any(|change| {
+                change.kind == crate::store::CONTROL_CLOSED_DAY
+                    || change.kind == crate::store::CONTROL_ASSESSMENT
+            });
+            if amended {
+                self.evict_all();
+            }
+            return;
+        }
+        let mut rows = Vec::with_capacity(changes.len());
+        for change in changes {
+            // Rows served and not kept were never the record's, nor held.
+            if change.kind == "served" {
+                continue;
+            }
+            match DataType::named(&change.kind)
+                .and_then(|data_type| Observation::decode(data_type, &change.body).ok())
+            {
+                Some(row) => rows.push(row),
+                None => {
+                    self.evict_dataset(partition);
+                    return;
+                }
+            }
+        }
+        self.committed(partition, &rows);
+    }
+
+    /// Everything held of a dataset dropped: a reader's partition whose
+    /// changes it did not follow.
+    pub fn forget_dataset(&self, dataset: &str) {
+        self.evict_dataset(dataset);
+    }
+
+    fn evict_all(&self) {
+        let mut layer = self.layer();
+        layer.latest.retain(|_| false);
+        layer.listings.retain(|_| false);
+        for loading in layer.loading_latest.values_mut() {
+            loading.spoiled = true;
+        }
+        for loading in layer.loading_listings.values_mut() {
+            loading.spoiled = true;
         }
         layer.counts = Counts::default();
     }

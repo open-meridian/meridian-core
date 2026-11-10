@@ -197,7 +197,15 @@ pub struct Bus {
     /// `read_after` (contract v30, stage B): the positions of the stores this
     /// process serves the reads of, and a sidecar's session.
     reads: Arc<crate::read_after::Reads>,
+
+    /// A reader member's serve mode (contract v30, stage B; the resilience
+    /// spec's section 1): the topics it serves, every other declined. Unset,
+    /// as every writer and every other component, everything is served.
+    serves_only: RwLock<Option<Serves>>,
 }
+
+/// Which topics a reader member serves.
+type Serves = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What [`Bus::observe_calls`] is told of each call: its topic, when it was
 /// asked and how long its answer took. Never its payload.
@@ -280,6 +288,7 @@ impl Bus {
             clock,
             observer: RwLock::new(None),
             reads: Arc::default(),
+            serves_only: RwLock::new(None),
         }
     }
 
@@ -368,6 +377,14 @@ impl Bus {
     /// `work`, so two subscriptions of one process to one topic for
     /// different work each hear it. At most once.
     pub fn subscribe_shared(&self, pattern: &str, work: &str) -> Subscription {
+        // A reader member does none of its component's shared work: each
+        // message would otherwise reach it rather than the writer, which
+        // does that work (contract v30, stage B). Its subscription ends at
+        // once.
+        if self.serves_only.read().expect("serves poisoned").is_some() {
+            let (_, rx) = tokio::sync::mpsc::channel(1);
+            return Subscription::new(rx, pattern, Default::default());
+        }
         let group = format!("{}.{work}", self.instance_id);
         self.backend_for(pattern).subscribe_shared(pattern, &group)
     }
@@ -381,6 +398,9 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
+        if self.declines(topic) {
+            return;
+        }
         let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
@@ -399,6 +419,31 @@ impl Bus {
     /// member keeps its position here, a sidecar its session.
     pub fn reads_after(&self) -> &Arc<crate::read_after::Reads> {
         &self.reads
+    }
+
+    /// Serve only the topics `serves` says, from now on: a store's reader
+    /// member, the same image in a reads-only mode the chart sets (contract
+    /// v30, stage B; the resilience spec's section 1). Every other topic its
+    /// component would serve is left to the writer -- a member not in a
+    /// topic's queue group is never asked it -- and its shared work too.
+    pub fn serve_only(&self, serves: impl Fn(&str) -> bool + Send + Sync + 'static) {
+        *self.serves_only.write().expect("serves poisoned") = Some(Arc::new(serves));
+    }
+
+    /// Whether this process is a reader member, serving reads alone.
+    pub fn reads_only(&self) -> bool {
+        self.serves_only.read().expect("serves poisoned").is_some()
+    }
+
+    fn declines(&self, topic: &str) -> bool {
+        let serves = self.serves_only.read().expect("serves poisoned");
+        match serves.as_ref() {
+            Some(serves) if !serves(topic) => {
+                tracing::debug!(topic, "a reader: left to the writer");
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A store's read held to its `read_after` (W4.4): never answered from
@@ -429,6 +474,9 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
+        if self.declines(topic) {
+            return;
+        }
         let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
@@ -671,6 +719,53 @@ impl Bus {
             // its plugin's reads (stage B); unset reads from the nearest member.
             read_after: stamp.read_after.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod reads_only_tests {
+    use super::*;
+    use crate::MemoryBackend;
+    use meridian_clock::ManualClock;
+
+    #[tokio::test]
+    async fn a_reader_serves_only_its_reads_and_does_no_shared_work() {
+        let bus = Bus::single(
+            "lake-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(ManualClock::at(1_790_553_600_000_000_000)),
+        );
+        bus.serve_only(crate::read_after::is_read);
+        assert!(bus.reads_only());
+        bus.serve("platform.lake.query.list-quotes", |_| {
+            Ok(("t".into(), Vec::new()))
+        });
+        bus.serve("platform.lake.command.record-prices", |_| {
+            Ok(("t".into(), Vec::new()))
+        });
+        assert!(bus
+            .call(
+                "platform.lake.query.list-quotes",
+                "t",
+                Vec::new(),
+                None,
+                None
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            bus.call(
+                "platform.lake.command.record-prices",
+                "t",
+                Vec::new(),
+                None,
+                None
+            )
+            .await,
+            Err(BusError::NoHandler(_))
+        ));
+        let mut shared = bus.subscribe_shared("platform.reference.event.*", "work");
+        assert!(shared.recv().await.is_none(), "ended at once");
     }
 }
 
@@ -982,6 +1077,7 @@ mod tests {
             clock: Arc::new(ManualClock::at(NOW)),
             observer: RwLock::new(None),
             reads: Arc::default(),
+            serves_only: RwLock::new(None),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

@@ -92,6 +92,14 @@ ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
 
 STORES = ["lake", "bor", "instrument", "street", "conductor", "launcher"]
+# The stores with a reader member in the HA runs (contract v30, stage B),
+# and how many each.
+READ_STORES = ["lake", "bor"]
+READERS = 1
+# TEST ONLY: where a reader is told to hold behind, while the file is there
+# (MERIDIAN_READER_HOLD_FILE, which the chart never sets): in its pod's own
+# scratch, the ready volume.
+HOLD_FILE = "/run/meridian-ready/hold"
 BINARY = {c: f"meridian-{c}" for c in STORES}
 
 # The bounds each profile is held to (rulings 1048 and 1056), in seconds.
@@ -414,6 +422,10 @@ def install(s):
         # the dashboard and analytics at two.
         if PROFILE != "reconfigure":
             values += ["--set", "resilience.profile=ha"]
+            # A reader beside the lake's and the book's writer and standby
+            # (contract v30, stage B; the spec's section 15 shape), each
+            # serving its store's reads in the store's queue group.
+            values += ["--set", f"lake.readers={READERS}", "--set", f"bor.readers={READERS}"]
         if TLS:
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
@@ -424,6 +436,9 @@ def install(s):
         values += driver_values()
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
+    if PROFILE == "ha":
+        # The book's reader may be held behind on purpose (reader_held).
+        kubectl("set", "env", f"deployment/{FULL}-bor-reader", f"MERIDIAN_READER_HOLD_FILE={HOLD_FILE}")
     if public:
         driver_trusted(public)
     if PROFILE == "ha":
@@ -688,6 +703,15 @@ def shape(s):
         s.check(modes == ["standby", "writer"], f"{component}: one writer, one standby ({modes})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
+    # The readers (contract v30, stage B): each store's reader ready, in the
+    # reader mode, a Deployment of its own beside the writer's.
+    for component in READ_STORES:
+        reader = f"{component}-reader"
+        settled = happens(lambda r=reader: len(pods(r)) == READERS and all(ready(p) for p in pods(r)), 300)
+        s.check(settled, f"{component}: {READERS} reader ready ({len(pods(reader))})")
+        modes = [(probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
+                 for p in pods(reader)]
+        s.check(modes == ["reader"] * READERS, f"{component}: its reader says it reads ({modes})")
     tolerated = all(
         any(t.get("key") == "node.kubernetes.io/unreachable" and t.get("tolerationSeconds") == 30
             for t in p["spec"].get("tolerations", []))
@@ -2643,6 +2667,55 @@ def flood(s, failure, mode, reason, component):
            "retry_after_min_s": heard.get("retry_after_min", 0)})
 
 
+# ── A reader held behind (contract v30, stage B) ──────────────────────────
+
+def reader_log(pod_name, said, since="10m"):
+    """How many times the reader's log says `said`, in the last `since`."""
+    logs = kubectl("logs", pod_name, "-c", "bor", f"--since={since}", check=False, quiet=True)
+    return logs.stdout.decode(errors="replace").count(said) if logs.returncode == 0 else 0
+
+
+FROM_PRIMARY = "answered from the primary"
+
+
+def reader_held(s):
+    """The book's reader held behind its writer on purpose while the oms
+    driver appends and reads its accounts through its sidecar: each read
+    names the watermark of the driver's own last write (read_after, stamped
+    by the sidecar), so one the held reader takes waits up to its bound or
+    the call's deadline less a second and is answered from the primary,
+    never from behind it, and the reader stays ready. Let go, it reads the
+    gap from the writer and answers from its own record again. What every
+    read saw is Elle's to hold, after the run (tools/elle-check.sh): every
+    acknowledged append in every later read, whichever member answered it
+    (the spec's section 5, "Tested")."""
+    print("R: a reader held behind answers from the primary", flush=True)
+    readers = pods("bor-reader")
+    if not readers:
+        s.check(False, "reader held: the book has no reader")
+        return
+    reader = readers[0]["metadata"]["name"]
+    before = reader_log(reader, FROM_PRIMARY)
+    kubectl("exec", reader, "-c", "bor", "--", "touch", HOLD_FILE)
+    try:
+        answered = happens(lambda: reader_log(reader, FROM_PRIMARY) > before, 90, every=3)
+        s.check(answered, f"reader held: the book's reader, behind, answered from the primary "
+                          f"({reader_log(reader, FROM_PRIMARY) - before} reads)")
+        s.check(ready_of(next((p for p in pods("bor-reader") if p["metadata"]["name"] == reader), None)),
+                "reader held: the reader stayed ready, serving")
+    finally:
+        kubectl("exec", reader, "-c", "bor", "--", "rm", "-f", HOLD_FILE, check=False)
+    # Let go: the next page heard is a gap, read from the writer; the reads
+    # after it are its own again.
+    time.sleep(5)
+    settled = reader_log(reader, FROM_PRIMARY, since="1m")
+    time.sleep(15)
+    s.check(reader_log(reader, FROM_PRIMARY, since="1m") <= settled,
+            "reader held: let go, it caught up and answers from its own record again")
+    probe_said = (probe(reader, "bor") or {}).get("member", {})
+    s.check(probe_said.get("mode") == "reader", f"reader held: still a reader ({probe_said.get('mode')})")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -2701,6 +2774,11 @@ def main():
     if PROFILE in ("ha", "scaled"):
         shape(s)
     properties(s, "the install")
+    if PROFILE == "ha" and DRIVEN:
+        try:
+            reader_held(s)
+        except SystemExit as stopped:
+            s.check(False, f"reader held: {stopped}")
     if PROFILE == "reconfigure":
         try:
             reconfigure(s)

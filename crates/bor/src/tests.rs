@@ -2350,3 +2350,51 @@ async fn each_entry_is_told_on_its_partitions_tail_and_read_back() {
     assert_eq!(page.changes, vec![change]);
     assert_eq!(page.head, entry.last_sequence);
 }
+
+/// Contract v30, stage B: a reader member's books, held over the primary,
+/// are each forgotten as the writer's change log names a new entry of the
+/// account, so none held is older than what it has applied; and it acts on
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_readers_books_follow_the_change_log_and_it_acts_on_nothing() {
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+    ));
+    let store = Arc::new(MemoryStore::new());
+    let writer: Arc<dyn Store> = Arc::new(crate::writer::Writer::new(store.clone(), bus.clone()));
+    serve(bus.clone(), writer, bus.clock());
+    resolving(&bus);
+    open(&bus).await;
+    let reader = crate::reader::ReaderStore::new(store.clone(), None, 1 << 20);
+    let before = reader.book(ACC).unwrap();
+    assert_eq!(reader.held().0, 1, "held once read");
+    let head = Store::heads(store.as_ref()).unwrap()["P0"];
+    send(
+        &bus,
+        RECORD_BREAK,
+        "meridian.v1.RecordBreakRequest",
+        &aapl_break(),
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    // Not yet followed: the book held, as it was.
+    assert_eq!(
+        reader.book(ACC).unwrap().entries.len(),
+        before.entries.len()
+    );
+    let changes = Store::read_changes(store.as_ref(), "P0", head, meridian_changes::PAGE_MOST)
+        .unwrap()
+        .changes;
+    assert!(!changes.is_empty());
+    reader.follow(&changes);
+    assert_eq!(reader.held().0, 0, "the account's book forgotten");
+    let after = reader.book(ACC).unwrap();
+    assert!(after.entries.len() > before.entries.len());
+    assert_eq!(after.breaks.len(), before.breaks.len() + 1);
+    // Every act the writer's.
+    assert!(reader.rebuild().is_err());
+    assert!(reader.adopt().is_err());
+}

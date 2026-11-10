@@ -30,6 +30,7 @@
   No key and no platform address: licensed data never leaves the deployment
   (spec/the-lake, requirement 14).
 */}}
+{{- define "meridian-runtime.lake.deployment" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -96,7 +97,7 @@ spec:
             {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "lake" "values" .Values.lake "resources" .Values.resources "heldMiB" (add 64 .Values.lake.hotLayer.latestMiB .Values.lake.hotLayer.listingsMiB) "name" "lake") | nindent 12 }}
             # How many whole answers it builds at once (rulings 957, 958).
             - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
-              value: {{ $answers | int | quote }}
+              value: {{ .Values.lake.maxConcurrentAnswers | int | quote }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -121,4 +122,9 @@ spec:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
         {{- with (include "meridian-runtime.databaseCaVolume" .) }}{{ . | nindent 8 }}{{- end }}
+{{- end -}}
+{{ include "meridian-runtime.lake.deployment" . }}
+{{- /* Its reader members (contract v30, stage B; spec section 5): the same
+       Deployment in a reads-only mode, `lake.readers` of them. */}}
+{{ include "meridian-runtime.readers" (dict "top" $ "component" "lake" "values" .Values.lake "readUrl" "MERIDIAN_LAKE_READ_DATABASE_URL" "rendered" (include "meridian-runtime.lake.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "lake" "values" $.Values.lake) }}

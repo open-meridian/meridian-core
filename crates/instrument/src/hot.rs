@@ -44,6 +44,10 @@ struct Layer {
     by_use: BTreeMap<u64, (bool, String)>,
     bytes: usize,
     tick: u64,
+    /// Moved by each eviction: a record read from the record while one was
+    /// evicted is answered and not held, as it may be older than the write
+    /// that evicted it.
+    evicted: u64,
 }
 
 impl Layer {
@@ -102,13 +106,26 @@ impl HotStore {
     }
 
     fn clear(&self) {
-        *self.layer() = Layer::default();
+        let mut layer = self.layer();
+        let evicted = layer.evicted + 1;
+        *layer = Layer {
+            evicted,
+            ..Layer::default()
+        };
     }
 
     fn evict(&self, id: &str) {
         let mut layer = self.layer();
         layer.forget(true, id);
         layer.forget(false, id);
+        layer.evicted += 1;
+    }
+
+    /// A reader member's following (contract v30, stage B): any change the
+    /// writer committed empties the layer, as any write but a record's own
+    /// does on the writer; a record read again is held again.
+    pub fn follow(&self) {
+        self.clear();
     }
 }
 
@@ -126,6 +143,7 @@ impl Store for HotStore {
                 return Ok(held);
             }
         }
+        let before = self.layer().evicted;
         let read = self.inner.by_id(instrument_id)?;
         let size = read
             .as_ref()
@@ -133,6 +151,9 @@ impl Store for HotStore {
             + instrument_id.len()
             + 160;
         let mut layer = self.layer();
+        if layer.evicted != before {
+            return Ok(read);
+        }
         layer.forget(true, instrument_id);
         let tick = layer.touch(true, instrument_id);
         layer.bytes += size;
@@ -156,8 +177,12 @@ impl Store for HotStore {
                 return Ok(held);
             }
         }
+        let before = self.layer().evicted;
         let read = self.inner.replacement_of(instrument_id)?;
         let mut layer = self.layer();
+        if layer.evicted != before {
+            return Ok(read);
+        }
         layer.forget(false, instrument_id);
         let tick = layer.touch(false, instrument_id);
         layer.bytes += instrument_id.len() + 96;
@@ -430,6 +455,32 @@ mod tests {
             .mint(record(&id, &format!("S{n}"), 1), &key, entry(&id, 1))
             .unwrap();
         id
+    }
+
+    /// Contract v30, stage B: a reader's layer is emptied by each change it
+    /// follows, so a record the writer wrote is read again, and a reader
+    /// writes nothing.
+    #[test]
+    fn a_readers_layer_follows_the_writers_changes_and_it_writes_nothing() {
+        let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let id = minted(primary.as_ref(), 1);
+        let hot = Arc::new(HotStore::new(Arc::clone(&primary), DEFAULT_BYTES));
+        let reader = crate::reader::ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        assert_eq!(hot.held().0, 1);
+        // The writer writes; held until followed.
+        primary
+            .write(record(&id, "S1", 2), 1, entry(&id, 2))
+            .unwrap();
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        hot.follow();
+        assert_eq!(hot.held().0, 0);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 2);
+        assert!(reader
+            .write(record(&id, "S1", 3), 2, entry(&id, 3))
+            .is_err());
+        assert!(reader.set_state("k", "v").is_err());
+        assert_eq!(primary.by_id(&id).unwrap().unwrap().version, 2);
     }
 
     /// Step 3a: the same answer as the record, before and after each write,

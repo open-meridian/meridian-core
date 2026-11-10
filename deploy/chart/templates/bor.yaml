@@ -15,6 +15,7 @@
   No key and no platform address: what it runs reaches the platform by way
   of the instrument store, as the street store's does.
 */}}
+{{- define "meridian-runtime.bor.deployment" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -100,4 +101,9 @@ spec:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
         {{- with (include "meridian-runtime.databaseCaVolume" .) }}{{ . | nindent 8 }}{{- end }}
+{{- end -}}
+{{ include "meridian-runtime.bor.deployment" . }}
+{{- /* Its reader members (contract v30, stage B; spec section 5): the same
+       Deployment in a reads-only mode, `bor.readers` of them. */}}
+{{ include "meridian-runtime.readers" (dict "top" $ "component" "bor" "values" .Values.bor "readUrl" "MERIDIAN_BOR_READ_DATABASE_URL" "rendered" (include "meridian-runtime.bor.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}

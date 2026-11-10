@@ -15,6 +15,17 @@
 //! took over, and serves as the writer. A writer restarted comes back as the
 //! standby.
 //!
+//! **A reader** (`<store>.readers`, contract v30, stage B; spec section 5):
+//! the same image again, in a reads-only mode the chart sets
+//! (`MERIDIAN_MEMBER_MODE=reader`). It never writes and never takes the
+//! lease: it serves its store's reads alone, in the store's query queue group
+//! beside the writer, follows the writer's change log from the primary's
+//! heads as it starts, applying each change to its hot layer ([`Apply`]),
+//! and is ready only while its lag is under `<store>.readyLagMs`. A read
+//! naming a `read_after` it has not applied waits up to its bound or the
+//! call's deadline less a margin, then is answered from the store's primary
+//! database.
+//!
 //! **Stepping down.** A writer stops writing, by ending its process, as soon
 //! as it learns it may no longer: another member holds the lease, it could
 //! not renew within its deadline (before the lease ends, so no standby
@@ -43,6 +54,7 @@ pub const STEPPED_DOWN: i32 = 75;
 pub enum Mode {
     Writer,
     Standby,
+    Reader,
 }
 
 impl Mode {
@@ -50,6 +62,7 @@ impl Mode {
         match self {
             Mode::Writer => "writer",
             Mode::Standby => "standby",
+            Mode::Reader => "reader",
         }
     }
 }
@@ -111,6 +124,9 @@ pub struct Member {
     domain: Option<&'static str>,
     lease: Option<Settings>,
     ready_lag: Duration,
+    /// A reader member (contract v30, stage B): the chart's
+    /// `MERIDIAN_MEMBER_MODE=reader`.
+    reader: bool,
 }
 
 /// What a standby's lag is held under by default where the chart says
@@ -151,11 +167,24 @@ impl Member {
                 Some(settings)
             }
         };
+        let reader = match var("MERIDIAN_MEMBER_MODE").as_deref() {
+            None | Some("") => false,
+            Some("reader") => true,
+            Some(other) => {
+                return Err(format!(
+                    "MERIDIAN_MEMBER_MODE is {other:?}; \"reader\" or unset"
+                ))
+            }
+        };
+        if reader && domain.is_none() {
+            return Err(format!("{component} keeps no store, and has no readers"));
+        }
         Ok(Self {
             component,
             domain,
             lease,
             ready_lag: Duration::from_millis(whole("MERIDIAN_READY_LAG_MS", READY_LAG_DEFAULT_MS)?),
+            reader,
         })
     }
 
@@ -166,7 +195,68 @@ impl Member {
             domain: None,
             lease: None,
             ready_lag: Duration::from_millis(READY_LAG_DEFAULT_MS),
+            reader: false,
         }
+    }
+
+    /// A reader member of `domain`'s store with `ready_lag` its bound: what
+    /// tests run.
+    pub fn reader_of(component: &'static str, domain: &'static str, ready_lag: Duration) -> Self {
+        Self {
+            component,
+            domain: Some(domain),
+            lease: None,
+            ready_lag,
+            reader: true,
+        }
+    }
+
+    /// Whether this member is a reader, serving its store's reads alone.
+    pub fn is_reader(&self) -> bool {
+        self.reader
+    }
+
+    /// Serve as a reader (contract v30, stage B): its reads held to their
+    /// `read_after` by what it has applied of the change log, from `start`
+    /// -- the primary's heads as it started, before its hot layer held
+    /// anything -- and answered from the primary, at `primary`, past their
+    /// wait. Following, each change applied to `apply` in order; ready while
+    /// its lag is under its bound. Called once the store's reads are
+    /// registered, the bus serving its reads alone.
+    pub fn read(
+        &self,
+        bus: &Arc<Bus>,
+        start: HashMap<String, u64>,
+        apply: Arc<dyn Apply>,
+        primary: Arc<dyn meridian_bus::read_after::Position>,
+    ) -> Result<Arc<Followed>, String> {
+        let domain = self
+            .domain
+            .ok_or_else(|| format!("{} keeps no store to read", self.component))?;
+        said().set_mode(Mode::Reader);
+        said().set_partitions(start.keys().cloned().collect());
+        let followed = Arc::new(Followed {
+            at: Mutex::new(start),
+        });
+        let reads = bus.reads_after();
+        reads.set_bound(self.ready_lag);
+        reads.keep(domain, Arc::clone(&followed) as Arc<_>);
+        reads.keep_primary(domain, primary);
+        tokio::spawn(follow(
+            Arc::clone(bus),
+            domain,
+            self.ready_lag,
+            Some(Following {
+                followed: Arc::clone(&followed),
+                apply,
+            }),
+        ));
+        tracing::info!(
+            component = self.component,
+            member = %member_name(),
+            "a reader: serving reads, following the writer's change log"
+        );
+        Ok(followed)
     }
 
     pub fn leased(&self) -> bool {
@@ -199,7 +289,7 @@ impl Member {
         let mut elector = Elector::new(api, settings);
         let following = self
             .domain
-            .map(|domain| tokio::spawn(follow(Arc::clone(bus), domain, self.ready_lag)));
+            .map(|domain| tokio::spawn(follow(Arc::clone(bus), domain, self.ready_lag, None)));
         if following.is_none() {
             // Nothing to follow: a standby of the launcher is ready while it
             // waits.
@@ -559,6 +649,77 @@ fn restarts_counted() -> (u32, i64) {
     STARTS.get().copied().unwrap_or((0, 0))
 }
 
+/// What a reader member applies each change it follows to: its store's hot
+/// layer (contract v30, stage B).
+pub trait Apply: Send + Sync {
+    /// `changes` of `partition`, in order, each following the last applied.
+    fn apply(&self, partition: &str, changes: &[meridian_changes::Change]);
+
+    /// Everything held of `partition` dropped: changes of it were not
+    /// followed, so nothing held of it is known to be current.
+    fn reset(&self, partition: &str);
+}
+
+/// A reader member's position: each partition's head as far as it has
+/// applied the change log, what its reads are held to.
+pub struct Followed {
+    at: Mutex<HashMap<String, u64>>,
+}
+
+impl Followed {
+    fn set(&self, partition: &str, head: u64) {
+        self.at
+            .lock()
+            .expect("followed poisoned")
+            .insert(partition.to_string(), head);
+    }
+
+    /// Each partition's head as applied.
+    pub fn heads(&self) -> HashMap<String, u64> {
+        self.at.lock().expect("followed poisoned").clone()
+    }
+}
+
+impl meridian_bus::read_after::Position for Followed {
+    fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String> {
+        let at = self.at.lock().expect("followed poisoned");
+        Ok(partitions
+            .iter()
+            .filter_map(|partition| at.get(partition).map(|head| (partition.clone(), *head)))
+            .collect())
+    }
+}
+
+/// A store's position read from its change log, partition by partition: a
+/// read replica's, or a primary's whose store reads no heads whole.
+pub struct LogHeads<L: ?Sized>(pub Arc<L>);
+
+impl<L> meridian_bus::read_after::Position for LogHeads<L>
+where
+    L: meridian_changes::ChangeLog + ?Sized,
+{
+    fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String> {
+        let mut heads = HashMap::new();
+        for partition in partitions {
+            // From past the head: the head alone, no change read.
+            match self.0.read_changes(partition, i64::MAX as u64, 1) {
+                Ok(reply) => {
+                    heads.insert(partition.clone(), reply.head);
+                }
+                Err(meridian_changes::ReadError::UnknownPartition(_)) => {}
+                Err(failed) => return Err(failed.to_string()),
+            }
+        }
+        Ok(heads)
+    }
+}
+
+/// A reader's following: where it has applied to, and what applies.
+struct Following {
+    followed: Arc<Followed>,
+    apply: Arc<dyn Apply>,
+}
+
 /// How often a standby asks its writer, which is also its interest in the
 /// tail (ruling 1062).
 const ASK_EVERY: Duration = Duration::from_secs(1);
@@ -567,9 +728,21 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 /// tail applied where it follows the last, a page missed read from the
 /// writer, and the writer asked every second -- for its liveness, and so it
 /// keeps publishing the tail. Ready while its lag is under `bound`.
-async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
+///
+/// A reader's following applies each change too, from the heads it started
+/// at: a page that follows on, a gap read from the writer, and a partition
+/// first heard (or past retention) reset and held from its head.
+async fn follow(
+    bus: Arc<Bus>,
+    domain: &'static str,
+    bound: Duration,
+    following: Option<Following>,
+) {
     let mut tail = bus.subscribe_every(&meridian_changes::every_changes_topic(domain));
-    let mut at: HashMap<String, u64> = HashMap::new();
+    let mut at: HashMap<String, u64> = following
+        .as_ref()
+        .map(|following| following.followed.heads())
+        .unwrap_or_default();
     let mut chains: HashMap<String, meridian_changes::integrity::Chain> = HashMap::new();
     // Behind since a page was missed and not yet read; unanswered since the
     // writer last failed to answer. The lag is the longer.
@@ -580,6 +753,14 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
         tokio::select! {
             heard = tail.recv() => {
                 let Some(delivery) = heard else { return };
+                // TEST ONLY: a reader held behind on purpose, while the file
+                // `MERIDIAN_READER_HOLD_FILE` names exists (the ha failover
+                // run's check that a reader held behind answers from the
+                // primary). Pages heard meanwhile are not applied; the next
+                // after it is gone is read from the writer, as any gap is.
+                if following.is_some() && held_on_purpose() {
+                    continue;
+                }
                 let page = match meridian_changes::read_tail(
                     &delivery.envelope.payload_type,
                     &delivery.envelope.payload,
@@ -611,23 +792,45 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
                 }
                 match at.get(&partition).copied() {
                     None => {
-                        at.insert(partition, page.head);
+                        // Its changes before this page never followed: what
+                        // a reader holds of it is dropped, and held from here.
+                        if let Some(following) = &following {
+                            following.apply.reset(&partition);
+                        }
+                        at.insert(partition.clone(), page.head);
                     }
                     Some(held) if page.head <= held => {}
                     Some(held) if page.after_sequence == held => {
-                        at.insert(partition, page.head);
+                        if let Some(following) = &following {
+                            following.apply.apply(&partition, &page.changes);
+                        }
+                        at.insert(partition.clone(), page.head);
                     }
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
                         gap_since.get_or_insert_with(Instant::now);
-                        match catch_up(&bus, domain, &partition, held, &mut chains).await {
+                        let applying = following.as_ref().map(|f| f.apply.as_ref());
+                        match catch_up(&bus, domain, &partition, held, &mut chains, applying).await {
                             Ok(head) => {
-                                at.insert(partition, head.max(page.head));
+                                at.insert(partition.clone(), head.max(page.head));
+                                gap_since = None;
+                            }
+                            // Behind the writer's retention: a reader holds
+                            // the partition again from its head, as a
+                            // standby's reload does.
+                            Err(failed) if meridian_changes::is_behind(&failed) && following.is_some() => {
+                                if let Some(following) = &following {
+                                    following.apply.reset(&partition);
+                                }
+                                at.insert(partition.clone(), page.head);
                                 gap_since = None;
                             }
                             Err(failed) => tracing::warn!(domain, partition, %failed, "a page missed could not be read"),
                         }
                     }
+                }
+                if let (Some(following), Some(head)) = (&following, at.get(&partition)) {
+                    following.followed.set(&partition, *head);
                 }
                 said().set_partitions(at.keys().cloned().collect());
             }
@@ -652,6 +855,12 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
             }
         }
     }
+}
+
+/// Whether a reader is held behind on purpose: TEST ONLY, by the file
+/// `MERIDIAN_READER_HOLD_FILE` names, which the chart never sets.
+fn held_on_purpose() -> bool {
+    var("MERIDIAN_READER_HOLD_FILE").is_some_and(|path| std::path::Path::new(&path).exists())
 }
 
 /// Ask the writer's change log, for its control partition from its head:
@@ -701,6 +910,7 @@ async fn catch_up(
     partition: &str,
     mut after: u64,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    apply: Option<&dyn Apply>,
 ) -> Result<u64, String> {
     loop {
         let asked = meridian_changes::ReadChangesRequest {
@@ -729,6 +939,9 @@ async fn catch_up(
                 ));
             }
             after = change.sequence;
+        }
+        if let Some(apply) = apply {
+            apply.apply(partition, &page.changes);
         }
         if page.changes.is_empty() || after >= page.head {
             return Ok(after.max(page.head));

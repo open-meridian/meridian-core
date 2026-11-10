@@ -38,6 +38,19 @@ fn main() {
     }
 }
 
+/// A lake reader's following: each change applied to its hot layer.
+struct LakeFollows(Arc<meridian_lake::hot::HotStore>);
+
+impl meridian_runtime::member::Apply for LakeFollows {
+    fn apply(&self, partition: &str, changes: &[meridian_changes::Change]) {
+        self.0.follow(partition, changes);
+    }
+
+    fn reset(&self, partition: &str) {
+        self.0.forget_dataset(partition);
+    }
+}
+
 fn run() -> Result<(), String> {
     // Every path this member needs, probed from inside its pod: what
     // `meridian status` and `doctor` read (step 3b).
@@ -117,7 +130,8 @@ fn run() -> Result<(), String> {
         var("MERIDIAN_LAKE_HOT_LATEST_MIB").as_deref(),
         var("MERIDIAN_LAKE_HOT_LISTINGS_MIB").as_deref(),
     )?;
-    let store: Arc<dyn meridian_lake::Store> = meridian_lake::hot::HotStore::new(record, bounds);
+    let hot = meridian_lake::hot::HotStore::new(Arc::clone(&record), bounds);
+    let store: Arc<dyn meridian_lake::Store> = hot.clone();
     tracing::info!(
         latest_mib = bounds.latest_bytes >> 20,
         listings_mib = bounds.listings_bytes >> 20,
@@ -147,6 +161,60 @@ fn run() -> Result<(), String> {
             (bounds.latest_bytes + bounds.listings_bytes + meridian_lake::pages::MOST_BYTES) as u64,
         )?;
         let bus = bus_from_env(&instance_id).await?;
+        // A reader member (contract v30, stage B): the lake's reads alone,
+        // its hot layer kept by the writer's change log, never writing.
+        if member.is_reader() {
+            bus.serve_only(meridian_bus::read_after::is_read);
+            let replica = match var("MERIDIAN_LAKE_READ_DATABASE_URL") {
+                None => None,
+                Some(read_url) => Some(Arc::new(wait_for_store(
+                    "the lake's read replica",
+                    &read_url,
+                    |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+                    |store| {
+                        store
+                            .verify()
+                            .map_err(|failed| Wait::NotYet(failed.to_string()))
+                    },
+                )?) as Arc<dyn meridian_lake::Store>),
+            };
+            // Where it starts following from: the primary's heads before its
+            // hot layer holds anything.
+            let start = tokio::task::block_in_place(|| record.heads())
+                .map_err(|failed| format!("the lake's heads could not be read: {failed}"))?
+                .into_iter()
+                .collect();
+            let reading = meridian_lake::reader::ReaderStore::new(
+                Arc::clone(&hot),
+                Arc::clone(&record),
+                replica,
+            );
+            let lake = meridian_lake::service::serve(bus.clone(), reading, clock());
+            lake.build_at_most(answers_at_once);
+            let primary = Arc::clone(&record);
+            member.read(
+                &bus,
+                start,
+                Arc::new(LakeFollows(Arc::clone(&hot))),
+                Arc::new(meridian_bus::read_after::AllHeads(move || {
+                    primary.heads().map_err(|failed| failed.to_string())
+                })),
+            )?;
+            let reporting = bus.clone();
+            let schema = meridian_lake::migrations::latest();
+            meridian_runtime::background(async move {
+                report_inward_forever(reporting, "lake", schema).await
+            });
+            meridian_runtime::background(meridian_runtime::report_latency_forever(bus.clone()));
+            tracing::info!(
+                instance_id,
+                answers_at_once,
+                "the lake is serving reads, as a reader"
+            );
+            shutdown().await;
+            tracing::info!("stopping");
+            return Ok(());
+        }
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.

@@ -1,5 +1,6 @@
 {{- include "meridian-runtime.require" . -}}
 {{- include "meridian-runtime.oneWriter" (dict "top" $ "component" "instrument" "what" "instrument store" "values" .Values.instrument) -}}
+{{- define "meridian-runtime.instrument.deployment" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -96,4 +97,9 @@ spec:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
         {{- with (include "meridian-runtime.databaseCaVolume" .) }}{{ . | nindent 8 }}{{- end }}
+{{- end -}}
+{{ include "meridian-runtime.instrument.deployment" . }}
+{{- /* Its reader members (contract v30, stage B; spec section 5): the same
+       Deployment in a reads-only mode, `instrument.readers` of them. */}}
+{{ include "meridian-runtime.readers" (dict "top" $ "component" "instrument" "values" .Values.instrument "readUrl" "MERIDIAN_INSTRUMENT_READ_DATABASE_URL" "rendered" (include "meridian-runtime.instrument.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "instrument" "values" $.Values.instrument) }}

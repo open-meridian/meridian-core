@@ -268,6 +268,18 @@ instrument:
   # standby:
   # A standby's readiness bound: its lag behind the writer's change log.
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
+  # A read replica's URL, in this Secret under database.key (contract v30,
+  # stage B): a reader answers a record's history from it once it has
+  # reached the read's watermark. Empty, as by default: the primary.
+  database:
+    readExistingSecret: ""
   image:
     tag: ""
   # The hot layer (step 3a): records by ID and what each became, answered
@@ -330,11 +342,23 @@ bor:
     intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
   image:
     tag: ""
   database:
     existingSecret: ""
     key: ""
+    # A read replica's URL, in this Secret under the same key (contract
+    # v30, stage B): a reader answers the record's past -- as of a time,
+    # ranges, past dates, history -- from it once it has reached the read's
+    # watermark. Empty, as by default: the primary.
+    readExistingSecret: ""
   # The book replays an account's journal for each command and each dated
   # read, so it needs more room than the other components (approved
   # 2026-10-15, after a development pod at 256Mi was OOMKilled). Replaces
@@ -375,6 +399,13 @@ lake:
     intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
   image:
     tag: ""
   # glibc's allocator arenas, at most this many, as the book's: a chain
@@ -415,6 +446,11 @@ lake:
   database:
     existingSecret: ""
     key: ""
+    # A read replica's URL, in this Secret under the same key (contract
+    # v30, stage B): a reader answers the record's past -- as of a time,
+    # ranges, past dates, history -- from it once it has reached the read's
+    # watermark. Empty, as by default: the primary.
+    readExistingSecret: ""
 
 # The analytics component (contract v26, W12): a coordinator and a pool of
 # workers, its own image from the same commit, its own credential.
