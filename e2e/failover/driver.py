@@ -748,8 +748,15 @@ async def drive_standing(role):
     from meridian import analytics
 
     jobs = analytics.Jobs()
-    job = analytics.job(analytics.measure("market_value", refresh="per_change"),
+    # The Treasury curve, a job over no account (the component answers one
+    # asking only it; W12.1): this run's accounts hold no position, so a
+    # job over one has no base currency the stores answer and is refused,
+    # and this run holds no curve, so its figure is not evaluated -- the
+    # class is about where the job is held, not its figures. The SDK's
+    # builder asks for an account, so the job is built and then cleared of it.
+    job = analytics.job(analytics.measure("treasury_curve", refresh="per_change"),
                         accounts=ACCOUNTS[:1], standing=True)
+    del job.account_ids[:]
     view = None
     while not stopped() and view is None:
         try:
