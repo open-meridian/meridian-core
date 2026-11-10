@@ -5,7 +5,9 @@
 //! - **Latest reads** from the hot layer, which the member keeps current by
 //!   following the writer's change log ([`HotStore::follow`]); a key not held
 //!   is loaded from the primary, so nothing held is older than what it has
-//!   applied.
+//!   applied. A read the lake cut off at its own now, as it cuts every read
+//!   its caller did not ([`cut_off_its_own`]), is a latest read: only a
+//!   caller's `as_of_ns` is the record's past.
 //! - **The record's past** -- a read as of a time, a range, past dates,
 //!   versions -- from the read replica (`<store>.database.readExistingSecret`)
 //!   where one is set and has reached the read's `read_after`; from the
@@ -20,7 +22,7 @@
 //!   answered part of it had reached.
 //! - **Nothing written**: every write is refused, the writer's alone.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -44,11 +46,33 @@ thread_local! {
     /// thread answers, as it was first looked at for it: the read's
     /// watermark is held to them.
     static REPLICA_ANSWERED: RefCell<Option<BTreeMap<String, u64>>> = const { RefCell::new(None) };
+
+    /// The cut-off the lake set itself for the read this thread answers --
+    /// its own now, where the caller named no `as_of_ns` -- which makes it a
+    /// latest read, not the record's past.
+    static OWN_CUT_OFF: Cell<Option<i64>> = const { Cell::new(None) };
 }
 
-/// A read begins on this thread: no replica has answered any of it yet.
+/// A read begins on this thread: no replica has answered any of it yet, and
+/// the lake has cut it off nowhere.
 pub fn begin() {
     REPLICA_ANSWERED.with(|held| held.borrow_mut().take());
+    OWN_CUT_OFF.with(|held| held.set(None));
+    crate::hot::noted::begin();
+}
+
+/// The lake cut the read this thread answers off at `as_of_ns`, its own now,
+/// its caller having named no `as_of_ns`: a latest read, which a reader
+/// answers from its hot layer (contract v30, stage B; spec section 5,
+/// "latest and by-ID reads from its hot layer").
+pub fn cut_off_its_own(as_of_ns: i64) {
+    OWN_CUT_OFF.with(|held| held.set(Some(as_of_ns)));
+}
+
+/// Whether a read cut off at `as_of_ns` reads the latest: no cut-off, or the
+/// lake's own; a caller's is the record's past.
+fn latest_cut(as_of_ns: i64) -> bool {
+    as_of_ns == 0 || OWN_CUT_OFF.with(Cell::get) == Some(as_of_ns)
 }
 
 /// A reader member's store: its hot layer over the primary, the primary, the
@@ -120,11 +144,11 @@ fn reached(heads: &BTreeMap<String, u64>) -> bool {
     behind(&asked, &heads).is_empty()
 }
 
-/// Whether a read is of now -- the latest in force, recorded by now -- which
-/// the hot layer answers; any other, as of a time included, is the record's
-/// past.
+/// Whether a read is of now -- the latest in force, recorded by now or by the
+/// lake's own cut-off -- which the hot layer answers; any other, as of a time
+/// its caller named included, is the record's past.
 fn of_now(query: &Query) -> bool {
-    answers_latest(query) && query.as_of_ns == 0
+    answers_latest(query) && latest_cut(query.as_of_ns)
 }
 
 fn written() -> StoreError {
@@ -166,7 +190,7 @@ impl Store for ReaderStore {
         places: &[(String, u64)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
-        if as_of_ns == 0 {
+        if latest_cut(as_of_ns) {
             self.now().rows_at(data_type, places, as_of_ns)
         } else {
             self.past().rows_at(data_type, places, as_of_ns)
@@ -314,7 +338,7 @@ impl Store for ReaderStore {
         as_of_ns: i64,
         published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
-        if as_of_ns == 0 && published_as_of_ns == 0 {
+        if latest_cut(as_of_ns) && published_as_of_ns == 0 {
             self.now()
                 .read_dataset(dataset, data_type, as_of_ns, published_as_of_ns)
         } else {
@@ -330,7 +354,7 @@ impl Store for ReaderStore {
         as_of_ns: i64,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        if as_of_ns == 0 {
+        if latest_cut(as_of_ns) {
             self.now()
                 .read_dataset_each(dataset, data_type, as_of_ns, each)
         } else {

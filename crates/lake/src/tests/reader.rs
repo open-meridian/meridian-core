@@ -267,8 +267,7 @@ fn answered_at(answer: &service::ReadAnswer) -> u64 {
 /// A reader's reply carries the position it was answered at: what it has
 /// applied, never the primary's heads beyond it; the primary's for an answer
 /// from the primary past its wait; and no further than a read replica that
-/// answered it had reached. (The lake cuts every read off at its own now, so
-/// a reader's latest read is the record's past here, the replica's.)
+/// answered it had reached.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_readers_reply_says_the_position_it_was_answered_at() {
     let clock = Arc::new(ManualClock::at(NOW));
@@ -351,5 +350,87 @@ async fn a_readers_reply_says_the_position_it_was_answered_at() {
         answered_at(&past),
         behind,
         "the replica's, behind what it applied"
+    );
+}
+
+/// A plain latest read -- cut off at the lake's own now, its caller naming no
+/// `as_of_ns` -- is a reader's hot layer's, answered at its own applied
+/// position; a read as of a time its caller named is the record's past,
+/// still the read replica's (contract v30, stage B; spec section 5,
+/// "latest and by-ID reads from its hot layer; record reads from the read
+/// secret").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_readers_plain_latest_read_is_its_hot_layers_and_a_callers_as_of_the_replicas() {
+    let clock = Arc::new(ManualClock::at(NOW));
+    let bus = Arc::new(Bus::single(
+        "lake-1",
+        Arc::new(MemoryBackend::new()),
+        clock.clone(),
+    ));
+    stand_ins(&bus);
+    bus.serve_only(meridian_bus::read_after::is_read);
+    let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let replica: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    kept_close(primary.as_ref(), "k1", "2026-10-07", "5");
+    kept_close(replica.as_ref(), "k1", "2026-10-07", "5");
+    // Restated on the primary; the replica has not reached it.
+    kept_close(primary.as_ref(), "k1", "2026-10-07", "7");
+    let (behind, ahead) = (
+        replica.heads().unwrap()[DAILY],
+        primary.heads().unwrap()[DAILY],
+    );
+    assert!(behind < ahead);
+    let hot = HotStore::new(Arc::clone(&primary), Bounds::DEFAULT);
+    // The member has applied the writer's change log to the head.
+    let reading = ReaderStore::new(
+        Arc::clone(&hot),
+        Arc::clone(&primary),
+        Some(Arc::clone(&replica)),
+        Arc::new(move || BTreeMap::from([(DAILY.to_string(), ahead)])),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let lake = service::serve(bus.clone(), reading, clock.clone());
+    lake.configured(&configuration(true, &[]));
+    let h = Harness {
+        bus: bus.clone(),
+        store,
+        clock,
+        lake,
+    };
+    let reading_at = |as_of_ns: i64| {
+        crate::reader::begin();
+        let answer = read(
+            &h,
+            "reporting-1",
+            &[BTC],
+            "",
+            SourceChoice::default(),
+            as_of_ns,
+        );
+        let (from_memory, _) = crate::hot::noted::peek();
+        let prices: Vec<String> = answer
+            .rows
+            .iter()
+            .map(|row| match row {
+                Observation::Price(price) => amount(price),
+                other => panic!("a price, not {other:?}"),
+            })
+            .collect();
+        (prices, answered_at(&answer), from_memory)
+    };
+    // Its first read loads the key; held, the hot layer answers.
+    reading_at(0);
+    hot.load_wanted();
+    assert_eq!(
+        reading_at(0),
+        (vec!["7".to_string()], ahead, true),
+        "the hot layer's, at its own applied position"
+    );
+    // As of a time its caller named, after both versions were recorded: the
+    // record's past, the replica's -- its row, and its position.
+    assert_eq!(
+        reading_at(NOW + 1_000_000_000),
+        (vec!["5".to_string()], behind, false),
+        "the replica's"
     );
 }

@@ -2728,6 +2728,11 @@ impl Lake {
                 0,
             ),
         };
+        // The lake's own, its caller having named none: a latest read, which
+        // a reader answers from its hot layer (contract v30, stage B).
+        if request.as_of_ns == 0 {
+            crate::reader::cut_off_its_own(as_of);
+        }
         let page = match request.page_size {
             0 => 100,
             n => n.min(500) as usize,
@@ -4017,7 +4022,9 @@ impl Lake {
             return Err("as_of_ns is never negative".into());
         }
         let as_of = if request.as_of_ns == 0 {
-            self.clock.now_ns()
+            let now = self.clock.now_ns();
+            crate::reader::cut_off_its_own(now);
+            now
         } else {
             request.as_of_ns
         };
