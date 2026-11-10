@@ -109,7 +109,10 @@ GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
 #                    (after the compile: above where the compile left the disk)
 GATE_BUDGETS_LOCAL ?= checks=4 images=9  compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
-GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12.5 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+# CI's compile budget is 12.5 (the product owner, 2026-11-10): contract 30
+# adds about 0.1 GB to a compile measured at 12.1 on ubuntu-24.04, past the
+# 12.0 it had.
 # A cold run's compile stages, in place of the row's (the product owner,
 # 2026-11-07): a compile stage gets 9 GB on a warm cache and at most 11 GB
 # compiling every dependency again after a prune (step 3b part 3 measured
