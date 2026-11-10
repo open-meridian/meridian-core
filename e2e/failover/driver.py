@@ -755,7 +755,11 @@ async def drive_standing(role):
         try:
             view = await asyncio.wait_for(jobs.standing(role, job), 60)
         except Exception as failed:  # noqa: BLE001 - registered again until it holds
-            say(f"driver: standing: not held yet ({words(failed)})")
+            # What the call said, and the status under it: a CallFailed
+            # names only its type in words().
+            cause = failed.__cause__ or failed
+            said = words(cause) if isinstance(cause, grpc.aio.AioRpcError) else str(failed)
+            say(f"driver: standing: not held yet ({type(failed).__name__}: {said[:400]})")
             await asyncio.sleep(2)
     last = ""
     while not stopped():
