@@ -70,8 +70,15 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// JetStream's API and its acknowledgements, to the analytics component's
 /// credential alone, so its coordinators make and fill the queue and its
 /// workers take and acknowledge from it. No other credential holds either.
-const COMPONENT_TOPICS: [(&str, &str); 13] = [
+///
+/// From contract v30 (W12.4; the step 3 plan's question 13), the analytics
+/// coordinators' own: each says it is live on `members` and hears the
+/// others there, and is handed a standing job's question by another on
+/// `standing.{member}`, its pod's name (approved 2026-11-10).
+const COMPONENT_TOPICS: [(&str, &str); 15] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
+    ("analytics", "platform.analytics.internal.members"),
+    ("analytics", "platform.analytics.internal.standing.*"),
     ("analytics", "$JS.API.>"),
     ("analytics", "$JS.ACK.>"),
     ("lake", "platform.lake.internal.read-changes"),

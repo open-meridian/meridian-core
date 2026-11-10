@@ -2219,6 +2219,12 @@ chart-check:
 		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
 	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.generate=false >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: a deployment with no key and no way to make one rendered anyway" >&2; exit 1; }; true
+	@# Contract v30 (W12.4): a standing job's lease under a sidecar's 20 s
+	@# renewal, or no standing job at all, refused.
+	@for refused in analytics.standing.leaseSeconds=10 analytics.standing.most=0; do \
+		$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set $$refused >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$refused rendered, and cannot stand" >&2; exit 1; }; \
+	done; true
 	@for missing in deployment.id; do \
 		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \

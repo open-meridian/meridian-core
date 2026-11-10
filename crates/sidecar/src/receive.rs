@@ -298,6 +298,20 @@ impl Sidecar {
             Arc::clone(&self.subscriptions),
             generation,
         );
+        // Contract v30 (W12.4): its standing jobs renewed, each unknown told
+        // as a loss of their row.
+        crate::subscriptions::renew_jobs_every_lease(
+            Arc::clone(&self.bus),
+            Arc::clone(&self.subscriptions),
+            generation,
+        );
+        {
+            let waiting = Arc::clone(&waiting);
+            self.subscriptions.losing(
+                generation,
+                Arc::new(move |row: &'static str| waiting.lose(None, Some(row))),
+            );
+        }
         for row in chosen {
             start(row);
         }
@@ -642,9 +656,18 @@ async fn deliver(
     // stream's own rows, or by a subscription to its row naming the account
     // or every one.
     if !lake_row {
-        subscription_ids =
-            lake.subscriptions
-                .matching_book(lake.generation, row.name, read.account.as_deref());
+        subscription_ids = match &read.item {
+            // Contract v30 (W12.4): a standing job's figures, to the
+            // subscriptions naming that job.
+            plugin::delivery::Item::DerivedSeriesUpdated(event) => {
+                lake.subscriptions
+                    .matching_job(lake.generation, row.name, &event.job_id)
+            }
+            _ => {
+                lake.subscriptions
+                    .matching_book(lake.generation, row.name, read.account.as_deref())
+            }
+        };
         if !by_stream && subscription_ids.is_empty() {
             return;
         }

@@ -40,9 +40,12 @@ fn contract() -> Contract {
          platform.lake.command.renew-wants\tcommand\tsidecar\tlake\n\
          platform.street.event.custodial-position-updated\tevent\tstreet\toperations\n\
          platform.config.event.entitlements-changed\tevent\tconductor\tlake,sidecar\n\
-         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n\
+         platform.analytics.query.run-job\tquery\tsignal\tanalytics\n\
+         platform.analytics.command.renew-jobs\tcommand\tsidecar\tanalytics\n\
+         platform.analytics.event.derived-series-updated\tevent\tanalytics\tsignal\n",
         "name\tkind\nsignal\trole\noperations\trole\nlake\tcomponent\nstreet\tcomponent\n\
-         sidecar\tcomponent\nconductor\tcomponent\n",
+         sidecar\tcomponent\nconductor\tcomponent\nanalytics\tcomponent\n",
     )
     .unwrap()
 }
@@ -589,4 +592,190 @@ async fn a_subscription_lives_on_the_stream_it_opened_on() {
     publish_quote(&w.bus, AAPL, None);
     let delivery = next(&mut first).await;
     assert_eq!(delivery.meta.unwrap().subscription_ids, vec!["on-first"]);
+}
+
+// ── Contract v30 (W4.3, W12.4): a standing job's figures ────────────────────
+
+/// The analytics component stood in: `RunJob` answers a standing job
+/// `JOB-1`, and a renewal names unknown each job in `unheld`.
+struct Analytics {
+    renewed: Arc<Mutex<Vec<Vec<String>>>>,
+    unheld: Arc<Mutex<Vec<String>>>,
+}
+
+fn analytics(bus: &Bus) -> Analytics {
+    use meridian_domain::v1::{RenewJobsReply, RenewJobsRequest, RunJobReply};
+    let renewed = Arc::new(Mutex::new(Vec::new()));
+    let unheld: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    bus.serve("platform.analytics.query.run-job", |_| {
+        Ok((
+            "meridian.v1.RunJobReply".into(),
+            RunJobReply {
+                answered_inline: true,
+                job_id: "JOB-1".into(),
+                answer: None,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let (heard, unknown) = (Arc::clone(&renewed), Arc::clone(&unheld));
+    bus.serve(super::RENEW_JOBS, move |envelope| {
+        let asked = RenewJobsRequest::decode(&envelope.payload[..]).unwrap();
+        heard.lock().unwrap().push(asked.job_ids.clone());
+        let unheld = unknown.lock().unwrap().clone();
+        Ok((
+            "meridian.v1.RenewJobsReply".into(),
+            RenewJobsReply {
+                unknown_job_ids: asked
+                    .job_ids
+                    .into_iter()
+                    .filter(|job| unheld.contains(job))
+                    .collect(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    Analytics { renewed, unheld }
+}
+
+fn figures_of(id: &str, jobs: &[&str]) -> plugin::SubscribeRequest {
+    plugin::SubscribeRequest {
+        subscription_id: id.into(),
+        row: super::DERIVED_SERIES_UPDATED.into(),
+        job_ids: jobs.iter().map(|j| j.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+async fn register_standing(sidecar: &Sidecar) -> String {
+    let job = plugin::Job {
+        measures: vec![plugin::MeasureRef {
+            definition: "implied_volatility".into(),
+            version: 1,
+            refresh: plugin::Refresh::PerChange as i32,
+            ..Default::default()
+        }],
+        standing: true,
+        ..Default::default()
+    };
+    sidecar
+        .run_job(Request::new(plugin::RunJobParams { job: Some(job) }))
+        .await
+        .unwrap()
+        .into_inner()
+        .job_id
+}
+
+fn publish_figures(bus: &Bus, job: &str, holder: &str, sequence: i64) {
+    bus.publish(
+        "platform.analytics.event.derived-series-updated",
+        "meridian.v1.DerivedSeriesUpdatedEvent",
+        meridian_domain::v1::DerivedSeriesUpdatedEvent {
+            job_id: job.into(),
+            client_instance_id: holder.into(),
+            sequence,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+/// The fixture's base case: a job the plugin registered, its figures heard
+/// by the subscription naming it alone, at this instance alone, and renewed
+/// at once.
+#[tokio::test]
+async fn a_standing_jobs_figures_reach_the_subscription_naming_it_and_it_is_renewed_at_once() {
+    let w = world().await;
+    let a = analytics(&w.bus);
+    let mut stream = stream_of(&w.sidecar, &["QuotesRecorded"]).await;
+    let job = register_standing(&w.sidecar).await;
+    assert_eq!(job, "JOB-1");
+    w.sidecar
+        .subscribe(Request::new(figures_of("surface", &[&job])))
+        .await
+        .unwrap();
+    assert_eq!(a.renewed.lock().unwrap().clone(), vec![vec![job.clone()]]);
+    assert_eq!(w.sidecar.subscriptions.jobs(1), vec![job.clone()]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Another job's, and this job's for another instance: not heard here.
+    publish_figures(&w.bus, "JOB-2", "signal-1", 1);
+    publish_figures(&w.bus, &job, "signal-2", 1);
+    publish_figures(&w.bus, &job, "signal-1", 7);
+    let delivery = next(&mut stream).await;
+    assert_eq!(
+        delivery.meta.as_ref().unwrap().subscription_ids,
+        vec!["surface"]
+    );
+    let Some(plugin::delivery::Item::DerivedSeriesUpdated(heard)) = delivery.item else {
+        panic!("{delivery:?}");
+    };
+    assert_eq!((heard.job_id.as_str(), heard.sequence), ("JOB-1", 7));
+    nothing_more(&mut stream).await;
+}
+
+/// The refusals: `job_ids` with another row, and a job neither registered
+/// by this plugin nor held for it (NOT_FOUND naming it); a job the
+/// component holds for this plugin, registered before this sidecar
+/// started, is heard.
+#[tokio::test]
+async fn a_job_this_plugin_holds_none_of_is_refused_naming_it() {
+    let w = world().await;
+    let a = analytics(&w.bus);
+    let _stream = stream_of(&w.sidecar, &["QuotesRecorded"]).await;
+    let mut quotes = own("quotes");
+    quotes.job_ids = vec!["JOB-1".into()];
+    let refused = w.sidecar.subscribe(Request::new(quotes)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("job_ids"), "{refused:?}");
+    a.unheld.lock().unwrap().push("JOB-9".into());
+    let refused = w
+        .sidecar
+        .subscribe(Request::new(figures_of("other", &["JOB-9"])))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::NotFound, "{refused:?}");
+    assert_eq!(
+        refused.message(),
+        "job_ids[0] names no standing job this plugin registered"
+    );
+    // Held for this plugin by the component, though this sidecar never saw
+    // it registered: heard.
+    w.sidecar
+        .subscribe(Request::new(figures_of("held", &["JOB-5"])))
+        .await
+        .unwrap();
+    let too_many: Vec<String> = (0..65).map(|i| format!("JOB-{i}")).collect();
+    let mut many = figures_of("many", &[]);
+    many.job_ids = too_many;
+    let refused = w.sidecar.subscribe(Request::new(many)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+}
+
+/// A job registered here that the component no longer holds -- its
+/// coordinator lost -- is told the plugin as a loss of the row, so the SDK
+/// reads it again, is answered NOT_FOUND and registers it again.
+#[tokio::test]
+async fn a_job_the_component_no_longer_holds_is_told_as_a_loss_of_its_row() {
+    let w = world().await;
+    let a = analytics(&w.bus);
+    let mut stream = stream_of(&w.sidecar, &["QuotesRecorded"]).await;
+    let job = register_standing(&w.sidecar).await;
+    a.unheld.lock().unwrap().push(job.clone());
+    w.sidecar
+        .subscribe(Request::new(figures_of("surface", &[&job])))
+        .await
+        .unwrap();
+    let delivery = next(&mut stream).await;
+    let Some(plugin::delivery::Item::Lost(lost)) = delivery.item else {
+        panic!("{delivery:?}");
+    };
+    assert_eq!(lost.rows, vec![super::DERIVED_SERIES_UPDATED.to_string()]);
+    // As each renewal of the lease would say it.
+    assert_eq!(
+        super::renew_jobs(&w.bus, vec![job.clone()]).await.unwrap(),
+        vec![job]
+    );
 }

@@ -40,7 +40,10 @@ held to what it was told, none lost and none twice); `memory-pressure` and
 `noisy-plugin` (stage M, the resilience spec's section 10a: the flood
 instance reads past the lake's budget, or past its own share at its
 sidecar, and is refused for load alone, with a retry-after, every other
-instance within its band, nothing restarted and nothing OOMKilled).
+instance within its band, nothing restarted and nothing OOMKilled);
+`standing-coordinator` (HA only; contract v30, W12.4: the analytics
+coordinator holding the standing driver's job killed outright, the job
+registered again with a live coordinator within 30 s).
 
 The write driver (driver.py, step 3b part 5) writes through the stores for
 the whole run, from test-only plugin instances in the chart's sidecars[]
@@ -128,14 +131,18 @@ RECONFIGURE = ["ha", "tolerant", "ha"]
 # the ems stand-in (desk). What a class lost is read in the stores' own rows
 # against what each acknowledged.
 DRIVEN = PROFILE in ("tolerant", "ha", "reconfigure")
-DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk", "drive-flood": "flood"}
+DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk", "drive-flood": "flood",
+           "drive-standing": "standing"}
 # What each instance is launched with: the ems stand-in (desk) holds oms and
 # ems, as e2e/orders/stand_in.py's desk does; it is the order-plugin class's
 # subject.
 DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"],
                 # The memory and isolation classes' subject (stage M): it
                 # records its own dataset and reads it.
-                "flood": ["data", "reporting"]}
+                "flood": ["data", "reporting"],
+                # The standing-coordinator class's subject (contract v30): a
+                # standing job held by its view.
+                "standing": ["reporting"]}
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
 DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
@@ -160,7 +167,7 @@ DEFAULT_FAILURES = {
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
            "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin",
-           "memory-pressure", "noisy-plugin"],
+           "memory-pressure", "noisy-plugin", "standing-coordinator"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -2436,6 +2443,61 @@ FLOOD_SECONDS = 60
 # quarter to whole second, so each acknowledges at least this many in a
 # minute's flood, about a quarter of what each does unflooded.
 FLOOD_BAND = {"price": 25, "order": 15}
+# ── A standing job's coordinator killed (contract v30, W12.4) ───────────────
+#
+# Question 13: a standing job is held by one coordinator, by rendezvous
+# hashing of its key over the live ones. The coordinator holding the
+# standing driver's job killed outright, the job is back -- registered
+# again by the SDK with a live coordinator and its answer read -- within
+# 1048's 30 s for a component: a lease's renewal plus a first load.
+
+STANDING_BACK = 30
+
+
+def standing_held():
+    """The standing driver's job IDs, in the order it was held under each."""
+    return [line.split()[1] for line in driver_file("drive-standing", "/tmp/standing.log").splitlines()
+            if line.startswith("HELD ")]
+
+
+def standing_holder(job_id):
+    """The analytics coordinator pod that holds `job_id`, by its line."""
+    for pod in pods("analytics-coordinator"):
+        name = pod["metadata"]["name"]
+        said = kubectl("logs", name, "-c", "analytics-coordinator", check=False)
+        for line in said.stdout.decode(errors="replace").splitlines():
+            if job_id in line and "a standing job held" in line:
+                return name
+    return ""
+
+
+def standing_coordinator(s):
+    print("F: standing-coordinator: the coordinator holding a standing job killed", flush=True)
+    held = happens(lambda: standing_held(), 300, every=2)
+    s.check(held, f"standing-coordinator: the driver holds a standing job ({standing_held()[-1:]})")
+    if not held:
+        return
+    job_id = standing_held()[-1]
+    holder = ""
+    found = happens(lambda: bool(standing_holder(job_id)), 60, every=2)
+    if found:
+        holder = standing_holder(job_id)
+    s.check(found, f"standing-coordinator: {job_id} held by {holder or 'no coordinator found'}")
+    if not found:
+        return
+    began = time.time()
+    kubectl("delete", "pod", holder, "--grace-period=0", "--force", "--wait=false", check=False)
+    back = happens(lambda: (standing_held()[-1:] or [job_id])[0] != job_id, STANDING_BACK * 2, every=0.5)
+    seconds = time.time() - began if back else STANDING_BACK * 2
+    again = standing_held()[-1]
+    s.check(back, f"standing-coordinator: the job registered again as {again}")
+    if back:
+        s.check(standing_holder(again) not in ("", holder),
+                f"standing-coordinator: {again} held by a live coordinator ({standing_holder(again)})")
+    claim(s, "standing-coordinator", "analytics", seconds, STANDING_BACK,
+          {"job_before": job_id, "job_after": again, "killed": holder})
+
+
 # How soon the flooder is answered again once it stops (the tolerant pod
 # bound; nothing restarts, so it is the refusals' retry-after that counts).
 FLOOD_RECOVERED = 30
@@ -2564,6 +2626,7 @@ FAILURES = {
     "order-plugin": order_plugin,
     "memory-pressure": lambda s: flood(s, "memory-pressure", "pressure", "overloaded", "lake"),
     "noisy-plugin": lambda s: flood(s, "noisy-plugin", "noisy", "rate_limited", "sidecar"),
+    "standing-coordinator": standing_coordinator,
 }
 
 

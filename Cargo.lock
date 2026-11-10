@@ -1749,6 +1749,7 @@ dependencies = [
  "async-nats",
  "futures-util",
  "meridian-analytics-engine",
+ "meridian-budget",
  "meridian-bus",
  "meridian-clock",
  "meridian-domain",

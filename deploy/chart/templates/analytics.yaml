@@ -17,6 +17,14 @@
   component's credential whatever the values say, and a deployment's
   templates bind to its models (the first release's §1).
 */}}
+{{- /* A sidecar renews its standing jobs every 20 seconds (W12.4), so a
+       lease under 30 lets a job held lapse between two renewals. */}}
+{{- if lt (int .Values.analytics.standing.leaseSeconds) 30 -}}
+{{- fail (printf "analytics.standing.leaseSeconds is %v: a sidecar renews its standing jobs every 20 seconds, so the lease is 30 or more" .Values.analytics.standing.leaseSeconds) -}}
+{{- end -}}
+{{- if lt (int .Values.analytics.standing.most) 1 -}}
+{{- fail "analytics.standing.most is under 1: a coordinator holds one standing job or more" -}}
+{{- end }}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- range $part := list "coordinator" "worker" }}
 {{- $values := index $.Values.analytics $part }}
@@ -89,6 +97,18 @@ spec:
               value: {{ $.Values.analytics.inlineMs | quote }}
             - name: MERIDIAN_ANALYTICS_PRICE_DEADLINE_MS
               value: {{ $.Values.analytics.priceDeadlineMs | quote }}
+            # Contract v30 (W12.4): standing jobs held by a sidecar's
+            # renewals within the lease, at most so many a coordinator; and
+            # this coordinator's name among the others, its pod's, which a
+            # standing job's key is placed on (rendezvous hashing).
+            - name: MERIDIAN_ANALYTICS_STANDING_LEASE_SECONDS
+              value: {{ $.Values.analytics.standing.leaseSeconds | quote }}
+            - name: MERIDIAN_ANALYTICS_STANDING_MOST
+              value: {{ $.Values.analytics.standing.most | quote }}
+            - name: MERIDIAN_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- end }}
             {{- include "meridian-runtime.readyEnv" $ | nindent 12 }}
             {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}

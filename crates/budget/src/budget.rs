@@ -306,6 +306,11 @@ impl Handle {
         let until = Instant::now() + GROW_WAIT;
         let mut state = self.inner.lock();
         loop {
+            // Released already: nothing is held for it, so nothing grows
+            // (a grow racing its release never leaves bytes reserved).
+            if !state.held.contains_key(&self.id) {
+                return Ok(());
+            }
             let fits = match self.inner.working {
                 None => true,
                 Some(working) => state.reserved.saturating_add(more) <= working,
@@ -455,6 +460,23 @@ mod tests {
             .reserve(6 * MIB, "list-quotes for data-b", Duration::ZERO)
             .unwrap();
         assert_eq!(second.bytes(), 6 * MIB);
+    }
+
+    #[test]
+    fn a_grow_after_its_reservation_is_released_reserves_nothing() {
+        let budget = Budget::new(Some(10 * MIB));
+        let held = budget
+            .reserve(2 * MIB, "a standing job", Duration::ZERO)
+            .unwrap();
+        let handle = (*held).clone();
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+        handle.grow(4 * MIB).unwrap();
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "nothing left reserved by a released one"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! it is refused naming it, and every store read carries both.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use meridian_analytics_engine::canonical;
@@ -32,6 +32,7 @@ use prost::Message;
 use serde_json::{json, Value};
 
 use crate::resolve::{self, Ask};
+use crate::standing::{self, Peers};
 use crate::{topics, wire};
 
 /// How the coordinator runs.
@@ -68,6 +69,8 @@ pub struct Config {
     /// Where a page of an answer ends, in bytes (ruling 794): an answer past
     /// it is never given inline, and is read in pages of it.
     pub page_budget: usize,
+    /// Contract v30 (W12.4): how standing jobs are held.
+    pub standing: standing::Settings,
 }
 
 impl Default for Config {
@@ -83,6 +86,7 @@ impl Default for Config {
             jobs_at_once: JOBS_AT_ONCE,
             jobs_waiting: JOBS_WAITING,
             page_budget: crate::pages::PAGE_BUDGET,
+            standing: standing::Settings::default(),
         }
     }
 }
@@ -167,7 +171,7 @@ struct Slots {
 
 /// A job's place among those running, given back when it finishes, however
 /// it finishes.
-struct Slot<'a> {
+pub(crate) struct Slot<'a> {
     coordinator: &'a Coordinator,
 }
 
@@ -187,24 +191,33 @@ struct Batches {
 }
 
 pub struct Coordinator {
-    bus: Arc<Bus>,
-    handle: tokio::runtime::Handle,
-    clock: Arc<dyn Clock>,
-    config: Config,
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) config: Config,
     executor: Arc<dyn Executor>,
     jobs: Mutex<Jobs>,
     slots: Mutex<Slots>,
     slot_freed: Condvar,
     batches: Mutex<Batches>,
     batch_answered: Condvar,
+    /// Contract v30 (W12.4): the standing jobs this coordinator holds, told
+    /// when one's answer is in and when one is dirtied.
+    pub(crate) standing: Mutex<standing::Registry>,
+    pub(crate) standing_changed: Condvar,
+    /// The live coordinators, and how one is asked (question 13).
+    pub(crate) peers: RwLock<Arc<dyn Peers>>,
+    /// A budget the standing answers reserve against in place of the
+    /// process's: a test's.
+    pub(crate) standing_budget: RwLock<Option<Arc<meridian_budget::Budget>>>,
 }
 
 /// The store reads for one job, each stamped with the client and its scope.
-struct OnBehalf {
-    bus: Arc<Bus>,
-    handle: tokio::runtime::Handle,
-    stamp: Stamp,
-    timeout: Duration,
+pub(crate) struct OnBehalf {
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) stamp: Stamp,
+    pub(crate) timeout: Duration,
 }
 
 impl Ask for OnBehalf {
@@ -235,7 +248,7 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
 
 /// The client: the instance that asked, and the read scope its sidecar
 /// stamped, None for a core component reading as itself.
-fn client_of(envelope: &Envelope) -> (String, Option<Vec<String>>) {
+pub(crate) fn client_of(envelope: &Envelope) -> (String, Option<Vec<String>>) {
     let meta = envelope.meta.clone().unwrap_or_default();
     let scope = meta.account_scope_applies.then_some(meta.account_scope);
     (meta.publisher_instance_id, scope)
@@ -284,6 +297,12 @@ impl Coordinator {
             slot_freed: Condvar::new(),
             batches: Mutex::new(Batches::default()),
             batch_answered: Condvar::new(),
+            standing: Mutex::new(standing::Registry::default()),
+            standing_changed: Condvar::new(),
+            standing_budget: RwLock::new(None),
+            peers: RwLock::new(Arc::new(standing::Alone(standing::member_named(
+                crate::INSTANCE,
+            )))),
         })
     }
 
@@ -294,6 +313,18 @@ impl Coordinator {
         envelope: &Envelope,
     ) -> Result<RunJobReply, String> {
         let (client, scope) = client_of(envelope);
+        self.run_job_for(request, client, scope, false)
+    }
+
+    /// W12.1: a job run for `client` within `scope`; `handed`, asked by
+    /// another coordinator, which a standing job is never handed on from.
+    pub(crate) fn run_job_for(
+        self: &Arc<Self>,
+        request: RunJobRequest,
+        client: String,
+        scope: Option<Vec<String>>,
+        handed: bool,
+    ) -> Result<RunJobReply, String> {
         let job = request.job.unwrap_or_default();
         if let Some(scope) = &scope {
             for (i, account) in job.account_ids.iter().enumerate() {
@@ -306,6 +337,8 @@ impl Coordinator {
                 }
             }
         }
+        // Contract v30 (W12.1): a standing job's own refusals first.
+        standing::refused(&job)?;
         let compiled = compile::compile(&job).map_err(|refused| {
             refusal_with_status(
                 RefusalStatus::InvalidArgument,
@@ -313,6 +346,9 @@ impl Coordinator {
                 refused.to_string(),
             )
         })?;
+        if job.standing {
+            return self.run_standing(job, client, scope, handed);
+        }
         // A place among the jobs running, or among those waiting for one;
         // past both, refused, never another thread holding its inputs.
         {
@@ -387,6 +423,14 @@ impl Coordinator {
 
     /// A place among the jobs running: waits, counted among those waiting,
     /// until one is free.
+    /// Contract v30 (W12.4): a standing job's recomputation's place among
+    /// the jobs running, as a job's: waits until one is free, never refused
+    /// -- its holders keep the figures they have meanwhile.
+    pub(crate) fn standing_slot(&self) -> Slot<'_> {
+        self.slots.lock().expect("not poisoned").waiting += 1;
+        self.slot()
+    }
+
     fn slot(&self) -> Slot<'_> {
         let mut slots = self.slots.lock().expect("not poisoned");
         while slots.running >= self.config.jobs_at_once.max(1) {
@@ -406,6 +450,18 @@ impl Coordinator {
         compiled: &compile::Compiled,
         job_id: &str,
     ) -> Result<JobAnswer, String> {
+        self.answer_read(asker, job, compiled, job_id)
+            .map(|(answer, _)| answer)
+    }
+
+    /// A job's answer, and the inputs document it was computed from.
+    pub(crate) fn answer_read(
+        &self,
+        asker: &dyn Ask,
+        job: &meridian_domain::v1::Job,
+        compiled: &compile::Compiled,
+        job_id: &str,
+    ) -> Result<(JobAnswer, serde_json::Value), String> {
         let resolved = resolve::resolve(
             asker,
             job,
@@ -422,7 +478,7 @@ impl Coordinator {
         if answer.asks_execution_cost {
             self.record_execution_costs(&wire::execution_costs(&answer, &resolved.executions));
         }
-        wire::job_answer(job_id, &answer)
+        Ok((wire::job_answer(job_id, &answer)?, inputs))
     }
 
     /// Contract v27 (W10.11; ruling 481): the rows an `execution_cost` job
@@ -500,6 +556,13 @@ impl Coordinator {
             .map(|p| p.answer_hash.clone())
             .unwrap_or_default();
         self.keep(job_id, client, answer);
+        self.tell(job_id, client, answer_hash);
+    }
+
+    /// The client told a job it ran has finished, sequenced for its
+    /// catch-up (W12.4): a one-off job's, and from contract v30 a standing
+    /// job's first answer, where its `RunJob` was answered before it was in.
+    pub(crate) fn tell(&self, job_id: &str, client: &str, answer_hash: String) {
         let event = {
             let mut jobs = self.jobs.lock().expect("not poisoned");
             let now_ms = self.clock.now_ns() / 1_000_000;
@@ -538,7 +601,35 @@ impl Coordinator {
         request: ReadJobAnswerRequest,
         envelope: &Envelope,
     ) -> Result<JobAnswer, String> {
-        let (client, _) = client_of(envelope);
+        let (client, scope) = client_of(envelope);
+        self.read_job_answer_for(request, &client, &scope, false)
+    }
+
+    /// W12.4: a job's answer read for `client`: a standing job's held here,
+    /// a one-off job's kept here, or, not `handed`, either held by another
+    /// coordinator (question 13).
+    pub(crate) fn read_job_answer_for(
+        &self,
+        request: ReadJobAnswerRequest,
+        client: &str,
+        scope: &Option<Vec<String>>,
+        handed: bool,
+    ) -> Result<JobAnswer, String> {
+        if let Some(read) = self.read_standing(&request, client) {
+            return read;
+        }
+        let held_here = self
+            .jobs
+            .lock()
+            .expect("not poisoned")
+            .answers
+            .contains_key(&request.job_id);
+        if !held_here && !handed {
+            if let Some(read) = self.read_elsewhere(&request, client, scope) {
+                return read;
+            }
+        }
+        let client = client.to_string();
         let mut jobs = self.jobs.lock().expect("not poisoned");
         jobs.trim(&self.config, self.clock.now_ns());
         match jobs.answers.get(&request.job_id) {
@@ -932,6 +1023,8 @@ pub fn serve(bus: &Arc<Bus>, coordinator: &Arc<Coordinator>) {
         ),
         |c, reply: PriceBatchReply, envelope| c.answer_price_batch(reply, envelope),
     );
+    // Contract v30 (W12.4): a sidecar's renewal of its standing jobs.
+    crate::standing::coordinator::serve_renewals(bus, coordinator);
 }
 
 /// The executor the coordinator answers with: the worker pool over the bus.

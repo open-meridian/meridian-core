@@ -151,6 +151,7 @@ fn reassembled(pages: &[JobAnswer]) -> JobAnswer {
     };
     for page in pages {
         whole.figures.extend(page.figures.iter().cloned());
+        whole.values.extend(page.values.iter().cloned());
         whole
             .not_evaluated
             .extend(page.not_evaluated.iter().cloned());
@@ -292,5 +293,51 @@ fn an_entry_past_the_budget_is_a_page_of_its_own() {
     assert!(pages
         .iter()
         .all(|p| p.figures.len() + p.not_evaluated.len() == 1));
+    assert_eq!(reassembled(&pages), answer);
+}
+
+/// Contract v30 (W12.4): a standing job's answer pages its values between
+/// its figures and what was not evaluated, and reassembles equal.
+#[test]
+fn a_standing_answers_values_page_between_its_figures_and_what_was_not_evaluated() {
+    let mut answer = chain_answer(4, 30);
+    let figures = std::mem::take(&mut answer.figures);
+    let (keyed, kept): (Vec<_>, Vec<_>) =
+        figures.into_iter().partition(|f| !f.series_key.is_empty());
+    answer.figures = kept;
+    answer.values = keyed
+        .iter()
+        .map(|f| meridian_domain::v1::DerivedSeries {
+            meta: Some(meridian_domain::v1::ObservationMeta {
+                row_key: format!("implied_volatility:{}", f.series_key[0].value),
+                series_key: f.series_key.clone(),
+                ..Default::default()
+            }),
+            series: "implied_volatility".into(),
+            value: Some(meridian_domain::v1::UnitValue {
+                value: f.value,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    assert!(!answer.values.is_empty());
+    let pages = every_page(&answer, 7, PAGE_BUDGET);
+    assert!(pages.len() > 2);
+    // In order: no page holds a value before a figure still to come, nor
+    // what was not evaluated before a value still to come.
+    let mut seen = (false, false);
+    for page in &pages {
+        if !page.figures.is_empty() {
+            assert!(!seen.0 && !seen.1, "figures first");
+        }
+        if !page.values.is_empty() {
+            assert!(!seen.1, "values before what was not evaluated");
+            seen.0 = true;
+        }
+        if !page.not_evaluated.is_empty() {
+            seen.1 = true;
+        }
+    }
     assert_eq!(reassembled(&pages), answer);
 }

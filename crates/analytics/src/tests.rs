@@ -18,19 +18,19 @@ use prost::Message;
 use crate::service::{self, Config, Coordinator};
 use crate::{topics, worker};
 
-const NOW: i64 = 1_792_300_000_000_000_000;
-const USD: &str = "INS-CASHUSD";
-const USDT: &str = "INS-USDT";
-const AAPL: &str = "INS-AAPL";
-const BTC: &str = "INS-BTC";
+pub(crate) const NOW: i64 = 1_792_300_000_000_000_000;
+pub(crate) const USD: &str = "INS-CASHUSD";
+pub(crate) const USDT: &str = "INS-USDT";
+pub(crate) const AAPL: &str = "INS-AAPL";
+pub(crate) const BTC: &str = "INS-BTC";
 const YES: &str = "INS-E1";
 const NO: &str = "INS-E2";
 
-fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
+pub(crate) fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
     Some(Exact::from_str(text).unwrap().to_wire())
 }
 
-fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
+pub(crate) fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
     Some(Money {
         amount: d(amount),
         currency_code: code.into(),
@@ -38,7 +38,13 @@ fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
     })
 }
 
-fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset: &str) -> Price {
+pub(crate) fn price(
+    subject: &str,
+    kind: PriceKind,
+    amount: &str,
+    instrument: &str,
+    dataset: &str,
+) -> Price {
     Price {
         meta: Some(ObservationMeta {
             subjects: vec![SubjectRef {
@@ -79,13 +85,13 @@ fn record(id: &str, class: AssetClass, currency: &str, template: &str) -> Instru
 
 /// What the stores were asked, and how: every envelope's stamp.
 #[derive(Default)]
-struct Heard {
+pub(crate) struct Heard {
     stamps: Vec<(String, MessageMeta)>,
 }
 
-struct Stores {
-    bus: Arc<Bus>,
-    heard: Arc<Mutex<Heard>>,
+pub(crate) struct Stores {
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) heard: Arc<Mutex<Heard>>,
     routing: Arc<Mutex<Vec<ModelRouting>>>,
     /// Contract v28 (ruling 619): AAPL's close invalid, left out of a
     /// default read and answered to one naming alpaca-1:daily with
@@ -95,7 +101,7 @@ struct Stores {
     quarantined_quote: Arc<Mutex<bool>>,
 }
 
-fn serve_store<Req, Rep, F>(
+pub(crate) fn serve_store<Req, Rep, F>(
     stores: &Stores,
     topic: &'static str,
     reply_type: &'static str,
@@ -120,7 +126,7 @@ fn serve_store<Req, Rep, F>(
 /// The book, the instrument store, the lake and the conductor, as their
 /// reads answer, for one account: AAPL with a lot in USD, cash, half a BTC
 /// priced in USDT, a local line, and a member of an event group.
-fn stores() -> Stores {
+pub(crate) fn stores() -> Stores {
     let bus = Arc::new(Bus::single(
         crate::INSTANCE,
         Arc::new(MemoryBackend::new()),
@@ -393,7 +399,7 @@ fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) ->
     coordinator
 }
 
-fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
+pub(crate) fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
     RunJobRequest {
         job: Some(Job {
             account_ids: vec!["ACC-1".into()],
@@ -1473,9 +1479,9 @@ async fn an_execution_cost_job_reads_the_order_path_and_records_its_rows() {
 
 // ── Contract v28: a job over a chain, and a grid on a saved scenario set ────
 
-const OSI_CALL: &str = "AAPL  261120C00230000";
-const OSI_PUT: &str = "AAPL  261120P00230000";
-const OSI_DEEP: &str = "AAPL  261120C00150000";
+pub(crate) const OSI_CALL: &str = "AAPL  261120C00230000";
+pub(crate) const OSI_PUT: &str = "AAPL  261120P00230000";
+pub(crate) const OSI_DEEP: &str = "AAPL  261120C00150000";
 const VENUE: &str = "VEN-XCBO";
 
 fn series_row(osi: &str, right: &str, strike: &str) -> ListedSeries {
@@ -1518,7 +1524,7 @@ fn series_row(osi: &str, right: &str, strike: &str) -> ListedSeries {
     }
 }
 
-fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
+pub(crate) fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
     Quote {
         meta: Some(ObservationMeta {
             series_key: vec![Identifier {
@@ -1540,7 +1546,7 @@ fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
     }
 }
 
-fn chain_stores() -> Stores {
+pub(crate) fn chain_stores() -> Stores {
     chain_stores_with(true)
 }
 

@@ -20,6 +20,7 @@ mod pages;
 pub mod queue;
 pub mod resolve;
 pub mod service;
+pub mod standing;
 pub mod wire;
 pub mod worker;
 
@@ -37,6 +38,10 @@ pub mod topics {
     pub const LIST_FINISHED_JOBS: &str = "platform.analytics.query.list-finished-jobs";
     pub const READ_JOB_ANSWER: &str = "platform.analytics.query.read-job-answer";
     pub const LIST_MODEL_ROUTING: &str = "platform.analytics.query.list-model-routing";
+    /// Contract v30 (W12.4): a sidecar's renewal of its plugin's standing
+    /// jobs, and a standing job's recomputed figures.
+    pub const RENEW_JOBS: &str = "platform.analytics.command.renew-jobs";
+    pub const DERIVED_SERIES_UPDATED: &str = "platform.analytics.event.derived-series-updated";
 
     pub const LIST_POSITIONS: &str = "platform.book.query.list-positions";
     pub const LIST_ACCOUNT_ATTRIBUTES: &str = "platform.book.query.list-account-attributes";

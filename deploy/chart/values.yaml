@@ -456,6 +456,17 @@ analytics:
   # How long a routed pricing plugin has to answer a batch before the
   # figures through it are not evaluated (W12.3, requirement 22).
   priceDeadlineMs: 5000
+  # Contract v30 (W12.4; spec/one-data-access-model section 4): standing
+  # jobs, each computed once for every client with its key and kept
+  # current. A job no sidecar's renewal named within leaseSeconds is
+  # stopped (a sidecar renews every 20 s, so 30 or more); one past `most`
+  # held by a coordinator is refused FAILED_PRECONDITION naming standing.
+  # `most` is an interim value until core's bench sets it: each job holds
+  # its current answer (a chain's about 1.2 MB on dev) beside the answers
+  # kept.
+  standing:
+    leaseSeconds: 30
+    most: 256
 
 # Installed for development (spec/live-plugin-development, ruling 2): it may
 # run plugin code as it is being written, which nobody has reviewed, and every

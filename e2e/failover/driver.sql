@@ -39,6 +39,19 @@ INSERT INTO config_permission (permission_id, user_group_id, account_group_id, a
 VALUES ('perm-drive', 'ug-drive', 'ag-drive', 'grp-drive')
 ON CONFLICT DO NOTHING;
 
+-- Contract v30 (W12.4): the standing-coordinator class's subject,
+-- drive-standing, holding reporting: read on the driver's accounts, so a
+-- standing job over one of them is within its read scope.
+INSERT INTO config_access_group (access_group_id, name) VALUES ('grp-drive-standing', 'Driver standing reader')
+ON CONFLICT DO NOTHING;
+-- AccessLevel 1: read.
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level, role)
+VALUES ('grp-drive-standing', 0, 'drive-standing', 1, 'reporting')
+ON CONFLICT DO NOTHING;
+INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
+VALUES ('perm-drive-standing', 'ug-drive', 'ag-drive', 'grp-drive-standing')
+ON CONFLICT DO NOTHING;
+
 -- The ems stand-in's own account (the order-plugin class's subject,
 -- drive-desk, holding oms and ems): in its write scope on both roles, and
 -- no other instance's.

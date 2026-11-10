@@ -33,6 +33,16 @@
 //! **Upstream.** Each lake row's selector keeps its want alive at the lake
 //! through `RenewWants`, one message per lease for every open selector, and
 //! one at once for a selector newly opened (W10.7; ruling 885).
+//!
+//! **A standing job's figures** (contract v30, W4.3, W12.4): a subscription
+//! to `DerivedSeriesUpdated` names the standing jobs it hears by
+//! `job_ids`, each one this plugin registered by `RunJob` or the analytics
+//! component holds for it, else refused NOT_FOUND naming it. It hears only
+//! those jobs' events. The jobs every open subscription names are renewed
+//! in one `RenewJobs` every [`JOB_RENEWAL`], inside the component's 30 s
+//! lease, and at once for a subscription newly opened; a job the component
+//! answers unknown is told the plugin as a loss of the row, so the SDK reads
+//! the job's answer again, is answered NOT_FOUND, and registers it again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -61,6 +71,23 @@ pub(crate) const LEASE: Duration = Duration::from_secs(30);
 const WANTS_AT_ONCE: usize = 500;
 
 pub(crate) const RENEW_WANTS: &str = "platform.lake.command.renew-wants";
+
+/// Contract v30 (W12.4): a standing job's figures, the row that names jobs.
+pub(crate) const DERIVED_SERIES_UPDATED: &str = "DerivedSeriesUpdated";
+
+/// How often a stream's standing jobs are renewed: inside the analytics
+/// component's lease (analytics.standing.leaseSeconds, 30 at the least),
+/// so a renewal late by a few seconds never lets a job held lapse.
+pub(crate) const JOB_RENEWAL: Duration = Duration::from_secs(20);
+
+/// The most jobs one renewal names (RenewJobsRequest.job_ids).
+const JOBS_AT_ONCE: usize = meridian_pb::bounds::RENEW_JOBS_REQUEST_JOB_IDS_COUNT.most;
+
+/// The most standing jobs a sidecar remembers its plugin registered: the
+/// oldest forgotten first, and asked of the component again where named.
+const REGISTERED_MOST: usize = 4_096;
+
+pub(crate) const RENEW_JOBS: &str = "platform.analytics.command.renew-jobs";
 const LIST_SERIES: &str = "platform.lake.query.list-series";
 
 /// The template paths a listed series' expiry is read from, in order: an
@@ -154,6 +181,9 @@ struct Open {
     /// Within a window: the series the listing holds expiring in it.
     listed: BTreeSet<String>,
     fields: BTreeSet<String>,
+    /// Contract v30: the standing jobs whose figures it hears; none for
+    /// every standing job of this instance.
+    job_ids: BTreeSet<String>,
     /// The stream it was opened on, and is delivered on.
     generation: u64,
 }
@@ -208,10 +238,14 @@ impl Open {
 /// for a row the stream is not yet hearing.
 pub(crate) type StartRow = Arc<dyn Fn(&'static Row) + Send + Sync>;
 
+/// How a stream tells its plugin a row's deliveries were lost.
+pub(crate) type LoseRow = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 struct Stream {
     /// The rows forwarded on it now, chosen or subscribed.
     forwarded: BTreeSet<&'static str>,
     start: StartRow,
+    lose: Option<LoseRow>,
 }
 
 #[derive(Default)]
@@ -221,6 +255,8 @@ struct Inner {
     streams: BTreeMap<u64, Stream>,
     open: BTreeMap<String, Open>,
     generations: u64,
+    /// Contract v30: the standing jobs the plugin registered, oldest first.
+    registered: std::collections::VecDeque<String>,
 }
 
 impl Inner {
@@ -260,6 +296,7 @@ impl Registry {
             Stream {
                 forwarded: chosen,
                 start,
+                lose: None,
             },
         );
         generation
@@ -276,6 +313,87 @@ impl Registry {
             .get_mut(&generation)
         {
             stream.start = start;
+        }
+    }
+
+    /// How a stream tells its plugin of a loss, given once its queue exists.
+    pub(crate) fn losing(&self, generation: u64, lose: LoseRow) {
+        if let Some(stream) = self
+            .inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .streams
+            .get_mut(&generation)
+        {
+            stream.lose = Some(lose);
+        }
+    }
+
+    /// Contract v30 (W12.4): a standing job the plugin registered by
+    /// `RunJob`, which a subscription may name.
+    pub(crate) fn registered(&self, job_id: &str) {
+        if job_id.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("subscriptions poisoned");
+        if inner.registered.iter().any(|held| held == job_id) {
+            return;
+        }
+        inner.registered.push_back(job_id.to_string());
+        while inner.registered.len() > REGISTERED_MOST {
+            inner.registered.pop_front();
+        }
+    }
+
+    fn is_registered(&self, job_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .registered
+            .iter()
+            .any(|held| held == job_id)
+    }
+
+    /// The standing jobs a stream's open subscriptions name, as a renewal
+    /// names them.
+    pub(crate) fn jobs(&self, generation: u64) -> Vec<String> {
+        let inner = self.inner.lock().expect("subscriptions poisoned");
+        let named: BTreeSet<String> = inner
+            .open
+            .values()
+            .filter(|open| open.generation == generation)
+            .flat_map(|open| open.job_ids.iter().cloned())
+            .collect();
+        named.into_iter().collect()
+    }
+
+    /// A standing job's figures heard: the subscriptions to the row naming
+    /// that job, or every job.
+    pub(crate) fn matching_job(&self, generation: u64, row: &str, job_id: &str) -> Vec<String> {
+        let inner = self.inner.lock().expect("subscriptions poisoned");
+        inner
+            .open
+            .iter()
+            .filter(|(_, open)| {
+                open.generation == generation
+                    && open.row == row
+                    && (open.job_ids.is_empty() || open.job_ids.contains(job_id))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// A row's deliveries said lost on a stream: its plugin reads again.
+    pub(crate) fn lost(&self, generation: u64, row: &'static str) {
+        let lose = self
+            .inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .streams
+            .get(&generation)
+            .and_then(|stream| stream.lose.clone());
+        if let Some(lose) = lose {
+            lose(row);
         }
     }
 
@@ -468,6 +586,12 @@ impl Sidecar {
             ));
         };
         let open = self.selector(&request, row)?;
+        // Contract v30 (W12.4): each job named this plugin's, renewed at once.
+        let unheld = if open.job_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.jobs_named(&request).await?
+        };
         {
             let inner = self
                 .subscriptions
@@ -545,6 +669,21 @@ impl Sidecar {
         if let Some(want) = want {
             renew(&self.bus, vec![want]).await;
         }
+        // A job registered here that the component no longer holds: read
+        // again, so the SDK registers it again.
+        if !unheld.is_empty() {
+            let generation = self
+                .subscriptions
+                .inner
+                .lock()
+                .expect("subscriptions poisoned")
+                .open
+                .get(&id)
+                .map(|open| open.generation);
+            if let Some(generation) = generation {
+                self.subscriptions.lost(generation, DERIVED_SERIES_UPDATED);
+            }
+        }
         tracing::info!(
             instance = self.instance_id(),
             subscription_id = id,
@@ -568,6 +707,52 @@ impl Sidecar {
             .open
             .remove(&request.subscription_id);
         Ok(Response::new(plugin::UnsubscribeReply {}))
+    }
+
+    /// Contract v30 (W12.4): each job a subscription names checked and
+    /// renewed at once in one `RenewJobs`. One neither registered here nor
+    /// held for this plugin by the component is refused NOT_FOUND naming
+    /// it; one registered here that the component answers unknown is
+    /// answered, its jobs to be read again.
+    async fn jobs_named(&self, request: &plugin::SubscribeRequest) -> Result<Vec<String>, Status> {
+        let unknown = match renew_jobs(&self.bus, request.job_ids.clone()).await {
+            Ok(unknown) => unknown,
+            Err(failed) => {
+                if let Some((i, _)) = request
+                    .job_ids
+                    .iter()
+                    .enumerate()
+                    .find(|(_, job)| !self.subscriptions.is_registered(job))
+                {
+                    return Err(refused(
+                        self,
+                        Status::failed_precondition(format!(
+                            "job_ids[{i}]: the analytics component could not say whether it \
+                             holds it for this plugin ({failed}); subscribe again shortly"
+                        )),
+                    ));
+                }
+                Vec::new()
+            }
+        };
+        let mut unheld = Vec::new();
+        for (i, job) in request.job_ids.iter().enumerate() {
+            let registered = self.subscriptions.is_registered(job);
+            if unknown.contains(job) {
+                if !registered {
+                    return Err(refused(
+                        self,
+                        Status::not_found(format!(
+                            "job_ids[{i}] names no standing job this plugin registered"
+                        )),
+                    ));
+                }
+                unheld.push(job.clone());
+            } else if !registered {
+                self.subscriptions.registered(job);
+            }
+        }
+        Ok(unheld)
     }
 
     /// A request held to its row: the subjects, series, window and fields
@@ -623,6 +808,19 @@ impl Sidecar {
                 ));
             }
         }
+        // Contract v30 (W4.3, W12.4): standing jobs, named only with their row.
+        if !request.job_ids.is_empty() && row.name != DERIVED_SERIES_UPDATED {
+            return bad(Status::invalid_argument(format!(
+                "job_ids: set only with the row {DERIVED_SERIES_UPDATED}, not {}",
+                row.name
+            )));
+        }
+        if !meridian_pb::bounds::SUBSCRIBE_REQUEST_JOB_IDS_COUNT.admits(request.job_ids.len()) {
+            return bad(Status::invalid_argument(format!(
+                "job_ids names {}; at most 64",
+                request.job_ids.len()
+            )));
+        }
         let lake = is_lake(row);
         if !lake
             && (!request.series_keys.is_empty() || request.all_series || !request.fields.is_empty())
@@ -662,6 +860,7 @@ impl Sidecar {
             window: windowed.then_some((from, to)),
             listed: BTreeSet::new(),
             fields: request.fields.iter().cloned().collect(),
+            job_ids: request.job_ids.iter().cloned().collect(),
             generation: 0,
         })
     }
@@ -750,6 +949,79 @@ pub(crate) async fn renew(bus: &meridian_bus::Bus, wants: Vec<RenewedWant>) {
             tracing::warn!(%failed, wants = chunk.len(), "a renewal of wants was not answered");
         }
     }
+}
+
+/// Contract v30 (W12.4): standing jobs renewed with the analytics
+/// component, at most 256 a message, as the plugin; the jobs it answered
+/// unknown. A renewal not answered is said, and the next renews again.
+pub(crate) async fn renew_jobs(
+    bus: &meridian_bus::Bus,
+    job_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    use meridian_domain::v1::{RenewJobsReply, RenewJobsRequest};
+    let mut unknown = Vec::new();
+    for chunk in job_ids.chunks(JOBS_AT_ONCE) {
+        let payload = RenewJobsRequest {
+            job_ids: chunk.to_vec(),
+        }
+        .encode_to_vec();
+        let stamp = meridian_bus::Stamp {
+            account_scope: Some(Vec::new()),
+            ..Default::default()
+        };
+        let (_, reply) = bus
+            .call_stamped(
+                RENEW_JOBS,
+                "meridian.v1.RenewJobsRequest",
+                payload,
+                None,
+                None,
+                &stamp,
+            )
+            .await
+            .map_err(|failed| failed.to_string())?;
+        let reply = RenewJobsReply::decode(&reply[..])
+            .map_err(|failed| format!("a renewal's answer did not decode: {failed}"))?;
+        unknown.extend(reply.unknown_job_ids);
+    }
+    Ok(unknown)
+}
+
+/// Every [`JOB_RENEWAL`], the standing jobs a stream's subscriptions name
+/// renewed, until the stream closes; each answered unknown told the plugin
+/// as a loss of the row.
+pub(crate) fn renew_jobs_every_lease(
+    bus: Arc<meridian_bus::Bus>,
+    registry: Arc<Registry>,
+    generation: u64,
+) {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(JOB_RENEWAL);
+        every.tick().await;
+        loop {
+            every.tick().await;
+            if !registry.is_open(generation) {
+                return;
+            }
+            let jobs = registry.jobs(generation);
+            if jobs.is_empty() {
+                continue;
+            }
+            match renew_jobs(&bus, jobs).await {
+                Ok(unknown) if !unknown.is_empty() => {
+                    tracing::info!(
+                        unknown = unknown.len(),
+                        "standing jobs the analytics component no longer holds; read again"
+                    );
+                    registry.lost(generation, DERIVED_SERIES_UPDATED);
+                }
+                Ok(_) => {}
+                Err(failed) => {
+                    tracing::warn!(%failed, "a renewal of standing jobs was not answered")
+                }
+            }
+        }
+    });
 }
 
 /// Every lease, the open selectors' wants renewed, until the stream of

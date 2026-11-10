@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_analytics::service::{self, Config, Coordinator};
+use meridian_analytics::standing::{self, BusPeers};
 use meridian_analytics::{engine_version, queue, worker, INSTANCE};
 use meridian_analytics_engine::graph::Cache;
 use meridian_runtime::{bus_from_env, clock, on_runtime, shutdown, var, Ready, VERSION};
@@ -46,6 +47,16 @@ fn millis(name: &str, default: u64) -> Result<Duration, String> {
     }
 }
 
+fn whole(name: &str, default: u64) -> Result<u64, String> {
+    match var(name) {
+        None => Ok(default),
+        Some(text) => text
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} is {text:?}; a whole number")),
+    }
+}
+
 fn run() -> Result<(), String> {
     let (coordinates, works) = match std::env::args().nth(1).as_deref() {
         Some("coordinator") => (true, false),
@@ -63,7 +74,27 @@ fn run() -> Result<(), String> {
         inline: millis("MERIDIAN_ANALYTICS_INLINE_MS", 2_000)?,
         price_deadline: millis("MERIDIAN_ANALYTICS_PRICE_DEADLINE_MS", 5_000)?,
         read_timeout: millis("MERIDIAN_ANALYTICS_READ_TIMEOUT_MS", 8_000)?,
+        // Contract v30 (W12.4): the chart's analytics.standing.leaseSeconds
+        // and analytics.standing.most.
+        standing: standing::Settings {
+            lease: Duration::from_secs(whole(
+                "MERIDIAN_ANALYTICS_STANDING_LEASE_SECONDS",
+                standing::LEASE.as_secs(),
+            )?),
+            most: whole("MERIDIAN_ANALYTICS_STANDING_MOST", standing::MOST as u64)? as usize,
+            ..standing::Settings::default()
+        },
         ..Config::default()
+    };
+    // This coordinator's name among the others, its pod's (question 13):
+    // where none is given, one of its own, never another's.
+    let member = {
+        let pod = meridian_runtime::member::member_name();
+        if pod.is_empty() {
+            format!("coordinator-{:x}", std::process::id())
+        } else {
+            standing::member_named(&pod)
+        }
     };
     let unit_timeout = millis("MERIDIAN_ANALYTICS_UNIT_TIMEOUT_MS", 10_000)?;
     let ready = Ready::from_env();
@@ -119,8 +150,22 @@ fn run() -> Result<(), String> {
         if coordinates {
             let handle = tokio::runtime::Handle::current();
             let executor = service::pool_queued(&bus, handle.clone(), unit_timeout, queue.clone());
-            let coordinator = Coordinator::new(Arc::clone(&bus), handle, clock(), config, executor);
+            let read_timeout = config.read_timeout;
+            let coordinator =
+                Coordinator::new(Arc::clone(&bus), handle.clone(), clock(), config, executor);
+            // Contract v30 (W12.4): the live coordinators, heard and told on
+            // the component's own topic; the questions they hand this one;
+            // what it hears for its standing jobs; and their recomputing.
+            coordinator.use_peers(BusPeers::start(
+                Arc::clone(&bus),
+                handle,
+                member.clone(),
+                read_timeout,
+            ));
             service::serve(&bus, &coordinator);
+            standing::coordinator::serve_standing(&bus, &coordinator);
+            coordinator.hold_standing_forever();
+            tracing::info!(member, "this coordinator holds standing jobs");
         }
         tracing::info!(
             coordinates,

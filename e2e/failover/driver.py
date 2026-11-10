@@ -17,6 +17,11 @@ DRIVER_ROLE says which of its instances it is:
   workers at once;
 - `desk`: the ems stand-in, holding oms and ems, the order-plugin class's
   subject (below): orders recorded in its own account and placed;
+- `standing` (contract v30): holding reporting, the standing-coordinator
+  class's subject: a standing job over its first account held as a view
+  (`analytics.Jobs().standing`), each job ID it is held under kept in
+  /tmp/standing.log as `HELD <job ID> <unix ms>`, so a job registered
+  again with another coordinator shows;
 - `flood`: holding data and reporting, the memory-pressure and noisy-plugin
   classes' subject (stage M, below): its own dataset recorded once, then
   read past the lake's budget, or past its own share at its sidecar, as
@@ -730,6 +735,40 @@ async def drive_flood(plugin):
         await asyncio.sleep(1.0)
 
 
+# ── standing -> analytics: the standing-coordinator class's subject ────────
+#
+# Contract v30 (W12.4; spec/one-data-access-model section 4, question 13):
+# a standing job over the first account, held by the SDK's view. A view
+# whose job the analytics component no longer holds -- its coordinator
+# killed -- hears a loss at its sidecar's next renewal, reads the job again,
+# is answered NOT_FOUND and registers it again, under another job ID, with
+# a live coordinator. Each ID it is held under is kept.
+
+async def drive_standing(role):
+    from meridian import analytics
+
+    jobs = analytics.Jobs()
+    job = analytics.job(analytics.measure("market_value", refresh="per_change"),
+                        accounts=ACCOUNTS[:1], standing=True)
+    view = None
+    while not stopped() and view is None:
+        try:
+            view = await asyncio.wait_for(jobs.standing(role, job), 60)
+        except Exception as failed:  # noqa: BLE001 - registered again until it holds
+            say(f"driver: standing: not held yet ({words(failed)})")
+            await asyncio.sleep(2)
+    last = ""
+    while not stopped():
+        held = tuple(getattr(view._shared.selector, "job_ids", ()))
+        now = held[0] if held else ""
+        if now and now != last:
+            line = f"HELD {now} {int(time.time() * 1000)}"
+            kept("/tmp/standing.log", line)
+            say(f"driver: standing: {line}")
+            last = now
+        await asyncio.sleep(0.25)
+
+
 # ── Start ───────────────────────────────────────────────────────────────────
 
 
@@ -746,14 +785,14 @@ def declaration():
 
 
 async def main():
-    if ROLE not in ("data", "oms", "desk", "flood") or not INSTRUMENT or (
+    if ROLE not in ("data", "oms", "desk", "flood", "standing") or not INSTRUMENT or (
             ROLE in ("oms", "desk") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
         raise SystemExit("driver: DRIVER_ROLE is data, oms or desk, with DRIVER_INSTRUMENT (and, for oms and "
                          "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
     roles = {"data": [Recording()], "oms": [Managing()], "desk": [Desking(), Managing()],
-             "flood": [Recording(), Reporting()]}[ROLE]
+             "flood": [Recording(), Reporting()], "standing": [Reporting()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
     while not stopped():
@@ -762,7 +801,8 @@ async def main():
                 say(f"driver: registered as {plugin.identity.instance_id}")
                 kept("/tmp/registered", f"REGISTERED {int(time.time() * 1000)}")
                 await {"data": lambda: drive_data(plugin, gen), "oms": lambda: drive_oms(plugin, gen),
-                       "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin)}[ROLE]()
+                       "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin),
+                       "standing": lambda: drive_standing(roles[0])}[ROLE]()
             break
         except Exception as failed:  # noqa: BLE001 - every start failure is waited out
             say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")

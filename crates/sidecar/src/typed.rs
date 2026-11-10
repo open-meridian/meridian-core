@@ -205,6 +205,9 @@ const UNPLACED_KIND: &str = "unplaced-fact-recorded";
 /// The orders read (W11.17, contract v22): a connectivity plugin's answers
 /// only the orders behind placements naming its instance.
 const LIST_ORDERS: &str = "meridian.v1.ListOrdersRequest";
+/// Contract v30 (W12.4): a job run, which the sidecar remembers its plugin
+/// registered where it asked one standing.
+const RUN_JOB: &str = "meridian.v1.RunJobRequest";
 
 /// The role whose venue facts take their account from the venue account map
 /// (contract v22, W11.22).
@@ -579,6 +582,9 @@ impl Sidecar {
         // requirement 15): given longer than that, every other call the
         // bus's default.
         let within = (topic == RESOLVE_IDENTIFIER).then_some(RESOLVE_WITHIN);
+        let standing = payload_type == RUN_JOB
+            && domain::RunJobRequest::decode(&message.encode_to_vec()[..])
+                .is_ok_and(|asked| asked.job.is_some_and(|job| job.standing));
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -591,6 +597,13 @@ impl Sidecar {
             )
             .await
             .map_err(refused)?;
+        // Contract v30 (W12.4): a standing job this plugin registered, which
+        // a subscription may name (SubscribeRequest.job_ids).
+        if standing {
+            if let Ok(reply) = domain::RunJobReply::decode(&payload[..]) {
+                self.subscriptions.registered(&reply.job_id);
+            }
+        }
         // A connectivity plugin reads the orders behind the placements naming
         // its instance, and the records of those alone (W11.17, as a
         // placement is heard at the instance it names, matrix/directed.tsv).
