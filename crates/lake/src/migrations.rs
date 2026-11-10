@@ -86,6 +86,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "row_digest",
         sql: include_str!("../migrations/0012_row_digest.sql"),
     },
+    // The record path batched (ruled 2026-11-10): each subject's last
+    // sequence in a dataset, found by an index.
+    Migration {
+        version: 13,
+        name: "subject_sequence",
+        sql: include_str!("../migrations/0013_subject_sequence.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

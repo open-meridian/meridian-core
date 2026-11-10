@@ -512,7 +512,9 @@ test-store: network tests-image
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; exit 1; }
+	@# The lake's speed check's figures, on every run, passing or not.
+	@grep -h 'SPEED lake' .test-store.log || echo "test-store: the lake's speed check said nothing"
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.

@@ -22,7 +22,22 @@ fail-fast = true
 # own process, so its binary's tests run one at a time instead.
 [test-groups]
 book-rebuilds = { max-threads = 1 }
+lake-speed = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(meridian-bor) & binary(postgres)'
 test-group = 'book-rebuilds'
+
+# The lake's speed check (crates/lake/tests/postgres.rs,
+# a_chains_latest_loads_one_row_per_series) runs alone: in its own group, and
+# needing every test thread, so none of the lake's other Postgres tests share
+# the database's time with it -- a rate it measured beside them was theirs
+# too (CI 42895485994: 598 rows a second recorded against its 600, then
+# 23,222 read against its 25,000). Its figures are printed on every run,
+# passing or not, and kept in its JUnit, which CI keeps.
+[[profile.default.overrides]]
+filter = 'package(meridian-lake) & binary(postgres) & test(=a_chains_latest_loads_one_row_per_series)'
+test-group = 'lake-speed'
+threads-required = 'num-test-threads'
+success-output = 'immediate'
+junit = { store-success-output = true }

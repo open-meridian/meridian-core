@@ -251,25 +251,46 @@ impl PostgresStore {
     }
 }
 
-fn latest_of(
+/// Each row key's latest version held, for a whole batch in one look
+/// (ruled 2026-11-10): one probe of `lake_row_version` a key, inside one
+/// statement, rather than one round trip a key.
+fn latest_of_each(
     client: &mut impl GenericClient,
     dataset: &str,
-    row: &Observation,
-) -> Result<Option<Observation>> {
+    rows: &[Observation],
+) -> Result<BTreeMap<(i16, String), Observation>> {
+    let mut asked: BTreeMap<(i16, String), DataType> = BTreeMap::new();
+    for row in rows {
+        asked.insert(
+            (row.data_type().code(), row.meta().row_key.clone()),
+            row.data_type(),
+        );
+    }
+    let (types, keys): (Vec<i16>, Vec<String>) = asked.keys().cloned().unzip();
     let found = client
-        .query_opt(
-            "SELECT body FROM lake_row
-              WHERE dataset = $1 AND data_type = $2 AND row_key = $3
-              ORDER BY version DESC LIMIT 1",
-            &[&dataset, &row.data_type().code(), &row.meta().row_key],
+        .query(
+            "SELECT k.data_type, k.row_key, r.body
+               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+              CROSS JOIN LATERAL (
+                    SELECT body FROM lake_row
+                     WHERE dataset = $1 AND data_type = k.data_type AND row_key = k.row_key
+                     ORDER BY version DESC LIMIT 1) AS r",
+            &[&dataset, &types, &keys],
         )
         .map_err(unavailable)?;
-    found
-        .map(|r| {
-            let body: Vec<u8> = r.get(0);
-            Observation::decode(row.data_type(), &body).map_err(unreadable)
-        })
-        .transpose()
+    let mut latest = BTreeMap::new();
+    for row in found {
+        let key = (row.get::<_, i16>(0), row.get::<_, String>(1));
+        let Some(data_type) = asked.get(&key).copied() else {
+            continue;
+        };
+        let body: &[u8] = row.get(2);
+        latest.insert(
+            key,
+            Observation::decode(data_type, body).map_err(unreadable)?,
+        );
+    }
+    Ok(latest)
 }
 
 /// Every closed-day re-check of these rows of one dataset, in order.
@@ -375,68 +396,178 @@ fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
     })
 }
 
-fn previous_of(client: &mut impl GenericClient, dataset: &str, row: &Observation) -> Result<u64> {
-    let found: Option<i64> = client
-        .query_one(
-            "SELECT max(sequence) FROM lake_row
-              WHERE subject = $1 AND data_type = $2 AND dataset = $3",
-            &[&row.subject(), &row.data_type().code(), &dataset],
+/// Each subject's last sequence in the dataset, for a whole batch in one
+/// look (ruled 2026-11-10), by `lake_row_subject_sequence` (migration 13):
+/// the top of each subject's own entries, one probe a subject. The subject
+/// is named as that index keys it, `subject || ''`, which no other read
+/// names, so a read of the latest is never planned on it.
+fn previous_of_each(
+    client: &mut impl GenericClient,
+    dataset: &str,
+    rows: &[Observation],
+) -> Result<BTreeMap<(i16, String), u64>> {
+    let asked: std::collections::BTreeSet<(i16, String)> = rows
+        .iter()
+        .map(|row| (row.data_type().code(), row.subject().to_string()))
+        .collect();
+    let (types, subjects): (Vec<i16>, Vec<String>) = asked.into_iter().unzip();
+    let found = client
+        .query(
+            "SELECT k.data_type, k.subject,
+                    (SELECT max(sequence) FROM lake_row
+                      WHERE dataset = $1 AND data_type = k.data_type
+                        AND (subject || '') = k.subject)
+               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, subject)",
+            &[&dataset, &types, &subjects],
         )
-        .map_err(unavailable)?
-        .get(0);
-    Ok(found.unwrap_or(0) as u64)
+        .map_err(unavailable)?;
+    Ok(found
+        .iter()
+        .filter_map(|row| {
+            let last: Option<i64> = row.get(2);
+            last.map(|last| ((row.get(0), row.get(1)), last as u64))
+        })
+        .collect())
 }
 
-fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation, epoch: u64) -> Result<()> {
-    let meta = row.meta();
-    let date: Option<String> = (!meta.business_date.is_empty()).then(|| meta.business_date.clone());
-    // A series row's expiry and listed type (migration 7); none for any other.
-    let listing = row.listing();
-    let expires: Option<String> = listing.as_ref().and_then(|(expires, _)| expires.clone());
-    let listed_type: Option<i16> = listing.map(|(_, kind)| kind as i16);
-    // Its digest, kept beside it (step 3b, integrity at rest).
-    let body = row.encode();
-    let digest = meridian_changes::integrity::digest(&body);
-    tx.execute(
-        "INSERT INTO lake_row
-                (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
-                 interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
-                 recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                 latest_key, quality, expires, listed_type, published_at_ns, epoch, digest)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18, $19, $20, $21::text::date, $22, $23, $24, $25)",
-        &[
-            &dataset,
-            &(meta.sequence as i64),
-            &row.data_type().code(),
-            &meta.row_key,
-            &(meta.version as i64),
-            &row.subject(),
-            &row.subjects(),
-            &(row.kind() as i16),
-            &row.interval_ns(),
-            &row.venue(),
-            &meta.valid_from_ns,
-            &meta.valid_until_ns,
-            &date,
-            &meta.recorded_at_ns,
-            &(meta.previous_sequence as i64),
-            &!meta.unconverted.is_empty(),
-            &body,
-            &closed_reason(meta.closed_day.as_ref()),
-            &row.latest_key(),
-            &(meta.quality as i16),
-            &expires,
-            &listed_type,
-            // A rate's published time, its versions' order in force
-            // (ruling 1006 (b); migration 8).
-            &crate::store::published_order(row),
-            &(epoch as i64),
-            &digest,
-        ],
-    )
-    .map_err(unavailable)?;
+/// The batch's rows written in one COPY (ruled 2026-11-10), rather than one
+/// INSERT a row: what each row keeps is unchanged. COPY's binary rows are
+/// sent a few KiB at a time, so no connection keeps a buffer the size of a
+/// batch, as a multi-row INSERT's one message would have it keep.
+fn insert_all(
+    tx: &mut Transaction<'_>,
+    dataset: &str,
+    rows: &[Observation],
+    epoch: u64,
+) -> Result<()> {
+    use postgres::binary_copy::BinaryCopyInWriter;
+    use postgres::types::Type;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let sink = tx
+        .copy_in(
+            "COPY lake_row
+                  (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
+                   interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
+                   recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
+                   latest_key, quality, expires, listed_type, published_at_ns, epoch, digest)
+             FROM STDIN (FORMAT binary)",
+        )
+        .map_err(unavailable)?;
+    let types = [
+        Type::TEXT,
+        Type::INT8,
+        Type::INT2,
+        Type::TEXT,
+        Type::INT8,
+        Type::TEXT,
+        Type::TEXT_ARRAY,
+        Type::INT2,
+        Type::INT8,
+        Type::TEXT,
+        Type::INT8,
+        Type::INT8,
+        Type::DATE,
+        Type::INT8,
+        Type::INT8,
+        Type::BOOL,
+        Type::BYTEA,
+        Type::INT2,
+        Type::TEXT,
+        Type::INT2,
+        Type::DATE,
+        Type::INT2,
+        Type::INT8,
+        Type::INT8,
+        Type::BYTEA,
+    ];
+    let mut writer = BinaryCopyInWriter::new(sink, &types);
+    let epoch = epoch as i64;
+    for row in rows {
+        let meta = row.meta();
+        let date = pg_date(&meta.business_date)?;
+        // A series row's expiry and listed type (migration 7); none for any
+        // other.
+        let listing = row.listing();
+        let expires = match listing.as_ref().and_then(|(expires, _)| expires.as_deref()) {
+            Some(text) => pg_date(text)?,
+            None => None,
+        };
+        let listed_type: Option<i16> = listing.map(|(_, kind)| kind as i16);
+        // Its digest, kept beside it (step 3b, integrity at rest).
+        let body = row.encode();
+        let digest = meridian_changes::integrity::digest(&body);
+        writer
+            .write(&[
+                &dataset,
+                &(meta.sequence as i64),
+                &row.data_type().code(),
+                &meta.row_key,
+                &(meta.version as i64),
+                &row.subject(),
+                &row.subjects(),
+                &(row.kind() as i16),
+                &row.interval_ns(),
+                &row.venue(),
+                &meta.valid_from_ns,
+                &meta.valid_until_ns,
+                &date,
+                &meta.recorded_at_ns,
+                &(meta.previous_sequence as i64),
+                &!meta.unconverted.is_empty(),
+                &body,
+                &closed_reason(meta.closed_day.as_ref()),
+                &row.latest_key(),
+                &(meta.quality as i16),
+                &expires,
+                &listed_type,
+                // A rate's published time, its versions' order in force
+                // (ruling 1006 (b); migration 8).
+                &crate::store::published_order(row),
+                &epoch,
+                &digest,
+            ])
+            .map_err(unavailable)?;
+    }
+    writer.finish().map_err(unavailable)?;
     Ok(())
+}
+
+/// A plain date (YYYY-MM-DD) as COPY's binary DATE takes it; none where the
+/// text is empty. A date that does not read is refused, as Postgres refused
+/// it read from its text before.
+fn pg_date(text: &str) -> Result<Option<PgDate>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let date = Date::parse(text).map_err(|_| {
+        StoreError::Unavailable(format!(
+            "db error: ERROR: invalid input syntax for type date: {text:?}"
+        ))
+    })?;
+    // Postgres counts a DATE's days from 2000-01-01, 10,957 days after 1970's.
+    Ok(Some(PgDate((date.days_since_epoch() - 10_957) as i32)))
+}
+
+/// A DATE in Postgres's binary form: days since 2000-01-01.
+#[derive(Debug, Clone, Copy)]
+struct PgDate(i32);
+
+impl postgres::types::ToSql for PgDate {
+    fn to_sql(
+        &self,
+        _: &postgres::types::Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> std::result::Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    {
+        out.extend_from_slice(&self.0.to_be_bytes());
+        Ok(postgres::types::IsNull::No)
+    }
+
+    postgres::types::accepts!(DATE);
+    postgres::types::to_sql_checked!();
 }
 
 /// A read of the latest, chosen in SQL (found on dev 2026-10-26): of the
@@ -915,19 +1046,12 @@ impl Store for PostgresStore {
         let mut head = self.head(&mut tx, dataset)?;
         let epoch = self.fence.epoch();
         // Read what each row is decided against first, then number: the
-        // closures cannot borrow the transaction the inserts need.
-        let mut latest = BTreeMap::new();
-        let mut previous = BTreeMap::new();
-        for row in &rows {
-            let key = (row.data_type().code(), row.meta().row_key.clone());
-            if let std::collections::btree_map::Entry::Vacant(held) = latest.entry(key) {
-                held.insert(latest_of(&mut tx, dataset, row)?);
-            }
-            let subject = (row.data_type().code(), row.subject().to_string());
-            if let std::collections::btree_map::Entry::Vacant(held) = previous.entry(subject) {
-                held.insert(previous_of(&mut tx, dataset, row)?);
-            }
-        }
+        // closures cannot borrow the transaction the inserts need. Each in
+        // one look for the whole batch -- every key's latest version, every
+        // subject's last sequence -- and the batch written in one INSERT
+        // (ruled 2026-11-10): before, two round trips a row.
+        let latest = latest_of_each(&mut tx, dataset, &rows)?;
+        let previous = previous_of_each(&mut tx, dataset, &rows)?;
         let done = number(
             rows,
             &mut head,
@@ -936,7 +1060,6 @@ impl Store for PostgresStore {
                 latest
                     .get(&(row.data_type().code(), row.meta().row_key.clone()))
                     .cloned()
-                    .flatten()
             },
             |row| {
                 previous
@@ -945,9 +1068,7 @@ impl Store for PostgresStore {
                     .unwrap_or(0)
             },
         );
-        for row in &done.rows {
-            insert(&mut tx, dataset, row, epoch)?;
-        }
+        insert_all(&mut tx, dataset, &done.rows, epoch)?;
         // Each row numbered version 1 is a key the partition held no
         // version of; every other replaces its key's last.
         Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;

@@ -1662,11 +1662,20 @@ fn said(m: &LakeMeasure) -> String {
 /// The floors are a quarter of what the gate's container measured
 /// (INSTALL.md, "Capacity"), so a slower CI runner passes and a
 /// regression of four times does not.
+///
+/// It runs alone (.config/nextest.toml, `lake-speed`), and says what it
+/// measured, beside its floors, on every run, passing or not: test-store
+/// prints the line, and its JUnit keeps it.
 #[test]
 fn a_chains_latest_loads_one_row_per_series() {
     let store = store();
     let measured = measure_chain(&store, 200, 100);
-    eprintln!("bench: {}", said(&measured));
+    println!(
+        "SPEED lake {} floors: record_rows_per_s>={GUARD_RECORD_ROWS_PER_S:.0} \
+         read_rows_per_s>={GUARD_READ_ROWS_PER_S:.0} latest_ms<={}",
+        said(&measured),
+        GUARD_LATEST.as_millis()
+    );
     assert!(
         measured.record_rows_per_s >= GUARD_RECORD_ROWS_PER_S,
         "the lake records {:.0} rows a second; its guard is {GUARD_RECORD_ROWS_PER_S}",
@@ -1684,9 +1693,11 @@ fn a_chains_latest_loads_one_row_per_series() {
     );
 }
 
-/// The guard's floors: a quarter of the stated capacity at 20,000 rows
-/// (2,449 rows a second recorded, 102,429 read, the latest in 222 ms), and
-/// four times its latest read.
+/// The guard's floors, set from the capacity stated on 2026-10-26 at 20,000
+/// rows (a quarter of 2,449 rows a second recorded and 102,429 read, and
+/// four times its latest read of 222 ms), and kept as they were when the
+/// record path was batched (2026-11-10; INSTALL.md now states about 15,000
+/// recorded and the latest in 14 ms).
 const GUARD_RECORD_ROWS_PER_S: f64 = 600.0;
 const GUARD_READ_ROWS_PER_S: f64 = 25_000.0;
 const GUARD_LATEST: std::time::Duration = std::time::Duration::from_millis(900);
