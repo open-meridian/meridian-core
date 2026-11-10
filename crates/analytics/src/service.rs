@@ -47,6 +47,24 @@ pub struct Config {
     pub read_timeout: Duration,
     /// How many finished answers are kept to be read (Q12: losable).
     pub answers_kept: usize,
+    /// The most bytes the answers kept hold in all, as encoded, where they
+    /// are kept (found 2026-11-09: kept by count alone, a thousand chain
+    /// answers of about 1.2 MB each could hold about 1.2 GB of a 2 GiB
+    /// coordinator). The oldest leaves first; an answer larger than all of
+    /// it is kept as a refusal saying so, never pushing every other out.
+    pub answers_kept_bytes: usize,
+    /// How long a finished answer is kept to be read; past it, it has left
+    /// the cache and the job is run again (Q12).
+    pub answers_kept_for: Duration,
+    /// How many jobs resolve and compute at once, each holding its inputs
+    /// while it runs (found 2026-11-09: a thread a job and no bound, so a
+    /// burst of chain jobs held every chain's inputs at once). A job past
+    /// it waits for one to finish, answered later as any job past its
+    /// window is.
+    pub jobs_at_once: usize,
+    /// How many jobs may wait for one running to finish; one past it is
+    /// refused, saying so, and asked again later.
+    pub jobs_waiting: usize,
     /// Where a page of an answer ends, in bytes (ruling 794): an answer past
     /// it is never given inline, and is read in pages of it.
     pub page_budget: usize,
@@ -60,23 +78,105 @@ impl Default for Config {
             price_deadline: Duration::from_secs(5),
             read_timeout: Duration::from_secs(8),
             answers_kept: 1_000,
+            answers_kept_bytes: ANSWERS_KEPT_BYTES,
+            answers_kept_for: ANSWERS_KEPT_FOR,
+            jobs_at_once: JOBS_AT_ONCE,
+            jobs_waiting: JOBS_WAITING,
             page_budget: crate::pages::PAGE_BUDGET,
         }
     }
 }
 
-/// A finished job's answer, read only by the instance that ran it.
+/// The answers kept, in bytes as encoded: a quarter of the coordinator's
+/// 2 GiB (the chart's limit), about two hundred chain answers of dev's
+/// 1.2 MB.
+pub const ANSWERS_KEPT_BYTES: usize = 256 * 1024 * 1024;
+
+/// How long an answer is kept to be read: time for its client to hear it
+/// finished, catch up after a restart, and read it a page at a time.
+pub const ANSWERS_KEPT_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// Jobs running at once: v26's benchmark holds a 500-position account's
+/// inputs, about 25 MB, while it runs, and a 1,000-account batch about ten
+/// times that; four of those beside the answers kept stay within the
+/// coordinator's 2 GiB.
+pub const JOBS_AT_ONCE: usize = 4;
+
+/// Jobs waiting for one running to finish, each holding its request alone.
+pub const JOBS_WAITING: usize = 64;
+
+/// A finished job's answer, read only by the instance that ran it: kept
+/// encoded, so what it holds is what it is counted at.
 struct Finished {
     client: String,
-    answer: Result<JobAnswer, String>,
+    answer: Result<Arc<[u8]>, String>,
+    /// When it was kept, by the coordinator's clock.
+    kept_at_ns: i64,
+}
+
+impl Finished {
+    fn bytes(&self) -> usize {
+        match &self.answer {
+            Ok(encoded) => encoded.len(),
+            Err(refused) => refused.len(),
+        }
+    }
 }
 
 #[derive(Default)]
 struct Jobs {
     answers: BTreeMap<String, Finished>,
     order: VecDeque<String>,
+    /// What the answers kept hold, as [`Finished::bytes`] counts them.
+    kept_bytes: usize,
     events: BTreeMap<String, Vec<JobFinishedEvent>>,
     sequences: BTreeMap<String, i64>,
+}
+
+impl Jobs {
+    /// The oldest answers left, while more are kept than the count, the
+    /// bytes or the age allow.
+    fn trim(&mut self, config: &Config, now_ns: i64) {
+        let oldest_kept = now_ns.saturating_sub(config.answers_kept_for.as_nanos() as i64);
+        while let Some(oldest) = self.order.front() {
+            let expired = self
+                .answers
+                .get(oldest)
+                .is_none_or(|held| held.kept_at_ns < oldest_kept);
+            if !expired
+                && self.order.len() <= config.answers_kept
+                && self.kept_bytes <= config.answers_kept_bytes
+            {
+                break;
+            }
+            let oldest = self.order.pop_front().expect("one is first");
+            if let Some(gone) = self.answers.remove(&oldest) {
+                self.kept_bytes -= gone.bytes();
+            }
+        }
+    }
+}
+
+/// The jobs running and waiting, so that only so many hold their inputs at
+/// once.
+#[derive(Default)]
+struct Slots {
+    running: usize,
+    waiting: usize,
+}
+
+/// A job's place among those running, given back when it finishes, however
+/// it finishes.
+struct Slot<'a> {
+    coordinator: &'a Coordinator,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut slots = self.coordinator.slots.lock().expect("not poisoned");
+        slots.running -= 1;
+        self.coordinator.slot_freed.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -93,6 +193,8 @@ pub struct Coordinator {
     config: Config,
     executor: Arc<dyn Executor>,
     jobs: Mutex<Jobs>,
+    slots: Mutex<Slots>,
+    slot_freed: Condvar,
     batches: Mutex<Batches>,
     batch_answered: Condvar,
 }
@@ -178,6 +280,8 @@ impl Coordinator {
             config,
             executor,
             jobs: Mutex::new(Jobs::default()),
+            slots: Mutex::new(Slots::default()),
+            slot_freed: Condvar::new(),
             batches: Mutex::new(Batches::default()),
             batch_answered: Condvar::new(),
         })
@@ -209,6 +313,25 @@ impl Coordinator {
                 refused.to_string(),
             )
         })?;
+        // A place among the jobs running, or among those waiting for one;
+        // past both, refused, never another thread holding its inputs.
+        {
+            let mut slots = self.slots.lock().expect("not poisoned");
+            if slots.running >= self.config.jobs_at_once.max(1)
+                && slots.waiting >= self.config.jobs_waiting
+            {
+                return Err(refusal_with_status(
+                    RefusalStatus::FailedPrecondition,
+                    &[],
+                    format!(
+                        "the analytics component is running {} jobs with {} waiting, the most \
+                         it holds at once: run the job again shortly",
+                        slots.running, slots.waiting
+                    ),
+                ));
+            }
+            slots.waiting += 1;
+        }
         let job_id = job_id(self.clock.now_ns());
         let (told, heard) = mpsc::channel();
         let me = Arc::clone(self);
@@ -225,7 +348,9 @@ impl Coordinator {
         };
         let finishing_client = client.clone();
         std::thread::spawn(move || {
+            let slot = me.slot();
             let answered = me.answer(&asker, &job, &compiled, &id);
+            drop(slot);
             if told.send(answered.clone()).is_err() {
                 // The reply went: the job finishes later (W12.4).
                 me.finished(&id, &finishing_client, answered);
@@ -258,6 +383,18 @@ impl Coordinator {
                 answer: None,
             }),
         }
+    }
+
+    /// A place among the jobs running: waits, counted among those waiting,
+    /// until one is free.
+    fn slot(&self) -> Slot<'_> {
+        let mut slots = self.slots.lock().expect("not poisoned");
+        while slots.running >= self.config.jobs_at_once.max(1) {
+            slots = self.slot_freed.wait(slots).expect("not poisoned");
+        }
+        slots.waiting -= 1;
+        slots.running += 1;
+        Slot { coordinator: self }
     }
 
     /// A job's answer: its inputs resolved, its routed batches priced, its
@@ -311,21 +448,39 @@ impl Coordinator {
         }
     }
 
+    /// A finished answer kept to be read, encoded, within the count, the
+    /// bytes and the age the coordinator keeps (Q12: losable).
     fn keep(&self, job_id: &str, client: &str, answer: Result<JobAnswer, String>) {
-        let mut jobs = self.jobs.lock().expect("not poisoned");
-        jobs.answers.insert(
-            job_id.to_string(),
-            Finished {
-                client: client.to_string(),
-                answer,
-            },
-        );
-        jobs.order.push_back(job_id.to_string());
-        while jobs.order.len() > self.config.answers_kept {
-            if let Some(oldest) = jobs.order.pop_front() {
-                jobs.answers.remove(&oldest);
+        let answer = match answer {
+            Ok(answer) if answer.encoded_len() > self.config.answers_kept_bytes => {
+                Err(refusal_with_status(
+                    RefusalStatus::FailedPrecondition,
+                    &[],
+                    format!(
+                        "{job_id}'s answer is {} bytes, more than the {} the analytics \
+                         component keeps for every job's answers: narrow the job",
+                        answer.encoded_len(),
+                        self.config.answers_kept_bytes
+                    ),
+                ))
             }
+            Ok(answer) => Ok(Arc::from(answer.encode_to_vec())),
+            Err(refused) => Err(refused),
+        };
+        let now_ns = self.clock.now_ns();
+        let finished = Finished {
+            client: client.to_string(),
+            answer,
+            kept_at_ns: now_ns,
+        };
+        let mut jobs = self.jobs.lock().expect("not poisoned");
+        jobs.kept_bytes += finished.bytes();
+        if let Some(replaced) = jobs.answers.insert(job_id.to_string(), finished) {
+            jobs.kept_bytes -= replaced.bytes();
+        } else {
+            jobs.order.push_back(job_id.to_string());
         }
+        jobs.trim(&self.config, now_ns);
     }
 
     /// A job answered later has finished: its answer kept, and the client
@@ -384,10 +539,19 @@ impl Coordinator {
         envelope: &Envelope,
     ) -> Result<JobAnswer, String> {
         let (client, _) = client_of(envelope);
-        let jobs = self.jobs.lock().expect("not poisoned");
+        let mut jobs = self.jobs.lock().expect("not poisoned");
+        jobs.trim(&self.config, self.clock.now_ns());
         match jobs.answers.get(&request.job_id) {
             Some(held) if held.client == client => match &held.answer {
-                Ok(answer) => crate::pages::page(answer, &request, self.config.page_budget),
+                Ok(encoded) => {
+                    // Decoded for the page outside the lock: one reader's
+                    // answer never holds up another's.
+                    let encoded = Arc::clone(encoded);
+                    drop(jobs);
+                    let answer = JobAnswer::decode(&encoded[..])
+                        .map_err(|failed| format!("a kept answer did not decode: {failed}"))?;
+                    crate::pages::page(&answer, &request, self.config.page_budget)
+                }
                 Err(refused) => Err(refused.clone()),
             },
             // Another instance's job is not this caller's to know of: answered
