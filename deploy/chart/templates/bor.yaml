@@ -69,10 +69,9 @@ spec:
               value: {{ .Values.bor.hotLayer.booksMiB | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
-            {{- with .Values.bor.mallocArenaMax }}
-            - name: MALLOC_ARENA_MAX
-              value: {{ . | quote }}
-            {{- end }}
+            # Its working memory (stage M), less the hot layer's bound; glibc's
+            # arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "bor" "values" .Values.bor "resources" (.Values.bor.resources | default .Values.resources) "heldMiB" .Values.bor.hotLayer.booksMiB "name" "bor") | nindent 12 }}
             {{- with .Values.bor.snapshotInterval }}
             - name: MERIDIAN_BOR_SNAPSHOT_INTERVAL
               value: {{ . | quote }}

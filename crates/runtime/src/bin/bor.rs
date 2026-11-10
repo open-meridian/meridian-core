@@ -155,6 +155,8 @@ fn run() -> Result<(), String> {
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "bor-1".into());
 
     on_runtime(async {
+        // Its working budget (stage M), less the hot layer's bound.
+        meridian_runtime::install_budget("bor", books_bound as u64)?;
         let bus = bus_from_env(&instance_id).await?;
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the

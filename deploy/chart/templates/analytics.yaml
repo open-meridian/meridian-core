@@ -71,6 +71,9 @@ spec:
               value: {{ $full }}-analytics
             - name: RUST_LOG
               value: {{ $.Values.logLevel | quote }}
+            # Its working memory (stage M; the resilience spec's section 10a),
+            # and glibc's arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" (printf "analytics-%s" $part) "values" $values "resources" $values.resources "heldMiB" 0 "name" "analytics") | nindent 12 }}
             {{- if gt (int (include "meridian-runtime.jetstreamReplicas" $)) 0 }}
             # The units' work queue on JetStream (step 3b).
             - name: MERIDIAN_ANALYTICS_UNITS

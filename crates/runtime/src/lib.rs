@@ -569,6 +569,27 @@ pub fn mark_ready(serving: bool) {
 /// exit: in an upgrade the broker restarts beside everything that connects to
 /// it, and a component that exited on it was restarted once per release.
 pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
+    // Every component's working memory is budgeted before it answers
+    // anything (stage M; the resilience spec's section 10a): one installed
+    // by its binary with its hot layer's and held answers' bounds, or else
+    // installed here with none held. A process with no limit known runs
+    // unbounded, as before.
+    if meridian_budget::installed().is_none() {
+        let component = instance_id.split('-').next().unwrap_or(instance_id);
+        install_budget(component, 0)?;
+    }
+    bus_from_env_budgeted(instance_id).await
+}
+
+/// This component's budget, installed from the chart's memory settings, less
+/// `held` bytes of hot layer and held answers (section 10a); refused, and the
+/// component stopped, where they leave nothing to answer with -- as the
+/// chart refuses such a configuration before it is applied.
+pub fn install_budget(component: &str, held: u64) -> Result<(), String> {
+    meridian_budget::install(component, held, meridian_budget::permits_from_env()).map(|_| ())
+}
+
+async fn bus_from_env_budgeted(instance_id: &str) -> Result<Arc<Bus>, String> {
     let backend: Arc<dyn Backend> = match var("MERIDIAN_BROKER_URL") {
         Some(url) => {
             let mut waiting = Waiting::new("the broker");

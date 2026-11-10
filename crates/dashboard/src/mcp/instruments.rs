@@ -2366,6 +2366,7 @@ mod tests {
                     refusal: Some(meridian_pb::v1::Refusal {
                         reason: RefusalReason::RecordChanged as i32,
                         fields: vec!["against_version".into()],
+                        retry_after_seconds: 0,
                     }),
                     detail: "changed".into(),
                     ..Default::default()

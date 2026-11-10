@@ -146,6 +146,7 @@ fn complete_one(
             refusal: Some(Refusal {
                 reason: reason as i32,
                 fields,
+                retry_after_seconds: 0,
             }),
             detail,
         };

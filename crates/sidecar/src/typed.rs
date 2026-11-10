@@ -1499,6 +1499,29 @@ pub(crate) fn refused_naming(
     reason: RefusalReason,
     fields: Vec<String>,
 ) -> Status {
+    refused_with(code, words, reason, fields, 0)
+}
+
+/// A refusal for load (contract v30; W4.4): RESOURCE_EXHAUSTED, its reason
+/// -- REFUSAL_REASON_OVERLOADED or REFUSAL_REASON_RATE_LIMITED -- and how
+/// long to wait before asking again, at least a second.
+pub fn refused_for_load(reason: RefusalReason, retry_after_seconds: u32, words: String) -> Status {
+    refused_with(
+        Code::ResourceExhausted,
+        words,
+        reason,
+        Vec::new(),
+        retry_after_seconds.max(1),
+    )
+}
+
+fn refused_with(
+    code: Code,
+    words: String,
+    reason: RefusalReason,
+    fields: Vec<String>,
+    retry_after_seconds: u32,
+) -> Status {
     let mut metadata = MetadataMap::new();
     metadata.insert_bin(
         REFUSAL_METADATA,
@@ -1506,6 +1529,7 @@ pub(crate) fn refused_naming(
             &Refusal {
                 reason: reason as i32,
                 fields,
+                retry_after_seconds,
             }
             .encode_to_vec(),
         ),
@@ -1543,6 +1567,15 @@ pub(crate) fn refused(failed: BusError) -> Status {
         BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
             .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
         {
+            // A component's budget full (contract v30; W4.4): refused for
+            // load, with its retry-after, nothing recorded.
+            Some((reason @ (RefusalReason::Overloaded | RefusalReason::RateLimited), words)) => {
+                refused_for_load(
+                    reason,
+                    meridian_bus::refusal_retry_after(&detail).unwrap_or(1),
+                    words.to_string(),
+                )
+            }
             // A store that could not check the command, nothing recorded:
             // to be tried again, so the status a caller retries (contract
             // v10). Every other refusal of a component's is `aborted`.

@@ -53,6 +53,9 @@ pub enum BusError {
 /// `;`, so neither the code's end nor a field's is ever mistaken.
 const REFUSAL_REASON_PREFIX: &str = "[refusal-reason ";
 const REFUSAL_FIELDS: &str = "fields=";
+/// A refusal for load says when to ask again (contract v30; W4.4):
+/// `[refusal-reason 32 retry=3] words`.
+const REFUSAL_RETRY: &str = "retry=";
 
 /// A handler's refusal, carrying `reason` -- a meridian.v1.RefusalReason's
 /// number, never 0 -- beside its words.
@@ -70,34 +73,67 @@ pub fn refusal_naming(reason: i32, fields: &[String], words: impl std::fmt::Disp
     format!("{REFUSAL_REASON_PREFIX}{reason} {REFUSAL_FIELDS}{named}] {words}")
 }
 
-/// The code, the fields and the words, where the detail carries a code.
-fn refusal_parts(detail: &str) -> Option<(i32, Vec<&str>, &str)> {
+/// A refusal for load (contract v30; the resilience spec's section 10a),
+/// carrying `reason` -- REFUSAL_REASON_OVERLOADED or
+/// REFUSAL_REASON_RATE_LIMITED -- and how long to wait before asking again,
+/// at least a second.
+pub fn refusal_retrying(
+    reason: i32,
+    retry_after_seconds: u32,
+    words: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{REFUSAL_REASON_PREFIX}{reason} {REFUSAL_RETRY}{}] {words}",
+        retry_after_seconds.max(1)
+    )
+}
+
+/// A component's refusal of a request its budget had no room for
+/// (REFUSAL_REASON_OVERLOADED), with its retry-after.
+pub fn overloaded(over: &meridian_budget::Overloaded) -> String {
+    refusal_retrying(
+        meridian_pb::v1::RefusalReason::Overloaded as i32,
+        over.retry_after_seconds,
+        &over.words,
+    )
+}
+
+/// How long a refusal for load says to wait, in seconds; none on any other.
+pub fn refusal_retry_after(detail: &str) -> Option<u32> {
+    refusal_parts(detail).and_then(|(_, _, retry, _)| retry)
+}
+
+/// The code, the fields, the retry-after and the words, where the detail
+/// carries a code.
+fn refusal_parts(detail: &str) -> Option<(i32, Vec<&str>, Option<u32>, &str)> {
     let rest = detail.strip_prefix(REFUSAL_REASON_PREFIX)?;
     let (head, words) = rest.split_once("] ")?;
-    let (number, fields) = match head.split_once(' ') {
-        Some((number, named)) => (
-            number,
-            named
-                .strip_prefix(REFUSAL_FIELDS)?
-                .split(';')
-                .filter(|field| !field.is_empty())
-                .collect(),
-        ),
-        None => (head, Vec::new()),
-    };
+    let mut said = head.split(' ');
+    let number = said.next()?;
+    let mut fields = Vec::new();
+    let mut retry = None;
+    for part in said {
+        if let Some(named) = part.strip_prefix(REFUSAL_FIELDS) {
+            fields.extend(named.split(';').filter(|field| !field.is_empty()));
+        } else if let Some(seconds) = part.strip_prefix(REFUSAL_RETRY) {
+            retry = Some(seconds.parse().ok()?);
+        } else {
+            return None;
+        }
+    }
     let reason: i32 = number.parse().ok()?;
-    (reason > 0).then_some((reason, fields, words))
+    (reason > 0).then_some((reason, fields, retry, words))
 }
 
 /// A refusal's reason code and its words, where it carries one.
 pub fn read_refusal(detail: &str) -> Option<(i32, &str)> {
-    refusal_parts(detail).map(|(reason, _, words)| (reason, words))
+    refusal_parts(detail).map(|(reason, _, _, words)| (reason, words))
 }
 
 /// The fields a refusal names as left out; none where it names none.
 pub fn refusal_fields(detail: &str) -> Vec<String> {
     refusal_parts(detail)
-        .map(|(_, fields, _)| fields.into_iter().map(str::to_string).collect())
+        .map(|(_, fields, _, _)| fields.into_iter().map(str::to_string).collect())
         .unwrap_or_default()
 }
 
@@ -215,6 +251,31 @@ mod refusal_status_tests {
             Some((RefusalStatus::FailedPrecondition, vec!["pack".to_string()]))
         );
         assert!(read_refusal_status("[refusal-reason 21] words").is_none());
+    }
+
+    #[test]
+    fn a_refusal_for_load_carries_its_retry_after_beside_its_code_and_words() {
+        let over = meridian_budget::Overloaded {
+            retry_after_seconds: 3,
+            words: "overloaded: list-statistics".into(),
+        };
+        let said = overloaded(&over);
+        assert_eq!(
+            read_refusal(&said),
+            Some((
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                "overloaded: list-statistics"
+            ))
+        );
+        assert_eq!(refusal_retry_after(&said), Some(3));
+        assert!(refusal_fields(&said).is_empty());
+        let limited = refusal_retrying(33, 0, "past its share");
+        assert_eq!(refusal_retry_after(&limited), Some(1), "at least a second");
+        // Every refusal before carries none, and reads as before.
+        let incomplete = refusal_naming(11, &["positions[0].lots".into()], "left out");
+        assert_eq!(refusal_retry_after(&incomplete), None);
+        assert_eq!(refusal_fields(&incomplete), vec!["positions[0].lots"]);
+        assert_eq!(read_refusal("[refusal-reason 11 nonsense] words"), None);
     }
 }
 

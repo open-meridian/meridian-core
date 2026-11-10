@@ -2673,6 +2673,38 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
 	done
+	@# Stage M (the resilience spec's section 10a): every component and every
+	@# sidecar is told its container's limit, memory.budgetPercent and
+	@# memory.shedPercent and glibc's settings; a percent out of range, or a
+	@# limit that leaves a component nothing past its hot layer and held
+	@# answers, renders nothing; a plugin's share reaches its sidecar, its own
+	@# limits overriding the chart's; and the broker's bounds reach it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	shared="$$base --set sidecars[0].instanceId=probe --set sidecars[0].roles[0]=data --set sidecars[0].limits.inFlight=4"; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$shared 2>/dev/null)"; \
+	for container in lake bor instrument street conductor dashboard launcher analytics-coordinator analytics-worker sidecar; do \
+		echo "$$said" | grep -A3 'name: MERIDIAN_MEMORY_LIMIT_BYTES$$' | grep -q "containerName: $$container$$" \
+			|| { echo "chart-check FAILED: the $$container container is not told its memory limit (stage M)" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$said" | grep -A1 'name: MERIDIAN_MEMORY_BUDGET_PERCENT$$' | grep -c 'value: "80"')" -ge 10 ] \
+		|| { echo "chart-check FAILED: memory.budgetPercent does not reach every component as 80" >&2; exit 1; }; \
+	[ "$$(echo "$$said" | grep -A1 'name: MALLOC_ARENA_MAX$$' | grep -c 'value: "2"')" -ge 10 ] \
+		|| { echo "chart-check FAILED: glibc's arenas are not set on every component" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_IN_FLIGHT$$' | grep -q 'value: "4"' \
+		|| { echo "chart-check FAILED: a sidecars[] entry's limits.inFlight does not override sidecar.limits.inFlight" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_REQUESTS_PER_SECOND$$' | grep -q 'value: "200"' \
+		|| { echo "chart-check FAILED: sidecar.limits.requestsPerSecond does not reach a sidecar as 200" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set memory.shedPercent=85 2>/dev/null | grep -A1 'name: MERIDIAN_MEMORY_SHED_PERCENT$$' | grep -q 'value: "85"' \
+		|| { echo "chart-check FAILED: memory.shedPercent=85 does not reach the components" >&2; exit 1; }; \
+	for refused in memory.budgetPercent=5 memory.budgetPercent=96 memory.shedPercent=80 memory.shedPercent=100 sidecar.limits.inFlight=0 resources.limits.memory=128Mi; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$shared --set $$refused >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: $$refused rendered; it leaves nothing, or is out of range (stage M)" >&2; exit 1; }; \
+	done; \
+	brought="$$($(HELM_TEMPLATE) check deploy/chart $$base --set broker.limits.maxPending=32MB --set broker.jetstream.maxMemory=48MB 2>/dev/null)"; \
+	for pair in max-pending:32MB max-payload:1MB jetstream-memory:48MB; do \
+		echo "$$brought" | grep -A1 -e "- --$${pair%%:*}$$" | grep -q "\"$${pair#*:}\"" \
+			|| { echo "chart-check FAILED: the broker is not given --$${pair%%:*} $${pair#*:} (stage M)" >&2; exit 1; }; \
+	done
 	@# Step 3a: each hot layer's bound reaches its store, in MiB, by default
 	@# and as set.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \

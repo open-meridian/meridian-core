@@ -399,43 +399,10 @@ impl meridian_changes::ChangeLog for LakeLog {
 /// The analytics component's instance where nothing names another (W12.2).
 pub const ANALYTICS: &str = "analytics";
 
-/// Ruling 957 (b): glibc's free memory handed back to the system, from the
-/// top of each arena and the free pages within it; what it did said at
-/// debug. Only glibc keeps memory this way, and only glibc is asked.
-#[cfg(target_env = "gnu")]
+/// Ruling 957 (b): glibc's free memory handed back to the system, as every
+/// component's sweep does (stage M; meridian_budget::sweep).
 fn release_to_system() {
-    let told = tracing::enabled!(tracing::Level::DEBUG);
-    let before = told.then(resident_kib).flatten();
-    let started = std::time::Instant::now();
-    // SAFETY: malloc_trim takes no pointer and touches only the allocator's
-    // own state, under the allocator's own locks.
-    let released = unsafe { libc::malloc_trim(0) } == 1;
-    if told {
-        tracing::debug!(
-            released,
-            resident_before_kib = before.unwrap_or(0),
-            resident_after_kib = resident_kib().unwrap_or(0),
-            ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3),
-            "the memory freed returned to the system"
-        );
-    }
-}
-
-#[cfg(not(target_env = "gnu"))]
-fn release_to_system() {}
-
-/// The process's resident memory, in KiB, as /proc says it.
-#[cfg(target_env = "gnu")]
-fn resident_kib() -> Option<u64> {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .ok()
+    meridian_budget::sweep::release_to_system();
 }
 
 static ANALYTICS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();

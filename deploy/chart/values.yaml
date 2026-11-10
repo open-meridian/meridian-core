@@ -587,6 +587,16 @@ broker:
   jetstream:
     size: 1Gi
     storageClassName: ""
+    # What JetStream holds in memory on each server (stage M; section 10a).
+    maxMemory: 16MB
+  # The broker's bounds (stage M; section 10a; approved 2026-11-09): a
+  # client that stops reading is cut off alone, as a slow consumer, once
+  # maxPending bytes wait for it, and every other keeps its deliveries; the
+  # largest message is maxPayload, the 1 MiB every paged answer is budgeted
+  # under -- never raised to fit an answer: page it.
+  limits:
+    maxPending: 64MB
+    maxPayload: 1MB
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so
@@ -836,6 +846,21 @@ resources:
 
 logLevel: info
 
+# Each component's working memory (stage M; the resilience spec's section
+# 10a; approved 2026-11-09): a component's budget is its container's memory
+# limit times budgetPercent, less its hot layer's and held answers' bounds,
+# and every request reserves its working memory against it before it runs;
+# with the budget full a request waits briefly, then is refused
+# RESOURCE_EXHAUSTED with REFUSAL_REASON_OVERLOADED and a retry-after.
+# Above shedPercent of its limit a component cancels its largest request in
+# flight with the same refusal, so the kernel's OOM killer never fires. A
+# configuration that leaves a component nothing to answer with is refused
+# before it is applied. Raising a limit is not the fix for a component that
+# refuses (808); lowering the bound that holds the memory is.
+memory:
+  budgetPercent: 80
+  shedPercent: 90
+
 sidecar:
   # Where a plugin dials its sidecar, on loopback. A plugin runs as a second
   # container in its sidecar's pod, which is what sharing a network namespace
@@ -850,6 +875,19 @@ sidecar:
   # and closed by a NetworkPolicy to everything but the dashboard's pods. The
   # plugin's own page stays on loopback, where only its sidecar reaches it.
   frontDoorPort: 9292
+  # Each plugin's own share at its sidecar (stage M; section 10a; approved
+  # 2026-11-09): at most inFlight requests at once, requestsPerSecond with a
+  # burst of a second's worth, and answerMiB of answers held or paged in
+  # flight for it. Past any of them only that plugin is refused,
+  # RESOURCE_EXHAUSTED with REFUSAL_REASON_RATE_LIMITED and a retry-after; a
+  # bulk act counts as one request. A sidecars[] entry's own `limits`
+  # overrides these for that plugin. Above what a data plugin's relaunch
+  # asks (71 reads in two minutes on dev, 2026-11-09), until the throughput
+  # bench sets the floor.
+  limits:
+    inFlight: 32
+    requestsPerSecond: 200
+    answerMiB: 64
 
 nameOverride: ""
 fullnameOverride: ""

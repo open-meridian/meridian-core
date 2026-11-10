@@ -2728,3 +2728,71 @@ async fn a_data_plugins_derived_series_says_whose_figure_it_is() {
         .publishers_figures_stand(topic, "meridian.v1.RecordPricesRequest", &batch(""))
         .is_ok());
 }
+
+/// Contract v30 (W4.4; the resilience spec's section 10a): a component whose
+/// budget was full refuses for load, and the plugin hears RESOURCE_EXHAUSTED
+/// with REFUSAL_REASON_OVERLOADED and how long to wait before asking again.
+#[tokio::test]
+async fn a_component_refusing_for_load_is_resource_exhausted_with_its_retry_after() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.book.command.record-break\tcommand\toperations\tbor\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\noperations\trole\nbor\tcomponent\nsidecar\tcomponent\n\
+         conductor\tcomponent\n",
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve("platform.book.command.record-break", |_| {
+        Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+            retry_after_seconds: 4,
+            words: "overloaded: the book's budget is full".into(),
+        }))
+    });
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration {
+                plugin_instance_id: "operations-sample-1".into(),
+                read_account_ids: vec!["ACC-1".into()],
+                write_account_ids: vec!["ACC-1".into()],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let sidecar = Sidecar::under(
+        &contract,
+        bus,
+        "DEP-test",
+        Identity::new("operations-sample-1", vec!["operations".into()]),
+    );
+    sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v10".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let refused = sidecar
+        .record_break(Request::new(meridian_pb::plugin::v1::RecordBreakParams {
+            account_id: "ACC-1".into(),
+            business_date: "2026-09-09".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    let carried = refused
+        .metadata()
+        .get_bin(crate::REFUSAL_METADATA)
+        .expect("a refusal");
+    let refusal = Refusal::decode(carried.to_bytes().unwrap().as_ref()).unwrap();
+    assert_eq!(refusal.reason, RefusalReason::Overloaded as i32);
+    assert_eq!(refusal.retry_after_seconds, 4);
+    assert_eq!(refused.message(), "overloaded: the book's budget is full");
+}

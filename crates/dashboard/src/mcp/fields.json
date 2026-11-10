@@ -52393,6 +52393,16 @@
           "value": "REFUSAL_REASON_AGENT_LIVE_ORDER",
           "meaning": "beside ABORTED: a placement, or an accept of fills to a new order, made through a delegation or by a service account on a connectivity instance that is not demo while the deployment's agent_orders_demo_only is on (W11.8, W11.23, W11.38); recorded, as the connectivity refusal is, a fill staying unmatched",
           "since": "v26"
+        },
+        {
+          "value": "REFUSAL_REASON_OVERLOADED",
+          "meaning": "beside RESOURCE_EXHAUSTED: a component's working budget was full and the request waited its while (W4.4; the resilience spec's section 10a); nothing recorded, and retry_after_seconds says when to send it again",
+          "since": "v30"
+        },
+        {
+          "value": "REFUSAL_REASON_RATE_LIMITED",
+          "meaning": "beside RESOURCE_EXHAUSTED: the plugin past its own share at its sidecar -- requests at once, requests a second, or answers held or paged in flight for it (W4.4) -- refused alone; nothing recorded, and retry_after_seconds says when to send it again",
+          "since": "v30"
         }
       ],
       "empty": "unspecified where the status says all there is",
@@ -52433,6 +52443,26 @@
       "filled_by": "bor",
       "since": "v9",
       "stability": "stable",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.Refusal.retry_after_seconds",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "300"
+        }
+      },
+      "unit": "seconds",
+      "empty": "0 on every refusal but REFUSAL_REASON_OVERLOADED and REFUSAL_REASON_RATE_LIMITED",
+      "intent": "says how long to wait before sending a request refused for load again",
+      "meaning": "the refusing component's or the sidecar's estimate of when it will have room, at least 1 on a refusal for load (W4.4); gRPC's RetryInfo, as the MCP bounds' retry_after_seconds is",
+      "not_meaning": "a promise that the request will then be answered, or a wait the sidecar does for the plugin",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
       "store": "sidecar"
     },
     {

@@ -140,6 +140,12 @@ fn run() -> Result<(), String> {
     }
 
     on_runtime(async {
+        // Its working budget (stage M): the limit's share, less the hot
+        // layer's bounds and the held answers' budget.
+        meridian_runtime::install_budget(
+            "lake",
+            (bounds.latest_bytes + bounds.listings_bytes + meridian_lake::pages::MOST_BYTES) as u64,
+        )?;
         let bus = bus_from_env(&instance_id).await?;
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the

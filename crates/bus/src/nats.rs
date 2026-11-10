@@ -45,13 +45,6 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 /// answer's shape and a refusal is not an answer of that shape.
 const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
-/// The most requests a process answers at once (approved 2026-10-15, the
-/// product owner, after the book's pod was OOMKilled): each is answered on
-/// the blocking pool, and an unbounded burst there is as many threads, each
-/// with an allocator arena of its own, as there are requests in flight. The
-/// rest wait their turn on a cheap task.
-pub const HANDLERS_AT_ONCE: usize = 16;
-
 /// How often a client asks its server to hand a message back to it, and how
 /// long it waits for it before moving to another server (step 3b): the
 /// servers' 2 s rule for a client, said from the client's side. A server
@@ -63,15 +56,6 @@ pub const HANDLERS_AT_ONCE: usize = 16;
 /// which every credential holds (`_INBOX.>`).
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const UNANSWERED: Duration = Duration::from_secs(2);
-
-/// The bound a process runs with: `MERIDIAN_HANDLERS_AT_ONCE` where it is a
-/// positive number, so a deployment lowers one component's without a
-/// release; otherwise [`HANDLERS_AT_ONCE`].
-pub fn handlers_at_once(said: Option<&str>) -> usize {
-    said.and_then(|text| text.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(HANDLERS_AT_ONCE)
-}
 
 pub struct NatsBackend {
     client: async_nats::Client,
@@ -93,10 +77,6 @@ pub struct NatsBackend {
     /// lake's trades is heard in its sequence (contract v19), which a task
     /// per message did not keep.
     outbox: mpsc::UnboundedSender<(String, Vec<u8>)>,
-
-    /// Every served topic's handlers share it: at most [`HANDLERS_AT_ONCE`]
-    /// answering at once.
-    answering: Arc<tokio::sync::Semaphore>,
 
     /// The client's heartbeat, stopped with it.
     heartbeat: tokio::task::AbortHandle,
@@ -152,9 +132,6 @@ impl NatsBackend {
             sequences: Mutex::new(HashMap::new()),
             dropped: Arc::new(AtomicU64::new(0)),
             outbox,
-            answering: Arc::new(tokio::sync::Semaphore::new(handlers_at_once(
-                std::env::var("MERIDIAN_HANDLERS_AT_ONCE").ok().as_deref(),
-            ))),
             heartbeat,
         })
     }
@@ -537,7 +514,6 @@ impl NatsBackend {
     fn offer(&self, topic: &str, group: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
         let client = self.client.clone();
         let subject = topic.to_string();
-        let answering = Arc::clone(&self.answering);
         let group = group.to_string();
 
         self.handle.spawn(async move {
@@ -570,14 +546,16 @@ impl NatsBackend {
                 let client = client.clone();
                 let topic = subject.clone();
                 let delivered = delivered.clone();
-                let answering = Arc::clone(&answering);
 
                 // Each request on its own task, so one slow handler does not
                 // hold up the next, and on a blocking pool, because a handler
-                // that blocks would otherwise stall unrelated work; at most
-                // HANDLERS_AT_ONCE of them answering at once.
+                // that blocks would otherwise stall unrelated work. Admitted
+                // first (the resilience spec's section 10a): its turn among
+                // its class's callers at this process's gate -- at most
+                // HANDLERS_AT_ONCE answering at once -- and its working memory
+                // reserved; or refused for load with a retry-after.
                 tokio::spawn(async move {
-                    let answered = answer_bounded(&answering, move || handler(asked)).await;
+                    let answered = crate::router::admitted(&topic, asked, handler).await;
 
                     let (payload_type, payload, refusal) = match answered {
                         Ok(Ok((payload_type, payload))) => (payload_type, payload, None),
@@ -679,16 +657,6 @@ pub(crate) fn past_the_broker(topic: &str, size: usize, most: usize) -> Option<S
     })
 }
 
-/// `work` on the blocking pool once a permit is free, the permit held until
-/// it is done: no more than the semaphore's permits answer at once.
-async fn answer_bounded<T: Send + 'static>(
-    answering: &tokio::sync::Semaphore,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, tokio::task::JoinError> {
-    let _permit = answering.acquire().await;
-    tokio::task::spawn_blocking(work).await
-}
-
 #[cfg(test)]
 mod size_tests {
     use super::*;
@@ -715,34 +683,37 @@ mod bounded_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn the_bound_is_sixteen_unless_a_positive_number_is_set() {
-        assert_eq!(handlers_at_once(None), 16);
-        assert_eq!(handlers_at_once(Some("4")), 4);
-        assert_eq!(handlers_at_once(Some("0")), 16);
-        assert_eq!(handlers_at_once(Some("many")), 16);
-    }
-
     /// A burst of requests: never more than the permits answering at once,
-    /// and every one answered.
+    /// and every one answered, admitted at the gate as the broker's are
+    /// (the resilience spec's section 10a): one caller's burst within its
+    /// share waits its turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_burst_is_answered_at_most_handlers_at_once_at_a_time() {
-        let answering = Arc::new(tokio::sync::Semaphore::new(HANDLERS_AT_ONCE));
         let now = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
-        for n in 0..(HANDLERS_AT_ONCE * 6) {
-            let (answering, now, most) = (answering.clone(), now.clone(), most.clone());
+        for n in 0..(meridian_budget::HANDLERS_AT_ONCE * 5) {
+            let (now, most) = (now.clone(), most.clone());
+            let handler: Handler = Arc::new(move |_| {
+                let at = now.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(at, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                now.fetch_sub(1, Ordering::SeqCst);
+                Ok((n.to_string(), Vec::new()))
+            });
+            let asked = Envelope {
+                meta: None,
+                payload_type: String::new(),
+                payload: Vec::new(),
+            };
             tasks.push(tokio::spawn(async move {
-                answer_bounded(&answering, move || {
-                    let at = now.fetch_add(1, Ordering::SeqCst) + 1;
-                    most.fetch_max(at, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(20));
-                    now.fetch_sub(1, Ordering::SeqCst);
-                    n
-                })
-                .await
-                .unwrap()
+                crate::router::admitted("platform.lake.query.list-quotes", asked, handler)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .parse::<usize>()
+                    .unwrap()
             }));
         }
         let mut answered = Vec::new();
@@ -750,9 +721,15 @@ mod bounded_tests {
             answered.push(task.await.unwrap());
         }
         answered.sort_unstable();
-        assert_eq!(answered, (0..HANDLERS_AT_ONCE * 6).collect::<Vec<_>>());
+        assert_eq!(
+            answered,
+            (0..meridian_budget::HANDLERS_AT_ONCE * 5).collect::<Vec<_>>()
+        );
         let most = most.load(Ordering::SeqCst);
-        assert!(most <= HANDLERS_AT_ONCE, "{most} answered at once");
+        assert!(
+            most <= meridian_budget::HANDLERS_AT_ONCE,
+            "{most} answered at once"
+        );
         assert!(most > 1, "answered concurrently all the same: {most}");
     }
 }

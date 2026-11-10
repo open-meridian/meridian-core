@@ -288,6 +288,9 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Its working memory (stage M; the resilience spec's section 10a),
+            # and glibc's arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "dashboard" "values" .Values.dashboard "resources" .Values.resources "heldMiB" 0 "name" "dashboard") | nindent 12 }}
             {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" .) }}{{ . | nindent 12 }}{{- end }}
           # Read when first needed and kept once found, so the Job finishing

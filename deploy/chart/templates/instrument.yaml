@@ -67,6 +67,9 @@ spec:
                   key: {{ if .Values.broker.existingSecret }}{{ .Values.broker.instrumentKey }}{{ else }}instrument{{ end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Its working memory (stage M; the resilience spec's section 10a),
+            # and glibc's arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "instrument" "values" .Values.instrument "resources" .Values.resources "heldMiB" .Values.instrument.hotLayer.recordsMiB "name" "instrument") | nindent 12 }}
             - name: MERIDIAN_DATABASE_URL
               valueFrom:
                 secretKeyRef:

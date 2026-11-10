@@ -2832,3 +2832,77 @@ async fn a_corrected_row_counts_once_in_force_as_reported_and_on_a_closed_day() 
         "kept"
     );
 }
+
+/// Stage M (the resilience spec's section 10a): a read reserves its working
+/// memory from the rows it holds as it reads them; past its component's
+/// budget it stops reading and is refused for load, with a retry-after,
+/// never grown past the budget -- and the same read with room is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_past_its_budget_is_refused_for_load_and_answered_with_room() {
+    let h = harness();
+    for batch in 0..6 {
+        let rows: Vec<Price> = (0..500)
+            .map(|n| {
+                let key = format!("BTC-USD:{:05}", batch * 500 + n);
+                close("coinbase-1", &key, BTC, "2026-10-07", "62000.5")
+            })
+            .collect();
+        record(&h, "coinbase-1", rows, "").unwrap();
+    }
+    let mib = 1024 * 1024;
+    let read_within = |budget: &meridian_budget::Budget| {
+        let reservation = budget
+            .reserve(
+                64 * 1024,
+                "list-prices for reporting-1",
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        tokio::task::block_in_place(|| {
+            meridian_budget::within(&reservation, || {
+                h.lake.read(
+                    ReadRequest {
+                        data_type: DataType::Price,
+                        subjects: vec![SubjectRef {
+                            entity_id: BTC.into(),
+                            ..Default::default()
+                        }],
+                        kinds: vec![],
+                        interval_ns: 0,
+                        sources: Some(SourceChoice::default()),
+                        at_ns: 0,
+                        business_date: "2026-10-07".into(),
+                        valid_from_ns: 0,
+                        valid_until_ns: 0,
+                        as_of_ns: 0,
+                        page_size: 0,
+                        cursor: String::new(),
+                        after: None,
+                        tenors: Vec::new(),
+                        published_as_of_ns: 0,
+                        series_keys: Vec::new(),
+                        all_series: false,
+                        dates: None,
+                        window: Default::default(),
+                        fields: Vec::new(),
+                    },
+                    &envelope("reporting-1", true, ""),
+                )
+            })
+        })
+    };
+    let tight = meridian_budget::Budget::new(Some(256 * 1024));
+    let Err(refused) = read_within(&tight) else {
+        panic!("past the budget, and answered");
+    };
+    assert_eq!(
+        meridian_bus::read_refusal(&refused).map(|(reason, _)| reason),
+        Some(meridian_pb::v1::RefusalReason::Overloaded as i32),
+        "{refused}"
+    );
+    assert!(meridian_bus::refusal_retry_after(&refused).unwrap() >= 1);
+    assert_eq!(tight.reserved(), 0, "everything it held given back");
+    let roomy = meridian_budget::Budget::new(Some(64 * mib));
+    let answered = read_within(&roomy).expect("answered with room");
+    assert!(!answered.rows.is_empty(), "rows answered");
+}

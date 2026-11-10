@@ -679,6 +679,14 @@ impl Names {
 }
 
 /// What a row held whole costs, as a held answer counts it.
+/// How much more a read holds before it grows its reservation: a quarter of
+/// a page's worth, so a page's read takes a few reservations, not one a row.
+const RESERVE_STEP: usize = 128 * 1024;
+
+/// How many rows a read takes between looks at whether the shed line
+/// cancelled it.
+const CHECK_EVERY: u32 = 1024;
+
 fn held_cost(row: &Observation) -> usize {
     crate::pages::row_bytes(row)
 }
@@ -1088,12 +1096,41 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
             gather.admit(row);
         }
     } else {
-        store
-            .read_each(&query, &mut |row| {
-                gather.admit(row);
-                Ok(())
-            })
-            .map_err(|failed| failed.to_string())?;
+        // Its working memory reserved from the rows as it holds them (stage
+        // M; the resilience spec's section 10a): a read the budget has no
+        // room for, or one the shed line cancelled, stops reading and is
+        // refused for load, never grown past the budget.
+        let mut refused = None;
+        let mut reserved = 0usize;
+        let mut since_check = 0u32;
+        let stopped = store.read_each(&query, &mut |row| {
+            gather.admit(row);
+            since_check += 1;
+            let held = gather.held_bytes;
+            let over = if held >= reserved + RESERVE_STEP {
+                let grown = meridian_budget::grow((held - reserved) as u64);
+                reserved = held;
+                grown.err()
+            } else if since_check >= CHECK_EVERY {
+                since_check = 0;
+                meridian_budget::check().err()
+            } else {
+                None
+            };
+            match over {
+                None => Ok(()),
+                Some(over) => {
+                    refused = Some(over);
+                    Err(crate::store::StoreError::Unavailable(
+                        "refused for load".into(),
+                    ))
+                }
+            }
+        });
+        if let Some(over) = refused {
+            return Err(meridian_bus::overloaded(&over));
+        }
+        stopped.map_err(|failed| failed.to_string())?;
     }
     let Gather {
         tenor_seen,

@@ -99,6 +99,68 @@ pub struct Stamp {
     pub on_behalf_of_instance_id: String,
 }
 
+/// Who a request is asked by, for its component's fair shares (the
+/// resilience spec's section 10a): its calling instance -- a plugin's, by
+/// its sidecar -- and, where the call names one, the delegation or else the
+/// person it is asked for, and the client instance the analytics component
+/// reads for. A browser's calls are keyed by the person; a delegation's by
+/// the delegation.
+pub fn caller_of(meta: Option<&MessageMeta>) -> String {
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let mut caller = meta.publisher_instance_id.clone();
+    let narrower = [
+        ("d", &meta.acting_through_delegation),
+        ("p", &meta.acting_for_subject),
+        ("i", &meta.on_behalf_of_instance_id),
+    ]
+    .into_iter()
+    .find(|(_, said)| !said.is_empty());
+    if let Some((kind, said)) = narrower {
+        caller.push('|');
+        caller.push_str(kind);
+        caller.push(':');
+        caller.push_str(said);
+    }
+    caller
+}
+
+/// Admit a request on `topic` at this process's gate and budget, and run
+/// `handler` on the blocking pool within its reservation; refused for load,
+/// with its retry-after, where it waited its while (section 10a).
+pub(crate) async fn admitted(
+    topic: &str,
+    envelope: Envelope,
+    handler: Handler,
+) -> std::result::Result<HandlerReply, tokio::task::JoinError> {
+    let class = meridian_budget::Class::of_topic(topic);
+    let caller = caller_of(envelope.meta.as_ref());
+    let bytes = envelope.payload.len() as u64;
+    let what = format!(
+        "{topic} for {}",
+        if caller.is_empty() { "itself" } else { &caller }
+    );
+    match meridian_budget::process()
+        .admit(class, &caller, bytes, &what)
+        .await
+    {
+        Err(over) => {
+            tracing::info!(
+                topic,
+                caller,
+                retry_after_seconds = over.retry_after_seconds,
+                "{}",
+                over.words
+            );
+            Ok(Err(crate::backend::overloaded(&over)))
+        }
+        Ok(admitted) => {
+            tokio::task::spawn_blocking(move || admitted.within(|| handler(envelope))).await
+        }
+    }
+}
+
 /// The bus.
 ///
 /// Owns routing, identity stamping and request-reply. Backends own transport
@@ -468,7 +530,10 @@ impl Bus {
         // The handler runs off the async runtime. A handler that blocks is a
         // handler that would otherwise stall unrelated tasks on the same
         // worker, and the timeout below would not fire because the timer could
-        // not be polled.
+        // not be polled. A process asking itself is not admitted at its own
+        // gate: its callers are other processes, which the broker's path
+        // admits (section 10a), and a question it asks itself while
+        // answering one would otherwise wait on its own turn.
         let joined = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || handler(envelope)),

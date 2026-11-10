@@ -29,12 +29,13 @@ mod nats;
 mod router;
 
 pub use backend::{
-    read_refusal, read_refusal_status, refusal, refusal_fields, refusal_naming,
-    refusal_with_status, Answer, Backend, BusError, Delivery, DropCount, Handler, HandlerReply,
-    RefusalStatus, Subscription,
+    overloaded, read_refusal, read_refusal_status, refusal, refusal_fields, refusal_naming,
+    refusal_retry_after, refusal_retrying, refusal_with_status, Answer, Backend, BusError,
+    Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Subscription,
 };
 pub use memory::MemoryBackend;
 pub use nats::{NatsBackend, INTERNAL_TLS_CA};
+pub use router::caller_of;
 pub use router::{
     calls_by_topic, calls_said, timed, Bus, CallObserver, RouteRule, Stamp, TimedCall,
 };

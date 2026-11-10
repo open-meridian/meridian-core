@@ -1124,3 +1124,98 @@ the name connected to (sslmode verify-full).
         path: ca.crt
 {{- end }}
 {{- end -}}
+
+{{/*
+A memory quantity in whole MiB, as a container's limit names it (Ki, Mi,
+Gi, Ti, K, M, G, T or plain bytes); -1 where it cannot be read.
+*/}}
+{{- define "meridian-runtime.mib" -}}
+{{- $q := toString . -}}
+{{- $units := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "K" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "" 1.0 -}}
+{{- $digits := regexFind "^[0-9]+(\\.[0-9]+)?" $q -}}
+{{- $unit := trimPrefix $digits $q -}}
+{{- if and $digits (hasKey $units $unit) -}}
+{{- div (int64 (mulf (float64 $digits) (index $units $unit))) 1048576 -}}
+{{- else -}}
+-1
+{{- end -}}
+{{- end -}}
+
+{{/*
+A component's working memory (stage M; the resilience spec's section 10a):
+its container's limit, handed down from the pod's own `limits.memory`, and
+`memory.budgetPercent` and `memory.shedPercent`, with which it reserves each
+request's working memory and cancels its largest above the shed line; and
+glibc's arenas and mmap threshold, carried to every component as the lake
+runs them (`<component>.mallocArenaMax`, 2; `<component>.mallocMmapThreshold`,
+128 KiB). A configuration that leaves a component nothing to answer with --
+its limit's share less its hot layer's and held answers' bounds (`heldMiB`)
+-- is refused here, before it is applied. Takes a dict: top, container,
+values (the component's), resources (the ones its container runs with),
+heldMiB, and name (for the words).
+*/}}
+{{- define "meridian-runtime.memoryEnv" -}}
+{{- $memory := .top.Values.memory | default dict -}}
+{{- $budget := $memory.budgetPercent | default 80 -}}
+{{- $shed := $memory.shedPercent | default 90 -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $budget)) -}}
+{{- fail (printf "memory.budgetPercent is %v; a whole number from 10 to 95" $budget) -}}
+{{- end -}}
+{{- if or (lt (int $budget) 10) (gt (int $budget) 95) -}}
+{{- fail (printf "memory.budgetPercent is %v; a whole number from 10 to 95" $budget) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $shed))) (le (int $shed) (int $budget)) (gt (int $shed) 99) -}}
+{{- fail (printf "memory.shedPercent is %v; above memory.budgetPercent (%v) and at most 99, so a component cancels its largest request before the kernel's OOM killer fires" $shed $budget) -}}
+{{- end -}}
+{{- $limit := dig "limits" "memory" "" (.resources | default dict) -}}
+{{- if $limit -}}
+{{- $mib := int64 (include "meridian-runtime.mib" $limit) -}}
+{{- $held := int64 (.heldMiB | default 0) -}}
+{{- $working := sub (div (mul $mib (int64 $budget)) 100) $held -}}
+{{- if and (ge $mib 0) (lt $working 4) -}}
+{{- fail (printf "%s: a memory limit of %s at memory.budgetPercent %v leaves %d MiB, and its hot layer and held answers take %d MiB: nothing is left to answer with; raise its limit or lower its bounds" .name $limit $budget (div (mul $mib (int64 $budget)) 100) $held) -}}
+{{- end -}}
+{{- end -}}
+{{- $mmap := dig "mallocMmapThreshold" 131072 (.values | default dict) -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (int64 $mmap))) -}}
+{{- fail (printf "%s.mallocMmapThreshold is %v; a whole number of bytes above 0" .name $mmap) -}}
+{{- end }}
+- name: MERIDIAN_MEMORY_LIMIT_BYTES
+  valueFrom:
+    resourceFieldRef:
+      containerName: {{ .container }}
+      resource: limits.memory
+- name: MERIDIAN_MEMORY_BUDGET_PERCENT
+  value: {{ $budget | toString | quote }}
+- name: MERIDIAN_MEMORY_SHED_PERCENT
+  value: {{ $shed | toString | quote }}
+- name: MALLOC_ARENA_MAX
+  value: {{ dig "mallocArenaMax" 2 (.values | default dict) | toString | quote }}
+- name: MALLOC_MMAP_THRESHOLD_
+  value: {{ $mmap | int64 | toString | quote }}
+{{- end -}}
+
+{{/*
+A plugin's share at its sidecar (stage M; section 10a): the chart's
+`sidecar.limits`, each overridable for one plugin by its own `limits`
+(sidecars[] here; a launch's override in step 3d). Takes a dict: top, limits
+(the plugin's own, or none).
+*/}}
+{{- define "meridian-runtime.sidecarLimitsEnv" -}}
+{{- $chart := .top.Values.sidecar.limits | default dict -}}
+{{- $own := .limits | default dict -}}
+{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" }}
+{{- range $said := list (dict "where" "sidecar.limits" "from" $chart) (dict "where" "a plugin's limits" "from" $own) }}
+{{- if hasKey $said.from $name }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $said.from $name))) }}
+{{- fail (printf "%s.%s is %v; a whole number above 0" $said.where $name (index $said.from $name)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $value := ternary (index $own $name) (index $chart $name) (hasKey $own $name) }}
+{{- if $value }}
+- name: {{ $env }}
+  value: {{ $value | toString | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}

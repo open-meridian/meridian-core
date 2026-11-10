@@ -14,6 +14,9 @@ meridian-bus = { path = "../bus" }
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+# An answer's body counted against its plugin's sidecar.limits.answerMiB
+# (stage M). Already in the tree through tonic.
+http-body = "1"
 prost.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -26,5 +29,6 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 
 [dev-dependencies]
+meridian-budget.workspace = true
 rand.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

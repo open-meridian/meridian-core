@@ -1793,11 +1793,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-budget"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-bus"
 version = "0.1.0"
 dependencies = [
  "async-nats",
  "futures-util",
+ "meridian-budget",
  "meridian-clock",
  "meridian-domain",
  "meridian-pb",
@@ -1977,7 +1987,7 @@ name = "meridian-lake"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "libc",
+ "meridian-budget",
  "meridian-bus",
  "meridian-changes",
  "meridian-clock",
@@ -1997,7 +2007,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=b357cf45e6b26bb9d114b45239526fac1a1b5919#b357cf45e6b26bb9d114b45239526fac1a1b5919"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=770107fbb41314c365ce0b74823d397f99aa3c30#770107fbb41314c365ce0b74823d397f99aa3c30"
 dependencies = [
  "prost",
  "tonic",
@@ -2015,6 +2025,7 @@ dependencies = [
  "meridian-analytics",
  "meridian-analytics-engine",
  "meridian-bor",
+ "meridian-budget",
  "meridian-bus",
  "meridian-changes",
  "meridian-clock",
@@ -2049,6 +2060,8 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "ed25519-dalek",
+ "http-body",
+ "meridian-budget",
  "meridian-bus",
  "meridian-clock",
  "meridian-domain",
