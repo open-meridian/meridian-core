@@ -57,7 +57,7 @@ jobs:
   # so nothing is published that the gates have not seen. The release the
   # images say is the chart's version below.
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.promote.outputs.version }}
     steps:
@@ -145,7 +145,7 @@ jobs:
   # scratch image of copied files needs no emulation to build for both.
   harness:
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       HARNESS: ghcr.io/open-meridian/meridian-harness
     steps:
@@ -220,7 +220,7 @@ jobs:
   # was published beside. Both architectures: it runs on a person's laptop.
   backup-image:
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       BACKUP: ghcr.io/open-meridian/meridian-backup
     steps:
@@ -286,7 +286,7 @@ jobs:
   # image is. Both architectures.
   postgres-image:
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       POSTGRES: ghcr.io/open-meridian/meridian-postgres
     steps:
@@ -351,7 +351,7 @@ jobs:
   # manifest that does not exist yet is a chart that installs and cannot pull.
   chart:
     needs: [publish, backup-image, postgres-image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
