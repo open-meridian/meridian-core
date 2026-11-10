@@ -46,6 +46,11 @@ pub struct Spec {
 }
 
 impl Spec {
+    /// Every partition the log keeps: the store's own, and `control`.
+    pub fn partitions(&self) -> [&'static str; 2] {
+        [self.partition, CONTROL]
+    }
+
     fn change_table(&self) -> String {
         format!("{}_change", self.prefix)
     }

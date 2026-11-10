@@ -225,6 +225,65 @@ async fn a_reader_holds_what_the_primary_holds_as_soon_as_its_writer_answers() {
     assert!(applied.changes.lock().unwrap().is_empty());
 }
 
+/// The instrument store's reader, started before its writer served, catches
+/// up as the lake's and the book's do: its primary's position, read from the
+/// change log partition by partition, lists every partition the log keeps
+/// (`LogHeads::listing`), so the reader holds each from the primary's head
+/// as soon as its writer answers -- never left unfollowed, every read naming
+/// it waiting out its bound and answered from the primary. A replica's
+/// position lists none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instrument_reader_started_before_its_writer_served_catches_up() {
+    use meridian_bus::read_after::Position as _;
+
+    let bus = Arc::new(Bus::single(
+        "member-test-instrument",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    // Written before the reader followed, no page of it heard.
+    let log = Arc::new(Log {
+        head: AtomicU64::new(3),
+    });
+    assert!(LogHeads::of(log.clone()).all_heads().is_none());
+    meridian_changes::serve(&bus, "reference", log.clone());
+    let applied = Arc::new(Applied::default());
+    let primary = LogHeads::listing(log.clone(), &["P0", meridian_changes::CONTROL]);
+    let member = Member::reader_of("instrument", "reference", Duration::from_secs(5));
+    // Started knowing nothing, as the instrument reader starts.
+    let followed = crate::member::Followed::from_heads([]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(primary))
+        .unwrap();
+    until("P0 held from the primary's head", || {
+        followed.heads().get("P0") == Some(&3)
+    })
+    .await;
+    assert_eq!(
+        followed.heads().get(meridian_changes::CONTROL),
+        Some(&0),
+        "every partition its log keeps"
+    );
+    // A read naming the head is its own to answer, at once.
+    assert_eq!(
+        bus.reads_after().hold(
+            "platform.reference.query.resolve-instrument",
+            &meridian_pb::v1::Watermark {
+                partitions: vec![meridian_pb::v1::PartitionSequence {
+                    partition: "P0".into(),
+                    sequence: 3,
+                }],
+            },
+        ),
+        Ok(meridian_bus::read_after::Held::Here)
+    );
+    // And what it holds moves on with the writer's tail from there.
+    log.head.store(4, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "reference", 3, &[change(4)]);
+    until("4 applied", || followed.heads().get("P0") == Some(&4)).await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![4]);
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");

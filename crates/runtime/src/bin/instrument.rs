@@ -178,7 +178,7 @@ fn run() -> Result<(), String> {
                         },
                     )?);
                     let at: Arc<dyn meridian_bus::read_after::Position> =
-                        Arc::new(meridian_runtime::member::LogHeads(replica.clone()));
+                        Arc::new(meridian_runtime::member::LogHeads::of(replica.clone()));
                     Some((replica as Arc<dyn meridian_instrument::Store>, at))
                 }
             };
@@ -192,7 +192,13 @@ fn run() -> Result<(), String> {
                 &bus,
                 meridian_runtime::member::Followed::from_heads([]),
                 Arc::new(RecordsFollow(hot.clone())),
-                Arc::new(meridian_runtime::member::LogHeads(postgres.clone())),
+                // Its primary, listing every partition its log keeps: what
+                // the reader reconciles with as its writer answers it, as
+                // the lake's and the book's readers do.
+                Arc::new(meridian_runtime::member::LogHeads::listing(
+                    postgres.clone(),
+                    &meridian_instrument::postgres::CHANGES.partitions(),
+                )),
             )?;
             meridian_runtime::background(async move {
                 report_inward_forever(bus, "instrument", 0).await

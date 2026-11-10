@@ -701,7 +701,37 @@ impl meridian_bus::read_after::Position for Followed {
 
 /// A store's position read from its change log, partition by partition: a
 /// read replica's, or a primary's whose store reads no heads whole.
-pub struct LogHeads<L: ?Sized>(pub Arc<L>);
+pub struct LogHeads<L: ?Sized> {
+    log: Arc<L>,
+    /// Every partition its log keeps, where it lists them: what a reader
+    /// reconciles with as its writer answers it ([`Position::all_heads`]).
+    ///
+    /// [`Position::all_heads`]: meridian_bus::read_after::Position::all_heads
+    every: Vec<String>,
+}
+
+impl<L: ?Sized> LogHeads<L> {
+    /// Read partition by partition, listing none: a read replica's position.
+    pub fn of(log: Arc<L>) -> Self {
+        Self {
+            log,
+            every: Vec::new(),
+        }
+    }
+
+    /// Read partition by partition, `every` partition its log keeps listed:
+    /// a primary a reader reconciles with (the instrument store's, whose
+    /// log keeps its one partition and `control`).
+    pub fn listing(log: Arc<L>, every: &[&str]) -> Self {
+        Self {
+            log,
+            every: every
+                .iter()
+                .map(|partition| partition.to_string())
+                .collect(),
+        }
+    }
+}
 
 impl<L> meridian_bus::read_after::Position for LogHeads<L>
 where
@@ -711,7 +741,7 @@ where
         let mut heads = HashMap::new();
         for partition in partitions {
             // From past the head: the head alone, no change read.
-            match self.0.read_changes(partition, i64::MAX as u64, 1) {
+            match self.log.read_changes(partition, i64::MAX as u64, 1) {
                 Ok(reply) => {
                     heads.insert(partition.clone(), reply.head);
                 }
@@ -720,6 +750,10 @@ where
             }
         }
         Ok(heads)
+    }
+
+    fn all_heads(&self) -> Option<Result<HashMap<String, u64>, String>> {
+        (!self.every.is_empty()).then(|| self.heads(&self.every))
     }
 }
 
