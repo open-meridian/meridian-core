@@ -202,11 +202,14 @@ async fn a_reader_holds_what_the_primary_holds_as_soon_as_its_writer_answers() {
     meridian_changes::serve(&bus, "book", log.clone());
     let applied = Arc::new(Applied::default());
     let primary = log.clone();
+    // Read as the stores' Postgres clients read: blocking on a runtime of
+    // their own, which panics where an async task drives the thread.
     let heads = meridian_bus::read_after::AllHeads(move || {
-        Ok(std::collections::BTreeMap::from([(
-            "P0".to_string(),
-            primary.head.load(Ordering::SeqCst),
-        )]))
+        let head = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { primary.head.load(Ordering::SeqCst) });
+        Ok(std::collections::BTreeMap::from([("P0".to_string(), head)]))
     });
     let member = Member::reader_of("bor", "book", Duration::from_secs(5));
     // Started knowing nothing of P0.

@@ -893,8 +893,17 @@ async fn reconcile(
     at: &mut HashMap<String, u64>,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
 ) {
-    let Some(heads) = following.primary.all_heads() else {
-        return;
+    // Read off the runtime's own threads: a store's record is read blocking
+    // (the book's and the lake's Postgres clients refuse to be driven from
+    // an async task; CI 42878357895).
+    let primary = Arc::clone(&following.primary);
+    let heads = match tokio::task::spawn_blocking(move || primary.all_heads()).await {
+        Ok(Some(heads)) => heads,
+        Ok(None) => return,
+        Err(failed) => {
+            tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
+            return;
+        }
     };
     let heads = match heads {
         Ok(heads) => heads,
