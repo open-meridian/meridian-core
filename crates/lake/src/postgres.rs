@@ -289,6 +289,33 @@ fn amendments_of(
 
 /// The assessments of these rows (contract v28, W10.12), in the order
 /// journalled.
+/// The closed-day re-checks of these rows alone, in order (stage M; the
+/// store memory audit of 2026-11-09, item 12): read beside each chunk, as
+/// its assessments are, never every re-check its datasets ever had.
+fn amendments_for(
+    client: &mut impl GenericClient,
+    rows: &[Observation],
+) -> Result<Vec<ClosedDayAmendment>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (datasets, sequences): (Vec<String>, Vec<i64>) = rows
+        .iter()
+        .map(|row| (row.dataset().to_string(), row.meta().sequence as i64))
+        .unzip();
+    let found = client
+        .query(
+            "SELECT c.dataset, c.sequence, c.closed_day, c.why, c.at_ns
+               FROM lake_closed_day c
+               JOIN (SELECT DISTINCT * FROM unnest($1::text[], $2::bigint[])) AS asked(dataset, sequence)
+                 ON c.dataset = asked.dataset AND c.sequence = asked.sequence
+              ORDER BY c.amendment_id",
+            &[&datasets, &sequences],
+        )
+        .map_err(unavailable)?;
+    found.iter().map(amendment_of).collect()
+}
+
 fn assessments_of(
     client: &mut impl GenericClient,
     rows: &[Observation],
@@ -991,7 +1018,6 @@ impl Store for PostgresStore {
             let data_type = query.data_type.code();
             let params: [&(dyn postgres::types::ToSql + Sync); 5] =
                 [&datasets, &after, &query.subjects, &data_type, &cut_off];
-            let amendments = amendments_of(&mut tx, &query.datasets)?;
             let portal = tx.bind(chosen, &params).map_err(unavailable)?;
             loop {
                 let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
@@ -1004,6 +1030,7 @@ impl Store for PostgresStore {
                     chunk.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
                 }
                 let assessments = assessments_of(&mut tx, &chunk)?;
+                let amendments = amendments_for(&mut tx, &chunk)?;
                 as_flagged(&mut chunk, &amendments, query.as_of_ns);
                 as_assessed(&mut chunk, &assessments, query.as_of_ns);
                 for row in chunk {
@@ -1073,7 +1100,6 @@ impl Store for PostgresStore {
             &until,
             &at,
         ];
-        let amendments = amendments_of(&mut tx, &query.datasets)?;
         // A chunk at a time from one portal, each chunk's assessments read
         // beside it, each row handed on as it is decoded: never the whole
         // result held, as the database sent it or decoded (found on dev
@@ -1091,6 +1117,7 @@ impl Store for PostgresStore {
                 chunk.push(Observation::decode(query.data_type, body).map_err(unreadable)?);
             }
             let assessments = assessments_of(&mut tx, &chunk)?;
+            let amendments = amendments_for(&mut tx, &chunk)?;
             as_flagged(&mut chunk, &amendments, query.as_of_ns);
             as_assessed(&mut chunk, &assessments, query.as_of_ns);
             for row in chunk {
@@ -1141,7 +1168,7 @@ impl Store for PostgresStore {
         let mut named: Vec<String> = datasets;
         named.sort();
         named.dedup();
-        let amendments = amendments_of(&mut tx, &named)?;
+        let amendments = amendments_for(&mut tx, &out)?;
         let assessments = assessments_of(&mut tx, &out)?;
         tx.commit().map_err(unavailable)?;
         as_flagged(&mut out, &amendments, as_of_ns);
@@ -1620,6 +1647,58 @@ impl Store for PostgresStore {
         let assessments = assessments_of(&mut *conn, &out)?;
         as_assessed(&mut out, &assessments, as_of_ns);
         Ok(out)
+    }
+
+    fn read_dataset_each(
+        &self,
+        dataset: &str,
+        data_type: crate::row::DataType,
+        as_of_ns: i64,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        // Each row key at its version in force by the cut-off, chosen by
+        // the database by the order versions take force in (ruling 1006
+        // (b)), as `as_of` chose it; read a chunk at a time from one portal,
+        // each chunk's assessments beside it (stage M).
+        let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
+        let code = data_type.code();
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let portal = tx
+            .bind(
+                "SELECT body FROM (
+                     SELECT DISTINCT ON (row_key) body, sequence AS at_sequence
+                       FROM lake_row
+                      WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                      ORDER BY row_key, COALESCE(published_at_ns, 0) DESC, version DESC
+                 ) AS in_force
+                 ORDER BY at_sequence",
+                &[&dataset, &code, &cut_off],
+            )
+            .map_err(unavailable)?;
+        loop {
+            let rows = tx.query_portal(&portal, READ_CHUNK).map_err(unavailable)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut chunk = Vec::with_capacity(rows.len());
+            for row in rows {
+                let body: &[u8] = row.get(0);
+                chunk.push(Observation::decode(data_type, body).map_err(unreadable)?);
+            }
+            let assessments = assessments_of(&mut tx, &chunk)?;
+            as_assessed(&mut chunk, &assessments, as_of_ns);
+            for row in chunk {
+                each(row)?;
+            }
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(())
     }
 
     fn read_dataset_versions(

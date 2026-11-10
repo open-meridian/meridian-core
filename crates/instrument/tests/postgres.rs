@@ -1159,3 +1159,103 @@ fn a_store_that_held_rows_before_its_log_sends_a_follower_from_the_start_to_relo
     assert_eq!(after.changes.len(), 1);
     assert_eq!(after.lowest_kept, 2);
 }
+
+/// Stage M (the store memory audit of 2026-11-09, item 3): the list of
+/// records to complete reads the store a chunk at a time, counting each
+/// record as it is read and keeping only those its page reaches; its heap
+/// holds a chunk and a page, never every record. 10,000 records, each with a
+/// long description, read for a page of ten.
+#[test]
+fn the_list_to_complete_holds_a_chunk_and_its_page_never_every_record() {
+    use meridian_domain::v1::ListInstrumentsToCompleteRequest;
+    let store = store();
+    let tag = unique("LIST");
+    for n in 0..10_000 {
+        let id = format!("LCL-{tag}-{n:05}");
+        let symbol = format!("{tag}-{n}");
+        let mut held = record(&id, vec![identifier("symbol", &symbol, "snaptrade", 0)]);
+        held.description = format!(
+            "{tag} {n} {}",
+            "a long description of the record ".repeat(40)
+        );
+        let key = IdentifierSet::new([asked("symbol", &symbol, "snaptrade")]).key();
+        store.mint(held, &key, entry(&id, 1, "mint")).unwrap();
+    }
+    let request = ListInstrumentsToCompleteRequest {
+        page_size: 10,
+        include_complete: true,
+        search: tag.to_lowercase(),
+        ..Default::default()
+    };
+    // Once to warm the pool's connections, then measured.
+    meridian_instrument::list::list_to_complete(&store, &request).unwrap();
+    counted::take();
+    let listed = meridian_instrument::list::list_to_complete(&store, &request).unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(listed.instruments.len(), 10);
+    assert!(!listed.next_cursor.is_empty(), "more pages");
+    let whole_mib = 10_000.0 * 1_400.0 / 1048576.0;
+    println!("LIST heap_peak_mib={peak:.2} descriptions_alone_mib={whole_mib:.1}");
+    assert!(
+        peak * 3.0 < whole_mib,
+        "the list's heap peaked at {peak:.2} MiB; the descriptions alone are {whole_mib:.1} MiB"
+    );
+    // The page reads on: its next page starts where this one ended.
+    let next = meridian_instrument::list::list_to_complete(
+        &store,
+        &ListInstrumentsToCompleteRequest {
+            cursor: listed.next_cursor.clone(),
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    let first: Vec<_> = listed
+        .instruments
+        .iter()
+        .map(|i| i.instrument.as_ref().unwrap().instrument_id.clone())
+        .collect();
+    let second: Vec<_> = next
+        .instruments
+        .iter()
+        .map(|i| i.instrument.as_ref().unwrap().instrument_id.clone())
+        .collect();
+    assert!(
+        first.iter().all(|id| !second.contains(id)),
+        "no record on both pages"
+    );
+    assert!(first.last() < second.first(), "in the list's order");
+}
+
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Counting;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(at, layout) };
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+    }
+
+    /// The heap's peak since the last take, and now, in MiB.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.load(Ordering::Relaxed);
+        let peak = PEAK.swap(live, Ordering::Relaxed);
+        (live as f64 / 1048576.0, peak as f64 / 1048576.0)
+    }
+}
+
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;

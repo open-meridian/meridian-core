@@ -5,7 +5,7 @@
 //! joins no other store (decisions/012). It counts the licensed identifiers
 //! the deployment holds, per scheme, and never sends one anywhere.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::v1::{
     InstrumentChange, InstrumentConflict, InstrumentToComplete, InstrumentVersion,
@@ -41,31 +41,6 @@ pub fn list_to_complete(
     store: &dyn Store,
     request: &ListInstrumentsToCompleteRequest,
 ) -> Result<ListInstrumentsToCompleteReply> {
-    let mut live: Vec<Instrument> = Vec::new();
-    for record in store.all()? {
-        if store.replacement_of(&record.instrument_id)?.is_none() {
-            live.push(record);
-        }
-    }
-
-    let incomplete_for_book = live.iter().filter(|r| !complete_for_book(r)).count() as i64;
-    let incomplete = live.iter().filter(|r| !complete(r)).count() as i64;
-    let licensed_identifiers = LICENSED
-        .iter()
-        .filter_map(|scheme| {
-            let held: BTreeSet<&str> = live
-                .iter()
-                .flat_map(|record| record.held_now())
-                .filter(|identifier| identifier.scheme == *scheme)
-                .map(|identifier| identifier.value.as_str())
-                .collect();
-            (!held.is_empty()).then(|| LicensedIdentifierCount {
-                scheme: scheme.to_string(),
-                count: held.len() as i64,
-            })
-        })
-        .collect();
-
     // Contract v20 (W3.11): the picker's search, complete records included,
     // by an identifier's value, a symbol or the description, case aside.
     let search: String = request
@@ -75,56 +50,102 @@ pub fn list_to_complete(
         .take(MOST_SEARCH)
         .collect::<String>()
         .to_lowercase();
-    let mut chosen: Vec<&Instrument> = if !search.is_empty() {
-        let mut found: Vec<&Instrument> = live
-            .iter()
-            .filter(|record| matches(record, &search))
-            .collect();
-        // The exact first: an ID or an identifier's value as typed.
-        found.sort_by_key(|record| {
-            let exact = record.instrument_id.to_lowercase() == search
-                || record
-                    .held_now()
-                    .any(|id| id.value.to_lowercase() == search);
-            (
-                !exact,
-                record.description.to_lowercase(),
-                record.instrument_id.clone(),
-            )
-        });
-        found
-    } else if request.provisional {
-        // Contract v24 (W3.11): the provisional records, complete or not.
-        live.iter()
-            .filter(|record| record.local.provisional)
-            .collect()
-    } else if request.instrument_id.is_empty() {
-        live.iter()
-            .filter(|record| request.include_complete || !complete(record))
-            .collect()
+    // A replaced record answers the one it became (W3.6, W3.8): a resolved
+    // LCL- ID reads its INS- record, the link on it.
+    let became = if search.is_empty() && !request.provisional && !request.instrument_id.is_empty() {
+        Some(current(store, &request.instrument_id)?)
     } else {
-        // A replaced record answers the one it became (W3.6, W3.8): a
-        // resolved LCL- ID reads its INS- record, the link on it.
-        let became = current(store, &request.instrument_id)?;
-        live.iter()
-            .filter(|record| record.instrument_id == became)
-            .collect()
+        None
     };
-    if search.is_empty() {
-        chosen.sort_by_key(|record| {
-            (
-                complete_for_book(record),
-                complete(record),
-                record.instrument_id.clone(),
-            )
-        });
-    }
-
     let start: usize = request.cursor.parse().unwrap_or(0);
     let size = match request.page_size {
         n if n <= 0 => PAGE,
         n => (n as usize).min(MOST),
     };
+
+    // The live records a chunk at a time (stage M; the store memory audit of
+    // 2026-11-09, item 3): each counted as it is read, and only those the
+    // page reaches kept -- the first `start + size` by the list's order --
+    // never every record.
+    let keep = start.saturating_add(size);
+    let mut incomplete_for_book = 0i64;
+    let mut incomplete = 0i64;
+    let mut licensed: BTreeMap<&str, BTreeSet<String>> = LICENSED
+        .iter()
+        .map(|scheme| (*scheme, BTreeSet::new()))
+        .collect();
+    let mut tallies = crate::reask::Tallies::new(store);
+    let mut chosen_count = 0usize;
+    // Ordered as the list is: the exact first, then by description and ID,
+    // for a search; otherwise those the book cannot use first, then the
+    // rest lacking something, then the complete, each by ID.
+    let mut best: BTreeMap<(u8, String, String), Instrument> = BTreeMap::new();
+    store.each(&mut |record| {
+        if store.replacement_of(&record.instrument_id)?.is_some() {
+            return Ok(true);
+        }
+        if !complete_for_book(&record) {
+            incomplete_for_book += 1;
+        }
+        if !complete(&record) {
+            incomplete += 1;
+        }
+        for identifier in record.held_now() {
+            if let Some(held) = licensed.get_mut(identifier.scheme.as_str()) {
+                held.insert(identifier.value.clone());
+            }
+        }
+        tallies.add(store, &record)?;
+        let rank = 2 * u8::from(complete_for_book(&record)) + u8::from(complete(&record));
+        let key = if !search.is_empty() {
+            if !matches(&record, &search) {
+                return Ok(true);
+            }
+            let exact = record.instrument_id.to_lowercase() == search
+                || record
+                    .held_now()
+                    .any(|id| id.value.to_lowercase() == search);
+            (
+                u8::from(!exact),
+                record.description.to_lowercase(),
+                record.instrument_id.clone(),
+            )
+        } else if request.provisional {
+            // Contract v24 (W3.11): the provisional records, complete or not.
+            if !record.local.provisional {
+                return Ok(true);
+            }
+            (rank, String::new(), record.instrument_id.clone())
+        } else if let Some(became) = &became {
+            if &record.instrument_id != became {
+                return Ok(true);
+            }
+            (rank, String::new(), record.instrument_id.clone())
+        } else {
+            if !request.include_complete && complete(&record) {
+                return Ok(true);
+            }
+            (rank, String::new(), record.instrument_id.clone())
+        };
+        chosen_count += 1;
+        best.insert(key, record);
+        if best.len() > keep {
+            best.pop_last();
+        }
+        Ok(true)
+    })?;
+    let licensed_identifiers = LICENSED
+        .iter()
+        .filter_map(|scheme| {
+            let held = licensed.get(scheme).map_or(0, BTreeSet::len);
+            (held > 0).then(|| LicensedIdentifierCount {
+                scheme: scheme.to_string(),
+                count: held as i64,
+            })
+        })
+        .collect();
+    let chosen: Vec<&Instrument> = best.values().collect();
+
     let page: Vec<InstrumentToComplete> = chosen
         .iter()
         .skip(start)
@@ -169,7 +190,7 @@ pub fn list_to_complete(
             },
         })
         .collect();
-    let next_cursor = if start + page.len() < chosen.len() {
+    let next_cursor = if start + page.len() < chosen_count {
         (start + page.len()).to_string()
     } else {
         String::new()
@@ -210,8 +231,8 @@ pub fn list_to_complete(
         incomplete_for_book,
         incomplete,
         licensed_identifiers,
-        migration_counts: crate::reask::migration_counts(store, &live)?,
-        backfill_counts: crate::reask::backfill_counts(store, &live),
+        migration_counts: tallies.migration(),
+        backfill_counts: tallies.backfill(),
     })
 }
 

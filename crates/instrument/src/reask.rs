@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use meridian_domain::v1::{
-    BackfillCount, EscalateInstrumentRequest, MigrationCounts, ProvisionalReason,
+    BackfillCount, EscalateInstrumentRequest, LicenceList, MigrationCounts, ProvisionalReason,
 };
 
 use crate::one_id::{self, Applied};
@@ -115,19 +115,63 @@ pub fn ask_again(
         .unwrap_or(0);
     let mut applied = Vec::new();
     let mut sent = 0;
-    for record in store.all()? {
+    // A record at a time (stage M; audit item 3): the beat holds the one it
+    // asks about, never every record.
+    let mut failed = None;
+    store.each(&mut |record| {
         if sent >= batch {
-            break;
+            return Ok(false);
         }
+        match ask_again_one(store, ask, writing, asked, &list, list_at, &record, now_ns) {
+            Ok(Asked::Skipped) => Ok(true),
+            Ok(Asked::Sent(kept)) => {
+                sent += 1;
+                if let Some(kept) = kept {
+                    applied.push(*kept);
+                }
+                Ok(true)
+            }
+            Ok(Asked::Unreachable) => Ok(false),
+            Err(error) => {
+                failed = Some(error);
+                Ok(false)
+            }
+        }
+    })?;
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(applied),
+    }
+}
+
+/// What one record's turn in [`ask_again`] did.
+enum Asked {
+    Skipped,
+    Sent(Option<Box<Applied>>),
+    Unreachable,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ask_again_one(
+    store: &dyn Store,
+    ask: &dyn Ask,
+    writing: &std::sync::Mutex<()>,
+    asked: &mut HashMap<String, i64>,
+    list: &LicenceList,
+    list_at: i64,
+    record: &Instrument,
+    now_ns: i64,
+) -> Result<Asked> {
+    {
         if !record.local.provisional
-            || awaits_its_line(&record)
+            || awaits_its_line(record)
             || record.local.reason == ProvisionalReason::HeldBack as i32
             || store.replacement_of(&record.instrument_id)?.is_some()
         {
-            continue;
+            return Ok(Asked::Skipped);
         }
-        let Some(request) = one_id::escalation_for(&record, &list, now_ns) else {
-            continue;
+        let Some(request) = one_id::escalation_for(record, list, now_ns) else {
+            return Ok(Asked::Skipped);
         };
         let last = asked
             .get(&record.instrument_id)
@@ -141,23 +185,21 @@ pub fn ask_again(
                 _ => false,
             };
         if !due {
-            continue;
+            return Ok(Asked::Skipped);
         }
-        sent += 1;
         let said = ask.ask(request).said;
         asked.insert(record.instrument_id.clone(), now_ns);
         if said == PlatformSaid::Unreachable {
-            break;
+            return Ok(Asked::Unreachable);
         }
         let _held = writing
             .lock()
             .map_err(|_| crate::store::StoreError::Unavailable("the write lock".into()))?;
         let kept = one_id::apply_answer(store, &record.instrument_id, &said, now_ns)?;
-        if kept.replaced.is_some() || !kept.changed.is_empty() {
-            applied.push(kept);
-        }
+        Ok(Asked::Sent(
+            (kept.replaced.is_some() || !kept.changed.is_empty()).then(|| Box::new(kept)),
+        ))
     }
-    Ok(applied)
 }
 
 /// One pass of the migration: at most `batch` records kept before v24 sent
@@ -178,12 +220,19 @@ pub fn migrate(
     let mut away = 0;
     // Those never sent first, then those not reached before, so a record
     // the platform cannot be reached about starves none of the others.
+    // Done once: no record kept before v24 is left to send, and none is
+    // made since (stage M; audit item 3: every record read each beat after
+    // the migration was done).
+    if store.state(MIGRATED)?.is_some() {
+        return Ok((0, Vec::new()));
+    }
     let mut queue = Vec::new();
-    for record in store.all()? {
+    store.each(&mut |record| {
         if remaining(store, &record)? {
             queue.push(record);
         }
-    }
+        Ok(true)
+    })?;
     queue.sort_by_key(|record| record.local.migration == section::UNREACHABLE);
     for record in queue {
         if sent >= batch || stop {
@@ -311,14 +360,13 @@ pub fn migrate(
     }
     let sent_and_answered = sent - away;
     if sent_and_answered == 0 && away == 0 && store.state(MIGRATED)?.is_none() {
-        let left = store
-            .all()?
-            .iter()
-            .map(|record| remaining(store, record))
-            .collect::<Result<Vec<bool>>>()?
-            .into_iter()
-            .filter(|left| *left)
-            .count();
+        let mut left = 0;
+        store.each(&mut |record| {
+            if remaining(store, &record)? {
+                left += 1;
+            }
+            Ok(true)
+        })?;
         if left == 0 {
             store.set_state(MIGRATED, &now_ns.to_string())?;
         }
@@ -338,14 +386,74 @@ fn remaining(store: &dyn Store, record: &Instrument) -> Result<bool> {
 
 /// The migration's counts (W3.11, W3.26), from the records alone.
 pub fn migration_counts(store: &dyn Store, live: &[Instrument]) -> Result<Option<MigrationCounts>> {
-    let mut counts = MigrationCounts::default();
-    let mut any = false;
+    let mut tallies = Tallies::new(store);
     for record in live {
-        if remaining(store, record)? && record.local.migration.is_empty() {
-            counts.remaining += 1;
-            any = true;
-            continue;
+        tallies.add(store, record)?;
+    }
+    Ok(tallies.migration())
+}
+
+/// The migration's and the backfills' counts, a record at a time (stage M;
+/// the store memory audit of 2026-11-09, item 3), so a reader counts the
+/// live records as it reads them, never holding them all.
+pub struct Tallies {
+    list: LicenceList,
+    migration: MigrationCounts,
+    any: bool,
+    backfill: Vec<BackfillCount>,
+}
+
+impl Tallies {
+    pub fn new(store: &dyn Store) -> Self {
+        let list = one_id::licence(store);
+        let backfill = list
+            .schemes
+            .iter()
+            .filter(|scheme| !one_id::OPEN_FAMILIES.contains(&scheme.as_str()))
+            .map(|scheme| BackfillCount {
+                scheme: scheme.clone(),
+                ..Default::default()
+            })
+            .collect();
+        Self {
+            list,
+            migration: MigrationCounts::default(),
+            any: false,
+            backfill,
         }
+    }
+
+    /// One live record counted.
+    pub fn add(&mut self, store: &dyn Store, record: &Instrument) -> Result<()> {
+        for count in &mut self.backfill {
+            let carrying = record.held_now().any(|identifier| {
+                one_id::family_held(&identifier.scheme, &identifier.source, &self.list)
+                    == count.scheme.as_str()
+            });
+            if !carrying {
+                continue;
+            }
+            if record.instrument_id.starts_with("INS-")
+                && record
+                    .identifiers
+                    .iter()
+                    .any(|identifier| identifier.scheme == one_id::LOCAL_SCHEME)
+            {
+                count.matched += 1;
+            }
+            if awaits_its_line(record) {
+                count.awaiting_person += 1;
+            }
+            if record.local.provisional && !awaits_its_line(record) {
+                count.remaining += 1;
+            }
+        }
+        if remaining(store, record)? && record.local.migration.is_empty() {
+            self.migration.remaining += 1;
+            self.any = true;
+            return Ok(());
+        }
+        let counts = &mut self.migration;
         let slot = match record.local.migration.as_str() {
             section::ALREADY_HELD => &mut counts.already_held,
             section::MATCHED => &mut counts.matched,
@@ -355,55 +463,33 @@ pub fn migration_counts(store: &dyn Store, live: &[Instrument]) -> Result<Option
             section::KEPT_LOCAL => &mut counts.kept_local,
             section::UNREACHABLE => &mut counts.unreachable,
             section::HELD_BACK => &mut counts.held_back,
-            _ => continue,
+            _ => return Ok(()),
         };
         *slot += 1;
-        any = true;
+        self.any = true;
+        Ok(())
     }
-    Ok(any.then_some(counts))
+
+    pub fn migration(&self) -> Option<MigrationCounts> {
+        self.any.then_some(self.migration)
+    }
+
+    pub fn backfill(&self) -> Vec<BackfillCount> {
+        self.backfill.clone()
+    }
 }
 
 /// Each backfill's counts (W3.11, W3.25): per scheme the licence list
 /// names beyond the open ones every deployment starts with, the records
 /// carrying it resolved, and those still to send.
 pub fn backfill_counts(store: &dyn Store, live: &[Instrument]) -> Vec<BackfillCount> {
-    let list = one_id::licence(store);
-    list.schemes
-        .iter()
-        .filter(|scheme| !one_id::OPEN_FAMILIES.contains(&scheme.as_str()))
-        .map(|scheme| {
-            let carrying = |record: &&Instrument| {
-                record.held_now().any(|identifier| {
-                    one_id::family_held(&identifier.scheme, &identifier.source, &list)
-                        == scheme.as_str()
-                })
-            };
-            BackfillCount {
-                scheme: scheme.clone(),
-                matched: live
-                    .iter()
-                    .filter(carrying)
-                    .filter(|record| {
-                        record.instrument_id.starts_with("INS-")
-                            && record
-                                .identifiers
-                                .iter()
-                                .any(|identifier| identifier.scheme == one_id::LOCAL_SCHEME)
-                    })
-                    .count() as i64,
-                awaiting_person: live
-                    .iter()
-                    .filter(carrying)
-                    .filter(|record| awaits_its_line(record))
-                    .count() as i64,
-                remaining: live
-                    .iter()
-                    .filter(carrying)
-                    .filter(|record| record.local.provisional && !awaits_its_line(record))
-                    .count() as i64,
-            }
-        })
-        .collect()
+    let mut tallies = Tallies::new(store);
+    for record in live {
+        // The backfills' counts never fail; the migration's may, and are
+        // not asked for here.
+        let _ = tallies.add(store, record);
+    }
+    tallies.backfill()
 }
 
 /// A line the platform answered with an `INS-` record: matched, minted, a

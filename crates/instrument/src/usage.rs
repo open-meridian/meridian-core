@@ -202,9 +202,10 @@ pub fn list_identifier_usage(
     let mut counts: BTreeMap<String, SchemeUsageCount> = BTreeMap::new();
     let list = crate::one_id::licence(store);
     // The records as the period ends: those standing, not replaced.
-    for record in store.all()? {
+    // A record at a time (stage M; audit item 3).
+    store.each(&mut |record| {
         if !counts_as_standing(store, &record)? {
-            continue;
+            return Ok(true);
         }
         let named = families(
             record
@@ -225,7 +226,8 @@ pub fn list_identifier_usage(
                 slot(&mut counts, only).instruments_only_by += 1;
             }
         }
-    }
+        Ok(true)
+    })?;
     let mut day = Some(start);
     while let Some(date) = day.filter(|date| *date <= end) {
         let kept: BTreeMap<String, i64> = store

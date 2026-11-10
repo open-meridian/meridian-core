@@ -592,6 +592,24 @@ pub trait Store: Send + Sync {
         as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
 
+    /// [`Store::read_dataset`], each row handed on as it is read, in
+    /// sequence order (stage M; the store memory audit of 2026-11-09, item
+    /// 6): a reader keeps what it answers -- one account's execution costs,
+    /// the scenarios asked -- never the dataset. A store that reads a chunk
+    /// at a time says so by overriding this.
+    fn read_dataset_each(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        for row in self.read_dataset(dataset, data_type, as_of_ns)? {
+            each(row)?;
+        }
+        Ok(())
+    }
+
     /// Every version of every row of one dataset and data type, in sequence
     /// order: how a saved scenario is read at a version not its latest
     /// (contract v28, W10.6, W12.8).

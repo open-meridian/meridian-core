@@ -897,6 +897,17 @@ impl Store for HotStore {
         self.inner.read_dataset(dataset, data_type, as_of_ns)
     }
 
+    fn read_dataset_each(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        self.inner
+            .read_dataset_each(dataset, data_type, as_of_ns, each)
+    }
+
     fn read_dataset_versions(
         &self,
         dataset: &str,

@@ -681,19 +681,17 @@ fn serve_one_id(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, wr
                             )
                         }
                     })?;
-                let mut live = Vec::new();
-                for record in store.all().map_err(|failed| failed.to_string())? {
-                    if store
-                        .replacement_of(&record.instrument_id)
-                        .map_err(|failed| failed.to_string())?
-                        .is_none()
-                    {
-                        live.push(record);
-                    }
-                }
-                let counts = crate::reask::migration_counts(store.as_ref(), &live)
-                    .map_err(|failed| failed.to_string())?
-                    .unwrap_or_default();
+                // Counted a record at a time (stage M; audit item 3).
+                let mut tallies = crate::reask::Tallies::new(store.as_ref());
+                store
+                    .each(&mut |record| {
+                        if store.replacement_of(&record.instrument_id)?.is_none() {
+                            tallies.add(store.as_ref(), &record)?;
+                        }
+                        Ok(true)
+                    })
+                    .map_err(|failed| failed.to_string())?;
+                let counts = tallies.migration().unwrap_or_default();
                 (made, counts)
             };
             for applied in &made.applied {

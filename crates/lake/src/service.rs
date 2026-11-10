@@ -1086,28 +1086,38 @@ impl Lake {
         let config = self.config();
         let mut scenarios = Vec::new();
         for dataset in config.readable(&reader, DataType::Scenario) {
-            let rows = if request.version == 0 {
-                self.store.read_dataset(&dataset, DataType::Scenario, 0)
-            } else {
-                self.store
-                    .read_dataset_versions(&dataset, DataType::Scenario)
-            }
-            .map_err(|failed| failed.to_string())?;
-            // A saved scenario whose effective state is invalid is left out,
+            // Each row as it is read, kept only where the read asks for it
+            // (stage M; the store memory audit of 2026-11-09, item 6). A
+            // saved scenario whose effective state is invalid is left out,
             // as every default read leaves one out (W10.6; ruling 421).
-            for row in rows.into_iter().filter(|row| !crate::store::invalid(row)) {
+            let mut keep = |row: Observation| {
+                if crate::store::invalid(&row) {
+                    return;
+                }
                 let Observation::Scenario(saved) = row else {
-                    continue;
+                    return;
                 };
                 let meta = saved.meta.clone().unwrap_or_default();
                 if !request.row_keys.is_empty() && !request.row_keys.contains(&meta.row_key) {
-                    continue;
+                    return;
                 }
                 if request.version != 0 && meta.version != request.version {
-                    continue;
+                    return;
                 }
                 scenarios.push(saved);
+            };
+            if request.version == 0 {
+                self.store
+                    .read_dataset_each(&dataset, DataType::Scenario, 0, &mut |row| {
+                        keep(row);
+                        Ok(())
+                    })
+            } else {
+                self.store
+                    .read_dataset_versions(&dataset, DataType::Scenario)
+                    .map(|rows| rows.into_iter().for_each(&mut keep))
             }
+            .map_err(|failed| failed.to_string())?;
         }
         Ok(meridian_domain::v1::ListScenariosReply { scenarios })
     }
@@ -1739,38 +1749,41 @@ impl Lake {
                 .parse()
                 .map_err(|_| invalid("cursor", "not a cursor this lake wrote"))?
         };
-        let mut costs: Vec<ExecutionCost> = self
-            .store
-            .read_dataset(
+        // Each row as it is read, kept only where it answers the account and
+        // what the read narrows to (stage M; the store memory audit of
+        // 2026-11-09, item 6): never every account's costs held.
+        let mut costs: Vec<ExecutionCost> = Vec::new();
+        self.store
+            .read_dataset_each(
                 lake::EXECUTION_COST_DATASET,
                 DataType::ExecutionCost,
                 request.as_of_ns,
+                &mut |row| {
+                    // Left out where invalid, as a default read leaves it (W10.6).
+                    if crate::store::invalid(&row) {
+                        return Ok(());
+                    }
+                    let Observation::ExecutionCost(cost) = row else {
+                        return Ok(());
+                    };
+                    let kept = cost.account_id == request.account_id
+                        && (request.execution_ids.is_empty()
+                            || request.execution_ids.contains(&cost.execution_id))
+                        && (request.order_id.is_empty() || cost.order_id == request.order_id)
+                        && (request.trade_date.is_empty()
+                            || cost
+                                .meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.business_date == request.trade_date))
+                        && (request.benchmarks.is_empty()
+                            || request.benchmarks.contains(&cost.benchmark));
+                    if kept {
+                        costs.push(*cost);
+                    }
+                    Ok(())
+                },
             )
-            .map_err(|failed| failed.to_string())?
-            .into_iter()
-            // Left out where invalid, as a default read leaves it (W10.6).
-            .filter(|row| !crate::store::invalid(row))
-            .filter_map(|row| match row {
-                Observation::ExecutionCost(cost) => Some(*cost),
-                _ => None,
-            })
-            .filter(|cost| cost.account_id == request.account_id)
-            .filter(|cost| {
-                request.execution_ids.is_empty()
-                    || request.execution_ids.contains(&cost.execution_id)
-            })
-            .filter(|cost| request.order_id.is_empty() || cost.order_id == request.order_id)
-            .filter(|cost| {
-                request.trade_date.is_empty()
-                    || cost
-                        .meta
-                        .as_ref()
-                        .is_some_and(|meta| meta.business_date == request.trade_date)
-            })
-            .filter(|cost| {
-                request.benchmarks.is_empty() || request.benchmarks.contains(&cost.benchmark)
-            })
-            .collect();
+            .map_err(|failed| failed.to_string())?;
         costs.sort_by(|a, b| (&a.execution_id, a.benchmark).cmp(&(&b.execution_id, b.benchmark)));
         let next = skip + page;
         let next_cursor = if next < costs.len() {

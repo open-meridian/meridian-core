@@ -351,6 +351,161 @@ fn a_catch_up_from_an_old_watermark_holds_a_chunk_never_the_dataset() {
     );
 }
 
+/// Stage M (the store memory audit of 2026-11-09, item 12): a read loads the
+/// closed-day re-checks of the rows it answers, beside each chunk, never
+/// every re-check its dataset ever had. A day's read of a dataset re-checked
+/// 20,000 times holds a few kilobytes of them, and still answers the flag
+/// as re-checked.
+#[test]
+fn a_read_loads_the_closed_day_rechecks_of_its_rows_alone() {
+    use meridian_domain::v1::{DateCheck, DateCheckReason};
+    use meridian_lake::store::ClosedDayAmendment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let other = unique("LCL-ETH");
+    const ROWS: usize = 20_000;
+    let mut sequences = Vec::new();
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                close(
+                    &dataset,
+                    &format!("k{}", batch * 500 + n),
+                    &other,
+                    "2026-10-12",
+                    10,
+                )
+            })
+            .collect();
+        let done = store.record(&dataset, rows, 1_000).unwrap();
+        sequences.extend(done.rows.iter().map(|row| row.meta().sequence));
+    }
+    let asked = store
+        .record(
+            &dataset,
+            vec![close(&dataset, "asked", &subject, "2026-10-13", 10)],
+            1_000,
+        )
+        .unwrap()
+        .rows[0]
+        .meta()
+        .sequence;
+    sequences.push(asked);
+    let recheck = |sequence: u64| ClosedDayAmendment {
+        dataset: dataset.clone(),
+        sequence,
+        closed_day: Some(DateCheck {
+            date: "2026-10-13".into(),
+            reason: DateCheckReason::Holiday as i32,
+            holiday_name: format!("A closure re-checked for row {sequence} of the dataset"),
+            ..Default::default()
+        }),
+        why: "calendar CAL-USSS version 2 applied".into(),
+        at_ns: 2_000,
+    };
+    for chunk in sequences.chunks(1_000) {
+        let rechecks: Vec<ClosedDayAmendment> = chunk.iter().map(|s| recheck(*s)).collect();
+        store.amend_closed_day(&rechecks).unwrap();
+    }
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    // Once to warm the pool's connections, then measured.
+    store.read(&query).unwrap();
+    counted::take();
+    let read = store.read(&query).unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        read[0].meta().closed_day.as_ref().unwrap().reason,
+        DateCheckReason::Holiday as i32,
+        "the flag as re-checked"
+    );
+    println!(
+        "RECHECKS heap_peak_mib={peak:.2} rechecks={}",
+        sequences.len()
+    );
+    assert!(
+        peak < 1.0,
+        "a read of one row held {peak:.2} MiB; every re-check of the dataset is about 4 MiB"
+    );
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 6): a whole dataset's
+/// read -- how one account's execution costs and the saved scenarios are
+/// read -- hands each row key on at its version in force, a chunk at a time,
+/// in sequence order, the same rows `read_dataset` answers; the reader keeps
+/// what it answers, and the heap holds a chunk, never the dataset.
+#[test]
+fn a_whole_datasets_read_hands_on_a_chunk_at_a_time() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    const ROWS: usize = 40_000;
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                trade(
+                    &dataset,
+                    &format!("t{}", batch * 500 + n),
+                    &subject,
+                    1_000 + n as i64,
+                )
+            })
+            .collect();
+        store.record(&dataset, rows, 1_000 + batch as i64).unwrap();
+    }
+    let restated: Vec<Observation> = (0..10)
+        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .collect();
+    store.record(&dataset, restated, 5_000).unwrap();
+    let mut whole_bytes = 0usize;
+    let mut kept = Vec::new();
+    let mut answered = 0usize;
+    let mut last = 0u64;
+    counted::take();
+    store
+        .read_dataset_each(&dataset, DataType::Trade, 0, &mut |row| {
+            whole_bytes += meridian_lake::pages::row_bytes(&row);
+            answered += 1;
+            assert!(row.meta().sequence > last, "in sequence order");
+            last = row.meta().sequence;
+            // What a reader keeps: one row in a thousand.
+            if row.meta().row_key.ends_with("000") {
+                kept.push(row);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(answered, ROWS, "each row key once");
+    let whole = store.read_dataset(&dataset, DataType::Trade, 0).unwrap();
+    assert_eq!(whole.len(), ROWS, "the rows read_dataset answers");
+    assert_eq!(
+        whole.iter().filter(|row| row.meta().version == 2).count(),
+        10,
+        "a restated key at its version in force"
+    );
+    let whole_mib = whole_bytes as f64 / 1048576.0;
+    println!(
+        "DATASET heap_peak_mib={peak:.1} whole_set_mib={whole_mib:.1} kept={}",
+        kept.len()
+    );
+    assert!(
+        peak * 10.0 < whole_mib,
+        "the read's heap peaked at {peak:.1} MiB against the set's {whole_mib:.1} MiB decoded"
+    );
+}
+
 fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation {
     Observation::Outcome(Box::new(meridian_domain::v1::Outcome {
         meta: Some(ObservationMeta {

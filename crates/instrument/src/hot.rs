@@ -213,6 +213,10 @@ impl Store for HotStore {
         self.inner.all()
     }
 
+    fn each(&self, every: &mut dyn FnMut(Instrument) -> Result<bool>) -> Result<()> {
+        self.inner.each(every)
+    }
+
     fn count(&self) -> Result<usize> {
         self.inner.count()
     }

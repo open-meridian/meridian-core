@@ -78,6 +78,9 @@ fn from_the_platform(version: i64) -> String {
 const REPORTED_BEFORE_V10: &str = "reported before contract v10";
 
 /// The instrument store, in a database.
+/// How many records [`Store::each`] loads at once.
+const EACH_CHUNK: i64 = 500;
+
 pub struct PostgresStore {
     pool: Pool,
     /// The epoch this writer's commits are fenced by (step 3a); none until
@@ -843,6 +846,38 @@ impl Store for PostgresStore {
             .map(|row| row.get(0))
             .collect();
         Self::load(&mut conn, &ids)
+    }
+
+    fn each(&self, every: &mut dyn FnMut(Instrument) -> Result<bool>) -> Result<()> {
+        // Keyset pages of IDs, each page's records loaded whole, so what is
+        // held is a chunk of records, never every one (stage M). The
+        // connection is given back before the chunk is handed on, so a
+        // reader that reads the store for each record takes its own.
+        let mut after = String::new();
+        loop {
+            let mut conn = self.conn()?;
+            let ids: Vec<String> = conn
+                .query(
+                    "SELECT instrument_id FROM instrument WHERE instrument_id > $1
+                      ORDER BY instrument_id LIMIT $2",
+                    &[&after, &EACH_CHUNK],
+                )
+                .map_err(unavailable)?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let Some(last) = ids.last().cloned() else {
+                return Ok(());
+            };
+            let chunk = Self::load(&mut conn, &ids)?;
+            drop(conn);
+            for record in chunk {
+                if !every(record)? {
+                    return Ok(());
+                }
+            }
+            after = last;
+        }
     }
 
     fn count(&self) -> Result<usize> {
