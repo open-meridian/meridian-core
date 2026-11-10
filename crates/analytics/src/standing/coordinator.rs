@@ -620,6 +620,7 @@ impl Coordinator {
         }
         let peers = self.peers_now();
         let live = peers.live();
+        let reachable = peers.reachable();
         let me = peers.me();
         let now = self.clock.now_ns();
         let mut unknown: BTreeSet<String> = BTreeSet::new();
@@ -661,7 +662,7 @@ impl Coordinator {
         if handed {
             unknown.extend(elsewhere);
         } else {
-            for member in live.iter().filter(|member| **member != me) {
+            for member in reachable.iter().filter(|member| **member != me) {
                 if elsewhere.is_empty() {
                     break;
                 }
@@ -773,7 +774,7 @@ impl Coordinator {
     ) -> Option<Result<JobAnswer, String>> {
         let peers = self.peers_now();
         let me = peers.me();
-        for member in peers.live().iter().filter(|member| **member != me) {
+        for member in peers.reachable().iter().filter(|member| **member != me) {
             match peers.ask(
                 member,
                 Asked::ReadJobAnswer,

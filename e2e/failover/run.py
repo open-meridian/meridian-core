@@ -2524,8 +2524,14 @@ def standing_coordinator(s):
     again = standing_held()[-1]
     s.check(back, f"standing-coordinator: the job registered again as {again}")
     if back:
-        s.check(standing_holder(again) not in ("", holder),
-                f"standing-coordinator: {again} held by a live coordinator ({standing_holder(again)})")
+        # The job it settles on, held by a coordinator still running, whose
+        # line may follow the driver's by a moment.
+        settled = happens(standing_settled, 120, every=2)
+        now = standing_held()[-1]
+        live = happens(lambda: standing_holder(standing_held()[-1]) not in ("", holder), 30, every=2)
+        s.check(settled and live,
+                f"standing-coordinator: {now} held by a live coordinator "
+                f"({standing_holder(now) or 'none found: ' + coordinators_said()})")
     claim(s, "standing-coordinator", "analytics", seconds, STANDING_BACK,
           {"job_before": job_id, "job_after": again, "killed": holder})
 

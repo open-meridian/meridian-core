@@ -299,8 +299,15 @@ impl Asked {
 pub trait Peers: Send + Sync {
     /// This coordinator's name among them.
     fn me(&self) -> String;
-    /// Every live coordinator's name, this one's among them, sorted.
+    /// Every live coordinator's name, this one's among them, sorted: what a
+    /// key is placed over.
     fn live(&self) -> Vec<String>;
+    /// Every coordinator worth asking about a job not held here: the live
+    /// ones and any heard of lately, so a word missed for a few seconds
+    /// never answers a held job unknown. One gone answers no one, at once.
+    fn reachable(&self) -> Vec<String> {
+        self.live()
+    }
     /// `payload`, asked of `member` as `asked` for `client` within its
     /// scope; the reply's bytes, or the refusal it answered.
     fn ask(
@@ -1047,11 +1054,15 @@ pub fn asked_of(member: &str) -> String {
 
 /// How often a coordinator says it is live, and how long one unheard is
 /// still counted live.
-pub const SAID_EVERY: Duration = Duration::from_secs(5);
+pub const SAID_EVERY: Duration = Duration::from_secs(2);
+
+/// How long a coordinator heard of is still asked about a job not held
+/// here, beside the live ones.
+pub const ASKED_FOR: Duration = Duration::from_secs(120);
 
 /// How long another coordinator has to answer a renewal or a read.
 pub const ASKED_WITHIN: Duration = Duration::from_secs(3);
-pub const LIVE_FOR: Duration = Duration::from_secs(15);
+pub const LIVE_FOR: Duration = Duration::from_secs(10);
 
 /// The live coordinators, by what each says on [`MEMBERS`], and a
 /// question asked of one on its own topic.
@@ -1061,6 +1072,8 @@ pub struct BusPeers {
     me: String,
     heard: Mutex<BTreeMap<String, std::time::Instant>>,
     timeout: Duration,
+    /// The live set last said, so each change is said once.
+    said: Mutex<Vec<String>>,
 }
 
 /// The payload type a coordinator's own topic answers a refusal under.
@@ -1084,6 +1097,7 @@ impl BusPeers {
             me: me.clone(),
             heard: Mutex::new(BTreeMap::new()),
             timeout,
+            said: Mutex::new(Vec::new()),
         });
         let mut hearing = bus.subscribe_every(MEMBERS);
         let held = Arc::clone(&peers);
@@ -1134,7 +1148,31 @@ impl Peers for BusPeers {
             .map(|(member, _)| member.clone())
             .collect();
         live.insert(self.me.clone());
-        live.into_iter().collect()
+        let live: Vec<String> = live.into_iter().collect();
+        let mut said = self.said.lock().expect("not poisoned");
+        if *said != live {
+            tracing::info!(
+                me = self.me,
+                live = live.join(","),
+                "the live coordinators changed"
+            );
+            *said = live.clone();
+        }
+        live
+    }
+
+    fn reachable(&self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut heard: BTreeSet<String> = self
+            .heard
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) <= ASKED_FOR)
+            .map(|(member, _)| member.clone())
+            .collect();
+        heard.extend(self.live());
+        heard.into_iter().collect()
     }
 
     fn ask(
