@@ -166,6 +166,7 @@ impl PostgresStore {
     /// cause. Nothing where it writes under no epoch.
     fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
         use meridian_changes::timeline::Timeline;
+        let _alone = self.watch.alone();
         let mine = self.fence.epoch();
         if mine == 0 {
             return Ok(Timeline::Same);

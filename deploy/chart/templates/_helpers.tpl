@@ -926,6 +926,11 @@ maximum_lag_on_failover: 1048576
 synchronous_mode: {{ if gt (int .standbys) 0 }}quorum{{ else }}false{{ end }}
 synchronous_mode_strict: {{ gt (int .standbys) 0 }}
 synchronous_node_count: 1
+{{- /* The API server lost (contract v30, stage C; the resilience spec's
+       section 2): Patroni's failsafe_mode keeps the primary through its
+       store's outage -- Kubernetes, here -- while it reaches every member
+       by their REST APIs, so the record's writers write on. */}}
+failsafe_mode: true
 postgresql:
   use_pg_rewind: true
   use_slots: true

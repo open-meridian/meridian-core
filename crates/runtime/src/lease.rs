@@ -174,6 +174,19 @@ impl<L: Leases> Elector<L> {
     /// deployment's time for the record's own fields (read by people, never
     /// by an election).
     pub async fn look(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
+        let looked = self.look_once(now, wall_ns).await;
+        if looked.is_err() {
+            // Not watched while the API server did not answer (contract v30,
+            // stage C): a lease's expiry is observed, and an unobserved
+            // stretch is never counted as its holder's silence -- else a
+            // standby cut off with its writer takes the lease the moment the
+            // API server answers again (CI 42958621081, FAILURE=apiserver).
+            self.observed = None;
+        }
+        looked
+    }
+
+    async fn look_once(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let me = self.settings.holder.clone();
         let stamp = micro_time(wall_ns);
         let Some(current) = self.api.get(&self.settings.name).await? else {

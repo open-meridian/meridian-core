@@ -3002,15 +3002,22 @@ def write_ahead_bound(s):
     before = upgrade(f"lake.writeAhead.maxAge={SHORT_MAX_AGE_S}s")
     s.check(before.returncode == 0, "write-ahead-bound: the stream's bound set short by an upgrade")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    # The lease's holder a pod that runs: the upgrade rolled the members.
+    wait_for("the lake's writer running", lambda: writer_pod("lake") in
+             [p["metadata"]["name"] for p in pods("lake")], seconds=300)
     since = int(time.time() * 1e9)
-    writer = writer_pod("lake")
+    # Every lake member held from the broker, its standby and its readers
+    # too: a standby that took over would take the stream on in time.
+    held = [p["metadata"]["name"] for c in ("lake", "lake-reader") for p in pods(c)]
     broker = [pod_ip(p["metadata"]["name"]) for p in pods("broker")]
     began = time.time()
-    cut_rules(writer, broker, "-I")
+    for member in held:
+        cut_rules(member, broker, "-I")
     try:
         time.sleep(SHORT_MAX_AGE_S + HELD_PAST_S)
     finally:
-        cut_rules(writer, broker, "-D")
+        for member in held:
+            cut_rules(member, broker, "-D")
     let_go = time.time()
     dataset = "drive-data:drive"
     found = happens(lambda: gaps_of(dataset, since), 180, every=3)

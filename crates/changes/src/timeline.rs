@@ -80,9 +80,21 @@ pub fn database_identity(client: &mut impl GenericClient) -> Result<String, post
 pub struct Watch {
     seen: Mutex<Option<String>>,
     moved: AtomicBool,
+    /// Held while a writer follows the timeline: one at a time, so a look
+    /// and a connection's raise never read each other's raise as another
+    /// writer's (CI 42958602978: the street's writer stepped down so).
+    following: Mutex<()>,
 }
 
 impl Watch {
+    /// Follow the timeline alone: the writer's look and each connection's
+    /// raise one after the other.
+    pub fn alone(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.following
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+    }
+
     /// Whether a connection opened since the identity was last settled saw
     /// a new one; answered once.
     pub fn moved(&self) -> bool {
