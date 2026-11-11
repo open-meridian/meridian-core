@@ -293,6 +293,29 @@ fn as_released(
     }
 }
 
+/// A migration is applied on a primary, never a server in recovery: waited
+/// for where the server reached is one (contract v30, stage D).
+///
+/// An upgrade moving the brought database under Patroni back to ha hands its
+/// leadership to another member while member 0 restarts as a replica, and
+/// the database's Service can still name member 0 for a moment: PR CI
+/// 43058388339's e2e-cluster-reconfigure, the second move to ha, reached it
+/// with the release's own connection count and failed "cannot execute
+/// CREATE TABLE in a read-only transaction" (the Service named member 1,
+/// the primary, a few seconds later). Stage C2's intermittent of the same
+/// step, its pods' logs gone, is this one's likeliest cause.
+fn a_primary(in_recovery: bool) -> Result<(), Wait> {
+    if in_recovery {
+        Err(Wait::NotYet(
+            "the server reached is in recovery, a standby, not the primary a migration is \
+             applied on"
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// [`database_answers`], and on the database the chart brings, the server
 /// this release starts ([`as_released`]): one connection, made and closed.
 fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<(), Wait> {
@@ -314,6 +337,11 @@ fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<()
     let mut client = config
         .connect(tls)
         .map_err(|failed| Wait::NotYet(failed.to_string()))?;
+    let in_recovery: bool = client
+        .query_one("select pg_is_in_recovery()", &[])
+        .map_err(|failed| Wait::NotYet(failed.to_string()))?
+        .get(0);
+    a_primary(in_recovery)?;
     if as_released(&hosts, brought, None).is_ok() {
         return Ok(());
     }
@@ -1427,6 +1455,16 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// A migration waits for a primary: a server in recovery is waited past,
+    /// never migrated (PR CI 43058388339, e2e-cluster-reconfigure).
+    #[test]
+    fn a_migration_waits_past_a_server_in_recovery() {
+        assert!(
+            matches!(super::a_primary(true), Err(super::Wait::NotYet(why)) if why.contains("in recovery"))
+        );
+        assert!(super::a_primary(false).is_ok());
+    }
+
     /// The brought database's record-read replica reached with the store's
     /// own URL, its host the chart's (contract v30, stage C2).
     #[test]
