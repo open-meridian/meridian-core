@@ -1466,7 +1466,7 @@ export PGPASSWORD="${PATRONI_SUPERUSER_PASSWORD:-$POSTGRES_PASSWORD}"
 end=$(( $(date +%s) + SECONDS_ ))
 while [ "$(date +%s)" -lt "$end" ]; do
   id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
-       -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
+       -c "insert into failover_e2e.marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
     && echo "ACKED $id"
   sleep 0.05
 done
@@ -1474,7 +1474,13 @@ done
 
 
 def marks_table():
-    psql("create table if not exists failover_marks (id bigserial primary key, at timestamptz not null)")
+    """The marks' table, in a schema of this run's own: in the stores'
+    `public` it was the superuser's, and every migration after it failed
+    granting the stores' role its tables ("permission denied for table
+    failover_marks": migrate-3 Init:Error in failover-repeat 43078770407, ha
+    run 1, and PR CI 43078729225, after write-ahead-bound's upgrades)."""
+    psql("create schema if not exists failover_e2e; "
+         "create table if not exists failover_e2e.marks (id bigserial primary key, at timestamptz not null)")
 
 
 def write_marks(pod_name, seconds, pause=0.05):
@@ -1500,7 +1506,7 @@ def acknowledged(writer):
 def database_writes(avoid=()):
     """The database's primary takes a commit: it is serving."""
     try:
-        psql("insert into failover_marks (at) values (clock_timestamp())", pod=primary(avoid))
+        psql("insert into failover_e2e.marks (at) values (clock_timestamp())", pod=primary(avoid))
         return True
     except SystemExit:
         return False
@@ -1536,8 +1542,8 @@ def db_primary(s, failure="db-primary"):
         writing_in = next((m for m in members if m != victim), None)
         writer = write_marks(writing_in, 45, pause=0) if writing_in else None
         time.sleep(3)
-        psql("insert into failover_marks (at) values (clock_timestamp())")
-        acked_before = int(psql("select max(id) from failover_marks") or 0)
+        psql("insert into failover_e2e.marks (at) values (clock_timestamp())")
+        acked_before = int(psql("select max(id) from failover_e2e.marks") or 0)
     began = time.time()
     # With standbys, the primary is kept down: cut off from everything on
     # its node, then killed, so its Patroni cannot renew the leader key as
@@ -1587,7 +1593,7 @@ def db_primary(s, failure="db-primary"):
     if acked_before is not None:
         acked = acknowledged(writer) if writer else set()
         acked.add(acked_before)
-        kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
+        kept = {int(i) for i in psql("select id from failover_e2e.marks", pod=new_primary).split()}
         lost = sorted(acked - kept)
         s.check(not lost, f"{failure}: every commit the database acknowledged under the heavy load kept "
                 f"({len(acked)} acknowledged, {len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
