@@ -568,6 +568,14 @@ def first_run(s):
     addresses["data"] = {
         "dashboard-url": base64.b64encode(b"http://failover-e2e.localhost").decode(),
         "administrator-login": base64.b64encode(ADMIN.encode()).decode(),
+        # The deployment holds its own accounts, as the wizard says for a
+        # local administrator (local|alice): so the dashboard keeps its
+        # tables -- the inbox's notices among them -- in the database every
+        # copy shares, and write-ahead-bound reads a gap's notice where an
+        # admin's inbox reads it (contract v30, stage D). Without it the
+        # dashboard signed nobody in and kept its notices in each copy's
+        # memory (failover-repeat 43071322484, PR CI 43070882389).
+        "local-accounts": base64.b64encode(b"on").decode(),
     }
     kubectl("replace", "-f", "-", input=json.dumps(addresses).encode(), quiet=True)
     del serving, migrating, passwords
