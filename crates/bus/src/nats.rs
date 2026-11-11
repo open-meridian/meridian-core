@@ -86,6 +86,46 @@ pub struct NatsBackend {
 
     /// The client's heartbeat, stopped with it.
     heartbeat: tokio::task::AbortHandle,
+
+    /// Every live subscription's drop count, each counted a loss when the
+    /// connection is lost (the resilience spec's section 10a).
+    listening: Arc<Listening>,
+}
+
+/// Every live subscription's drop count, so a connection lost counts a loss
+/// on each (the resilience spec's section 10a; decisions/024's at-most-once
+/// deliveries). Whatever the broker held for them while the connection was
+/// down -- a slow consumer cut off at `broker.limits.maxPending`, a server
+/// lost -- is gone, and the library's reconnection and resubscription say
+/// nothing of it. Counted, a sidecar puts a `Lost` in its plugin's stream
+/// and the plugin reads again from the store, as after any loss.
+#[derive(Default)]
+struct Listening(Mutex<Vec<std::sync::Weak<AtomicU64>>>);
+
+impl Listening {
+    fn hold(&self, count: &DropCount) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(count.weak());
+    }
+
+    /// A loss counted on every subscription still live, those gone let go:
+    /// how many it was counted on.
+    fn lost(&self) -> u64 {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.retain(|weak| match weak.upgrade() {
+            Some(count) => {
+                count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        });
+        held.len() as u64
+    }
 }
 
 impl Drop for NatsBackend {
@@ -114,6 +154,25 @@ impl NatsBackend {
     /// lets the synchronous half of [`Backend`] reach an async client.
     pub async fn connect(url: &str) -> Result<Self, BusError> {
         let (options, address) = credential_in(url);
+        let listening = Arc::new(Listening::default());
+        let dropped = Arc::new(AtomicU64::new(0));
+        let options = options.event_callback({
+            let (listening, dropped) = (Arc::clone(&listening), Arc::clone(&dropped));
+            move |event| {
+                let (listening, dropped) = (Arc::clone(&listening), Arc::clone(&dropped));
+                async move {
+                    if matches!(event, async_nats::Event::Disconnected) {
+                        let lost = listening.lost();
+                        dropped.fetch_add(lost, Ordering::Relaxed);
+                        tracing::warn!(
+                            subscriptions = lost,
+                            "the connection to the broker was lost: what it held for each \
+                             subscription meanwhile is counted lost, and read again"
+                        );
+                    }
+                }
+            }
+        });
         let client = options
             .connect(&address)
             .await
@@ -136,10 +195,24 @@ impl NatsBackend {
             client,
             handle: tokio::runtime::Handle::current(),
             sequences: Mutex::new(HashMap::new()),
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped,
             outbox,
             heartbeat,
+            listening,
         })
+    }
+
+    /// Give up this connection and make it again, as the heartbeat does on
+    /// a server that stopped answering: every subscription is counted a
+    /// loss, and resubscribed.
+    pub async fn reconnect(&self) -> Result<(), BusError> {
+        self.client
+            .force_reconnect()
+            .await
+            .map_err(|failed| BusError::HandlerFailed {
+                topic: "the broker".into(),
+                detail: failed.to_string(),
+            })
     }
 
     /// A client of its own on the broker the URL names, with its credential,
@@ -465,6 +538,7 @@ impl NatsBackend {
         let client = self.client.clone();
         let owned = pattern.to_string();
         let dropped = DropCount::default();
+        self.listening.hold(&dropped);
         let counted = dropped.clone();
         let total = Arc::clone(&self.dropped);
 

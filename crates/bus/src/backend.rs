@@ -319,6 +319,12 @@ impl DropCount {
     pub(crate) fn add(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// The same count, held without keeping it alive: a backend counting a
+    /// loss on every live subscription at once holds each this way.
+    pub(crate) fn weak(&self) -> std::sync::Weak<AtomicU64> {
+        Arc::downgrade(&self.0)
+    }
 }
 
 /// A live subscription. Dropping it unsubscribes.
