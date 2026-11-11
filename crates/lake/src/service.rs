@@ -689,6 +689,38 @@ fn gap_id(now_ns: i64) -> String {
     format!("GAP-{ulid}")
 }
 
+/// The gap recorded the moment the write-ahead stream is found to have
+/// skipped `run` (approved 2026-11-11; the resilience spec's section 4): its
+/// datasets not yet known (`dataset` empty), over the stream's times either
+/// side of the run, unrecovered -- nothing can be asked again of no dataset --
+/// so it is shown at once, and stays shown for a dataset that never writes
+/// again. Each dataset's own gap names it as that dataset's next write
+/// arrives.
+fn unattributed_gap(run: &crate::store::Dropped, now: i64) -> meridian_domain::v1::DatasetGap {
+    use meridian_domain::v1::{GapCause, GapState};
+    let valid_until_ns = if run.until_at_ns > 0 {
+        run.until_at_ns
+    } else {
+        now
+    };
+    let valid_from_ns = if run.after_at_ns > 0 {
+        run.after_at_ns.min(valid_until_ns)
+    } else {
+        valid_until_ns
+    };
+    meridian_domain::v1::DatasetGap {
+        gap_id: run.gap_id.clone(),
+        dataset: String::new(),
+        subjects: Vec::new(),
+        valid_from_ns,
+        valid_until_ns,
+        cause: GapCause::WriteAheadBound as i32,
+        state: GapState::Unrecovered as i32,
+        recorded_at_ns: now,
+        found_in_gap_id: String::new(),
+    }
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -2038,6 +2070,15 @@ impl Lake {
         }
         let now = self.clock.now_ns();
         let config = self.config();
+        // Each run the stream skipped that this batch found: a gap recorded
+        // with it, its datasets not yet known (approved 2026-11-11), so the
+        // admin hears of it at once, whether or not a dataset writes again.
+        let unattributed: Vec<meridian_domain::v1::DatasetGap> = batch
+            .dropped
+            .iter()
+            .map(|run| unattributed_gap(run, now))
+            .collect();
+        batch.gaps.extend(unattributed);
         let mut valid: BTreeMap<String, i64> = BTreeMap::new();
         let mut written: Vec<Result<Kept, String>> = Vec::with_capacity(writes.len());
         for write in writes {
@@ -2066,7 +2107,7 @@ impl Lake {
                 unkept: Vec::new(),
             };
             for (dataset, rows) in by_dataset {
-                if let Some(dropped) = write.after_gap {
+                if let Some(dropped) = write.after_gap.as_ref() {
                     batch.gaps.push(
                         self.gap_found(
                             &dataset,
@@ -2076,6 +2117,7 @@ impl Lake {
                                 .copied()
                                 .unwrap_or(dropped.after_at_ns),
                             dropped.until_at_ns,
+                            &dropped.gap_id,
                             now,
                         ),
                     );
@@ -2134,18 +2176,26 @@ impl Lake {
         Ok(crate::write_ahead::Recorded { answers, valid })
     }
 
+    /// A new gap's ID, at the lake's time.
+    pub fn new_gap_id(&self) -> String {
+        gap_id(self.clock.now_ns())
+    }
+
     /// A gap found in `dataset` before the write whose rows are `rows`
     /// (W10.14): from `valid_from_ns`, the dataset's latest valid time the
     /// lake recorded before it, to the write's earliest, over the write's
     /// subjects; refetching where the dataset declares `backfill`,
     /// unrecovered where it declares anything else or nothing (the cautious
-    /// reading).
+    /// reading). `found_in` names the unattributed gap recorded when the
+    /// stream skipped the run it follows (approved 2026-11-11).
+    #[allow(clippy::too_many_arguments)]
     fn gap_found(
         &self,
         dataset: &str,
         rows: &[Observation],
         valid_from_ns: i64,
         until_at_ns: i64,
+        found_in: &str,
         now: i64,
     ) -> meridian_domain::v1::DatasetGap {
         use meridian_domain::v1::{GapCause, GapState};
@@ -2178,6 +2228,7 @@ impl Lake {
                 GapState::Unrecovered
             } as i32,
             recorded_at_ns: now,
+            found_in_gap_id: found_in.to_string(),
         }
     }
 
@@ -2186,6 +2237,17 @@ impl Lake {
     /// or, unrecovered, said, where its rows are never invented.
     fn gap_recorded(&self, gap: meridian_domain::v1::DatasetGap) {
         use meridian_domain::v1::GapState;
+        if gap.dataset.is_empty() {
+            tracing::warn!(
+                gap_id = gap.gap_id,
+                valid_from_ns = gap.valid_from_ns,
+                valid_until_ns = gap.valid_until_ns,
+                "a gap in the write-ahead stream: rows it dropped before the lake committed \
+                 them, their datasets not yet known; recorded and unrecovered, each dataset's \
+                 own gap named as it writes next"
+            );
+            return;
+        }
         if gap.state != GapState::Refetching as i32 {
             tracing::warn!(
                 gap_id = gap.gap_id,

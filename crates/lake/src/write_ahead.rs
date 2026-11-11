@@ -162,11 +162,14 @@ impl Writer {
         let mut dropped = Vec::new();
         for write in &taken {
             if write.sequence > expected {
+                // Found the moment the stream skips (approved 2026-11-11):
+                // a gap recorded with the batch, its datasets not yet known.
                 dropped.push(Dropped {
                     first: expected,
                     last: write.sequence - 1,
                     after_at_ns: before_at,
                     until_at_ns: write.at_ns,
+                    gap_id: self.lake.new_gap_id(),
                 });
             }
             expected = write.sequence + 1;
@@ -176,8 +179,10 @@ impl Writer {
             tracing::warn!(
                 first = run.first,
                 last = run.last,
+                gap_id = run.gap_id,
                 "the lake's write-ahead stream dropped writes before the lake took them: \
-                 a writer gone longer than the stream's bound"
+                 a writer gone longer than the stream's bound; a gap recorded at once, its \
+                 datasets named as each writes next"
             );
         }
         let mut sent_to = Vec::with_capacity(taken.len());
@@ -188,7 +193,7 @@ impl Writer {
                     .iter()
                     .chain(&dropped)
                     .find(|run| run.holds(after))
-                    .copied()
+                    .cloned()
             });
             sent_to.push(write.reply_to);
             writes.push(Written {

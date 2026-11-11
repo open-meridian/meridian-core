@@ -1289,8 +1289,9 @@ impl Store for PostgresStore {
         for dropped in &batch.dropped {
             tx.execute(
                 "INSERT INTO lake_write_ahead_dropped
-                        (stream, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                        (stream, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns,
+                         gap_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
                 &[
                     &batch.stream,
                     &(dropped.first as i64),
@@ -1298,6 +1299,7 @@ impl Store for PostgresStore {
                     &dropped.after_at_ns,
                     &dropped.until_at_ns,
                     &now_ns,
+                    &dropped.gap_id,
                 ],
             )
             .map_err(unavailable)?;
@@ -1349,7 +1351,7 @@ impl Store for PostgresStore {
         let mut conn = self.conn()?;
         let dropped = conn
             .query(
-                "SELECT first_sequence, last_sequence, after_at_ns, until_at_ns
+                "SELECT first_sequence, last_sequence, after_at_ns, until_at_ns, gap_id
                    FROM lake_write_ahead_dropped WHERE stream = $1 ORDER BY first_sequence",
                 &[&stream],
             )
@@ -1360,6 +1362,7 @@ impl Store for PostgresStore {
                 last: row.get::<_, i64>(1) as u64,
                 after_at_ns: row.get(2),
                 until_at_ns: row.get(3),
+                gap_id: row.get(4),
             })
             .collect();
         let valid = conn

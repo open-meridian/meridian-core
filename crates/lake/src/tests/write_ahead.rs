@@ -238,7 +238,7 @@ async fn a_writer_gone_past_the_bound_leaves_a_backfill_gap_asked_again_and_reco
         "the write after a gap is recorded"
     );
     // The gap, recorded and asked again of its data plugin, naming it.
-    let open = gaps(&h, "", GapState::Unspecified);
+    let open = gaps(&h, "coinbase-1:daily", GapState::Unspecified);
     assert_eq!(open.len(), 1, "{open:?}");
     let gap = &open[0];
     assert!(
@@ -279,12 +279,21 @@ async fn a_writer_gone_past_the_bound_leaves_a_backfill_gap_asked_again_and_reco
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].gap_id, gap.gap_id);
     assert!(gaps(&h, "", GapState::Refetching).is_empty());
-    // Each state its own record, in the control partition too.
+    // Each state its own record, in the control partition too: the
+    // unattributed gap first, recorded as the stream was found to skip.
     let every = h.store.dataset_gaps().unwrap();
     assert_eq!(
-        every.iter().map(|g| g.state).collect::<Vec<_>>(),
-        vec![GapState::Refetching as i32, GapState::Recovered as i32]
+        every
+            .iter()
+            .map(|g| (g.dataset.as_str(), g.state))
+            .collect::<Vec<_>>(),
+        vec![
+            ("", GapState::Unrecovered as i32),
+            ("coinbase-1:daily", GapState::Refetching as i32),
+            ("coinbase-1:daily", GapState::Recovered as i32)
+        ]
     );
+    assert_eq!(gap.found_in_gap_id, every[0].gap_id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -324,7 +333,8 @@ async fn a_gap_in_a_dataset_declaring_none_is_recorded_unrecovered_and_read_neve
     let mut after = written(10, "kraken-1", vec![price("j", NOW)]);
     after.after = Some(9);
     tokio::task::block_in_place(|| writer.take(vec![after])).unwrap();
-    assert_eq!(h.store.dataset_gaps().unwrap().len(), 1);
+    // The run's unattributed gap and the dataset's, nothing more.
+    assert_eq!(h.store.dataset_gaps().unwrap().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -352,7 +362,100 @@ async fn a_gap_whose_want_is_declined_is_unrecovered() {
         reason: UnansweredReason::BeyondHistory as i32,
     };
     tokio::task::block_in_place(|| h.lake.decline(declined, &asked)).unwrap();
-    let shown = gaps(&h, "", GapState::Unrecovered);
+    let shown = gaps(&h, "coinbase-1:daily", GapState::Unrecovered);
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].gap_id, want.gap_id);
+}
+
+/// The unattributed gap (contract v30, stage C2; the resilience spec's
+/// section 4, "A gap is found when the stream skips", approved 2026-11-11):
+/// the writer records a gap the moment it finds the stream's sequence past
+/// rows it never committed, its datasets not yet known, unrecovered and so
+/// shown at once, before any dataset writes again. Each dataset's next write
+/// names its own gap, found from it, and asks its own `backfill`; a writer
+/// started again names it too; a dataset that never writes again leaves the
+/// unattributed gap shown, never silent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_is_recorded_the_moment_the_stream_skips_and_each_dataset_names_it_as_it_writes_next()
+{
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let coinbase =
+        |key: &str, valid: i64| at_valid(close("coinbase-1", key, BTC, "2026-10-07", "1"), valid);
+    let kraken =
+        |key: &str, valid: i64| at_valid(close("kraken-1", key, BTC, "2026-10-07", "1"), valid);
+    tokio::task::block_in_place(|| {
+        writer.take(vec![
+            written(1, "coinbase-1", vec![coinbase("a", NOW - 30_000)]),
+            written(2, "kraken-1", vec![kraken("a", NOW - 30_000)]),
+        ])
+    })
+    .unwrap();
+    // 3 to 6 dropped. The first write taken after them is neither dataset's
+    // next after the gap -- a write of another instance, refused -- so no
+    // dataset is named yet; the gap is recorded all the same, at once.
+    let stray = written(
+        7,
+        "kraken-1",
+        vec![close("coinbase-1", "z", BTC, "2026-10-07", "1")],
+    );
+    tokio::task::block_in_place(|| writer.take(vec![stray])).unwrap();
+    let found = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let unattributed = found[0].clone();
+    assert_eq!(unattributed.dataset, "", "its datasets not yet known");
+    assert!(unattributed.found_in_gap_id.is_empty());
+    assert_eq!(
+        unattributed.state,
+        GapState::Unrecovered as i32,
+        "shown at once"
+    );
+    assert_eq!(unattributed.cause, GapCause::WriteAheadBound as i32);
+    assert_eq!(
+        (unattributed.valid_from_ns, unattributed.valid_until_ns),
+        (NOW + 2, NOW + 7),
+        "the stream's times either side of the run it skipped"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), wanted.recv())
+            .await
+            .is_err(),
+        "nothing asked of no dataset"
+    );
+    // coinbase-1 writes next, its sidecar's last write one of those dropped:
+    // its own gap, naming the unattributed one, and its backfill asked.
+    let mut next = written(8, "coinbase-1", vec![coinbase("e", NOW - 10_000)]);
+    next.after = Some(4);
+    tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
+    let named = gaps(&h, "coinbase-1:daily", GapState::Refetching);
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0].found_in_gap_id, unattributed.gap_id);
+    assert_eq!(
+        (named[0].valid_from_ns, named[0].valid_until_ns),
+        (NOW - 30_000, NOW - 10_000)
+    );
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert_eq!(
+        (want.gap_id.as_str(), want.dataset.as_str()),
+        (named[0].gap_id.as_str(), "coinbase-1:daily")
+    );
+    // A writer started again -- a takeover, a restart -- names it too: the
+    // run keeps its gap's ID in the store.
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut later = written(9, "kraken-1", vec![kraken("i", NOW - 1_000)]);
+    later.after = Some(5);
+    tokio::task::block_in_place(|| writer.take(vec![later])).unwrap();
+    let kraken_gap = gaps(&h, "kraken-1:daily", GapState::Unrecovered);
+    assert_eq!(kraken_gap.len(), 1);
+    assert_eq!(kraken_gap[0].found_in_gap_id, unattributed.gap_id);
+    // The unattributed gap stays shown: a dataset that never writes again
+    // is still in it.
+    let still = gaps(&h, "", GapState::Unrecovered)
+        .into_iter()
+        .filter(|g| g.dataset.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(still, vec![unattributed]);
 }

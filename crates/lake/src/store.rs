@@ -125,13 +125,18 @@ pub struct WriteAheadBatch {
 /// A run of the write-ahead stream's sequences it dropped at its bound
 /// before the lake took them (W10.14): the first and last, the stream's
 /// time of the last write the lake had before them and of the first it
-/// took after.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// took after, and the gap recorded for it the moment it was found, its
+/// datasets not yet known (approved 2026-11-11): each dataset's gap found
+/// from the run names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Dropped {
     pub first: u64,
     pub last: u64,
     pub after_at_ns: i64,
     pub until_at_ns: i64,
+    /// The unattributed gap's ID; empty for a run found before the lake
+    /// recorded one.
+    pub gap_id: String,
 }
 
 impl Dropped {

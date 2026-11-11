@@ -114,6 +114,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "database_identity",
         sql: include_str!("../migrations/0016_database_identity.sql"),
     },
+    // The unattributed gap (contract v30, stage C2; approved 2026-11-11):
+    // each run the stream skipped keeps the gap recorded for it at once.
+    Migration {
+        version: 17,
+        name: "unattributed_gap",
+        sql: include_str!("../migrations/0017_unattributed_gap.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -47394,8 +47394,8 @@
     {
       "name": "meridian.v1.DatasetGap.dataset",
       "type": "identifier dataset",
-      "empty": "never empty",
-      "intent": "names the dataset with a gap (W10.14; the record approved 2026-11-09)",
+      "empty": "empty: not yet known -- the unattributed gap the writer records the moment the stream's sequence passes rows it never committed, before any dataset's next write names its own (approved 2026-11-11)",
+      "intent": "names the dataset with a gap (W10.14; the record approved 2026-11-09; empty as not yet known approved 2026-11-11)",
       "meaning": "the dataset whose rows were dropped",
       "not_meaning": "an entitlement",
       "filled": "decided",
@@ -47513,6 +47513,25 @@
       "intent": "states when the gap's state was recorded (W10.14; approved 2026-11-09)",
       "meaning": "by the lake's clock, for this state",
       "not_meaning": "when the rows were dropped",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DatasetGap.found_in_gap_id",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          64
+        ]
+      },
+      "empty": "empty: the unattributed gap itself, or a gap found before an unattributed gap was recorded",
+      "intent": "links a dataset's gap to the unattributed gap it was found from (the resilience spec's section 4, \"A gap is found when the stream skips\"; approved 2026-11-11)",
+      "meaning": "the gap_id of the gap whose dataset is empty, recorded when the stream skipped, that this dataset's gap was named from as its next write arrived",
+      "not_meaning": "a want's ID, or a gap of the same dataset recorded earlier",
       "filled": "decided",
       "filled_by": "lake",
       "since": "v30",

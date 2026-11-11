@@ -4929,12 +4929,16 @@ fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
         cause: GapCause::WriteAheadBound as i32,
         state: GapState::Refetching as i32,
         recorded_at_ns: 5_000,
+        found_in_gap_id: String::new(),
     };
+    // The run keeps the unattributed gap recorded for it (contract v30,
+    // stage C2), so a writer that starts names it too.
     let dropped = Dropped {
         first: 2,
         last: 4,
         after_at_ns: 1_001,
         until_at_ns: 1_005,
+        gap_id: unique("GAP-UNATTRIBUTED"),
     };
     store
         .record_write_ahead(
@@ -4949,7 +4953,7 @@ fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
                     dataset.clone(),
                     vec![close(&dataset, "x", &subject, "2026-10-07", 10)],
                 )],
-                dropped: vec![dropped],
+                dropped: vec![dropped.clone()],
                 valid: vec![(dataset.clone(), 100)],
                 gaps: vec![gap.clone()],
             },

@@ -18316,13 +18316,22 @@ pub struct PartitionMoved {
 /// again through the want where the dataset declares GAP_RECOVERY_BACKFILL,
 /// marked unrecovered otherwise; rows inside an unrecovered range are never
 /// invented.
+///
+/// Found the moment the stream's sequence passes rows the lake never
+/// committed (approved 2026-11-11): first as one gap whose dataset is not yet
+/// known (`dataset` empty), recorded unrecovered at once; then, as each
+/// dataset's next write arrives, that dataset's own gap, naming the first in
+/// `found_in_gap_id`. A dataset that never writes again stays on the
+/// unattributed gap, shown, never silent.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DatasetGap {
     /// `GAP-` and a ULID, never reused: 1 to 64 characters. A want asking again
     /// for it names it.
     #[prost(string, tag = "1")]
     pub gap_id: ::prost::alloc::string::String,
-    /// The dataset whose rows were dropped.
+    /// The dataset whose rows were dropped. Empty: not yet known -- the gap
+    /// the writer recorded the moment the stream skipped, before any dataset's
+    /// next write named its own.
     #[prost(string, tag = "2")]
     pub dataset: ::prost::alloc::string::String,
     /// Entity IDs, as the dropped rows named them; 0 to 500. None: every
@@ -18343,6 +18352,11 @@ pub struct DatasetGap {
     /// By the lake's clock, for this state.
     #[prost(int64, tag = "8")]
     pub recorded_at_ns: i64,
+    /// The unattributed gap (`dataset` empty) this dataset's gap was found
+    /// from: the run of the stream it skipped, named as its dataset's next
+    /// write arrived. Empty on the unattributed gap itself.
+    #[prost(string, tag = "9")]
+    pub found_in_gap_id: ::prost::alloc::string::String,
 }
 /// A deployment admin reads the gaps (W10.14), newest first. Changes nothing.
 #[derive(Clone, PartialEq, ::prost::Message)]

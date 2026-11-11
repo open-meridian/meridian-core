@@ -2985,6 +2985,55 @@ def gaps_of(dataset, since_ns):
     return gaps
 
 
+def proto_text(body, number):
+    """A protobuf message's string field `number`, from its bytes; empty
+    where it is not set. Enough of the wire format to read one field."""
+    at = 0
+
+    def varint():
+        nonlocal at
+        value, shift = 0, 0
+        while True:
+            byte = body[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value
+    while at < len(body):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            varint()
+        elif wire == 1:
+            at += 8
+        elif wire == 5:
+            at += 4
+        elif wire == 2:
+            length = varint()
+            if field == number:
+                return body[at:at + length].decode()
+            at += length
+        else:
+            return ""
+    return ""
+
+
+def gaps_found_in(dataset, since_ns):
+    """Each gap recorded since `since_ns` -- of `dataset`, or with it empty
+    the unattributed ones -- by its ID: the gap it was found from
+    (DatasetGap.found_in_gap_id, field 9) and when it was first recorded."""
+    said = psql("select gap_id, min(recorded_at_ns), encode((array_agg(body order by change_id))[1], 'hex') "
+                f"from lake_dataset_gap where dataset = '{dataset}' and recorded_at_ns >= {since_ns} "
+                "group by gap_id", quiet=True)
+    found = {}
+    for line in said.splitlines():
+        parts = line.split("|")
+        if len(parts) == 3 and parts[1].strip().isdigit():
+            found[parts[0].strip()] = (proto_text(bytes.fromhex(parts[2].strip()), 9), int(parts[1]))
+    return found
+
+
 def write_ahead_bound(s):
     """FAILURE=write-ahead-bound (HA; contract v30, stage C; the resilience
     spec's sections 4 and 15): the lake's write-ahead stream bounded short
@@ -2992,8 +3041,10 @@ def write_ahead_bound(s):
     it while the data driver writes, so the stream drops writes the lake
     never took (none acknowledged: a write is answered after the lake
     commits it). Let go, the writer finds the stream's sequence passed rows
-    it never committed: the gap of the driver's dataset recorded with its
-    next write (GAP_CAUSE_WRITE_AHEAD_BOUND), asked again where the dataset
+    it never committed: a gap recorded at once, its datasets not yet known
+    (dataset empty; stage C2, approved 2026-11-11), then the gap of the
+    driver's dataset recorded with its next write, naming it
+    (found_in_gap_id; GAP_CAUSE_WRITE_AHEAD_BOUND), asked again where the dataset
     declares backfill and unrecovered where it declares none (the driver
     declares none), and read where the dataset is (lake_dataset_gap, which
     ListDatasetGaps answers). The bound set back after."""
@@ -3023,11 +3074,27 @@ def write_ahead_bound(s):
             cut_rules(member, broker, "-D")
     let_go = time.time()
     dataset = "drive-data:drive"
+    # Found the moment the stream skips: a gap, its datasets not yet known.
+    unattributed = happens(lambda: gaps_found_in("", since), 180, every=1)
+    first = gaps_found_in("", since)
+    found_at = min((at for _, at in first.values()), default=0)
+    at_once = (found_at / 1e9 - let_go) if found_at else None
+    s.check(unattributed, "write-ahead-bound: a gap recorded the moment the stream skipped, its datasets not "
+            f"yet known ({len(first)} gap(s)"
+            + (f", recorded {at_once:.1f}s after the writer was let go)" if at_once is not None else ")"))
     found = happens(lambda: gaps_of(dataset, since), 180, every=3)
     took = time.time() - let_go
     gaps = gaps_of(dataset, since)
     s.check(found, f"write-ahead-bound: the gap the stream left in {dataset} recorded "
             f"({len(gaps)} gap(s), {took:.1f}s after the writer was let go)")
+    # Then the dataset's own gap, naming the one found when the stream
+    # skipped (found_in_gap_id).
+    named = gaps_found_in(dataset, since)
+    s.check(bool(named) and all(found_in in first for found_in, _ in named.values()),
+            f"write-ahead-bound: {dataset}'s gap names the gap found when the stream skipped "
+            f"({sorted(found_in for found_in, _ in named.values())} in {sorted(first)})")
+    s.check(bool(named) and found_at > 0 and all(at >= found_at for _, at in named.values()),
+            "write-ahead-bound: the unattributed gap recorded first, then the dataset's")
     if not found:
         # What the lake's members said of the stream meanwhile, before the
         # bound set back rolls them away.
@@ -3046,7 +3113,8 @@ def write_ahead_bound(s):
     if found:
         claim(s, "write-ahead-bound", "lake", took, 60,
               {"what": "from the writer let go to its dataset's gap recorded", "held_s":
-               round(let_go - began, 1), "max_age_s": SHORT_MAX_AGE_S, "gaps": len(gaps)})
+               round(let_go - began, 1), "max_age_s": SHORT_MAX_AGE_S, "gaps": len(gaps),
+               "unattributed_s": round(at_once, 1) if at_once is not None else None})
     back = upgrade("lake.writeAhead.maxAge=10m")
     s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)

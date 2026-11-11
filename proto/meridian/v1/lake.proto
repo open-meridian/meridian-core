@@ -2699,11 +2699,20 @@ message PartitionMoved {
 // again through the want where the dataset declares GAP_RECOVERY_BACKFILL,
 // marked unrecovered otherwise; rows inside an unrecovered range are never
 // invented.
+//
+// Found the moment the stream's sequence passes rows the lake never
+// committed (approved 2026-11-11): first as one gap whose dataset is not yet
+// known (`dataset` empty), recorded unrecovered at once; then, as each
+// dataset's next write arrives, that dataset's own gap, naming the first in
+// `found_in_gap_id`. A dataset that never writes again stays on the
+// unattributed gap, shown, never silent.
 message DatasetGap {
   // `GAP-` and a ULID, never reused: 1 to 64 characters. A want asking again
   // for it names it.
   string gap_id = 1;
-  // The dataset whose rows were dropped.
+  // The dataset whose rows were dropped. Empty: not yet known -- the gap
+  // the writer recorded the moment the stream skipped, before any dataset's
+  // next write named its own.
   string dataset = 2;
   // Entity IDs, as the dropped rows named them; 0 to 500. None: every
   // subject of the rows dropped.
@@ -2717,6 +2726,10 @@ message DatasetGap {
   GapState state = 7;
   // By the lake's clock, for this state.
   int64 recorded_at_ns = 8;
+  // The unattributed gap (`dataset` empty) this dataset's gap was found
+  // from: the run of the stream it skipped, named as its dataset's next
+  // write arrived. Empty on the unattributed gap itself.
+  string found_in_gap_id = 9;
 }
 
 // Why a dataset's rows were dropped (contract v30; step 3c's question 5).
