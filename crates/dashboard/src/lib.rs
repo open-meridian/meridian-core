@@ -32,6 +32,7 @@ pub mod dataset_gaps;
 pub mod delegation;
 pub mod directory;
 pub mod documentation;
+pub mod fair;
 pub mod figures;
 pub mod first_run;
 pub mod health;

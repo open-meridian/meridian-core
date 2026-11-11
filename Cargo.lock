@@ -1907,6 +1907,7 @@ dependencies = [
  "http",
  "ldap3",
  "meridian-access",
+ "meridian-budget",
  "meridian-bus",
  "meridian-changes",
  "meridian-clock",

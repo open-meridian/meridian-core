@@ -161,6 +161,7 @@ impl Gate {
             let fair = &mut state.classes[class.index()];
             let mine = fair.by_caller.get(caller).map_or(0, VecDeque::len);
             if mine >= per_caller {
+                self.inner.refused.fetch_add(1, Ordering::Relaxed);
                 let seconds = self.inner.retry_after(mine);
                 return Err(Overloaded::new(
                     seconds,
@@ -170,6 +171,7 @@ impl Gate {
                 ));
             }
             if state.waiting >= most {
+                self.inner.refused.fetch_add(1, Ordering::Relaxed);
                 let seconds = self.inner.retry_after(state.waiting);
                 return Err(Overloaded::new(
                     seconds,
@@ -196,6 +198,7 @@ impl Gate {
             // Timed out: the request left waiting is skipped when its turn
             // comes; a turn handed to it as it gave up returns itself.
             _ => {
+                self.inner.refused.fetch_add(1, Ordering::Relaxed);
                 let waiting = self.inner.lock().waiting;
                 Err(Overloaded::new(
                     self.inner.retry_after(waiting),
@@ -414,6 +417,8 @@ mod tests {
         for task in waiting {
             assert!(task.await.unwrap().is_err());
         }
+        // Every refusal counted, for the component's report.
+        assert_eq!(gate.refused(), 2 + WAITING_PER_CALLER_PER_TURN as u64);
         drop(held);
         // The requests that gave up are skipped; the turn is free again.
         assert_eq!(gate.busy(), 0);

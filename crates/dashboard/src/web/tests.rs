@@ -46,6 +46,7 @@ pub(in crate::web) fn app_with(records: Option<AccessRecords>, read_at: i64, now
         health: Arc::default(),
         kit: None,
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::default(),

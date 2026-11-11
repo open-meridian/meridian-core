@@ -2889,6 +2889,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         health,
         kit: Some(Arc::new(kit)),
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::new(service_accounts()),

@@ -271,6 +271,7 @@ fn dashboard(
         health: Arc::default(),
         kit: Some(Arc::new(kit())),
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::default(),

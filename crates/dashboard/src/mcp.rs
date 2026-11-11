@@ -959,10 +959,20 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
     // instance is the name's owner, which a plugin's tool always names.
     let (owner, _) = name.split_once("__").unwrap_or((name, ""));
     let instance = (owner != DASHBOARD && crate::plugins::is_instance(owner)).then_some(owner);
+    // Admitted by the bounds, then taken in the delegation's turn among the
+    // dashboard's callers (the resilience spec's section 10a): the bounds
+    // are its caps, and no second rate is added.
     let admitted = match app
         .bounds
         .admit(called_at_ns, &caller.delegation_id, instance)
     {
+        Ok(admitted) => match app.turns.turn(&format!("d:{}", caller.delegation_id)).await {
+            Ok(turn) => Ok((admitted, turn)),
+            Err(over) => Err(u64::from(over.retry_after_seconds)),
+        },
+        Err(wait) => Err(wait),
+    };
+    let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(wait) => {
             let record = crate::delegation::ToolCall {

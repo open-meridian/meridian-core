@@ -164,6 +164,7 @@ fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
         health: Arc::default(),
         kit: None,
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets,
         prepared: Arc::default(),
         service_accounts: Arc::default(),

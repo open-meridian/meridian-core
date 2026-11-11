@@ -177,6 +177,7 @@ fn harness_holding(
         health: Arc::default(),
         kit: None,
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::default(),
