@@ -1413,10 +1413,9 @@ impl Store for PostgresStore {
     ) -> Result<Acted> {
         // The writer's epoch, adopted before a connection is taken, so a
         // store of one connection never waits on itself (step 3a).
-        let epoch = match self.fence.epoch() {
-            0 => self.adopt()?,
-            epoch => epoch,
-        };
+        if self.fence.epoch() == 0 {
+            self.adopt()?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let partition: String = tx
@@ -1441,6 +1440,14 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         self.fence.admits(held.get::<_, i64>(1) as u64)?;
+        // The epoch the entry is committed under: the head row's, which the
+        // fence has just admitted as the writer's own -- never one read
+        // before the connection was taken, which a connection opened on a
+        // new database timeline raises (contract v30, stage C). Read before,
+        // an entry was kept at the old epoch after the raise's first one
+        // (failover-repeat 43015006850, torn-write: "book: 1 commit(s) at
+        // an epoch below one before it").
+        let epoch = held.get::<_, i64>(1) as u64;
         let head: i64 = held.get(0);
         // The partition's last digest, its chain's end (step 3b).
         let last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
