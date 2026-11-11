@@ -912,7 +912,7 @@ E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
 # How much of each container's log .e2e-cluster.log keeps when a run fails,
 # timestamped: enough of a database member's (Patroni says something every
 # two seconds) to reach back past a reconfigure's first upgrade.
-E2E_K3D_LOG_LINES ?= 400
+E2E_K3D_LOG_LINES ?= 6000
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.

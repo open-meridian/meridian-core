@@ -290,6 +290,55 @@ def pods(component):
     return alive
 
 
+def jetstream_said(when):
+    """DIAGNOSTIC (c30-d2, never landed): each broker server's own view of
+    JetStream -- its meta group, its streams' groups, its routes -- read on
+    the server itself (MERIDIAN_BROKER_MONITOR, 127.0.0.1:8222)."""
+    print(f"J: {when}", flush=True)
+    said = json.loads(out("get", "pods", "-l",
+                          f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+                          "-o", "json", check=False) or "{}").get("items", [])
+    for pod in sorted(said, key=lambda p: p["metadata"]["name"]):
+        name = pod["metadata"]["name"]
+        status = pod.get("status", {})
+        if status.get("phase") != "Running":
+            print(f"    J {name}: {status.get('phase')} on {pod['spec'].get('nodeName')}", flush=True)
+            continue
+
+        def get(path):
+            script = (f'exec 3<>/dev/tcp/127.0.0.1/8222 && printf "GET {path} HTTP/1.0\\r\\n\\r\\n" >&3 '
+                      '&& cat <&3')
+            done = kubectl("exec", name, "-c", "broker", "--", "bash", "-c", script, check=False)
+            body = done.stdout.decode(errors="replace").split("\r\n\r\n", 1)[-1]
+            try:
+                return json.loads(body)
+            except ValueError:
+                return {"unread": (body or done.stderr.decode(errors="replace"))[-300:]}
+
+        jsz = get("/jsz?accounts=true&streams=true")
+        meta = jsz.get("meta_cluster", {})
+        peers = [(r.get("name"), "current" if r.get("current") else "behind",
+                  "offline" if r.get("offline") else "online", r.get("active"))
+                 for r in meta.get("replicas", []) or []]
+        print(f"    J {name} ip={status.get('podIP')} up={jsz.get('now', '')[:19]} js_disabled={jsz.get('disabled')} "
+              f"meta: size={meta.get('cluster_size')} leader={meta.get('leader')} peer={meta.get('peer')} "
+              f"others={peers} unread={jsz.get('unread', '')!r}", flush=True)
+        for account in jsz.get("account_details", []) or []:
+            for stream in account.get("stream_detail", []) or []:
+                cluster = stream.get("cluster", {}) or {}
+                replicas = [(r.get("name"), "current" if r.get("current") else "behind",
+                             "offline" if r.get("offline") else "online", r.get("lag"))
+                            for r in cluster.get("replicas", []) or []]
+                print(f"      stream {stream.get('name')}: leader={cluster.get('leader')} others={replicas} "
+                      f"msgs={stream.get('state', {}).get('messages')}", flush=True)
+        routez = get("/routez")
+        remotes = {}
+        for route in routez.get("routes", []) or []:
+            remotes[route.get("remote_name")] = remotes.get(route.get("remote_name"), 0) + 1
+        health = get("/healthz")
+        print(f"      routes={remotes} healthz={health}", flush=True)
+
+
 def ready(pod):
     return any(c["type"] == "Ready" and c["status"] == "True"
                for c in pod["status"].get("conditions", []))
@@ -496,6 +545,7 @@ def install(s):
         kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
                 *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
+        kubectl("set", "env", f"statefulset/{broker_set()}", "-c", "broker", "MERIDIAN_BROKER_MONITOR=1")
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
         cluster_services_on_server()
 
@@ -3149,6 +3199,7 @@ def write_ahead_bound(s):
         return
     before = upgrade(f"lake.writeAhead.maxAge={SHORT_MAX_AGE_S}s")
     s.check(before.returncode == 0, "write-ahead-bound: the stream's bound set short by an upgrade")
+    jetstream_said("write-ahead-bound: after the upgrade")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
     # The upgrade's roll of the lake's members and readers finished, so no
     # member listed below is one it is still replacing (failover-repeat
@@ -3172,6 +3223,7 @@ def write_ahead_bound(s):
         for member in held:
             cut_rules(member, broker, "-D")
     let_go = time.time()
+    jetstream_said("write-ahead-bound: the writer let go")
     dataset = "drive-data:drive"
     # Found the moment the stream skips: a gap, its datasets not yet known.
     unattributed = happens(lambda: gaps_found_in("", since), 180, every=1)
@@ -3461,8 +3513,12 @@ def main():
     print(f"A: installed in the {PROFILE} profile", flush=True)
     install(s)
     first_run(s)
+    if PROFILE == "ha":
+        jetstream_said("after first run")
     if DRIVEN:
         driver_fixtures(s)
+        if PROFILE == "ha":
+            jetstream_said("after the driver's fixtures")
         try:
             page_entitled(s)
         except SystemExit as stopped:
@@ -3471,6 +3527,8 @@ def main():
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
+    if PROFILE == "ha":
+        jetstream_said("after the shape (the broker rolled)")
     properties(s, "the install")
     if PROFILE == "ha" and DRIVEN:
         try:
@@ -3506,6 +3564,8 @@ def main():
                 driver_rpo_held(s, failure)
             except SystemExit as stopped:
                 s.check(False, f"{failure}: the stores' rows could not be read against the driver's: {stopped}")
+        if PROFILE == "ha":
+            jetstream_said(f"after {failure}")
     if DRIVEN:
         try:
             driver_rpo_held(s, "the whole run", lake_may_lose=PROFILE == "ha")

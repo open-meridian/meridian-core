@@ -312,6 +312,16 @@ mod serve {
                 .0
             }
         };
+        // DIAGNOSTIC (c30-d2, never landed): JetStream's own view on
+        // 127.0.0.1:8222 where MERIDIAN_BROKER_MONITOR is set.
+        let monitored = |said: String| {
+            if std::env::var_os("MERIDIAN_BROKER_MONITOR").is_some() {
+                format!("{said}http: \"127.0.0.1:8222\"\n")
+            } else {
+                said
+            }
+        };
+        current = monitored(current);
         std::fs::write(&args.out, &current)
             .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
 
@@ -341,7 +351,8 @@ mod serve {
                 }
                 _ = every.tick() => {
                     match reconciled(&api, &args, &chart, &mut hashes).await {
-                        Ok(configuration) if configuration != current => {
+                        Ok(configuration) if monitored(configuration.clone()) != current => {
+                            let configuration = monitored(configuration);
                             std::fs::write(&args.out, &configuration)
                                 .map_err(|failed| format!("{} could not be written: {failed}", args.out))?;
                             signal_child(pid, libc::SIGHUP);
