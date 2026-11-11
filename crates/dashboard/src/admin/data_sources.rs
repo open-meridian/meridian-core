@@ -756,7 +756,7 @@ fn priority_tab(
                 .find(|s| s.data_type == p.data_type && s.kind == p.kind)
                 .map_or(String::new(), |s| {
                     format!(
-                        " <span class=\"badge warn\" data-switched title=\"{} to {}, {}\">{SWITCHED}</span>",
+                        "<span class=\"badge warn\" data-switched title=\"{} to {}, {}\">{SWITCHED}</span> ",
                         escape(&s.from_dataset),
                         escape(&s.to_dataset),
                         reason_word(s.reason)
@@ -775,8 +775,8 @@ fn priority_tab(
             });
             format!(
                 "<tr data-id=\"{what}\"><td title=\"{what}\"><button type=\"button\" class=\"link\" \
-                 data-dialog-open=\"priority-dialog\" data-title=\"Change the priority\" data-fill=\"{fill}\">{what}</button>{switched}</td>\
-                 <td title=\"{order}\">{order}</td><td class=\"wide\" title=\"{note}\">{by}</td>\
+                 data-dialog-open=\"priority-dialog\" data-title=\"Change the priority\" data-fill=\"{fill}\">{what}</button></td>\
+                 <td title=\"{order}\">{switched}{order}</td><td class=\"wide\" title=\"{note}\">{by}</td>\
                  <td title=\"{day} {time} by {by}\">{day}<span class=\"dates\"> {time}</span></td>\
                  <td class=\"actions\"><button type=\"button\" data-dialog-open=\"priority-dialog\" \
                  data-title=\"Change the priority\" data-fill=\"{fill}\">Edit</button></td></tr>",

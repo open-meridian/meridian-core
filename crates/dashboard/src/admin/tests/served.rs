@@ -2392,6 +2392,262 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             ))
         });
     }
+    // Contract v30 (W6.39, W10.6, W10.14; stage D): the Resilience page's
+    // reads, as the conductor answers them for an ha deployment on three
+    // nodes in one zone, and the lake's source switches and gaps: Price's
+    // close standing on its backup, a gap not yet attributed and the
+    // dataset's gap found from it.
+    {
+        use meridian_domain::v1::{
+            resilience_history_item::Item, ComponentReport, DatasetGap, IntegrityFinding,
+            ListDatasetGapsReply, ListSourceSwitchesReply, NeverBlindLine, PartitionOwner,
+            ReadResilienceProfileReply, ReadResilienceReply, ResilienceChange,
+            ResilienceHistoryItem, ResilienceLine, SourceSwitched, WriterTookOver,
+        };
+        let now = meridian_clock::SystemClock.now_ns();
+        let line =
+            |subject: &str, state: i32, reason: &str, changes: &[(&str, &str)]| ResilienceLine {
+                subject: subject.into(),
+                state,
+                reason: reason.into(),
+                changes: changes
+                    .iter()
+                    .map(|(change, cost)| ResilienceChange {
+                        change: (*change).into(),
+                        cost: (*cost).into(),
+                    })
+                    .collect(),
+            };
+        let zone = [(
+            "add nodes in two more zones and set zones",
+            "two nodes or more",
+        )];
+        let profile = ReadResilienceProfileReply {
+            level: 3,
+            next_level_changes: vec![ResilienceChange {
+                change: zone[0].0.into(),
+                cost: zone[0].1.into(),
+            }],
+            failures: vec![
+                line("a pod", 1, "a standby takes over: within 10 s for the book, street and order path, 15 s for the lake's writes, as CI tests it in ha", &[]),
+                line("memory exhausted, or one plugin flooding", 1, "refused with a retry-after and recovered as load falls, never restarted, as CI tests it in ha", &[]),
+                line("a node or hypervisor lost", 1, "standbys on other nodes take over, as CI tests it in ha", &[]),
+                line("a node frozen", 1, "the old writer's commits are refused and it follows as a standby, as CI tests it in ha", &[]),
+                line("a network partition", 1, "one writer per partition by the epoch; the broker's majority serves, as CI tests it in ha", &[]),
+                line("the Kubernetes API server unreachable", 1, "writers keep writing under their epoch; nothing is taken over, as CI tests it in ha", &[]),
+                line("a database failover or restore that lost a committed tail", 1, "a standby is promoted; the epoch is raised and followers read again, as CI tests it in ha", &[]),
+                line("a firewall or NetworkPolicy change", 1, "members whose paths work keep serving, as CI tests it in ha", &[]),
+                line("silent bit rot", 1, "a verifying member serves and the bad one is re-cloned, as CI tests it in ha", &[]),
+                line("a torn write", 1, "crash recovery on the promoted or restarted member, as CI tests it in ha", &[]),
+                line("a volume lost", 1, "a standby is re-cloned; a primary's loss fails over first, as CI tests it in ha", &[]),
+                line("a zone's node pool", 3, "every node in one zone", &zone),
+            ],
+            tiers: vec![
+                line("a component or a node: the book, street and order path", 1, "a standby on another node takes over, as CI tests it in ha", &[]),
+                line("a component or a node: the lake", 1, "a standby on another node takes over, as CI tests it in ha", &[]),
+                line("a component or a node: analytics", 1, "a standby on another node takes over, as CI tests it in ha", &[]),
+                line("the database primary: the book, street and order path", 1, "a synchronous standby is promoted, as CI tests it in ha", &[]),
+                line("the database primary: the lake", 1, "a synchronous standby is promoted, as CI tests it in ha", &[]),
+                line("the database primary: analytics", 1, "a synchronous standby is promoted, as CI tests it in ha", &[]),
+                line("a zone: the book, street and order path", 3, "every node in one zone", &zone),
+                line("a zone: the lake", 3, "every node in one zone", &zone),
+                line("a zone: analytics", 3, "every node in one zone", &zone),
+                line("a region (recovery)", 3, "backups not scheduled", &[("backup.walArchive: on, with a backup schedule", "a backup volume and its storage")]),
+            ],
+            never_blind: vec![
+                NeverBlindLine { data_type: "meridian.v1.Price".into(), second_source: true, standby_pods: false, age_and_source: true },
+                NeverBlindLine { data_type: "meridian.v1.Bar".into(), second_source: true, standby_pods: false, age_and_source: true },
+            ],
+            computed_at_ns: now,
+        };
+        let mut members = Vec::new();
+        for (component, n) in [
+            ("lake", 2),
+            ("bor", 2),
+            ("instrument", 2),
+            ("street", 2),
+            ("conductor", 2),
+            ("launcher", 2),
+            ("dashboard", 2),
+        ] {
+            for i in 0..n {
+                let mode = match (component, i) {
+                    ("dashboard", _) => "",
+                    (_, 0) => "writer",
+                    _ => "standby",
+                };
+                members.push(ComponentReport {
+                    component: component.into(),
+                    member: format!("om-meridian-runtime-{component}-7d9f{i}-x2k{i}q"),
+                    mode: mode.into(),
+                    zone: "zone-a".into(),
+                    lag_ms: if mode == "standby" { 3 + i as u64 } else { 0 },
+                    restarts: u32::from(component == "street" && i == 1),
+                    last_restart_reason: if component == "street" && i == 1 {
+                        "Error".into()
+                    } else {
+                        String::new()
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+        members.push(ComponentReport {
+            component: "lake".into(),
+            member: "om-meridian-runtime-lake-reader-5c8b-pp2tz".into(),
+            mode: "reader".into(),
+            zone: "zone-a".into(),
+            lag_ms: 12,
+            ..Default::default()
+        });
+        let mut partitions: Vec<PartitionOwner> = [
+            "alpaca-1:daily",
+            "coinbase-1:daily",
+            "kraken-1:daily",
+            "databento-1:daily",
+            "control",
+        ]
+        .iter()
+        .map(|partition| PartitionOwner {
+            component: "lake".into(),
+            partition: (*partition).into(),
+            writer: "om-meridian-runtime-lake-7d9f0-x2k0q".into(),
+            epoch: 4,
+            ..Default::default()
+        })
+        .collect();
+        for partition in ["P0", "control"] {
+            partitions.push(PartitionOwner {
+                component: "bor".into(),
+                partition: partition.into(),
+                writer: "om-meridian-runtime-bor-7d9f0-x2k0q".into(),
+                epoch: 7,
+                ..Default::default()
+            });
+        }
+        let minute = 60_000_000_000;
+        let mut history: Vec<ResilienceHistoryItem> = Vec::new();
+        for i in 0..64_i64 {
+            let item = match i % 3 {
+                0 => Item::WriterTookOver(WriterTookOver {
+                    component: ["lake", "street", "instrument", "conductor"][(i / 3 % 4) as usize]
+                        .into(),
+                    member: format!("om-meridian-runtime-street-7d9f1-x2k{}q", i % 2),
+                    previous_member: format!(
+                        "om-meridian-runtime-street-7d9f0-x2k{}q",
+                        (i + 1) % 2
+                    ),
+                    partitions: vec!["S0".into(), "control".into()],
+                    epoch: (70 - i) as u64,
+                    reason: 1 + (i % 2) as i32,
+                    took_over_at_ns: now - i * 7 * minute,
+                }),
+                1 => Item::SourceSwitched(SourceSwitched {
+                    data_type: "meridian.v1.Price".into(),
+                    kind: 1,
+                    from_dataset: "coinbase-1:daily".into(),
+                    to_dataset: "kraken-1:daily".into(),
+                    reason: 2,
+                    switched_at_ns: now - i * 7 * minute,
+                    ..Default::default()
+                }),
+                _ => Item::IntegrityFinding(IntegrityFinding {
+                    component: "street".into(),
+                    partition: "S0".into(),
+                    check: 2,
+                    first_bad_sequence: 1_204 + i as u64,
+                    found_at_ns: now - i * 7 * minute,
+                    ..Default::default()
+                }),
+            };
+            history.push(ResilienceHistoryItem { item: Some(item) });
+        }
+        let history = Arc::new(history);
+        bus.serve(
+            crate::admin::resilience::READ_RESILIENCE_PROFILE,
+            move |_| {
+                Ok((
+                    "meridian.v1.ReadResilienceProfileReply".into(),
+                    profile.encode_to_vec(),
+                ))
+            },
+        );
+        bus.serve(crate::admin::resilience::READ_RESILIENCE, move |envelope| {
+            let asked = meridian_domain::v1::ReadResilienceRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let skip: usize = asked.cursor.parse().unwrap_or(0);
+            let page = if asked.page_size == 0 {
+                50
+            } else {
+                asked.page_size as usize
+            };
+            let next = skip + page;
+            Ok((
+                "meridian.v1.ReadResilienceReply".into(),
+                ReadResilienceReply {
+                    members: members.clone(),
+                    partitions: partitions.clone(),
+                    history: history.iter().skip(skip).take(page).cloned().collect(),
+                    next_cursor: if next < history.len() {
+                        next.to_string()
+                    } else {
+                        String::new()
+                    },
+                }
+                .encode_to_vec(),
+            ))
+        });
+        bus.serve(
+            crate::admin::data_sources::LIST_SOURCE_SWITCHES,
+            move |_| {
+                Ok((
+                    "meridian.v1.ListSourceSwitchesReply".into(),
+                    ListSourceSwitchesReply {
+                        switches: vec![SourceSwitched {
+                            data_type: "meridian.v1.Price".into(),
+                            kind: 1,
+                            from_dataset: "coinbase-1:daily".into(),
+                            to_dataset: "kraken-1:daily".into(),
+                            subjects: vec!["INS-BTC".into()],
+                            reason: 2,
+                            switched_at_ns: now - 4 * minute,
+                        }],
+                        next_cursor: String::new(),
+                    }
+                    .encode_to_vec(),
+                ))
+            },
+        );
+        bus.serve(crate::admin::data_sources::LIST_DATASET_GAPS, move |_| {
+            Ok((
+                "meridian.v1.ListDatasetGapsReply".into(),
+                ListDatasetGapsReply {
+                    gaps: vec![
+                        DatasetGap {
+                            gap_id: "GAP-01JC9Z3F7Q2V8W4X6Y0A1B2C3D".into(),
+                            dataset: "coinbase-1:daily".into(),
+                            subjects: vec!["INS-BTC".into()],
+                            valid_from_ns: now - 9 * minute,
+                            valid_until_ns: now - 6 * minute,
+                            cause: 1,
+                            state: 3,
+                            recorded_at_ns: now - 5 * minute,
+                            found_in_gap_id: "GAP-01JC9Z3E1K4M6N8P0R2S4T6V8W".into(),
+                        },
+                        DatasetGap {
+                            gap_id: "GAP-01JC9Z3E1K4M6N8P0R2S4T6V8W".into(),
+                            cause: 1,
+                            state: 3,
+                            recorded_at_ns: now - 6 * minute,
+                            ..Default::default()
+                        },
+                    ],
+                    next_cursor: String::new(),
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
     // Contract v28 (W6.37, W3.31): the series request rule, at its default,
     // and a request for series the rule refuses.
     bus.serve(crate::admin::series_rule::READ_SERIES_REQUEST_RULE, |_| {
