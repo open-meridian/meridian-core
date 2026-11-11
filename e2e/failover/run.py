@@ -3075,7 +3075,12 @@ def write_ahead_bound(s):
     before = upgrade(f"lake.writeAhead.maxAge={SHORT_MAX_AGE_S}s")
     s.check(before.returncode == 0, "write-ahead-bound: the stream's bound set short by an upgrade")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
-    # The lease's holder a pod that runs: the upgrade rolled the members.
+    # The upgrade's roll of the lake's members and readers finished, so no
+    # member listed below is one it is still replacing (failover-repeat
+    # 43015006850: a lake pod listed was gone by the cut, "get pod ...
+    # failed"); then the lease's holder a pod that runs.
+    for rolled in ("lake", "lake-reader"):
+        kubectl("rollout", "status", f"deployment/{FULL}-{rolled}", "--timeout=600s", check=False)
     wait_for("the lake's writer running", lambda: writer_pod("lake") in
              [p["metadata"]["name"] for p in pods("lake")], seconds=300)
     since = int(time.time() * 1e9)
