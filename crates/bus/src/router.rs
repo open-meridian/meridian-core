@@ -329,8 +329,12 @@ impl Bus {
         }
     }
 
+    /// Route the topics `rules` match to the backends they name, beside the
+    /// rules already given: each transport adds its own routes -- the lake's
+    /// write-ahead stream's in `ha`, a second data-plane transport's later --
+    /// and none takes another's away. The first rule matching a topic wins.
     pub fn with_rules(mut self, rules: Vec<RouteRule>) -> Self {
-        self.rules = rules;
+        self.rules.extend(rules);
         self
     }
 
@@ -1159,6 +1163,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BusError::HandlerFailed { .. }), "got {err:?}");
+    }
+
+    /// Two transports beside the default, each with its own routes, as a
+    /// second data-plane transport would stand beside the write-ahead
+    /// stream (contract v30, stage E): a topic goes to the backend its rule
+    /// names, whichever was given first, and the rest to the default.
+    #[tokio::test]
+    async fn each_transport_adds_its_routes_and_none_takes_anothers_away() {
+        let default_backend = Arc::new(MemoryBackend::new());
+        let writes = Arc::new(MemoryBackend::new());
+        let hot = Arc::new(MemoryBackend::new());
+        let bus = Bus::single(
+            "core-1",
+            default_backend.clone(),
+            Arc::new(ManualClock::at(NOW)),
+        )
+        .with_backend("writes", writes.clone())
+        .with_rules(vec![RouteRule {
+            pattern: "platform.lake.command.record-trades".into(),
+            backend: "writes".into(),
+        }])
+        .with_backend("hot", hot.clone())
+        .with_rules(vec![RouteRule {
+            pattern: "platform.lake.*.event.trades-recorded".into(),
+            backend: "hot".into(),
+        }]);
+        let mut on_writes = writes.subscribe("platform.lake.command.record-trades");
+        let mut on_hot = hot.subscribe("platform.lake.*.event.trades-recorded");
+        let mut on_default = default_backend.subscribe("platform.**");
+        bus.publish(
+            "platform.lake.command.record-trades",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        bus.publish(
+            "platform.lake.v:live.event.trades-recorded",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        bus.publish(
+            "platform.lake.v:live.event.prices-recorded",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(on_writes.recv().await.is_some());
+        assert!(on_hot.recv().await.is_some());
+        let heard = on_default.recv().await.unwrap();
+        assert_eq!(
+            heard.envelope.meta.unwrap().topic,
+            "platform.lake.v:live.event.prices-recorded"
+        );
     }
 
     #[tokio::test]
