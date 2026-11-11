@@ -1247,6 +1247,62 @@ pub fn var(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Where the chart names the brought database's record-read replica a
+/// store's readers read the record's past from (contract v30, stage C2; the
+/// resilience spec's section 5, approved 2026-11-11): its host, the store's
+/// own URL otherwise, so no Secret is edited by hand.
+pub const READ_DATABASE_HOST: &str = "MERIDIAN_READ_DATABASE_HOST";
+
+/// A store reader's read replica's URL: the variable `name` where set, on
+/// the host [`READ_DATABASE_HOST`] names where the chart set one -- the
+/// brought database's record-read replica, reached with the store's own
+/// credentials, database and settings.
+pub fn read_database_url(name: &str) -> Option<String> {
+    let url = var(name)?;
+    Some(match var(READ_DATABASE_HOST) {
+        Some(host) => with_host(&url, &host),
+        None => url,
+    })
+}
+
+/// `url` with its host `host`, its credentials, port, database and settings
+/// as they were: a URL (`postgres://user:pass@host:port/db?...`) or libpq's
+/// `key=value` form.
+pub fn with_host(url: &str, host: &str) -> String {
+    if let Some(scheme) = url.find("://") {
+        let start = scheme + 3;
+        let rest = &url[start..];
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let authority = &rest[..end];
+        let (user, at) = match authority.rfind('@') {
+            Some(i) => (&authority[..=i], &authority[i + 1..]),
+            None => ("", authority),
+        };
+        let port = if at.starts_with('[') {
+            at.find("]:").map_or("", |i| &at[i + 1..])
+        } else {
+            at.rfind(':').map_or("", |i| &at[i..])
+        };
+        return format!("{}{user}{host}{port}{}", &url[..start], &rest[end..]);
+    }
+    let mut named = false;
+    let mut parts: Vec<String> = url
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with("host=") {
+                named = true;
+                format!("host={host}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect();
+    if !named {
+        parts.push(format!("host={host}"));
+    }
+    parts.join(" ")
+}
+
 pub fn required(name: &str) -> Result<String, String> {
     var(name).ok_or_else(|| format!("{name} is not set"))
 }
@@ -1348,6 +1404,29 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// The brought database's record-read replica reached with the store's
+    /// own URL, its host the chart's (contract v30, stage C2).
+    #[test]
+    fn a_readers_replica_url_is_the_stores_own_on_the_replicas_host() {
+        let replica = "om-database-3.om.svc.cluster.local";
+        assert_eq!(
+            super::with_host("postgres://meridian:p%40ss@om-database:5432/meridian?sslmode=verify-full", replica),
+            "postgres://meridian:p%40ss@om-database-3.om.svc.cluster.local:5432/meridian?sslmode=verify-full"
+        );
+        assert_eq!(
+            super::with_host("postgresql://u@om-database/m", replica),
+            "postgresql://u@om-database-3.om.svc.cluster.local/m"
+        );
+        assert_eq!(
+            super::with_host("postgres://u:p@[fd00::1]:5432/m", replica),
+            "postgres://u:p@om-database-3.om.svc.cluster.local:5432/m"
+        );
+        assert_eq!(
+            super::with_host("host=om-database port=5432 dbname=m user=u", replica),
+            "host=om-database-3.om.svc.cluster.local port=5432 dbname=m user=u"
+        );
+    }
+
     use std::cell::Cell;
     use std::time::Duration;
 

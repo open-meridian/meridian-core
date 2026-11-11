@@ -98,10 +98,12 @@ database:
     # standbys:
     # Record-read replicas (contract v30, stage C): 0, as by default, or 1,
     # an asynchronous member under Patroni tagged nosync and nofailover --
-    # never in the synchronous quorum, never promoted -- from which a store's
-    # reader reads the record's past (`<release>-database-<n>.<release>-
-    # database-members`, named in a Secret by <store>.database.
-    # readExistingSecret). A record read there is stamped from its own
+    # never in the synchronous quorum, never promoted -- from which each
+    # store's readers read the record's past. The chart wires them itself
+    # (stage C2, approved 2026-11-11): the store's own URL on the replica's
+    # host, `<release>-database-<n>`, a Service of its own; nothing to edit
+    # by hand. A store's <store>.database.readExistingSecret, where set,
+    # names its own instead. A record read there is stamped from its own
     # snapshot. The HA standbys serve no reads. Each member is given the
     # same memory and max_connections as the primary.
     # readReplicas: 0
@@ -290,7 +292,9 @@ instrument:
   readers: 0
   # A read replica's URL, in this Secret under database.key (contract v30,
   # stage B): a reader answers a record's history from it once it has
-  # reached the read's watermark. Empty, as by default: the primary.
+  # reached the read's watermark. Empty, as by default: the brought
+  # database's record-read replica where database.brought.readReplicas is
+  # above 0, wired by the chart (stage C2); the primary otherwise.
   database:
     readExistingSecret: ""
   image:
@@ -370,7 +374,9 @@ bor:
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's
-    # watermark. Empty, as by default: the primary.
+    # watermark. Empty, as by default: the brought database's record-read
+    # replica where database.brought.readReplicas is above 0, wired by the
+    # chart (stage C2); the primary otherwise.
     readExistingSecret: ""
   # The write-ahead stream's bounds (contract v30, stage E; the resilience
   # spec's sections 4 and 11): in ha a data plugin's lake writes are held by
@@ -479,7 +485,9 @@ lake:
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's
-    # watermark. Empty, as by default: the primary.
+    # watermark. Empty, as by default: the brought database's record-read
+    # replica where database.brought.readReplicas is above 0, wired by the
+    # chart (stage C2); the primary otherwise.
     readExistingSecret: ""
 
 # The analytics component (contract v26, W12): a coordinator and a pool of

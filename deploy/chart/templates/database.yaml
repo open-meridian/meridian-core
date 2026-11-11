@@ -165,14 +165,24 @@ spec:
       port: 5432
     - name: patroni
       port: 8008
-{{- if $tls }}
-{{- range $i := until 3 }}
+{{- /* The members named apart: with internal TLS the first three, and
+       always a record-read replica, which a store's readers read the
+       record's past from (contract v30, stage C2). */}}
+{{- $replicasFrom := add 1 $standbys }}
+{{- $members := add $replicasFrom $readReplicas }}
+{{- range $i := until (int (max $members (ternary 3 0 $tls))) }}
+{{- $named := and $tls (lt $i 3) }}
+{{- $replica := and (ge $i $replicasFrom) (lt $i $members) }}
+{{- if or $named $replica }}
 ---
 # Member {{ $i }} by a name of its own (`<name>-{{ $i }}.<namespace>.svc`), which its
 # certificate carries: Patroni's members reach each other's REST API by it
-# over TLS, each verified by that name (ruled 2026-11-08). A Service per
-# member, because a StatefulSet's pods have DNS names only under the
-# Service it was made with, which here is the primary's.
+# over TLS, each verified by that name (ruled 2026-11-08); and a record-read
+# replica's Postgres, which the chart points the stores' readers at
+# (MERIDIAN_READ_DATABASE_HOST; contract v30, stage C2, approved
+# 2026-11-11). A Service per member, because a StatefulSet's pods have DNS
+# names only under the Service it was made with, which here is the
+# primary's.
 apiVersion: v1
 kind: Service
 metadata:
@@ -188,8 +198,14 @@ spec:
     meridian.dev/component: database
     statefulset.kubernetes.io/pod-name: {{ $name }}-{{ $i }}
   ports:
+    {{- if $named }}
     - name: patroni
       port: 8008
+    {{- end }}
+    {{- if $replica }}
+    - name: postgres
+      port: 5432
+    {{- end }}
 {{- end }}
 {{- end }}
 ---

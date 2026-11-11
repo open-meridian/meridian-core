@@ -766,6 +766,25 @@ def shape(s):
     roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
     s.check(roles == ["primary"] + ["replica"] * (database_members() - 1),
             f"database: one primary, its standbys and record-read replicas ({roles})")
+    if SHAPE == "scaled":
+        # Each store's reader wired to the record-read replica by the chart
+        # itself (contract v30, stage C2, approved 2026-11-11): its read pool
+        # is on that member, and on no standby, which serve no reads.
+        replica = f"{FULL}-database-{database_members() - 1}"
+        standbys = [f"{FULL}-database-{n}" for n in (1, 2)]
+
+        def held_on(member, address):
+            said = psql(f"select count(*) from pg_stat_activity where client_addr = '{address}'",
+                        database="postgres", quiet=True, pod=member)
+            return int(said or 0)
+        for component in READ_STORES:
+            for pod in pods(f"{component}-reader"):
+                address = pod["status"].get("podIP", "")
+                on = happens(lambda a=address: held_on(replica, a) > 0, 120)
+                s.check(on, f"{component}: its reader reads the record's past from the record-read replica "
+                        f"({replica}; {held_on(replica, address)} connection(s) from {pod['metadata']['name']})")
+                elsewhere = sum(held_on(member, address) for member in standbys)
+                s.check(elsewhere == 0, f"{component}: its reader holds nothing on a standby ({elsewhere})")
     # The synchronous standbys a quorum (contract v30, stage C): ANY 1 of
     # the two, each standing in it, strict.
     quorum = psql("select count(*) from pg_stat_replication where sync_state = 'quorum'", database="postgres")

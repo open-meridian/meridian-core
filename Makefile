@@ -2839,8 +2839,24 @@ chart-check:
 		&& { echo "chart-check FAILED: lake.standby=0 under the ha profile still gives the lake a standby" >&2; exit 1; }; \
 	echo "$$over" | grep -q "\-\-route\|meridian.dev/database-manager: patroni" \
 		&& { echo "chart-check FAILED: the ha profile's broker and database counts are not overridable" >&2; exit 1; }; \
-	read="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 2>/dev/null)" \
+	read="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 --set lake.readers=1 --set bor.readers=1 --set instrument.readers=1 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the ha profile did not render with a record-read replica" >&2; exit 1; }; \
+	[ "$$(echo "$$read" | grep -A1 "name: MERIDIAN_READ_DATABASE_HOST" | grep -c 'value: "check-meridian-runtime-database-3\.default\.svc\.cluster\.local"')" = 3 ] \
+		|| { echo "chart-check FAILED: the chart does not wire each store's reader to the record-read replica, member 3 (contract v30, stage C2)" >&2; exit 1; }; \
+	echo "$$read" | grep -A16 "name: check-meridian-runtime-database-3$$" | grep -q "port: 5432" \
+		|| { echo "chart-check FAILED: the record-read replica, member 3, has no Service of its own for the readers" >&2; exit 1; }; \
+	echo "$$read" | grep -B5 "name: MERIDIAN_READ_DATABASE_HOST" | grep -q "name: MERIDIAN_LAKE_READ_DATABASE_URL" \
+		|| { echo "chart-check FAILED: the lake's reader is not given the store's own URL beside the replica's host" >&2; exit 1; }; \
+	echo "$$read" | grep -q "name: check-meridian-runtime-database-[012]$$" \
+		&& { echo "chart-check FAILED: a standby is given a Service of its own without internal TLS: the HA standbys serve no reads" >&2; exit 1; }; \
+	own="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 --set lake.readers=1 --set lake.database.readExistingSecret=lake-read 2>/dev/null)" \
+		|| { echo "chart-check FAILED: a reader with a read Secret of its own did not render" >&2; exit 1; }; \
+	echo "$$own" | grep -q "name: MERIDIAN_READ_DATABASE_HOST" \
+		&& { echo "chart-check FAILED: a reader named a read Secret of its own is still pointed at the brought replica" >&2; exit 1; }; \
+	none="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set lake.readers=1 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with a reader" >&2; exit 1; }; \
+	echo "$$none" | grep -q "name: MERIDIAN_READ_DATABASE_HOST\|name: MERIDIAN_LAKE_READ_DATABASE_URL" \
+		&& { echo "chart-check FAILED: with no record-read replica a reader is pointed at one" >&2; exit 1; }; \
 	echo "$$read" | grep -q "read-replica-check-meridian-runtime-database-3: |" \
 		|| { echo "chart-check FAILED: the record-read replica, member 3, has no tags of its own" >&2; exit 1; }; \
 	echo "$$read" | grep -A2 "read-replica-check-meridian-runtime-database-3: |" | grep -q "nosync: true" \

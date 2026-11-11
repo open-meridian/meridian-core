@@ -164,7 +164,9 @@ fn run() -> Result<(), String> {
         // became and their history, never writing or asking the platform.
         if member.is_reader() {
             bus.serve_only(|topic| READER_SERVES.contains(&topic));
-            let replica = match var("MERIDIAN_INSTRUMENT_READ_DATABASE_URL") {
+            let replica = match meridian_runtime::read_database_url(
+                "MERIDIAN_INSTRUMENT_READ_DATABASE_URL",
+            ) {
                 None => None,
                 Some(read_url) => {
                     let replica = Arc::new(wait_for_store(

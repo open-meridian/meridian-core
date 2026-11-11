@@ -175,19 +175,20 @@ fn run() -> Result<(), String> {
         // its books kept by the writer's change log, never acting.
         if member.is_reader() {
             bus.serve_only(meridian_bus::read_after::is_read);
-            let replica = match var("MERIDIAN_BOR_READ_DATABASE_URL") {
-                None => None,
-                Some(read_url) => Some(Arc::new(wait_for_store(
-                    "the book's read replica",
-                    &read_url,
-                    |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-                    |store| {
-                        store
-                            .verify()
-                            .map_err(|failed| Wait::NotYet(failed.to_string()))
-                    },
-                )?) as Arc<dyn meridian_bor::Store>),
-            };
+            let replica =
+                match meridian_runtime::read_database_url("MERIDIAN_BOR_READ_DATABASE_URL") {
+                    None => None,
+                    Some(read_url) => Some(Arc::new(wait_for_store(
+                        "the book's read replica",
+                        &read_url,
+                        |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+                        |store| {
+                            store
+                                .verify()
+                                .map_err(|failed| Wait::NotYet(failed.to_string()))
+                        },
+                    )?) as Arc<dyn meridian_bor::Store>),
+                };
             let start =
                 tokio::task::block_in_place(|| meridian_bor::Store::heads(postgres.as_ref()))
                     .map_err(|failed| format!("the book's heads could not be read: {failed}"))?;

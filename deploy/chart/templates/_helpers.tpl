@@ -103,7 +103,8 @@ database.brought.readReplicas, 0 by default, or 1, the shape CI tests
 (e2e-cluster-scaled). Asynchronous members under Patroni tagged nosync and
 nofailover: never in the synchronous quorum, so a long record read neither
 delays a commit nor is cancelled by replay, and never promoted. A store's
-reader is pointed at one by its <store>.database.readExistingSecret; the
+reader is pointed at one by the chart itself (meridian-runtime.readers,
+approved 2026-11-11), or by its <store>.database.readExistingSecret; the
 HA standbys serve no reads. Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseReadReplicas" -}}
@@ -1394,8 +1395,12 @@ store's own Deployment again, rendered as `rendered`, in a reads-only mode
 instance, so it joins the store's query queue group; ready while its lag
 behind the writer's change log is under `<store>.readyLagMs`. With
 `<store>.database.readExistingSecret` set, the record's past is read from
-that read replica (its URL under the store's database key); unset, from the
-primary. Takes a dict: top, component, values, readUrl, rendered.
+that read replica (its URL under the store's database key); unset, with
+the brought database's database.brought.readReplicas above 0, from that
+replica, wired here (contract v30, stage C2, approved 2026-11-11): the
+store's own URL on the replica member's host (MERIDIAN_READ_DATABASE_HOST);
+otherwise from the primary. Takes a dict: top, component, values, readUrl,
+rendered.
 */}}
 {{- define "meridian-runtime.readers" -}}
 {{- $readers := index .values "readers" | default 0 -}}
@@ -1414,9 +1419,16 @@ primary. Takes a dict: top, component, values, readUrl, rendered.
 {{- if not (contains "MERIDIAN_READY_LAG_MS" $out) -}}
 {{- $env = printf "%s${1}  - name: MERIDIAN_READY_LAG_MS\n${1}    value: %s\n" $env (index .values "readyLagMs" | default 5000 | toString | quote) -}}
 {{- end -}}
-{{- if $read -}}
 {{- $key := dig "database" "key" "" .values | default .top.Values.database.key -}}
+{{- if $read -}}
 {{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n" $env .readUrl $read $key -}}
+{{- else if and .top.Values.database.brought.enabled (not (dig "database" "existingSecret" "" .values)) (gt (int (include "meridian-runtime.databaseReadReplicas" .top)) 0) -}}
+{{- /* The brought database's record-read replica, wired by the chart
+       (contract v30, stage C2; approved 2026-11-11): the store's own URL,
+       on the replica's host, so no Secret is edited by hand. */ -}}
+{{- $member := printf "%s-database-%d" (include "meridian-runtime.fullname" .top) (add 1 (int (include "meridian-runtime.databaseStandbys" .top))) -}}
+{{- $host := printf "%s.%s.svc.cluster.local" $member .top.Release.Namespace -}}
+{{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n${1}  - name: MERIDIAN_READ_DATABASE_HOST\n${1}    value: %s\n" $env .readUrl (include "meridian-runtime.databaseSecret" .top) $key (quote $host) -}}
 {{- end -}}
 {{- $out = regexReplaceAll "(?m)^(\\s+)env:$" $out (printf "${1}env:\n%s" (trimSuffix "\n" $env)) }}
 ---
