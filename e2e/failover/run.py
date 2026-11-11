@@ -2919,10 +2919,13 @@ def apiserver_lost(s):
     readers' included, ready throughout and after)."""
     print(f"F: apiserver: the API server cut from the release's pods for {API_CUT_S} s, under the driver's "
           "writes", flush=True)
-    for component in ("bor", "lake"):
+    # Every store settled first, so a member still coming back from an
+    # earlier class is never taken for one this one flapped.
+    for component in [c for c in STORES if c != "launcher"]:
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     watched = [c for c in STORES if c != "launcher"] + [f"{c}-reader" for c in ("lake", "bor")]
-    epochs = {c: epoch_now(c) for c in ("bor", "lake", "instrument", "street")}
+    wait_for("every member ready", lambda: all(ready(p) for c in watched for p in pods(c)), seconds=300)
+    epochs = {c: epoch_now(c) for c in ("bor", "lake", "instrument", "street", "conductor")}
     members = {p["metadata"]["name"]: c for c in watched for p in pods(c)}
     restarted = {name: restarts(name) for name in members}
     flaps = set()

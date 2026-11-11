@@ -508,3 +508,95 @@ async fn a_reader_drops_nothing_when_the_epoch_rises_over_a_record_that_lost_not
     assert!(applied.resets.lock().unwrap().is_empty());
     assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5]);
 }
+
+/// A writer's log one change of which no longer matches its digest (bit
+/// rot): read for it, refused; asked for its head, answered.
+struct Rotten {
+    head: AtomicU64,
+    epoch: AtomicU64,
+}
+
+impl ChangeLog for Rotten {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
+        let (head, epoch) = (
+            self.head.load(Ordering::SeqCst),
+            self.epoch.load(Ordering::SeqCst),
+        );
+        if partition == meridian_changes::CONTROL {
+            return Ok(ReadChangesReply {
+                head: 0,
+                epoch,
+                ..Default::default()
+            });
+        }
+        if after < head && epoch > 2 {
+            return Err(ReadError::Unavailable(format!(
+                "change {} of partition P0 does not match its digest",
+                after + 1
+            )));
+        }
+        let mut page = Page::new(most);
+        for sequence in (after + 1)..=head {
+            if !page.take(change(sequence)) {
+                break;
+            }
+        }
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept: 1,
+            epoch,
+            after_sequence: 0,
+        })
+    }
+}
+
+/// A reader whose last applied change the record can no longer read back
+/// (its digest no longer matches) once the epoch rises holds the partition
+/// from the record's head, never asking for ever and staying behind
+/// (contract v30, stage C; CI 42965355676's conductor standby).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_whose_applied_change_cannot_be_read_back_holds_from_the_head() {
+    let bus = Arc::new(Bus::single(
+        "member-test-rotten",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Rotten {
+        head: AtomicU64::new(2),
+        epoch: AtomicU64::new(2),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    struct Primary;
+    impl meridian_bus::read_after::Position for Primary {
+        fn heads(&self, _: &[String]) -> Result<HashMap<String, u64>, String> {
+            Ok([("P0".to_string(), 2)].into())
+        }
+    }
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(Primary))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.head.store(3, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 2, &[change(3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+    // The epoch rises; change 3 no longer reads back.
+    log.head.store(4, Ordering::SeqCst);
+    log.epoch.store(3, Ordering::SeqCst);
+    until("P0 held from the record's head", || {
+        followed.heads().get("P0") == Some(&4)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
+}

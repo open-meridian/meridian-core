@@ -1210,6 +1210,24 @@ impl Lineage<'_> {
             let last = applied.get(&partition).cloned();
             let found = match holds(self.bus, domain, &partition, held, last.as_ref()).await {
                 Ok(found) => found,
+                // The writer refused to read it back -- a change of the
+                // record no longer matching its digest (bit rot), say --
+                // so what this member applied cannot be shown to be the
+                // record's: held from the record's head, as one lost is
+                // (CI 42965355676: the conductor's standby, asking for ever,
+                // stayed unready).
+                Err(failed) if failed.contains("handler for") => {
+                    match holds(self.bus, domain, &partition, i64::MAX as u64, None).await {
+                        Ok((_, head)) => {
+                            tracing::warn!(domain, partition, %failed, "what this member applied could not be read back from the record: held from its head");
+                            (false, head)
+                        }
+                        Err(again) => {
+                            tracing::warn!(domain, partition, %again, "what this member applied could not be read back; asking again");
+                            continue;
+                        }
+                    }
+                }
                 Err(failed) => {
                     tracing::warn!(domain, partition, %failed, "what this member applied could not be read back; asking again");
                     continue;
