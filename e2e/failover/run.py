@@ -3097,7 +3097,9 @@ def gap_notices():
         return {}
     found = {}
     for line in said.splitlines():
-        parts = line.split("|")
+        # A subject holds a bar itself (local|alice): the about and the time
+        # first, the subject whole after them.
+        parts = line.split("|", 2)
         if len(parts) == 3 and parts[0].startswith("GAP-") and parts[1].strip().isdigit():
             found.setdefault(parts[0].split()[0], []).append((int(parts[1]), parts[2].strip()))
     return found

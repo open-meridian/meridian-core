@@ -43,6 +43,24 @@ fn gap_id_of(about: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// A gap's notice's ID for one person: a ULID whose time is the gap's
+/// recording and whose rest is the digest of the gap's ID and the person,
+/// so every dashboard copy and every restart files the same notice, which
+/// the store keeps once (ha runs two copies, each its own judge).
+pub fn notice_id(gap: &DatasetGap, subject: &str) -> String {
+    use sha2::Digest;
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let digest = sha2::Sha256::digest(format!("{}\0{subject}", gap.gap_id).as_bytes());
+    let mut rest = [0u8; 16];
+    rest.copy_from_slice(&digest[..16]);
+    let ms = (gap.recorded_at_ns.max(0) / 1_000_000) as u128;
+    let value: u128 = (ms << 80) | (u128::from_be_bytes(rest) & ((1u128 << 80) - 1));
+    (0..26)
+        .rev()
+        .map(|i| CROCKFORD[((value >> (i * 5)) & 31) as usize] as char)
+        .collect()
+}
+
 /// A time as a person reads it, to the second, in UTC.
 fn at(ns: i64) -> String {
     crate::custody::utc(ns)
@@ -178,7 +196,7 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                         "a gap in the lake: its notice filed"
                     );
                     people.iter().map(|subject| Notice {
-                        notice_id: app.tickets.ulid(now),
+                        notice_id: notice_id(gap, subject),
                         subject: subject.clone(),
                         plugin_instance_id: "lake".to_string(),
                         kind: GAP_FOUND.to_string(),
@@ -252,6 +270,29 @@ mod tests {
             .filter_map(|w| gap_id_of(w).map(str::to_string))
             .collect();
         assert!(unfiled(&later, &mut again).is_empty());
+    }
+
+    /// Every copy files the same notice for a gap and a person, a ULID
+    /// sorted by when the gap was recorded; another person's is its own.
+    #[test]
+    fn a_gaps_notice_is_the_same_from_every_copy() {
+        let one = gap(
+            "GAP-01B",
+            "",
+            1_793_000_000_000_000_000,
+            GapState::Unrecovered,
+        );
+        let id = notice_id(&one, "local|alice");
+        assert_eq!(id, notice_id(&one, "local|alice"));
+        assert_ne!(id, notice_id(&one, "local|bob"));
+        assert_eq!(id.len(), 26);
+        let later = gap(
+            "GAP-01C",
+            "",
+            1_793_000_000_001_000_000,
+            GapState::Unrecovered,
+        );
+        assert!(notice_id(&later, "local|alice") > id);
     }
 
     /// Every deployment admin the records name is told, signed in or not.

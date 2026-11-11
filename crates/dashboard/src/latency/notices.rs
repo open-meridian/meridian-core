@@ -61,10 +61,16 @@ pub struct InMemory {
 
 impl NoticeStore for InMemory {
     fn notify(&self, notices: &[Notice]) -> Result<(), String> {
-        self.held
+        let mut held = self
+            .held
             .lock()
-            .map_err(|_| "the notices' lock".to_string())?
-            .extend_from_slice(notices);
+            .map_err(|_| "the notices' lock".to_string())?;
+        // Kept once by its ID, as the dashboard's table keeps it.
+        for notice in notices {
+            if !held.iter().any(|n| n.notice_id == notice.notice_id) {
+                held.push(notice.clone());
+            }
+        }
         Ok(())
     }
 
@@ -112,7 +118,8 @@ impl NoticeStore for InPostgres {
             tx.execute(
                 "INSERT INTO dashboard_notice (notice_id, subject, ticket_id, kind,
                      author_provenance, plugin_instance_id, about, changed_ns, read)
-                 VALUES ($1, $2, NULL, $3, 'rules', $4, $5, $6, false)",
+                 VALUES ($1, $2, NULL, $3, 'rules', $4, $5, $6, false)
+                 ON CONFLICT (notice_id) DO NOTHING",
                 &[
                     &notice.notice_id,
                     &notice.subject,
