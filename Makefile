@@ -528,14 +528,15 @@ test-store: network tests-image
 # The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
 # record and read rates and its latest read as a dataset grows, the plugin
 # catalogue and the store at 2,000 versions and launches, the access
-# records' bytes a person against the broker's 1 MiB, and the engine's
-# options a second on the tree. Run by hand on the machine whose capacity is
+# records' bytes a person against the broker's 1 MiB, the book's proposals
+# at a wealth platform's volume against the sidecar's caps and the broker's
+# pending bound (stage M2), and the engine's options a second on the tree. Run by hand on the machine whose capacity is
 # stated; never in the gate, which runs each one's guard at a size it can
 # afford (test-store, test). Prints the CAPACITY lines INSTALL.md's table is.
 BENCH_LAKE_ROWS ?= 20000,100000,400000
 bench: network
 	@$(COMPOSE) run --rm -T --build -e MERIDIAN_BENCH_LAKE_ROWS=$(BENCH_LAKE_ROWS) tests \
-		run-tests -p meridian-lake --test postgres -p meridian-config --test postgres \
+		run-tests -p meridian-lake --test postgres -p meridian-config --test postgres -p meridian-bor --test postgres \
 		-- --ignored capacity --nocapture >.bench.log 2>&1 \
 		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
 	@$(COMPOSE) run --rm -T tests run-tests -p meridian-config --lib \

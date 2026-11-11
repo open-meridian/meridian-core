@@ -1893,3 +1893,141 @@ async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_beh
         assert!(at[&last.partition] >= last.last_sequence, "{at:?}");
     });
 }
+
+/// The book's proposals at a wealth platform's volume (stage M2;
+/// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
+/// 100,000-order proposal end to end through the book), against the
+/// sidecar's per-plugin caps and the broker's pending bound: `make bench`
+/// runs it by hand, never the gate.
+///
+/// One plugin proposing `MERIDIAN_BENCH_ORDERS` orders (10,000 by default)
+/// across `MERIDIAN_BENCH_ACCOUNTS` accounts (1,000), with
+/// `MERIDIAN_BENCH_IN_FLIGHT` requests at once (each of 1, 8, 16, 32 and
+/// 64 in turn): there is no bulk proposal, so each order is one request,
+/// as through a sidecar. Per level it prints the book's rate and each
+/// request's latency (p50, p99, the most), and per order the bytes asked,
+/// answered and published on the book's events -- what a subscriber's
+/// pending bytes at the broker grow by while it falls behind. The book's
+/// pool and its handlers at once are the deployment's (8; 16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_book_proposals_at_wealth_scale() {
+    use meridian_bor::order_service::*;
+    let from_env =
+        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let orders: usize = from_env("MERIDIAN_BENCH_ORDERS", "10000").parse().unwrap();
+    let accounts: usize = from_env("MERIDIAN_BENCH_ACCOUNTS", "1000").parse().unwrap();
+    let levels: Vec<usize> = from_env("MERIDIAN_BENCH_IN_FLIGHT", "1,8,16,32,64")
+        .split(',')
+        .map(|n| n.trim().parse().unwrap())
+        .collect();
+    let (bus, _store) = wired();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let run = unique("BENCH");
+    let accounts: Vec<String> = (0..accounts).map(|n| format!("ACC-{run}-{n}")).collect();
+    for account in &accounts {
+        send_order(
+            &bus,
+            SET_ACCOUNT_ATTRIBUTE,
+            &SetAccountAttributeRequest {
+                account_id: account.clone(),
+                attribute: Some(
+                    set_account_attribute_request::Attribute::WaitsForCompliance(false),
+                ),
+                reason: "the bench proposes without a compliance plugin".into(),
+            },
+            Some(PERSON),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    // What the book publishes, counted as a subscriber's pending bytes would.
+    let published = Arc::new(AtomicU64::new(0));
+    let events = Arc::new(AtomicU64::new(0));
+    let mut heard = bus.subscribe_every("platform.book.event.**");
+    let drops = heard.drop_count();
+    let counting = {
+        let (published, events) = (Arc::clone(&published), Arc::clone(&events));
+        tokio::spawn(async move {
+            while let Some(delivery) = heard.recv().await {
+                published.fetch_add(delivery.envelope.encoded_len() as u64, Ordering::Relaxed);
+                events.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    for at_once in levels {
+        let (published_before, events_before) = (
+            published.load(Ordering::Relaxed),
+            events.load(Ordering::Relaxed),
+        );
+        let next = Arc::new(AtomicU64::new(0));
+        let asked_bytes = Arc::new(AtomicU64::new(0));
+        let answered_bytes = Arc::new(AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        let mut workers = Vec::new();
+        for _ in 0..at_once {
+            let (bus, accounts, next, run) = (
+                Arc::clone(&bus),
+                accounts.clone(),
+                Arc::clone(&next),
+                run.clone(),
+            );
+            let (asked_bytes, answered_bytes) =
+                (Arc::clone(&asked_bytes), Arc::clone(&answered_bytes));
+            workers.push(tokio::spawn(async move {
+                let mut took = Vec::new();
+                loop {
+                    let n = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    if n >= orders {
+                        return took;
+                    }
+                    let proposal = ProposeOrderRequest {
+                        account_id: accounts[n % accounts.len()].clone(),
+                        instrument_id: "INS-AAPL".into(),
+                        sleeve: "core".into(),
+                        side: Side::Buy as i32,
+                        quantity: d("10"),
+                        order_type: OrderType::Limit as i32,
+                        limit_price: usd("227.50"),
+                        time_in_force: TimeInForce::Day as i32,
+                        idempotency_key: format!("{run}-{at_once}-{n}"),
+                        ..Default::default()
+                    };
+                    asked_bytes.fetch_add(proposal.encoded_len() as u64, Ordering::Relaxed);
+                    let began = std::time::Instant::now();
+                    let answer = send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                        .await
+                        .unwrap_or_else(|refused| panic!("order {n} refused: {refused}"));
+                    took.push(began.elapsed());
+                    answered_bytes.fetch_add(answer.len() as u64, Ordering::Relaxed);
+                }
+            }));
+        }
+        let mut took = Vec::new();
+        for worker in workers {
+            took.extend(worker.await.unwrap());
+        }
+        let elapsed = started.elapsed();
+        // The events of the last few orders are still on their way.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        took.sort();
+        let at = |q: f64| took[((took.len() as f64 * q) as usize).min(took.len() - 1)];
+        let per_order = |bytes: u64| bytes as f64 / orders as f64;
+        println!(
+            "CAPACITY book proposals orders={orders} in_flight={at_once} rate_per_s={:.0} \
+             p50_ms={:.2} p99_ms={:.2} most_ms={:.2} asked_bytes={:.0} answered_bytes={:.0} \
+             events_per_order={:.2} event_bytes_per_order={:.0} events_dropped={}",
+            orders as f64 / elapsed.as_secs_f64(),
+            at(0.50).as_secs_f64() * 1e3,
+            at(0.99).as_secs_f64() * 1e3,
+            took.last().unwrap().as_secs_f64() * 1e3,
+            per_order(asked_bytes.load(Ordering::Relaxed)),
+            per_order(answered_bytes.load(Ordering::Relaxed)),
+            (events.load(Ordering::Relaxed) - events_before) as f64 / orders as f64,
+            per_order(published.load(Ordering::Relaxed) - published_before),
+            drops.get(),
+        );
+    }
+    counting.abort();
+}
