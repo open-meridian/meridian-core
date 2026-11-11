@@ -2,10 +2,13 @@
 # images, and green only when every run is (accepted 2026-11-07: the fast
 # local gate, CI decides). It replaces the five local runs a step 3b change
 # was proved by: `make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover`
-# in a profile, `repeat` times, each on its own runner and its own cluster,
-# from one build of the runtime and analytics images.
+# in each profile named, `repeat` times, each on its own runner and its own
+# cluster, from one build of the runtime and analytics images: one matrix of
+# profiles x runs under one "every run green" check (ruled 2026-11-11).
 #
-#   gh workflow run failover-repeat --ref <branch> -f profile=ha -f repeat=5
+#   gh workflow run failover-repeat --ref <branch> -f profiles=tolerant,ha -f repeat=3
+#   gh workflow run failover-repeat --ref <branch> -f profiles=ha -f repeat=5
+#   gh workflow run failover-repeat --ref <branch> -f profiles=reconfigure -f repeat=1
 #
 # By hand only. Each run keeps its claims (failover-claims-<profile>-<n>), as
 # ci's failover jobs keep theirs for the claims ledger.
@@ -14,11 +17,10 @@ name: failover-repeat
 on:
   workflow_dispatch:
     inputs:
-      profile:
-        description: The profile installed (tolerant; ha on three agents in three zones; or reconfigure, a live install moved tolerant -> ha -> tolerant -> ha and restored to a time, as e2e-cluster-reconfigure runs)
-        type: choice
-        options: [ha, tolerant, reconfigure]
-        default: ha
+      profiles:
+        description: The profiles installed, comma-separated (tolerant; ha on three agents in three zones; reconfigure, a live install moved tolerant -> ha -> tolerant -> ha and restored to a time, as e2e-cluster-reconfigure runs)
+        type: string
+        default: tolerant,ha
       failure:
         description: The failure classes injected, comma-separated (FAILURE=); empty for the profile's all (reconfigure takes none)
         type: string
@@ -44,6 +46,7 @@ jobs:
     timeout-minutes: 45
     outputs:
       runs: ${{ steps.runs.outputs.runs }}
+      profiles: ${{ steps.runs.outputs.profiles }}
     defaults:
       run:
         working-directory: workspace/meridian-core
@@ -52,10 +55,22 @@ jobs:
         id: runs
         working-directory: .
         env:
+          PROFILES: ${{ inputs.profiles }}
           REPEAT: ${{ inputs.repeat }}
           FAILURE: ${{ inputs.failure }}
           SDK_REF: ${{ inputs.sdk_ref }}
         run: |
+          # Each profile named once, in the order given.
+          profiles=""
+          for p in $(echo "$PROFILES" | tr ',' ' '); do
+            case "$p" in
+              tolerant | ha | reconfigure) ;;
+              *) echo "::error::profiles is tolerant, ha or reconfigure, comma-separated, not '$PROFILES'"; exit 1 ;;
+            esac
+            case ",$profiles," in *",\"$p\","*) continue ;; esac
+            profiles="${profiles:+$profiles,}\"$p\""
+          done
+          [ -n "$profiles" ] || { echo "::error::profiles names no profile"; exit 1; }
           case "$REPEAT" in
             [1-9] | 10) ;;
             *) echo "::error::repeat is a whole number from 1 to 10, not '$REPEAT'"; exit 1 ;;
@@ -66,6 +81,7 @@ jobs:
           case "$SDK_REF" in
             "" | *[!A-Za-z0-9._/-]*) echo "::error::sdk_ref is a branch or tag of meridian-python, not '$SDK_REF'"; exit 1 ;;
           esac
+          echo "profiles=[$profiles]" >> "$GITHUB_OUTPUT"
           echo "runs=[$(seq -s, 1 "$REPEAT")]" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
@@ -120,15 +136,17 @@ jobs:
           retention-days: 1
 
   # Each run as ci's e2e-cluster-k3d job runs e2e-cluster-failover: its own
-  # runner, its own k3d cluster, the images above.
+  # runner, its own k3d cluster, the images above; each profile keeps its own
+  # timeout (tolerant 45 minutes, ha and reconfigure 70).
   failover-repeat:
-    name: failover-repeat (${{ inputs.profile }}, run ${{ matrix.run }})
+    name: failover-repeat (${{ matrix.profile }}, run ${{ matrix.run }})
     needs: [failover-images]
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.profile == 'tolerant' && 45 || 70 }}
+    timeout-minutes: ${{ matrix.profile == 'tolerant' && 45 || 70 }}
     strategy:
       fail-fast: false
       matrix:
+        profile: ${{ fromJSON(needs.failover-images.outputs.profiles) }}
         run: ${{ fromJSON(needs.failover-images.outputs.runs) }}
     steps:
       - uses: actions/checkout@v4
@@ -157,13 +175,13 @@ jobs:
       # flags, as ci.yaml's e2e-cluster-reconfigure runs them.
       - uses: azure/setup-helm@v4
         with:
-          version: ${{ inputs.profile == 'reconfigure' && 'v4.2.3' || 'v3.16.2' }}
+          version: ${{ matrix.profile == 'reconfigure' && 'v4.2.3' || 'v3.16.2' }}
 
       - name: make e2e-cluster-k3d
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
-          PROFILE: ${{ inputs.profile }}
+          PROFILE: ${{ matrix.profile }}
           FAILURE: ${{ inputs.failure }}
         run: |
           agents=0 zones=""
@@ -177,7 +195,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: failover-claims-${{ inputs.profile }}-${{ matrix.run }}
+          name: failover-claims-${{ matrix.profile }}-${{ matrix.run }}
           path: workspace/meridian-core/.e2e-failover-claims.jsonl
           include-hidden-files: true
           if-no-files-found: warn
@@ -206,13 +224,13 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: failover-repeat-logs-${{ inputs.profile }}-${{ matrix.run }}
+          name: failover-repeat-logs-${{ matrix.profile }}-${{ matrix.run }}
           path: workspace/meridian-core/.e2e-*.log
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
-  # Green only when every run was.
+  # Green only when every run of every profile was.
   failover-verdict:
     name: failover-repeat (every run green)
     needs: [failover-images, failover-repeat]
@@ -224,12 +242,12 @@ jobs:
         env:
           IMAGES: ${{ needs.failover-images.result }}
           RUNS: ${{ needs.failover-repeat.result }}
-          PROFILE: ${{ inputs.profile }}
+          PROFILES: ${{ needs.failover-images.outputs.profiles }}
           REPEAT: ${{ inputs.repeat }}
         run: |
           if [ "$IMAGES" = success ] && [ "$RUNS" = success ]; then
-            echo "failover-repeat: $REPEAT of $REPEAT runs green in $PROFILE"
+            echo "failover-repeat: $REPEAT of $REPEAT runs green in each of $PROFILES"
           else
-            echo "::error::failover-repeat: not every run was green in $PROFILE (images $IMAGES, runs $RUNS)"
+            echo "::error::failover-repeat: not every run was green in $PROFILES (images $IMAGES, runs $RUNS)"
             exit 1
           fi
