@@ -1314,10 +1314,23 @@ def pod_ip(pod_name):
     return json.loads(out("get", "pod", pod_name, "-o", "json"))["status"].get("podIP", "")
 
 
+# Where every cut's rules go: the mangle table, which every packet crosses
+# before the filter table and in which nothing of the cluster's reorders a
+# rule. The filter table's FORWARD and INPUT are kube-router's: on each of its
+# syncs, which pods coming and going start, it puts its own jump back above
+# whatever is first, and its pods' chains accept an established connection
+# before a rule below them is read. A cut placed first in filter's FORWARD was
+# lifted for the connections it was there to cut (diagnostic run 43100786136:
+# KUBE-ROUTER-FORWARD back at 1 above the write-ahead-bound cut half way
+# through it; 43090858893, ha run 3: the lake's writer, its connection to the
+# broker kept, never held from the stream, so no gap and the class red).
+CUT = "iptables -t mangle"
+
+
 def cut_rules(pod_name, targets, verb):
     """Drop every packet between a pod and each target, on the pod's node,
-    first in FORWARD: established connections too, which a NetworkPolicy
-    (kube-router's, as most) lets carry on.
+    first in the mangle table's FORWARD (CUT): established connections too,
+    which a NetworkPolicy (kube-router's, as most) lets carry on.
 
     Every rule in one exec on the node, so the cut starts (and ends) at
     once: a docker exec per rule, some thirty for the broker class, spent
@@ -1325,7 +1338,7 @@ def cut_rules(pod_name, targets, verb):
     taking it out (broker 9.46 s of 10 in a local run)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
     at = "1 " if verb == "-I" else ""
-    rules = [f"iptables {verb} FORWARD {at}-s {a} -d {b} -j DROP"
+    rules = [f"{CUT} {verb} FORWARD {at}-s {a} -d {b} -j DROP"
              for target in targets for a, b in ((ip, target), (target, ip))]
     # Put in, every one must hold; taken out, each is gone whether or not.
     joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
@@ -1621,11 +1634,12 @@ def write_ahead_position(pod=None):
 def isolate(pod_name, verb):
     """Every packet to and from a pod dropped on its node, whatever its
     peer: routed through the node (FORWARD) or the node itself (INPUT,
-    OUTPUT), the API server and the kubelet included."""
+    OUTPUT), the API server and the kubelet included; in the mangle table
+    (CUT)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
     for chain, rule in (("FORWARD", ["-s", ip]), ("FORWARD", ["-d", ip]),
                         ("INPUT", ["-s", ip]), ("OUTPUT", ["-d", ip])):
-        run("docker", "exec", node, "iptables", verb, chain, *(["1"] if verb == "-I" else []),
+        run("docker", "exec", node, *CUT.split(), verb, chain, *(["1"] if verb == "-I" else []),
             *rule, "-j", "DROP", check=verb == "-I")
 
 
@@ -2985,8 +2999,8 @@ def api_addresses():
 def cut_api(verb):
     """Every pod of the release cut from the API server, both ways, on its
     node: routed through the node (FORWARD), and to the node itself where
-    the API server runs there (INPUT). One exec per node, so the cut starts
-    and ends at once."""
+    the API server runs there (INPUT), in the mangle table (CUT). One exec
+    per node, so the cut starts and ends at once."""
     api = api_addresses()
     by_node = {}
     for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
@@ -2998,9 +3012,9 @@ def cut_api(verb):
         rules = []
         for ip in sorted(ips):
             for target in api:
-                rules += [f"iptables {verb} FORWARD {at}-s {ip} -d {target} -j DROP",
-                          f"iptables {verb} FORWARD {at}-s {target} -d {ip} -j DROP",
-                          f"iptables {verb} INPUT {at}-s {ip} -d {target} -j DROP"]
+                rules += [f"{CUT} {verb} FORWARD {at}-s {ip} -d {target} -j DROP",
+                          f"{CUT} {verb} FORWARD {at}-s {target} -d {ip} -j DROP",
+                          f"{CUT} {verb} INPUT {at}-s {ip} -d {target} -j DROP"]
         joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
         run("docker", "exec", node, "sh", "-c", joined or "true", check=verb == "-I")
     return api
