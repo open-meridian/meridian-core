@@ -896,7 +896,13 @@ ttl: 20
 loop_wait: 2
 retry_timeout: 5
 maximum_lag_on_failover: 1048576
-synchronous_mode: {{ gt (int .standbys) 0 }}
+{{- /* The synchronous standbys are a quorum (contract v30, stage C; the
+       resilience spec's section 4, approved 2026-11-10): Patroni's
+       `synchronous_mode: quorum` gives synchronous_standby_names = 'ANY 1
+       (...)' over the two standbys, so either acknowledges and losing one
+       neither stalls nor slows a commit; strict still, so a primary cut off
+       from both acknowledges nothing alone. */}}
+synchronous_mode: {{ if gt (int .standbys) 0 }}quorum{{ else }}false{{ end }}
 synchronous_mode_strict: {{ gt (int .standbys) 0 }}
 synchronous_node_count: 1
 postgresql:

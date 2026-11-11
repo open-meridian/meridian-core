@@ -738,8 +738,12 @@ def shape(s):
         s.check(budget, f"{component}: a disruption budget over its members")
     roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
     s.check(roles == ["primary", "replica", "replica"], f"database: one primary, two standbys ({roles})")
-    sync = psql("select count(*) from pg_stat_replication where sync_state = 'sync'", database="postgres")
-    s.check(sync == "1", f"database: one standby synchronous ({sync})")
+    # The synchronous standbys a quorum (contract v30, stage C): ANY 1 of
+    # the two, each standing in it, strict.
+    quorum = psql("select count(*) from pg_stat_replication where sync_state = 'quorum'", database="postgres")
+    names = psql("show synchronous_standby_names", database="postgres")
+    s.check(quorum == "2" and names.startswith("ANY 1 ("),
+            f"database: both standbys in a quorum of one ({quorum}; {names})")
     checksums = psql("show data_checksums", database="postgres")
     s.check(checksums == "on", f"database: made with page checksums ({checksums})")
     # Every store's probe names the primary it reaches, and its checksums.

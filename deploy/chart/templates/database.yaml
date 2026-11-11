@@ -44,9 +44,10 @@
   postgres:16-alpine, restarted on its volume (the tolerant default and the
   desktop). Or under Patroni, from database.brought.patroniImage -- the same
   Postgres with Patroni and pgBackRest -- as a primary and
-  database.brought.standbys standbys, each on its own volume, one of them
-  synchronous and strict, so a primary cut off from its standbys cannot
-  acknowledge a commit alone; Patroni keeps its state in this namespace's
+  database.brought.standbys standbys, each on its own volume, a quorum of
+  either synchronous and strict (ANY 1; contract v30, stage C), so losing one
+  neither stalls nor slows a commit and a primary cut off from both cannot
+  acknowledge one alone; Patroni keeps its state in this namespace's
   ConfigMaps and the members' labels, under a namespaced Role (no CRD, no
   cluster-wide right: decisions/016), and the Service follows the primary's
   label. Once a database has run under Patroni it stays under it, standbys

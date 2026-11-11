@@ -88,8 +88,8 @@ database:
     # Standbys beside the primary (step 3b; spec/a-deployment-scales-out-
     # and-fails-over-by-configuration section 4): 0, the tolerant default,
     # one database restarted on its volume; or 2, a primary and two standbys
-    # under Patroni, each on its own volume and node, one synchronous and
-    # strict, so the book's, the street store's, the instrument store's and
+    # under Patroni, each on its own volume and node, a quorum of either
+    # (ANY 1, strict; contract v30, stage C), so the book's, the street store's, the instrument store's and
     # the configuration's commits survive the primary (RPO 0) and a primary
     # lost is answered for within 30 s (ruling 1048). By the profile: 0
     # tolerant, 2 ha. Patroni keeps its state in this namespace's ConfigMaps.
