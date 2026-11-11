@@ -110,7 +110,39 @@ pub struct WriteAheadBatch {
     /// The position the batch commits.
     pub through: WriteAheadPosition,
     pub parts: Vec<(String, Vec<Observation>)>,
+    /// Sequences the stream dropped before the lake took them, found by
+    /// this batch: kept, so a later write naming one is known to follow a
+    /// gap (W10.14).
+    pub dropped: Vec<Dropped>,
+    /// Each dataset's latest valid time the batch recorded: where a gap of
+    /// it found later begins.
+    pub valid: Vec<(String, i64)>,
+    /// Each gap the batch found, as first recorded (W10.14): its own record,
+    /// in the same transaction, so no gap found is lost with its batch.
+    pub gaps: Vec<meridian_domain::v1::DatasetGap>,
 }
+
+/// A run of the write-ahead stream's sequences it dropped at its bound
+/// before the lake took them (W10.14): the first and last, the stream's
+/// time of the last write the lake had before them and of the first it
+/// took after.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub first: u64,
+    pub last: u64,
+    pub after_at_ns: i64,
+    pub until_at_ns: i64,
+}
+
+impl Dropped {
+    /// Whether the stream dropped `sequence`.
+    pub fn holds(&self, sequence: u64) -> bool {
+        (self.first..=self.last).contains(&sequence)
+    }
+}
+
+/// A dataset gap's control change's kind (W10.14): each change of its state.
+pub const CONTROL_GAP: &str = "meridian.v1.DatasetGap";
 
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -484,6 +516,26 @@ pub trait Store: Send + Sync {
     fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
         let _ = (batch, now_ns);
         Err(no_write_ahead())
+    }
+
+    /// What the write-ahead stream dropped that the lake has found, and each
+    /// dataset's latest valid time recorded from it (W10.14): what a writer
+    /// that starts goes on with.
+    fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
+        let _ = stream;
+        Err(no_write_ahead())
+    }
+
+    /// A dataset gap's next state, its own record (W10.14; decisions/031),
+    /// in the `control` partition.
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        let _ = gap;
+        Err(no_write_ahead())
+    }
+
+    /// Every dataset gap's every state, in the order recorded (W10.14).
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        Ok(Vec::new())
     }
 
     /// The rows a query names, each row key at its version as of the

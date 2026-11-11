@@ -23,6 +23,7 @@
 //! and the stream is a bounded buffer ahead of it. In `tolerant` there is no
 //! stream and nothing here runs.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ use meridian_bus::{Envelope, HandlerReply};
 use prost::Message as _;
 
 use crate::service::Lake;
-use crate::store::{StoreError, WriteAheadPosition};
+use crate::store::{Dropped, StoreError, WriteAheadBatch, WriteAheadPosition};
 
 /// The most writes taken in one batch.
 pub const MOST_WRITES: usize = 256;
@@ -62,22 +63,50 @@ pub struct Taken {
 /// What a batch did: each write's answer, to where it is sent.
 pub type Answers = Vec<(Option<String>, HandlerReply)>;
 
+/// One write as the lake records it from the stream: its topic, its
+/// request, and the run the stream dropped that its sidecar's last write of
+/// the dataset was in, where it was in one -- the first write of its
+/// dataset after a gap (W10.14).
+#[derive(Debug, Clone)]
+pub struct Written {
+    pub topic: String,
+    pub envelope: Envelope,
+    pub after_gap: Option<Dropped>,
+}
+
+/// What [`crate::service::Lake::record_written`] did, once committed: each
+/// write's answer, and each dataset's latest valid time it recorded.
+pub struct Recorded {
+    pub answers: Vec<HandlerReply>,
+    pub valid: Vec<(String, i64)>,
+}
+
 /// The writer's place in the stream: the position the store holds, which
-/// each batch moves.
+/// each batch moves, and what the stream dropped that the lake has found.
 pub struct Writer {
     lake: Arc<Lake>,
     stream: String,
     position: Option<WriteAheadPosition>,
+    /// The sequence to take from next where it is not the one after the
+    /// position: a stream made again, which numbers from its own first.
+    from: Option<u64>,
+    dropped: Vec<Dropped>,
+    valid: BTreeMap<String, i64>,
 }
 
 impl Writer {
-    /// The writer of `lake`, at the position its store holds in `stream`.
+    /// The writer of `lake`, at the position its store holds in `stream`,
+    /// with what it found the stream dropped.
     pub fn start(lake: Arc<Lake>, stream: &str) -> Result<Writer, StoreError> {
         let position = lake.write_ahead_position(stream)?;
+        let (dropped, valid) = lake.write_ahead_found(stream)?;
         Ok(Writer {
             lake,
             stream: stream.to_string(),
             position,
+            from: None,
+            dropped,
+            valid,
         })
     }
 
@@ -88,19 +117,33 @@ impl Writer {
 
     /// The first sequence the writer takes next.
     pub fn next(&self) -> u64 {
-        self.position.map_or(1, |at| at.sequence + 1)
+        self.from
+            .unwrap_or_else(|| self.position.map_or(1, |at| at.sequence + 1))
+    }
+
+    /// Take from `sequence` next, whatever the position: the stream's own
+    /// first, where the stream is not the one the position was taken in.
+    pub fn begin_at(&mut self, sequence: u64) {
+        self.from = Some(sequence);
     }
 
     /// The position read again from the store: after a batch it refused.
     pub fn reread(&mut self) -> Result<(), StoreError> {
         self.position = self.lake.write_ahead_position(&self.stream)?;
+        let (dropped, valid) = self.lake.write_ahead_found(&self.stream)?;
+        self.dropped = dropped;
+        self.valid = valid;
+        self.from = None;
         Ok(())
     }
 
     /// A batch taken from the stream, in its order, recorded with the
-    /// position it reaches; answered with each write's reply. Refused whole
-    /// where the store refused it: the writer reads its position again
-    /// before it takes another.
+    /// position it reaches; answered with each write's reply. A sequence
+    /// the batch skips past was dropped by the stream before the lake took
+    /// it, and is kept as such with the batch; a write whose sidecar's last
+    /// write of its dataset was dropped is the first after a gap (W10.14).
+    /// Refused whole where the store refused it: the writer reads its
+    /// position again before it takes another.
     pub fn take(&mut self, taken: Vec<Taken>) -> Result<Answers, StoreError> {
         let Some(last) = taken.last() else {
             return Ok(Vec::new());
@@ -109,17 +152,62 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
+        let mut expected = self.next();
+        let mut before_at = self.position.map_or(0, |at| at.at_ns);
+        let mut dropped = Vec::new();
+        for write in &taken {
+            if write.sequence > expected {
+                dropped.push(Dropped {
+                    first: expected,
+                    last: write.sequence - 1,
+                    after_at_ns: before_at,
+                    until_at_ns: write.at_ns,
+                });
+            }
+            expected = write.sequence + 1;
+            before_at = write.at_ns;
+        }
+        for run in &dropped {
+            tracing::warn!(
+                first = run.first,
+                last = run.last,
+                "the lake's write-ahead stream dropped writes before the lake took them: \
+                 a writer gone longer than the stream's bound"
+            );
+        }
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
         for write in taken {
+            let after_gap = write.after.and_then(|after| {
+                self.dropped
+                    .iter()
+                    .chain(&dropped)
+                    .find(|run| run.holds(after))
+                    .copied()
+            });
             sent_to.push(write.reply_to);
-            writes.push((write.topic, write.envelope));
+            writes.push(Written {
+                topic: write.topic,
+                envelope: write.envelope,
+                after_gap,
+            });
         }
-        let answers = self
-            .lake
-            .record_written(writes, &self.stream, self.position, through)?;
+        let batch = WriteAheadBatch {
+            stream: self.stream.clone(),
+            after: self.position,
+            through,
+            dropped: dropped.clone(),
+            ..Default::default()
+        };
+        let recorded = self.lake.record_written(writes, batch, &self.valid)?;
         self.position = Some(through);
-        Ok(sent_to.into_iter().zip(answers).collect())
+        self.from = None;
+        self.dropped.extend(dropped);
+        for (dataset, valid_ns) in recorded.valid {
+            let at = self.valid.entry(dataset).or_insert(valid_ns);
+            *at = (*at).max(valid_ns);
+        }
+        Ok(sent_to.into_iter().zip(recorded.answers).collect())
     }
 }
 
@@ -242,6 +330,13 @@ pub async fn write_forever(
             }
         }
     };
+    // The gaps the last writer was asking for again, asked again by this
+    // one (W10.14): their wants were in its memory.
+    match tokio::task::block_in_place(|| lake.resume_gaps()) {
+        Ok(0) => {}
+        Ok(asked) => tracing::info!(asked, "gaps still refetching asked again"),
+        Err(failed) => tracing::warn!(%failed, "the gaps still refetching could not be read"),
+    }
     tracing::info!(
         from = writer.next(),
         max_age_s = bounds.max_age.as_secs(),
@@ -249,9 +344,25 @@ pub async fn write_forever(
         "the lake takes its writes from the write-ahead stream"
     );
     loop {
-        let from = writer.next();
         let consumer = match context.get_stream(STREAM).await {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                // A stream made again -- its volume lost, or JetStream off and
+                // on again -- numbers from its own first: the position was
+                // taken in another, and what that one held past it is gone.
+                if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
+                    let state = &info.state;
+                    if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
+                        tracing::error!(
+                            position = at.sequence,
+                            last = state.last_sequence,
+                            "the lake's write-ahead stream is not the one its position was taken \
+                             in: going on from its first write; what the stream held past the \
+                             position before it was made again is not recorded"
+                        );
+                        writer.begin_at(state.first_sequence.max(1));
+                    }
+                }
+                let from = writer.next();
                 stream
                     .create_consumer(consumer::pull::OrderedConfig {
                         deliver_policy: consumer::DeliverPolicy::ByStartSequence {

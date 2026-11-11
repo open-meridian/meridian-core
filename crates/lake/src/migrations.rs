@@ -100,6 +100,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "write_ahead",
         sql: include_str!("../migrations/0014_write_ahead.sql"),
     },
+    // A dataset's gaps (W10.14): what the stream dropped before the lake
+    // took it, each gap's every state, and where a dataset's next begins.
+    Migration {
+        version: 15,
+        name: "dataset_gap",
+        sql: include_str!("../migrations/0015_dataset_gap.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

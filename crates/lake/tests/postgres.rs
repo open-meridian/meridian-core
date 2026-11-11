@@ -4850,6 +4850,7 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
                     // its next version, numbered after the first part.
                     (a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)]),
                 ],
+                ..Default::default()
             },
             5_000,
         )
@@ -4875,6 +4876,7 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
             after: Some(at(2)),
             through: at(4),
             parts: vec![(a.clone(), vec![close(&a, "z", &subject, "2026-10-07", 30)])],
+            ..Default::default()
         },
         6_000,
     );
@@ -4893,6 +4895,7 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
                 after: Some(at(3)),
                 through: at(4),
                 parts: vec![(a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)])],
+                ..Default::default()
             },
             7_000,
         )
@@ -4903,4 +4906,70 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
     );
     assert_eq!(store.heads().unwrap()[&a], 2);
     assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(4)));
+}
+
+/// Contract v30, stage E (W10.14): what a batch from the write-ahead stream
+/// found -- the runs the stream dropped, each dataset's latest valid time,
+/// each gap -- commits with it, and each gap's next state is its own
+/// record, read back in order.
+#[test]
+fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
+    use meridian_domain::v1::{DatasetGap, GapCause, GapState};
+    use meridian_lake::store::{Dropped, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let stream = unique("STREAM");
+    let dataset = unique("coinbase-1:gaps");
+    let subject = unique("LCL-BTC");
+    let gap = DatasetGap {
+        gap_id: unique("GAP-TEST"),
+        dataset: dataset.clone(),
+        subjects: vec![subject.clone()],
+        valid_from_ns: 100,
+        valid_until_ns: 200,
+        cause: GapCause::WriteAheadBound as i32,
+        state: GapState::Refetching as i32,
+        recorded_at_ns: 5_000,
+    };
+    let dropped = Dropped {
+        first: 2,
+        last: 4,
+        after_at_ns: 1_001,
+        until_at_ns: 1_005,
+    };
+    store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 5,
+                    at_ns: 1_005,
+                },
+                parts: vec![(
+                    dataset.clone(),
+                    vec![close(&dataset, "x", &subject, "2026-10-07", 10)],
+                )],
+                dropped: vec![dropped],
+                valid: vec![(dataset.clone(), 100)],
+                gaps: vec![gap.clone()],
+            },
+            5_000,
+        )
+        .unwrap();
+    let (found, valid) = store.write_ahead_found(&stream).unwrap();
+    assert_eq!(found, vec![dropped]);
+    assert_eq!(valid.get(&dataset), Some(&100));
+    let recovered = DatasetGap {
+        state: GapState::Recovered as i32,
+        recorded_at_ns: 6_000,
+        ..gap.clone()
+    };
+    store.record_gap(&recovered).unwrap();
+    let mine: Vec<DatasetGap> = store
+        .dataset_gaps()
+        .unwrap()
+        .into_iter()
+        .filter(|g| g.gap_id == gap.gap_id)
+        .collect();
+    assert_eq!(mine, vec![gap, recovered]);
 }

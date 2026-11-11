@@ -237,6 +237,25 @@ impl PostgresStore {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
+    /// Each gap's state kept, one row a change (W10.14; decisions/031).
+    fn gaps_kept(tx: &mut Transaction<'_>, gaps: &[meridian_domain::v1::DatasetGap]) -> Result<()> {
+        for gap in gaps {
+            tx.execute(
+                "INSERT INTO lake_dataset_gap (gap_id, dataset, state, recorded_at_ns, body)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &gap.gap_id,
+                    &gap.dataset,
+                    &(gap.state as i16),
+                    &gap.recorded_at_ns,
+                    &gap.encode_to_vec(),
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
     /// Moves the partition's head, and its rows in force by the row keys
     /// the batch kept that it held no version of (contract v29, ruling 619
     /// (2); migration 8): a new version of a key held replaces its last, and
@@ -1156,6 +1175,47 @@ impl Store for PostgresStore {
                 answered[place] = part;
             }
         }
+        // What the batch found the stream dropped, each dataset's latest
+        // valid time it recorded, and each gap it found: with its rows and
+        // its position, or not at all (W10.14).
+        for dropped in &batch.dropped {
+            tx.execute(
+                "INSERT INTO lake_write_ahead_dropped
+                        (stream, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                &[
+                    &batch.stream,
+                    &(dropped.first as i64),
+                    &(dropped.last as i64),
+                    &dropped.after_at_ns,
+                    &dropped.until_at_ns,
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        for (dataset, valid_ns) in &batch.valid {
+            tx.execute(
+                "INSERT INTO lake_write_ahead_dataset (stream, dataset, valid_ns) VALUES ($1, $2, $3)
+                 ON CONFLICT (stream, dataset) DO UPDATE
+                    SET valid_ns = greatest(lake_write_ahead_dataset.valid_ns, EXCLUDED.valid_ns)",
+                &[&batch.stream, dataset, valid_ns],
+            )
+            .map_err(unavailable)?;
+        }
+        Self::gaps_kept(&mut tx, &batch.gaps)?;
+        let logged: Vec<(&str, Vec<u8>, i64)> = batch
+            .gaps
+            .iter()
+            .map(|gap| {
+                (
+                    crate::store::CONTROL_GAP,
+                    gap.encode_to_vec(),
+                    gap.recorded_at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut tx, &logged)?;
         tx.execute(
             "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
              VALUES ($1, $2, $3, $4)
@@ -1172,6 +1232,66 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         Ok(answered)
+    }
+
+    fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(Vec<crate::store::Dropped>, BTreeMap<String, i64>)> {
+        let mut conn = self.conn()?;
+        let dropped = conn
+            .query(
+                "SELECT first_sequence, last_sequence, after_at_ns, until_at_ns
+                   FROM lake_write_ahead_dropped WHERE stream = $1 ORDER BY first_sequence",
+                &[&stream],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| crate::store::Dropped {
+                first: row.get::<_, i64>(0) as u64,
+                last: row.get::<_, i64>(1) as u64,
+                after_at_ns: row.get(2),
+                until_at_ns: row.get(3),
+            })
+            .collect();
+        let valid = conn
+            .query(
+                "SELECT dataset, valid_ns FROM lake_write_ahead_dataset WHERE stream = $1",
+                &[&stream],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        Ok((dropped, valid))
+    }
+
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        Self::gaps_kept(&mut tx, std::slice::from_ref(gap))?;
+        self.log_control(
+            &mut tx,
+            &[(
+                crate::store::CONTROL_GAP,
+                gap.encode_to_vec(),
+                gap.recorded_at_ns,
+            )],
+        )?;
+        tx.commit().map_err(unavailable)
+    }
+
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        self.conn()?
+            .query("SELECT body FROM lake_dataset_gap ORDER BY change_id", &[])
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let body: Vec<u8> = row.get(0);
+                meridian_domain::v1::DatasetGap::decode(&body[..]).map_err(unreadable)
+            })
+            .collect()
     }
 
     fn serve_unkept(

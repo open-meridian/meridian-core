@@ -752,6 +752,24 @@ impl Store for HotStore {
         Ok(done)
     }
 
+    fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(
+        Vec<crate::store::Dropped>,
+        std::collections::BTreeMap<String, i64>,
+    )> {
+        self.inner.write_ahead_found(stream)
+    }
+
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        self.inner.record_gap(gap)
+    }
+
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        self.inner.dataset_gaps()
+    }
+
     fn serve_unkept(
         &self,
         dataset: &str,

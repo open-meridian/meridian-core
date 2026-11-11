@@ -285,6 +285,11 @@ impl Store for ReaderStore {
         self.past().want_changes()
     }
 
+    /// A dataset's gaps, as the record keeps them (W10.14).
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        self.past().dataset_gaps()
+    }
+
     fn served(&self) -> Result<Vec<Served>> {
         self.past().served()
     }

@@ -165,3 +165,194 @@ fn every_topic_the_stream_carries_is_one_the_lake_takes_from_it() {
     .unwrap_err()
     .contains("no write the lake takes"));
 }
+
+/// Each dataset's catalogue as `configuration` makes it, coinbase-1's
+/// prices alone and declaring `backfill`, kraken-1's declaring nothing --
+/// read as `none` (W10.14).
+fn gap_configured(h: &Harness) {
+    let mut event = configuration(true, &[]);
+    for dataset in &mut event.datasets {
+        let declared = dataset.declaration.as_mut().unwrap();
+        declared.data_types = vec!["meridian.v1.Price".into()];
+        if dataset.dataset == "coinbase-1:daily" {
+            declared.gap_recovery = meridian_pb::v1::GapRecovery::Backfill as i32;
+        }
+    }
+    h.lake.configured(&event);
+}
+
+fn at_valid(mut price: Price, valid_from_ns: i64) -> Price {
+    price.meta.as_mut().unwrap().valid_from_ns = valid_from_ns;
+    price
+}
+
+fn gaps(h: &Harness, dataset: &str, state: GapState) -> Vec<DatasetGap> {
+    let (_, bytes) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            h.bus.call(
+                service::LIST_DATASET_GAPS,
+                "meridian.v1.ListDatasetGapsRequest",
+                ListDatasetGapsRequest {
+                    dataset: dataset.into(),
+                    state: state as i32,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                None,
+            ),
+        )
+    })
+    .unwrap();
+    ListDatasetGapsReply::decode(&bytes[..]).unwrap().gaps
+}
+
+use meridian_domain::v1::{
+    DatasetGap, GapCause, GapState, ListDatasetGapsReply, ListDatasetGapsRequest,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_gone_past_the_bound_leaves_a_backfill_gap_asked_again_and_recovered() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let price =
+        |key: &str, valid: i64| at_valid(close("coinbase-1", key, BTC, "2026-10-07", "1"), valid);
+    tokio::task::block_in_place(|| {
+        writer.take(vec![written(
+            1,
+            "coinbase-1",
+            vec![price("a", NOW - 30_000)],
+        )])
+    })
+    .unwrap();
+    // The writer gone past the stream's bound: 2 to 4 dropped. The next
+    // write the sidecar sent says its last was 3, one of them.
+    let mut next = written(5, "coinbase-1", vec![price("e", NOW - 10_000)]);
+    next.after = Some(3);
+    let answers = tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
+    assert_eq!(
+        reply(&answers[0].1).recorded,
+        1,
+        "the write after a gap is recorded"
+    );
+    // The gap, recorded and asked again of its data plugin, naming it.
+    let open = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(open.len(), 1, "{open:?}");
+    let gap = &open[0];
+    assert!(
+        gap.gap_id.starts_with("GAP-") && gap.gap_id.len() == 30,
+        "{}",
+        gap.gap_id
+    );
+    assert_eq!(gap.dataset, "coinbase-1:daily");
+    assert_eq!(gap.subjects, vec![BTC.to_string()]);
+    assert_eq!(
+        (gap.valid_from_ns, gap.valid_until_ns),
+        (NOW - 30_000, NOW - 10_000),
+        "from the dataset's latest valid time before the gap to the write after it"
+    );
+    assert_eq!(gap.cause, GapCause::WriteAheadBound as i32);
+    assert_eq!(gap.state, GapState::Refetching as i32);
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert_eq!(want.gap_id, gap.gap_id);
+    assert_eq!(want.dataset, "coinbase-1:daily");
+    assert_eq!(want.data_type, "meridian.v1.Price");
+    assert_eq!(
+        (want.valid_from_ns, want.valid_until_ns),
+        (NOW - 30_000, NOW - 10_000)
+    );
+    assert_eq!(want.subjects[0].entity_id, BTC);
+    // The plugin answers it from its source's history: the gap recovered,
+    // a row it already held recorded once.
+    let answered = record(
+        &h,
+        "coinbase-1",
+        vec![price("b", NOW - 25_000), price("e", NOW - 10_000)],
+        &want.want_id,
+    )
+    .unwrap();
+    assert_eq!((answered.recorded, answered.unchanged), (1, 1));
+    let recovered = gaps(&h, "coinbase-1:daily", GapState::Recovered);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].gap_id, gap.gap_id);
+    assert!(gaps(&h, "", GapState::Refetching).is_empty());
+    // Each state its own record, in the control partition too.
+    let every = h.store.dataset_gaps().unwrap();
+    assert_eq!(
+        every.iter().map(|g| g.state).collect::<Vec<_>>(),
+        vec![GapState::Refetching as i32, GapState::Recovered as i32]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_in_a_dataset_declaring_none_is_recorded_unrecovered_and_read_never_asked() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let price =
+        |key: &str, valid: i64| at_valid(close("kraken-1", key, BTC, "2026-10-07", "1"), valid);
+    tokio::task::block_in_place(|| {
+        writer.take(vec![written(1, "kraken-1", vec![price("a", NOW - 30_000)])])
+    })
+    .unwrap();
+    // A writer started again after the gap: what it found is the store's.
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut next = written(9, "kraken-1", vec![price("i", NOW - 1_000)]);
+    next.after = Some(8);
+    tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
+    let shown = gaps(&h, "kraken-1:daily", GapState::Unrecovered);
+    assert_eq!(shown.len(), 1, "a gap is never silent");
+    assert_eq!(
+        (shown[0].valid_from_ns, shown[0].valid_until_ns),
+        (NOW - 30_000, NOW - 1_000)
+    );
+    assert!(gaps(&h, "coinbase-1:daily", GapState::Unspecified).is_empty());
+    // Never asked again: the source cannot be.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), wanted.recv())
+            .await
+            .is_err(),
+        "no want for a gap its dataset cannot recover"
+    );
+    // Rows inside it are never invented: what was recorded is what is read.
+    assert_eq!(h.store.heads().unwrap()["kraken-1:daily"], 2);
+    // A later write of the dataset, not after a gap, finds none.
+    let mut after = written(10, "kraken-1", vec![price("j", NOW)]);
+    after.after = Some(9);
+    tokio::task::block_in_place(|| writer.take(vec![after])).unwrap();
+    assert_eq!(h.store.dataset_gaps().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_whose_want_is_declined_is_unrecovered() {
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut first = written(
+        2,
+        "coinbase-1",
+        vec![close("coinbase-1", "a", BTC, "2026-10-07", "1")],
+    );
+    first.after = Some(1);
+    // No position yet and the stream's first is 2: 1 was dropped before any
+    // writer took it.
+    tokio::task::block_in_place(|| writer.take(vec![first])).unwrap();
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    let mut asked = envelope("coinbase-1", true, "");
+    asked.payload_type = "meridian.v1.DeclineWantRequest".into();
+    let declined = DeclineWantRequest {
+        want_id: want.want_id.clone(),
+        subjects: want.subjects.clone(),
+        reason: UnansweredReason::BeyondHistory as i32,
+    };
+    tokio::task::block_in_place(|| h.lake.decline(declined, &asked)).unwrap();
+    let shown = gaps(&h, "", GapState::Unrecovered);
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].gap_id, want.gap_id);
+}

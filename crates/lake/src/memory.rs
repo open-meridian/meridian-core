@@ -37,6 +37,12 @@ struct Held {
     control: Vec<meridian_changes::Change>,
     /// The write-ahead stream's position, by stream (the `ha` profile).
     write_ahead: BTreeMap<String, WriteAheadPosition>,
+    /// What each stream dropped and each dataset's latest valid time from
+    /// it (W10.14).
+    dropped: BTreeMap<String, Vec<crate::store::Dropped>>,
+    valid: BTreeMap<(String, String), i64>,
+    /// Every dataset gap's every state, in order (W10.14).
+    gaps: Vec<meridian_domain::v1::DatasetGap>,
 }
 
 #[derive(Default)]
@@ -300,8 +306,67 @@ impl Store for MemoryStore {
                 answered[place] = done;
             }
         }
+        held.dropped
+            .entry(batch.stream.clone())
+            .or_default()
+            .extend(batch.dropped);
+        for (dataset, valid_ns) in batch.valid {
+            let at = held
+                .valid
+                .entry((batch.stream.clone(), dataset))
+                .or_insert(valid_ns);
+            *at = (*at).max(valid_ns);
+        }
+        let logged: Vec<(&str, Vec<u8>, i64)> = batch
+            .gaps
+            .iter()
+            .map(|gap| {
+                use prost::Message as _;
+                (
+                    crate::store::CONTROL_GAP,
+                    gap.encode_to_vec(),
+                    gap.recorded_at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut held, logged)?;
+        held.gaps.extend(batch.gaps);
         held.write_ahead.insert(batch.stream, batch.through);
         Ok(answered)
+    }
+
+    fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(Vec<crate::store::Dropped>, BTreeMap<String, i64>)> {
+        let held = self.lock();
+        Ok((
+            held.dropped.get(stream).cloned().unwrap_or_default(),
+            held.valid
+                .iter()
+                .filter(|((at, _), _)| at == stream)
+                .map(|((_, dataset), valid)| (dataset.clone(), *valid))
+                .collect(),
+        ))
+    }
+
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        use prost::Message as _;
+        let mut held = self.lock();
+        self.log_control(
+            &mut held,
+            vec![(
+                crate::store::CONTROL_GAP,
+                gap.encode_to_vec(),
+                gap.recorded_at_ns,
+            )],
+        )?;
+        held.gaps.push(gap.clone());
+        Ok(())
+    }
+
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        Ok(self.lock().gaps.clone())
     }
 
     fn serve_unkept(

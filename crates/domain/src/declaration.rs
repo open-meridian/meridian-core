@@ -11,8 +11,8 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    AlgorithmDeclaration, Catalogue, CopyrightClass, DatasetDeclaration, DerivedUse, NotCarried,
-    NotCarriedReason, ObservationMode, PluginDeclaration, PriceSourceClass,
+    AlgorithmDeclaration, Catalogue, CopyrightClass, DatasetDeclaration, DerivedUse, GapRecovery,
+    NotCarried, NotCarriedReason, ObservationMode, PluginDeclaration, PriceSourceClass,
     PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
 };
 
@@ -131,6 +131,11 @@ pub struct DeclaredDataset {
     /// enum's name; empty or absent for not stated.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub price_source_class: String,
+    /// How a gap in it is recovered (W10.1, W10.14; contract v30): its word
+    /// (`backfill`, `stream_only`, `none`) or the enum's name; empty or
+    /// absent for none declared, read as `none`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gap_recovery: String,
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -408,6 +413,13 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     dataset.price_source_class
                 )
             })?;
+        let gap_recovery = gap_recovery_of(&dataset.gap_recovery).ok_or_else(|| {
+            format!(
+                "declaration.catalogue.datasets[{i}].gap_recovery {:?} is none of backfill, \
+                 stream_only and none",
+                dataset.gap_recovery
+            )
+        })?;
         datasets.push(DatasetDeclaration {
             key: dataset.key.clone(),
             vendor: dataset.vendor.clone(),
@@ -422,20 +434,44 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             calendar_id: dataset.calendar_id.clone(),
             declared_delay_ns: dataset.declared_delay_ns,
             price_source_class: price_source_class as i32,
-            // Contract v30's terms and pricing, sessions calendar and gap
-            // recovery (W10.1): not yet read from an upload; core's stage
-            // commits read them (step 3c).
+            // Contract v30's terms and pricing and sessions calendar
+            // (W10.1): not yet read from an upload; Track 6's core part
+            // reads them (step 3c).
             terms_and_pricing: String::new(),
             sessions_calendar_id: String::new(),
-            gap_recovery: 0,
+            // How a gap in it is recovered (W10.14; core's stage E).
+            gap_recovery: gap_recovery as i32,
         });
     }
     Ok(Catalogue { datasets })
 }
 
-/// A dataset's catalogue entry as JSON, its modes in their words.
+/// How a gap is recovered, from its word or the enum's name; unspecified
+/// for none said, none for a word that names nothing.
+pub fn gap_recovery_of(text: &str) -> Option<GapRecovery> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(GapRecovery::Unspecified);
+    }
+    GapRecovery::from_str_name(text).or_else(|| {
+        GapRecovery::from_str_name(&format!("GAP_RECOVERY_{}", text.to_ascii_uppercase()))
+    })
+}
+
+/// How a gap is recovered, in its word: empty for none declared.
+pub fn gap_recovery_word(recovery: i32) -> &'static str {
+    match GapRecovery::try_from(recovery) {
+        Ok(GapRecovery::Backfill) => "backfill",
+        Ok(GapRecovery::StreamOnly) => "stream_only",
+        Ok(GapRecovery::None) => "none",
+        _ => "",
+    }
+}
+
+/// A dataset's catalogue entry as JSON, its modes in their words, and how a
+/// gap in it is recovered where it declares that (contract v30).
 pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
-    serde_json::json!({
+    let mut said = serde_json::json!({
         "key": dataset.key,
         "vendor": dataset.vendor,
         "aggregator": dataset.aggregator,
@@ -449,7 +485,12 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "calendar_id": dataset.calendar_id,
         "declared_delay_ns": dataset.declared_delay_ns,
         "price_source_class": price_source_class_word(dataset.price_source_class),
-    })
+    });
+    let recovery = gap_recovery_word(dataset.gap_recovery);
+    if !recovery.is_empty() {
+        said["gap_recovery"] = serde_json::Value::from(recovery);
+    }
+    said
 }
 
 /// The wire's message as JSON, for the catalogue's listing.
@@ -625,5 +666,54 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("catalogue.datasets[0].price_source_class"));
+    }
+
+    /// Contract v30 (W10.1, W10.14; core's stage E): how a gap in a dataset
+    /// is recovered travels as the SDK uploads it, by its word or the enum's
+    /// name, and is printed back by its word; none declared is unspecified,
+    /// which the lake reads as `none`.
+    #[test]
+    fn a_datasets_gap_recovery_travels_as_the_sdk_uploads_it() {
+        let declared: Declared = serde_json::from_value(serde_json::json!({
+            "catalogue": {"datasets": [{
+                "key": "live", "vendor": "TrueFX", "modes": ["stream"],
+                "data_types": ["meridian.v1.Quote"],
+                "gap_recovery": "backfill"
+            }]}
+        }))
+        .unwrap();
+        let declaration = from_json(&declared).unwrap();
+        let dataset = &declaration.catalogue.as_ref().unwrap().datasets[0];
+        assert_eq!(dataset.gap_recovery, GapRecovery::Backfill as i32);
+        let back = to_json(&declaration);
+        assert_eq!(back["catalogue"]["datasets"][0]["gap_recovery"], "backfill");
+        let again: Declared = serde_json::from_value(back).unwrap();
+        assert_eq!(from_json(&again).unwrap(), declaration);
+        for (word, recovery) in [
+            ("stream_only", GapRecovery::StreamOnly),
+            ("none", GapRecovery::None),
+            ("GAP_RECOVERY_BACKFILL", GapRecovery::Backfill),
+            ("", GapRecovery::Unspecified),
+        ] {
+            let mut said = declared.clone();
+            said.catalogue.as_mut().unwrap().datasets[0].gap_recovery = word.into();
+            assert_eq!(
+                from_json(&said).unwrap().catalogue.unwrap().datasets[0].gap_recovery,
+                recovery as i32,
+                "{word}"
+            );
+        }
+        // None declared prints nothing, as an SDK before v30 uploads it.
+        let mut none = declared.clone();
+        none.catalogue.as_mut().unwrap().datasets[0].gap_recovery = String::new();
+        let printed = to_json(&from_json(&none).unwrap());
+        assert!(printed["catalogue"]["datasets"][0]
+            .get("gap_recovery")
+            .is_none());
+        let mut bad = declared.clone();
+        bad.catalogue.as_mut().unwrap().datasets[0].gap_recovery = "sometimes".into();
+        assert!(from_json(&bad)
+            .unwrap_err()
+            .contains("catalogue.datasets[0].gap_recovery"));
     }
 }

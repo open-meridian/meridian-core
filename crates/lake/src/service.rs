@@ -146,6 +146,8 @@ pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
 pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
 pub const LIST_EXECUTION_COSTS: &str = "platform.lake.query.list-execution-costs";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
+/// Contract v30 (W10.14): a deployment admin reads the dataset gaps.
+pub const LIST_DATASET_GAPS: &str = "platform.lake.query.list-dataset-gaps";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
 /// A lake read handed on, unchanged, by a reader member to the writer, which
 /// alone serves it, and the writer's reply (contract v30, stage B; topics.md,
@@ -398,7 +400,23 @@ pub struct Lake {
     /// Each public read's handler by its topic: what a read handed on by a
     /// reader member ([`READ_FROM_WRITER`]) is answered by on the writer.
     read_handlers: RwLock<BTreeMap<&'static str, meridian_bus::Handler>>,
+    /// Each gap asked again of its data plugin (W10.14), by its ID: the gap
+    /// as recorded, the wants still open for it, and when it was asked.
+    refetching: Mutex<BTreeMap<String, Refetching>>,
 }
+
+/// A gap asked again of its data plugin (W10.14): recovered once every want
+/// asked for it is answered, unrecovered at a decline or past
+/// [`GAP_REFETCH_NS`].
+struct Refetching {
+    gap: meridian_domain::v1::DatasetGap,
+    wants: BTreeSet<String>,
+    asked_at_ns: i64,
+}
+
+/// How long a gap's want waits for its rows before the gap is marked
+/// unrecovered: ten minutes, a vendor's history read and recorded at least.
+pub const GAP_REFETCH_NS: i64 = 10 * 60 * 1_000_000_000;
 
 /// What a batch did, as its parts are published: what its reply counts,
 /// the datasets it wrote and the subjects it named.
@@ -635,6 +653,35 @@ pub fn rows_of(
     }
 }
 
+/// A ListDatasetGaps page's rows by default, and at most (W10.14).
+const GAPS_PAGE: usize = 100;
+const GAPS_MOST: usize = 500;
+
+/// Each gap in its latest state, from every state recorded in order.
+fn latest_gaps(
+    every: Vec<meridian_domain::v1::DatasetGap>,
+) -> Vec<meridian_domain::v1::DatasetGap> {
+    let mut latest: BTreeMap<String, meridian_domain::v1::DatasetGap> = BTreeMap::new();
+    for gap in every {
+        latest.insert(gap.gap_id.clone(), gap);
+    }
+    latest.into_values().collect()
+}
+
+/// A gap's ID: `GAP-` and a ULID at the lake's time (W10.14), its
+/// randomness a v4 UUID's.
+fn gap_id(now_ns: i64) -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let ms = (now_ns.max(0) / 1_000_000) as u128;
+    let random = uuid::Uuid::new_v4().as_u128() & ((1u128 << 80) - 1);
+    let value = (ms << 80) | random;
+    let ulid: String = (0..26)
+        .rev()
+        .map(|i| CROCKFORD[((value >> (i * 5)) & 31) as usize] as char)
+        .collect();
+    format!("GAP-{ulid}")
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -703,6 +750,7 @@ impl Lake {
                     .map_or(0, |at| at.head),
             ),
             read_handlers: RwLock::new(BTreeMap::new()),
+            refetching: Mutex::new(BTreeMap::new()),
             store,
         })
     }
@@ -1829,26 +1877,41 @@ impl Lake {
         self.store.write_ahead_position(stream)
     }
 
+    /// What the lake found its write-ahead stream `stream` dropped, and each
+    /// dataset's latest valid time recorded from it (W10.14).
+    pub fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(Vec<crate::store::Dropped>, BTreeMap<String, i64>), crate::store::StoreError> {
+        self.store.write_ahead_found(stream)
+    }
+
     /// Writes taken from the write-ahead stream, in its order, recorded as
     /// one with the stream's position (the `ha` profile; the resilience
     /// spec's section 4): each write checked as [`Lake::record`] checks it,
     /// the rows the lake keeps of every write recorded in one transaction
-    /// with the position moved from `after` to `through`, and only then
-    /// each write's rows published, its want settled and its answer made --
-    /// what [`Lake::record`] would have answered it, or its refusal. Rows of
-    /// a dataset served, not kept, are served once the batch commits.
+    /// with `batch`'s position, the runs it found the stream dropped, each
+    /// dataset's latest valid time and each gap found; and only then each
+    /// write's rows published, its want settled and its answer made -- what
+    /// [`Lake::record`] would have answered it, or its refusal. Rows of a
+    /// dataset served, not kept, are served once the batch commits.
+    ///
+    /// A write that follows a run the stream dropped (`after_gap`) is the
+    /// first of its dataset after a gap (W10.14): the gap is recorded from
+    /// the dataset's latest valid time before it to the write's earliest,
+    /// over the write's subjects, and asked again where the dataset declares
+    /// `backfill` or marked unrecovered where it does not.
     ///
     /// Refused whole, nothing answered, where the store refuses the batch:
     /// [`crate::store::StoreError::PositionMoved`] where the position it
-    /// holds is not `after`, so the writer goes back to it.
+    /// holds is not `batch.after`, so the writer goes back to it.
     pub fn record_written(
         &self,
-        writes: Vec<(String, Envelope)>,
-        stream: &str,
-        after: Option<crate::store::WriteAheadPosition>,
-        through: crate::store::WriteAheadPosition,
-    ) -> Result<Vec<meridian_bus::HandlerReply>, crate::store::StoreError> {
-        struct Written {
+        writes: Vec<crate::write_ahead::Written>,
+        mut batch: crate::store::WriteAheadBatch,
+        valid_before: &BTreeMap<String, i64>,
+    ) -> Result<crate::write_ahead::Recorded, crate::store::StoreError> {
+        struct Kept {
             want_id: String,
             envelope: Envelope,
             kept: Vec<(String, usize)>,
@@ -1856,44 +1919,72 @@ impl Lake {
         }
         let now = self.clock.now_ns();
         let config = self.config();
-        let mut parts = Vec::new();
-        let mut written: Vec<Result<Written, String>> = Vec::with_capacity(writes.len());
-        for (topic, envelope) in writes {
-            let prepared = rows_of(&topic, &envelope).and_then(|(field, rows, want_id)| {
-                let by_dataset = self.prepared(field, rows, &envelope)?;
-                Ok((by_dataset, want_id))
-            });
-            written.push(prepared.map(|(by_dataset, want_id)| {
-                let mut write = Written {
-                    want_id,
-                    envelope,
-                    kept: Vec::new(),
-                    unkept: Vec::new(),
-                };
-                for (dataset, rows) in by_dataset {
-                    if config.licence(&dataset).kept {
-                        write.kept.push((dataset.clone(), parts.len()));
-                        parts.push((dataset, rows));
-                    } else {
-                        write.unkept.push((dataset, rows));
+        let mut valid: BTreeMap<String, i64> = BTreeMap::new();
+        let mut written: Vec<Result<Kept, String>> = Vec::with_capacity(writes.len());
+        for write in writes {
+            let prepared =
+                rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
+                    Ok((self.prepared(field, rows, &write.envelope)?, want))
+                });
+            let (by_dataset, want_id) = match prepared {
+                Ok(prepared) => prepared,
+                Err(refused) => {
+                    if write.after_gap.is_some() {
+                        tracing::warn!(
+                            refused,
+                            "a write after a gap in the write-ahead stream was refused: its \
+                             dataset's gap is found by its next write"
+                        );
                     }
+                    written.push(Err(refused));
+                    continue;
                 }
-                write
-            }));
+            };
+            let mut kept = Kept {
+                want_id,
+                envelope: write.envelope,
+                kept: Vec::new(),
+                unkept: Vec::new(),
+            };
+            for (dataset, rows) in by_dataset {
+                if let Some(dropped) = write.after_gap {
+                    batch.gaps.push(
+                        self.gap_found(
+                            &dataset,
+                            &rows,
+                            valid_before
+                                .get(&dataset)
+                                .copied()
+                                .unwrap_or(dropped.after_at_ns),
+                            dropped.until_at_ns,
+                            now,
+                        ),
+                    );
+                }
+                if config.licence(&dataset).kept {
+                    let latest = rows.iter().map(|row| row.meta().valid_from_ns).max();
+                    if let Some(latest) = latest {
+                        let at = valid.entry(dataset.clone()).or_insert(latest);
+                        *at = (*at).max(latest);
+                    }
+                    kept.kept.push((dataset.clone(), batch.parts.len()));
+                    batch.parts.push((dataset, rows));
+                } else {
+                    kept.unkept.push((dataset, rows));
+                }
+            }
+            written.push(Ok(kept));
         }
-        let batch = crate::store::WriteAheadBatch {
-            stream: stream.to_string(),
-            after,
-            through,
-            parts,
-        };
+        batch.valid = valid.into_iter().collect();
+        let gaps = batch.gaps.clone();
+        let valid = batch.valid.clone();
         let mut done: Vec<Option<crate::store::Recorded>> = self
             .store
             .record_write_ahead(batch, now)?
             .into_iter()
             .map(Some)
             .collect();
-        Ok(written
+        let answers = written
             .into_iter()
             .map(|write| {
                 let write = write?;
@@ -1915,7 +2006,314 @@ impl Lake {
                     reply.encode_to_vec(),
                 ))
             })
-            .collect())
+            .collect();
+        // Each gap found, recorded with the batch: asked again of its data
+        // plugin, or said unrecovered (W10.14).
+        for gap in gaps {
+            self.gap_recorded(gap);
+        }
+        Ok(crate::write_ahead::Recorded { answers, valid })
+    }
+
+    /// A gap found in `dataset` before the write whose rows are `rows`
+    /// (W10.14): from `valid_from_ns`, the dataset's latest valid time the
+    /// lake recorded before it, to the write's earliest, over the write's
+    /// subjects; refetching where the dataset declares `backfill`,
+    /// unrecovered where it declares anything else or nothing (the cautious
+    /// reading).
+    fn gap_found(
+        &self,
+        dataset: &str,
+        rows: &[Observation],
+        valid_from_ns: i64,
+        until_at_ns: i64,
+        now: i64,
+    ) -> meridian_domain::v1::DatasetGap {
+        use meridian_domain::v1::{GapCause, GapState};
+        let mut subjects: Vec<String> = rows
+            .iter()
+            .flat_map(|row| row.subjects())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        subjects.truncate(500);
+        let valid_until_ns = rows
+            .iter()
+            .map(|row| row.meta().valid_from_ns)
+            .filter(|at| *at > 0)
+            .min()
+            .unwrap_or(until_at_ns);
+        let backfill = self.config().declaration(dataset).is_some_and(|declared| {
+            declared.gap_recovery == meridian_pb::v1::GapRecovery::Backfill as i32
+        });
+        meridian_domain::v1::DatasetGap {
+            gap_id: gap_id(now),
+            dataset: dataset.to_string(),
+            subjects,
+            valid_from_ns: valid_from_ns.min(valid_until_ns),
+            valid_until_ns,
+            cause: GapCause::WriteAheadBound as i32,
+            state: if backfill {
+                GapState::Refetching
+            } else {
+                GapState::Unrecovered
+            } as i32,
+            recorded_at_ns: now,
+        }
+    }
+
+    /// A gap recorded (W10.14): asked again of its data plugin through the
+    /// want, naming the gap, once for each data type its dataset declares;
+    /// or, unrecovered, said, where its rows are never invented.
+    fn gap_recorded(&self, gap: meridian_domain::v1::DatasetGap) {
+        use meridian_domain::v1::GapState;
+        if gap.state != GapState::Refetching as i32 {
+            tracing::warn!(
+                gap_id = gap.gap_id,
+                dataset = gap.dataset,
+                valid_from_ns = gap.valid_from_ns,
+                valid_until_ns = gap.valid_until_ns,
+                "a gap in a dataset: rows the write-ahead stream dropped, which its dataset \
+                 cannot be asked for again; recorded and unrecovered"
+            );
+            return;
+        }
+        let now = self.clock.now_ns();
+        let data_types: Vec<String> = self
+            .config()
+            .declaration(&gap.dataset)
+            .map(|declared| declared.data_types.clone())
+            .unwrap_or_default();
+        let mut wants = BTreeSet::new();
+        for data_type in data_types {
+            let want_id = uuid::Uuid::new_v4().to_string();
+            let event = ObservationsWantedEvent {
+                want_id: want_id.clone(),
+                dataset: gap.dataset.clone(),
+                data_type,
+                subjects: gap
+                    .subjects
+                    .iter()
+                    .map(|subject| SubjectRef {
+                        entity_id: subject.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                valid_from_ns: gap.valid_from_ns,
+                valid_until_ns: gap.valid_until_ns,
+                gap_id: gap.gap_id.clone(),
+                ..Default::default()
+            };
+            self.wants.lock().expect("wants poisoned").open.insert(
+                want_id.clone(),
+                OpenWant {
+                    event: event.clone(),
+                    asked_by: ["lake".to_string()].into(),
+                    asked_at_ns: now,
+                    published_at_ns: now,
+                    cadence_ns: 0,
+                    settled: BTreeSet::new(),
+                    renewed_at_ns: 0,
+                },
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a gap's want was not published");
+            }
+            let change = WantChange {
+                want_id: want_id.clone(),
+                dataset: event.dataset.clone(),
+                kind: WantChangeKind::Asked,
+                subjects: gap.subjects.clone(),
+                reason: 0,
+                by: vec!["lake".into()],
+                at_ns: now,
+                want: Some(event),
+            };
+            if let Err(failed) = self.store.record_want(&change) {
+                tracing::warn!(%failed, "a gap's want was not recorded");
+            }
+            wants.insert(want_id);
+        }
+        if wants.is_empty() {
+            // Nothing its dataset declares to ask for: unrecovered.
+            self.gap_moved(gap, GapState::Unrecovered, now);
+            return;
+        }
+        tracing::info!(
+            gap_id = gap.gap_id,
+            dataset = gap.dataset,
+            wants = wants.len(),
+            "a gap in a dataset asked again of its data plugin"
+        );
+        self.refetching.lock().expect("refetching poisoned").insert(
+            gap.gap_id.clone(),
+            Refetching {
+                gap,
+                wants,
+                asked_at_ns: now,
+            },
+        );
+    }
+
+    /// A gap's next state, its own record (W10.14; decisions/031).
+    fn gap_moved(
+        &self,
+        mut gap: meridian_domain::v1::DatasetGap,
+        state: meridian_domain::v1::GapState,
+        now: i64,
+    ) {
+        gap.state = state as i32;
+        gap.recorded_at_ns = now;
+        match self.store.record_gap(&gap) {
+            Ok(()) => tracing::info!(
+                gap_id = gap.gap_id,
+                dataset = gap.dataset,
+                state = state.as_str_name(),
+                "a dataset's gap moved"
+            ),
+            Err(failed) => {
+                tracing::warn!(%failed, gap_id = gap.gap_id, "a gap's state was not recorded")
+            }
+        }
+    }
+
+    /// A want of a gap settled (W10.14): its gap recovered once every want
+    /// asked for it is answered whole; unrecovered at a decline.
+    fn gap_want_settled(&self, gap_id: &str, want_id: &str, declined: bool, closed: bool) {
+        use meridian_domain::v1::GapState;
+        let now = self.clock.now_ns();
+        let moved = {
+            let mut refetching = self.refetching.lock().expect("refetching poisoned");
+            let Some(held) = refetching.get_mut(gap_id) else {
+                return;
+            };
+            if declined {
+                refetching
+                    .remove(gap_id)
+                    .map(|held| (held, GapState::Unrecovered))
+            } else if closed {
+                held.wants.remove(want_id);
+                if held.wants.is_empty() {
+                    refetching
+                        .remove(gap_id)
+                        .map(|held| (held, GapState::Recovered))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((held, state)) = moved {
+            if state == GapState::Unrecovered {
+                self.forget_wants(&held.wants);
+            }
+            self.gap_moved(held.gap, state, now);
+        }
+    }
+
+    /// Gaps asked again past [`GAP_REFETCH_NS`] with no answer: unrecovered,
+    /// their wants withdrawn (W10.14).
+    fn sweep_gaps(&self, now: i64) {
+        use meridian_domain::v1::GapState;
+        let lapsed: Vec<Refetching> = {
+            let mut refetching = self.refetching.lock().expect("refetching poisoned");
+            let ids: Vec<String> = refetching
+                .iter()
+                .filter(|(_, held)| now - held.asked_at_ns > GAP_REFETCH_NS)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| refetching.remove(id)).collect()
+        };
+        for held in lapsed {
+            self.forget_wants(&held.wants);
+            self.gap_moved(held.gap, GapState::Unrecovered, now);
+        }
+    }
+
+    /// A gap's wants no longer asked: closed, and withdrawn from their data
+    /// plugin.
+    fn forget_wants(&self, ids: &BTreeSet<String>) {
+        let closed: Vec<OpenWant> = {
+            let mut wants = self.wants.lock().expect("wants poisoned");
+            ids.iter().filter_map(|id| wants.open.remove(id)).collect()
+        };
+        for open in closed {
+            let event = WantWithdrawnEvent {
+                want_id: open.event.want_id.clone(),
+                dataset: open.event.dataset.clone(),
+            };
+            if let Err(failed) = self.bus.publish(
+                WANT_WITHDRAWN,
+                "meridian.v1.WantWithdrawnEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a gap's want's withdrawal was not published");
+            }
+        }
+    }
+
+    /// The gaps still refetching when a writer starts (W10.14): their wants
+    /// were the last writer's, held in its memory, so each is asked again.
+    pub fn resume_gaps(&self) -> Result<usize, crate::store::StoreError> {
+        use meridian_domain::v1::GapState;
+        let open: Vec<meridian_domain::v1::DatasetGap> = latest_gaps(self.store.dataset_gaps()?)
+            .into_iter()
+            .filter(|gap| gap.state == GapState::Refetching as i32)
+            .collect();
+        let count = open.len();
+        for gap in open {
+            self.gap_recorded(gap);
+        }
+        Ok(count)
+    }
+
+    /// W10.14 (contract v30): a deployment admin reads the gaps, each in its
+    /// latest state, newest first, by dataset and state, a page at a time.
+    pub(crate) fn list_dataset_gaps(
+        &self,
+        request: meridian_domain::v1::ListDatasetGapsRequest,
+    ) -> Result<meridian_domain::v1::ListDatasetGapsReply, String> {
+        let mut gaps: Vec<meridian_domain::v1::DatasetGap> = latest_gaps(
+            self.store
+                .dataset_gaps()
+                .map_err(|failed| failed.to_string())?,
+        )
+        .into_iter()
+        .filter(|gap| request.dataset.is_empty() || gap.dataset == request.dataset)
+        .filter(|gap| request.state == 0 || gap.state == request.state)
+        .collect();
+        gaps.sort_by(|a, b| (b.recorded_at_ns, &b.gap_id).cmp(&(a.recorded_at_ns, &a.gap_id)));
+        let page = match request.page_size {
+            0 => GAPS_PAGE,
+            asked => (asked as usize).min(GAPS_MOST),
+        };
+        let skip: usize = if request.cursor.is_empty() {
+            0
+        } else {
+            request
+                .cursor
+                .parse()
+                .map_err(|_| format!("cursor {:?} is no cursor this read gave", request.cursor))?
+        };
+        let next = skip + page;
+        let next_cursor = if next < gaps.len() {
+            next.to_string()
+        } else {
+            String::new()
+        };
+        Ok(meridian_domain::v1::ListDatasetGapsReply {
+            gaps: gaps.into_iter().skip(skip).take(page).collect(),
+            next_cursor,
+        })
     }
 
     /// W10.11 (contract v27; ruling 481): execution costs, the analytics
@@ -2479,6 +2877,7 @@ impl Lake {
             .cloned()
             .collect();
         open.settled.extend(mine.iter().cloned());
+        let kind_was = kind.clone();
         let change = WantChange {
             want_id: want_id.to_string(),
             dataset: open.event.dataset.clone(),
@@ -2490,6 +2889,7 @@ impl Lake {
             want: None,
         };
         let done = !open.event.standing && open.settled.len() >= open.event.subjects.len();
+        let gap_id = open.event.gap_id.clone();
         if done {
             wants.open.remove(want_id);
             wants.by_key.retain(|_, id| id != want_id);
@@ -2497,6 +2897,12 @@ impl Lake {
         drop(wants);
         if let Err(failed) = self.store.record_want(&change) {
             tracing::warn!(%failed, "a want's change was not recorded");
+        }
+        // A gap's want (W10.14): its gap recovered once its wants are
+        // answered whole, unrecovered at a decline.
+        if !gap_id.is_empty() {
+            let declined = matches!(kind_was, WantChangeKind::Declined);
+            self.gap_want_settled(&gap_id, want_id, declined, done);
         }
     }
 
@@ -2706,6 +3112,7 @@ impl Lake {
     /// (at least a minute), withdrawn (W10.7).
     pub fn sweep_wants(&self) {
         let now = self.clock.now_ns();
+        self.sweep_gaps(now);
         let mut withdrawn = Vec::new();
         let mut again = Vec::new();
         {
@@ -6669,6 +7076,20 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .priorities()
                     .map_err(|failed| failed.to_string())?,
             })
+        },
+    );
+    // Contract v30 (W10.14): the gaps the write-ahead stream left, each in
+    // its latest state, for a deployment admin.
+    serve_on(
+        &bus,
+        &lake,
+        LIST_DATASET_GAPS,
+        (
+            "meridian.v1.ListDatasetGapsRequest",
+            "meridian.v1.ListDatasetGapsReply",
+        ),
+        |lake, request: meridian_domain::v1::ListDatasetGapsRequest, _| {
+            lake.list_dataset_gaps(request)
         },
     );
     serve_on(
