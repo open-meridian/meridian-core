@@ -1282,6 +1282,42 @@ impl Store for PostgresStore {
         tx.commit().map_err(unavailable)
     }
 
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        if switches.is_empty() {
+            return Ok(());
+        }
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let logged: Vec<(&str, Vec<u8>, i64)> = switches
+            .iter()
+            .map(|switch| {
+                (
+                    crate::store::CONTROL_SWITCH,
+                    switch.encode_to_vec(),
+                    switch.switched_at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut tx, &logged)?;
+        tx.commit().map_err(unavailable)
+    }
+
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        self.conn()?
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
+                &[&crate::store::CONTROL_SWITCH],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let body: Vec<u8> = row.get(0);
+                meridian_domain::v1::SourceSwitched::decode(&body[..]).map_err(unreadable)
+            })
+            .collect()
+    }
+
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
         self.conn()?
             .query("SELECT body FROM lake_dataset_gap ORDER BY change_id", &[])

@@ -4973,3 +4973,58 @@ fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
         .collect();
     assert_eq!(mine, vec![gap, recovered]);
 }
+
+/// Never blind (contract v30, W10.6; the resilience spec's section 8): a
+/// default read's source switches, and switches back, each its own record in
+/// the `control` partition, read back in the order recorded.
+#[test]
+fn a_source_switch_and_its_switch_back_are_kept_in_the_control_partition() {
+    use meridian_domain::v1::{SourceSwitchReason, SourceSwitched};
+    let store = store();
+    store.adopt().unwrap();
+    let from = unique("switch-a");
+    let to = unique("switch-b");
+    let before = store
+        .read_changes(meridian_changes::CONTROL, i64::MAX as u64, 1)
+        .unwrap()
+        .head;
+    let switch = |reason: SourceSwitchReason, a: &str, b: &str, at: i64| SourceSwitched {
+        data_type: "meridian.v1.Quote".into(),
+        kind: 0,
+        from_dataset: a.into(),
+        to_dataset: b.into(),
+        subjects: Vec::new(),
+        reason: reason as i32,
+        switched_at_ns: at,
+    };
+    store
+        .record_switches(&[switch(SourceSwitchReason::Stalled, &from, &to, 10)])
+        .unwrap();
+    store
+        .record_switches(&[switch(SourceSwitchReason::Restored, &to, &from, 20)])
+        .unwrap();
+    let mine: Vec<SourceSwitched> = store
+        .source_switches()
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.from_dataset == from || s.to_dataset == from)
+        .collect();
+    assert_eq!(
+        mine.iter().map(|s| s.reason).collect::<Vec<_>>(),
+        vec![
+            SourceSwitchReason::Stalled as i32,
+            SourceSwitchReason::Restored as i32
+        ]
+    );
+    let control = store
+        .read_changes(meridian_changes::CONTROL, before, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert!(
+        control
+            .changes
+            .iter()
+            .filter(|c| c.kind == "meridian.v1.SourceSwitched")
+            .count()
+            >= 2
+    );
+}

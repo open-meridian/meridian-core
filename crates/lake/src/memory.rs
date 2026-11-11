@@ -43,6 +43,8 @@ struct Held {
     valid: BTreeMap<(String, String), i64>,
     /// Every dataset gap's every state, in order (W10.14).
     gaps: Vec<meridian_domain::v1::DatasetGap>,
+    /// Every switch of a default read's source, in order (W10.6).
+    switches: Vec<meridian_domain::v1::SourceSwitched>,
 }
 
 #[derive(Default)]
@@ -367,6 +369,28 @@ impl Store for MemoryStore {
 
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
         Ok(self.lock().gaps.clone())
+    }
+
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        use prost::Message as _;
+        let mut held = self.lock();
+        let logged = switches
+            .iter()
+            .map(|switch| {
+                (
+                    crate::store::CONTROL_SWITCH,
+                    switch.encode_to_vec(),
+                    switch.switched_at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut held, logged)?;
+        held.switches.extend(switches.iter().cloned());
+        Ok(())
+    }
+
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        Ok(self.lock().switches.clone())
     }
 
     fn serve_unkept(

@@ -770,6 +770,14 @@ impl Store for HotStore {
         self.inner.dataset_gaps()
     }
 
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        self.inner.record_switches(switches)
+    }
+
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        self.inner.source_switches()
+    }
+
     fn serve_unkept(
         &self,
         dataset: &str,

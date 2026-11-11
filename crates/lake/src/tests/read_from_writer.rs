@@ -100,6 +100,7 @@ struct Members {
     writer_bus: Arc<Bus>,
     client: Arc<Bus>,
     store: Arc<MemoryStore>,
+    clock: Arc<ManualClock>,
 }
 
 fn members(configured: &EntitlementsChangedEvent) -> Members {
@@ -128,13 +129,14 @@ fn members(configured: &EntitlementsChangedEvent) -> Members {
     );
     let reader = service::serve(reader_bus, reading, clock.clone());
     reader.configured(configured);
-    let client = Arc::new(Bus::single("reporting-1", broker.clone(), clock));
+    let client = Arc::new(Bus::single("reporting-1", broker.clone(), clock.clone()));
     Members {
         broker,
         writer,
         writer_bus,
         client,
         store,
+        clock,
     }
 }
 
@@ -357,4 +359,98 @@ async fn a_read_that_asks_a_source_is_wanted_by_the_writer_whichever_member_take
     };
     assert!(reasons(&at_writer).contains(&(UnansweredReason::AskedSource as i32)));
     assert_eq!(reasons(&at_reader), reasons(&at_writer));
+}
+
+/// Never blind (the resilience spec's section 8): a default read of the
+/// latest now whose first source's rows are past its stale ceiling -- which
+/// only its liveness, the writer's, can say is alive -- is handed to the
+/// writer by a reader member, so a stalled source is passed over, and a live
+/// one kept, alike whichever member takes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_liveness_can_settle_is_the_writers_whichever_member_takes_it() {
+    let mut config = configuration(true, &[]);
+    for dataset in &mut config.datasets {
+        if dataset.dataset == "coinbase-1:daily" {
+            dataset.stale_after_ns = 10;
+        }
+    }
+    let m = members(&config);
+    let latest = |instance: &str, row_key: &str, amount: &str| {
+        let mut price = close(instance, row_key, BTC, "", amount);
+        let meta = price.meta.as_mut().unwrap();
+        meta.business_date = String::new();
+        meta.valid_until_ns = 0;
+        tokio::task::block_in_place(|| {
+            m.writer.record(
+                "prices",
+                vec![Observation::Price(Box::new(price))],
+                "",
+                &envelope(instance, true, ""),
+            )
+        })
+        .unwrap();
+    };
+    latest("coinbase-1", "c", "61000");
+    latest("kraken-1", "k", "61010");
+    // Past the ceiling since the rows were recorded, and alive by the
+    // source's liveness, which the writer alone holds: coinbase answers.
+    m.clock.advance(100);
+    tokio::task::block_in_place(|| {
+        m.writer.record_liveness(
+            RecordLivenessRequest {
+                liveness: vec![DatasetLiveness {
+                    dataset: "coinbase-1:daily".into(),
+                    venue_id: String::new(),
+                    alive_at_ns: NOW + 100,
+                    instance: String::new(),
+                }],
+            },
+            &envelope("coinbase-1", true, ""),
+        )
+    })
+    .unwrap();
+    let at_writer: ListPricesReply = ask(
+        &m,
+        WRITER,
+        service::LIST_PRICES,
+        "meridian.v1.ListPricesRequest",
+        btc_on(""),
+    )
+    .await;
+    let at_reader: ListPricesReply = ask(
+        &m,
+        READER,
+        service::LIST_PRICES,
+        "meridian.v1.ListPricesRequest",
+        btc_on(""),
+    )
+    .await;
+    assert_eq!(
+        said(&at_writer).0,
+        vec![("c".to_string(), "61000".to_string())]
+    );
+    assert_eq!(said(&at_reader), said(&at_writer), "answered alike");
+    // No sign of life within the ceiling: kraken answers, from either.
+    m.clock.advance(100);
+    let at_writer: ListPricesReply = ask(
+        &m,
+        WRITER,
+        service::LIST_PRICES,
+        "meridian.v1.ListPricesRequest",
+        btc_on(""),
+    )
+    .await;
+    let at_reader: ListPricesReply = ask(
+        &m,
+        READER,
+        service::LIST_PRICES,
+        "meridian.v1.ListPricesRequest",
+        btc_on(""),
+    )
+    .await;
+    assert_eq!(
+        said(&at_writer).0,
+        vec![("k".to_string(), "61010".to_string())]
+    );
+    assert_eq!(said(&at_reader), said(&at_writer), "answered alike");
 }

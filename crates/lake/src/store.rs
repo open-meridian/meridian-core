@@ -144,6 +144,10 @@ impl Dropped {
 /// A dataset gap's control change's kind (W10.14): each change of its state.
 pub const CONTROL_GAP: &str = "meridian.v1.DatasetGap";
 
+/// A default read's source switched, or switched back (W10.6; the
+/// resilience spec's section 8): its control change's kind.
+pub const CONTROL_SWITCH: &str = "meridian.v1.SourceSwitched";
+
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Recorded {
@@ -535,6 +539,21 @@ pub trait Store: Send + Sync {
 
     /// Every dataset gap's every state, in the order recorded (W10.14).
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        Ok(Vec::new())
+    }
+
+    /// Switches of the default reads' sources, and switches back, each its
+    /// own record (W10.6; the resilience spec's section 8; decisions/031),
+    /// in the `control` partition, in one transaction.
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        let _ = switches;
+        Err(StoreError::Unavailable(
+            "this store keeps no source switches".into(),
+        ))
+    }
+
+    /// Every switch recorded, in the order recorded (W10.6).
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
         Ok(Vec::new())
     }
 

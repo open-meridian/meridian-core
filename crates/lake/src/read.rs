@@ -41,7 +41,8 @@ use std::sync::Arc;
 
 use meridian_domain::date::Date;
 use meridian_domain::v1::{
-    InstrumentType, SourceChoice, SourcePriority, SourceTimeKind, Tenor, UnansweredReason,
+    InstrumentType, SourceChoice, SourcePriority, SourceSwitchReason, SourceTimeKind, Tenor,
+    UnansweredReason,
 };
 use meridian_pb::v1::ObservationMode;
 
@@ -335,6 +336,28 @@ pub struct Against<'a> {
     /// Each replaced record and the one that stays (W10.8).
     pub aliases: &'a BTreeMap<String, String>,
     pub now_ns: i64,
+    /// Each dataset's latest sign of life: its source's liveness (W10.4;
+    /// ruling 418), the latest over its venues, by which a default read's
+    /// stalled source is judged (the resilience spec's section 8). `None`
+    /// where this member holds none: a reader member, whose liveness only
+    /// the writer's commands set.
+    pub liveness: Option<&'a BTreeMap<String, i64>>,
+    /// Whether the read is of the latest now, its caller having named no
+    /// cut-off: only such a default read passes over a stalled or
+    /// quarantined source, and says what it served for the lake's switches.
+    pub live: bool,
+}
+
+/// A default read of the latest now, per subject and kind (the resilience
+/// spec's section 8, never blind): the dataset that served it -- empty where
+/// none was left to -- and each dataset above it passed over, with why.
+/// What the lake records its source switches from (`SourceSwitched`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Switching {
+    pub kind: i32,
+    pub subject: String,
+    pub served: String,
+    pub passed: Vec<(String, SourceSwitchReason)>,
 }
 
 /// How long a source's decline answers for it before it is asked again.
@@ -393,6 +416,29 @@ pub fn by_priority(
             .collect(),
         None => readable.to_vec(),
     }
+}
+
+/// Whether a dataset is stalled for a default read of the latest now (the
+/// resilience spec's section 8; spec/sessions-and-data-report-their-
+/// latency-and-quality): its stale ceiling is set, and nothing within it
+/// says its source is alive -- no row of the subject recorded since, and no
+/// liveness stated. `None` where only its liveness could say, and this
+/// member holds none.
+fn stalled(dataset: &str, rows: &[Candidate], against: &Against<'_>) -> Option<bool> {
+    let ceiling = against
+        .config
+        .datasets
+        .get(dataset)
+        .map_or(0, |d| d.stale_after_ns);
+    if ceiling <= 0 {
+        return Some(false);
+    }
+    let since = against.now_ns.saturating_sub(ceiling);
+    if rows.iter().any(|row| row.recorded_at_ns >= since) {
+        return Some(false);
+    }
+    let liveness = against.liveness?;
+    Some(liveness.get(dataset).is_none_or(|alive| *alive < since))
 }
 
 /// Whether a dataset's latest row for a subject, recorded then, is older
@@ -747,6 +793,14 @@ pub struct Chosen {
     pub rows: Vec<Candidate>,
     pub not_served: Vec<NotServed>,
     pub asks: Vec<Ask>,
+    /// A default read of the latest now: what each subject and kind was
+    /// served from, and what was passed over (the resilience spec's section
+    /// 8). Empty for every other read.
+    pub switching: Vec<Switching>,
+    /// A source whose rows are past its stale ceiling, which only its
+    /// liveness could say is alive, and this member holds none: a reader
+    /// member's read, the writer's to answer.
+    pub stall_unknown: bool,
 }
 
 type LatestKey = (Arc<str>, Arc<str>, i32, Arc<str>, i64, Arc<str>, Arc<str>);
@@ -767,6 +821,11 @@ struct Gather<'a, 'b> {
     /// one not (W10.6; rulings 421, 422 and 619).
     invalid_seen: BTreeSet<(String, String, i32)>,
     valid_seen: BTreeSet<(String, String, i32)>,
+    /// A default read of the latest: each subject's, dataset's and kind's
+    /// latest row so far, by valid time and sequence, and whether it is
+    /// held quarantined (invalid): a dataset whose latest is, is passed over
+    /// (the resilience spec's section 8).
+    latest_state: BTreeMap<(String, String, i32), (i64, u64, bool)>,
     /// A read of the latest: the latest in force per key so far.
     latest: Option<BTreeMap<LatestKey, Candidate>>,
     rows: Vec<Candidate>,
@@ -785,6 +844,7 @@ impl<'a, 'b> Gather<'a, 'b> {
             tenor_asked: BTreeSet::new(),
             invalid_seen: BTreeSet::new(),
             valid_seen: BTreeSet::new(),
+            latest_state: BTreeMap::new(),
             latest: matches!(read.when, When::Latest { .. }).then(BTreeMap::new),
             rows: Vec::new(),
             held_bytes: 0,
@@ -868,6 +928,16 @@ impl<'a, 'b> Gather<'a, 'b> {
                 row.dataset().to_string(),
                 row.kind(),
             );
+            if switching(read, self.against) {
+                let at = (row.meta().valid_from_ns, row.meta().sequence);
+                let bad = invalid(&row);
+                match self.latest_state.get(&held) {
+                    Some((valid_from_ns, sequence, _)) if (*valid_from_ns, *sequence) >= at => {}
+                    _ => {
+                        self.latest_state.insert(held.clone(), (at.0, at.1, bad));
+                    }
+                }
+            }
             if invalid(&row) {
                 self.invalid_seen.insert(held);
                 return;
@@ -979,6 +1049,16 @@ fn held_bytes_of(candidate: &Candidate) -> usize {
         Place::Held(row) => held_cost(row),
         Place::Kept(..) => 0,
     }
+}
+
+/// Whether a read is a default read of the latest now, which passes over a
+/// silent, stalled or quarantined source and says so (the resilience spec's
+/// section 8).
+fn switching(read: &Read, against: &Against<'_>) -> bool {
+    against.live
+        && read.sources.named.is_empty()
+        && !read.sources.side_by_side
+        && matches!(read.when, When::Latest { .. })
 }
 
 fn alias_of(read: &Read, against: &Against<'_>, subject: &str) -> String {
@@ -1179,10 +1259,12 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
         tenor_asked,
         invalid_seen,
         valid_seen,
+        latest_state,
         latest,
         mut rows,
         ..
     } = gather;
+    let default_live = switching(read, against);
     let tenor_silent: BTreeSet<(String, String)> =
         tenor_seen.difference(&tenor_asked).cloned().collect();
     // A dataset left with nothing for a subject and kind is source silent:
@@ -1341,6 +1423,10 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
             for mut group in groups {
                 let mut answered = false;
                 let mut first_silent: Option<Vec<Candidate>> = None;
+                // Never blind (the resilience spec's section 8): what a
+                // default read of the latest now served, and passed over.
+                let mut served = String::new();
+                let mut passed: Vec<(String, SourceSwitchReason)> = Vec::new();
                 for dataset in &order {
                     let (of, rest): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(&mut group)
                         .into_iter()
@@ -1351,6 +1437,54 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
                         && of.iter().all(silent);
                     if of.is_empty() && holding.contains(dataset.as_str()) {
                         continue;
+                    }
+                    if default_live {
+                        // Its latest rows held quarantined, or no sign of
+                        // life within its stale ceiling: passed over for the
+                        // next source by priority, its last good rows kept
+                        // to answer with, aged, where none is left.
+                        let quarantined = latest_state
+                            .get(&(subject.clone(), dataset.clone(), kind))
+                            .is_some_and(|(_, _, bad)| *bad);
+                        let stalled = if quarantined || of.is_empty() {
+                            Some(false)
+                        } else {
+                            stalled(dataset, &of, against)
+                        };
+                        if stalled.is_none() {
+                            out.stall_unknown = true;
+                        }
+                        let reason = if quarantined {
+                            Some(SourceSwitchReason::Quarantined)
+                        } else if stalled == Some(true) {
+                            Some(SourceSwitchReason::Stalled)
+                        } else if latest_silent {
+                            Some(SourceSwitchReason::Silent)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
+                            passed.push((dataset.clone(), reason));
+                        }
+                        if quarantined || stalled == Some(true) {
+                            let said = NotServed {
+                                subject: subject.clone(),
+                                dataset: dataset.clone(),
+                                field: String::new(),
+                                reason: if quarantined {
+                                    UnansweredReason::Quarantined
+                                } else {
+                                    UnansweredReason::SourceSilent
+                                },
+                            };
+                            if !fallen.contains(&said) {
+                                fallen.push(said);
+                            }
+                            if !of.is_empty() {
+                                first_silent.get_or_insert(of);
+                            }
+                            continue;
+                        }
                     }
                     if of.is_empty() || latest_silent {
                         let (reason, ask) = why_not(dataset, subject, kind);
@@ -1405,12 +1539,21 @@ pub fn choose(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<C
                     }
                     chosen.extend(of);
                     answered = true;
+                    served = dataset.clone();
                     break;
                 }
                 if !answered {
                     if let Some(of) = first_silent {
                         chosen.extend(of);
                     }
+                }
+                if default_live && (answered || !passed.is_empty()) {
+                    out.switching.push(Switching {
+                        kind,
+                        subject: subject.clone(),
+                        served,
+                        passed,
+                    });
                 }
             }
             out.not_served.extend(fallen);

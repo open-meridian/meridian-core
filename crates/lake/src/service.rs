@@ -148,6 +148,9 @@ pub const LIST_EXECUTION_COSTS: &str = "platform.lake.query.list-execution-costs
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
 /// Contract v30 (W10.14): a deployment admin reads the dataset gaps.
 pub const LIST_DATASET_GAPS: &str = "platform.lake.query.list-dataset-gaps";
+/// Contract v30 (W10.6; the resilience spec's section 8): a deployment admin
+/// reads the switches of the default reads' sources.
+pub const LIST_SOURCE_SWITCHES: &str = "platform.lake.query.list-source-switches";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
 /// A lake read handed on, unchanged, by a reader member to the writer, which
 /// alone serves it, and the writer's reply (contract v30, stage B; topics.md,
@@ -403,6 +406,10 @@ pub struct Lake {
     /// Each gap asked again of its data plugin (W10.14), by its ID: the gap
     /// as recorded, the wants still open for it, and when it was asked.
     refetching: Mutex<BTreeMap<String, Refetching>>,
+    /// The sources the default reads pass over now, as the lake last
+    /// recorded their switches (contract v30, W10.6; the resilience spec's
+    /// section 8): rebuilt from the records at start.
+    switches: Mutex<crate::switches::Switches>,
 }
 
 /// A gap asked again of its data plugin (W10.14): recovered once every want
@@ -725,6 +732,17 @@ impl Lake {
             .map(|event| DataConfig::from_event(&event))
             .unwrap_or_default();
         let reads_only = bus.reads_only();
+        // The switches recorded so far (W10.6): what a writer taking over
+        // holds as passed over, so it records none of them again.
+        let mut switches = crate::switches::Switches::default();
+        if !reads_only {
+            match store.source_switches() {
+                Ok(recorded) => switches.replay(&recorded),
+                Err(failed) => {
+                    tracing::warn!(%failed, "the source switches recorded could not be read; held as none")
+                }
+            }
+        }
         Arc::new(Lake {
             bus,
             reads_only,
@@ -751,7 +769,108 @@ impl Lake {
             ),
             read_handlers: RwLock::new(BTreeMap::new()),
             refetching: Mutex::new(BTreeMap::new()),
+            switches: Mutex::new(switches),
             store,
+        })
+    }
+
+    /// Each dataset's latest sign of life, its liveness over every venue
+    /// (W10.4; ruling 418), by which a default read's stalled source is
+    /// judged (the resilience spec's section 8).
+    fn alive(&self) -> BTreeMap<String, i64> {
+        let mut alive: BTreeMap<String, i64> = BTreeMap::new();
+        for ((dataset, _), liveness) in self.liveness.lock().expect("liveness poisoned").iter() {
+            let at = alive.entry(dataset.clone()).or_insert(liveness.alive_at_ns);
+            *at = (*at).max(liveness.alive_at_ns);
+        }
+        alive
+    }
+
+    /// A default read's switches (W10.6; the resilience spec's section 8):
+    /// each source it passed over that was not already, and each it served
+    /// from again, recorded in the `control` partition and published. The
+    /// writer's alone; a record that did not commit is made again by the
+    /// next such read.
+    fn note_switches(&self, data_type: DataType, switching: &[read::Switching]) {
+        if self.reads_only || switching.is_empty() {
+            return;
+        }
+        let mut held = self.switches.lock().expect("switches poisoned");
+        let made = held.observe(data_type, switching, self.clock.now_ns());
+        if held.over_bound() {
+            tracing::warn!(
+                most = crate::switches::HELD_MOST,
+                "the lake holds as many passed-over sources as it may: a switch is recorded, and its switch back is not"
+            );
+        }
+        if made.is_empty() {
+            return;
+        }
+        match self.store.record_switches(&made) {
+            Ok(()) => {
+                drop(held);
+                for switch in &made {
+                    tracing::warn!(
+                        data_type = switch.data_type,
+                        from = switch.from_dataset,
+                        to = switch.to_dataset,
+                        reason = switch.reason,
+                        subjects = switch.subjects.len(),
+                        "a default read's source switched"
+                    );
+                }
+                self.publish_control();
+            }
+            Err(failed) => {
+                held.forget(&made);
+                tracing::warn!(%failed, "a source switch was not recorded; the next default read records it");
+            }
+        }
+    }
+
+    /// W10.6 (contract v30; the resilience spec's section 8): a deployment
+    /// admin reads the switches of the default reads' sources, and the
+    /// switches back, newest first, by data type and dataset, a page at a
+    /// time. Changes nothing.
+    pub(crate) fn list_source_switches(
+        &self,
+        request: meridian_domain::v1::ListSourceSwitchesRequest,
+    ) -> Result<meridian_domain::v1::ListSourceSwitchesReply, String> {
+        let mut switches: Vec<meridian_domain::v1::SourceSwitched> = self
+            .store
+            .source_switches()
+            .map_err(|failed| failed.to_string())?
+            .into_iter()
+            .filter(|s| request.data_type.is_empty() || s.data_type == request.data_type)
+            .filter(|s| {
+                request.dataset.is_empty()
+                    || s.from_dataset == request.dataset
+                    || s.to_dataset == request.dataset
+            })
+            .collect();
+        // Newest first: the records are in the order recorded.
+        switches.reverse();
+        let page = match request.page_size {
+            0 => GAPS_PAGE,
+            asked => (asked as usize).min(GAPS_MOST),
+        };
+        let skip: usize = if request.cursor.is_empty() {
+            0
+        } else {
+            request
+                .cursor
+                .parse()
+                .map_err(|_| format!("cursor {:?} is no cursor this read gave", request.cursor))?
+        };
+        let next = skip + page;
+        let next_cursor = if next < switches.len() {
+            next.to_string()
+        } else {
+            String::new()
+        };
+        Ok(meridian_domain::v1::ListSourceSwitchesReply {
+            switches: switches.into_iter().skip(skip).take(page).collect(),
+            next_cursor,
         })
     }
 
@@ -3519,12 +3638,18 @@ impl Lake {
             window: request.window,
             fields: request.fields.into_iter().collect(),
         };
+        // Never blind (the resilience spec's section 8): a default read of
+        // the latest now passes over a stalled source by its liveness, which
+        // the writer alone holds.
+        let alive = (!self.reads_only).then(|| self.alive());
         let against = Against {
             config: &config,
             priorities: &priorities,
             declined: &declined,
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
+            liveness: alive.as_ref(),
+            live: request.as_of_ns == 0 && request.cursor.is_empty(),
         };
         // A later page read from the answer its first page made, where it is
         // held, by its rows' places; otherwise the whole read is answered
@@ -3716,6 +3841,17 @@ impl Lake {
         if self.reads_only && !answered.asks.is_empty() {
             return Err(to_the_writer());
         }
+        // A default read of the latest now whose source is past its stale
+        // ceiling, which only its liveness could say is alive: the writer
+        // holds the liveness, and so answers it (the resilience spec's
+        // section 8, never blind).
+        if self.reads_only && answered.stall_unknown {
+            return Err(to_the_writer());
+        }
+        // Its switches, recorded by the writer (W10.6).
+        let switching = std::mem::take(&mut answered.switching);
+        self.note_switches(read.data_type, &switching);
+        drop(switching);
         // A dataset served, not kept (W10.7; ruling 734): the read that
         // asked hears what is served within its wait; any other is told it
         // is not kept, never asked forever.
@@ -4774,6 +4910,8 @@ impl Lake {
                 declined: &read::Declined::new(),
                 aliases: &aliases,
                 now_ns: self.clock.now_ns(),
+                liveness: None,
+                live: false,
             },
         )?;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -5256,6 +5394,8 @@ impl Lake {
             declined: &declined,
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
+            liveness: None,
+            live: false,
         };
         let mut asks = Vec::new();
         for (i, want) in request.wants.iter().enumerate() {
@@ -7076,6 +7216,20 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .priorities()
                     .map_err(|failed| failed.to_string())?,
             })
+        },
+    );
+    // Contract v30 (W10.6; the resilience spec's section 8): the switches of
+    // the default reads' sources, for a deployment admin.
+    serve_on(
+        &bus,
+        &lake,
+        LIST_SOURCE_SWITCHES,
+        (
+            "meridian.v1.ListSourceSwitchesRequest",
+            "meridian.v1.ListSourceSwitchesReply",
+        ),
+        |lake, request: meridian_domain::v1::ListSourceSwitchesRequest, _| {
+            lake.list_source_switches(request)
         },
     );
     // Contract v30 (W10.14): the gaps the write-ahead stream left, each in

@@ -290,6 +290,10 @@ impl Store for ReaderStore {
         self.past().dataset_gaps()
     }
 
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        self.past().source_switches()
+    }
+
     fn served(&self) -> Result<Vec<Served>> {
         self.past().served()
     }
