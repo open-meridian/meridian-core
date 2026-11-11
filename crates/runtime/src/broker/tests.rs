@@ -388,7 +388,17 @@ fn a_data_plugin_writes_ahead_on_its_own_subjects_and_the_lake_reads_the_stream(
     assert!(data
         .publish
         .contains(&"platform.lake.internal.write-ahead.truefx.*".to_string()));
-    assert!(!data.publish.iter().any(|s| s.starts_with("$JS")));
+    // JetStream's API for its own datasets' last writes alone, by subject
+    // (contract v30, stage C: a restarted sidecar's chain).
+    let api: Vec<&String> = data
+        .publish
+        .iter()
+        .filter(|s| s.starts_with("$JS"))
+        .collect();
+    assert_eq!(
+        api,
+        vec!["$JS.API.DIRECT.GET.LAKE_WRITE_AHEAD.platform.lake.internal.write-ahead.truefx.*"]
+    );
     let reporting = user(&users, "reporting-1");
     assert!(!reporting
         .publish

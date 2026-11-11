@@ -237,6 +237,10 @@ pub fn stream_config(bounds: &Bounds) -> stream::Config {
         max_age: bounds.max_age,
         max_bytes: bounds.max_bytes,
         discard: stream::DiscardPolicy::New,
+        // A sidecar restarted reads the last write of each of its datasets
+        // back, by its subject alone, to go on with its chain (contract
+        // v30, stage C).
+        allow_direct: true,
         ..Default::default()
     }
 }

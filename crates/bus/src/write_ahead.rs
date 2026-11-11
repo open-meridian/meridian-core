@@ -203,7 +203,8 @@ pub struct WriteAhead {
     max_payload: Box<dyn Fn() -> usize + Send + Sync>,
     fallback: Arc<dyn Backend>,
     replies: Arc<Replies>,
-    /// The stream's sequence of the write it held last, by subject.
+    /// The stream's sequence of the write it held last, by subject; 0 where
+    /// the stream holds none of the subject's.
     after: Mutex<HashMap<String, u64>>,
 }
 
@@ -274,13 +275,7 @@ impl WriteAhead {
         if let Some(meta) = envelope.meta.as_ref().filter(|m| !m.message_id.is_empty()) {
             headers.insert(MESSAGE_ID_HEADER, meta.message_id.as_str());
         }
-        if let Some(after) = self
-            .after
-            .lock()
-            .expect("after poisoned")
-            .get(&subject)
-            .copied()
-        {
+        if let Some(after) = self.after_of(&subject, deadline).await {
             headers.insert(AFTER_HEADER, after.to_string().as_str());
         }
         // A write whose caller has stopped waiting -- it waited past its
@@ -339,6 +334,40 @@ impl WriteAhead {
                 Err(timed_out())
             }
         }
+    }
+}
+
+impl WriteAhead {
+    /// The stream's sequence of the write this sidecar's stream held last on
+    /// `subject`, its dataset's chain. Kept as each write is held; and where
+    /// this process has held none -- a sidecar restarted -- taken from the
+    /// stream, the last message on the subject (contract v30, stage C,
+    /// approved 2026-11-11), so a restart never hides a gap from the
+    /// writer. None where the stream holds none of it, or could not say in
+    /// time (at most a second, within the write's deadline).
+    async fn after_of(&self, subject: &str, deadline: Instant) -> Option<u64> {
+        if let Some(held) = self.after.lock().expect("after poisoned").get(subject) {
+            return (*held > 0).then_some(*held);
+        }
+        let within = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        let stream = self.context.get_stream_no_info(STREAM).await.ok()?;
+        let last = tokio::time::timeout(within, stream.direct_get_last_for_subject(subject)).await;
+        let held = match last {
+            Ok(Ok(message)) => message.sequence,
+            Ok(Err(failed)) if failed.kind() == jetstream::stream::DirectGetErrorKind::NotFound => {
+                0
+            }
+            Ok(Err(failed)) => {
+                tracing::warn!(subject, %failed, "the stream's last write of a dataset could not be read; its chain begins here");
+                return None;
+            }
+            Err(_) => return None,
+        };
+        let mut after = self.after.lock().expect("after poisoned");
+        let held = *after.entry(subject.to_string()).or_insert(held);
+        (held > 0).then_some(held)
     }
 }
 

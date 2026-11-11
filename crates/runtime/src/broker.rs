@@ -308,6 +308,12 @@ pub fn permissions_entitled(
     // its own instance's subjects alone, so it writes no other's datasets.
     if roles.iter().any(|role| role == "data") && dataset_reads(instance_id) {
         publish.insert(format!("{WRITE_AHEAD}.{instance_id}.*"));
+        // And the last write of each of its own datasets read back from the
+        // stream, by subject, as a restarted sidecar goes on with its chain
+        // (contract v30, stage C): its own instance's subjects alone.
+        publish.insert(format!(
+            "$JS.API.DIRECT.GET.LAKE_WRITE_AHEAD.{WRITE_AHEAD}.{instance_id}.*"
+        ));
     }
     for topic in granted.subscribe.iter().chain(&sidecar.subscribe) {
         if topic.contains(DATASET) {
