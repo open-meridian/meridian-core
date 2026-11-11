@@ -150,5 +150,16 @@ debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
 
+# Third-party crates without debug info in the debug and test builds: the
+# workspace's own keep their line tables, so a stack trace through our code
+# stays readable. Measured on e48cefb in a fresh target directory (the
+# workspace's debug build and every test binary, as CI's compile stage
+# makes them): 8,463 MiB without this, 6,976 MiB with it.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 debug = false
