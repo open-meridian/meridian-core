@@ -283,6 +283,16 @@ data:
       data_dir: /var/lib/postgresql/data/pgdata
       bin_dir: /usr/local/bin
       pgpass: /tmp/pgpass
+      # A member made, or made again, from its primary by pg_basebackup asks
+      # for an immediate checkpoint, never a spread one: a spread checkpoint
+      # paces its writes over checkpoint_completion_target of
+      # checkpoint_timeout, 270 s of Postgres's 300, and the new member waited
+      # all of it before it streamed (PR CI 42977215067: the third member
+      # started streaming at 07:25:31, four seconds after a checkpoint whose
+      # writes took 269.1 s). Patroni's basebackup options, its
+      # `--checkpoint=fast`.
+      basebackup:
+        - checkpoint: fast
       {{- if or $archive $tls }}
       parameters:
         {{- if $archive }}

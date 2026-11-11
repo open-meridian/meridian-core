@@ -2822,7 +2822,7 @@ chart-check:
 			|| { echo "chart-check FAILED: the ha profile gives $$store no standby" >&2; exit 1; }; \
 	done; \
 	for held in "meridian.dev/database-manager: patroni" "meridian.dev/database-role: primary" \
-		"synchronous_mode: quorum" "synchronous_mode_strict: true" "failsafe_mode: true" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
+		"synchronous_mode: quorum" "synchronous_mode_strict: true" "failsafe_mode: true" "checkpoint: fast" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
 		"name: check-meridian-runtime-broker-jetstream-members" "name: check-meridian-runtime-database-members" \
 		"meridian.dev/broker-set: check-meridian-runtime-broker-jetstream"; do \
 		echo "$$ha" | grep -q -- "$$held" \
