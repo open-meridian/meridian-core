@@ -10,7 +10,12 @@ DRIVER_ROLE says which of its instances it is:
 
 - `data`: one dataset declared at registration (`<instance>:drive`), and a
   price recorded into it every half second (RecordPrices, data -> lake),
-  each named by its row key;
+  each named by its row key; and, holding reporting too, its latest read
+  back every second as a live page reads it (a default read of the latest,
+  ListPrices), each read kept in /tmp/page.log as `PAGE <unix ms> ok
+  <row key> <valid ms>`, `PAGE <unix ms> empty` or `PAGE <unix ms> failed
+  <status>`: what the buy-side trust targets are measured from (contract
+  v30, stage C; the resilience spec's section 15);
 - `oms`: telephoned orders recorded in the accounts of DRIVER_ACCOUNTS
   (RecordOrder, oms -> book), each the next number in its account, and the
   accounts read back through the book's writer (ListOrders), by two
@@ -339,6 +344,29 @@ async def drive_data(plugin, gen):
             say(f"REFUSED price {key}: {words(failed)}")
             await asyncio.sleep(0.5)
         await asyncio.sleep(0.5)
+
+
+async def drive_page(plugin):
+    """A live page's reads of the driver's own price (contract v30, stage
+    C): the latest, by the deployment's default sources, every second, as
+    the kit's live cells are drawn; each answer's row and its valid time
+    kept, or that it was empty or failed. The page ages each value itself."""
+    stub = plugin._operations()
+    while not stopped():
+        began = int(time.time() * 1000)
+        try:
+            listed = await bounded(stub.ListPrices(ops.ListPricesParams(
+                subjects=[ops.SubjectRef(entity_id=INSTRUMENT)], page_size=1)))
+            if listed.prices:
+                meta = listed.prices[0].meta
+                kept("/tmp/page.log", f"PAGE {began} ok {meta.row_key} {meta.valid_from_ns // 1_000_000}")
+            else:
+                kept("/tmp/page.log", f"PAGE {began} empty")
+        except asyncio.TimeoutError:
+            kept("/tmp/page.log", f"PAGE {began} failed TIMEOUT")
+        except grpc.aio.AioRpcError as failed:
+            kept("/tmp/page.log", f"PAGE {began} failed {failed.code().name}")
+        await asyncio.sleep(max(0.0, 1.0 - (time.time() * 1000 - began) / 1000))
 
 
 # ── oms -> book ─────────────────────────────────────────────────────────────
@@ -913,7 +941,7 @@ async def main():
                          "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
-    roles = {"data": [Recording()], "oms": [Managing()], "desk": [Desking(), Managing()],
+    roles = {"data": [Recording(), Reporting()], "oms": [Managing()], "desk": [Desking(), Managing()],
              "flood": [Recording(), Reporting()], "standing": [Reporting()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
@@ -922,7 +950,8 @@ async def main():
             async with await connect(declaration=declaration(), roles=roles) as plugin:
                 say(f"driver: registered as {plugin.identity.instance_id}")
                 kept("/tmp/registered", f"REGISTERED {int(time.time() * 1000)}")
-                await {"data": lambda: drive_data(plugin, gen), "oms": lambda: drive_oms(plugin, gen),
+                await {"data": lambda: asyncio.gather(drive_data(plugin, gen), drive_page(plugin)),
+                       "oms": lambda: drive_oms(plugin, gen),
                        "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin),
                        "standing": lambda: drive_standing(roles[0])}[ROLE]()
             break

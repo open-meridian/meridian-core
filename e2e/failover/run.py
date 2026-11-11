@@ -43,7 +43,22 @@ sidecar, and is refused for load alone, with a retry-after, every other
 instance within its band, nothing restarted and nothing OOMKilled);
 `standing-coordinator` (HA only; contract v30, W12.4: the analytics
 coordinator holding the standing driver's job killed outright, the job
-registered again with a live coordinator within 30 s).
+registered again with a live coordinator within 30 s); `apiserver`
+(contract v30, stage C: the API server cut from every pod of the release
+for 30 s under the driver's load: no takeover, no write outage, no
+readiness flap); `write-ahead-bound` (HA only, stage C: the lake's writer
+cut from the broker past a short `lake.writeAhead.maxAge`, so the stream
+drops what it held: the gap recorded with the next batch, asked again
+where its dataset declares backfill, and read where the dataset is).
+
+The buy-side trust targets (contract v30, stage C; the resilience spec's
+section 15), after every class: the data driver reads its own price back
+every second as a live page reads it (a default read of the latest), and
+from those reads and the lake's own rows the run holds that a page drawn
+from them (1) flagged the price stale within its data type's stale
+threshold plus 2 s of the lake's newest row turning stale, never showing it
+live past that, and (2) was never blank: no read answered without the last
+good row. A failed read leaves the page as it was drawn, its value ageing.
 
 The write driver (driver.py, step 3b part 5) writes through the stores for
 the whole run, from test-only plugin instances in the chart's sidecars[]
@@ -144,7 +159,7 @@ DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk", "driv
 # What each instance is launched with: the ems stand-in (desk) holds oms and
 # ems, as e2e/orders/stand_in.py's desk does; it is the order-plugin class's
 # subject.
-DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"],
+DRIVER_ROLES = {"data": ["data", "reporting"], "oms": ["oms"], "desk": ["oms", "ems"],
                 # The memory and isolation classes' subject (stage M): it
                 # records its own dataset and reads it.
                 "flood": ["data", "reporting"],
@@ -171,11 +186,13 @@ HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
-                 "bit-rot", "torn-write", "order-plugin", "memory-pressure", "noisy-plugin"],
+                 "bit-rot", "torn-write", "order-plugin", "memory-pressure", "noisy-plugin",
+                 "apiserver"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
            "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin",
-           "memory-pressure", "noisy-plugin", "standing-coordinator"],
+           "memory-pressure", "noisy-plugin", "standing-coordinator", "apiserver",
+           "write-ahead-bound"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -406,6 +423,11 @@ def install(s):
         # renders only beside it.
         "--set", "pluginStorage.enabled=false",
     ]
+    if PROFILE == "tolerant":
+        # A reader beside the lake's one writer (contract v30, stage C): the
+        # db-primary class holds it to what the record holds after the
+        # database restarts.
+        values += ["--set", f"lake.readers={READERS}"]
     if PROFILE in ("ha", "scaled", "reconfigure"):
         # The conductor's standby needs the key as a Secret: the generated
         # one's volume attaches to one node. A tolerant install that is to
@@ -1441,6 +1463,10 @@ def db_primary(s, failure="db-primary"):
     until the lake has it again). torn-write adds heavy commits straight to the
     database from a member that is not killed, as its load, each
     acknowledged one held too."""
+    if failure == "db-primary" and PROFILE != "tolerant" and DRIVEN:
+        for component in ("bor", "lake"):
+            wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+        standby_lost(s)
     if failure == "db-primary":
         print("F: db-primary: the database's primary killed outright (SIGKILL), under the driver's writes", flush=True)
     for component in ("bor", "lake"):
@@ -1501,6 +1527,8 @@ def db_primary(s, failure="db-primary"):
         # (contract v30, stage E; the resilience spec's section 4).
         rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary))
         extra = rpo_extra(rpo)
+        if failure == "db-primary":
+            extra.update(STANDBY_LOST)
         if stream_before is not None:
             moved = happens(lambda: write_ahead_position(new_primary) > stream_before, 60, every=2)
             s.check(moved, f"{failure}: the lake's writes went by its write-ahead stream, its place in it "
@@ -2820,6 +2848,352 @@ def reader_hands_on(s):
                         f"each answered by it")
 
 
+def api_addresses():
+    """The API server's addresses, as its Service's endpoints name them."""
+    said = run("kubectl", "get", "endpoints", "kubernetes", "-o",
+               "jsonpath={.subsets[*].addresses[*].ip}").stdout.decode().split()
+    return [a for a in said if a]
+
+
+def cut_api(verb):
+    """Every pod of the release cut from the API server, both ways, on its
+    node: routed through the node (FORWARD), and to the node itself where
+    the API server runs there (INPUT). One exec per node, so the cut starts
+    and ends at once."""
+    api = api_addresses()
+    by_node = {}
+    for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+        ip, node = pod["status"].get("podIP"), pod["spec"].get("nodeName")
+        if ip and node and not pod["metadata"].get("deletionTimestamp"):
+            by_node.setdefault(node, set()).add(ip)
+    at = "1 " if verb == "-I" else ""
+    for node, ips in by_node.items():
+        rules = []
+        for ip in sorted(ips):
+            for target in api:
+                rules += [f"iptables {verb} FORWARD {at}-s {ip} -d {target} -j DROP",
+                          f"iptables {verb} FORWARD {at}-s {target} -d {ip} -j DROP",
+                          f"iptables {verb} INPUT {at}-s {ip} -d {target} -j DROP"]
+        joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
+        run("docker", "exec", node, "sh", "-c", joined or "true", check=verb == "-I")
+    return api
+
+
+def ack_gaps(began_ms, ended_ms):
+    """The longest pause, in seconds, between the driver's acknowledgements
+    of each kind within a window, its edges counted."""
+    said = {}
+    for kind in ("price", "order"):
+        times = sorted(at for at in driver_acked().get(kind, {}).values() if began_ms <= at <= ended_ms)
+        edges = [began_ms] + times + [ended_ms]
+        said[kind] = round(max(b - a for a, b in zip(edges, edges[1:])) / 1000, 2)
+    return said
+
+
+# How long the API server is cut off, and the pause in the driver's
+# acknowledgements that counts as a write outage: a write is acknowledged
+# every half second, so anything past a few seconds is the stores stopping.
+API_CUT_S = 30
+WRITE_PAUSE_S = 5
+
+
+def apiserver_lost(s):
+    """FAILURE=apiserver (contract v30, stage C; the resilience spec's
+    sections 2, 10 and 15, approved 2026-11-10): the API server cut from
+    every pod of the release for 30 s under the driver's load. Writers keep
+    writing under their epoch and stay ready: no takeover (each store's
+    epoch as it was), no write outage (the book and the lake acknowledging
+    the driver throughout), and no readiness flap (every store member, its
+    readers' included, ready throughout and after)."""
+    print(f"F: apiserver: the API server cut from the release's pods for {API_CUT_S} s, under the driver's "
+          "writes", flush=True)
+    for component in ("bor", "lake"):
+        wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+    watched = [c for c in STORES if c != "launcher"] + [f"{c}-reader" for c in ("lake", "bor")]
+    epochs = {c: epoch_now(c) for c in ("bor", "lake", "instrument", "street")}
+    members = {p["metadata"]["name"]: c for c in watched for p in pods(c)}
+    restarted = {name: restarts(name) for name in members}
+    flaps = set()
+    began = time.time()
+    api = cut_api("-I")
+    s.note(f"apiserver: {len(api)} API server address(es) cut from every pod")
+    try:
+        while time.time() - began < API_CUT_S:
+            for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+                if pod["metadata"]["name"] in members and not ready(pod):
+                    flaps.add(pod["metadata"]["name"])
+            time.sleep(1)
+    finally:
+        cut_api("-D")
+    ended = time.time()
+    # And for a while after: a member that stepped down at the cut's end.
+    for _ in range(15):
+        for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+            name = pod["metadata"]["name"]
+            if name in members and (not ready(pod) or restarts(name) > restarted[name]):
+                flaps.add(name)
+        time.sleep(1)
+    s.check(not flaps, f"apiserver: no member's readiness flapped ({', '.join(sorted(flaps)) or 'none'})")
+    after = {c: epoch_now(c) for c in epochs}
+    moved = {c: (epochs[c], after[c]) for c in epochs if after[c] != epochs[c]}
+    s.check(not moved, f"apiserver: no takeover, every store's epoch as it was "
+            f"({', '.join(f'{c} {a}->{b}' for c, (a, b) in moved.items()) or 'none moved'})")
+    if DRIVEN:
+        gaps = ack_gaps(int(began * 1000), int(ended * 1000))
+        s.check(all(g <= WRITE_PAUSE_S for g in gaps.values()),
+                f"apiserver: no write outage, the driver acknowledged throughout (longest pause: "
+                f"book {gaps['order']} s, lake {gaps['price']} s; at most {WRITE_PAUSE_S} s)")
+        claim(s, "apiserver", "bor", gaps["order"], WRITE_PAUSE_S,
+              {"what": "the longest pause in the book's acknowledgements while the API server was cut",
+               "cut_s": API_CUT_S, "takeovers": len(moved), "readiness_flaps": len(flaps)})
+        claim(s, "apiserver", "lake", gaps["price"], WRITE_PAUSE_S,
+              {"what": "the longest pause in the lake's acknowledgements while the API server was cut",
+               "cut_s": API_CUT_S, "takeovers": len(moved), "readiness_flaps": len(flaps)})
+
+
+# The write-ahead-bound class's stream bound, short, and how long past it
+# the lake's writer is held.
+SHORT_MAX_AGE_S = 20
+HELD_PAST_S = 25
+
+
+def gaps_of(dataset, since_ns):
+    """Each gap of `dataset` recorded since `since_ns`, by its ID, its states
+    in order (lake_dataset_gap; GapState numbers)."""
+    said = psql("select gap_id, state from lake_dataset_gap where dataset = "
+                f"'{dataset}' and recorded_at_ns >= {since_ns} order by change_id", quiet=True)
+    gaps = {}
+    for line in said.splitlines():
+        parts = line.split("|") if "|" in line else line.split()
+        if len(parts) == 2 and parts[1].strip().isdigit():
+            gaps.setdefault(parts[0].strip(), []).append(int(parts[1]))
+    return gaps
+
+
+def write_ahead_bound(s):
+    """FAILURE=write-ahead-bound (HA; contract v30, stage C; the resilience
+    spec's sections 4 and 15): the lake's write-ahead stream bounded short
+    (lake.writeAhead.maxAge), and the lake's writer cut from the broker past
+    it while the data driver writes, so the stream drops writes the lake
+    never took (none acknowledged: a write is answered after the lake
+    commits it). Let go, the writer finds the stream's sequence passed rows
+    it never committed: the gap of the driver's dataset recorded with its
+    next write (GAP_CAUSE_WRITE_AHEAD_BOUND), asked again where the dataset
+    declares backfill and unrecovered where it declares none (the driver
+    declares none), and read where the dataset is (lake_dataset_gap, which
+    ListDatasetGaps answers). The bound set back after."""
+    print(f"F: write-ahead-bound: the lake's writer held from its stream past a {SHORT_MAX_AGE_S} s bound",
+          flush=True)
+    if not DRIVEN:
+        s.check(False, "write-ahead-bound: no driver writes ahead")
+        return
+    before = upgrade(f"lake.writeAhead.maxAge={SHORT_MAX_AGE_S}s")
+    s.check(before.returncode == 0, "write-ahead-bound: the stream's bound set short by an upgrade")
+    wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    since = int(time.time() * 1e9)
+    writer = writer_pod("lake")
+    broker = [pod_ip(p["metadata"]["name"]) for p in pods("broker")]
+    began = time.time()
+    cut_rules(writer, broker, "-I")
+    try:
+        time.sleep(SHORT_MAX_AGE_S + HELD_PAST_S)
+    finally:
+        cut_rules(writer, broker, "-D")
+    let_go = time.time()
+    dataset = "drive-data:drive"
+    found = happens(lambda: gaps_of(dataset, since), 180, every=3)
+    took = time.time() - let_go
+    gaps = gaps_of(dataset, since)
+    s.check(found, f"write-ahead-bound: the gap the stream left in {dataset} recorded "
+            f"({len(gaps)} gap(s), {took:.1f}s after the writer was let go)")
+    states = [states[-1] for states in gaps.values()]
+    # The driver's dataset declares no gap_recovery: none, the cautious
+    # reading, so its gap is unrecovered at once and asked of nobody.
+    s.check(bool(states) and all(state == 3 for state in states),
+            f"write-ahead-bound: each gap unrecovered, its dataset declaring no backfill ({states})")
+    if found:
+        claim(s, "write-ahead-bound", "lake", took, 60,
+              {"what": "from the writer let go to its dataset's gap recorded", "held_s":
+               round(let_go - began, 1), "max_age_s": SHORT_MAX_AGE_S, "gaps": len(gaps)})
+    back = upgrade("lake.writeAhead.maxAge=10m")
+    s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
+    wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    # Nothing acknowledged was lost: the driver's rows held as every class's.
+    acks = acks_again(int(let_go * 1000), seconds=180)
+    s.check(acks, "write-ahead-bound: the driver acknowledged by the lake again")
+
+
+STANDBY_LOST = {}
+
+
+def standby_lost(s):
+    """In ha, one of the database's two synchronous standbys killed outright
+    under the driver's load (contract v30, stage C; the resilience spec's
+    section 4: a quorum of either, ANY 1): the book's commits go on within
+    their bound, never waiting on the lost standby."""
+    standbys = [p["metadata"]["name"] for p in pods("database")
+                if p["metadata"]["labels"].get("meridian.dev/database-role") == "replica"]
+    if len(standbys) < 2:
+        s.check(False, f"db-primary: two standbys to lose one of ({standbys})")
+        return
+    victim = standbys[0]
+    print(f"F: db-primary: a synchronous standby ({victim}) killed outright, under the driver's writes",
+          flush=True)
+    began = time.time()
+    isolate(victim, "-I")
+    crash(victim, "postgres")
+    try:
+        time.sleep(20)
+    finally:
+        isolate(victim, "-D")
+    ended = time.time()
+    gaps = ack_gaps(int(began * 1000), int(ended * 1000))
+    s.check(gaps["order"] <= HA["bor"],
+            f"db-primary: with a standby lost, the book's commits went on (longest pause "
+            f"{gaps['order']} s, within {HA['bor']} s)")
+    # Said in the db-primary class's claims, beside its RPO.
+    STANDBY_LOST.update({"one_standby_lost_book_pause_s": gaps["order"],
+                         "one_standby_lost_lake_pause_s": gaps["price"]})
+    healed = happens(lambda: len(pods("database")) == database_members()
+                     and all(ready(p) for p in pods("database")), 300)
+    s.check(healed, "db-primary: the lost standby back")
+
+
+# The buy-side trust targets (contract v30, stage C): a streamed price's
+# stale threshold (spec/sessions-and-data-report-their-latency-and-quality,
+# 5 s), and the 2 s past it a stale flag may take (approved 2026-11-11).
+STALE_AFTER_S = 5
+STALE_FLAG_S = 2
+
+
+def page_reads(since_ms):
+    """The data driver's page reads since `since_ms`: (unix ms, state, row
+    key, valid ms)."""
+    reads = []
+    for line in driver_file("drive-data", "/tmp/page.log").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "PAGE" and parts[1].isdigit() and int(parts[1]) >= since_ms:
+            row = parts[3] if parts[2] == "ok" and len(parts) == 5 else ""
+            valid = int(parts[4]) if parts[2] == "ok" and len(parts) == 5 and parts[4].isdigit() else 0
+            reads.append((int(parts[1]), parts[2], row, valid))
+    return reads
+
+
+def lake_newest(since_ms, until_ms):
+    """Each row of the driver's dataset the lake recorded in the window and
+    a little before: (recorded ms, valid ms), in recorded order."""
+    said = psql("select recorded_at_ns / 1000000, valid_from_ns / 1000000 from lake_row where dataset = "
+                f"'drive-data:drive' and recorded_at_ns >= {(since_ms - 60_000) * 1_000_000} and "
+                f"recorded_at_ns <= {until_ms * 1_000_000} order by recorded_at_ns", quiet=True)
+    rows = []
+    for line in said.splitlines():
+        parts = line.replace("|", " ").split()
+        if len(parts) == 2 and all(p.lstrip("-").isdigit() for p in parts):
+            rows.append((int(parts[0]), int(parts[1])))
+    return rows
+
+
+def trust_targets(s, failure, began_ms):
+    """The buy-side trust targets in a class (contract v30, stage C; the
+    resilience spec's section 15, approved 2026-11-10 and 2026-11-11), as a
+    live page drawn from the driver's reads would show its price:
+
+    - stale on time: the page ages its value every second from the row's own
+      valid time; it holds the newest row its reads answered. Each second of
+      the class where the lake's newest row (by what it had recorded then)
+      was past the threshold, the page must have flagged it by the threshold
+      plus 2 s, and never shown it live where the lake held nothing newer;
+    - never blank: every read answered drew a row -- the last good one at
+      least -- never an empty answer. A failed read leaves the page drawn.
+
+    What it cannot see: the kit's own cells (the kit's step), a page's
+    render, a browser's clock, deliveries a page hears between reads."""
+    if not DRIVEN:
+        return
+    ended_ms = int(time.time() * 1000)
+    reads = page_reads(began_ms)
+    if not reads:
+        s.check(False, f"{failure}: trust targets: the page read nothing in the class")
+        return
+    empty = sum(1 for r in reads if r[1] == "empty")
+    failed = sum(1 for r in reads if r[1] == "failed")
+    answered = [r for r in reads if r[1] == "ok"]
+    longest = 0
+    last = began_ms
+    for at, state, _, _ in reads:
+        if state == "ok":
+            longest = max(longest, at - last)
+            last = at
+    longest = max(longest, ended_ms - last)
+    s.check(empty == 0, f"{failure}: never blank: every read the page answered drew a row ({len(reads)} reads, "
+            f"{empty} empty, {failed} failed and left the page as drawn; longest without a fresh answer "
+            f"{longest / 1000:.1f} s)")
+    newest = lake_newest(began_ms, ended_ms)
+    late, live_while_stale, flagged = 0.0, 0, 0
+    held_valid = None
+    i, j = 0, 0
+    lake_valid = None
+    for tick in range(began_ms + 1000, ended_ms, 1000):
+        while i < len(answered) and answered[i][0] <= tick:
+            held_valid = answered[i][3] if held_valid is None else max(held_valid, answered[i][3])
+            i += 1
+        while j < len(newest) and newest[j][0] <= tick:
+            lake_valid = newest[j][1] if lake_valid is None else max(lake_valid, newest[j][1])
+            j += 1
+        if lake_valid is None or held_valid is None:
+            continue
+        due = lake_valid + STALE_AFTER_S * 1000
+        page_stale = tick - held_valid > STALE_AFTER_S * 1000
+        if tick > due:
+            if page_stale:
+                flagged += 1
+            else:
+                live_while_stale += 1
+                late = max(late, (tick - due) / 1000)
+    s.check(live_while_stale == 0 or late <= STALE_FLAG_S,
+            f"{failure}: stale on time: the page flagged its price stale within {STALE_AFTER_S} s + "
+            f"{STALE_FLAG_S} s of it turning stale ({flagged} stale second(s) flagged, "
+            f"{live_while_stale} shown live, at most {late:.1f} s late)")
+    claim(s, f"{failure}", "page", late, STALE_FLAG_S,
+          {"what": "the buy-side trust targets: the page's stale flag past its threshold, and blank reads",
+           "stale_after_s": STALE_AFTER_S, "stale_seconds_flagged": flagged,
+           "shown_live_while_stale": live_while_stale, "reads": len(reads), "blank_reads": empty,
+           "failed_reads": failed, "longest_without_fresh_s": round(longest / 1000, 1)})
+
+
+def rows_read_are_kept(s, failure, began_ms):
+    """Every row the page read in the class is one the lake's record holds:
+    no member -- a reader's hot layer above all -- answered a change the
+    record does not (contract v30, stage C; the resilience spec's section 3:
+    after a database failover, a reader holds exactly what the record
+    holds)."""
+    if not DRIVEN:
+        return
+    keys = sorted({r[2] for r in page_reads(began_ms) if r[1] == "ok" and r[2]})
+    if not keys:
+        return
+    held = set(psql("select row_key from lake_row where dataset = 'drive-data:drive' and row_key = any("
+                    "array[" + ",".join(f"'{k}'" for k in keys) + "])", quiet=True).split())
+    missing = [k for k in keys if k not in held]
+    s.check(not missing, f"{failure}: every row the page read is in the lake's record ({len(keys)} read, "
+            f"{len(missing)} not held{': ' + ', '.join(missing[:5]) if missing else ''})")
+
+
+def page_entitled(s):
+    """The data driver entitled to read its own dataset back, as a deployment
+    admin entitles a reader (W10.1): its DatasetEntitlement recorded where
+    the conductor keeps it, published whole within a minute. Once a run."""
+    now = time.time_ns()
+    dataset, instance = "drive-data:drive", "drive-data"
+    why = "the buy-side trust targets: the page reads the driver's price back"
+    entitlement = (text_field(1, dataset) + text_field(2, instance) + varint(3 << 3) + varint(1)
+                   + text_field(5, ADMIN) + varint(6 << 3) + varint(now) + text_field(9, why))
+    psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
+         f"VALUES ('{dataset}', '{instance}', decode('{entitlement.hex()}', 'hex'), {now})")
+    reading = happens(lambda: any(r[1] == "ok" for r in page_reads(0)), 240, every=5)
+    s.check(reading, "the page reads the driver's price back")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -2842,6 +3216,8 @@ FAILURES = {
     "memory-pressure": lambda s: flood(s, "memory-pressure", "pressure", "overloaded", "lake"),
     "noisy-plugin": lambda s: flood(s, "noisy-plugin", "noisy", "rate_limited", "sidecar"),
     "standing-coordinator": standing_coordinator,
+    "apiserver": apiserver_lost,
+    "write-ahead-bound": write_ahead_bound,
 }
 
 
@@ -2873,6 +3249,10 @@ def main():
     first_run(s)
     if DRIVEN:
         driver_fixtures(s)
+        try:
+            page_entitled(s)
+        except SystemExit as stopped:
+            s.check(False, f"the page's entitlement: {stopped}")
     if TLS:
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
@@ -2893,10 +3273,16 @@ def main():
         except SystemExit as stopped:
             s.check(False, f"reconfigure: {stopped}")
     for failure in failures:
+        began_ms = int(time.time() * 1000)
         try:
             FAILURES[failure](s)
         except SystemExit as stopped:
             s.check(False, f"{failure}: {stopped}")
+        try:
+            trust_targets(s, failure, began_ms)
+            rows_read_are_kept(s, failure, began_ms)
+        except SystemExit as stopped:
+            s.check(False, f"{failure}: the trust targets could not be read: {stopped}")
         try:
             properties(s, failure)
         except SystemExit as stopped:
