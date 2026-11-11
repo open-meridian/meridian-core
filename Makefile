@@ -1136,7 +1136,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn .e2e-said-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) \

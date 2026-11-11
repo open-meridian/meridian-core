@@ -2209,80 +2209,128 @@ def under_patroni():
     return set_["spec"]["template"]["metadata"].get("labels", {}).get("meridian.dev/database-manager") == "patroni"
 
 
+# How much of each container's log a failed move keeps: the Makefile's
+# E2E_K3D_LOG_LINES, which .e2e-cluster.log keeps at a run's end.
+SAID_LINES = os.environ.get("E2E_K3D_LOG_LINES", "400")
+SAID_KEPT = []
+
+
+def cluster_said(when):
+    """What the cluster said when a check failed, kept at once beside the
+    run (.e2e-said-<n>.log, which CI keeps with .e2e-cluster.log): the
+    pods, the namespace's events in order, and each container's log and
+    its previous one, timestamped. For reconfigure, whose later moves
+    replace every pod a failed check was about."""
+    SAID_KEPT.append(when)
+    name = f".e2e-said-{len(SAID_KEPT)}.log"
+    parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    parts.append(kubectl("get", "pods", "-o", "wide", check=False).stdout.decode(errors="replace"))
+    parts.append(kubectl("get", "events", "--sort-by=.lastTimestamp", check=False).stdout.decode(errors="replace"))
+    for pod in json.loads(out("get", "pods", "-o", "json", check=False) or "{}").get("items", []):
+        pod_name = pod["metadata"]["name"]
+        spec = pod.get("spec", {})
+        for container in [c["name"] for c in spec.get("initContainers", []) + spec.get("containers", [])]:
+            for previous in ((), ("--previous",)):
+                said = kubectl("logs", pod_name, "-c", container, "--timestamps", f"--tail={SAID_LINES}",
+                               *previous, check=False)
+                parts.append(f"== {pod_name}, {container}{', before, if it restarted' if previous else ''}")
+                parts.append((said.stdout or said.stderr).decode(errors="replace"))
+    with open(name, "w", encoding="utf-8") as kept:
+        kept.write("\n".join(parts))
+    print(f"R: {when}: what the cluster said, kept in {name}", flush=True)
+
+
 def reconfigure(s):
     global SHAPE
+    failed_before = len(s.failures)
     tls_turned_on(s)
     archived_in_tolerant(s)
+    if len(s.failures) > failed_before:
+        cluster_said("reconfigure's internal TLS and archive")
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
     for target in RECONFIGURE:
-        before = record_now()
-        # Alone, it moves under Patroni in two upgrades; under it already
-        # (back from ha), one upgrade gives it its standbys.
-        alone = not under_patroni()
-        print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
-        began = time.time()
-        upgraded = upgrade(f"resilience.profile={target}")
-        s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
-                + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
-        if upgraded.returncode != 0:
-            return
-        SHAPE = target
-        # Each upgrade's migration succeeds, the way back included, where
-        # the database's own restart for a start-only setting once cut it.
-        migrated(s, f"reconfigure to {target}")
-        if target == "ha" and alone:
-            # A database alone moves under Patroni first, alone, and is given
-            # its standbys by a second upgrade with the same values, as the
-            # chart says. Run once the first has rolled out, as `meridian
-            # upgrade-deployment` waits for every workload of the release
-            # before it returns: member 0's postgres answering on its own
-            # address is not the Service routing to it, which it does only
-            # once Patroni says the member is ready, and a second upgrade
-            # started before that met its preflight refused (CI runs
-            # 42453056096, 42462993343 and 42482853675's run 3: no ready
-            # endpoint for over a minute).
-            said = upgraded.stdout.decode(errors="replace")
-            moved = "upgrade again with" in said
-            s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
-            if moved:
-                wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
-                         lambda: not rollout_unfinished(), seconds=600)
-                print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
-                      flush=True)
-                member_now("before the second upgrade")
-                with HookLog("preflight") as preflight:
-                    again = upgrade(f"resilience.profile={target}")
-                print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
-                      f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
-                print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
-                member_now("after the second upgrade")
-                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
-                        + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
-                if again.returncode != 0:
-                    database_said(s, "the second upgrade")
-                else:
-                    migrated(s, f"reconfigure to {target}, the second upgrade")
-        settled = happens(settled_everywhere, 900, every=5)
-        took = time.time() - began
-        s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
-        if not settled:
-            for component in STORES:
-                explain(s, f"reconfigure to {target}", component)
-            return
-        connections_held(s, f"reconfigure to {target}")
-        extra = {"from": "tolerant" if target == "ha" else "ha"}
-        if DRIVEN:
-            # RPO through the stores across the move: the database moved
-            # under Patroni and back, every member replaced, and nothing
-            # acknowledged lost, the lake's included (no primary was lost).
-            s.check(acks_again(int(began * 1000), seconds=180),
-                    f"reconfigure to {target}: the write driver acknowledged by the book and the lake again")
-            extra.update(rpo_extra(driver_rpo_held(s, f"reconfigure to {target}", store_rpo(int(began * 1000)))))
-        claim(s, f"reconfigure-{target}", "deployment", took, None, extra)
-        after = record_now()
-        kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
-        s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
-        properties(s, f"reconfigure to {target}")
+        failed_before = len(s.failures)
+        # Ended early -- a wait that stopped the move, or a return after a
+        # failed check -- unless the move's last line is reached.
+        stopped = True
+        try:
+            before = record_now()
+            # Alone, it moves under Patroni in two upgrades; under it already
+            # (back from ha), one upgrade gives it its standbys.
+            alone = not under_patroni()
+            print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
+            began = time.time()
+            upgraded = upgrade(f"resilience.profile={target}")
+            s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
+                    + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+            if upgraded.returncode != 0:
+                return
+            SHAPE = target
+            # Each upgrade's migration succeeds, the way back included, where
+            # the database's own restart for a start-only setting once cut it.
+            migrated(s, f"reconfigure to {target}")
+            if target == "ha" and alone:
+                # A database alone moves under Patroni first, alone, and is given
+                # its standbys by a second upgrade with the same values, as the
+                # chart says. Run once the first has rolled out, as `meridian
+                # upgrade-deployment` waits for every workload of the release
+                # before it returns: member 0's postgres answering on its own
+                # address is not the Service routing to it, which it does only
+                # once Patroni says the member is ready, and a second upgrade
+                # started before that met its preflight refused (CI runs
+                # 42453056096, 42462993343 and 42482853675's run 3: no ready
+                # endpoint for over a minute).
+                said = upgraded.stdout.decode(errors="replace")
+                moved = "upgrade again with" in said
+                s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
+                if moved:
+                    wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
+                             lambda: not rollout_unfinished(), seconds=600)
+                    print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
+                          flush=True)
+                    member_now("before the second upgrade")
+                    with HookLog("preflight") as preflight:
+                        again = upgrade(f"resilience.profile={target}")
+                    print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
+                          f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                    print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
+                    member_now("after the second upgrade")
+                    s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
+                            + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
+                    if again.returncode != 0:
+                        database_said(s, "the second upgrade")
+                    else:
+                        migrated(s, f"reconfigure to {target}, the second upgrade")
+            settled = happens(settled_everywhere, 900, every=5)
+            took = time.time() - began
+            s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
+            if not settled:
+                for component in STORES:
+                    explain(s, f"reconfigure to {target}", component)
+                return
+            connections_held(s, f"reconfigure to {target}")
+            extra = {"from": "tolerant" if target == "ha" else "ha"}
+            if DRIVEN:
+                # RPO through the stores across the move: the database moved
+                # under Patroni and back, every member replaced, and nothing
+                # acknowledged lost, the lake's included (no primary was lost).
+                s.check(acks_again(int(began * 1000), seconds=180),
+                        f"reconfigure to {target}: the write driver acknowledged by the book and the lake again")
+                extra.update(rpo_extra(driver_rpo_held(s, f"reconfigure to {target}", store_rpo(int(began * 1000)))))
+            claim(s, f"reconfigure-{target}", "deployment", took, None, extra)
+            after = record_now()
+            kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
+            s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
+            properties(s, f"reconfigure to {target}")
+            stopped = False
+        finally:
+            # What every pod and the namespace said at the move a check
+            # failed in, kept now: the moves after it replace every member,
+            # so the run's own record at its end no longer holds them (PR CI
+            # 43022080248: the first move to ha failed once, its pods' logs
+            # gone by then).
+            if stopped or len(s.failures) > failed_before:
+                cluster_said(f"reconfigure to {target}")
 
 
 # ── reconfigure's archive and its last act: a restore to a time in ha ─────
