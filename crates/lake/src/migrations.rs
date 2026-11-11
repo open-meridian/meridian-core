@@ -93,6 +93,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "subject_sequence",
         sql: include_str!("../migrations/0013_subject_sequence.sql"),
     },
+    // The write-ahead stream's position (the `ha` profile; the resilience
+    // spec's section 4, rulings of 2026-11-08): committed with each batch.
+    Migration {
+        version: 14,
+        name: "write_ahead",
+        sql: include_str!("../migrations/0014_write_ahead.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

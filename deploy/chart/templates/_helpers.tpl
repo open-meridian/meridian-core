@@ -115,6 +115,20 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 {{- $n -}}
 {{- end -}}
 
+{{/*
+The lake's write-ahead stream (contract v30, stage E; the resilience spec's
+section 4; the rulings of 2026-11-08): where JetStream runs at three -- the
+`ha` profile -- a data plugin's sidecar puts its lake writes in the stream
+first, and the lake's writer records them from it with the stream's
+position. Nothing where it does not. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadEnv" -}}
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD
+  value: jetstream
+{{- end }}
+{{- end -}}
+
 {{/* A stateless set's copies: 1 or 2 by the profile, at least 1. Takes a dict: top, value. */}}
 {{- define "meridian-runtime.copies" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" .top "value" .value "tolerant" 1 "ha" 2) -}}

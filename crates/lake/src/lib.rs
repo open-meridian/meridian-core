@@ -41,6 +41,7 @@ pub mod reader;
 pub mod row;
 pub mod service;
 pub mod store;
+pub mod write_ahead;
 
 mod memory;
 

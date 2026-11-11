@@ -949,9 +949,9 @@ def store_rpo(since_ms=0, pod=None):
 
 def rpo_extra(rpo):
     """The claims' RPO fields: the book's acknowledged orders and those
-    lost (none may be: RPO 0 for the record), and the lake's, which
-    commits locally (spec section 4, durability) and whose loss is measured
-    and said, its bound not yet ruled."""
+    lost (none may be: RPO 0 for the record), and the lake's acknowledged
+    rows and those lost (none may be: in ha its writes are held by the
+    write-ahead stream before they are acknowledged, contract v30 stage E)."""
     return {"through": "the stores: RecordOrder to the book, RecordPrices to the lake",
             "acknowledged_commits": rpo["book"]["acknowledged"], "rpo_commits_lost": len(rpo["book"]["lost"]),
             "lake_rows_acknowledged": rpo["lake"]["acknowledged"], "lake_rows_lost": len(rpo["lake"]["lost"]),
@@ -959,9 +959,9 @@ def rpo_extra(rpo):
 
 
 def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
-    """Every acknowledged order kept, after a class; and every price, but
-    where the class took the database's primary, whose lake commits are
-    local (measured and said there)."""
+    """Every acknowledged order kept, after a class; and every price, unless
+    the caller says the lake may lose some (no class does since the lake's
+    write-ahead stream, contract v30 stage E)."""
     rpo = rpo or store_rpo()
     book, lake = rpo["book"], rpo["lake"]
     s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
@@ -1432,8 +1432,9 @@ def database_writes(avoid=()):
 def db_primary(s, failure="db-primary"):
     """The database's primary killed outright under the write driver's
     load: RPO read through the stores, every order the book acknowledged
-    kept (RPO 0 for the record), the lake's loss measured and said (its
-    commits are local). torn-write adds heavy commits straight to the
+    kept (RPO 0 for the record), and every row the lake acknowledged (its
+    commits are local, and in ha its write-ahead stream holds each write
+    until the lake has it again). torn-write adds heavy commits straight to the
     database from a member that is not killed, as its load, each
     acknowledged one held too."""
     if failure == "db-primary":
@@ -1487,8 +1488,11 @@ def db_primary(s, failure="db-primary"):
         # the failover is all in, and read once it is.
         again = acks_again(int(began * 1000))
         s.check(again, f"{failure}: the write driver acknowledged by the book and the lake again")
-        rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary),
-                              lake_may_lose=PROFILE != "tolerant")
+        # Every row the lake acknowledged is in it, in either profile: in ha
+        # its writes are held by the write-ahead stream first, and its
+        # writer goes back to the position the promoted standby holds
+        # (contract v30, stage E; the resilience spec's section 4).
+        rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary))
         extra = rpo_extra(rpo)
     if acked_before is not None:
         acked = acknowledged(writer) if writer else set()

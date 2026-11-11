@@ -22,13 +22,13 @@ use meridian_domain::v1::{
     EntitlementsChangedEvent, InstrumentType, ObservationsWantedEvent, SourcePriority,
 };
 
-use crate::memory::{as_of, number, served_of};
+use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;
 use crate::row::{DataType, Observation};
 use crate::store::{
     as_assessed, as_flagged, closed_reason, listed_of, Assessment, ClosedDayAmendment, Listed,
     Query, Recorded, Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind,
-    When,
+    When, WriteAheadBatch, WriteAheadPosition,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
@@ -1074,6 +1074,104 @@ impl Store for PostgresStore {
         Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
+    }
+
+    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1",
+                &[&stream],
+            )
+            .map_err(unavailable)?
+            .map(|row| WriteAheadPosition {
+                sequence: row.get::<_, i64>(0) as u64,
+                at_ns: row.get(1),
+            }))
+    }
+
+    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The position first, under its lock: a batch that does not follow
+        // the position the store holds is refused, never recorded past a
+        // gap -- after a failover lost the commits since the one it holds,
+        // the writer goes back to it, so nothing it acknowledged is lost.
+        let at = tx
+            .query_opt(
+                "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
+                &[&batch.stream],
+            )
+            .map_err(unavailable)?
+            .map(|row| WriteAheadPosition {
+                sequence: row.get::<_, i64>(0) as u64,
+                at_ns: row.get(1),
+            });
+        if at != batch.after {
+            return Err(StoreError::PositionMoved(format!(
+                "the lake's place in {} is {at:?}, not {:?}",
+                batch.stream, batch.after
+            )));
+        }
+        let epoch = self.fence.epoch();
+        let mut answered = vec![Recorded::default(); batch.parts.len()];
+        // Each dataset's parts as one batch of it, the datasets taken in
+        // their names' order: every batch takes the heads' locks in one order.
+        let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
+        for (place, (dataset, rows)) in batch.parts.into_iter().enumerate() {
+            by_dataset.entry(dataset).or_default().push((place, rows));
+        }
+        for (dataset, parts) in by_dataset {
+            let mut head = self.head(&mut tx, &dataset)?;
+            let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
+            let every: Vec<Observation> = rows.iter().flatten().cloned().collect();
+            let latest = latest_of_each(&mut tx, &dataset, &every)?;
+            let previous = previous_of_each(&mut tx, &dataset, &every)?;
+            drop(every);
+            let done = number_parts(
+                rows,
+                &mut head,
+                now_ns,
+                |row| {
+                    latest
+                        .get(&(row.data_type().code(), row.meta().row_key.clone()))
+                        .cloned()
+                },
+                |row| {
+                    previous
+                        .get(&(row.data_type().code(), row.subject().to_string()))
+                        .copied()
+                        .unwrap_or(0)
+                },
+            );
+            let numbered: Vec<Observation> = done
+                .iter()
+                .flat_map(|part| part.rows.iter().cloned())
+                .collect();
+            insert_all(&mut tx, &dataset, &numbered, epoch)?;
+            let new_keys: u64 = done.iter().map(|part| u64::from(part.recorded)).sum();
+            Self::move_head(&mut tx, &dataset, head, new_keys)?;
+            for (place, part) in places.into_iter().zip(done) {
+                answered[place] = part;
+            }
+        }
+        tx.execute(
+            "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (stream) DO UPDATE
+                SET sequence = EXCLUDED.sequence, at_ns = EXCLUDED.at_ns,
+                    committed_at_ns = EXCLUDED.committed_at_ns",
+            &[
+                &batch.stream,
+                &(batch.through.sequence as i64),
+                &batch.through.at_ns,
+                &now_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(answered)
     }
 
     fn serve_unkept(

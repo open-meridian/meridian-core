@@ -4817,3 +4817,90 @@ fn a_dataset_read_as_published_keeps_a_row_a_key_never_every_version() {
         "the read's heap peaked at {peak:.1} MiB, choosing from every version {whole_peak:.1} MiB"
     );
 }
+
+/// Contract v30, stage E (the resilience spec's section 4): writes from the
+/// write-ahead stream recorded as one -- each dataset's parts numbered in
+/// turn, as one batch of it -- with the stream's position in the same
+/// commit; a batch that does not follow the position held is refused and
+/// records nothing, so a writer behind a failover goes back and takes the
+/// writes again, each recorded once.
+#[test]
+fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
+    use meridian_lake::store::{StoreError, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let stream = unique("STREAM");
+    let a = unique("coinbase-1:a");
+    let b = unique("coinbase-1:b");
+    let subject = unique("LCL-BTC");
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), None);
+    let at = |sequence: u64| WriteAheadPosition {
+        sequence,
+        at_ns: 1_000 + sequence as i64,
+    };
+    let done = store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: None,
+                through: at(3),
+                parts: vec![
+                    (a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 10)]),
+                    (b.clone(), vec![close(&b, "y", &subject, "2026-10-07", 20)]),
+                    // The same key again, a later part of the same dataset:
+                    // its next version, numbered after the first part.
+                    (a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)]),
+                ],
+            },
+            5_000,
+        )
+        .unwrap();
+    assert_eq!(
+        done.iter()
+            .map(|part| (part.recorded, part.restated, part.unchanged, part.head))
+            .collect::<Vec<_>>(),
+        vec![(1, 0, 0, 1), (1, 0, 0, 1), (0, 1, 0, 2)]
+    );
+    let second = done[2].rows[0].meta();
+    assert_eq!(
+        (second.sequence, second.version, second.previous_sequence),
+        (2, 2, 1)
+    );
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(3)));
+
+    // A writer that believes the stream is elsewhere is refused, and
+    // nothing of its batch is recorded.
+    let refused = store.record_write_ahead(
+        WriteAheadBatch {
+            stream: stream.clone(),
+            after: Some(at(2)),
+            through: at(4),
+            parts: vec![(a.clone(), vec![close(&a, "z", &subject, "2026-10-07", 30)])],
+        },
+        6_000,
+    );
+    assert!(
+        matches!(refused, Err(StoreError::PositionMoved(_))),
+        "{refused:?}"
+    );
+    assert_eq!(store.heads().unwrap()[&a], 2);
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(3)));
+
+    // From the position held, a write taken again changes nothing.
+    let again = store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: Some(at(3)),
+                through: at(4),
+                parts: vec![(a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)])],
+            },
+            7_000,
+        )
+        .unwrap();
+    assert_eq!(
+        (again[0].recorded, again[0].restated, again[0].unchanged),
+        (0, 0, 1)
+    );
+    assert_eq!(store.heads().unwrap()[&a], 2);
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(4)));
+}

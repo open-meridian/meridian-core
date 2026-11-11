@@ -354,12 +354,56 @@ fn the_analytics_component_holds_its_own_credential_and_its_own_topic() {
             "{} carries the analytics component's own topic",
             other.user
         );
+        // The lake's write-ahead stream alone, by the lake's credential
+        // (contract v30, stage E): never the analytics units' queue.
+        let js: Vec<&String> = other
+            .publish
+            .iter()
+            .filter(|s| s.starts_with("$JS"))
+            .collect();
         assert!(
-            !other.publish.iter().any(|s| s.starts_with("$JS")),
-            "{} may speak to JetStream",
+            js.iter()
+                .all(|s| other.user == "runtime" && s.contains(".LAKE_WRITE_AHEAD")),
+            "{} may speak to JetStream: {js:?}",
             other.user
         );
     }
+}
+
+/// Contract v30, stage E (the resilience spec's section 4): in `ha` a data
+/// plugin's lake writes go by the lake's write-ahead stream, on its own
+/// instance's subjects alone, and the lake's writer reaches that stream's
+/// API and no other's.
+#[test]
+fn a_data_plugin_writes_ahead_on_its_own_subjects_and_the_lake_reads_the_stream() {
+    let users = users(
+        Contract::embedded(),
+        &[
+            Instance::plugin("truefx", &["data"]),
+            Instance::plugin("reporting-1", &["reporting"]),
+        ],
+    )
+    .expect("generates");
+    let data = user(&users, "truefx");
+    assert!(data
+        .publish
+        .contains(&"platform.lake.internal.write-ahead.truefx.*".to_string()));
+    assert!(!data.publish.iter().any(|s| s.starts_with("$JS")));
+    let reporting = user(&users, "reporting-1");
+    assert!(!reporting
+        .publish
+        .iter()
+        .any(|s| s.starts_with("platform.lake.internal.write-ahead")));
+    let runtime = user(&users, "runtime");
+    for api in [
+        "$JS.API.STREAM.*.LAKE_WRITE_AHEAD",
+        "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD",
+        "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>",
+        "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*",
+    ] {
+        assert!(runtime.publish.contains(&api.to_string()), "{api}");
+    }
+    assert!(!runtime.publish.contains(&"$JS.API.>".to_string()));
 }
 
 /// Step 3a: each store's change log is a component topic, held by the

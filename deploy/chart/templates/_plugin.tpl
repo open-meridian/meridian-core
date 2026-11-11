@@ -172,6 +172,10 @@ spec:
               value: {{ .roles | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
+            {{- /* In `ha`, a data plugin's lake writes held by the lake's
+                   write-ahead stream before they are recorded (contract v30,
+                   stage E); the sidecar of any other role ignores it. */}}
+            {{- with (include "meridian-runtime.writeAheadEnv" $top) }}{{ . | nindent 12 }}{{- end }}
             {{- /* Its own budget, and the plugin's share at it (stage M; the
                    resilience spec's section 10a): past the share only this
                    plugin is refused. A sidecars[] entry's own `limits`

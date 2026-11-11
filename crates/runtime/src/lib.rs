@@ -578,7 +578,21 @@ pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
         let component = instance_id.split('-').next().unwrap_or(instance_id);
         install_budget(component, 0)?;
     }
-    bus_from_env_budgeted(instance_id).await
+    bus_from_env_budgeted(instance_id, false).await
+}
+
+/// [`bus_from_env`], for a data plugin's sidecar in `ha` (the resilience
+/// spec's section 4): its lake writes routed to the lake's write-ahead
+/// stream, everything else to the broker as before. Where the chart does not
+/// say the deployment writes ahead (`MERIDIAN_LAKE_WRITE_AHEAD`), or there
+/// is no broker, the same bus as [`bus_from_env`].
+pub async fn bus_from_env_writing_ahead(instance_id: &str) -> Result<Arc<Bus>, String> {
+    if meridian_budget::installed().is_none() {
+        let component = instance_id.split('-').next().unwrap_or(instance_id);
+        install_budget(component, 0)?;
+    }
+    let on = var("MERIDIAN_LAKE_WRITE_AHEAD").as_deref() == Some("jetstream");
+    bus_from_env_budgeted(instance_id, on).await
 }
 
 /// This component's budget, installed from the chart's memory settings, less
@@ -591,7 +605,7 @@ pub fn install_budget(component: &str, held: u64) -> Result<(), String> {
     meridian_budget::install(component, held, meridian_budget::permits_from_env()).map(|_| ())
 }
 
-async fn bus_from_env_budgeted(instance_id: &str) -> Result<Arc<Bus>, String> {
+async fn bus_from_env_budgeted(instance_id: &str, write_ahead: bool) -> Result<Arc<Bus>, String> {
     let backend: Arc<dyn Backend> = match var("MERIDIAN_BROKER_URL") {
         Some(url) => {
             let mut waiting = Waiting::new("the broker");
@@ -618,7 +632,24 @@ async fn bus_from_env_budgeted(instance_id: &str) -> Result<Arc<Bus>, String> {
         }
     };
 
-    Ok(Arc::new(Bus::single(instance_id, backend, clock())))
+    let bus = Bus::single(instance_id, Arc::clone(&backend), clock());
+    let Some(url) = var("MERIDIAN_BROKER_URL").filter(|_| write_ahead) else {
+        return Ok(Arc::new(bus));
+    };
+    let mut waiting = Waiting::new("the lake's write-ahead stream");
+    let stream = loop {
+        match meridian_bus::write_ahead::WriteAhead::connect(&url, Arc::clone(&backend)).await {
+            Ok(stream) => break stream,
+            Err(failed) => waiting.not_yet(&format!("it could not be reached: {failed}")),
+        }
+        tokio::time::sleep(WAIT_AGAIN_AFTER).await;
+    };
+    waiting.over();
+    tracing::info!("the plugin's lake writes go by the lake's write-ahead stream");
+    Ok(Arc::new(
+        bus.with_backend(meridian_bus::write_ahead::BACKEND, Arc::new(stream))
+            .with_rules(meridian_bus::write_ahead::routes()),
+    ))
 }
 
 /// The platform client, for a component that talks to the platform.

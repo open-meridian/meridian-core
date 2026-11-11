@@ -24,6 +24,10 @@ uuid.workspace = true
 # The control partition's bodies (step 3b): assessments, amendments, aliases.
 serde_json.workspace = true
 tokio = { workspace = true }
+# The write-ahead stream in `ha` (the resilience spec's section 4): the
+# writer takes its writes from JetStream.
+async-nats.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

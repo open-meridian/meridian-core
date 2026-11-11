@@ -43,13 +43,13 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 
 /// Where a refusal travels. Not in the payload, because the payload is the
 /// answer's shape and a refusal is not an answer of that shape.
-const REFUSAL_HEADER: &str = "Meridian-Refusal";
+pub(crate) const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
 /// How long a request's caller waits for its answer, in milliseconds, carried
 /// beside the request as gRPC's own `grpc-timeout` is: relative, so no two
 /// clocks are compared. The answering side holds a read to its `read_after`
 /// no longer than its caller waits (contract v30, ruled 2026-11-10).
-const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
+pub(crate) const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
 
 /// How often a client asks its server to hand a message back to it, and how
 /// long it waits for it before moving to another server (step 3b): the

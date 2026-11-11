@@ -12,7 +12,9 @@
 //! Who this serves is launch configuration and never what registers: a plugin
 //! that named its own roles would be choosing its own privileges.
 
-use meridian_runtime::{bus_from_env, names_from, required, shutdown, var};
+use meridian_runtime::{
+    bus_from_env, bus_from_env_writing_ahead, names_from, required, shutdown, var,
+};
 use std::sync::Arc;
 
 use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
@@ -122,6 +124,9 @@ fn run() -> Result<(), String> {
         .or_else(|| var("MERIDIAN_INSTANCE_ID"))
         .unwrap_or_else(|| "sidecar-1".into());
 
+    // Whether its plugin records the lake's rows: the data role's (W10.4).
+    let writes_rows = identity.roles.iter().any(|role| role == "data");
+
     // The plugin's share, refused at start where the chart or the launch
     // set it to something that is not one.
     let limits = Limits::from_env()?;
@@ -134,7 +139,15 @@ fn run() -> Result<(), String> {
             // Its own budget (stage M), inside the desktop footprint's +15 %
             // (1058): the plugin's share keeps a flood off it.
             meridian_budget::install("sidecar", 0, meridian_budget::permits_from_env())?;
-            let bus = bus_from_env(&instance_id).await?;
+            // A data plugin's lake writes go by the lake's write-ahead stream
+            // in `ha` (the resilience spec's section 4): held by the stream
+            // before the lake records them, so none it was answered for is
+            // lost.
+            let bus = if writes_rows {
+                bus_from_env_writing_ahead(&instance_id).await?
+            } else {
+                bus_from_env(&instance_id).await?
+            };
             // Its own hops' ages -- a record batch accepted, a row delivered
             // -- to the monitor, under its plugin's instance (W4.16; 606).
             tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));

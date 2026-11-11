@@ -9,7 +9,8 @@ use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 use crate::row::{DataType, Observation};
 use crate::store::{
     as_assessed, as_flagged, closed_reason, counted, force_order, matches, Assessment,
-    ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale, Store, WantChange,
+    ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale, Store, StoreError,
+    WantChange, WriteAheadBatch, WriteAheadPosition,
 };
 
 #[derive(Default)]
@@ -34,6 +35,8 @@ struct Held {
     /// The `control` partition's log (step 3b): assessments, amendments,
     /// priorities and aliases, in the order committed.
     control: Vec<meridian_changes::Change>,
+    /// The write-ahead stream's position, by stream (the `ha` profile).
+    write_ahead: BTreeMap<String, WriteAheadPosition>,
 }
 
 #[derive(Default)]
@@ -90,58 +93,77 @@ pub(crate) fn number(
     rows: Vec<Observation>,
     head: &mut u64,
     now_ns: i64,
+    latest: impl FnMut(&Observation) -> Option<Observation>,
+    previous: impl FnMut(&Observation) -> u64,
+) -> Recorded {
+    number_parts(vec![rows], head, now_ns, latest, previous)
+        .pop()
+        .unwrap_or_default()
+}
+
+/// [`number`], for several batches of one dataset numbered in turn as one
+/// (the write-ahead stream's, the resilience spec's section 4): each part is
+/// decided against what is held and what every part before it numbered, and
+/// answered with what it did itself.
+pub(crate) fn number_parts(
+    parts: Vec<Vec<Observation>>,
+    head: &mut u64,
+    now_ns: i64,
     mut latest: impl FnMut(&Observation) -> Option<Observation>,
     mut previous: impl FnMut(&Observation) -> u64,
-) -> Recorded {
-    let mut done = Recorded::default();
-    for mut row in rows {
-        let earlier = done
-            .rows
-            .iter()
-            .rev()
-            .find(|held| {
-                held.data_type() == row.data_type() && held.meta().row_key == row.meta().row_key
-            })
-            .cloned()
-            .or_else(|| latest(&row));
-        let version = match &earlier {
-            Some(held) if held.same_value(&row) => {
-                done.unchanged += 1;
-                continue;
-            }
-            // A rate's confirmation (contract v27, W10.4): only its raw
-            // reference changed. Recorded, as the next version keeping the
-            // reference, and counted unchanged, never a restatement.
-            Some(held) if held.confirms(&row) => {
-                done.unchanged += 1;
-                held.meta().version + 1
-            }
-            Some(held) => {
-                done.restated += 1;
-                held.meta().version + 1
-            }
-            None => {
-                done.recorded += 1;
-                1
-            }
-        };
-        let previous_sequence = done
-            .rows
-            .iter()
-            .rev()
-            .find(|held| held.data_type() == row.data_type() && held.subject() == row.subject())
-            .map(|held| held.meta().sequence)
-            .unwrap_or_else(|| previous(&row));
-        *head += 1;
-        let meta = row.meta_mut();
-        meta.version = version;
-        meta.sequence = *head;
-        meta.previous_sequence = previous_sequence;
-        meta.recorded_at_ns = now_ns;
-        done.rows.push(row);
+) -> Vec<Recorded> {
+    // What the parts have numbered so far: each row key's last version, and
+    // each subject's last sequence, of the rows numbered.
+    let mut keys: std::collections::HashMap<(i16, String), Observation> =
+        std::collections::HashMap::new();
+    let mut subjects: std::collections::HashMap<(i16, String), u64> =
+        std::collections::HashMap::new();
+    let mut answered = Vec::with_capacity(parts.len());
+    for rows in parts {
+        let mut done = Recorded::default();
+        for mut row in rows {
+            let key = (row.data_type().code(), row.meta().row_key.clone());
+            let earlier = keys.get(&key).cloned().or_else(|| latest(&row));
+            let version = match &earlier {
+                Some(held) if held.same_value(&row) => {
+                    done.unchanged += 1;
+                    continue;
+                }
+                // A rate's confirmation (contract v27, W10.4): only its raw
+                // reference changed. Recorded, as the next version keeping the
+                // reference, and counted unchanged, never a restatement.
+                Some(held) if held.confirms(&row) => {
+                    done.unchanged += 1;
+                    held.meta().version + 1
+                }
+                Some(held) => {
+                    done.restated += 1;
+                    held.meta().version + 1
+                }
+                None => {
+                    done.recorded += 1;
+                    1
+                }
+            };
+            let subject = (row.data_type().code(), row.subject().to_string());
+            let previous_sequence = subjects
+                .get(&subject)
+                .copied()
+                .unwrap_or_else(|| previous(&row));
+            *head += 1;
+            let meta = row.meta_mut();
+            meta.version = version;
+            meta.sequence = *head;
+            meta.previous_sequence = previous_sequence;
+            meta.recorded_at_ns = now_ns;
+            keys.insert(key, row.clone());
+            subjects.insert(subject, *head);
+            done.rows.push(row);
+        }
+        done.head = *head;
+        answered.push(done);
     }
-    done.head = *head;
-    done
+    answered
 }
 
 /// Each row key at its version in force among those recorded by `as_of_ns`
@@ -215,6 +237,71 @@ impl Store for MemoryStore {
         }
         held.rows.extend(done.rows.iter().cloned());
         Ok(done)
+    }
+
+    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        Ok(self.lock().write_ahead.get(stream).copied())
+    }
+
+    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+        let mut held = self.lock();
+        let epoch = self.fenced(&mut held)?;
+        let at = held.write_ahead.get(&batch.stream).copied();
+        if at != batch.after {
+            return Err(StoreError::PositionMoved(format!(
+                "the lake's place in {} is {at:?}, not {:?}",
+                batch.stream, batch.after
+            )));
+        }
+        let mut answered = vec![Recorded::default(); batch.parts.len()];
+        let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
+        for (at, (dataset, rows)) in batch.parts.into_iter().enumerate() {
+            by_dataset.entry(dataset).or_default().push((at, rows));
+        }
+        for (dataset, parts) in by_dataset {
+            let mut head = held.heads.get(&dataset).copied().unwrap_or(0);
+            let stored = &held.rows;
+            let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
+            let done = number_parts(
+                rows,
+                &mut head,
+                now_ns,
+                |row| {
+                    stored
+                        .iter()
+                        .filter(|h| {
+                            h.dataset() == dataset
+                                && h.data_type() == row.data_type()
+                                && h.meta().row_key == row.meta().row_key
+                        })
+                        .max_by_key(|h| h.meta().version)
+                        .cloned()
+                },
+                |row| {
+                    stored
+                        .iter()
+                        .filter(|h| {
+                            h.dataset() == dataset
+                                && h.data_type() == row.data_type()
+                                && h.subject() == row.subject()
+                        })
+                        .map(|h| h.meta().sequence)
+                        .max()
+                        .unwrap_or(0)
+                },
+            );
+            held.heads.insert(dataset.clone(), head);
+            for (place, done) in places.into_iter().zip(done) {
+                for row in &done.rows {
+                    held.epochs
+                        .insert((dataset.clone(), row.meta().sequence), epoch);
+                }
+                held.rows.extend(done.rows.iter().cloned());
+                answered[place] = done;
+            }
+        }
+        held.write_ahead.insert(batch.stream, batch.through);
+        Ok(answered)
     }
 
     fn serve_unkept(

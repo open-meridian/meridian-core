@@ -23,6 +23,7 @@
 
 pub mod read_after;
 pub mod topic;
+pub mod write_ahead;
 
 mod backend;
 mod memory;

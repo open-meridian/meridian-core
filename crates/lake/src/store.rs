@@ -28,9 +28,22 @@ pub enum StoreError {
     /// lake over, and this one steps down (step 3a; ruling 1060).
     #[error("{0}")]
     Fenced(#[from] meridian_changes::Fenced),
+
+    /// A write-ahead batch refused because the store's position in the
+    /// stream is not the one the batch follows (the `ha` profile; the
+    /// resilience spec's section 4): the database failed over and lost the
+    /// commits after it, or another writer moved it. The writer reads the
+    /// position again and goes on from there.
+    #[error("{0}")]
+    PositionMoved(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// What a store that keeps no write-ahead position answers: a reader's.
+fn no_write_ahead() -> StoreError {
+    StoreError::Unavailable("this member keeps no write-ahead position: the writer does".into())
+}
 
 /// Which valid time a read asks about (W10.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +86,30 @@ pub struct Query {
     /// and point, and the latest of those not invalid, as the read chooses
     /// them ([`crate::read`]). A store may answer every row still.
     pub latest_only: bool,
+}
+
+/// The lake's place in its write-ahead stream (the `ha` profile; the
+/// resilience spec's section 4): the last of the stream's sequences whose
+/// writes the lake has recorded, and the stream's time for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteAheadPosition {
+    pub sequence: u64,
+    pub at_ns: i64,
+}
+
+/// Writes taken from the write-ahead stream, recorded as one: each part one
+/// request's rows of one dataset that the lake keeps, in the stream's order,
+/// and the position they take the lake to, committed with them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteAheadBatch {
+    /// The stream's name.
+    pub stream: String,
+    /// The position the writer last read or committed: the batch is refused
+    /// [`StoreError::PositionMoved`] where the store holds another.
+    pub after: Option<WriteAheadPosition>,
+    /// The position the batch commits.
+    pub through: WriteAheadPosition,
+    pub parts: Vec<(String, Vec<Observation>)>,
 }
 
 /// What a batch did.
@@ -430,6 +467,24 @@ pub trait Store: Send + Sync {
         readers: &[String],
         now_ns: i64,
     ) -> Result<Recorded>;
+
+    /// The lake's position in its write-ahead stream `stream`, none before
+    /// its first batch from it (the `ha` profile).
+    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        let _ = stream;
+        Err(no_write_ahead())
+    }
+
+    /// Writes from the write-ahead stream recorded as one (the `ha`
+    /// profile; the resilience spec's section 4): each dataset's parts
+    /// numbered in turn, as one batch of it, decided as [`Store::record`]
+    /// decides a batch, and the stream's position moved to `through` in the
+    /// same transaction, so the rows and the position commit or roll back
+    /// together. Answered with what each part did, in the parts' order.
+    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+        let _ = (batch, now_ns);
+        Err(no_write_ahead())
+    }
 
     /// The rows a query names, each row key at its version as of the
     /// query's cut-off, with no choice among them made: which in force is

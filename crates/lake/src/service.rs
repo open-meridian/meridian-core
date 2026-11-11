@@ -400,6 +400,15 @@ pub struct Lake {
     read_handlers: RwLock<BTreeMap<&'static str, meridian_bus::Handler>>,
 }
 
+/// What a batch did, as its parts are published: what its reply counts,
+/// the datasets it wrote and the subjects it named.
+#[derive(Default)]
+struct Said {
+    reply: RecordObservationsReply,
+    datasets: BTreeSet<String>,
+    subjects: Vec<String>,
+}
+
 /// The lake's change log, read from its store.
 struct LakeLog(Arc<dyn Store>);
 
@@ -478,6 +487,152 @@ pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
         }
     }
     superseded
+}
+
+/// A write's rows as the lake records them, by the topic it was asked on
+/// (W10.4): the field its request names them by, each row as a row of its
+/// kind, and the want it answers. Every topic of
+/// [`meridian_bus::write_ahead::TOPICS`], each decoded as the lake's own
+/// handler for it decodes it; any other refused.
+pub fn rows_of(
+    topic: &str,
+    envelope: &Envelope,
+) -> Result<(&'static str, Vec<Observation>, String), String> {
+    use meridian_domain::v1;
+    fn rows<R: Message + Default, T>(
+        envelope: &Envelope,
+        request_type: &str,
+        field: &'static str,
+        take: impl FnOnce(R) -> (Vec<T>, String),
+        each: impl Fn(T) -> Observation,
+    ) -> Result<(&'static str, Vec<Observation>, String), String> {
+        let (rows, want_id) = take(decode(envelope, request_type)?);
+        Ok((field, rows.into_iter().map(each).collect(), want_id))
+    }
+    match topic {
+        RECORD_PRICES => rows(
+            envelope,
+            "meridian.v1.RecordPricesRequest",
+            "prices",
+            |r: RecordPricesRequest| (r.prices, r.want_id),
+            |row| Observation::Price(Box::new(row)),
+        ),
+        RECORD_BARS => rows(
+            envelope,
+            "meridian.v1.RecordBarsRequest",
+            "bars",
+            |r: RecordBarsRequest| (r.bars, r.want_id),
+            |row| Observation::Bar(Box::new(row)),
+        ),
+        RECORD_TRADES => rows(
+            envelope,
+            "meridian.v1.RecordTradesRequest",
+            "trades",
+            |r: RecordTradesRequest| (r.trades, r.want_id),
+            |row| Observation::Trade(Box::new(row)),
+        ),
+        RECORD_QUOTES => rows(
+            envelope,
+            "meridian.v1.RecordQuotesRequest",
+            "quotes",
+            |r: RecordQuotesRequest| (r.quotes, r.want_id),
+            |row| Observation::Quote(Box::new(row)),
+        ),
+        RECORD_OUTCOMES => rows(
+            envelope,
+            "meridian.v1.RecordOutcomesRequest",
+            "outcomes",
+            |r: RecordOutcomesRequest| (r.outcomes, String::new()),
+            |row| Observation::Outcome(Box::new(row)),
+        ),
+        RECORD_RATES => rows(
+            envelope,
+            "meridian.v1.RecordRatesRequest",
+            "rates",
+            |r: RecordRatesRequest| (r.rates, r.want_id),
+            |row| Observation::Rate(Box::new(row)),
+        ),
+        RECORD_STATISTICS => rows(
+            envelope,
+            "meridian.v1.RecordStatisticsRequest",
+            "statistics",
+            |r: RecordStatisticsRequest| (r.statistics, r.want_id),
+            Observation::Statistic,
+        ),
+        RECORD_SERIES => rows(
+            envelope,
+            "meridian.v1.RecordSeriesRequest",
+            "series",
+            |r: RecordSeriesRequest| (r.series, r.want_id),
+            Observation::Series,
+        ),
+        RECORD_DERIVED_SERIES => rows(
+            envelope,
+            "meridian.v1.RecordDerivedSeriesRequest",
+            "values",
+            |r: v1::RecordDerivedSeriesRequest| (r.values, String::new()),
+            |row| Observation::Derived(Box::new(row)),
+        ),
+        RECORD_SCENARIOS => rows(
+            envelope,
+            "meridian.v1.RecordScenariosRequest",
+            "scenarios",
+            |r: v1::RecordScenariosRequest| (r.scenarios, String::new()),
+            Observation::Scenario,
+        ),
+        RECORD_CORPORATE_ACTIONS => rows(
+            envelope,
+            "meridian.v1.RecordCorporateActionsRequest",
+            "actions",
+            |r: RecordCorporateActionsRequest| (r.actions, r.want_id),
+            |row| Observation::CorporateAction(Box::new(row)),
+        ),
+        RECORD_FILINGS => rows(
+            envelope,
+            "meridian.v1.RecordFilingsRequest",
+            "filings",
+            |r: v1::RecordFilingsRequest| (r.filings, r.want_id),
+            Observation::Filing,
+        ),
+        RECORD_REPORTED_FACTS => rows(
+            envelope,
+            "meridian.v1.RecordReportedFactsRequest",
+            "facts",
+            |r: v1::RecordReportedFactsRequest| (r.facts, r.want_id),
+            |row| Observation::ReportedFact(Box::new(row)),
+        ),
+        RECORD_RATING_ACTIONS => rows(
+            envelope,
+            "meridian.v1.RecordRatingActionsRequest",
+            "actions",
+            |r: v1::RecordRatingActionsRequest| (r.actions, r.want_id),
+            Observation::RatingAction,
+        ),
+        RECORD_HOLDINGS_REPORTS => rows(
+            envelope,
+            "meridian.v1.RecordHoldingsReportsRequest",
+            "reports",
+            |r: v1::RecordHoldingsReportsRequest| (r.reports, r.want_id),
+            Observation::HoldingsReport,
+        ),
+        RECORD_HOLDINGS => rows(
+            envelope,
+            "meridian.v1.RecordHoldingsRequest",
+            "holdings",
+            |r: v1::RecordHoldingsRequest| (r.holdings, r.want_id),
+            |row| Observation::Holding(Box::new(row)),
+        ),
+        RECORD_FACTORS => rows(
+            envelope,
+            "meridian.v1.RecordFactorsRequest",
+            "factors",
+            |r: v1::RecordFactorsRequest| (r.factors, r.want_id),
+            |row| Observation::Factor(Box::new(row)),
+        ),
+        other => Err(format!(
+            "{other} is no write the lake takes from its write-ahead stream"
+        )),
+    }
 }
 
 fn publisher(envelope: &Envelope) -> String {
@@ -1492,6 +1647,24 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
+        let by_dataset = self.prepared(field, rows, envelope)?;
+        let now = self.clock.now_ns();
+        let mut said = Said::default();
+        for (dataset, rows) in by_dataset {
+            let done = self.write_one(&dataset, rows, want_id, now)?;
+            self.published(&dataset, &done, &mut said);
+        }
+        self.answered(said, want_id, envelope, now)
+    }
+
+    /// A batch's bound and every row checked, as [`Lake::checked`] checks
+    /// them, by dataset, each row on a closed day flagged: what is written.
+    fn prepared(
+        &self,
+        field: &str,
+        rows: Vec<Observation>,
+        envelope: &Envelope,
+    ) -> Result<BTreeMap<String, Vec<Observation>>, String> {
         let bound = match field {
             "prices" => bounds::RECORD_PRICES_REQUEST_PRICES_COUNT,
             "trades" => bounds::RECORD_TRADES_REQUEST_TRADES_COUNT,
@@ -1526,71 +1699,101 @@ impl Lake {
                 bound.most
             ));
         }
-        let by_dataset = self.checked(field, rows, envelope)?;
+        let mut by_dataset = self.checked(field, rows, envelope)?;
+        for (dataset, rows) in by_dataset.iter_mut() {
+            self.flag_closed_days(dataset, rows);
+        }
+        Ok(by_dataset)
+    }
+
+    /// One dataset's rows of a batch written: kept, with its change log's
+    /// page published; or, where its licence keeps none of it, served to
+    /// the reads waiting on the want it answers (W10.7; ruling 734).
+    fn write_one(
+        &self,
+        dataset: &str,
+        rows: Vec<Observation>,
+        want_id: &str,
+        now: i64,
+    ) -> Result<crate::store::Recorded, String> {
         let config = self.config();
-        let now = self.clock.now_ns();
-        let mut reply = RecordObservationsReply::default();
-        let mut datasets = BTreeSet::new();
-        let mut subjects = Vec::new();
-        for (dataset, mut rows) in by_dataset {
-            datasets.insert(dataset.clone());
-            self.flag_closed_days(&dataset, &mut rows);
-            let done = if config.licence(&dataset).kept {
-                let done = self.store.record(&dataset, rows, now);
-                if let Ok(done) = &done {
-                    self.publish_changes(&dataset, done, None, now);
-                }
-                done
-            } else {
-                let readers: Vec<String> = self
-                    .wants
-                    .lock()
-                    .expect("wants poisoned")
-                    .open
-                    .get(want_id)
-                    .map(|w| w.asked_by.iter().cloned().collect())
-                    .unwrap_or_else(|| config.entitled(&dataset));
-                let served = self.store.serve_unkept(&dataset, rows, &readers, now);
-                // The reads waiting on the want hear what was served
-                // (W10.7; ruling 734): the lake keeps none of it.
-                if let Ok(done) = &served {
-                    self.publish_changes(&dataset, done, Some(&readers), now);
-                    self.hand_to_waiting(want_id, Heard::Served(done.rows.clone()));
-                }
-                served
-            }
+        if config.licence(dataset).kept {
+            let done = self
+                .store
+                .record(dataset, rows, now)
+                .map_err(|failed| failed.to_string())?;
+            self.publish_changes(dataset, &done, None, now);
+            return Ok(done);
+        }
+        let readers: Vec<String> = self
+            .wants
+            .lock()
+            .expect("wants poisoned")
+            .open
+            .get(want_id)
+            .map(|w| w.asked_by.iter().cloned().collect())
+            .unwrap_or_else(|| config.entitled(dataset));
+        let served = self
+            .store
+            .serve_unkept(dataset, rows, &readers, now)
             .map_err(|failed| failed.to_string())?;
-            reply.recorded += done.recorded;
-            reply.restated += done.restated;
-            reply.unchanged += done.unchanged;
-            // Each real-time row's age at the `lake` hop, on commit (W4.16;
-            // the latency spec's "The hops"; ruling 606): sent to the
-            // monitor with the component's next report.
-            let committed = self.clock.now_ns();
-            let superseded = superseded_in_batch(&done.rows);
-            for (at, row) in done.rows.iter().enumerate() {
-                subjects.extend(row.subjects());
-                if !superseded.contains(&at) {
-                    self.publish(&dataset, row);
-                }
-                if row.data_type().real_time() {
-                    meridian_domain::latency::recorder().record(
-                        &dataset,
-                        meridian_domain::v1::AgeHop::Lake,
-                        committed - meridian_domain::latency::source_ns(row.meta()),
-                    );
-                }
+        // The reads waiting on the want hear what was served (W10.7; ruling
+        // 734): the lake keeps none of it.
+        self.publish_changes(dataset, &served, Some(&readers), now);
+        self.hand_to_waiting(want_id, Heard::Served(served.rows.clone()));
+        Ok(served)
+    }
+
+    /// One dataset's part of a batch, once it committed: each row recorded
+    /// published, and its age at the lake's hop measured; counted in `said`.
+    fn published(&self, dataset: &str, done: &crate::store::Recorded, said: &mut Said) {
+        said.reply.recorded += done.recorded;
+        said.reply.restated += done.restated;
+        said.reply.unchanged += done.unchanged;
+        // Each real-time row's age at the `lake` hop, on commit (W4.16; the
+        // latency spec's "The hops"; ruling 606): sent to the monitor with
+        // the component's next report.
+        let committed = self.clock.now_ns();
+        let superseded = superseded_in_batch(&done.rows);
+        for (at, row) in done.rows.iter().enumerate() {
+            said.subjects.extend(row.subjects());
+            if !superseded.contains(&at) {
+                self.publish(dataset, row);
             }
-            let trades = done
-                .rows
-                .iter()
-                .filter(|row| row.data_type() == DataType::Trade)
-                .count() as u64;
-            if trades > 0 {
-                self.trades_recorded
-                    .fetch_add(trades, std::sync::atomic::Ordering::Relaxed);
+            if row.data_type().real_time() {
+                meridian_domain::latency::recorder().record(
+                    dataset,
+                    meridian_domain::v1::AgeHop::Lake,
+                    committed - meridian_domain::latency::source_ns(row.meta()),
+                );
             }
         }
+        let trades = done
+            .rows
+            .iter()
+            .filter(|row| row.data_type() == DataType::Trade)
+            .count() as u64;
+        if trades > 0 {
+            self.trades_recorded
+                .fetch_add(trades, std::sync::atomic::Ordering::Relaxed);
+        }
+        said.datasets.insert(dataset.to_string());
+    }
+
+    /// A batch answered once every part is published: its watermark, the
+    /// want it answers settled, and the reply.
+    fn answered(
+        &self,
+        said: Said,
+        want_id: &str,
+        envelope: &Envelope,
+        now: i64,
+    ) -> Result<RecordObservationsReply, String> {
+        let Said {
+            mut reply,
+            datasets,
+            subjects,
+        } = said;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         reply.watermark = Some(watermark(&heads, &datasets));
         // What the `lake_record_to_delivery_ms` band reads: from the batch
@@ -1615,6 +1818,104 @@ impl Lake {
             );
         }
         Ok(reply)
+    }
+
+    /// The lake's position in its write-ahead stream `stream` (the `ha`
+    /// profile): where its writer goes on from.
+    pub fn write_ahead_position(
+        &self,
+        stream: &str,
+    ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
+        self.store.write_ahead_position(stream)
+    }
+
+    /// Writes taken from the write-ahead stream, in its order, recorded as
+    /// one with the stream's position (the `ha` profile; the resilience
+    /// spec's section 4): each write checked as [`Lake::record`] checks it,
+    /// the rows the lake keeps of every write recorded in one transaction
+    /// with the position moved from `after` to `through`, and only then
+    /// each write's rows published, its want settled and its answer made --
+    /// what [`Lake::record`] would have answered it, or its refusal. Rows of
+    /// a dataset served, not kept, are served once the batch commits.
+    ///
+    /// Refused whole, nothing answered, where the store refuses the batch:
+    /// [`crate::store::StoreError::PositionMoved`] where the position it
+    /// holds is not `after`, so the writer goes back to it.
+    pub fn record_written(
+        &self,
+        writes: Vec<(String, Envelope)>,
+        stream: &str,
+        after: Option<crate::store::WriteAheadPosition>,
+        through: crate::store::WriteAheadPosition,
+    ) -> Result<Vec<meridian_bus::HandlerReply>, crate::store::StoreError> {
+        struct Written {
+            want_id: String,
+            envelope: Envelope,
+            kept: Vec<(String, usize)>,
+            unkept: Vec<(String, Vec<Observation>)>,
+        }
+        let now = self.clock.now_ns();
+        let config = self.config();
+        let mut parts = Vec::new();
+        let mut written: Vec<Result<Written, String>> = Vec::with_capacity(writes.len());
+        for (topic, envelope) in writes {
+            let prepared = rows_of(&topic, &envelope).and_then(|(field, rows, want_id)| {
+                let by_dataset = self.prepared(field, rows, &envelope)?;
+                Ok((by_dataset, want_id))
+            });
+            written.push(prepared.map(|(by_dataset, want_id)| {
+                let mut write = Written {
+                    want_id,
+                    envelope,
+                    kept: Vec::new(),
+                    unkept: Vec::new(),
+                };
+                for (dataset, rows) in by_dataset {
+                    if config.licence(&dataset).kept {
+                        write.kept.push((dataset.clone(), parts.len()));
+                        parts.push((dataset, rows));
+                    } else {
+                        write.unkept.push((dataset, rows));
+                    }
+                }
+                write
+            }));
+        }
+        let batch = crate::store::WriteAheadBatch {
+            stream: stream.to_string(),
+            after,
+            through,
+            parts,
+        };
+        let mut done: Vec<Option<crate::store::Recorded>> = self
+            .store
+            .record_write_ahead(batch, now)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        Ok(written
+            .into_iter()
+            .map(|write| {
+                let write = write?;
+                let mut said = Said::default();
+                // In the datasets' order, as a batch asked of the lake is
+                // written: what it keeps, then what it serves.
+                for (dataset, part) in &write.kept {
+                    let recorded = done[*part].take().unwrap_or_default();
+                    self.publish_changes(dataset, &recorded, None, now);
+                    self.published(dataset, &recorded, &mut said);
+                }
+                for (dataset, rows) in write.unkept {
+                    let served = self.write_one(&dataset, rows, &write.want_id, now)?;
+                    self.published(&dataset, &served, &mut said);
+                }
+                let reply = self.answered(said, &write.want_id, &write.envelope, now)?;
+                Ok((
+                    "meridian.v1.RecordObservationsReply".to_string(),
+                    reply.encode_to_vec(),
+                ))
+            })
+            .collect())
     }
 
     /// W10.11 (contract v27; ruling 481): execution costs, the analytics

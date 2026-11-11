@@ -297,6 +297,15 @@ impl Bus {
         self
     }
 
+    /// A second backend, by name, for the rules that name it: a transport
+    /// beside the default one, as the lake's write-ahead stream is in `ha`
+    /// ([`crate::write_ahead`]). Everything above the backends -- stamping,
+    /// `read_after`, the gate -- is the bus's, whichever carries a message.
+    pub fn with_backend(mut self, name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
+        self.backends.insert(name.into(), backend);
+        self
+    }
+
     /// How long a question waits when its asker states no bound of its own.
     ///
     /// Five seconds by default, which suits a question answered from memory

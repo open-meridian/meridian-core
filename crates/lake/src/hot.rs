@@ -732,6 +732,26 @@ impl Store for HotStore {
         Ok(done)
     }
 
+    fn write_ahead_position(
+        &self,
+        stream: &str,
+    ) -> Result<Option<crate::store::WriteAheadPosition>> {
+        self.inner.write_ahead_position(stream)
+    }
+
+    fn record_write_ahead(
+        &self,
+        batch: crate::store::WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Recorded>> {
+        let datasets: Vec<String> = batch.parts.iter().map(|(d, _)| d.clone()).collect();
+        let done = self.inner.record_write_ahead(batch, now_ns)?;
+        for (dataset, part) in datasets.iter().zip(&done) {
+            self.committed(dataset, &part.rows);
+        }
+        Ok(done)
+    }
+
     fn serve_unkept(
         &self,
         dataset: &str,

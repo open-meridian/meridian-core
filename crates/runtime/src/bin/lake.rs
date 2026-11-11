@@ -262,6 +262,27 @@ fn run() -> Result<(), String> {
         let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
         lake.build_at_most(answers_at_once);
 
+        // The write-ahead stream in `ha` (the resilience spec's section 4;
+        // the rulings of 2026-11-08): the data plugins' writes taken from
+        // it, each batch recorded with the stream's position, by this
+        // member alone while it writes. The chart says so where the broker
+        // keeps JetStream; `tolerant` has none.
+        if write_ahead_on() {
+            let url = required("MERIDIAN_BROKER_URL")?;
+            let client = meridian_bus::NatsBackend::client(&url)
+                .await
+                .map_err(|failed| format!("the write-ahead stream's broker: {failed}"))?;
+            let bounds = write_ahead_bounds()?;
+            let writing = Arc::clone(&lake);
+            meridian_runtime::background(async move {
+                if let Err(failed) =
+                    meridian_lake::write_ahead::write_forever(writing, client, bounds).await
+                {
+                    meridian_runtime::member::step_down("lake", &failed);
+                }
+            });
+        }
+
         // W5.20, said on the bus for the instrument store to carry outward:
         // the component's health and schema, never a row or a dataset.
         let reporting = bus.clone();
@@ -283,5 +304,23 @@ fn run() -> Result<(), String> {
         tracing::info!("stopping");
         holding.release().await;
         Ok(())
+    })
+}
+
+/// Whether this deployment's data plugins write ahead to the stream: the
+/// chart says so in `ha`, where the broker keeps JetStream at three.
+fn write_ahead_on() -> bool {
+    var("MERIDIAN_LAKE_WRITE_AHEAD").as_deref() == Some("jetstream")
+}
+
+/// The stream's bounds: how long it holds a write the lake has not
+/// recorded, and how much it holds.
+fn write_ahead_bounds() -> Result<meridian_lake::write_ahead::Bounds, String> {
+    Ok(meridian_lake::write_ahead::Bounds {
+        max_age: std::time::Duration::from_secs(15 * 60),
+        max_bytes: 128 * 1024 * 1024,
+        // The broker's three servers, a majority holding each write before
+        // its plugin is answered.
+        replicas: 3,
     })
 }
