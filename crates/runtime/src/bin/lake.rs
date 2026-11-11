@@ -173,19 +173,27 @@ fn run() -> Result<(), String> {
         // its hot layer kept by the writer's change log, never writing.
         if member.is_reader() {
             bus.serve_only(meridian_bus::read_after::is_read);
+            // Off the runtime's worker: the store's Postgres client is
+            // blocking, and connected from within the runtime it panicked
+            // (PR CI 43014977978, e2e-cluster-scaled: "Cannot start a runtime
+            // from within a runtime", once the chart wired the replica).
             let replica =
                 match meridian_runtime::read_database_url("MERIDIAN_LAKE_READ_DATABASE_URL") {
                     None => None,
-                    Some(read_url) => Some(Arc::new(wait_for_store(
-                        "the lake's read replica",
-                        &read_url,
-                        |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-                        |store| {
-                            store
-                                .verify()
-                                .map_err(|failed| Wait::NotYet(failed.to_string()))
-                        },
-                    )?)
+                    Some(read_url) => Some(Arc::new(tokio::task::block_in_place(|| {
+                        wait_for_store(
+                            "the lake's read replica",
+                            &read_url,
+                            |url| {
+                                PostgresStore::connect(url, 4).map_err(|failed| failed.to_string())
+                            },
+                            |store| {
+                                store
+                                    .verify()
+                                    .map_err(|failed| Wait::NotYet(failed.to_string()))
+                            },
+                        )
+                    })?)
                         as Arc<dyn meridian_lake::Store>),
                 };
             // Where it starts following from: the primary's heads before its

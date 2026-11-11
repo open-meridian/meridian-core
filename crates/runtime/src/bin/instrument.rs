@@ -169,16 +169,24 @@ fn run() -> Result<(), String> {
             ) {
                 None => None,
                 Some(read_url) => {
-                    let replica = Arc::new(wait_for_store(
-                        "the instrument store's read replica",
-                        &read_url,
-                        |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-                        |store| {
-                            store
-                                .verify()
-                                .map_err(|failed| Wait::NotYet(failed.to_string()))
-                        },
-                    )?);
+                    // Off the runtime's worker: the store's Postgres client is
+                    // blocking, and connected from within the runtime it panicked
+                    // (PR CI 43014977978, e2e-cluster-scaled: "Cannot start a runtime
+                    // from within a runtime", once the chart wired the replica).
+                    let replica = Arc::new(tokio::task::block_in_place(|| {
+                        wait_for_store(
+                            "the instrument store's read replica",
+                            &read_url,
+                            |url| {
+                                PostgresStore::connect(url, 4).map_err(|failed| failed.to_string())
+                            },
+                            |store| {
+                                store
+                                    .verify()
+                                    .map_err(|failed| Wait::NotYet(failed.to_string()))
+                            },
+                        )
+                    })?);
                     let at: Arc<dyn meridian_bus::read_after::Position> =
                         Arc::new(meridian_runtime::member::LogHeads::of(replica.clone()));
                     Some((replica as Arc<dyn meridian_instrument::Store>, at))
