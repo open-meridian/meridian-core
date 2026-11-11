@@ -56,6 +56,9 @@ pub struct PostgresStore {
     snapshot_interval: u64,
     /// The epoch this writer's commands commit under (step 3a).
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a command there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 impl PostgresStore {
@@ -65,14 +68,19 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
         Ok(Self {
             pool,
             snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -140,7 +148,53 @@ impl PostgresStore {
     }
 
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
+        Ok(conn)
+    }
+
+    /// Follow the database's timeline on `conn` for this writer (contract
+    /// v30, stage C): on a new one every partition's epoch raised as a
+    /// takeover raises it, adopted, and the takeover recorded with that
+    /// cause. Nothing where it writes under no epoch.
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let by = meridian_changes::TookOver {
+            member: meridian_changes::member().to_string(),
+            why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
+            at_ns: meridian_changes::now_ns(),
+        };
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let (found, identity) = meridian_changes::timeline::follow(
+            &mut tx,
+            "book_partition_head",
+            CONTROL_PARTITION,
+            mine,
+            |tx| raise(tx, &by),
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the book's database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The start-up's snapshots (v26's core; W9.10's note "when a snapshot
@@ -1435,34 +1489,15 @@ impl Store for PostgresStore {
         // A deposed writer stopped mid-entry holds the head row it took.
         meridian_changes::end_deposed_writers(&mut tx, &["book_partition_head"])
             .map_err(unavailable)?;
-        let epoch: i64 = tx
-            .query_one(
-                "WITH raised AS (
-                    UPDATE book_partition_head
-                       SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
-                    RETURNING epoch)
-                 SELECT max(epoch) FROM raised",
-                &[],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        // Who took it over and why, in the same transaction (step 3b).
-        tx.execute(
-            "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-             SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
-               FROM book_partition_head",
-            &[
-                &epoch,
-                &by.member,
-                &by.why,
-                &meridian_changes::origin(),
-                &by.at_ns,
-            ],
-        )
-        .map_err(unavailable)?;
+        let epoch = raise(&mut tx, by).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
-        self.fence.adopt(epoch as u64);
-        Ok(epoch as u64)
+        self.fence.adopt(epoch);
+        Ok(epoch)
+    }
+
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
     }
 
     fn head_epoch(&self) -> Result<u64> {
@@ -2508,4 +2543,37 @@ fn unavailable(failed: impl std::error::Error) -> StoreError {
         cause = next.source();
     }
     StoreError::Unavailable(detail)
+}
+
+/// Raise every partition's epoch in `tx`, and record who raised it and why
+/// (step 3b, `WriterTookOver`): answer the epoch. What a takeover does, and a
+/// writer on a new database timeline (contract v30, stage C).
+fn raise(
+    tx: &mut postgres::Transaction<'_>,
+    by: &meridian_changes::TookOver,
+) -> std::result::Result<u64, postgres::Error> {
+    let epoch: i64 = tx
+        .query_one(
+            "WITH raised AS (
+                UPDATE book_partition_head
+                   SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
+                RETURNING epoch)
+             SELECT max(epoch) FROM raised",
+            &[],
+        )?
+        .get(0);
+    // Who raised it and why, in the same transaction (step 3b).
+    tx.execute(
+        "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+         SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
+           FROM book_partition_head",
+        &[
+            &epoch,
+            &by.member,
+            &by.why,
+            &meridian_changes::origin(),
+            &by.at_ns,
+        ],
+    )?;
+    Ok(epoch as u64)
 }

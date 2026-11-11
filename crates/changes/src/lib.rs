@@ -39,6 +39,7 @@ use prost::Message;
 
 pub mod captured;
 pub mod integrity;
+pub mod timeline;
 pub mod tls;
 
 /// The most a page of changes holds, encoded (1056: 512 KiB pages).
@@ -442,6 +443,22 @@ pub fn set_origin(deployment_id: &str) {
 /// This process's deployment, as every change it makes carries it.
 pub fn origin() -> &'static str {
     ORIGIN.get().map(String::as_str).unwrap_or("")
+}
+
+/// This process's member, its pod's name (step 3b): who a store's writer
+/// says raised its epoch, where it raises one itself on a new database
+/// timeline (contract v30, stage C). Set once by the runtime; empty in a
+/// test.
+static MEMBER: OnceLock<String> = OnceLock::new();
+
+/// Name this process's member, once.
+pub fn set_member(name: &str) {
+    let _ = MEMBER.set(name.to_string());
+}
+
+/// This process's member.
+pub fn member() -> &'static str {
+    MEMBER.get().map(String::as_str).unwrap_or("")
 }
 
 /// How long a takeover waits for each deposed writer's session it ends to

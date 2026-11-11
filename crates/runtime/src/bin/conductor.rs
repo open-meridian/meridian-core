@@ -259,8 +259,17 @@ fn run() -> Result<(), String> {
             })?;
             tracing::info!(epoch, "the configuration store writes under its epoch");
             let watched = Arc::clone(postgres);
-            holding.keep(epoch, move || {
-                watched.head_epoch().map_err(|failed| failed.to_string())
+            let writing = Arc::clone(postgres);
+            holding.keep(
+                move || writing.epoch(),
+                move || watched.head_epoch().map_err(|failed| failed.to_string()),
+            );
+            // A new database timeline raises the epoch (contract v30, stage C).
+            let following = Arc::clone(postgres);
+            holding.follow_timeline(&bus, "config", move || {
+                following
+                    .follow_timeline()
+                    .map_err(|failed| failed.to_string())
             });
             // The scrub, under the lease (step 3b, integrity at rest).
             let scrubbing = scrub_url.clone();

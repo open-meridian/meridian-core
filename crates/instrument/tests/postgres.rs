@@ -1259,3 +1259,35 @@ mod counted {
 
 #[global_allocator]
 static COUNTING: counted::Counting = counted::Counting;
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3), in a store that captures its log: the
+/// identity a writer first sees is kept; another raises the epoch, recorded
+/// with that cause, and the writer's connections are named with it.
+#[test]
+fn a_new_database_timeline_raises_a_captured_stores_epoch() {
+    use meridian_changes::timeline::Timeline;
+    let (url, store) = isolated();
+    let epoch = store.adopt().unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::First);
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Same);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .execute(
+            "UPDATE instrument_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Moved(epoch + 1));
+    assert_eq!(store.epoch(), epoch + 1);
+    assert_eq!(store.head_epoch().unwrap(), epoch + 1);
+    let why: String = admin
+        .query_one(
+            "SELECT why FROM instrument_writer_took_over WHERE epoch = $1",
+            &[&((epoch + 1) as i64)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+}

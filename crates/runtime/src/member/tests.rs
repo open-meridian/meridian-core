@@ -350,3 +350,161 @@ fn the_tail_is_one_compressed_page_per_transaction() {
         assert!(tail.try_recv().is_none(), "and nothing else");
     });
 }
+
+/// A writer's log of `P0` across a database failover that lost a tail: each
+/// change below `lost_from` as first written, each from it written again
+/// under the raised epoch with another body.
+struct Failing {
+    state: Mutex<(u64, u64, u64)>, // head, lost_from, epoch now
+}
+
+impl Failing {
+    fn change(&self, sequence: u64) -> Change {
+        let (_, lost_from, epoch) = *self.state.lock().unwrap();
+        let again = sequence >= lost_from;
+        Change {
+            partition: "P0".into(),
+            sequence,
+            epoch: if again { epoch } else { 2 },
+            origin: "DEP-1".into(),
+            committed_at_ns: sequence as i64,
+            kind: "entry".into(),
+            body: vec![if again { 2 } else { 1 }; 16],
+            digest: Vec::new(),
+        }
+    }
+}
+
+impl ChangeLog for Failing {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
+        let (head, _, epoch) = *self.state.lock().unwrap();
+        if partition == meridian_changes::CONTROL {
+            return Ok(ReadChangesReply {
+                head: 0,
+                epoch,
+                ..Default::default()
+            });
+        }
+        let mut page = Page::new(most);
+        for sequence in (after + 1)..=head {
+            if !page.take(self.change(sequence)) {
+                break;
+            }
+        }
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept: 1,
+            epoch,
+            after_sequence: 0,
+        })
+    }
+}
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3): a reader that applied a tail the database's
+/// failover lost, the writer having taken those sequences again under the
+/// raised epoch, reads back what it applied once the epoch rises, finds the
+/// record no longer holds it, and drops the partition and reloads it at the
+/// record's head -- never holding a change the record does not -- then
+/// follows the new epoch's changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_that_applied_a_lost_tail_drops_it_when_the_epoch_rises() {
+    let bus = Arc::new(Bus::single(
+        "member-test-lineage",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Failing {
+        state: Mutex::new((2, u64::MAX, 2)),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    struct Primary;
+    impl meridian_bus::read_after::Position for Primary {
+        fn heads(&self, _: &[String]) -> Result<HashMap<String, u64>, String> {
+            Ok([("P0".to_string(), 2)].into())
+        }
+    }
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(Primary))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.state.lock().unwrap().0 = 6;
+    let first: Vec<Change> = (3..=6).map(|s| log.change(s)).collect();
+    meridian_changes::publish(&bus, "book", 2, &first);
+    until("6 applied", || followed.heads().get("P0") == Some(&6)).await;
+    let dropped_before = DROPPED.load(Ordering::SeqCst);
+
+    // The database failed over and lost 5 and 6; the writer raised its
+    // epoch and wrote 5 again, another change.
+    *log.state.lock().unwrap() = (5, 5, 3);
+    until("P0 dropped and reloaded at the record's head", || {
+        followed.heads().get("P0") == Some(&5)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
+    assert!(DROPPED.load(Ordering::SeqCst) > dropped_before);
+
+    // The new epoch's next change follows on.
+    log.state.lock().unwrap().0 = 6;
+    meridian_changes::publish(&bus, "book", 5, &[log.change(6)]);
+    until("the new 6 applied", || {
+        followed.heads().get("P0") == Some(&6)
+    })
+    .await;
+    assert_eq!(applied.resets.lock().unwrap().len(), 1);
+}
+
+/// A writer's takeover raises the epoch with nothing lost: the reader reads
+/// back what it applied, finds it held, and drops nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_drops_nothing_when_the_epoch_rises_over_a_record_that_lost_nothing() {
+    let bus = Arc::new(Bus::single(
+        "member-test-lineage-kept",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Failing {
+        state: Mutex::new((2, u64::MAX, 2)),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    struct Primary;
+    impl meridian_bus::read_after::Position for Primary {
+        fn heads(&self, _: &[String]) -> Result<HashMap<String, u64>, String> {
+            Ok([("P0".to_string(), 2)].into())
+        }
+    }
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(Primary))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.state.lock().unwrap().0 = 4;
+    let first: Vec<Change> = (3..=4).map(|s| log.change(s)).collect();
+    meridian_changes::publish(&bus, "book", 2, &first);
+    until("4 applied", || followed.heads().get("P0") == Some(&4)).await;
+    // A takeover: the epoch raised from 5 on, nothing lost.
+    *log.state.lock().unwrap() = (4, 5, 3);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    log.state.lock().unwrap().0 = 5;
+    meridian_changes::publish(&bus, "book", 4, &[log.change(5)]);
+    until("5 applied", || followed.heads().get("P0") == Some(&5)).await;
+    assert!(applied.resets.lock().unwrap().is_empty());
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5]);
+}

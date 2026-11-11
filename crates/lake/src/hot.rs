@@ -770,6 +770,16 @@ impl Store for HotStore {
         self.inner.dataset_gaps()
     }
 
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let found = self.inner.follow_timeline()?;
+        // The record lost what this layer may hold (contract v30, stage C):
+        // nothing held is kept past it; each key is loaded again.
+        if matches!(found, meridian_changes::timeline::Timeline::Moved(_)) {
+            self.evict_all();
+        }
+        Ok(found)
+    }
+
     fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
         self.inner.record_switches(switches)
     }

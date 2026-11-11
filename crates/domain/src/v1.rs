@@ -20062,8 +20062,10 @@ pub struct DerivedSeriesUpdatedEvent {
     /// 0 to 4,096.
     #[prost(message, repeated, tag = "5")]
     pub not_evaluated: ::prost::alloc::vec::Vec<NotEvaluated>,
-    /// The job's own sequence, the same for every holder, so a reader sees a
-    /// gap. Never zero.
+    /// The job's sequence for one holding instance, dense per holder, so a
+    /// reader sees a gap; after a gap or a loss marker the reader reads the
+    /// job's whole current answer again by ReadJobAnswer and applies events
+    /// above it. Not a lake row's sequence. Never zero.
     #[prost(int64, tag = "6")]
     pub sequence: i64,
 }
@@ -24514,6 +24516,11 @@ pub enum TakeoverReason {
     SteppedDown = 2,
     /// A partition moved to this member's group.
     Moved = 3,
+    /// The writer found its database on a new timeline or system identifier
+    /// (a failover or a restore that can have lost a committed tail) and raised
+    /// its partitions' epoch, so a follower that applied the lost tail drops it
+    /// (approved 2026-11-11).
+    DatabaseTimeline = 4,
 }
 impl TakeoverReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -24526,6 +24533,7 @@ impl TakeoverReason {
             Self::LeaseLapsed => "TAKEOVER_REASON_LEASE_LAPSED",
             Self::SteppedDown => "TAKEOVER_REASON_STEPPED_DOWN",
             Self::Moved => "TAKEOVER_REASON_MOVED",
+            Self::DatabaseTimeline => "TAKEOVER_REASON_DATABASE_TIMELINE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -24535,6 +24543,7 @@ impl TakeoverReason {
             "TAKEOVER_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
             "TAKEOVER_REASON_STEPPED_DOWN" => Some(Self::SteppedDown),
             "TAKEOVER_REASON_MOVED" => Some(Self::Moved),
+            "TAKEOVER_REASON_DATABASE_TIMELINE" => Some(Self::DatabaseTimeline),
             _ => None,
         }
     }

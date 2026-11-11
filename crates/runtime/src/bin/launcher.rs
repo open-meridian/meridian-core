@@ -267,7 +267,7 @@ fn run() -> Result<(), String> {
             let holding = member.wait_to_write(&bus).await?;
             // The launcher keeps no store, so no epoch: its lease alone says
             // which member launches, and a member that loses it stops.
-            holding.keep(0, || Ok(0));
+            holding.keep(|| 0, || Ok(0));
             // Not, or no longer, a development deployment: nothing it made live
             // stays (spec/live-plugin-development, ruling 2). The launcher
             // restarts when the chart changes, so this is the next moment

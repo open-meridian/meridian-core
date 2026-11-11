@@ -515,6 +515,14 @@ pub trait Store: Send + Sync {
     /// writer steps down once it moves past its own.
     fn head_epoch(&self) -> Result<u64>;
 
+    /// Follow the database's timeline (contract v30, stage C; the
+    /// resilience spec's section 3): on a new one every partition's epoch
+    /// raised as a takeover raises it and adopted, the takeover recorded
+    /// with that cause. A store with no database never moves.
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        Ok(meridian_changes::timeline::Timeline::Same)
+    }
+
     /// A page of `partition`'s change log after `after` (step 3a): its
     /// journal's entries in sequence, each one change, at most `most_bytes`.
     fn read_changes(

@@ -161,6 +161,10 @@ impl Spec {
                 ADD COLUMN IF NOT EXISTS tx        xid8,
                 ADD COLUMN IF NOT EXISTS ordinal   integer NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS claimed   boolean NOT NULL DEFAULT false;
+            -- The database's identity the writer last saw, on the control
+            -- row (contract v30, stage C): a new timeline raises the epoch.
+            ALTER TABLE {head}
+                ADD COLUMN IF NOT EXISTS database_identity text NOT NULL DEFAULT '';
             INSERT INTO {head} (partition, sequence) VALUES ('{partition}', 0), ('{CONTROL}', 0)
                 ON CONFLICT (partition) DO NOTHING;
             -- What the store held before its log began is not in it: a
@@ -399,6 +403,41 @@ impl Spec {
     ) -> Result<u64, postgres::Error> {
         let mut tx = client.transaction()?;
         crate::end_deposed_writers(&mut tx, &[self.head])?;
+        let epoch = self.raise(&mut tx, by)?;
+        tx.commit()?;
+        Ok(epoch)
+    }
+
+    /// Follow the database's timeline for the writer at epoch `mine`
+    /// (contract v30, stage C; [`crate::timeline`]): on a new one, the epoch
+    /// raised as a takeover raises it, the takeover recorded with
+    /// [`crate::timeline::DATABASE_TIMELINE`] by `member`, in one
+    /// transaction. Answers what was found, and the identity now.
+    pub fn follow_timeline(
+        &self,
+        client: &mut impl GenericClient,
+        mine: u64,
+        member: &str,
+    ) -> Result<(crate::timeline::Timeline, String), postgres::Error> {
+        let mut tx = client.transaction()?;
+        let by = crate::TookOver {
+            member: member.to_string(),
+            why: crate::timeline::DATABASE_TIMELINE.to_string(),
+            at_ns: crate::now_ns(),
+        };
+        let found =
+            crate::timeline::follow(&mut tx, self.head, CONTROL, mine, |tx| self.raise(tx, &by))?;
+        tx.commit()?;
+        Ok(found)
+    }
+
+    /// Raise the epoch of the partition and its control partition, and
+    /// record who raised it and why, in `tx`: answer the epoch.
+    fn raise(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        by: &crate::TookOver,
+    ) -> Result<u64, postgres::Error> {
         let epoch: i64 = tx
             .query_one(
                 &format!(
@@ -427,7 +466,6 @@ impl Spec {
                 &by.at_ns,
             ],
         )?;
-        tx.commit()?;
         Ok(epoch as u64)
     }
 

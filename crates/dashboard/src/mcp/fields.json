@@ -3427,7 +3427,7 @@
       "unit": "events in the job's sequence",
       "empty": "never zero",
       "intent": "numbers the job's events, so a reader sees a gap (W12.4; approved by 1057)",
-      "meaning": "the job's own sequence, the same for every holder; after a gap or a loss marker the reader reads the job's whole current answer again by ReadJobAnswer and applies events above it",
+      "meaning": "the job's sequence for one holding instance, dense per holder; after a gap or a loss marker the reader reads the job's whole current answer again by ReadJobAnswer and applies events above it",
       "not_meaning": "a lake row's sequence",
       "filled": "decided",
       "filled_by": "analytics",
@@ -26038,11 +26038,15 @@
         {
           "value": "TAKEOVER_REASON_MOVED",
           "meaning": "a partition moved to this member's group"
+        },
+        {
+          "value": "TAKEOVER_REASON_DATABASE_TIMELINE",
+          "meaning": "the writer found its database on a new timeline or system identifier, after a failover or a restore that can have lost a committed tail, and raised the epoch (approved 2026-11-11)"
         }
       ],
       "empty": "never unspecified",
       "intent": "says why the writer was taken over (W6.39; approved 2026-11-09)",
-      "meaning": "the lease lapsed, the writer stepped down, or a move",
+      "meaning": "the lease lapsed, the writer stepped down, a move, or a new database timeline",
       "not_meaning": "a pod's exit code",
       "filled": "decided",
       "filled_by": "conductor",
@@ -27606,7 +27610,7 @@
       "type": "message Watermark",
       "empty": "unset: the nearest member answers, eventually consistent, its watermark saying how current",
       "intent": "names the watermark a read must not be answered behind (W4.4; approved by 1057)",
-      "meaning": "the highest watermark the plugin's sidecar has seen for that instance on the store's partitions, from its own acknowledged writes and the deliveries it passed on, stamped by the sidecar, never by the plugin (approved 2026-11-09): session consistency, read-your-writes and monotonic reads for the instance; a member behind it waits up to its bound, then hands the read to the writer, and never answers from behind it",
+      "meaning": "the highest watermark the plugin's sidecar has seen for that instance on the store's partitions, from its own acknowledged writes, the deliveries it passed on and the watermark each of its reads was answered at, stamped by the sidecar, never by the plugin (approved 2026-11-09 and 2026-11-10): session consistency, read-your-writes and monotonic reads for the instance; a member behind it waits up to its bound or the call's remaining deadline, whichever is sooner, then answers from the store's primary database; a writer still behind it refuses UNAVAILABLE; no member answers from behind it",
       "not_meaning": "a point in time to read as of, which as_of_ns and book_at name; a plugin-facing field; or a demand to read from the writer: a member at or past it answers",
       "filled": "stamped",
       "filled_by": "sidecar",

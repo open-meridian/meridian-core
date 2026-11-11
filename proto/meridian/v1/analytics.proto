@@ -566,8 +566,10 @@ message DerivedSeriesUpdatedEvent {
   // The recomputed figures not evaluated, each with its reason, never zero;
   // 0 to 4,096.
   repeated NotEvaluated not_evaluated = 5;
-  // The job's own sequence, the same for every holder, so a reader sees a
-  // gap. Never zero.
+  // The job's sequence for one holding instance, dense per holder, so a
+  // reader sees a gap; after a gap or a loss marker the reader reads the
+  // job's whole current answer again by ReadJobAnswer and applies events
+  // above it. Not a lake row's sequence. Never zero.
   int64 sequence = 6;
 }
 

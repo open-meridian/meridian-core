@@ -5017,7 +5017,11 @@ fn a_source_switch_and_its_switch_back_are_kept_in_the_control_partition() {
         ]
     );
     let control = store
-        .read_changes(meridian_changes::CONTROL, before, meridian_changes::PAGE_MOST)
+        .read_changes(
+            meridian_changes::CONTROL,
+            before,
+            meridian_changes::PAGE_MOST,
+        )
         .unwrap();
     assert!(
         control
@@ -5027,4 +5031,72 @@ fn a_source_switch_and_its_switch_back_are_kept_in_the_control_partition() {
             .count()
             >= 2
     );
+}
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3): the identity a writer first sees is kept,
+/// nothing raised; one unlike it -- a failover or a restore -- raises the
+/// epoch on every head row, recorded with that cause, and the writer's next
+/// batch commits under it; a writer whose epoch another raised does nothing.
+#[test]
+fn a_new_database_timeline_raises_the_epoch_and_the_next_batch_commits_under_it() {
+    use meridian_changes::timeline::Timeline;
+    let (url, writer) = isolated("lake-timeline");
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "a", &subject, "2026-10-01", 1)],
+            10,
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::First);
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Same);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As a failover or a restore leaves the record: another database's.
+    admin
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Moved(2));
+    assert_eq!(writer.epoch(), 2);
+    let why: String = admin
+        .query_one("SELECT why FROM lake_writer_took_over WHERE epoch = 2", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "b", &subject, "2026-10-02", 2)],
+            20,
+        )
+        .unwrap();
+    let epochs: Vec<u64> = every_change(&writer, &dataset, meridian_changes::PAGE_MOST)
+        .iter()
+        .map(|c| c.epoch)
+        .collect();
+    assert_eq!(epochs, vec![1, 2]);
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Same);
+    // Another took the lake over: a writer whose epoch is gone raises none.
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    assert_eq!(
+        standby
+            .take_over(&meridian_changes::TookOver::unnamed("a test"))
+            .unwrap(),
+        3
+    );
+    admin
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'yet another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::NotMine(3));
 }

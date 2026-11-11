@@ -246,8 +246,18 @@ fn run() -> Result<(), String> {
         })?;
         tracing::info!(epoch, "the lake writes under its epoch");
         let watched = Arc::clone(&store);
-        holding.keep(epoch, move || {
-            watched.head_epoch().map_err(|failed| failed.to_string())
+        let writing = Arc::clone(&store);
+        holding.keep(
+            move || writing.epoch(),
+            move || watched.head_epoch().map_err(|failed| failed.to_string()),
+        );
+        // A new database timeline raises the epoch (contract v30, stage C):
+        // the hot layer let go of what the record may have lost.
+        let following = Arc::clone(&store);
+        holding.follow_timeline(&bus, "lake", move || {
+            following
+                .follow_timeline()
+                .map_err(|failed| failed.to_string())
         });
         // The scrub, under the lease (step 3b, integrity at rest).
         let scrubbing = url.clone();

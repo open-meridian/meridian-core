@@ -324,6 +324,18 @@ impl Reads {
         );
     }
 
+    /// What this process committed of `domain`, and the heads its record
+    /// was last seen at, forgotten: its database moved to a new timeline,
+    /// which may have lost some of it (contract v30, stage C), so the next
+    /// read looks at the record.
+    pub fn forget(&self, domain: &str) {
+        self.committed
+            .lock()
+            .expect("committed poisoned")
+            .remove(domain);
+        self.looked.lock().expect("looked poisoned").remove(domain);
+    }
+
     pub fn set_session(&self, session: Arc<dyn Session>) {
         *self.session.write().expect("session poisoned") = Some(session);
     }

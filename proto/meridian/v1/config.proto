@@ -1178,6 +1178,11 @@ enum TakeoverReason {
   TAKEOVER_REASON_STEPPED_DOWN = 2;
   // A partition moved to this member's group.
   TAKEOVER_REASON_MOVED = 3;
+  // The writer found its database on a new timeline or system identifier
+  // (a failover or a restore that can have lost a committed tail) and raised
+  // its partitions' epoch, so a follower that applied the lost tail drops it
+  // (approved 2026-11-11).
+  TAKEOVER_REASON_DATABASE_TIMELINE = 4;
 }
 
 // A store's record found changed where it rests (W6.39, plan 5j; the record

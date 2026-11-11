@@ -107,6 +107,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "dataset_gap",
         sql: include_str!("../migrations/0015_dataset_gap.sql"),
     },
+    // A new database timeline raises the epoch (contract v30, stage C): the
+    // identity the writer last saw.
+    Migration {
+        version: 16,
+        name: "database_identity",
+        sql: include_str!("../migrations/0016_database_identity.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

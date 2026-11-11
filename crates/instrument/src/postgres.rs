@@ -86,6 +86,9 @@ pub struct PostgresStore {
     /// The epoch this writer's commits are fenced by (step 3a); none until
     /// it adopts one, as the migration Job never does.
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a commit there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 /// The instrument store's change log (step 3a): every table its writes
@@ -133,14 +136,19 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
 
         Ok(Self {
             pool,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -160,6 +168,41 @@ impl PostgresStore {
         let epoch = CHANGES.take_over(&mut *conn, by).map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
+    }
+
+    /// The epoch this writer commits under; 0 before it adopts one.
+    pub fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    /// Follow the database's timeline (contract v30, stage C; the
+    /// resilience spec's section 3): on a new one the epoch is raised, as a
+    /// takeover raises it, and adopted, the takeover recorded with that
+    /// cause. Nothing where this store writes under no epoch.
+    pub fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
+    }
+
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let (found, identity) = CHANGES
+            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The store's epoch now, as its head row says (step 3b): a writer
@@ -460,6 +503,14 @@ impl PostgresStore {
     /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
         let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
         CHANGES
             .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
             .map_err(unavailable)?;

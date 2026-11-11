@@ -209,6 +209,16 @@ impl Store for Writer {
         self.inner.head_epoch()
     }
 
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let found = self.inner.follow_timeline()?;
+        // The record lost what a book held may hold (contract v30, stage
+        // C): none is kept past it; each is read again from the record.
+        if matches!(found, meridian_changes::timeline::Timeline::Moved(_)) {
+            *self.books() = Books::default();
+        }
+        Ok(found)
+    }
+
     fn read_changes(
         &self,
         partition: &str,

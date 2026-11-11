@@ -240,9 +240,14 @@ fn run() -> Result<(), String> {
         })?;
         tracing::info!(epoch, "the book writes under its epoch");
         let watched = postgres.clone();
-        holding.keep(epoch, move || {
-            meridian_bor::Store::head_epoch(watched.as_ref()).map_err(|failed| failed.to_string())
-        });
+        let writing = postgres.clone();
+        holding.keep(
+            move || meridian_bor::Store::epoch(writing.as_ref()),
+            move || {
+                meridian_bor::Store::head_epoch(watched.as_ref())
+                    .map_err(|failed| failed.to_string())
+            },
+        );
         // The scrub, under the lease (step 3b, integrity at rest).
         let scrubbing = url.clone();
         meridian_runtime::scrub::forever("book", move || {
@@ -269,6 +274,14 @@ fn run() -> Result<(), String> {
             bus.clone(),
             books_bound,
         ));
+        // A new database timeline raises the epoch (contract v30, stage C):
+        // the books held let go of what the record may have lost.
+        let following = Arc::clone(&store);
+        holding.follow_timeline(&bus, "book", move || {
+            following
+                .follow_timeline()
+                .map_err(|failed| failed.to_string())
+        });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // The start's snapshots (v26; W9.10): every account whose journal

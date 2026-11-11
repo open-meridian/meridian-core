@@ -44,6 +44,9 @@ pub struct PostgresStore {
     pool: Pool,
     /// The epoch this writer's batches commit under (step 3a).
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a batch there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 impl PostgresStore {
@@ -68,13 +71,18 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
         Ok(Self {
             pool,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -154,7 +162,53 @@ impl PostgresStore {
     }
 
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
+        Ok(conn)
+    }
+
+    /// Follow the database's timeline on `conn` for this writer (contract
+    /// v30, stage C): on a new one the epoch raised as a takeover raises it,
+    /// adopted, and the takeover recorded with that cause. Nothing where it
+    /// writes under no epoch.
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let by = meridian_changes::TookOver {
+            member: meridian_changes::member().to_string(),
+            why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
+            at_ns: meridian_changes::now_ns(),
+        };
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let (found, identity) = meridian_changes::timeline::follow(
+            &mut tx,
+            "lake_change_head",
+            meridian_changes::CONTROL,
+            mine,
+            |tx| raise(tx, &by),
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the lake's database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The writer's epoch, adopted at its first batch where it was not
@@ -2528,48 +2582,15 @@ impl Store for PostgresStore {
         // A deposed writer stopped mid-batch holds the rows it took.
         meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
             .map_err(unavailable)?;
-        // The control partition first: a dataset a deposed writer is
-        // beginning holds it shared until it commits, and is then raised
-        // with the rest.
-        let control: i64 = tx
-            .query_one(
-                "UPDATE lake_change_head SET epoch = epoch + 1 WHERE partition = 'control'
-                 RETURNING epoch",
-                &[],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        let highest: Option<i64> = tx
-            .query_one("SELECT max(epoch) FROM lake_partition", &[])
-            .map_err(unavailable)?
-            .get(0);
-        let epoch = control.max(highest.unwrap_or(0) + 1);
-        tx.execute(
-            "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
-            &[&epoch],
-        )
-        .map_err(unavailable)?;
-        tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])
-            .map_err(unavailable)?;
-        // Who took it over and why, in the same transaction (step 3b).
-        tx.execute(
-            "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-             SELECT $1, $2,
-                    array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control'),
-                    $3, $4, $5
-               FROM lake_partition",
-            &[
-                &epoch,
-                &by.member,
-                &by.why,
-                &meridian_changes::origin(),
-                &by.at_ns,
-            ],
-        )
-        .map_err(unavailable)?;
+        let epoch = raise(&mut tx, by).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
-        self.fence.adopt(epoch as u64);
-        Ok(epoch as u64)
+        self.fence.adopt(epoch);
+        Ok(epoch)
+    }
+
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
     }
 
     fn head_epoch(&self) -> Result<u64> {
@@ -2742,6 +2763,50 @@ impl Store for PostgresStore {
             after_sequence: 0,
         })
     }
+}
+
+/// Raise the epoch of the `control` partition and of every dataset's head
+/// in `tx`, and record who raised it and why (step 3b, `WriterTookOver`):
+/// answer the epoch. What a takeover does, and a writer on a new database
+/// timeline (contract v30, stage C).
+fn raise(
+    tx: &mut Transaction<'_>,
+    by: &meridian_changes::TookOver,
+) -> std::result::Result<u64, postgres::Error> {
+    // The control partition first: a dataset a deposed writer is beginning
+    // holds it shared until it commits, and is then raised with the rest.
+    let control: i64 = tx
+        .query_one(
+            "UPDATE lake_change_head SET epoch = epoch + 1 WHERE partition = 'control'
+             RETURNING epoch",
+            &[],
+        )?
+        .get(0);
+    let highest: Option<i64> = tx
+        .query_one("SELECT max(epoch) FROM lake_partition", &[])?
+        .get(0);
+    let epoch = control.max(highest.unwrap_or(0) + 1);
+    tx.execute(
+        "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
+        &[&epoch],
+    )?;
+    tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])?;
+    // Who raised it and why, in the same transaction (step 3b).
+    tx.execute(
+        "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+         SELECT $1, $2,
+                array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control'),
+                $3, $4, $5
+           FROM lake_partition",
+        &[
+            &epoch,
+            &by.member,
+            &by.why,
+            &meridian_changes::origin(),
+            &by.at_ns,
+        ],
+    )?;
+    Ok(epoch as u64)
 }
 
 /// [`PostgresStore::scrub`]'s reading, its errors Postgres's own so a page

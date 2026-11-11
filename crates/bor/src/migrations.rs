@@ -65,6 +65,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "journal_chain",
         sql: include_str!("../migrations/0009_journal_chain.sql"),
     },
+    // A new database timeline raises the epoch (contract v30, stage C): the
+    // identity the writer last saw.
+    Migration {
+        version: 10,
+        name: "database_identity",
+        sql: include_str!("../migrations/0010_database_identity.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

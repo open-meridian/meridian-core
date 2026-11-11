@@ -273,6 +273,9 @@ impl Member {
         // to its bound, `<store>.readyLagMs`, and is never answered from
         // behind it (contract v30, stage B; spec section 5).
         bus.reads_after().set_bound(self.ready_lag);
+        // Who raises an epoch, where its store raises one itself on a new
+        // database timeline (contract v30, stage C).
+        meridian_changes::set_member(&member_name());
         let Some(settings) = self.lease.clone() else {
             said().set_mode(Mode::Writer);
             return Ok(Holding {
@@ -386,19 +389,78 @@ impl Holding {
         Ok(epoch)
     }
 
+    /// Follow the database's timeline while writing (contract v30, stage C;
+    /// the resilience spec's section 3). The store raises its epoch itself
+    /// before it commits on a new one -- each connection its pool opens reads
+    /// the database's identity -- and `look`, the store's own look, is taken
+    /// at once, for a restore or a restart on a new timeline, and every
+    /// [`TIMELINE_LOOK_EVERY`] after, off the runtime's threads. Once a store
+    /// of this process raised its epoch so, what this process committed of
+    /// `domain` is forgotten by its reads held to their `read_after`: the
+    /// record may have lost some of it. Where the record's epoch is
+    /// another's, this member steps down.
+    pub fn follow_timeline<F>(&self, bus: &Arc<Bus>, domain: &'static str, look: F)
+    where
+        F: Fn() -> Result<meridian_changes::timeline::Timeline, String> + Send + Sync + 'static,
+    {
+        use meridian_changes::timeline::Timeline;
+        let component = self.component;
+        let bus = Arc::clone(bus);
+        let look = Arc::new(look);
+        tokio::spawn(async move {
+            let mut raised = meridian_changes::timeline::raised();
+            let mut said_failing = false;
+            loop {
+                let looking = Arc::clone(&look);
+                match tokio::task::spawn_blocking(move || looking()).await {
+                    Ok(Ok(Timeline::NotMine(epoch))) => step_down(
+                        component,
+                        &format!("the store's epoch is {epoch}, another writer's"),
+                    ),
+                    Ok(Ok(Timeline::First)) => tracing::info!(
+                        component,
+                        "the database's identity is kept: a new timeline raises the epoch"
+                    ),
+                    Ok(Ok(_)) => said_failing = false,
+                    Ok(Err(failed)) => {
+                        if !said_failing {
+                            tracing::warn!(component, %failed, "the database's timeline could not be read; looking again");
+                            said_failing = true;
+                        }
+                    }
+                    Err(failed) => {
+                        tracing::warn!(component, %failed, "the timeline's look failed")
+                    }
+                }
+                let now = meridian_changes::timeline::raised();
+                if now != raised {
+                    raised = now;
+                    bus.reads_after().forget(domain);
+                    tracing::warn!(
+                        component,
+                        "the store raised its epoch on a new database timeline: what this member committed is read again from the record"
+                    );
+                }
+                tokio::time::sleep(TIMELINE_LOOK_EVERY).await;
+            }
+        });
+    }
+
     /// Keep the lease while writing: renewed every renew; the member steps
     /// down when another holds it, when it could not renew within its
     /// deadline, when `epoch_now` -- the store's head epoch, read from the
-    /// record -- moves past `mine`, or when a commit of its own was fenced.
-    /// Nothing is kept where no lease is held.
+    /// record -- moves past `mine` -- the store's own, which a new database
+    /// timeline raises (contract v30, stage C) -- or when a commit of its
+    /// own was fenced. Nothing is kept where no lease is held.
     ///
     /// The epoch is read on a loop of its own: a read waits on the store's
     /// pool, up to its connection timeout while the database's primary is
     /// replaced, and a renewal waiting behind it let the lease lapse under a
     /// writer that was serving (CI 42291353103: the book's writer renewed
     /// nothing for 15 s of a database switchover, and its standby took over).
-    pub fn keep<E>(&self, mine: u64, epoch_now: E)
+    pub fn keep<M, E>(&self, mine: M, epoch_now: E)
     where
+        M: Fn() -> u64 + Send + Sync + 'static,
         E: Fn() -> Result<u64, String> + Send + Sync + 'static,
     {
         let Some(elector) = self.elector.clone() else {
@@ -416,9 +478,9 @@ impl Holding {
                     tokio::time::sleep(renew).await;
                     let reading = Arc::clone(&epoch_now);
                     match tokio::task::spawn_blocking(move || reading()).await {
-                        Ok(Ok(head)) if head > mine => step_down(
+                        Ok(Ok(head)) if head > mine() => step_down(
                             component,
-                            &format!("the store's epoch is {head}, past this writer's {mine}"),
+                            &format!("the store's epoch is {head}, past this writer's {}", mine()),
                         ),
                         Ok(Ok(_)) => {}
                         Ok(Err(failed)) => {
@@ -765,6 +827,10 @@ struct Following {
     primary: Arc<dyn meridian_bus::read_after::Position>,
 }
 
+/// How often a writer looks at its database's timeline beside what its
+/// pool's connections see (contract v30, stage C).
+pub const TIMELINE_LOOK_EVERY: Duration = Duration::from_secs(5);
+
 /// How often a standby asks its writer, which is also its interest in the
 /// tail (ruling 1062).
 const ASK_EVERY: Duration = Duration::from_secs(1);
@@ -789,6 +855,15 @@ async fn follow(
         .map(|following| following.followed.heads())
         .unwrap_or_default();
     let mut chains: HashMap<String, meridian_changes::integrity::Chain> = HashMap::new();
+    // The lineage (contract v30, stage C; the resilience spec's section 3):
+    // the change last applied of each partition, the epoch the writer's
+    // control partition was last seen at, and the partitions to read back
+    // since it rose. A partition unchecked takes nothing from the tail.
+    let mut applied: HashMap<String, Applied> = HashMap::new();
+    let mut control_epoch: Option<u64> = None;
+    let mut unchecked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Behind since a partition was left to read back.
+    let mut unchecked_since: Option<Instant> = None;
     // Behind since a page was missed and not yet read; unanswered since the
     // writer last failed to answer. The lag is the longer.
     let mut gap_since: Option<Instant> = None;
@@ -822,6 +897,26 @@ async fn follow(
                 let Some(partition) = page.changes.first().map(|c| c.partition.clone()) else {
                     continue;
                 };
+                // A higher epoch than the change last applied: read back
+                // whether the record still holds what this member applied,
+                // before taking anything more of the partition.
+                let page_epoch = page.changes.iter().map(|c| c.epoch).max().unwrap_or(0);
+                if applied.get(&partition).is_some_and(|(_, epoch, _)| page_epoch > *epoch) {
+                    unchecked.insert(partition.clone());
+                }
+                if unchecked.contains(&partition) {
+                    let check = Lineage { bus: &bus, domain, following: following.as_ref() };
+                    check
+                        .read_back(&mut unchecked, &mut at, &mut applied, &mut chains)
+                        .await;
+                    if unchecked.is_empty() {
+                        unchecked_since = None;
+                    }
+                    if unchecked.contains(&partition) {
+                        unchecked_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                }
                 // Integrity at rest (step 3b): every change it takes in order
                 // verified by its digest, the book's by its chain; one that
                 // does not verify is never taken, and the standby stays
@@ -852,6 +947,9 @@ async fn follow(
                         if let Some(following) = &following {
                             following.apply.apply(&partition, &page.changes);
                         }
+                        if let Some(last) = page.changes.last() {
+                            applied.insert(partition.clone(), applied_of(last));
+                        }
                         at.insert(partition.clone(), page.head);
                     }
                     Some(held) => {
@@ -859,9 +957,18 @@ async fn follow(
                         gap_since.get_or_insert_with(Instant::now);
                         let applying = following.as_ref().map(|f| f.apply.as_ref());
                         match catch_up(&bus, domain, &partition, held, &mut chains, applying).await {
-                            Ok(head) => {
+                            Ok((head, last)) => {
+                                if let Some(last) = last {
+                                    applied.insert(partition.clone(), last);
+                                }
                                 at.insert(partition.clone(), head.max(page.head));
                                 gap_since = None;
+                            }
+                            // The record no longer reaches what this member
+                            // applied: read it back (contract v30, stage C).
+                            Err(failed) if failed.starts_with(DIVERGED) => {
+                                unchecked.insert(partition.clone());
+                                unchecked_since.get_or_insert_with(Instant::now);
                             }
                             // Behind the writer's retention: a reader holds
                             // the partition again from its head, as a
@@ -884,7 +991,25 @@ async fn follow(
             }
             _ = ask.tick() => {
                 match ask_writer(&bus, domain).await {
-                    Ok(()) => {
+                    Ok(epoch) => {
+                        // The writer's epoch rose -- a takeover, or a new
+                        // database timeline (contract v30, stage C): every
+                        // partition held is read back before it is followed
+                        // further.
+                        if control_epoch.is_some_and(|seen| epoch > seen) {
+                            unchecked.extend(at.keys().cloned());
+                        }
+                        control_epoch = Some(epoch);
+                        if !unchecked.is_empty() {
+                            unchecked_since.get_or_insert_with(Instant::now);
+                            let check = Lineage { bus: &bus, domain, following: following.as_ref() };
+                            check
+                                .read_back(&mut unchecked, &mut at, &mut applied, &mut chains)
+                                .await;
+                        }
+                        if unchecked.is_empty() {
+                            unchecked_since = None;
+                        }
                         let again = unanswered_since.take().is_some() || !answered;
                         answered = true;
                         if let (true, Some(following)) = (again, &following) {
@@ -898,7 +1023,7 @@ async fn follow(
                         unanswered_since.get_or_insert_with(Instant::now);
                     }
                 }
-                let lag = [gap_since, unanswered_since]
+                let lag = [gap_since, unanswered_since, unchecked_since]
                     .into_iter()
                     .flatten()
                     .map(|since| since.elapsed().as_millis() as u64)
@@ -960,7 +1085,7 @@ async fn reconcile(
                 )
                 .await
                 {
-                    Ok(reached) => reached.max(held),
+                    Ok((reached, _)) => reached.max(held),
                     Err(failed) if meridian_changes::is_behind(&failed) => {
                         following.apply.reset(&partition);
                         head
@@ -990,22 +1115,157 @@ fn held_on_purpose() -> bool {
 
 /// Ask the writer's change log, for its control partition from its head:
 /// cheap, and it is the interest that keeps the tail published.
-async fn ask_writer(bus: &Bus, domain: &str) -> Result<(), String> {
+async fn ask_writer(bus: &Bus, domain: &str) -> Result<u64, String> {
     let asked = meridian_changes::ReadChangesRequest {
         partition: meridian_changes::CONTROL.to_string(),
         after_sequence: i64::MAX as u64,
         page_size: 1,
     };
-    bus.call(
-        &meridian_changes::read_changes_topic(domain),
-        "meridian.v1.ReadChangesRequest",
-        asked.encode_to_vec(),
-        None,
-        Some(ASK_EVERY),
+    let (_, body) = bus
+        .call(
+            &meridian_changes::read_changes_topic(domain),
+            "meridian.v1.ReadChangesRequest",
+            asked.encode_to_vec(),
+            None,
+            Some(ASK_EVERY),
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    meridian_changes::ReadChangesReply::decode(body.as_slice())
+        .map(|reply| reply.epoch)
+        .map_err(|failed| failed.to_string())
+}
+
+/// What a follower last applied of a partition: the change's sequence, its
+/// epoch and its body's digest (contract v30, stage C).
+type Applied = (u64, u64, Vec<u8>);
+
+fn applied_of(change: &meridian_changes::Change) -> Applied {
+    (
+        change.sequence,
+        change.epoch,
+        meridian_changes::integrity::digest(&change.body),
     )
-    .await
-    .map(|_| ())
-    .map_err(|failed| failed.to_string())
+}
+
+/// The words a catch-up refuses with where the record's head is below what
+/// the follower holds: the record lost what it applied.
+const DIVERGED: &str = "the record's head is below what this member applied";
+
+/// Changes followers of this process dropped, held past what the record
+/// holds after a database failover or restore lost them (contract v30,
+/// stage C): what `status` says of the lost committed tail.
+pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// A follower reading back what it applied, once the writer's epoch rose
+/// (contract v30, stage C; the resilience spec's section 3; Kafka's
+/// KIP-101). The record keeps every change's epoch; where it still holds
+/// the change this member last applied of a partition -- its sequence,
+/// epoch and body -- nothing it applied was lost, and it follows on. Where
+/// it does not -- the database's failover or restore lost a tail this
+/// member had applied, and the writer took those sequences again -- what
+/// it holds of the partition is dropped and the partition reloaded at the
+/// record's head (a reader's hot layer holds each key's latest, never the
+/// changes, so it cannot keep what came before and drop only the rest),
+/// so it never holds a change the record does not.
+struct Lineage<'a> {
+    bus: &'a Bus,
+    domain: &'static str,
+    following: Option<&'a Following>,
+}
+
+impl Lineage<'_> {
+    async fn read_back(
+        &self,
+        unchecked: &mut std::collections::BTreeSet<String>,
+        at: &mut HashMap<String, u64>,
+        applied: &mut HashMap<String, Applied>,
+        chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    ) {
+        let domain = self.domain;
+        for partition in unchecked.clone() {
+            let held = at.get(&partition).copied().unwrap_or(0);
+            let last = applied.get(&partition).cloned();
+            let found = match holds(self.bus, domain, &partition, held, last.as_ref()).await {
+                Ok(found) => found,
+                Err(failed) => {
+                    tracing::warn!(domain, partition, %failed, "what this member applied could not be read back; asking again");
+                    continue;
+                }
+            };
+            unchecked.remove(&partition);
+            let (kept, head) = found;
+            if kept {
+                continue;
+            }
+            let dropped = held.saturating_sub(head).max(1);
+            DROPPED.fetch_add(dropped, Ordering::Relaxed);
+            tracing::warn!(
+                domain,
+                partition,
+                held,
+                head,
+                "the record no longer holds what this member applied (a database failover or restore lost it): dropped, the partition reloaded at the record's head"
+            );
+            if let Some(following) = self.following {
+                following.apply.reset(&partition);
+                following.followed.set(&partition, head);
+            }
+            chains.remove(&partition);
+            applied.remove(&partition);
+            at.insert(partition, head);
+        }
+    }
+}
+
+/// Whether the record still holds what a follower stands at in a partition,
+/// and its head: the change it last applied read back from the writer, the
+/// same sequence, epoch and body; or where it applied none, the record's
+/// head not below where it stands. Past the record's retention, not held.
+async fn holds(
+    bus: &Bus,
+    domain: &str,
+    partition: &str,
+    at: u64,
+    applied: Option<&Applied>,
+) -> Result<(bool, u64), String> {
+    let ask = |after: u64| meridian_changes::ReadChangesRequest {
+        partition: partition.to_string(),
+        after_sequence: after,
+        page_size: 1,
+    };
+    let call = |asked: meridian_changes::ReadChangesRequest| async move {
+        let (_, body) = bus
+            .call(
+                &meridian_changes::read_changes_topic(domain),
+                "meridian.v1.ReadChangesRequest",
+                asked.encode_to_vec(),
+                None,
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|failed| failed.to_string())?;
+        meridian_changes::ReadChangesReply::decode(body.as_slice())
+            .map_err(|failed| failed.to_string())
+    };
+    let after = applied.map_or(at, |(sequence, _, _)| sequence.saturating_sub(1));
+    let reply = match call(ask(after)).await {
+        Ok(reply) => reply,
+        Err(failed) if meridian_changes::is_behind(&failed) => {
+            let head = call(ask(i64::MAX as u64)).await?.head;
+            return Ok((false, head));
+        }
+        Err(failed) => return Err(failed),
+    };
+    let kept = match applied {
+        Some((sequence, epoch, digest)) => reply.changes.first().is_some_and(|change| {
+            change.sequence == *sequence
+                && change.epoch == *epoch
+                && meridian_changes::integrity::digest(&change.body) == *digest
+        }),
+        None => reply.head >= at,
+    };
+    Ok((kept, reply.head))
 }
 
 /// Read a partition's changes after `after` from the writer, page by page,
@@ -1036,7 +1296,9 @@ async fn catch_up(
     mut after: u64,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
     apply: Option<&dyn Apply>,
-) -> Result<u64, String> {
+) -> Result<(u64, Option<Applied>), String> {
+    let mut last = None;
+    let from = after;
     loop {
         let asked = meridian_changes::ReadChangesRequest {
             partition: partition.to_string(),
@@ -1055,6 +1317,11 @@ async fn catch_up(
             .map_err(|failed| failed.to_string())?;
         let page = meridian_changes::ReadChangesReply::decode(body.as_slice())
             .map_err(|failed| failed.to_string())?;
+        // Below what this member stands at: the record lost what it applied
+        // (contract v30, stage C).
+        if after == from && page.head < from {
+            return Err(format!("{DIVERGED}: head {}, applied {from}", page.head));
+        }
         verified(domain, chains, &page.changes)?;
         for change in &page.changes {
             if change.sequence <= after {
@@ -1068,8 +1335,11 @@ async fn catch_up(
         if let Some(apply) = apply {
             apply.apply(partition, &page.changes);
         }
+        if let Some(change) = page.changes.last() {
+            last = Some(applied_of(change));
+        }
         if page.changes.is_empty() || after >= page.head {
-            return Ok(after.max(page.head));
+            return Ok((after.max(page.head), last));
         }
     }
 }
