@@ -480,9 +480,7 @@ def install(s):
         # so a test that stops or pauses an agent never stops them: theirs
         # are the db-primary and broker classes, injected apart. The shape
         # run (scaled) leaves them spread over the zones.
-        pin = json.dumps({"spec": {"template": {"spec": {
-            "nodeSelector": {"kubernetes.io/hostname": server_node()},
-            "affinity": None, "topologySpreadConstraints": None}}}})
+        pin = json.dumps(pinned())
         # The database's members are made by first run, after this.
         kubectl("patch", "statefulset", f"{FULL}-database", "--type", "merge", "-p", pin)
         # The broker's servers are made at install, each with JetStream's
@@ -498,6 +496,20 @@ def install(s):
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
         cluster_services_on_server()
+
+
+def pinned():
+    """The pin on the database's and the broker's members in ha: the server
+    node by its name, the chart's spread taken off (install, above)."""
+    return {"spec": {"template": {"spec": {
+        "nodeSelector": {"kubernetes.io/hostname": server_node()},
+        "affinity": None, "topologySpreadConstraints": None}}}}
+
+
+def pinned_sets():
+    """The member sets this run pinned to the server node: ha's database
+    and broker; none in another profile."""
+    return [f"{FULL}-database", broker_set()] if PROFILE == "ha" else []
 
 
 # The cluster's own services, of which k3s runs one each, on any node.
@@ -2009,8 +2021,30 @@ def upgrade(*sets):
     Helm 4 the chart's own counts taken back (--force-conflicts). CI runs it
     on Helm 4.2.3, the newest the CLI meets and the stricter (ci.yaml)."""
     values = [arg for value in sets for arg in ("--set", value)]
-    return run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
-               "--timeout", "15m", *helm_takes_counts(), *values, check=False)
+    # The pin is this run's, not the chart's: Helm puts the chart's spread
+    # back on the sets it pinned (Helm 3 merges it in, Helm 4 applies it),
+    # the zones' node affinity beside the pin's selector of the server node,
+    # which no zone holds, and the member each set rolled first could never
+    # be placed again (failover-repeat 43078770407, ha run 1, and PR CI
+    # 43078729225: broker-jetstream-2 and database-2 Pending, "4 node(s)
+    # didn't match Pod's node affinity/selector", from write-ahead-bound's
+    # upgrade on). So each pinned set is held from rolling through the
+    # upgrade (its partition at its count) and its pin put back after, the
+    # roll let go: a template the upgrade changed rolls as the pin places it,
+    # one it left as it was rolls nothing.
+    held = {name: int(out("get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+            for name in pinned_sets()}
+    for name, count in held.items():
+        kubectl("patch", "statefulset", name, "--type", "merge", "-p", json.dumps(
+            {"spec": {"updateStrategy": {"type": "RollingUpdate", "rollingUpdate": {"partition": count}}}}))
+    try:
+        return run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+                   "--timeout", "15m", *helm_takes_counts(), *values, check=False)
+    finally:
+        for name in held:
+            back = pinned()
+            back["spec"]["updateStrategy"] = {"type": "RollingUpdate", "rollingUpdate": {"partition": 0}}
+            kubectl("patch", "statefulset", name, "--type", "merge", "-p", json.dumps(back))
 
 
 def revision():
@@ -3232,6 +3266,13 @@ def write_ahead_bound(s):
     back = upgrade("lake.writeAhead.maxAge=10m")
     s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    # Every member of the sets this run pinned placed and ready after both
+    # upgrades: none left Pending where no node can hold it.
+    for name in pinned_sets():
+        count = int(out("get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+        placed = happens(lambda n=name, c=count: int(out("get", "statefulset", n, "-o",
+                                                          "jsonpath={.status.readyReplicas}") or 0) == c, 300)
+        s.check(placed, f"write-ahead-bound: {name}'s {count} members placed and ready after the upgrades")
     # Nothing acknowledged was lost: the driver's rows held as every class's.
     acks = acks_again(int(let_go * 1000), seconds=180)
     s.check(acks, "write-ahead-bound: the driver acknowledged by the lake again")
