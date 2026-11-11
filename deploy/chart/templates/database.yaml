@@ -553,7 +553,7 @@ spec:
             {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+            {{- include "meridian-runtime.databaseResources" . | nindent 12 }}
           {{- else }}
           {{- if $tls }}
           # Internal TLS (ruling 1084): the chart's certificate copied where
@@ -653,7 +653,7 @@ spec:
             {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+            {{- include "meridian-runtime.databaseResources" . | nindent 12 }}
           {{- end }}
         {{- if $archive }}
         # Beside the server (backup.walArchive): pgBackRest's own server,

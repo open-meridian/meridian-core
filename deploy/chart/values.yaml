@@ -98,11 +98,15 @@ database:
     # standbys:
     # Its max_connections, counted from what this chart deploys (ruled
     # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
-    # standby and a rollout's surge; each dashboard copy's 4 and 1; 6 for
+    # standby and a rollout's surge, and in ha 2 more for each lake member's
+    # write-ahead writer (stage E); each dashboard copy's 4 and 1; 6 for
     # jobs; 4 kept for the superuser and Patroni; a quarter over that. 82
-    # tolerant, 213 ha. Set it to override; below what the pods hold is
+    # tolerant, 220 ha. Set it to override; below what the pods hold is
     # refused. Each connection may take work_mem (4 MiB) under load, which
-    # the preflight counts against the memory limit above.
+    # the preflight counts against the memory limit above. With standbys
+    # the limit is the preflight's own count -- shared buffers and work_mem
+    # for every connection allowed -- with a quarter's room, 1280Mi at 220,
+    # or the limit above where that is more.
     # maxConnections:
     # The image the members run under Patroni: postgres:16-alpine's server
     # with Patroni and pgBackRest (deploy/database). Once a database has run

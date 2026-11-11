@@ -112,10 +112,18 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its pool of 8, and in ha 2 more for the write-ahead stream's writer --
+    // its batch's transaction and its position -- so its commits never wait
+    // behind the lake's reads (the chart's databaseConnections counts them).
+    let pool = 8 + if write_ahead_on() {
+        meridian_lake::write_ahead::CONNECTIONS
+    } else {
+        0
+    };
     let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
         "the lake's database",
         &url,
-        |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
+        |url| PostgresStore::connect(url, pool).map_err(|failed| failed.to_string()),
         |store| {
             store.verify().map_err(|failed| match failed {
                 StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),

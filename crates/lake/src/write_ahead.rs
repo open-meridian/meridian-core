@@ -35,6 +35,11 @@ use prost::Message as _;
 use crate::service::Lake;
 use crate::store::{Dropped, StoreError, WriteAheadBatch, WriteAheadPosition};
 
+/// The database connections the writer adds to the lake's pool in `ha`:
+/// its batch's transaction and its position's read (ruled 2026-11-08: the
+/// brought database's max_connections counts them).
+pub const CONNECTIONS: u32 = 2;
+
 /// The most writes taken in one batch.
 pub const MOST_WRITES: usize = 256;
 

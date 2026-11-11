@@ -747,11 +747,14 @@ during a rollout the one more a standby's surge starts -- holds its pool of
 dashboard copy its pool of 4 and 1 beside it; and the jobs that may run at
 once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
 comparison's 1). A store whose database is its own (<store>.database.
-existingSecret) is not counted. Kept in step with the pools the binaries
-open (crates/runtime/src/bin). Takes the chart.
+existingSecret) is not counted. In ha each lake member holds 2 more for the
+write-ahead stream's writer, its batch and its position (contract v30,
+stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
+(crates/runtime/src/bin). Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseConnections" -}}
 {{- $held := 6 -}}
+{{- $writeAhead := gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 -}}
 {{- range $component := list "instrument" "conductor" "street" "bor" "lake" -}}
 {{- $values := index $.Values $component -}}
 {{- if not (dig "database" "existingSecret" "" $values) -}}
@@ -759,7 +762,9 @@ open (crates/runtime/src/bin). Takes the chart.
 {{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
 {{- $members = add1 $members -}}
 {{- end -}}
-{{- $held = add $held (mul $members 10) -}}
+{{- $each := 10 -}}
+{{- if and $writeAhead (eq $component "lake") }}{{ $each = 12 }}{{ end -}}
+{{- $held = add $held (mul $members $each) -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.dashboard.enabled -}}
@@ -789,6 +794,46 @@ found as connections refused while the new pods start. Takes the chart.
 {{- else -}}
 {{- int $set -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+The brought database's memory limit (ruled 2026-11-08): where it runs with
+standbys -- the ha profile -- what the preflight's memory judge counts it
+may use, shared buffers and work memory for every connection it allows
+(crates/runtime/src/preflight.rs, judge_memory), with a quarter's room as
+max_connections keeps, rounded up to 64 MiB; database.brought.resources'
+own where that is more. Postgres's defaults, which this chart leaves as they
+are: shared_buffers 128 MiB, work_mem 4 MiB. Alone, its own limit, as set.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseMemoryLimit" -}}
+{{- $set := toString (dig "limits" "memory" "" (.Values.database.brought.resources | default .Values.resources)) -}}
+{{- if gt (int (include "meridian-runtime.databaseStandbys" .)) 0 -}}
+{{- $judged := add 128 (mul 4 (int (include "meridian-runtime.databaseMaxConnections" .))) -}}
+{{- $roomy := div (add (mul $judged 5) 3) 4 -}}
+{{- $mib := mul (div (add $roomy 63) 64) 64 -}}
+{{- $setMib := 0 -}}
+{{- if regexMatch "^[1-9][0-9]*(Mi|Gi)$" $set -}}
+{{- $setMib = int (regexFind "^[0-9]+" $set) -}}
+{{- if hasSuffix "Gi" $set }}{{ $setMib = mul $setMib 1024 }}{{ end -}}
+{{- end -}}
+{{- if gt $setMib $mib }}{{ $set }}{{ else }}{{ printf "%dMi" $mib }}{{ end -}}
+{{- else -}}
+{{- $set -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The brought database's resources: database.brought.resources (or the
+shared ones), its memory limit as databaseMemoryLimit says. Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseResources" -}}
+{{- $resources := deepCopy (.Values.database.brought.resources | default .Values.resources) -}}
+{{- $limit := include "meridian-runtime.databaseMemoryLimit" . -}}
+{{- if $limit -}}
+{{- $_ := set $resources "limits" (merge (dict "memory" $limit) (omit ($resources.limits | default dict) "memory")) -}}
+{{- end -}}
+{{- toYaml $resources -}}
 {{- end -}}
 
 {{/*

@@ -2845,11 +2845,13 @@ chart-check:
 	done; true
 	@# The brought database's max_connections, counted from what the chart
 	@# deploys (ruled 2026-11-08): each store member's pool and what is
-	@# beside it, a rollout's surge, the dashboard's copies, the jobs, the
-	@# superuser's and Patroni's reserve, and a quarter's room -- 82
-	@# tolerant, 213 ha -- given to the server alone and under Patroni and
-	@# to the preflight's memory judge; one set below what the pods hold is
-	@# refused, saying how many they hold.
+	@# beside it, the lake's write-ahead writer's in ha (stage E), a
+	@# rollout's surge, the dashboard's copies, the jobs, the superuser's and
+	@# Patroni's reserve, and a quarter's room -- 82 tolerant, 220 ha --
+	@# given to the server alone and under Patroni and to the preflight's
+	@# memory judge; one set below what the pods hold is refused, saying how
+	@# many they hold. Its memory in ha is the judge's count of it with a
+	@# quarter's room, 1280Mi, given to the members and to the judge.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
@@ -2858,13 +2860,19 @@ chart-check:
 	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "82"' \
 		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 82 connections" >&2; exit 1; }; \
 	patroni="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha 2>/dev/null)"; \
-	echo "$$patroni" | grep -q "^ *max_connections: 213$$" \
-		|| { echo "chart-check FAILED: the ha database is not given max_connections: 213 under Patroni" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q 'max_connections\\":213' \
-		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 213" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *max_connections: 220$$" \
+		|| { echo "chart-check FAILED: the ha database is not given max_connections: 220 under Patroni" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q 'max_connections\\":220' \
+		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 220" >&2; exit 1; }; \
+	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1280Mi"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1280Mi" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *memory: 1280Mi$$" \
+		|| { echo "chart-check FAILED: the ha database is not given the 1280Mi the memory judge counts at 220 connections" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1Gi"' \
+		|| { echo "chart-check FAILED: the tolerant database's memory is not its own 1Gi" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha --set database.brought.maxConnections=100 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: database.brought.maxConnections=100 rendered under ha, below what its pods hold" >&2; exit 1; }; \
-	echo "$$said" | grep -q "hold up to 166 connections" \
+	echo "$$said" | grep -q "hold up to 172 connections" \
 		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
 		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }
