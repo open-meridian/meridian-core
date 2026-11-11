@@ -290,8 +290,8 @@ fn gaps_tab(open: &[DatasetGap]) -> String {
             };
             format!(
                 "<tr data-gap=\"{id}\"><td title=\"{dataset}\">{dataset}</td>\
-                 <td><span class=\"badge warn\">{state}</span></td><td class=\"wide\" title=\"{range}\">{range}</td>\
-                 <td class=\"wide\">{cause}</td><td title=\"{id}\">{day}<span class=\"dates\"> {time}</span></td></tr>",
+                 <td title=\"{state}\"><span class=\"badge warn\">{state}</span></td><td class=\"wide\" title=\"{range}\">{range}</td>\
+                 <td class=\"wide\" title=\"{cause}\">{cause}</td><td title=\"{day} {time}, {id}\">{day}<span class=\"dates\"> {time}</span></td></tr>",
                 id = escape(&gap.gap_id),
                 dataset = escape(&dataset),
                 state = gap_state_word(gap.state),
@@ -776,12 +776,19 @@ fn priority_tab(
             format!(
                 "<tr data-id=\"{what}\"><td title=\"{what}\"><button type=\"button\" class=\"link\" \
                  data-dialog-open=\"priority-dialog\" data-title=\"Change the priority\" data-fill=\"{fill}\">{what}</button></td>\
-                 <td title=\"{order}\">{switched}{order}</td><td class=\"wide\" title=\"{note}\">{by}</td>\
+                 <td title=\"{whole}\">{switched}{order}</td><td class=\"wide\" title=\"{note}\">{by}</td>\
                  <td title=\"{day} {time} by {by}\">{day}<span class=\"dates\"> {time}</span></td>\
                  <td class=\"actions\"><button type=\"button\" data-dialog-open=\"priority-dialog\" \
                  data-title=\"Change the priority\" data-fill=\"{fill}\">Edit</button></td></tr>",
                 what = escape(&what),
                 order = escape(&p.datasets.join(" then ")),
+                // The cell's whole text in its title, the badge's words with
+                // it, since an ellipsised cell is read whole from its title.
+                whole = escape(&if switched.is_empty() {
+                    p.datasets.join(" then ")
+                } else {
+                    format!("{SWITCHED} {}", p.datasets.join(" then "))
+                }),
                 note = escape(&crate::mcp::others_words(&p.note)),
                 by = escape(&by),
                 day = escape(&day),
@@ -1191,9 +1198,8 @@ mod tests {
         assert!(body.contains(&format!(">{NOT_YET_KNOWN}</td>")));
         assert!(body.contains(">drive-data:drive</td>"));
         assert!(body.contains("write-ahead bound"));
-        assert_eq!(
-            body.matches(SWITCHED).count(),
-            2,
+        assert!(
+            body.contains("data-switched title=") && body.contains(&format!(": {SWITCHED}</p>")),
             "on its priority and above the tabs"
         );
         assert!(body.contains("data-switched-line"));

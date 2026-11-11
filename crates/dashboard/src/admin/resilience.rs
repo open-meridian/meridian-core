@@ -307,10 +307,11 @@ fn line_row(kind: &str, line: &ResilienceLine) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "<tr data-line=\"{kind}\"><td title=\"{subject}\">{subject}</td><td>{badge}</td>\
+        "<tr data-line=\"{kind}\"><td title=\"{subject}\">{subject}</td><td title=\"{state}\">{badge}</td>\
          <td class=\"wide\" title=\"{reason}\">{reason}</td><td title=\"{change}\">{change_or}</td></tr>",
         subject = escape(&line.subject),
         badge = state_badge(line.state),
+        state = state_word(line.state),
         reason = escape(&line.reason),
         change = escape(&change),
         change_or = if change.is_empty() {
@@ -398,12 +399,12 @@ fn member_row(m: &ComponentReport) -> String {
     let lag = if m.mode == "standby" || m.mode == "reader" {
         format!("{} ms", m.lag_ms)
     } else {
-        "&mdash;".to_string()
+        "\u{2014}".to_string()
     };
     format!(
-        "<tr data-member=\"{member}\"><td>{component}</td><td title=\"{member}\">{member}</td>\
-         <td>{mode}</td><td>{zone}</td><td class=\"num\">{lag}</td>\
-         <td class=\"wide num\" title=\"{why}\">{restarts}</td></tr>",
+        "<tr data-member=\"{member}\"><td title=\"{component}\">{component}</td><td title=\"{member}\">{member}</td>\
+         <td title=\"{mode}\">{mode}</td><td title=\"{zone}\">{zone}</td><td class=\"num\" title=\"{lag}\">{lag}</td>\
+         <td class=\"wide num\" title=\"{restarts} {why}\">{restarts}</td></tr>",
         component = escape(&m.component),
         member = escape(if m.member.is_empty() {
             &m.component
@@ -448,11 +449,10 @@ fn partitions_tab(partitions: &[PartitionOwner]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "<tr data-partition=\"{partition}\"><td>{component}</td><td title=\"{partition}\">{partition}</td>\
-                 <td title=\"{writer}\">{writer_or}</td><td class=\"num\">{epoch}</td></tr>",
+                "<tr data-partition=\"{partition}\"><td title=\"{component}\">{component}</td><td title=\"{partition}\">{partition}</td>\
+                 <td title=\"{writer_or}\">{writer_or}</td><td class=\"num\" title=\"{epoch}\">{epoch}</td></tr>",
                 component = escape(&p.component),
                 partition = escape(&p.partition),
-                writer = escape(&p.writer),
                 writer_or = if p.writer.is_empty() {
                     "no member holds its lease".to_string()
                 } else {
@@ -498,8 +498,8 @@ fn history_tab(history: &[ResilienceHistoryItem], next_cursor: &str, cursor: &st
             let (at, kind, words) = history_words(item);
             let (day, time) = ms_of(at);
             format!(
-                "<tr data-history-item=\"{kind}\"><td>{day}<span class=\"dates\"> {time}</span></td>\
-                 <td>{kind}</td><td class=\"wide\" title=\"{words}\">{words}</td></tr>",
+                "<tr data-history-item=\"{kind}\"><td title=\"{day} {time}\">{day}<span class=\"dates\"> {time}</span></td>\
+                 <td title=\"{kind}\">{kind}</td><td class=\"wide\" title=\"{words}\">{words}</td></tr>",
                 words = escape(&words),
             )
         })
