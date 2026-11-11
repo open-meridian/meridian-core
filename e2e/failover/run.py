@@ -3217,8 +3217,22 @@ def write_ahead_bound(s):
     began = time.time()
     for member in held:
         cut_rules(member, broker, "-I")
+    def forward_said(when):
+        # DIAGNOSTIC (c30-d2): where the cut's rules stand in each held
+        # member's node's FORWARD chain, with their packet counts.
+        print(f"I: write-ahead-bound: {when}; writer {writer_pod('lake')}; brokers {broker}", flush=True)
+        for member in held:
+            node = node_of(member)
+            said = run("docker", "exec", node, "sh", "-c", "iptables -L FORWARD -n -v --line-numbers | head -14",
+                       check=False).stdout.decode(errors="replace")
+            print(f"    I {member} ({pod_ip(member)}) on {node}:\n" + "\n".join("      " + l for l in said.splitlines()),
+                  flush=True)
     try:
-        time.sleep(SHORT_MAX_AGE_S + HELD_PAST_S)
+        forward_said("the cut in place")
+        time.sleep((SHORT_MAX_AGE_S + HELD_PAST_S) / 2)
+        forward_said("half way")
+        time.sleep((SHORT_MAX_AGE_S + HELD_PAST_S) / 2)
+        forward_said("about to let go")
     finally:
         for member in held:
             cut_rules(member, broker, "-D")
