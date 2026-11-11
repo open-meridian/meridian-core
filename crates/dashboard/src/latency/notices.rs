@@ -48,6 +48,10 @@ pub struct Notice {
 pub trait NoticeStore: Send + Sync {
     fn notify(&self, notices: &[Notice]) -> Result<(), String>;
     fn notices(&self, subject: &str, limit: usize) -> Result<Vec<Notice>, String>;
+    /// What every notice of `kind` was about, to anyone: what a judge reads
+    /// at its start so a notice filed once is never filed again after a
+    /// restart (`gap_found`, once per gap; contract v30, stage D).
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String>;
 }
 
 #[derive(Default)]
@@ -76,6 +80,17 @@ impl NoticeStore for InMemory {
         found.sort_by(|a, b| b.notice_id.cmp(&a.notice_id));
         found.truncate(limit);
         Ok(found)
+    }
+
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .held
+            .lock()
+            .map_err(|_| "the notices' lock".to_string())?
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.about.clone())
+            .collect())
     }
 }
 
@@ -135,6 +150,19 @@ impl NoticeStore for InPostgres {
             })
             .collect())
     }
+
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String> {
+        let mut conn = self.database.conn()?;
+        Ok(conn
+            .query(
+                "SELECT DISTINCT about FROM dashboard_notice WHERE kind = $1",
+                &[&kind],
+            )
+            .map_err(said)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
 }
 
 static STORE: OnceLock<Arc<dyn NoticeStore>> = OnceLock::new();
@@ -152,6 +180,14 @@ fn store() -> Arc<dyn NoticeStore> {
 /// health (W6.40; stage M), read beside the latency judge's.
 pub fn keep(notices: &[Notice]) -> Result<(), String> {
     store().notify(notices)
+}
+
+/// What every notice of `kind` was about: see [`NoticeStore::abouts`].
+pub async fn abouts(kind: &str) -> Result<Vec<String>, String> {
+    let kind = kind.to_string();
+    tokio::task::spawn_blocking(move || store().abouts(&kind))
+        .await
+        .map_err(|failed| failed.to_string())?
 }
 
 /// A person's latest latency notices, newest first.
@@ -323,6 +359,8 @@ pub fn rows(notices: &[Notice]) -> String {
                 kind if kind.ends_with("-shedding") => ("Shedding", " warn"),
                 kind if kind.ends_with("-restarting-repeatedly") => ("Restarting", " warn"),
                 kind if kind.ends_with("-memory-climbing") => ("Climbing", " warn"),
+                // A gap in a dataset (W10.14; contract v30, stage D).
+                "gap_found" => ("Gap found", " warn"),
                 _ => ("Recovered", ""),
             };
             format!(

@@ -28,6 +28,7 @@ pub mod component_health;
 pub mod custody;
 pub mod data_use;
 pub mod database;
+pub mod dataset_gaps;
 pub mod delegation;
 pub mod directory;
 pub mod documentation;

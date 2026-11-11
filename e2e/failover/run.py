@@ -3086,6 +3086,23 @@ def proto_text(body, number):
     return ""
 
 
+def gap_notices():
+    """Each gap's `gap_found` notices in the dashboard's inbox, by the gap's
+    ID its words begin with: (when filed, to whom) each. Empty where the
+    dashboard's table cannot be read yet."""
+    try:
+        said = psql("select about, changed_ns, subject from dashboard_notice where kind = 'gap_found'",
+                    quiet=True)
+    except SystemExit:
+        return {}
+    found = {}
+    for line in said.splitlines():
+        parts = line.split("|")
+        if len(parts) == 3 and parts[0].startswith("GAP-") and parts[1].strip().isdigit():
+            found.setdefault(parts[0].split()[0], []).append((int(parts[1]), parts[2].strip()))
+    return found
+
+
 def gaps_found_in(dataset, since_ns):
     """Each gap recorded since `since_ns` -- of `dataset`, or with it empty
     the unattributed ones -- by its ID: the gap it was found from
@@ -3167,6 +3184,21 @@ def write_ahead_bound(s):
             f"({sorted(found_in for found_in, _ in named.values())} in {sorted(first)})")
     s.check(bool(named) and found_at > 0 and all(at >= found_at for _, at in named.values()),
             "write-ahead-bound: the unattributed gap recorded first, then the dataset's")
+    # Each gap's notice in the deployment admin's inbox (`gap_found`, ruled
+    # 2026-11-11; contract v30, stage D): the unattributed gap's, then the
+    # dataset's, once each to each admin, filed within the dashboard's ask
+    # (10 s) of the lake recording it.
+    wanted = sorted(first) + sorted(g for g in named if g not in first)
+    filed = happens(lambda: all(g in gap_notices() for g in wanted), 90, every=2) if wanted else False
+    notices = gap_notices()
+    s.check(filed, "write-ahead-bound: a gap_found notice in the deployment admin's inbox for each gap "
+            f"({', '.join(f'{g}: {len(notices.get(g, []))}' for g in wanted) or 'no gap'})")
+    once = all(len(notices.get(g, [])) == len({who for _, who in notices.get(g, [])}) for g in wanted)
+    s.check(filed and once, "write-ahead-bound: each gap's notice filed once to each admin")
+    first_at = min((at for g in first for at, _ in notices.get(g, [])), default=0)
+    named_at = min((at for g in named for at, _ in notices.get(g, [])), default=0)
+    s.check(filed and 0 < first_at <= named_at,
+            "write-ahead-bound: the unattributed gap's notice first, then the dataset's")
     if not found:
         # What the lake's members said of the stream meanwhile, before the
         # bound set back rolls them away.

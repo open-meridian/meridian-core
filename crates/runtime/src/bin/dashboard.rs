@@ -592,6 +592,11 @@ fn run() -> Result<(), String> {
         // minute and judged (W6.40; stage M): a restart, a crossed budget,
         // a shed, restarts again and again, memory climbing, each a notice
         // to the people who look after it.
+        // A gap's notice, once per gap, to every deployment admin (W10.14;
+        // contract v30, stage D; `gap_found`, ruled 2026-11-11).
+        meridian_runtime::keep(meridian_dashboard::dataset_gaps::judge_forever(Arc::clone(
+            &app,
+        )));
         meridian_runtime::keep(meridian_dashboard::component_health::judge_forever(
             Arc::clone(&app),
         ));
