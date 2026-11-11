@@ -128,6 +128,11 @@ thread_local! {
     /// past with no read replica reached, or what its hot layer did not
     /// hold.
     static PRIMARY_ANSWERED: Cell<bool> = const { Cell::new(false) };
+
+    /// Which read this thread is answering: moved by each [`begin_read`], so
+    /// what a store noted of one read (a read replica's snapshot, contract
+    /// v30, stage C2) is never taken for the next's.
+    static READ: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Run `answer` with the call's deadline known to it, the deadline being
@@ -162,6 +167,13 @@ pub fn answering_from_primary() -> bool {
 /// [`Bus::serve`]: crate::Bus::serve
 pub fn begin_read() {
     PRIMARY_ANSWERED.with(|held| held.set(false));
+    READ.with(|read| read.set(read.get().wrapping_add(1)));
+}
+
+/// Which read this thread is answering, as [`begin_read`] last moved it:
+/// what a store keeps of one read is held to it.
+pub fn this_read() -> u64 {
+    READ.with(Cell::get)
 }
 
 /// Part of the read this thread answers was answered from the store's

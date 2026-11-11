@@ -19,6 +19,13 @@
 //!   position, never the primary's heads; a read the primary answered any
 //!   part of -- a book not held, loaded from it, or the record's past with no
 //!   replica reached -- or past its wait, the primary's.
+//! - **A replica's answer is stamped from its own snapshot** (contract v30,
+//!   stage C2; the resilience spec's section 5): the record's past read on
+//!   the replica in one repeatable-read snapshot, its partitions' head rows
+//!   read in the same, and the answer held to them -- taken where they have
+//!   reached the read's `read_after` (and the watermark it is read at),
+//!   stamped with them; answered by the primary where not. Exact, with no
+//!   write position mapped: the head rows replicate with the entries.
 //! - **Nothing written**: every act is the writer's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use meridian_bus::read_after::{
     answered_by_primary, answering_after, answering_from_primary, behind, primary_answered_part,
+    this_read,
 };
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break};
 
@@ -106,33 +114,71 @@ impl ReaderStore {
         self.primary.as_ref()
     }
 
-    /// Where a read of the record's past is answered: the read replica, where
-    /// set and at or past the read's `read_after`; the primary otherwise,
-    /// which the read's watermark then says.
-    fn past(&self) -> &dyn Store {
-        match &self.replica {
-            Some(replica) if !answering_from_primary() && reached(replica.as_ref()) => {
-                replica.as_ref()
-            }
-            _ => {
-                primary_answered_part();
-                self.primary.as_ref()
+    /// A read of the record's past (`read` asked of a store): from the read
+    /// replica, where set, in one snapshot whose head rows have reached the
+    /// read's `read_after` and `at` (a watermark it is read at), stamped with
+    /// them; from the primary otherwise, which the read's watermark then
+    /// says (contract v30, stage C2).
+    fn past<T>(&self, at: Option<&Mark>, read: impl Fn(&dyn Store) -> Result<T>) -> Result<T> {
+        if let Some(replica) = self.replica.as_ref().filter(|_| !answering_from_primary()) {
+            crate::postgres::stamp_from_snapshot();
+            let answered = read(replica.as_ref());
+            let snapshot = crate::postgres::snapshot_heads();
+            match answered {
+                Ok(answer) => {
+                    // A store that keeps no snapshot -- in memory, as a
+                    // test's -- says its heads after the read.
+                    match snapshot.map_or_else(|| replica.heads(), Ok) {
+                        Ok(heads) if reached(&heads, at) => {
+                            REPLICA_STAMP
+                                .with(|kept| *kept.borrow_mut() = Some((this_read(), heads)));
+                            return Ok(answer);
+                        }
+                        Ok(_) => {}
+                        Err(failed) => {
+                            tracing::warn!(%failed, "the read replica's heads could not be read; the primary answers")
+                        }
+                    }
+                }
+                Err(failed) => {
+                    tracing::warn!(%failed, "the read replica could not be read; the primary answers")
+                }
             }
         }
+        primary_answered_part();
+        read(self.primary.as_ref())
     }
 }
 
-fn reached(replica: &dyn Store) -> bool {
-    let Some(asked) = answering_after() else {
-        return true;
-    };
-    match replica.heads() {
-        Ok(heads) => behind(&asked, &heads.into_iter().collect()).is_empty(),
-        Err(failed) => {
-            tracing::warn!(%failed, "the read replica could not be read; the primary answers");
-            false
-        }
-    }
+thread_local! {
+    /// The heads of the replica's snapshot the read this thread answers was
+    /// answered from, with the read they are of ([`this_read`]).
+    static REPLICA_STAMP: std::cell::RefCell<Option<(u64, Mark)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The replica's snapshot this read was answered from, where it was.
+fn replica_stamp() -> Option<Mark> {
+    REPLICA_STAMP.with(|kept| {
+        kept.borrow()
+            .as_ref()
+            .filter(|(read, _)| *read == this_read())
+            .map(|(_, heads)| heads.clone())
+    })
+}
+
+/// Whether a replica's snapshot at `heads` has reached the read's
+/// `read_after`, and `at` where the read is at a watermark.
+fn reached(heads: &Mark, at: Option<&Mark>) -> bool {
+    let heads: std::collections::HashMap<String, u64> = heads
+        .iter()
+        .map(|(partition, head)| (partition.clone(), *head))
+        .collect();
+    let after = answering_after().is_none_or(|asked| behind(&asked, &heads).is_empty());
+    let at_reached = at.is_none_or(|at| {
+        at.iter()
+            .all(|(partition, wanted)| heads.get(partition).copied().unwrap_or(0) >= *wanted)
+    });
+    after && at_reached
 }
 
 fn acted() -> StoreError {
@@ -151,7 +197,7 @@ impl Store for ReaderStore {
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
-        self.past().journal(account_id)
+        self.past(None, |store| store.journal(account_id))
     }
 
     fn adopt(&self) -> Result<u64> {
@@ -184,7 +230,7 @@ impl Store for ReaderStore {
         account_id: &str,
         entry_ids: &[String],
     ) -> Result<Vec<(String, crate::journal::Body)>> {
-        self.past().bodies(account_id, entry_ids)
+        self.past(None, |store| store.bodies(account_id, entry_ids))
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
@@ -221,7 +267,7 @@ impl Store for ReaderStore {
         at: &Mark,
         until: Option<&str>,
     ) -> Result<crate::book::Book> {
-        self.past().book_as_of(account_id, at, until)
+        self.past(Some(at), |store| store.book_as_of(account_id, at, until))
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
@@ -238,6 +284,10 @@ impl Store for ReaderStore {
         if answered_by_primary() {
             return self.primary.heads();
         }
+        // The record's past answered by the replica: its snapshot's heads.
+        if let Some(stamped) = replica_stamp() {
+            return Ok(stamped);
+        }
         Ok((self.applied)())
     }
 
@@ -251,7 +301,7 @@ impl Store for ReaderStore {
 
     fn positions(&self, read: &PositionsRead) -> Result<Page<BookPosition>> {
         if past_positions(read) {
-            self.past().positions(read)
+            self.past(read.at.as_ref(), |store| store.positions(read))
         } else {
             self.now().positions(read)
         }
@@ -294,7 +344,7 @@ impl Store for ReaderStore {
     }
 
     fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>> {
-        self.past().order_history(read)
+        self.past(None, |store| store.order_history(read))
     }
 
     fn locates(&self, read: &LocatesRead) -> Result<Page<meridian_domain::v1::Locate>> {

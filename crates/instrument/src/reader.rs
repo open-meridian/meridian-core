@@ -10,6 +10,12 @@
 //!   reached the read's `read_after`; from the primary otherwise.
 //! - **Past its wait**, a read still behind its `read_after` is answered from
 //!   the primary, every part of it.
+//! - **A replica's answer is held to its own snapshot** (contract v30, stage
+//!   C2; the resilience spec's section 5): the record's past read on the
+//!   replica in one repeatable-read snapshot with its change log's head rows,
+//!   and taken where those have reached the read's `read_after`; the primary
+//!   answers where they have not. No reference reply carries a watermark of
+//!   its own, so the snapshot is what the answer is held to.
 //! - **Nothing written**: every write is the writer's.
 
 use std::sync::Arc;
@@ -48,32 +54,56 @@ impl ReaderStore {
         }
     }
 
-    fn past(&self) -> &dyn Store {
-        match &self.replica {
-            Some((replica, at)) if !answering_from_primary() && reached(at.as_ref()) => {
-                replica.as_ref()
+    /// A read of the record's past (`read` asked of a store): from the read
+    /// replica, where set, in one snapshot whose head rows have reached the
+    /// read's `read_after`; from the primary otherwise (contract v30, stage
+    /// C2).
+    fn past<T>(&self, read: impl Fn(&dyn Store) -> Result<T>) -> Result<T> {
+        if let Some((replica, at)) = self.replica.as_ref().filter(|_| !answering_from_primary()) {
+            crate::postgres::stamp_from_snapshot();
+            let answered = read(replica.as_ref());
+            let snapshot = crate::postgres::snapshot_heads();
+            match answered {
+                Ok(answer) => {
+                    // A store that keeps no snapshot -- in memory, as a
+                    // test's -- says its position after the read.
+                    let heads = match snapshot {
+                        Some(heads) => Ok(heads),
+                        None => at.heads(&asked_partitions()),
+                    };
+                    match heads {
+                        Ok(heads) if reached(&heads) => return Ok(answer),
+                        Ok(_) => {}
+                        Err(failed) => {
+                            tracing::warn!(%failed, "the read replica's heads could not be read; the primary answers")
+                        }
+                    }
+                }
+                Err(failed) => {
+                    tracing::warn!(%failed, "the read replica could not be read; the primary answers")
+                }
             }
-            _ => self.primary.as_ref(),
         }
+        read(self.primary.as_ref())
     }
 }
 
-fn reached(at: &dyn Position) -> bool {
-    let Some(asked) = answering_after() else {
-        return true;
-    };
-    let partitions: Vec<String> = asked
-        .partitions
-        .iter()
-        .map(|p| p.partition.clone())
-        .collect();
-    match at.heads(&partitions) {
-        Ok(heads) => behind(&asked, &heads).is_empty(),
-        Err(failed) => {
-            tracing::warn!(%failed, "the read replica could not be read; the primary answers");
-            false
-        }
-    }
+fn asked_partitions() -> Vec<String> {
+    answering_after()
+        .map(|asked| {
+            asked
+                .partitions
+                .iter()
+                .map(|p| p.partition.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a replica's snapshot at `heads` has reached the read's
+/// `read_after`.
+fn reached(heads: &std::collections::HashMap<String, u64>) -> bool {
+    answering_after().is_none_or(|asked| behind(&asked, heads).is_empty())
 }
 
 fn written() -> StoreError {
@@ -104,7 +134,7 @@ impl Store for ReaderStore {
         if as_of_ns == 0 {
             self.now().matching(scheme, value, source, as_of_ns)
         } else {
-            self.past().matching(scheme, value, source, as_of_ns)
+            self.past(|store| store.matching(scheme, value, source, as_of_ns))
         }
     }
 
@@ -129,7 +159,7 @@ impl Store for ReaderStore {
     }
 
     fn history(&self, instrument_id: &str) -> Result<Vec<Version>> {
-        self.past().history(instrument_id)
+        self.past(|store| store.history(instrument_id))
     }
 
     fn note_conflict(&self, _: Conflict) -> Result<()> {

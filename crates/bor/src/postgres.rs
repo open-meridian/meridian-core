@@ -38,6 +38,52 @@ use crate::store::{
     Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
+thread_local! {
+    /// Whether a read on this thread is to say the heads of its own snapshot
+    /// (contract v30, stage C2; the resilience spec's section 5): a record
+    /// read on a read replica, stamped from the snapshot it answered from.
+    static STAMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The heads its snapshots read, the lowest of each where it took more
+    /// than one.
+    static SNAPSHOT_HEADS: std::cell::RefCell<Option<Mark>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The next reads on this thread each answer from one repeatable-read
+/// snapshot and say its partitions' head rows ([`snapshot_heads`]): a read
+/// replica's record read (contract v30, stage C2; the resilience spec's
+/// section 5). Its watermark is then exact, with no write position mapped:
+/// the head rows replicate with the entries, as the lake's do.
+pub fn stamp_from_snapshot() {
+    STAMPING.with(|stamping| stamping.set(true));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take());
+}
+
+/// The heads the reads since [`stamp_from_snapshot`] answered from, each the
+/// lowest any of them read; none where none read any. Stops the stamping.
+pub fn snapshot_heads() -> Option<Mark> {
+    STAMPING.with(|stamping| stamping.set(false));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+fn stamping() -> bool {
+    STAMPING.with(std::cell::Cell::get)
+}
+
+/// In a read's repeatable-read transaction: every partition's head row from
+/// the same snapshot the read answers from, kept for [`snapshot_heads`].
+fn note_snapshot(tx: &mut Transaction<'_>) -> Result<()> {
+    let heads = heads_of(tx)?;
+    SNAPSHOT_HEADS.with(|noted| {
+        let mut noted = noted.borrow_mut();
+        let noted = noted.get_or_insert_with(Mark::new);
+        for (partition, head) in heads {
+            let at = noted.entry(partition).or_insert(head);
+            *at = (*at).min(head);
+        }
+    });
+    Ok(())
+}
+
 type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 type Connection =
     r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
@@ -259,6 +305,10 @@ impl PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // Its heads from this snapshot, where its thread asked (stage C2).
+        if stamping() {
+            note_snapshot(&mut tx)?;
+        }
         let out = read(&mut tx)?;
         tx.commit().map_err(unavailable)?;
         Ok(out)
@@ -668,6 +718,53 @@ fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64)
         )
         .map_err(unavailable)?;
     Ok(())
+}
+
+/// The accounts the book holds, in order.
+fn accounts_of(client: &mut impl GenericClient) -> Result<Vec<String>> {
+    Ok(client
+        .query(
+            "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
+              ORDER BY account_id COLLATE \"C\"",
+            &[],
+        )
+        .map_err(unavailable)?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// An account's book as of `at` (and `until`), from its latest snapshot
+/// holding nothing later, with the entries replayed and the sequence it was
+/// held to in its partition.
+fn book_as_of_in(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    at: &Mark,
+    until: Option<&str>,
+) -> Result<(Book, (Vec<Entry>, u64))> {
+    let partition: String = client
+        .query_opt(
+            "SELECT partition FROM book_account WHERE account_id = $1",
+            &[&account_id],
+        )
+        .map_err(unavailable)?
+        .map(|row| row.get(0))
+        .unwrap_or_else(|| FIRST_PARTITION.to_string());
+    let at = at.get(&partition).copied().unwrap_or(0);
+    let (book, entries) = match snapshot_of(client, account_id, Some(at), until)? {
+        Some(kept) => {
+            let after = crate::snapshot::last_sequence(&kept);
+            let tail = journal_after(client, account_id, after)?;
+            (kept.resume_as_of(&tail, Some(at), until)?, tail)
+        }
+        None => {
+            let entries = journal_of(client, account_id)?;
+            let book = Book::as_of(account_id, &partition, &entries, Some(at), until)?;
+            (book, entries)
+        }
+    };
+    Ok((book, (entries, at)))
 }
 
 fn heads_of(client: &mut impl GenericClient) -> Result<Mark> {
@@ -1460,6 +1557,10 @@ impl Store for PostgresStore {
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
+        if stamping() {
+            // A read replica's: one snapshot, its heads beside (stage C2).
+            return self.reading(|tx| journal_of(tx, account_id));
+        }
         journal_of(&mut *self.conn()?, account_id)
     }
 
@@ -1584,6 +1685,9 @@ impl Store for PostgresStore {
     }
 
     fn bodies(&self, account_id: &str, entry_ids: &[String]) -> Result<Vec<(String, Body)>> {
+        if stamping() {
+            return self.reading(|tx| bodies_of(tx, account_id, entry_ids));
+        }
         bodies_of(&mut *self.conn()?, account_id, entry_ids)
     }
 
@@ -1642,28 +1746,14 @@ impl Store for PostgresStore {
     }
 
     fn book_as_of(&self, account_id: &str, at: &Mark, until: Option<&str>) -> Result<Book> {
+        if stamping() {
+            // A read replica's: replayed in one snapshot, its heads beside,
+            // and no read's snapshot kept -- a replica writes nothing.
+            return self
+                .reading(|tx| book_as_of_in(tx, account_id, at, until).map(|(book, _)| book));
+        }
         let mut conn = self.conn()?;
-        let partition: String = conn
-            .query_opt(
-                "SELECT partition FROM book_account WHERE account_id = $1",
-                &[&account_id],
-            )
-            .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| FIRST_PARTITION.to_string());
-        let at = at.get(&partition).copied().unwrap_or(0);
-        let (book, entries) = match snapshot_of(&mut *conn, account_id, Some(at), until)? {
-            Some(kept) => {
-                let after = crate::snapshot::last_sequence(&kept);
-                let tail = journal_after(&mut *conn, account_id, after)?;
-                (kept.resume_as_of(&tail, Some(at), until)?, tail)
-            }
-            None => {
-                let entries = journal_of(&mut *conn, account_id)?;
-                let book = Book::as_of(account_id, &partition, &entries, Some(at), until)?;
-                (book, entries)
-            }
-        };
+        let (book, (entries, at)) = book_as_of_in(&mut *conn, account_id, at, until)?;
         // A read that reached the journal's end with no date is the book
         // now, kept as a read's snapshot where it replayed past the interval
         // (v26's core).
@@ -1678,22 +1768,18 @@ impl Store for PostgresStore {
         Ok(book)
     }
 
-    fn accounts(&self) -> Result<Vec<String>> {
-        Ok(self
-            .conn()?
-            .query(
-                "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
-                  ORDER BY account_id COLLATE \"C\"",
-                &[],
-            )
-            .map_err(unavailable)?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect())
+    fn heads(&self) -> Result<Mark> {
+        if stamping() {
+            return self.reading(|tx| heads_of(tx));
+        }
+        heads_of(&mut *self.conn()?)
     }
 
-    fn heads(&self) -> Result<Mark> {
-        heads_of(&mut *self.conn()?)
+    fn accounts(&self) -> Result<Vec<String>> {
+        if stamping() {
+            return self.reading(|tx| accounts_of(tx));
+        }
+        accounts_of(&mut *self.conn()?)
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {

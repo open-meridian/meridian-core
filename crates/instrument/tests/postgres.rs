@@ -1291,3 +1291,35 @@ fn a_new_database_timeline_raises_a_captured_stores_epoch() {
         .get(0);
     assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
 }
+
+/// A record read on a read replica answers from one snapshot and says its
+/// change log's head rows (contract v30, stage C2; the resilience spec's
+/// section 5): a record's history and a match as of a time each read in one
+/// repeatable-read snapshot with the heads beside, which the reader holds to
+/// the read's `read_after`. Not asked, nothing is said; and the connection
+/// goes back to the pool in no transaction, so the next write commits.
+#[test]
+fn a_record_read_answers_from_one_snapshot_and_says_its_heads() {
+    use meridian_instrument::postgres::{snapshot_heads, stamp_from_snapshot};
+    let store = store();
+    let held = minted(&store, "STAMP");
+    let symbol = held.identifiers[0].value.clone();
+    stamp_from_snapshot();
+    let history = store.history(&held.instrument_id).unwrap();
+    let heads = snapshot_heads().expect("the snapshot's heads");
+    assert_eq!(history.len(), 1);
+    assert!(heads.contains_key("instrument"), "{heads:?}");
+    stamp_from_snapshot();
+    let found = store
+        .matching("symbol", &symbol, "snaptrade", i64::MAX)
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(snapshot_heads().is_some_and(|heads| heads.contains_key("instrument")));
+    // Not asked: nothing said.
+    store.history(&held.instrument_id).unwrap();
+    assert!(snapshot_heads().is_none());
+    // Every pooled connection free of the snapshots: writes go on.
+    for _ in 0..6 {
+        minted(&store, "AFTER");
+    }
+}

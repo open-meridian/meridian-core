@@ -1749,3 +1749,54 @@ fn a_new_database_timeline_raises_the_books_epoch() {
     assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
     assert_eq!(store.head_epoch().unwrap(), epoch + 1);
 }
+
+/// A record read on a read replica is stamped from its own snapshot
+/// (contract v30, stage C2; the resilience spec's section 5): asked, the
+/// book's reads of its past each answer from one repeatable-read snapshot
+/// and say its partitions' head rows; not asked, nothing. A reader member
+/// answering the record's past from the replica says those heads as the
+/// read's position -- never its own applied position -- and the next read
+/// says its own again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
+    use meridian_bor::postgres::{snapshot_heads, stamp_from_snapshot};
+    let (bus, store) = wired();
+    let account = unique("ACC-STAMP");
+    open(&bus, &account, &unique("INS-STAMP")).await;
+    blocking(|| {
+        stamp_from_snapshot();
+        let entries = store.journal(&account).unwrap();
+        let said = snapshot_heads().expect("the snapshot's heads");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let head = said[&entry.partition];
+        assert!(
+            head >= entry.last_sequence && head <= store.heads().unwrap()[&entry.partition],
+            "the snapshot's head ({head}) holds the entry it answered and no more than the record"
+        );
+        // Not asked: nothing said, and nothing kept from before.
+        store.journal(&account).unwrap();
+        assert!(snapshot_heads().is_none());
+
+        // A reader member whose replica is this store, applied to nothing.
+        let reader = meridian_bor::reader::ReaderStore::new(
+            store.clone(),
+            Some(store.clone() as Arc<dyn Store>),
+            1 << 20,
+            Arc::new(meridian_bor::store::Mark::new),
+        );
+        meridian_bus::read_after::begin_read();
+        let past = Store::journal(&reader, &account).unwrap();
+        assert_eq!(past.len(), 1);
+        let stamped = Store::heads(&reader).unwrap();
+        assert!(
+            stamped.get(&entry.partition).copied().unwrap_or(0) >= entry.last_sequence,
+            "the replica's snapshot, not the member's applied position: {stamped:?}"
+        );
+        meridian_bus::read_after::begin_read();
+        assert!(
+            Store::heads(&reader).unwrap().is_empty(),
+            "the next read says the member's own position again"
+        );
+    });
+}
