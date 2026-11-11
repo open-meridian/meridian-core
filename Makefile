@@ -2786,14 +2786,18 @@ chart-check:
 	@# Step 3b: a warm standby is a value. With `<component>.standby: 1` a
 	@# component runs two members spread over nodes under the members' lease
 	@# right, a PodDisruptionBudget, a surging rollout and its lease named;
-	@# 2 is refused, and the default renders no lease, no account and no
-	@# budget. Every stateless component tolerates a lost node for 30 s.
+	@# 2 is refused, and the default renders no lease, no members' account
+	@# and no budget -- its one Lease right the conductor's read of them
+	@# (stage D, ruled 2026-11-11). Every stateless component tolerates a
+	@# lost node for 30 s.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "coordination.k8s.io"; do \
+	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "name: check-meridian-runtime-member$$"; do \
 		echo "$$plain" | grep -q "$$absent" \
 			&& { echo "chart-check FAILED: the default profile renders $$absent; standbys are configuration (ruling 1052)" >&2; exit 1; }; \
 	done; \
+	[ "$$(echo "$$plain" | grep -c 'coordination.k8s.io')" = 1 ] \
+		|| { echo "chart-check FAILED: the default profile renders a Lease right beyond the conductor's read of them (stage D); standbys are configuration (ruling 1052)" >&2; exit 1; }; \
 	echo "$$plain" | grep -q "tolerationSeconds: 30" \
 		|| { echo "chart-check FAILED: no component tolerates a lost node for 30 s (question 22)" >&2; exit 1; }; \
 	for store in lake bor instrument street conductor launcher; do \
