@@ -100,6 +100,16 @@ impl Limits {
         })
     }
 
+    /// What the sidecar holds apart from its own budget (the resilience
+    /// spec's section 10a; stage B's ruling 5): the plugin's answers in
+    /// flight, `answerMiB`, and its `read_after` session's
+    /// [`crate::read_after::MOST_BYTES`]. What is left of its working budget
+    /// is the sidecar's own work's -- its registrations, heartbeats,
+    /// reports and deliveries -- which a plugin flooding it cannot take.
+    pub fn held_apart(&self) -> u64 {
+        self.answer_mib * 1024 * 1024 + crate::read_after::MOST_BYTES as u64
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok();
         Self::read(
@@ -360,6 +370,39 @@ impl Drop for Counted {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_plugins_answers_and_its_session_are_held_apart_and_a_share_leaving_nothing_is_refused() {
+        let mib = 1024 * 1024;
+        assert_eq!(
+            Limits::DEFAULT.held_apart(),
+            64 * mib + crate::read_after::MOST_BYTES as u64
+        );
+        // The chart's own: 256 MiB at 80 %, less the default share, leaves
+        // the sidecar its own work's 140 MiB or so.
+        let settings = |limit_mib: u64| meridian_budget::Settings {
+            limit_bytes: Some(limit_mib * mib),
+            ..meridian_budget::Settings::unbounded()
+        };
+        let process = meridian_budget::Process::new(
+            "sidecar",
+            settings(256),
+            Limits::DEFAULT.held_apart(),
+            4,
+        )
+        .expect("the default share leaves the sidecar its own budget");
+        let own = process.budget.working().unwrap();
+        assert!(own > 128 * mib && own < 141 * mib, "{own}");
+        // A share as large as the sidecar's whole budget leaves it nothing.
+        let greedy = Limits {
+            answer_mib: 205,
+            ..Limits::DEFAULT
+        };
+        assert!(
+            meridian_budget::Process::new("sidecar", settings(256), greedy.held_apart(), 4)
+                .is_err()
+        );
+    }
 
     #[test]
     fn the_limits_default_where_unsaid_and_a_value_not_a_positive_number_is_refused_naming_it() {

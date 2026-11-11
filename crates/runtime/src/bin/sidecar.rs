@@ -137,8 +137,16 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             // Its own budget (stage M), inside the desktop footprint's +15 %
-            // (1058): the plugin's share keeps a flood off it.
-            meridian_budget::install("sidecar", 0, meridian_budget::permits_from_env())?;
+            // (1058): the plugin's share keeps a flood off it. The plugin's
+            // answers in flight (answerMiB) and its read_after session are
+            // held apart, so what is left is the sidecar's own work's,
+            // whatever the plugin does; a share that leaves it nothing is
+            // refused at start, as the chart refuses it.
+            meridian_budget::install(
+                "sidecar",
+                limits.held_apart(),
+                meridian_budget::permits_from_env(),
+            )?;
             // A data plugin's lake writes go by the lake's write-ahead stream
             // in `ha` (the resilience spec's section 4): held by the stream
             // before the lake records them, so none it was answered for is

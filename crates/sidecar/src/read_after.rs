@@ -10,10 +10,11 @@
 //! instance, as MongoDB's causally consistent sessions and Cosmos DB's
 //! session tokens give them, both of which advance a session on every reply.
 //!
-//! Bounded: at most [`MOST_BYTES`] of partitions are held, a fixed share
-//! within the sidecar's own (its per-plugin caps are stage M2's
-//! `sidecar.limits`); a partition past it is not held, said once, and reads
-//! of it name no more than was held.
+//! Bounded: at most [`MOST_BYTES`] of partitions are held, held apart from
+//! the sidecar's own budget beside the plugin's answers in flight
+//! (`sidecar.limits.answerMiB`; [`crate::share::Limits::held_apart`]); a
+//! partition past it is not held, said once, and reads of it name no more
+//! than was held.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,10 +27,8 @@ use meridian_pb::v1::Watermark;
 use prost::Message;
 
 /// The most a session holds: its partitions' names and sequences, a few
-/// thousand partitions.
-// gap until M2: these 256 KiB are reserved against the sidecar's budget once
-// stage M2 installs it (tasks/sdk-contract/standing-analytics-and-resilience-
-// contract, ruled 2026-11-10); until then they are a fixed share outside it.
+/// thousand partitions. Reserved under the sidecar's caps, held apart from
+/// its own budget at start (stage B's ruling 5, 2026-11-10; stage M2).
 pub const MOST_BYTES: usize = 256 * 1024;
 
 /// What one partition held costs, beyond its name.

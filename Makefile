@@ -2728,7 +2728,9 @@ chart-check:
 	@# memory.shedPercent and glibc's settings; a percent out of range, or a
 	@# limit that leaves a component nothing past its hot layer and held
 	@# answers, renders nothing; a plugin's share reaches its sidecar, its own
-	@# limits overriding the chart's; and the broker's bounds reach it.
+	@# limits overriding the chart's, and a share whose answers leave the
+	@# sidecar nothing of its own budget renders nothing (stage M2); and the
+	@# broker's bounds reach it.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	shared="$$base --set sidecars[0].instanceId=probe --set sidecars[0].roles[0]=data --set sidecars[0].limits.inFlight=4"; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$shared 2>/dev/null)"; \
@@ -2746,7 +2748,8 @@ chart-check:
 		|| { echo "chart-check FAILED: sidecar.limits.requestsPerSecond does not reach a sidecar as 200" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set memory.shedPercent=85 2>/dev/null | grep -A1 'name: MERIDIAN_MEMORY_SHED_PERCENT$$' | grep -q 'value: "85"' \
 		|| { echo "chart-check FAILED: memory.shedPercent=85 does not reach the components" >&2; exit 1; }; \
-	for refused in memory.budgetPercent=5 memory.budgetPercent=96 memory.shedPercent=80 memory.shedPercent=100 sidecar.limits.inFlight=0 resources.limits.memory=128Mi; do \
+	for refused in memory.budgetPercent=5 memory.budgetPercent=96 memory.shedPercent=80 memory.shedPercent=100 sidecar.limits.inFlight=0 resources.limits.memory=128Mi \
+		sidecar.limits.answerMiB=200 sidecars[0].limits.answerMiB=200; do \
 		! $(HELM_TEMPLATE) check deploy/chart $$shared --set $$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: $$refused rendered; it leaves nothing, or is out of range (stage M)" >&2; exit 1; }; \
 	done; \
