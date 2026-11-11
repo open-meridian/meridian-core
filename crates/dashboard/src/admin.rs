@@ -88,6 +88,8 @@ pub fn routes() -> Router<Arc<App>> {
         )
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
+        // Contract v30 (W6.39): the Resilience page, a deployment admin's.
+        .route(resilience::PATH, get(resilience_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
             "/admin/data-sources/entitlement",
@@ -481,6 +483,7 @@ pub mod holds;
 pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
+pub mod resilience;
 pub mod series_rule;
 pub mod sources_view;
 pub mod stale_reference;
@@ -4277,6 +4280,36 @@ async fn data_sources_page(
 }
 
 const DATA_SOURCES: &str = "/admin/data-sources";
+
+// ── The Resilience page ─────────────────────────────────────────────────────
+
+/// W6.39 (contract v30, stage D): the Resilience page, for a deployment
+/// admin: the profile, the members, the partitions and the history.
+async fn resilience_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let cursor = field(&query, "cursor");
+    let (profile, read) = tokio::join!(
+        resilience::profile(&app.bus, &session.subject),
+        resilience::resilience(&app.bus, &session.subject, resilience::HISTORY_PAGE, cursor),
+    );
+    let body = resilience::page(&profile, &read, cursor);
+    let chrome = Chrome {
+        crumbs: format!(
+            "{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_here("Resilience", None)
+        ),
+        ..admin_chrome(&session)
+    };
+    Html(page_with("Resilience", &body, &chrome)).into_response()
+}
 
 /// A list typed as words between commas, blanks dropped.
 fn words(fields: &Fields, name: &str) -> Vec<String> {

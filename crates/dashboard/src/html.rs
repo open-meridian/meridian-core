@@ -1593,6 +1593,8 @@ const SIDEBAR: [(&str, &[SidebarItem]); 5] = [
         "Deployment",
         &[
             ("time-zone", "Time zone", "/admin#time-zone", "clock", &[]),
+            // Contract v30 (W6.39): what the deployment survives.
+            ("resilience", "Resilience", "/admin/resilience", "", &[]),
             (
                 "fx-pivots",
                 "FX pivot currencies",
