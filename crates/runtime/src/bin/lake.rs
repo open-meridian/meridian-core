@@ -149,6 +149,27 @@ fn run() -> Result<(), String> {
     // adopted before the first batch (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
     let member = meridian_runtime::member::Member::from_env("lake", Some("lake"))?;
+    // A reader's record-read replica, made before the runtime and held here,
+    // as the primary is, so its blocking client closes its connections after
+    // the runtime has stopped, never on its worker (contract v30, stage D;
+    // a reader made it inside the runtime from stage C2, connecting in
+    // block_in_place after PR CI 43014977978's "Cannot start a runtime from
+    // within a runtime").
+    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
+        meridian_runtime::read_replica(
+            "the lake's read replica",
+            "MERIDIAN_LAKE_READ_DATABASE_URL",
+            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .verify()
+                    .map_err(|failed| Wait::NotYet(failed.to_string()))
+            },
+        )?
+        .map(Arc::new)
+    } else {
+        None
+    };
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "lake-1".into());
     // How many whole answers are built at once (the chart's
     // lake.maxConcurrentAnswers; rulings 957, 958): refused, not guessed,
@@ -173,29 +194,11 @@ fn run() -> Result<(), String> {
         // its hot layer kept by the writer's change log, never writing.
         if member.is_reader() {
             bus.serve_only(meridian_bus::read_after::is_read);
-            // Off the runtime's worker: the store's Postgres client is
-            // blocking, and connected from within the runtime it panicked
-            // (PR CI 43014977978, e2e-cluster-scaled: "Cannot start a runtime
-            // from within a runtime", once the chart wired the replica).
-            let replica =
-                match meridian_runtime::read_database_url("MERIDIAN_LAKE_READ_DATABASE_URL") {
-                    None => None,
-                    Some(read_url) => Some(Arc::new(tokio::task::block_in_place(|| {
-                        wait_for_store(
-                            "the lake's read replica",
-                            &read_url,
-                            |url| {
-                                PostgresStore::connect(url, 4).map_err(|failed| failed.to_string())
-                            },
-                            |store| {
-                                store
-                                    .verify()
-                                    .map_err(|failed| Wait::NotYet(failed.to_string()))
-                            },
-                        )
-                    })?)
-                        as Arc<dyn meridian_lake::Store>),
-                };
+            // Made before the runtime and held outside it (stage D): its
+            // connections close after the runtime has stopped.
+            let replica = replica
+                .clone()
+                .map(|replica| replica as Arc<dyn meridian_lake::Store>);
             // Where it starts following from: the primary's heads before its
             // hot layer holds anything.
             let start = tokio::task::block_in_place(|| record.heads())

@@ -132,6 +132,27 @@ fn run() -> Result<(), String> {
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
     meridian_changes::set_clock(clock());
     let member = meridian_runtime::member::Member::from_env("instrument", Some("reference"))?;
+    // A reader's record-read replica, made before the runtime and held here,
+    // as the primary is, so its blocking client closes its connections after
+    // the runtime has stopped, never on its worker (contract v30, stage D;
+    // a reader made it inside the runtime from stage C2, connecting in
+    // block_in_place after PR CI 43014977978's "Cannot start a runtime from
+    // within a runtime").
+    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
+        meridian_runtime::read_replica(
+            "the instrument store's read replica",
+            "MERIDIAN_INSTRUMENT_READ_DATABASE_URL",
+            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .verify()
+                    .map_err(|failed| Wait::NotYet(failed.to_string()))
+            },
+        )?
+        .map(Arc::new)
+    } else {
+        None
+    };
     // The hot layer in front of the record (step 3a): records by ID and what
     // each became, bounded by instrument.hotLayer.recordsMiB.
     let bound = meridian_instrument::hot::bytes_from_mib(
@@ -164,34 +185,13 @@ fn run() -> Result<(), String> {
         // became and their history, never writing or asking the platform.
         if member.is_reader() {
             bus.serve_only(|topic| READER_SERVES.contains(&topic));
-            let replica = match meridian_runtime::read_database_url(
-                "MERIDIAN_INSTRUMENT_READ_DATABASE_URL",
-            ) {
-                None => None,
-                Some(read_url) => {
-                    // Off the runtime's worker: the store's Postgres client is
-                    // blocking, and connected from within the runtime it panicked
-                    // (PR CI 43014977978, e2e-cluster-scaled: "Cannot start a runtime
-                    // from within a runtime", once the chart wired the replica).
-                    let replica = Arc::new(tokio::task::block_in_place(|| {
-                        wait_for_store(
-                            "the instrument store's read replica",
-                            &read_url,
-                            |url| {
-                                PostgresStore::connect(url, 4).map_err(|failed| failed.to_string())
-                            },
-                            |store| {
-                                store
-                                    .verify()
-                                    .map_err(|failed| Wait::NotYet(failed.to_string()))
-                            },
-                        )
-                    })?);
-                    let at: Arc<dyn meridian_bus::read_after::Position> =
-                        Arc::new(meridian_runtime::member::LogHeads::of(replica.clone()));
-                    Some((replica as Arc<dyn meridian_instrument::Store>, at))
-                }
-            };
+            // Made before the runtime and held outside it (stage D): its
+            // connections close after the runtime has stopped.
+            let replica = replica.clone().map(|replica| {
+                let at: Arc<dyn meridian_bus::read_after::Position> =
+                    Arc::new(meridian_runtime::member::LogHeads::of(replica.clone()));
+                (replica as Arc<dyn meridian_instrument::Store>, at)
+            });
             let reading = Arc::new(meridian_instrument::reader::ReaderStore::new(
                 hot.clone(),
                 postgres.clone(),

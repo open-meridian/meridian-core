@@ -1265,6 +1265,28 @@ pub fn read_database_url(name: &str) -> Option<String> {
     })
 }
 
+/// A reader member's record-read replica, where `name` names one: its store
+/// made and verified before the component's runtime starts, and held by the
+/// caller (contract v30, stage D; stage C2's leftover).
+///
+/// A reader's replica was made inside the runtime, so its last reference --
+/// the reader's service, its handlers' captures -- went with the runtime's
+/// tasks, and its blocking Postgres client closed its connections on the
+/// runtime's worker, which panics ([`on_runtime`]'s rule). Made here and
+/// held by the caller as the primary is, the runtime is gone before its
+/// last reference, and its connections close off any worker.
+pub fn read_replica<S>(
+    what: &str,
+    name: &str,
+    connect: impl Fn(&str) -> Result<S, String>,
+    verify: impl Fn(&S) -> Result<(), Wait>,
+) -> Result<Option<S>, String> {
+    match read_database_url(name) {
+        None => Ok(None),
+        Some(url) => wait_for_store(what, &url, connect, verify).map(Some),
+    }
+}
+
 /// `url` with its host `host`, its credentials, port, database and settings
 /// as they were: a URL (`postgres://user:pass@host:port/db?...`) or libpq's
 /// `key=value` form.
@@ -1491,6 +1513,86 @@ mod tests {
             !cancelled.load(Ordering::SeqCst),
             "the loop ran on into the runtime's shutdown: its blocking work was cancelled under it"
         );
+    }
+
+    /// A store whose connections close as the blocking Postgres client's
+    /// do: by running a runtime of its own, which panics on a thread already
+    /// driving one.
+    struct ClosesLikePostgres(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ClosesLikePostgres {
+        fn drop(&mut self) {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime of its own")
+                .block_on(async {});
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A reader shuts down cleanly (contract v30, stage D; stage C2's
+    /// leftover): its replica made before the runtime and held by the
+    /// caller, as [`super::read_replica`] is in the lake's, the book's and
+    /// the instrument store's readers, while its service and a background
+    /// task hold it too. The serving ends, the runtime stops, and the
+    /// replica's connections close after, off any worker.
+    #[test]
+    fn a_reader_holding_its_replica_shuts_down_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let replica = Some(Arc::new(ClosesLikePostgres(Arc::clone(&closed))));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::served_on(runtime, async {
+                // The reader's service and its handlers' captures.
+                let service = replica.clone();
+                let held = replica.clone();
+                super::background(async move {
+                    let _held = held;
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+                drop(service);
+                Ok(())
+            })
+        }));
+        assert_eq!(
+            served.ok(),
+            Some(Ok(())),
+            "the reader panicked as it shut down"
+        );
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "the replica closed inside the runtime"
+        );
+        drop(replica);
+        assert!(closed.load(Ordering::SeqCst), "the replica never closed");
+    }
+
+    /// What the test above keeps from happening: a replica made inside the
+    /// runtime, its last reference dropped there, panics as it closes.
+    #[test]
+    fn a_replica_closed_on_the_runtimes_worker_panics() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let closing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let replica = ClosesLikePostgres(Arc::new(AtomicBool::new(false)));
+                drop(replica);
+            })
+        }));
+        assert!(closing.is_err(), "a close on the worker did not panic");
     }
 
     /// The migration reaches the server its release starts, on the database
