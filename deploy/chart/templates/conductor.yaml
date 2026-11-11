@@ -14,11 +14,15 @@
   was that nobody would write its migrations; this one has a history from its
   first commit, applied by the migrate job, and a start only verifies it.
 
-  Its own account, whose one right of its own is to read the pods in this
-  namespace -- `get` and `list`, nothing written, no other resource
-  (approved 2026-11-10) -- so each member's health names its restarts and
-  why: an OOM kill named a defect (W6.40; stage M). With a standby, the
-  members' Lease right is bound to it too, as to every member.
+  Its own account, whose rights of its own are to read the pods and the
+  Leases in this namespace -- `get` and `list`, nothing written, no other
+  resource: the pods (approved 2026-11-10) so each member's health names its
+  restarts and why, an OOM kill named a defect (W6.40; stage M); the Leases
+  (contract v30, stage D; ruled 2026-11-11, decisions/016's namespaced
+  grant) so the resilience profile and the Resilience page read who writes
+  each store from the Leases themselves (W6.39). No node is read: a
+  member's node is its pod's, its zone its own report's. With a standby,
+  the members' Lease right is bound to it too, as to every member.
 */}}
 {{- $account := printf "%s-conductor" (include "meridian-runtime.fullname" .) }}
 apiVersion: v1
@@ -37,6 +41,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -171,6 +171,18 @@ impl ApiServer {
             .await
     }
 
+    /// The Leases in this namespace, as a list: read only, for the
+    /// conductor's resilience profile and the Resilience page, who writes
+    /// each store (W6.39; its Role's `get` and `list` on Leases, ruled
+    /// 2026-11-11).
+    pub async fn leases(&self) -> Result<serde_json::Value, ClusterError> {
+        self.get_json(&format!(
+            "/apis/coordination.k8s.io/v1/namespaces/{}/leases",
+            self.namespace
+        ))
+        .await
+    }
+
     /// The Deployments in this namespace carrying `selector`, as a list.
     pub async fn deployments(&self, selector: &str) -> Result<serde_json::Value, ClusterError> {
         self.get_json(&format!(
