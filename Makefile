@@ -2842,7 +2842,14 @@ chart-check:
 	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1"; do \
 		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
-	done; true
+	done; \
+	short="$$($(HELM_TEMPLATE) check deploy/chart $$base --set leases.renewSeconds=2 --set leases.durationSeconds=5 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: a lease of 5 s renewed every 2 s rendered; a lease lasts at least three renewals (contract v30, stage C)" >&2; exit 1; }; \
+	echo "$$short" | grep -q "leases.durationSeconds is 5 and leases.renewSeconds 2" \
+		|| { echo "chart-check FAILED: a lease shorter than three renewals is refused without naming both values: $$short" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set leases.renewSeconds=2 --set leases.durationSeconds=6 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: the default lease, 6 s renewed every 2 s, did not render" >&2; exit 1; }; \
+	true
 	@# The brought database's max_connections, counted from what the chart
 	@# deploys (ruled 2026-11-08): each store member's pool and what is
 	@# beside it, the lake's write-ahead writer's in ha (stage E), a

@@ -262,12 +262,31 @@ strategy:
 {{- end -}}
 
 {{/*
+The leases' timing (contract v30, stage C; the resilience spec's section 2,
+approved 2026-11-10): Patroni's rule, `loop_wait + 2 x retry_timeout <=
+ttl`. Each renewal gives up within leases.renewSeconds, so a lease that
+lasts three renewals outlives one slow answer and a retry; one shorter is
+refused, naming both.
+*/}}
+{{- define "meridian-runtime.leaseTiming" -}}
+{{- $renew := int .Values.leases.renewSeconds -}}
+{{- $lasts := int .Values.leases.durationSeconds -}}
+{{- if lt $renew 1 -}}
+{{- fail (printf "leases.renewSeconds is %v; a whole number of seconds above 0: how often a writer renews its lease, each renewal giving up within it" .Values.leases.renewSeconds) -}}
+{{- end -}}
+{{- if lt $lasts (mul 3 $renew) -}}
+{{- fail (printf "leases.durationSeconds is %v and leases.renewSeconds %v: a lease lasts at least three renewals (%d s here), so a writer whose renewal answered slowly once is never taken over while it still renews (Patroni's loop_wait + 2 x retry_timeout <= ttl). Raise leases.durationSeconds, or lower leases.renewSeconds." .Values.leases.durationSeconds .Values.leases.renewSeconds (mul 3 $renew)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 What a member is told of itself (step 3b): its pod's name, its zone where
 the cluster labels it, and with a standby its lease, the lease's timing
 (leases.renewSeconds, leases.durationSeconds) and the lag a standby is ready
 under (`<component>.readyLagMs`). Takes a dict: top, component, values.
 */}}
 {{- define "meridian-runtime.memberEnv" -}}
+{{- include "meridian-runtime.leaseTiming" .top -}}
 - name: MERIDIAN_POD_NAME
   valueFrom:
     fieldRef:

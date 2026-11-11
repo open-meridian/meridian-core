@@ -446,12 +446,14 @@ impl Holding {
         });
     }
 
-    /// Keep the lease while writing: renewed every renew; the member steps
-    /// down when another holds it, when it could not renew within its
-    /// deadline, when `epoch_now` -- the store's head epoch, read from the
-    /// record -- moves past `mine` -- the store's own, which a new database
-    /// timeline raises (contract v30, stage C) -- or when a commit of its
-    /// own was fenced. Nothing is kept where no lease is held.
+    /// Keep the lease while writing: renewed every renew, each renewal
+    /// giving up within it; the member steps down when the lease shows
+    /// another holder, when `epoch_now` -- the store's head epoch, read from
+    /// the record -- moves past `mine` -- the store's own, which a new
+    /// database timeline raises (contract v30, stage C) -- or when a commit
+    /// of its own was fenced. A renewal that fails alone never moves it
+    /// (contract v30, stage C: the API server lost). Nothing is kept where
+    /// no lease is held.
     ///
     /// The epoch is read on a loop of its own: a read waits on the store's
     /// pool, up to its connection timeout while the database's primary is
@@ -469,10 +471,7 @@ impl Holding {
         let component = self.component;
         let epoch_now = Arc::new(epoch_now);
         tokio::spawn(async move {
-            let (renew, deadline) = {
-                let held = elector.lock().await;
-                (held.settings().renew, held.settings().renew_deadline())
-            };
+            let renew = elector.lock().await.settings().renew;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(renew).await;
@@ -492,7 +491,16 @@ impl Holding {
                     }
                 }
             });
-            let mut last_renewed = Instant::now();
+            // The API server lost (contract v30, stage C; the resilience
+            // spec's section 2, approved 2026-11-10): a renewal that fails --
+            // the API server not answering -- never moves this writer. It
+            // keeps writing, and stays ready, while its commits pass the
+            // epoch, as Patroni's failsafe_mode keeps a primary through its
+            // store's outage: nobody can take a lease the API server cannot
+            // grant, and a takeover that did would raise the epoch, which
+            // refuses this writer's next commit (and the loop above finds).
+            // Each renewal gives up within one renew.
+            let mut unrenewed_since: Option<Instant> = None;
             loop {
                 tokio::time::sleep(renew).await;
                 if meridian_changes::fenced_seen() {
@@ -501,26 +509,40 @@ impl Holding {
                         "a commit of this writer was refused by a newer epoch",
                     );
                 }
-                let looked = elector.lock().await.look(Instant::now(), now_ns()).await;
+                let looked = tokio::time::timeout(renew, async {
+                    elector.lock().await.look(Instant::now(), now_ns()).await
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "the API server did not answer within {} s",
+                        renew.as_secs()
+                    ))
+                });
                 match looked {
-                    Ok(Standing::Held) => last_renewed = Instant::now(),
+                    Ok(Standing::Held) => {
+                        if let Some(since) = unrenewed_since.take() {
+                            tracing::info!(
+                                component,
+                                unrenewed_s = since.elapsed().as_secs(),
+                                "the lease is renewed again; this writer wrote on under its epoch meanwhile"
+                            );
+                        }
+                    }
                     Ok(Standing::HeldBy(holder)) => step_down(
                         component,
                         &format!("another member ({holder}) holds the lease"),
                     ),
                     Err(failed) => {
-                        tracing::warn!(component, %failed, "the lease could not be renewed");
+                        if unrenewed_since.is_none() {
+                            tracing::warn!(
+                                component,
+                                %failed,
+                                "the lease could not be renewed: writing on under the epoch, which refuses this writer's commits if another takes over"
+                            );
+                        }
+                        unrenewed_since.get_or_insert_with(Instant::now);
                     }
-                }
-                if last_renewed.elapsed() >= deadline {
-                    step_down(
-                        component,
-                        &format!(
-                            "the lease was not renewed within its deadline ({} s): \
-                             stopping before it lapses, so no standby overlaps this writer",
-                            deadline.as_secs()
-                        ),
-                    );
                 }
             }
         });

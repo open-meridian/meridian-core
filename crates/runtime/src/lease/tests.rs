@@ -193,6 +193,15 @@ fn the_renew_deadline_falls_before_the_lease_ends() {
     let mut bad = settings("x");
     bad.duration = Duration::from_secs(2);
     assert!(bad.check().unwrap_err().contains("leases.renewSeconds"));
+    // A lease lasts at least three renewals (contract v30, stage C).
+    let mut short = settings("x");
+    short.duration = Duration::from_secs(5);
+    assert!(short
+        .check()
+        .unwrap_err()
+        .contains("at least three times leases.renewSeconds"));
+    short.duration = Duration::from_secs(6);
+    assert!(short.check().is_ok());
 }
 
 #[test]
