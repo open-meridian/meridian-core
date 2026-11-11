@@ -84,10 +84,15 @@ nobody gives. No value of a secret, a key or a password is ever printed.
 import base64
 import json
 import os
+import queue
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-failover-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "fo")
@@ -2271,10 +2276,76 @@ def under_patroni():
     return set_["spec"]["template"]["metadata"].get("labels", {}).get("meridian.dev/database-manager") == "patroni"
 
 
-# How much of each container's log a failed move keeps: the Makefile's
-# E2E_K3D_LOG_LINES, which .e2e-cluster.log keeps at a run's end.
-SAID_LINES = os.environ.get("E2E_K3D_LOG_LINES", "400")
+# How much of each container's log a failed check keeps: the Makefile's
+# E2E_K3D_LOG_LINES, which .e2e-cluster.log keeps at a run's end too. 5000
+# lines: ten minutes and more of every quiet container (a database member
+# under Patroni says something every two seconds), and minutes of one
+# answering a flood (memory-pressure's refusals are a line each), so the
+# window a class failed in survives in the dump taken as it fails.
+SAID_LINES = os.environ.get("E2E_K3D_LOG_LINES", "5000")
 SAID_KEPT = []
+
+# The broker's own view of itself (stage D2's open item): each server's
+# health, JetStream (its meta leader, its streams' and consumers' state)
+# and routes, from its monitoring endpoint, which listens on the pod's
+# loopback alone (`http: 127.0.0.1:8222`, broker_config) and is reached by
+# a port-forward, which lands on the pod's own loopback.
+BROKER_MONITOR_PORT = 8222
+BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=true&config=true",
+               "/routez", "/varz")
+
+
+def broker_said():
+    """Each broker server's monitoring endpoint's answers, in text, for a
+    failed check's dump: never raises."""
+    parts = []
+    try:
+        servers = [p["metadata"]["name"] for p in json.loads(
+            out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+                "-o", "json", check=False) or "{}").get("items", [])]
+    except (ValueError, SystemExit) as failed:
+        return [f"== the broker's servers could not be listed: {failed}"]
+    for server in servers:
+        forward = subprocess.Popen(
+            ["kubectl", "--namespace", NAMESPACE, "port-forward", f"pod/{server}", f":{BROKER_MONITOR_PORT}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            # Read on a thread of its own: a port-forward that can reach
+            # nothing (the API server cut, a node gone) may say nothing and
+            # never end, and the dump must not wait on it.
+            lines = queue.Queue()
+            threading.Thread(target=lambda: [lines.put(line) for line in forward.stdout],
+                             daemon=True).start()
+            local = None
+            began = time.time()
+            while local is None and time.time() - began < 10:
+                try:
+                    line = lines.get(timeout=1).decode(errors="replace")
+                except queue.Empty:
+                    continue
+                found = re.search(r"Forwarding from 127\.0\.0\.1:(\d+)", line)
+                if found:
+                    local = found.group(1)
+            if local is None:
+                parts.append(f"== {server}, its monitoring endpoint: no port-forward within 10 s")
+                continue
+            for path in BROKER_SAID:
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{local}{path}", timeout=5) as answered:
+                        said = answered.read().decode(errors="replace")
+                except urllib.error.HTTPError as refused:
+                    said = f"HTTP {refused.code}: {refused.read().decode(errors='replace')}"
+                except (urllib.error.URLError, OSError) as failed:
+                    said = f"unanswered: {failed}"
+                parts.append(f"== {server}, {path}")
+                parts.append(said)
+        finally:
+            forward.terminate()
+            try:
+                forward.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                forward.kill()
+    return parts
 
 
 def cluster_said(when):
@@ -2288,6 +2359,7 @@ def cluster_said(when):
     parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
     parts.append(kubectl("get", "pods", "-o", "wide", check=False).stdout.decode(errors="replace"))
     parts.append(kubectl("get", "events", "--sort-by=.lastTimestamp", check=False).stdout.decode(errors="replace"))
+    parts.extend(broker_said())
     for pod in json.loads(out("get", "pods", "-o", "json", check=False) or "{}").get("items", []):
         pod_name = pod["metadata"]["name"]
         spec = pod.get("spec", {})
@@ -3549,10 +3621,15 @@ def main():
             s.check(False, f"reconfigure: {stopped}")
     for failure in failures:
         began_ms = int(time.time() * 1000)
+        failed_before = len(s.failures)
         try:
             FAILURES[failure](s)
         except SystemExit as stopped:
             s.check(False, f"{failure}: {stopped}")
+        # What the cluster and the broker said as the class failed, before
+        # the next class rolls the pods it was about.
+        if len(s.failures) > failed_before:
+            cluster_said(failure)
         try:
             trust_targets(s, failure, began_ms)
             rows_read_are_kept(s, failure, began_ms)

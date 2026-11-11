@@ -910,9 +910,11 @@ E2E_K3D_ZONES ?=
 E2E_K3D_SHARED = $(if $(or $(filter e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(filter reconfigure,$(PROFILE))),$(E2E_K3D_CLUSTER)-shared)
 E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
 # How much of each container's log .e2e-cluster.log keeps when a run fails,
-# timestamped: enough of a database member's (Patroni says something every
-# two seconds) to reach back past a reconfigure's first upgrade.
-E2E_K3D_LOG_LINES ?= 400
+# timestamped, and e2e/failover/run.py's dump as a class fails: ten minutes
+# and more of every quiet container (a database member under Patroni says
+# something every two seconds), past a reconfigure's first upgrade, and
+# minutes of one answering a flood, a refusal a line (stage M2).
+E2E_K3D_LOG_LINES ?= 5000
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -1139,6 +1141,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn .e2e-said-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \
 	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \

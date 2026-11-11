@@ -437,7 +437,11 @@ fn bounded(max_pending: &str, max_payload: &str) -> String {
     format!(
         "{header}# A client that stops reading is cut off alone, as a slow consumer, once\n\
          # this much is pending for it (broker.limits.maxPending; stage M).\n\
-         max_pending: {max_pending}\n\n"
+         max_pending: {max_pending}\n\n\
+         # Its monitoring endpoint (/healthz, /jsz, /routez), on the pod's own\n\
+         # loopback alone: no other pod reaches it, and nothing outside the pod\n\
+         # is served. Read by a port-forward when a failover check fails.\n\
+         http: \"127.0.0.1:8222\"\n\n"
     )
 }
 
@@ -637,6 +641,8 @@ mod tests {
         let said = super::bounded("32MB", "1MB");
         assert!(said.contains("\nmax_payload: 1MB\n"), "{said}");
         assert!(said.contains("\nmax_pending: 32MB\n"), "{said}");
+        // Monitored on the pod's loopback alone, never a port another pod reaches.
+        assert!(said.contains("\nhttp: \"127.0.0.1:8222\"\n"), "{said}");
         assert!(super::bounded(super::MAX_PENDING, "512KB").contains("\nmax_payload: 512KB\n"));
         assert!(!super::bounded(super::MAX_PENDING, "512KB").contains("max_payload: 1MB"));
         assert_eq!(
