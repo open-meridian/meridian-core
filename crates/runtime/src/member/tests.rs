@@ -600,3 +600,15 @@ async fn a_reader_whose_applied_change_cannot_be_read_back_holds_from_the_head()
     .await;
     assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
 }
+
+/// The member a lease's holder names, for a takeover's `previous_member`
+/// (contract v30, stage D): its pod's name, before the process's mark.
+#[test]
+fn a_lease_holder_names_its_pod() {
+    assert_eq!(
+        super::holder_member("om-bor-7d9f-x2k_18a3f"),
+        "om-bor-7d9f-x2k"
+    );
+    assert_eq!(super::holder_member("om-bor-0"), "om-bor-0");
+    assert_eq!(super::holder_member(""), "");
+}

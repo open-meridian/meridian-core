@@ -1115,11 +1115,67 @@ fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() 
         "no hole where the refused commit was"
     );
     assert_eq!(page.epoch, 2);
-    assert!(standby
+    // The control partition holds the takeover's record alone, under the
+    // epoch it raised (contract v30, stage D): the record the conductor
+    // reads. The store's own partition is untouched by it.
+    let control = standby
         .read_changes("control", 0, meridian_changes::PAGE_MOST)
-        .unwrap()
+        .unwrap();
+    let numbered: Vec<(u64, u64)> = control
         .changes
-        .is_empty());
+        .iter()
+        .map(|c| (c.sequence, c.epoch))
+        .collect();
+    assert_eq!(numbered, vec![(1, 2)]);
+    assert_eq!(
+        meridian_changes::integrity::digest(&control.changes[0].body),
+        control.changes[0].digest
+    );
+    let records = meridian_changes::records::of_change(&control.changes[0]);
+    let [meridian_changes::records::Record::TookOver(took)] = records.as_slice() else {
+        panic!("the takeover's record: {records:?}")
+    };
+    assert_eq!(
+        (took.component.as_str(), took.epoch, took.partitions.clone()),
+        (
+            "instrument",
+            2,
+            vec!["instrument".to_string(), "control".to_string()]
+        )
+    );
+    // A finding kept is the store's `IntegrityFinding` there too, once
+    // however often it is kept.
+    let scrubbed = meridian_changes::integrity::Scrubbed {
+        checked: 1,
+        filled: 0,
+        findings: vec![meridian_changes::integrity::Finding {
+            partition: "instrument".into(),
+            sequence: 1,
+            committed_at_ns: 5,
+            what: "a row does not match its digest: the record changed beneath the store".into(),
+        }],
+    };
+    standby.record_scrub(&scrubbed, "test", 1, 2).unwrap();
+    standby.record_scrub(&scrubbed, "test", 3, 4).unwrap();
+    let control = standby
+        .read_changes("control", 1, meridian_changes::PAGE_MOST)
+        .unwrap();
+    let records: Vec<_> = control
+        .changes
+        .iter()
+        .flat_map(meridian_changes::records::of_change)
+        .collect();
+    let [meridian_changes::records::Record::Finding(found)] = records.as_slice() else {
+        panic!("the finding's record, once: {records:?}")
+    };
+    assert_eq!(
+        (
+            found.component.as_str(),
+            found.first_bad_sequence,
+            found.found_at_ns
+        ),
+        ("instrument", 1, 2)
+    );
     assert!(standby
         .read_changes("elsewhere", 0, meridian_changes::PAGE_MOST)
         .is_err());

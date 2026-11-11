@@ -282,6 +282,7 @@ impl Member {
                 elector: None,
                 component: self.component,
                 why: "",
+                previous: String::new(),
             });
         };
         said().set_mode(Mode::Standby);
@@ -334,7 +335,8 @@ impl Member {
             member = %member_name(),
             "this member holds the lease: taking the writer's partitions over"
         );
-        let why = match elector.took_from() {
+        let took_from = elector.took_from();
+        let why = match &took_from {
             Some(Some(holder)) if !holder.is_empty() => meridian_changes::LEASE_LAPSED,
             Some(Some(_)) => meridian_changes::LEASE_RELEASED,
             _ => meridian_changes::LEASE_FREE,
@@ -343,6 +345,10 @@ impl Member {
             elector: Some(Arc::new(tokio::sync::Mutex::new(elector))),
             component: self.component,
             why,
+            previous: took_from
+                .flatten()
+                .map(|holder| holder_member(&holder))
+                .unwrap_or_default(),
         })
     }
 }
@@ -352,6 +358,17 @@ pub struct Holding {
     elector: Option<Arc<tokio::sync::Mutex<Elector<KubeLeases>>>>,
     component: &'static str,
     why: &'static str,
+    /// The member that held the lease before, where one did.
+    previous: String,
+}
+
+/// The member a lease's holder names: its pod's name, before the process's
+/// mark (`<pod>_<hex>`; pod names never hold an underscore).
+pub fn holder_member(holder: &str) -> String {
+    holder
+        .rsplit_once('_')
+        .map_or(holder, |(pod, _)| pod)
+        .to_string()
 }
 
 impl Holding {
@@ -376,6 +393,7 @@ impl Holding {
         }
         let by = meridian_changes::TookOver {
             member: member_name(),
+            previous: self.previous.clone(),
             why: self.why.to_string(),
             at_ns: now_ns(),
         };

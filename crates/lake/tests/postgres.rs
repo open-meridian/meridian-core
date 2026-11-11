@@ -4009,8 +4009,34 @@ fn the_control_partition_logs_what_is_not_a_row_and_is_fenced() {
     let after = standby
         .read_changes(meridian_changes::CONTROL, 4, meridian_changes::PAGE_MOST)
         .unwrap();
-    assert_eq!(after.changes.len(), 1);
-    assert_eq!(after.changes[0].epoch, 2);
+    // The takeover is a change in the control partition itself, under the
+    // epoch it raised, before the new writer's first (contract v30, stage
+    // D): the record the conductor reads.
+    let kinds: Vec<(&str, u64, u64)> = after
+        .changes
+        .iter()
+        .map(|c| (c.kind.as_str(), c.sequence, c.epoch))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (meridian_changes::records::TOOK_OVER, 5, 2),
+            (CONTROL_ALIAS, 6, 2)
+        ]
+    );
+    let took = meridian_changes::records::of_change(&after.changes[0]);
+    let [meridian_changes::records::Record::TookOver(took)] = took.as_slice() else {
+        panic!("the takeover's record: {took:?}")
+    };
+    assert_eq!(
+        (took.component.as_str(), took.epoch, took.partitions.last()),
+        ("lake", 2, Some(&"control".to_string()))
+    );
+    assert_eq!(
+        meridian_changes::integrity::digest(&after.changes[0].body),
+        after.changes[0].digest,
+        "carried with its digest"
+    );
 }
 
 // ── Integrity at rest (step 3b) ─────────────────────────────────────────────
@@ -4077,6 +4103,40 @@ fn each_row_keeps_its_digest_and_the_scrub_names_one_changed_beneath_the_lake() 
         .unwrap()
         .get(0);
     assert!(filled, "the row kept before digests now has its own");
+    // Each finding kept is also the lake's `IntegrityFinding` in its control
+    // partition, once however often it is kept (contract v30, stage D).
+    store.record_scrub(&scrubbed, "test", 1, 2).expect("kept");
+    store
+        .record_scrub(&scrubbed, "test", 3, 4)
+        .expect("kept again, once");
+    let mut found = Vec::new();
+    meridian_changes::catch_up(
+        |after| store.read_changes(meridian_changes::CONTROL, after, 0),
+        0,
+        |change| {
+            for record in meridian_changes::records::of_change(change) {
+                if let meridian_changes::records::Record::Finding(f) = record {
+                    if f.partition == dataset {
+                        found.push(f);
+                    }
+                }
+            }
+        },
+    )
+    .expect("the control partition reads");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (
+            found[0].component.as_str(),
+            found[0].first_bad_sequence,
+            found[0].check
+        ),
+        (
+            "lake",
+            2,
+            meridian_domain::v1::IntegrityCheck::RowDigest as i32
+        )
+    );
 }
 
 /// The lake's whole-dataset reads, each bounded by a chunk (found on dev

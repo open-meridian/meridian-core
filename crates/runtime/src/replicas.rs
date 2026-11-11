@@ -614,7 +614,22 @@ fn keep(
         }],
     };
     let now = clock.now_ns();
-    meridian_changes::integrity::record(&mut client, prefix, &scrubbed, member, now, now + 1)
+    // Each store's findings in its control partition too, where its log
+    // carries them (contract v30, stage D): the book's journal does not yet.
+    let captured = match prefix {
+        "config" => Some(&meridian_config::postgres::CHANGES),
+        "instrument" => Some(&meridian_instrument::postgres::CHANGES),
+        "street" => Some(&meridian_street::postgres::CHANGES),
+        _ => None,
+    };
+    let log = |tx: &mut postgres::Transaction<'_>,
+               finding: &meridian_changes::integrity::Finding,
+               at: i64| match (captured, prefix) {
+        (Some(spec), _) => meridian_changes::integrity::logged_in(spec)(tx, finding, at),
+        (None, "lake") => meridian_lake::postgres::log_finding(tx, finding, at),
+        _ => meridian_changes::integrity::unlogged(tx, finding, at),
+    };
+    meridian_changes::integrity::record(&mut client, prefix, &scrubbed, member, now, now + 1, log)
         .map_err(|failed| crate::preflight::with_causes(&failed))
 }
 

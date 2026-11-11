@@ -126,6 +126,7 @@ pub struct PostgresStore {
 /// The instrument store's change log (step 3a): every table its writes
 /// touch, captured in their own transaction under one store-wide sequence.
 pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    component: "instrument",
     prefix: "instrument",
     head: "instrument_change_head",
     partition: "instrument",
@@ -267,6 +268,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            meridian_changes::integrity::logged_in(&CHANGES),
         )
         .map_err(unavailable)
     }

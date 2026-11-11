@@ -39,6 +39,7 @@ use prost::Message;
 
 pub mod captured;
 pub mod integrity;
+pub mod records;
 pub mod timeline;
 pub mod tls;
 
@@ -582,6 +583,10 @@ impl Fence {
 pub struct TookOver {
     /// The member taking over: its pod's name.
     pub member: String,
+    /// The member that held the lease before, its pod's name; empty where
+    /// none did or it is not known (contract v30, stage D: the record's
+    /// `previous_member`).
+    pub previous: String,
     /// Why: the lease lapsed, the writer released it, or nobody held it.
     pub why: String,
     /// When, in the deployment's time.
@@ -593,6 +598,7 @@ impl TookOver {
     pub fn unnamed(why: &str) -> Self {
         Self {
             member: String::new(),
+            previous: String::new(),
             why: why.to_string(),
             at_ns: now_ns(),
         }

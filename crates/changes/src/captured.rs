@@ -30,6 +30,9 @@ pub const FENCED_STATE: &str = "MF001";
 /// What a store captures, and where.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
+    /// The component whose store this is, as its records name it: the
+    /// conductor's for the configuration store.
+    pub component: &'static str,
     /// Names the change table (`{prefix}_change`), the trigger function and
     /// the connection's epoch setting.
     pub prefix: &'static str,
@@ -422,6 +425,7 @@ impl Spec {
         let mut tx = client.transaction()?;
         let by = crate::TookOver {
             member: member.to_string(),
+            previous: String::new(),
             why: crate::timeline::DATABASE_TIMELINE.to_string(),
             at_ns: crate::now_ns(),
         };
@@ -466,7 +470,53 @@ impl Spec {
                 &by.at_ns,
             ],
         )?;
+        // And in the control partition, in the same transaction (contract
+        // v30, stage D): the record the conductor reads.
+        self.log_control(
+            tx,
+            &crate::records::Record::TookOver(crate::records::took_over(
+                self.component,
+                by,
+                partitions,
+                epoch as u64,
+            )),
+            by.at_ns,
+        )?;
         Ok(epoch as u64)
+    }
+
+    /// Append one of the store's own records to its `control` partition in
+    /// `tx` (contract v30, stage D; [`crate::records`]): the next sequence
+    /// from the control head row, under that row's lock and its epoch now,
+    /// its digest beside it as every captured change's. Nothing here applies
+    /// it: a follower's captured apply passes over a kind that is no table's.
+    pub fn log_control(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        record: &crate::records::Record,
+        at_ns: i64,
+    ) -> Result<(), postgres::Error> {
+        let kind = match record {
+            crate::records::Record::TookOver(_) => crate::records::TOOK_OVER,
+            crate::records::Record::Finding(_) => crate::records::FINDING,
+        };
+        let body = crate::records::to_json(record).to_string();
+        tx.execute(
+            &format!(
+                "WITH next AS (
+                    UPDATE {head} SET sequence = sequence + 1
+                     WHERE partition = '{CONTROL}' RETURNING sequence, epoch)
+                 INSERT INTO {change} (partition, sequence, ordinal, epoch, committed_at_ns, kind,
+                                       body, digest)
+                 SELECT '{CONTROL}', next.sequence, 0, next.epoch, $1, $2, $3::text::jsonb,
+                        sha256(convert_to($3::text::jsonb::text, 'UTF8'))
+                   FROM next",
+                head = self.head,
+                change = self.change_table()
+            ),
+            &[&at_ns, &kind, &body],
+        )?;
+        Ok(())
     }
 
     /// The partition's epoch now, as its head row says: what a writer

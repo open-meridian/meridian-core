@@ -189,6 +189,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            log_finding,
         )
         .map_err(unavailable)
     }
@@ -240,6 +241,7 @@ impl PostgresStore {
         }
         let by = meridian_changes::TookOver {
             member: meridian_changes::member().to_string(),
+            previous: String::new(),
             why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
             at_ns: meridian_changes::now_ns(),
         };
@@ -2872,7 +2874,68 @@ fn raise(
             &by.at_ns,
         ],
     )?;
+    // And in the control partition, in the same transaction (contract v30,
+    // stage D): the record the conductor reads.
+    let partitions: Vec<String> = tx
+        .query_one(
+            "SELECT array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control')
+               FROM lake_partition",
+            &[],
+        )?
+        .get(0);
+    log_record(
+        tx,
+        &meridian_changes::records::Record::TookOver(meridian_changes::records::took_over(
+            "lake",
+            by,
+            partitions,
+            epoch as u64,
+        )),
+        by.at_ns,
+    )?;
     Ok(epoch as u64)
+}
+
+/// A finding of the lake's, kept for the first time, appended to its
+/// `control` partition in `tx` as its `IntegrityFinding` (contract v30,
+/// stage D): the scrub's, and the replica scrub Job's.
+pub fn log_finding(
+    tx: &mut Transaction<'_>,
+    finding: &meridian_changes::integrity::Finding,
+    found_at_ns: i64,
+) -> std::result::Result<(), postgres::Error> {
+    log_record(
+        tx,
+        &meridian_changes::records::Record::Finding(meridian_changes::records::finding(
+            "lake",
+            meridian_domain::v1::IntegrityCheck::RowDigest,
+            finding,
+            found_at_ns,
+        )),
+        found_at_ns,
+    )
+}
+
+/// Append one of the lake's own records to its `control` partition in `tx`
+/// (contract v30, stage D; [`meridian_changes::records`]): the next
+/// sequence from the control head row, under that row's lock and its epoch
+/// now, its body the record's protobuf, as the lake's other control kinds.
+/// Its followers pass over the kind; the conductor reads it.
+fn log_record(
+    tx: &mut Transaction<'_>,
+    record: &meridian_changes::records::Record,
+    at_ns: i64,
+) -> std::result::Result<(), postgres::Error> {
+    let (kind, body) = meridian_changes::records::to_bytes(record);
+    tx.execute(
+        "WITH next AS (
+            UPDATE lake_change_head SET sequence = sequence + 1
+             WHERE partition = 'control' RETURNING sequence, epoch)
+         INSERT INTO lake_control_change (sequence, epoch, committed_at_ns, kind, body)
+         SELECT next.sequence, next.epoch, $1, $2, $3 FROM next",
+        &[&at_ns, &kind, &body],
+    )?;
+    Ok(())
 }
 
 /// [`PostgresStore::scrub`]'s reading, its errors Postgres's own so a page

@@ -168,6 +168,9 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            // The book's control partition is its journal: its findings
+            // stay in book_integrity_finding alone for now (stage D).
+            meridian_changes::integrity::unlogged,
         )
         .map_err(unavailable)
     }
@@ -219,6 +222,7 @@ impl PostgresStore {
         }
         let by = meridian_changes::TookOver {
             member: meridian_changes::member().to_string(),
+            previous: String::new(),
             why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
             at_ns: meridian_changes::now_ns(),
         };

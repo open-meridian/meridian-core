@@ -56,6 +56,7 @@ pub struct PostgresStore {
 /// conductor writes, captured in its own transaction under one sequence,
 /// but the platform's catalogue, which each pull replaces whole.
 pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    component: "conductor",
     prefix: "config",
     head: "config_change_head",
     partition: "config",
@@ -220,6 +221,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            meridian_changes::integrity::logged_in(&CHANGES),
         )
         .map_err(unavailable)
     }

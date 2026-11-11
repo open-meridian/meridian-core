@@ -61,6 +61,7 @@ pub struct PostgresStore {
 /// as it has numbered its changes since 0005, with every row of each change
 /// captured beside it.
 pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    component: "street",
     prefix: "street",
     head: "partition_head",
     partition: PARTITION,
@@ -194,6 +195,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            meridian_changes::integrity::logged_in(&CHANGES),
         )
         .map_err(unavailable)
     }
