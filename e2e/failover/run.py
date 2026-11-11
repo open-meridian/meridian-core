@@ -1442,6 +1442,9 @@ def db_primary(s, failure="db-primary"):
     for component in ("bor", "lake"):
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     marks_table()
+    # In ha the driver's prices go by the lake's write-ahead stream (contract
+    # v30, stage E): the lake's place in it, read before and after, moves.
+    stream_before = write_ahead_position() if PROFILE != "tolerant" and DRIVEN else None
     victim = primary()
     members = [p["metadata"]["name"] for p in pods("database")]
     writer, acked_before = None, None
@@ -1494,6 +1497,10 @@ def db_primary(s, failure="db-primary"):
         # (contract v30, stage E; the resilience spec's section 4).
         rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary))
         extra = rpo_extra(rpo)
+        if stream_before is not None:
+            moved = happens(lambda: write_ahead_position(new_primary) > stream_before, 60, every=2)
+            s.check(moved, f"{failure}: the lake's writes went by its write-ahead stream, its place in it "
+                    f"moved past {stream_before} across the failover (now {write_ahead_position(new_primary)})")
     if acked_before is not None:
         acked = acknowledged(writer) if writer else set()
         acked.add(acked_before)
@@ -1510,6 +1517,16 @@ def db_primary(s, failure="db-primary"):
     healed = happens(lambda: len(pods("database")) == database_members()
                      and all(ready(p) for p in pods("database")), 300)
     s.check(healed, f"{failure}: the killed member back, as a standby where there are standbys")
+
+
+def write_ahead_position(pod=None):
+    """The lake's place in its write-ahead stream (ha; contract v30, stage
+    E), as its store committed it: 0 where it has none."""
+    try:
+        said = psql("select coalesce(max(sequence), 0) from lake_write_ahead", pod=pod, quiet=True)
+    except SystemExit:
+        return 0
+    return int(said or 0)
 
 
 def isolate(pod_name, verb):
