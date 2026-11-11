@@ -1642,6 +1642,31 @@ impl Context<'_> {
             // W4.16, the Summary's latency part).
             "latency": crate::latency::summary_json(&instance, self.app.clock.now_ns()),
         });
+        // Its datasets' default reads standing on a backup, as its Summary
+        // says "switched to backup source" (contract v30; the resilience
+        // spec's section 8).
+        {
+            let mine = format!("{instance}:");
+            data["switched_to_backup_source"] =
+                crate::admin::data_sources::standing(&self.app.bus, &self.caller.subject)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|s| {
+                        s.from_dataset.starts_with(&mine) || s.to_dataset.starts_with(&mine)
+                    })
+                    .map(|s| {
+                        json!({
+                            "data_type": s.data_type,
+                            "from_dataset": s.from_dataset,
+                            "to_dataset": s.to_dataset,
+                            "reason": crate::admin::data_sources::reason_word(s.reason),
+                            "switched_at_ns": super::instruments::stamp_said(s.switched_at_ns),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+        }
         // The Summary's own parts, for an admin of any of its roles; a
         // deployment admin who is none reads the Overview's.
         if !admin_roles(self.access, &instance).is_empty() {

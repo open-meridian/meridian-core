@@ -37,8 +37,10 @@ use std::time::Duration;
 use meridian_access::person_access;
 use meridian_bus::BusError;
 use meridian_domain::v1::{
-    AccessRecords, DatasetEntitlement, DatasetRef, ListDatasetsReply, ListDatasetsRequest,
-    ListSourcePrioritiesReply, ListSourcePrioritiesRequest, PriceKind, SourcePriority,
+    AccessRecords, DatasetEntitlement, DatasetGap, DatasetRef, GapCause, GapState,
+    ListDatasetGapsReply, ListDatasetGapsRequest, ListDatasetsReply, ListDatasetsRequest,
+    ListSourcePrioritiesReply, ListSourcePrioritiesRequest, ListSourceSwitchesReply,
+    ListSourceSwitchesRequest, PriceKind, SourcePriority, SourceSwitchReason, SourceSwitched,
 };
 use meridian_domain::{lake, thousands};
 use meridian_pb::v1::DatasetLicence;
@@ -51,11 +53,18 @@ pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priori
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const SET_DATASET_LICENCE: &str = "platform.config.command.set-dataset-licence";
 pub const SET_DATASET_ENTITLEMENT: &str = "platform.config.command.set-dataset-entitlement";
+/// Contract v30 (W10.6, W10.14): the source switches and the gaps, the lake's.
+pub const LIST_SOURCE_SWITCHES: &str = "platform.lake.query.list-source-switches";
+pub const LIST_DATASET_GAPS: &str = "platform.lake.query.list-dataset-gaps";
+
+/// The words a default read standing on a backup is shown with (the
+/// resilience spec's section 8).
+pub const SWITCHED: &str = "switched to backup source";
 
 const WAIT: Duration = Duration::from_secs(5);
 
 /// The page's tabs, in the order an admin reaches for them.
-pub const TABS: [(&str, &str); 5] = [
+pub const TABS: [(&str, &str); 6] = [
     ("datasets", "Datasets"),
     ("entitlements", "Entitlements"),
     ("priority", "Priority"),
@@ -64,6 +73,9 @@ pub const TABS: [(&str, &str); 5] = [
     // Contract v28 (W10.13; 754): who could use each dataset this month,
     // against its meters ([`crate::data_use`]).
     ("use", "Use"),
+    // Contract v30 (W10.14; the resilience spec's section 4): a line per
+    // gap not recovered, the unattributed one's dataset not yet known.
+    ("gaps", "Gaps"),
 ];
 
 async fn read<R: Message + Default>(
@@ -116,6 +128,186 @@ pub async fn priorities(
         ListSourcePrioritiesRequest {},
     )
     .await
+}
+
+/// A page of the lake's gaps, each in its latest state, newest first
+/// (W10.14): of `dataset` where named, in `state` where not 0.
+pub async fn gaps(
+    bus: &meridian_bus::Bus,
+    subject: &str,
+    dataset: &str,
+    state: i32,
+    page_size: u32,
+    cursor: &str,
+) -> Result<ListDatasetGapsReply, String> {
+    read(
+        bus,
+        subject,
+        LIST_DATASET_GAPS,
+        "meridian.v1.ListDatasetGapsRequest",
+        ListDatasetGapsRequest {
+            dataset: dataset.to_string(),
+            state,
+            page_size,
+            cursor: cursor.to_string(),
+        },
+    )
+    .await
+}
+
+/// A page of the source switches, newest first (W10.6): of `data_type`
+/// and of `dataset` (from or to) where named.
+pub async fn switches(
+    bus: &meridian_bus::Bus,
+    subject: &str,
+    data_type: &str,
+    dataset: &str,
+    page_size: u32,
+    cursor: &str,
+) -> Result<ListSourceSwitchesReply, String> {
+    read(
+        bus,
+        subject,
+        LIST_SOURCE_SWITCHES,
+        "meridian.v1.ListSourceSwitchesRequest",
+        ListSourceSwitchesRequest {
+            data_type: data_type.to_string(),
+            dataset: dataset.to_string(),
+            page_size,
+            cursor: cursor.to_string(),
+        },
+    )
+    .await
+}
+
+/// The most pages of a lake listing the page reads, the lake's largest each.
+const PAGES_MOST: usize = 4;
+
+/// Every gap not recovered, newest first: what Data sources draws a line
+/// for, the unattributed one among them.
+pub async fn open_gaps(bus: &meridian_bus::Bus, subject: &str) -> Result<Vec<DatasetGap>, String> {
+    let mut open = Vec::new();
+    let mut cursor = String::new();
+    for _ in 0..PAGES_MOST {
+        let page = gaps(bus, subject, "", 0, 500, &cursor).await?;
+        open.extend(
+            page.gaps
+                .into_iter()
+                .filter(|gap| gap.state != GapState::Recovered as i32),
+        );
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    Ok(open)
+}
+
+/// Each default read standing on a backup now: the latest switch of each
+/// data type and kind, where it was not a switch back (the resilience
+/// spec's section 8).
+pub async fn standing(
+    bus: &meridian_bus::Bus,
+    subject: &str,
+) -> Result<Vec<SourceSwitched>, String> {
+    let mut read_all = Vec::new();
+    let mut cursor = String::new();
+    for _ in 0..PAGES_MOST {
+        let page = switches(bus, subject, "", "", 500, &cursor).await?;
+        read_all.extend(page.switches);
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    Ok(standing_of(&read_all))
+}
+
+/// [`standing`] from the switches, newest first.
+pub fn standing_of(newest_first: &[SourceSwitched]) -> Vec<SourceSwitched> {
+    let mut seen = BTreeSet::new();
+    newest_first
+        .iter()
+        .filter(|s| seen.insert((s.data_type.clone(), s.kind)))
+        .filter(|s| s.reason != SourceSwitchReason::Restored as i32)
+        .cloned()
+        .collect()
+}
+
+/// A switch's reason as a person reads it.
+pub fn reason_word(reason: i32) -> &'static str {
+    match SourceSwitchReason::try_from(reason).unwrap_or(SourceSwitchReason::Unspecified) {
+        SourceSwitchReason::Silent => "silent",
+        SourceSwitchReason::Stalled => "stalled",
+        SourceSwitchReason::Quarantined => "quarantined",
+        SourceSwitchReason::Restored => "restored",
+        SourceSwitchReason::Unspecified => "not said",
+    }
+}
+
+/// A gap's state, and its cause, as a person reads them.
+pub fn gap_state_word(state: i32) -> &'static str {
+    match GapState::try_from(state).unwrap_or(GapState::Unspecified) {
+        GapState::Refetching => "refetching",
+        GapState::Recovered => "recovered",
+        GapState::Unrecovered => "unrecovered",
+        GapState::Unspecified => "not said",
+    }
+}
+
+pub fn gap_cause_word(cause: i32) -> &'static str {
+    match GapCause::try_from(cause).unwrap_or(GapCause::Unspecified) {
+        GapCause::WriteAheadBound => "write-ahead bound",
+        GapCause::Unspecified => "not said",
+    }
+}
+
+/// The words for a gap whose dataset is not yet known (proto3's unset).
+pub const NOT_YET_KNOWN: &str = "dataset not yet known";
+
+/// The Gaps tab: a line per gap not recovered, newest first.
+fn gaps_tab(open: &[DatasetGap]) -> String {
+    if open.is_empty() {
+        return "<p class=\"empty\" data-gaps=\"0\">No gap: every row the lake acknowledged is \
+                recorded.</p>"
+            .to_string();
+    }
+    let lines: String = open
+        .iter()
+        .map(|gap| {
+            let dataset = if gap.dataset.is_empty() {
+                NOT_YET_KNOWN.to_string()
+            } else {
+                gap.dataset.clone()
+            };
+            let (from_day, from_time) = when(gap.valid_from_ns);
+            let (until_day, until_time) = when(gap.valid_until_ns);
+            let (day, time) = when(gap.recorded_at_ns);
+            let range = if gap.dataset.is_empty() {
+                "not yet known".to_string()
+            } else {
+                format!("{from_day} {from_time} to {until_day} {until_time}")
+            };
+            format!(
+                "<tr data-gap=\"{id}\"><td title=\"{dataset}\">{dataset}</td>\
+                 <td><span class=\"badge warn\">{state}</span></td><td class=\"wide\" title=\"{range}\">{range}</td>\
+                 <td class=\"wide\">{cause}</td><td title=\"{id}\">{day}<span class=\"dates\"> {time}</span></td></tr>",
+                id = escape(&gap.gap_id),
+                dataset = escape(&dataset),
+                state = gap_state_word(gap.state),
+                range = escape(&range),
+                cause = gap_cause_word(gap.cause),
+                day = escape(&day),
+                time = escape(&time),
+            )
+        })
+        .collect();
+    format!(
+        "<om-pager search=\"Search gaps\"><table class=\"list one-line gaps\" data-gaps=\"{n}\"><thead><tr>\
+         <th>Dataset</th><th>State</th><th class=\"wide\">Valid</th><th class=\"wide\">Cause</th>\
+         <th>Found</th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
+        n = open.len()
+    )
 }
 
 /// One dataset as the page and `dashboard__list_datasets` both draw it.
@@ -544,6 +736,7 @@ fn entitlements_tab(rows: &[Row], records: &AccessRecords, token: &str) -> Strin
 
 fn priority_tab(
     priorities: &[SourcePriority],
+    standing: &[SourceSwitched],
     rows: &[Row],
     records: &AccessRecords,
     token: &str,
@@ -557,6 +750,18 @@ fn priority_tab(
             } else {
                 format!("{}, {kind}", type_word(&p.data_type))
             };
+            // Its default read standing on a backup (section 8).
+            let switched = standing
+                .iter()
+                .find(|s| s.data_type == p.data_type && s.kind == p.kind)
+                .map_or(String::new(), |s| {
+                    format!(
+                        " <span class=\"badge warn\" data-switched title=\"{} to {}, {}\">{SWITCHED}</span>",
+                        escape(&s.from_dataset),
+                        escape(&s.to_dataset),
+                        reason_word(s.reason)
+                    )
+                });
             let (day, time) = when(p.updated_at_ns);
             let by = crate::tickets::display_name(records, &p.updated_by);
             let fill = serde_json::json!({
@@ -570,7 +775,7 @@ fn priority_tab(
             });
             format!(
                 "<tr data-id=\"{what}\"><td title=\"{what}\"><button type=\"button\" class=\"link\" \
-                 data-dialog-open=\"priority-dialog\" data-title=\"Change the priority\" data-fill=\"{fill}\">{what}</button></td>\
+                 data-dialog-open=\"priority-dialog\" data-title=\"Change the priority\" data-fill=\"{fill}\">{what}</button>{switched}</td>\
                  <td title=\"{order}\">{order}</td><td class=\"wide\" title=\"{note}\">{by}</td>\
                  <td title=\"{day} {time} by {by}\">{day}<span class=\"dates\"> {time}</span></td>\
                  <td class=\"actions\"><button type=\"button\" data-dialog-open=\"priority-dialog\" \
@@ -652,9 +857,12 @@ fn section(id: &str, title: &str, about: &str, action: &str, body: &str) -> Stri
 /// The page whole: its tabs, their tables and dialogs, and the script that
 /// shows one tab at a time. `unread` says what could not be read, in place
 /// of a table.
+#[allow(clippy::too_many_arguments)]
 pub fn page(
     listed: &Result<ListDatasetsReply, String>,
     priorities: &Result<ListSourcePrioritiesReply, String>,
+    open_gaps: &Result<Vec<DatasetGap>, String>,
+    standing: &Result<Vec<SourceSwitched>, String>,
     records: &AccessRecords,
     token: &str,
     notice: &str,
@@ -678,8 +886,9 @@ pub fn page(
         }
         Err(why) => (unread(why), String::new(), unread(why)),
     };
+    let standing: &[SourceSwitched] = standing.as_deref().unwrap_or_default();
     let (priority_body, priority_dialog) = match priorities {
-        Ok(reply) => priority_tab(&reply.priorities, &rows, records, token),
+        Ok(reply) => priority_tab(&reply.priorities, standing, &rows, records, token),
         Err(why) => (unread(why), String::new()),
     };
     let tabs: String = TABS
@@ -691,11 +900,38 @@ pub fn page(
     } else {
         format!("<p class=\"passed\">{}</p>", escape(notice))
     };
+    // Each default read standing on a backup, one line (section 8).
+    let notice = if standing.is_empty() {
+        notice
+    } else {
+        let said: Vec<String> = standing
+            .iter()
+            .map(|s| {
+                let kind = kind_word(s.kind);
+                let what = if kind.is_empty() {
+                    type_word(&s.data_type).to_string()
+                } else {
+                    format!("{}, {kind}", type_word(&s.data_type))
+                };
+                format!(
+                    "<span title=\"{} to {}, {}\">{}</span>",
+                    escape(&s.from_dataset),
+                    escape(&s.to_dataset),
+                    reason_word(s.reason),
+                    escape(&what)
+                )
+            })
+            .collect();
+        format!(
+            "{notice}<p class=\"refused one-line\" data-switched-line>{}: {SWITCHED}</p>",
+            said.join(", ")
+        )
+    };
     let add = "<button type=\"button\" class=\"primary\" data-dialog-open=\"priority-dialog\" \
                aria-label=\"Add a priority\">+ Add</button>";
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Data sources</h1></div>{notice}\
-         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{}{datasets_dialogs}{priority_dialog}{}</div>\
+         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{}{}{datasets_dialogs}{priority_dialog}{}</div>\
          <script>{}{}{PAGER_SCRIPT}</script>",
         section(
             "datasets",
@@ -737,6 +973,17 @@ pub fn page(
              persons, plugins by category, service accounts. Yours to file; never sent.",
             "<button type=\"button\" data-dialog-open=\"professional-status\">Change a status</button>",
             &used.0
+        ),
+        section(
+            "gaps",
+            "Gaps",
+            "Each gap the lake's write-ahead stream left that is not recovered: rows inside it are \
+             not invented, and a read over it returns what was recorded.",
+            "",
+            &match open_gaps {
+                Ok(open) => gaps_tab(open),
+                Err(why) => unread(why),
+            }
         ),
         used.1,
         super::overview::SCRIPT_START,
@@ -810,6 +1057,8 @@ mod tests {
         let body = page(
             &Ok(reply),
             &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &records,
             "<t>",
             "",
@@ -849,6 +1098,8 @@ mod tests {
         let body = page(
             &Ok(reply),
             &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &AccessRecords::default(),
             "<t>",
             "",
@@ -865,6 +1116,8 @@ mod tests {
         let body = page(
             &Ok(listed(false)),
             &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &AccessRecords::default(),
             "<t>",
             "",
@@ -873,6 +1126,89 @@ mod tests {
         );
         assert!(body.contains(">Price, Bar</td>"), "{body}");
         assert!(!body.contains("Coinbase \u{b7}"), "{body}");
+    }
+
+    /// Contract v30 (W10.6, W10.14): a line per gap not recovered, the
+    /// unattributed one's dataset not yet known; and a default read standing
+    /// on a backup "switched to backup source", on its priority and above
+    /// the tabs, a switch back standing on nothing.
+    #[test]
+    fn gaps_and_a_read_standing_on_a_backup_are_shown() {
+        let quote = |reason: SourceSwitchReason, at: i64| SourceSwitched {
+            data_type: lake::QUOTE.into(),
+            from_dataset: "kraken-1:ticker".into(),
+            to_dataset: "coinbase-1:ticker".into(),
+            reason: reason as i32,
+            switched_at_ns: at,
+            ..Default::default()
+        };
+        // Newest first: stalled now, after a switch back.
+        let standing = standing_of(&[
+            quote(SourceSwitchReason::Stalled, 3),
+            quote(SourceSwitchReason::Restored, 2),
+        ]);
+        assert_eq!(standing.len(), 1);
+        assert!(standing_of(&[
+            quote(SourceSwitchReason::Restored, 4),
+            quote(SourceSwitchReason::Stalled, 3)
+        ])
+        .is_empty());
+        let gaps = vec![
+            DatasetGap {
+                gap_id: "GAP-02".into(),
+                dataset: "drive-data:drive".into(),
+                state: GapState::Unrecovered as i32,
+                cause: GapCause::WriteAheadBound as i32,
+                found_in_gap_id: "GAP-01".into(),
+                ..Default::default()
+            },
+            DatasetGap {
+                gap_id: "GAP-01".into(),
+                state: GapState::Unrecovered as i32,
+                cause: GapCause::WriteAheadBound as i32,
+                ..Default::default()
+            },
+        ];
+        let priorities = ListSourcePrioritiesReply {
+            priorities: vec![SourcePriority {
+                data_type: lake::QUOTE.into(),
+                datasets: vec!["kraken-1:ticker".into(), "coinbase-1:ticker".into()],
+                ..Default::default()
+            }],
+        };
+        let body = page(
+            &Ok(listed(false)),
+            &Ok(priorities),
+            &Ok(gaps),
+            &Ok(standing),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(body.contains("data-gaps=\"2\""), "{body}");
+        assert!(body.contains(&format!(">{NOT_YET_KNOWN}</td>")));
+        assert!(body.contains(">drive-data:drive</td>"));
+        assert!(body.contains("write-ahead bound"));
+        assert_eq!(
+            body.matches(SWITCHED).count(),
+            2,
+            "on its priority and above the tabs"
+        );
+        assert!(body.contains("data-switched-line"));
+        let none = page(
+            &Ok(listed(false)),
+            &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(none.contains("data-gaps=\"0\"") && !none.contains(SWITCHED));
     }
 
     #[test]
@@ -890,6 +1226,8 @@ mod tests {
         let body = page(
             &Ok(listed(true)),
             &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &records,
             "<t>",
             "",
@@ -917,6 +1255,8 @@ mod tests {
         let body = page(
             &Ok(ListDatasetsReply::default()),
             &Ok(priorities),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &AccessRecords::default(),
             "<t>",
             "",
@@ -937,6 +1277,8 @@ mod tests {
         let body = page(
             &Err("timed out".into()),
             &Err("timed out".into()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
             &AccessRecords::default(),
             "<t>",
             "",

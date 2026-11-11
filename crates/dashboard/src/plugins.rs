@@ -1162,6 +1162,21 @@ pub(crate) async fn frame(
                 )
                 .await
                 .second_pair_of_eyes,
+                // Its datasets' default reads standing on a backup (contract
+                // v30; the resilience spec's section 8), on its Summary.
+                switched: if on_summary {
+                    let mine = format!("{instance}:");
+                    crate::admin::data_sources::standing(&app.bus, &session.subject)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|s| {
+                            s.from_dataset.starts_with(&mine) || s.to_dataset.starts_with(&mine)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             };
             crate::area::Shown::Drawn(match current.map(|tab| tab.key.as_str()) {
                 Some(crate::area::SETTINGS) => crate::admin::settings_tab(&manage),
