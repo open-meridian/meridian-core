@@ -1800,3 +1800,96 @@ async fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
         );
     });
 }
+
+fn a_break(account: &str) -> RecordBreakRequest {
+    RecordBreakRequest {
+        account_id: account.into(),
+        subject: Some(record_break_request::Subject::Position(PositionKey {
+            instrument_id: "INS-AAPL".into(),
+            side: HoldingSide::Long as i32,
+        })),
+        category: BreakCategory::TradeDateQuantity as i32,
+        differences: vec![BreakDifference {
+            field: "trade_date_quantity".into(),
+            book: None,
+            street: None,
+        }],
+        business_date: "2026-09-09".into(),
+        ..Default::default()
+    }
+}
+
+/// A write, then a record read naming its watermark, against a read replica
+/// held behind (contract v30, stage C2; the resilience spec's section 5): the
+/// reader never answers with less than the watermark. Its replica's snapshot
+/// behind it, the primary answers, the write in what it said, and the
+/// read's position is the primary's; once the replica holds the write, the
+/// replica answers, its position its own snapshot's, at or past the
+/// watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_behind_it() {
+    use meridian_bus::read_after::{answered_by_primary, begin_read, Reads};
+    use meridian_pb::v1::{PartitionSequence, Watermark};
+    let (_, primary) = blocking(isolated);
+    let (_, replica) = blocking(isolated);
+    let (bus, primary) = wired_with(primary);
+    let (replica_bus, replica) = wired_with(replica);
+    let account = unique("ACC-LAG");
+    // Both hold the account's opening; the replica is held there.
+    open(&bus, &account, "INS-AAPL").await;
+    open(&replica_bus, &account, "INS-AAPL").await;
+    // The write the read names: on the primary alone.
+    send(&bus, RECORD_BREAK, &a_break(&account), None)
+        .await
+        .unwrap();
+    let written = blocking(|| primary.journal(&account)).unwrap();
+    assert_eq!(written.len(), 2);
+    let last = written.last().unwrap();
+    let watermark = Watermark {
+        partitions: vec![PartitionSequence {
+            partition: last.partition.clone(),
+            sequence: last.last_sequence,
+        }],
+    };
+    let reader = meridian_bor::reader::ReaderStore::new(
+        primary.clone(),
+        Some(replica.clone() as Arc<dyn Store>),
+        1 << 20,
+        Arc::new(meridian_bor::store::Mark::new),
+    );
+    let reads = Reads::default();
+    let read = |reads: &Reads| {
+        begin_read();
+        reads.answer(
+            "platform.bor.query.list-lifecycle-events",
+            &watermark,
+            || Store::journal(&reader, &account).map_err(|failed| failed.to_string()),
+        )
+    };
+    blocking(|| {
+        let said = read(&reads).unwrap();
+        assert_eq!(said.len(), 2, "the write named is in what the read said");
+        assert!(
+            answered_by_primary(),
+            "the replica behind it: the primary answered"
+        );
+        let at = Store::heads(&reader).unwrap();
+        assert!(at[&last.partition] >= last.last_sequence, "{at:?}");
+    });
+    // The replica takes the write: it answers, stamped from its snapshot.
+    send(&replica_bus, RECORD_BREAK, &a_break(&account), None)
+        .await
+        .unwrap();
+    blocking(|| {
+        let held = replica.journal(&account).unwrap();
+        assert_eq!(held.last().unwrap().last_sequence, last.last_sequence);
+        let said = read(&reads).unwrap();
+        assert_eq!(said.len(), 2);
+        assert!(
+            !answered_by_primary(),
+            "the replica, at the watermark, answered"
+        );
+        let at = Store::heads(&reader).unwrap();
+        assert!(at[&last.partition] >= last.last_sequence, "{at:?}");
+    });
+}
