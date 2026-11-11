@@ -18,6 +18,7 @@ pub mod member;
 pub mod preflight;
 pub mod probe;
 pub mod replicas;
+pub mod resilience;
 pub mod scrub;
 
 use std::collections::BTreeMap;

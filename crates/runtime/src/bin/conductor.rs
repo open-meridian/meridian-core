@@ -463,11 +463,33 @@ fn run() -> Result<(), String> {
                 Arc::clone(&pods),
             ));
         }
+        let heard = meridian_runtime::members_heard(&bus);
         meridian_runtime::serve_component_health(
             &bus,
-            meridian_runtime::members_heard(&bus),
-            pods,
+            Arc::clone(&heard),
+            Arc::clone(&pods),
             move || meridian_runtime::member::member_report("conductor", schema, started_at_ns),
+        );
+        // What the deployment survives (W6.39; contract v30, stage D): the
+        // Resilience page's read and the resilience profile, from the
+        // members, the pods and Leases (its Role's reads), and each store's
+        // control partition. The chart's values as the release states them
+        // are not handed to the conductor yet (their name awaits a ruling):
+        // the profile judges what runs.
+        meridian_runtime::resilience::serve(
+            &bus,
+            meridian_runtime::resilience::Answering {
+                heard,
+                restarts: pods,
+                own: Arc::new(move || {
+                    meridian_runtime::member::member_report("conductor", schema, started_at_ns)
+                }),
+                cluster: meridian_first_run::cluster::ApiServer::in_cluster(clock())
+                    .ok()
+                    .map(Arc::new),
+                values: None,
+                history: Default::default(),
+            },
         );
         meridian_runtime::background(async move {
             report_forever(reporting, collecting, "conductor", schema).await
