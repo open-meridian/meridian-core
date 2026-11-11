@@ -483,6 +483,18 @@ impl Spec {
 
     /// A page of the partition's changes after `after`: each transaction's
     /// rows one change, never split across pages.
+    ///
+    /// Read by the log's key alone (`enable_seqscan` off for its
+    /// transaction): every question asked of a log is a range of one
+    /// partition's sequences, and a log small enough that Postgres would
+    /// scan it whole once analysed (a few pages) otherwise reads every page
+    /// to answer one -- so a page damaged anywhere in it failed every read,
+    /// the `control` partition's too, which holds no rows here and is what a
+    /// member's probe and followers ask (the tolerant bit-rot class: failover-
+    /// repeat 42977259116, the configuration store's log, its first page
+    /// flipped, refused the probe's read of `control` with "invalid page in
+    /// block 0" until the class gave up). A damaged page still fails the
+    /// reads that reach its rows, and the scrub records it.
     pub fn read(
         &self,
         client: &mut impl GenericClient,
@@ -493,6 +505,22 @@ impl Spec {
         if partition != self.partition && partition != CONTROL {
             return Err(ReadError::UnknownPartition(partition.to_string()));
         }
+        let unavailable = |failed: postgres::Error| ReadError::Unavailable(failed.to_string());
+        let mut tx = client.transaction().map_err(unavailable)?;
+        tx.batch_execute("SET LOCAL enable_seqscan = off")
+            .map_err(unavailable)?;
+        let page = self.read_by_key(&mut tx, partition, after, most_bytes)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(page)
+    }
+
+    fn read_by_key(
+        &self,
+        client: &mut impl GenericClient,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
         let unavailable = |failed: postgres::Error| ReadError::Unavailable(failed.to_string());
         let head_row = client
             .query_opt(
