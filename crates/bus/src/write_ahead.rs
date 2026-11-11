@@ -19,8 +19,17 @@
 //! else it is asked goes to the backend it stands in front of. Nothing above
 //! the bus changes, which is the transport seam decision 010 made: a second
 //! data-plane transport is another backend, routed the same way.
+//!
+//! **Limits** (the research batch's item 5, approved 2026-11-10): the stream
+//! refuses a write when it is full (`discard: new`; JetStream's default
+//! drops its oldest messages, which here are writes held for the lake, and
+//! is never used), and the plugin is refused for load with a retry-after;
+//! and a write whose caller has already stopped waiting -- or that the
+//! broker could not take now, so its client would queue it -- is dropped
+//! here, never sent, so the stream holds no write nobody waits for.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +66,10 @@ pub const REFUSAL_HEADER: &str = crate::nats::REFUSAL_HEADER;
 /// JetStream's own: a write sent again within the stream's duplicate window
 /// is held once.
 const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";
+
+/// How long a plugin refused because the stream is full is told to wait:
+/// the writer drains it a batch at a time, so a few seconds.
+pub const FULL_RETRY_AFTER_SECONDS: u32 = 5;
 
 /// The lake's topics whose rows a data plugin records (W10.4), each a
 /// batch of rows the lake keeps: what goes by the stream. A liveness, an
@@ -139,6 +152,16 @@ pub fn dataset_of(envelope: &Envelope) -> Option<String> {
     (!dataset.is_empty()).then_some(dataset)
 }
 
+/// Writes dropped here, never sent, because their caller had stopped
+/// waiting or the broker could not take them now, since the process
+/// started: counted apart from refusals.
+static EXPIRED: AtomicU64 = AtomicU64::new(0);
+
+/// [`EXPIRED`]'s count.
+pub fn expired() -> u64 {
+    EXPIRED.load(Ordering::Relaxed)
+}
+
 /// The writer's answers, each to the inbox its write named.
 struct Replies {
     prefix: String,
@@ -175,6 +198,7 @@ impl Replies {
 /// held by the stream, then answered by the lake's writer. Everything else
 /// goes to `fallback`, the broker's own backend.
 pub struct WriteAhead {
+    client: async_nats::Client,
     context: jetstream::Context,
     max_payload: Box<dyn Fn() -> usize + Send + Sync>,
     fallback: Arc<dyn Backend>,
@@ -209,6 +233,7 @@ impl WriteAhead {
         });
         let sizing = client.clone();
         Ok(Self {
+            client: client.clone(),
             context: jetstream::new(client),
             max_payload: Box::new(move || sizing.server_info().max_payload),
             fallback,
@@ -258,6 +283,32 @@ impl WriteAhead {
         {
             headers.insert(AFTER_HEADER, after.to_string().as_str());
         }
+        // A write whose caller has stopped waiting -- it waited past its
+        // deadline before it reached here -- is dropped, never sent: the
+        // stream holds nothing nobody will be answered for. So is one the
+        // broker cannot take now, which its client would queue and send
+        // whenever it reconnects, waited for or not.
+        if Instant::now() >= deadline {
+            self.replies.forget(&reply_to);
+            EXPIRED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                topic,
+                "a write dropped: its caller stopped waiting before it was sent"
+            );
+            return Err(timed_out());
+        }
+        if self.client.connection_state() != async_nats::connection::State::Connected {
+            self.replies.forget(&reply_to);
+            EXPIRED.fetch_add(1, Ordering::Relaxed);
+            return Err(BusError::HandlerFailed {
+                topic: topic.to_string(),
+                detail: crate::backend::refusal_with_status(
+                    crate::backend::RefusalStatus::Unavailable,
+                    &[],
+                    "the lake's write-ahead stream cannot be reached now; ask again",
+                ),
+            });
+        }
         let held = tokio::time::timeout_at(deadline.into(), async {
             self.context
                 .publish_with_headers(subject.clone(), headers, bytes.into())
@@ -272,7 +323,7 @@ impl WriteAhead {
             }
             Ok(Err(failed)) => {
                 self.replies.forget(&reply_to);
-                return Err(refused(topic, failed, timed_out));
+                return Err(refused(topic, failed.kind(), &failed, timed_out));
             }
             Ok(Ok(held)) => held,
         };
@@ -291,22 +342,54 @@ impl WriteAhead {
     }
 }
 
-/// The stream's refusal of a write, as the bus says it: no stream yet,
-/// nothing serving; out of time, a timeout.
+/// The stream's refusal of a write, as the bus says it: full, refused for
+/// load with a retry-after; no stream yet, nothing serving; out of time, a
+/// timeout.
 fn refused(
     topic: &str,
-    failed: jetstream::context::PublishError,
+    kind: jetstream::context::PublishErrorKind,
+    failed: &(dyn std::error::Error + 'static),
     timed_out: impl Fn() -> BusError,
 ) -> BusError {
     use jetstream::context::PublishErrorKind;
-    match failed.kind() {
+    let words = full_words(failed);
+    match kind {
         PublishErrorKind::StreamNotFound => BusError::NoHandler(topic.to_string()),
         PublishErrorKind::TimedOut => timed_out(),
+        _ if words.is_some() => BusError::HandlerFailed {
+            topic: topic.to_string(),
+            detail: crate::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                FULL_RETRY_AFTER_SECONDS,
+                words.unwrap_or_default(),
+            ),
+        },
         _ => BusError::HandlerFailed {
             topic: topic.to_string(),
             detail: format!("the lake's write-ahead stream did not hold the write: {failed}"),
         },
     }
+}
+
+/// Where the stream refused a write because it is full -- JetStream's store
+/// refusing it at a bound, `discard: new` -- the plugin's words.
+fn full_words(failed: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut said = failed.to_string();
+    let mut cause = failed.source();
+    while let Some(next) = cause {
+        said.push_str(": ");
+        said.push_str(&next.to_string());
+        cause = next.source();
+    }
+    let full = said.contains("maximum bytes exceeded")
+        || said.contains("maximum messages exceeded")
+        || said.contains("insufficient resources")
+        || said.contains("resource limits exceeded");
+    full.then(|| {
+        "overloaded: the lake's write-ahead stream is full and holds no more writes until the \
+         lake records what it holds"
+            .to_string()
+    })
 }
 
 /// The writer's answer, as the broker's request path reads one: a refusal
@@ -433,6 +516,53 @@ mod tests {
         ] {
             assert_eq!(subject_of(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_full_stream_is_a_refusal_for_load_with_a_retry_after() {
+        use jetstream::context::PublishErrorKind;
+        #[derive(Debug)]
+        struct Said(&'static str);
+        impl std::fmt::Display for Said {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Said {}
+        let topic = "platform.lake.command.record-prices";
+        // JetStream's own words for a stream at its bound with `discard: new`.
+        for full in ["maximum bytes exceeded", "maximum messages exceeded"] {
+            let BusError::HandlerFailed { detail, .. } =
+                refused(topic, PublishErrorKind::Other, &Said(full), || {
+                    BusError::ShuttingDown
+                })
+            else {
+                panic!("refused for load")
+            };
+            assert_eq!(
+                crate::read_refusal(&detail).map(|(reason, _)| reason),
+                Some(meridian_pb::v1::RefusalReason::Overloaded as i32)
+            );
+            assert_eq!(
+                crate::refusal_retry_after(&detail),
+                Some(FULL_RETRY_AFTER_SECONDS)
+            );
+        }
+        let other = refused(
+            topic,
+            PublishErrorKind::Other,
+            &Said("something else"),
+            || BusError::ShuttingDown,
+        );
+        assert!(
+            matches!(&other, BusError::HandlerFailed { detail, .. } if crate::refusal_retry_after(detail).is_none())
+        );
+        assert!(matches!(
+            refused(topic, PublishErrorKind::StreamNotFound, &Said(""), || {
+                BusError::ShuttingDown
+            }),
+            BusError::NoHandler(_)
+        ));
     }
 
     #[test]

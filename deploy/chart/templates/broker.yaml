@@ -379,10 +379,11 @@ spec:
             {{- end }}
             {{- end }}
             {{- if gt $jetstream 0 }}
-            # JetStream for the analytics units' work queue, on this
+            # JetStream for the analytics units' work queue and, in ha, the
+            # lake's write-ahead stream (contract v30, stage E), on this
             # server's own volume, at most this much of it.
             - --jetstream
-            - "256MB"
+            - {{ include "meridian-runtime.jetstreamFileStore" . | quote }}
             - --jetstream-store
             - /data/jetstream
             {{- end }}

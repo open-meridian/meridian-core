@@ -129,6 +129,60 @@ position. Nothing where it does not. Takes the chart.
 {{- end }}
 {{- end -}}
 
+{{/*
+The write-ahead stream's bounds, for the lake (lake.writeAhead.maxAge and
+maxBytes; contract v30, stage E): where JetStream runs, each refused here
+unless it is one the lake reads -- a whole number above 0 of s, m or h; of MB
+or GB. Nothing where JetStream does not run. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadBoundsEnv" -}}
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 }}
+{{- $w := .Values.lake.writeAhead | default dict }}
+{{- $age := toString ($w.maxAge | default "10m") }}
+{{- if not (regexMatch "^[1-9][0-9]*(s|m|h)$" $age) }}
+{{- fail (printf "lake.writeAhead.maxAge is %v; a whole number above 0 of seconds, minutes or hours, as 30s, 10m or 1h: how long the lake's write-ahead stream holds a write the lake has not recorded" $age) }}
+{{- end }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_AGE
+  value: {{ $age | quote }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES
+  value: {{ printf "%dMB" (int (include "meridian-runtime.writeAheadMiB" .)) | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+lake.writeAhead.maxBytes in MB, refused unless it is a whole number above 0
+of MB or GB. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadMiB" -}}
+{{- $w := .Values.lake.writeAhead | default dict }}
+{{- $bytes := toString ($w.maxBytes | default "256MB") }}
+{{- if not (regexMatch "^[1-9][0-9]*(MB|GB)$" $bytes) }}
+{{- fail (printf "lake.writeAhead.maxBytes is %v; a whole number above 0 of MB or GB, as 256MB: how much the lake's write-ahead stream holds before it refuses a write" $bytes) }}
+{{- end }}
+{{- $n := int (regexFind "^[0-9]+" $bytes) }}
+{{- if hasSuffix "GB" $bytes }}{{ mul $n 1024 }}{{ else }}{{ $n }}{{ end }}
+{{- end -}}
+
+{{/*
+Each broker server's JetStream file store (max_file_store), where JetStream
+runs: the lake's write-ahead stream at its maxBytes, the analytics units'
+queue's 48 MB, and 64 MB for JetStream's own state -- at least the 256 MB it
+was before the stream. broker.jetstream.size is the volume that holds it.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.jetstreamFileStore" -}}
+{{- $mb := max (add (int (include "meridian-runtime.writeAheadMiB" .)) 48 64) 256 -}}
+{{- $size := toString ((.Values.broker.jetstream | default dict).size | default "1Gi") -}}
+{{- if regexMatch "^[1-9][0-9]*(Mi|Gi)$" $size -}}
+{{- $volume := int (regexFind "^[0-9]+" $size) -}}
+{{- if hasSuffix "Gi" $size }}{{ $volume = mul $volume 1024 }}{{ end -}}
+{{- if gt $mb $volume -}}
+{{- fail (printf "broker.jetstream.size is %s, and JetStream's store needs %dMB of it: lake.writeAhead.maxBytes, the analytics units' 48MB and 64MB of JetStream's own. Grow broker.jetstream.size or lower lake.writeAhead.maxBytes." $size $mb) -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%dMB" $mb -}}
+{{- end -}}
+
 {{/* A stateless set's copies: 1 or 2 by the profile, at least 1. Takes a dict: top, value. */}}
 {{- define "meridian-runtime.copies" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" .top "value" .value "tolerant" 1 "ha" 2) -}}

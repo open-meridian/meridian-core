@@ -132,6 +132,32 @@ pub fn caller_of(meta: Option<&MessageMeta>) -> String {
     caller
 }
 
+/// Requests dropped because their caller's deadline passed while they
+/// waited for their turn, since the process started: counted apart from
+/// the refusals for load (the research batch's item 5).
+static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`EXPIRED`]'s count.
+pub fn expired_requests() -> u64 {
+    EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A request dropped, its caller gone: counted and said, and answered to
+/// nobody waiting.
+fn expired(topic: &str, caller: &str) -> String {
+    EXPIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        topic,
+        caller,
+        "a request dropped: its caller's deadline passed while it waited for its turn"
+    );
+    crate::backend::refusal_with_status(
+        crate::backend::RefusalStatus::Unavailable,
+        &[],
+        format!("{topic} was dropped: its caller's deadline passed while it waited for its turn"),
+    )
+}
+
 /// Admit a request on `topic` at this process's gate and budget, and run
 /// `handler` on the blocking pool within its reservation; refused for load,
 /// with its retry-after, where it waited its while (section 10a).
@@ -148,10 +174,21 @@ pub(crate) async fn admitted(
         "{topic} for {}",
         if caller.is_empty() { "itself" } else { &caller }
     );
-    match meridian_budget::process()
-        .admit(class, &caller, bytes, &what)
-        .await
-    {
+    let admit = meridian_budget::process().admit(class, &caller, bytes, &what);
+    // A request whose caller has stopped waiting is dropped, never run
+    // (the research batch's item 5, approved 2026-11-10): while it waits
+    // for its turn, or as its turn comes.
+    let admitted = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline.into(), admit).await {
+            Ok(admitted) => admitted,
+            Err(_) => return Ok(Err(expired(topic, &caller))),
+        },
+        None => admit.await,
+    };
+    match admitted {
+        Ok(_) if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) => {
+            Ok(Err(expired(topic, &caller)))
+        }
         Err(over) => {
             tracing::info!(
                 topic,
@@ -751,6 +788,43 @@ impl Bus {
             // its plugin's reads (stage B); unset reads from the nearest member.
             read_after: stamp.read_after.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod expired_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The research batch's item 5 (approved 2026-11-10): a request whose
+    /// caller's deadline has passed by its turn is dropped, never run, and
+    /// counted apart from the refusals for load.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_whose_caller_stopped_waiting_is_dropped_and_never_run() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let running = Arc::clone(&ran);
+        let handler: Handler = Arc::new(move |_| {
+            running.store(true, Ordering::SeqCst);
+            Ok((String::new(), Vec::new()))
+        });
+        let before = expired_requests();
+        let refused_before = meridian_budget::process().accounting().refused;
+        let gone = std::time::Instant::now() - Duration::from_millis(1);
+        let answered = admitted(
+            "platform.lake.command.record-prices",
+            Envelope::default(),
+            handler,
+            Some(gone),
+        )
+        .await
+        .unwrap();
+        assert!(answered.unwrap_err().contains("dropped"));
+        assert!(!ran.load(Ordering::SeqCst), "never run");
+        assert_eq!(expired_requests(), before + 1);
+        assert_eq!(
+            meridian_budget::process().accounting().refused,
+            refused_before
+        );
     }
 }
 

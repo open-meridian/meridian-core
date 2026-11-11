@@ -200,7 +200,7 @@ each still overridable by its own value:
 | `<store>.standby` (lake, bor, instrument, street, conductor, launcher) | 0 | 1 |
 | `database.brought.standbys` | 0 | 2, under Patroni |
 | `broker.replicas` | 1 | 3, a NATS cluster |
-| `broker.jetstream.replicas` | 0 | 3, the analytics units' work queue |
+| `broker.jetstream.replicas` | 0 | 3, the analytics units' work queue and the lake's write-ahead stream |
 | `dashboard.replicaCount` | 1 | 2 |
 | `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount` | 1 | 2 |
 
@@ -227,7 +227,8 @@ same Postgres 16 with Patroni and pgBackRest: a primary and two standbys,
 each on its own volume and node, one standby synchronous and strict, so a
 primary cut off from every standby cannot acknowledge a commit alone. The
 book's, the street store's, the instrument store's and the configuration's
-commits wait for that standby; the lake's commit locally. Patroni keeps its
+commits wait for that standby; the lake's commit locally, its write-ahead
+stream holding what a failover takes back. Patroni keeps its
 state in this namespace's ConfigMaps and its members' labels, under a
 namespaced Role, and the database's Service follows the primary. A database
 made by this chart has page checksums from initdb on; one made before keeps
@@ -240,6 +241,21 @@ and `broker.jetstream.storageClassName`), so a server restarted, one at a
 time as an upgrade rolls them, rejoins with what it held. Without JetStream
 the broker keeps nothing on disk. Every client checks its server answers
 each second and moves to another when one has not for 2 s.
+
+In `ha` a data plugin's lake writes go to the lake's write-ahead stream on
+those three servers first, and its plugin is answered once the stream holds
+the write and the lake has recorded it; the lake's writer records each batch
+with its place in the stream in one transaction, and after a database
+failover goes back to the place the promoted standby holds, so no
+acknowledged row is lost. `lake.writeAhead.maxAge` (10m) is how long the
+stream holds a write the lake has not recorded, and `lake.writeAhead.maxBytes`
+(256MB) how much it holds: full, it refuses a new write, the plugin refused
+for load with a retry-after, and drops none it holds. A writer gone longer
+than `maxAge` leaves a gap in each dataset whose writes the stream dropped,
+recorded, asked again of the data plugin where its dataset declares
+`backfill`, and marked unrecovered otherwise. Each server's JetStream store
+is sized to hold `maxBytes` beside the analytics units' queue, and the chart
+refuses a `broker.jetstream.size` too small for it.
 
 A profile is changed on a live install by an upgrade (`meridian
 upgrade-deployment --set resilience.profile=ha`, and back). A StatefulSet's

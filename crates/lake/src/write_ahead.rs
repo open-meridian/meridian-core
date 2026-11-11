@@ -214,6 +214,14 @@ impl Writer {
 /// The stream, as the lake's writer makes it where no writer has yet: on
 /// file at its replicas -- three, the broker's servers, in `ha` -- every
 /// subject of [`SUBJECTS`], kept by its bounds and never past them.
+///
+/// Full, it refuses a new write (`discard: new`), and its plugin is refused
+/// for load with a retry-after (approved 2026-11-10, the research batch's
+/// item 5). JetStream's default, `discard: old`, drops the oldest writes to
+/// take the new one -- writes held for the lake, its plugin already
+/// answered or waiting to be -- and is never used. A write older than
+/// `max_age` is dropped all the same: a writer gone that long leaves a gap
+/// (W10.14), which the next writer finds.
 pub fn stream_config(bounds: &Bounds) -> stream::Config {
     stream::Config {
         name: STREAM.to_string(),
@@ -223,6 +231,7 @@ pub fn stream_config(bounds: &Bounds) -> stream::Config {
         num_replicas: bounds.replicas,
         max_age: bounds.max_age,
         max_bytes: bounds.max_bytes,
+        discard: stream::DiscardPolicy::New,
         ..Default::default()
     }
 }
@@ -285,6 +294,86 @@ pub struct Bounds {
     pub max_bytes: i64,
     /// The servers that hold it: three in `ha`.
     pub replicas: usize,
+}
+
+/// `lake.writeAhead.maxAge` where the chart says nothing: ten minutes, five
+/// times the slowest recovery that stops the writer (a zone's, two
+/// minutes), and the bound a write is held within at a low rate.
+pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// `lake.writeAhead.maxBytes` where the chart says nothing: 256 MB, about
+/// 2.2 million rows at the 117 bytes a row a 100-row batch takes in the
+/// stream (measured), so ten minutes at 3,600 rows a second and 3 minutes
+/// at the lake's 12,000 -- past the zone's two -- before a plugin is
+/// refused for load. The bound a write is held within at a high rate.
+pub const MAX_BYTES: i64 = 256 << 20;
+
+impl Bounds {
+    /// The chart's bounds, `lake.writeAhead.maxAge` as `30s`, `10m` or `1h`
+    /// and `lake.writeAhead.maxBytes` as `256MB` or `1GB`, each above 0;
+    /// this module's where it says nothing. Refused naming the value.
+    pub fn from_said(
+        max_age: Option<&str>,
+        max_bytes: Option<&str>,
+        replicas: usize,
+    ) -> Result<Bounds, String> {
+        let max_age = match max_age.map(str::trim).filter(|said| !said.is_empty()) {
+            None => MAX_AGE,
+            Some(said) => duration(said).ok_or_else(|| {
+                format!(
+                    "lake.writeAhead.maxAge is {said:?}; a whole number above 0 of seconds, \
+                     minutes or hours, as 30s, 10m or 1h"
+                )
+            })?,
+        };
+        let max_bytes = match max_bytes.map(str::trim).filter(|said| !said.is_empty()) {
+            None => MAX_BYTES,
+            Some(said) => bytes(said).ok_or_else(|| {
+                format!(
+                    "lake.writeAhead.maxBytes is {said:?}; a whole number above 0 of bytes, KB, \
+                     MB or GB, as 256MB"
+                )
+            })?,
+        };
+        Ok(Bounds {
+            max_age,
+            max_bytes,
+            replicas,
+        })
+    }
+}
+
+fn whole(digits: &str) -> Option<u64> {
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .filter(|n| *n > 0)
+}
+
+fn duration(said: &str) -> Option<Duration> {
+    let (digits, unit) = said.split_at(said.len().checked_sub(1)?);
+    let seconds = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        _ => return None,
+    };
+    whole(digits).map(|n| Duration::from_secs(n * seconds))
+}
+
+fn bytes(said: &str) -> Option<i64> {
+    let digits = said.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let factor: u64 = match &said[digits.len()..] {
+        "" => 1,
+        // As the broker reads its own sizes: KB is 1,024 bytes.
+        "KB" => 1 << 10,
+        "MB" => 1 << 20,
+        "GB" => 1 << 30,
+        _ => return None,
+    };
+    whole(digits).and_then(|n| i64::try_from(n.checked_mul(factor)?).ok())
 }
 
 /// Take the stream's writes, record them and answer them, for as long as
@@ -448,4 +537,52 @@ async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, St
         }
     }
     Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stream_refuses_a_write_when_full_never_dropping_its_oldest() {
+        let config = stream_config(&Bounds {
+            max_age: MAX_AGE,
+            max_bytes: MAX_BYTES,
+            replicas: 3,
+        });
+        assert_eq!(config.discard, stream::DiscardPolicy::New);
+        assert_eq!(config.retention, stream::RetentionPolicy::Limits);
+        assert_eq!(config.storage, stream::StorageType::File);
+        assert_eq!((config.num_replicas, config.max_bytes), (3, MAX_BYTES));
+        assert_eq!(config.max_age, MAX_AGE);
+        assert_eq!(config.subjects, vec![format!("{SUBJECTS}.>")]);
+    }
+
+    #[test]
+    fn the_bounds_are_the_charts_or_these_and_a_bound_that_is_none_is_refused() {
+        let said = Bounds::from_said(Some("90s"), Some("64MB"), 3).unwrap();
+        assert_eq!(
+            (said.max_age, said.max_bytes),
+            (Duration::from_secs(90), 64 << 20)
+        );
+        assert_eq!(
+            Bounds::from_said(Some("2h"), Some("1GB"), 3)
+                .unwrap()
+                .max_age,
+            Duration::from_secs(7_200)
+        );
+        let none = Bounds::from_said(None, Some(""), 3).unwrap();
+        assert_eq!((none.max_age, none.max_bytes), (MAX_AGE, MAX_BYTES));
+        for (age, bytes, named) in [
+            ("0s", "", "maxAge"),
+            ("10", "", "maxAge"),
+            ("10d", "", "maxAge"),
+            ("", "0MB", "maxBytes"),
+            ("", "256Mi", "maxBytes"),
+            ("", "lots", "maxBytes"),
+        ] {
+            let refused = Bounds::from_said(Some(age), Some(bytes), 3).unwrap_err();
+            assert!(refused.contains(named), "{age} {bytes}: {refused}");
+        }
+    }
 }

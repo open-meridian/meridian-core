@@ -313,14 +313,15 @@ fn write_ahead_on() -> bool {
     var("MERIDIAN_LAKE_WRITE_AHEAD").as_deref() == Some("jetstream")
 }
 
-/// The stream's bounds: how long it holds a write the lake has not
-/// recorded, and how much it holds.
+/// The stream's bounds (`lake.writeAhead.maxAge`, `lake.writeAhead.maxBytes`):
+/// how long it holds a write the lake has not recorded, and how much it
+/// holds; refused where the chart says something that is neither. On the
+/// broker's three servers, a majority holding each write before its plugin
+/// is answered.
 fn write_ahead_bounds() -> Result<meridian_lake::write_ahead::Bounds, String> {
-    Ok(meridian_lake::write_ahead::Bounds {
-        max_age: std::time::Duration::from_secs(15 * 60),
-        max_bytes: 128 * 1024 * 1024,
-        // The broker's three servers, a majority holding each write before
-        // its plugin is answered.
-        replicas: 3,
-    })
+    meridian_lake::write_ahead::Bounds::from_said(
+        var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_AGE").as_deref(),
+        var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES").as_deref(),
+        3,
+    )
 }

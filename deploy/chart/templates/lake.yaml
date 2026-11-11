@@ -112,6 +112,7 @@ spec:
             {{- /* In `ha`, the data plugins' writes taken from the write-ahead
                    stream (contract v30, stage E). */}}
             {{- with (include "meridian-runtime.writeAheadEnv" .) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.writeAheadBoundsEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
