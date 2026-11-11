@@ -3028,6 +3028,16 @@ def write_ahead_bound(s):
     gaps = gaps_of(dataset, since)
     s.check(found, f"write-ahead-bound: the gap the stream left in {dataset} recorded "
             f"({len(gaps)} gap(s), {took:.1f}s after the writer was let go)")
+    if not found:
+        # What the lake's members said of the stream meanwhile, before the
+        # bound set back rolls them away.
+        words = ("write-ahead", "dropped writes", "a gap in a dataset", "stepping down", "takes its writes")
+        for pod in pods("lake"):
+            said = kubectl("logs", pod["metadata"]["name"], "-c", "lake", "--since=6m", check=False, quiet=True)
+            lines = [line for line in said.stdout.decode(errors="replace").splitlines()
+                     if any(w in line for w in words)]
+            for line in lines[-12:]:
+                s.note(f"write-ahead-bound: {pod['metadata']['name']}: {line[-300:]}")
     states = [states[-1] for states in gaps.values()]
     # The driver's dataset declares no gap_recovery: none, the cautious
     # reading, so its gap is unrecovered at once and asked of nobody.

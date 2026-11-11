@@ -354,18 +354,23 @@ async def drive_page(plugin):
     stub = plugin._operations()
     while not stopped():
         began = int(time.time() * 1000)
+        # Each read kept at the moment its answer came: what the page holds
+        # from then (a slow read answers with a row recorded while it waited).
         try:
             listed = await bounded(stub.ListPrices(ops.ListPricesParams(
                 subjects=[ops.SubjectRef(entity_id=INSTRUMENT)], page_size=1)))
+            answered = int(time.time() * 1000)
             if listed.prices:
                 meta = listed.prices[0].meta
-                kept("/tmp/page.log", f"PAGE {began} ok {meta.row_key} {meta.valid_from_ns // 1_000_000}")
+                kept("/tmp/page.log", f"PAGE {answered} ok {meta.row_key} {meta.valid_from_ns // 1_000_000}")
             else:
-                kept("/tmp/page.log", f"PAGE {began} empty")
+                kept("/tmp/page.log", f"PAGE {answered} empty")
         except asyncio.TimeoutError:
-            kept("/tmp/page.log", f"PAGE {began} failed TIMEOUT")
+            kept("/tmp/page.log", f"PAGE {int(time.time() * 1000)} failed TIMEOUT")
         except grpc.aio.AioRpcError as failed:
-            kept("/tmp/page.log", f"PAGE {began} failed {failed.code().name}")
+            kept("/tmp/page.log", f"PAGE {int(time.time() * 1000)} failed {failed.code().name}")
+        except Exception as failed:  # noqa: BLE001 - a page's read never takes the writes down
+            kept("/tmp/page.log", f"PAGE {int(time.time() * 1000)} failed {type(failed).__name__}")
         await asyncio.sleep(max(0.0, 1.0 - (time.time() * 1000 - began) / 1000))
 
 
