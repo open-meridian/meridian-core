@@ -2928,3 +2928,79 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
 /// What sixteen jobs at once may add to the heap at their peak, in jobs
 /// alone: the two running, and the answers kept and read as they finish.
 const BURST_JOBS_MOST: f64 = 5.0;
+
+/// The resilience spec's section 10a, fair shares: one client flooding the
+/// coordinator with jobs does not move another client's answer out of its
+/// band. Each client's jobs wait in their own queue and a freed place goes
+/// to the clients waiting in turn, so the quiet client's one job runs after
+/// at most one more of the flooder's -- never behind the whole burst -- and
+/// past its share of those waiting the flooder alone is refused for load,
+/// with a retry-after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn one_client_flooding_jobs_waits_behind_itself_and_another_runs_in_its_turn() {
+    let (stores, _) = wide_stores(200, Duration::from_millis(150));
+    let running = coordinator(
+        &stores,
+        Config {
+            jobs_at_once: 1,
+            jobs_waiting: 64,
+            inline: Duration::from_secs(30),
+            ..Config::default()
+        },
+        false,
+    );
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let ask = |client: &'static str, n: usize| {
+        let (coordinator, finished) = (Arc::clone(&running), Arc::clone(&finished));
+        std::thread::spawn(move || {
+            let answered = coordinator.run_job_for(wide_job(), client.to_string(), None, false);
+            assert!(answered.is_ok(), "{client} {n}: {answered:?}");
+            finished.lock().unwrap().push(format!("{client}-{n}"));
+        })
+    };
+    let mut asked = Vec::new();
+    for n in 0..6 {
+        asked.push(ask("flooder", n));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    asked.push(ask("quiet", 0));
+    for thread in asked {
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+    }
+    let order = finished.lock().unwrap().clone();
+    let quiet = order.iter().position(|said| said == "quiet-0").unwrap();
+    assert!(
+        quiet <= 2,
+        "the quiet client's job finished behind {quiet} of the flooder's: {order:?}"
+    );
+
+    // Past its share of those waiting (a quarter of jobs_waiting), the
+    // flooder alone is refused for load; the quiet client still waits its turn.
+    let (stores, _) = wide_stores(200, Duration::from_millis(150));
+    let full = coordinator(
+        &stores,
+        Config {
+            jobs_at_once: 1,
+            jobs_waiting: 8,
+            inline: Duration::from_millis(1),
+            ..Config::default()
+        },
+        false,
+    );
+    let mut flooded = Vec::new();
+    for _ in 0..4 {
+        flooded.push(full.run_job_for(wide_job(), "flooder".into(), None, false));
+    }
+    assert!(flooded[..3].iter().all(Result::is_ok), "{flooded:?}");
+    let refused = flooded[3].as_ref().unwrap_err();
+    assert!(
+        refused.contains("its share")
+            && meridian_bus::refusal_retry_after(refused).is_some_and(|after| after >= 1),
+        "{refused}"
+    );
+    assert!(full
+        .run_job_for(wide_job(), "quiet".into(), None, false)
+        .is_ok());
+}

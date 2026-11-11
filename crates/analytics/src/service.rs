@@ -162,11 +162,70 @@ impl Jobs {
 }
 
 /// The jobs running and waiting, so that only so many hold their inputs at
-/// once.
+/// once; and the waiting in fair shares (the resilience spec's section
+/// 10a): each client's jobs wait in their own queue, and a freed place goes
+/// to the clients waiting in turn (weighted fair queuing, every weight one),
+/// so one client's burst waits behind itself and every other client's next
+/// job is run after at most one of its. Standing recomputations take their
+/// turns as one more client ([`STANDING`]), so neither starves the other.
 #[derive(Default)]
 struct Slots {
     running: usize,
     waiting: usize,
+    /// Each client's tickets waiting, oldest first.
+    queues: BTreeMap<String, VecDeque<u64>>,
+    /// The clients with a ticket waiting, in the order their turn comes.
+    turn: VecDeque<String>,
+    /// Tickets given a place, not yet taken up by their job.
+    granted: std::collections::BTreeSet<u64>,
+    next_ticket: u64,
+}
+
+/// The queue standing recomputations wait in, beside the clients'.
+const STANDING: &str = "standing recomputations";
+
+impl Slots {
+    /// A ticket in `client`'s queue.
+    fn wait_in(&mut self, client: &str) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        let queue = self.queues.entry(client.to_string()).or_default();
+        if queue.is_empty() {
+            self.turn.push_back(client.to_string());
+        }
+        queue.push_back(ticket);
+        self.waiting += 1;
+        ticket
+    }
+
+    /// Free places handed to the clients waiting, in turn.
+    fn hand_out(&mut self, at_once: usize) {
+        while self.running < at_once {
+            let Some(client) = self.turn.pop_front() else {
+                return;
+            };
+            let Some(queue) = self.queues.get_mut(&client) else {
+                continue;
+            };
+            let Some(ticket) = queue.pop_front() else {
+                self.queues.remove(&client);
+                continue;
+            };
+            if queue.is_empty() {
+                self.queues.remove(&client);
+            } else {
+                self.turn.push_back(client);
+            }
+            self.granted.insert(ticket);
+            self.waiting -= 1;
+            self.running += 1;
+        }
+    }
+
+    /// How many of `client`'s jobs wait.
+    fn waiting_for(&self, client: &str) -> usize {
+        self.queues.get(client).map_or(0, VecDeque::len)
+    }
 }
 
 /// A job's place among those running, given back when it finishes, however
@@ -179,7 +238,8 @@ impl Drop for Slot<'_> {
     fn drop(&mut self) {
         let mut slots = self.coordinator.slots.lock().expect("not poisoned");
         slots.running -= 1;
-        self.coordinator.slot_freed.notify_one();
+        slots.hand_out(self.coordinator.config.jobs_at_once.max(1));
+        self.coordinator.slot_freed.notify_all();
     }
 }
 
@@ -350,12 +410,14 @@ impl Coordinator {
             return self.run_standing(job, client, scope, handed);
         }
         // A place among the jobs running, or among those waiting for one;
-        // past both, refused, never another thread holding its inputs.
-        {
+        // past both, refused, never another thread holding its inputs. Its
+        // client's own share of those waiting first (section 10a), so one
+        // client's burst cannot fill the queue every other waits in.
+        let ticket = {
             let mut slots = self.slots.lock().expect("not poisoned");
-            if slots.running >= self.config.jobs_at_once.max(1)
-                && slots.waiting >= self.config.jobs_waiting
-            {
+            let at_once = self.config.jobs_at_once.max(1);
+            let full = slots.running >= at_once;
+            if full && slots.waiting >= self.config.jobs_waiting {
                 return Err(refusal_with_status(
                     RefusalStatus::FailedPrecondition,
                     &[],
@@ -366,8 +428,22 @@ impl Coordinator {
                     ),
                 ));
             }
-            slots.waiting += 1;
-        }
+            let share = self.client_share();
+            let mine = slots.waiting_for(&client);
+            if full && mine >= share {
+                return Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: (self.config.inline.as_secs() as u32).max(1),
+                    words: format!(
+                        "overloaded: {client} already has {mine} job(s) waiting at the analytics \
+                         component, its share"
+                    ),
+                }));
+            }
+            let ticket = slots.wait_in(&client);
+            slots.hand_out(at_once);
+            self.slot_freed.notify_all();
+            ticket
+        };
         let job_id = job_id(self.clock.now_ns());
         let (told, heard) = mpsc::channel();
         let me = Arc::clone(self);
@@ -384,7 +460,7 @@ impl Coordinator {
         };
         let finishing_client = client.clone();
         std::thread::spawn(move || {
-            let slot = me.slot();
+            let slot = me.slot(ticket);
             let answered = me.answer(&asker, &job, &compiled, &id);
             drop(slot);
             if told.send(answered.clone()).is_err() {
@@ -427,18 +503,29 @@ impl Coordinator {
     /// the jobs running, as a job's: waits until one is free, never refused
     /// -- its holders keep the figures they have meanwhile.
     pub(crate) fn standing_slot(&self) -> Slot<'_> {
-        self.slots.lock().expect("not poisoned").waiting += 1;
-        self.slot()
+        let ticket = {
+            let mut slots = self.slots.lock().expect("not poisoned");
+            let ticket = slots.wait_in(STANDING);
+            slots.hand_out(self.config.jobs_at_once.max(1));
+            self.slot_freed.notify_all();
+            ticket
+        };
+        self.slot(ticket)
     }
 
-    fn slot(&self) -> Slot<'_> {
+    /// The place `ticket` was given, once its turn has come.
+    fn slot(&self, ticket: u64) -> Slot<'_> {
         let mut slots = self.slots.lock().expect("not poisoned");
-        while slots.running >= self.config.jobs_at_once.max(1) {
+        while !slots.granted.remove(&ticket) {
             slots = self.slot_freed.wait(slots).expect("not poisoned");
         }
-        slots.waiting -= 1;
-        slots.running += 1;
         Slot { coordinator: self }
+    }
+
+    /// How many jobs one client may have waiting: a quarter of those that
+    /// may wait in all, at least one.
+    fn client_share(&self) -> usize {
+        (self.config.jobs_waiting / 4).max(1)
     }
 
     /// A job's answer: its inputs resolved, its routed batches priced, its
