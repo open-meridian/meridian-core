@@ -37,6 +37,9 @@
 {{- $held := dict }}
 {{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
 {{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
+{{- /* Its record-read replicas (contract v30, stage C): members past the
+       primary and its standbys, asynchronous, tagged nosync and nofailover. */}}
+{{- $readReplicas := int (include "meridian-runtime.databaseReadReplicas" .) }}
 {{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
 {{/*
   Two ways to run it (step 3b; spec/a-deployment-scales-out-and-fails-over-
@@ -54,13 +57,13 @@
   or none: its data directory is Patroni's.
 */}}
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
-{{- $patroni := or (gt $standbys 0) $wasPatroni }}
+{{- $patroni := or (gt $standbys 0) (gt $readReplicas 0) $wasPatroni }}
 {{- /* Moving under Patroni from alone, in the first of two upgrades (see
        the StatefulSet's replicas): member 0 runs alone, so nothing waits
        for a synchronous standby it does not have yet -- strict, every
        commit would wait, and the connections waiting filled the server. */}}
 {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
-{{- $converting := and (gt (int $running) 0) (gt $standbys 0) (not $wasPatroni) }}
+{{- $converting := and (gt (int $running) 0) (gt (add $standbys $readReplicas) 0) (not $wasPatroni) }}
 {{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
@@ -244,6 +247,14 @@ metadata:
 data:
   database.sh: |
     {{- .Files.Get "files/database.sh" | nindent 4 }}
+  {{- range $i := until $readReplicas }}
+  # A record-read replica (contract v30, stage C): its own Patroni tags,
+  # laid over the static half by database.sh for this member alone.
+  read-replica-{{ $name }}-{{ add 1 $standbys $i }}: |
+    tags:
+      nosync: true
+      nofailover: true
+  {{- end }}
   patroni.yml: |
     scope: {{ $scope }}
     restapi:
@@ -383,7 +394,7 @@ spec:
   # standbys started before member 0 was moved, and the first of them made
   # a new, empty cluster that the Service then followed (step 3b part 3,
   # found by e2e-cluster-reconfigure).
-  replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys }}{{ end }}{{ else }}0{{ end }}
+  replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys $readReplicas }}{{ end }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:
     matchLabels:
@@ -413,7 +424,7 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if gt $standbys 0 }}
+      {{- if gt (add $standbys $readReplicas) 0 }}
       {{- include "meridian-runtime.spread" (dict "top" . "component" "database") | nindent 6 }}
       {{- end }}
       {{- else }}

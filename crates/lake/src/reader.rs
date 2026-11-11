@@ -61,6 +61,7 @@ thread_local! {
 /// it yet, and the lake has cut it off nowhere.
 pub fn begin() {
     REPLICA_ANSWERED.with(|held| held.borrow_mut().take());
+    let _ = crate::postgres::snapshot_heads();
     OWN_CUT_OFF.with(|held| held.set(None));
     crate::hot::noted::begin();
     meridian_bus::read_after::begin_read();
@@ -129,6 +130,10 @@ impl ReaderStore {
                 REPLICA_ANSWERED.with(|held| {
                     held.borrow_mut().get_or_insert(heads);
                 });
+                // Stamped from the snapshot it answers from (contract v30,
+                // stage C): the heads read in the same repeatable-read
+                // transaction as its rows ([`ReaderStore::stamped`]).
+                crate::postgres::stamp_from_snapshot();
                 replica.as_ref()
             }
             Ok(_) => self.primary_answers(),
@@ -164,6 +169,25 @@ fn of_now(query: &Query) -> bool {
     answers_latest(query) && latest_cut(query.as_of_ns)
 }
 
+/// A record read answered by the read replica, its watermark stamped from
+/// the snapshot it answered from (contract v30, stage C; the resilience
+/// spec's section 5): the head rows read in the same repeatable-read
+/// transaction as its rows, each partition it read held to them -- exact,
+/// with no write position mapped, since the head row replicates with the
+/// rows. Nothing depends on Postgres 19's WAIT FOR LSN.
+fn stamped<R>(answered: Result<R>) -> Result<R> {
+    if let Some(snapshot) = crate::postgres::snapshot_heads() {
+        REPLICA_ANSWERED.with(|held| {
+            let mut held = held.borrow_mut();
+            let held = held.get_or_insert_with(BTreeMap::new);
+            for (partition, head) in snapshot {
+                held.insert(partition, head);
+            }
+        });
+    }
+    answered
+}
+
 fn written() -> StoreError {
     StoreError::Unavailable("a reader member writes nothing: the writer does".into())
 }
@@ -181,7 +205,7 @@ impl Store for ReaderStore {
         if of_now(query) {
             self.now().read(query)
         } else {
-            self.past().read(query)
+            stamped(self.past().read(query))
         }
     }
 
@@ -193,7 +217,7 @@ impl Store for ReaderStore {
         if of_now(query) {
             self.now().read_each(query, each)
         } else {
-            self.past().read_each(query, each)
+            stamped(self.past().read_each(query, each))
         }
     }
 
@@ -206,7 +230,7 @@ impl Store for ReaderStore {
         if latest_cut(as_of_ns) {
             self.now().rows_at(data_type, places, as_of_ns)
         } else {
-            self.past().rows_at(data_type, places, as_of_ns)
+            stamped(self.past().rows_at(data_type, places, as_of_ns))
         }
     }
 
@@ -219,7 +243,7 @@ impl Store for ReaderStore {
         if as_of_ns == 0 {
             self.now().listing(datasets, subjects, as_of_ns)
         } else {
-            self.past().listing(datasets, subjects, as_of_ns)
+            stamped(self.past().listing(datasets, subjects, as_of_ns))
         }
     }
 

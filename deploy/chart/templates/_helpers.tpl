@@ -96,6 +96,24 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 {{- $n -}}
 {{- end -}}
 
+{{/*
+The brought database's record-read replicas (contract v30, stage C; the
+resilience spec's sections 4, 5 and 11, approved 2026-11-11):
+database.brought.readReplicas, 0 by default, or 1, the shape CI tests
+(e2e-cluster-scaled). Asynchronous members under Patroni tagged nosync and
+nofailover: never in the synchronous quorum, so a long record read neither
+delays a commit nor is cancelled by replay, and never promoted. A store's
+reader is pointed at one by its <store>.database.readExistingSecret; the
+HA standbys serve no reads. Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseReadReplicas" -}}
+{{- $n := index .Values.database.brought "readReplicas" | default 0 -}}
+{{- if not (has (toString $n) (list "0" "1")) -}}
+{{- fail (printf "database.brought.readReplicas is %v; it takes 0 (the record's reads from the primary) or 1 (an asynchronous replica outside the commit quorum, which a store's reader reads the record's past from by <store>.database.readExistingSecret), the shapes CI tests." $n) -}}
+{{- end -}}
+{{- $n -}}
+{{- end -}}
+
 {{- define "meridian-runtime.brokerReplicas" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" .Values.broker.replicas "tolerant" 1 "ha" 3) -}}
 {{- if not (has (toString $n) (list "1" "3")) -}}
@@ -827,7 +845,10 @@ Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseMemoryLimit" -}}
 {{- $set := toString (dig "limits" "memory" "" (.Values.database.brought.resources | default .Values.resources)) -}}
-{{- if gt (int (include "meridian-runtime.databaseStandbys" .)) 0 -}}
+{{- /* Every member under Patroni, its record-read replicas' included, is a
+       server of its own held to the same max_connections (a hot standby
+       takes no fewer than its primary), so each is given the same count. */}}
+{{- if gt (add (int (include "meridian-runtime.databaseStandbys" .)) (int (include "meridian-runtime.databaseReadReplicas" .))) 0 -}}
 {{- $judged := add 128 (mul 4 (int (include "meridian-runtime.databaseMaxConnections" .))) -}}
 {{- $roomy := div (add (mul $judged 5) 3) 4 -}}
 {{- $mib := mul (div (add $roomy 63) 64) 64 -}}

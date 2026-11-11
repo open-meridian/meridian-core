@@ -5100,3 +5100,43 @@ fn a_new_database_timeline_raises_the_epoch_and_the_next_batch_commits_under_it(
         .unwrap();
     assert_eq!(writer.follow_timeline().unwrap(), Timeline::NotMine(3));
 }
+
+/// A record read on a read replica is stamped from its own snapshot
+/// (contract v30, stage C; the resilience spec's section 5): asked, a read
+/// says the head row of each dataset it read from the same repeatable-read
+/// transaction as its rows; not asked, it says nothing.
+#[test]
+fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    store
+        .record(
+            &dataset,
+            vec![
+                close(&dataset, "a", &subject, "2026-10-01", 1),
+                close(&dataset, "b", &subject, "2026-10-02", 2),
+            ],
+            10,
+        )
+        .unwrap();
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: Vec::new(),
+        interval_ns: 0,
+        when: When::Latest { at_ns: 0 },
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    meridian_lake::postgres::stamp_from_snapshot();
+    let rows = store.read(&query).unwrap();
+    let heads = meridian_lake::postgres::snapshot_heads().expect("the snapshot's heads");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(heads.get(&dataset), Some(&2), "{heads:?}");
+    // Not asked: nothing said.
+    store.read(&query).unwrap();
+    assert!(meridian_lake::postgres::snapshot_heads().is_none());
+}

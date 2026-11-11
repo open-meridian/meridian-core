@@ -41,7 +41,14 @@ api() {
     curl -fsS "$@" "http://127.0.0.1:8008/${path}"
   fi
 }
-patroni /etc/patroni/patroni.yml &
+# A record-read replica (contract v30, stage C): its tags -- nosync,
+# nofailover -- laid over the static half, for this member alone.
+config=/etc/patroni/patroni.yml
+if [ -f "/etc/patroni/read-replica-${POD_NAME}" ]; then
+  cat /etc/patroni/patroni.yml "/etc/patroni/read-replica-${POD_NAME}" > /tmp/patroni.yml
+  config=/tmp/patroni.yml
+fi
+patroni "$config" &
 pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit $?' TERM INT
 (

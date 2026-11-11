@@ -35,6 +35,59 @@ type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::Database
 type Connection =
     r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
+thread_local! {
+    /// Whether a read on this thread is to say the heads of its own snapshot
+    /// (contract v30, stage C; the resilience spec's section 5): a record
+    /// read on a read replica, stamped from the snapshot it answered from.
+    static STAMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The heads its snapshots read, the lowest of each where it took more
+    /// than one.
+    static SNAPSHOT_HEADS: std::cell::RefCell<Option<BTreeMap<String, u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The next reads on this thread say the heads of the snapshot each answers
+/// from ([`snapshot_heads`]): a read replica's record read (contract v30,
+/// stage C; the resilience spec's section 5). Its watermark is then exact,
+/// with no write position mapped: the head rows replicate with the rows.
+pub fn stamp_from_snapshot() {
+    STAMPING.with(|stamping| stamping.set(true));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take());
+}
+
+/// The heads the reads since [`stamp_from_snapshot`] answered from, each the
+/// lowest any of them read; none where none read any. Stops the stamping.
+pub fn snapshot_heads() -> Option<BTreeMap<String, u64>> {
+    STAMPING.with(|stamping| stamping.set(false));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+/// In a read's repeatable-read transaction, where its thread asked: the
+/// head row of each of `datasets` from the same snapshot the read answers
+/// from, kept for [`snapshot_heads`].
+fn note_snapshot(tx: &mut Transaction<'_>, datasets: &[String]) -> Result<()> {
+    if !STAMPING.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let rows = tx
+        .query(
+            "SELECT dataset, head FROM lake_partition WHERE dataset = ANY($1)",
+            &[&datasets],
+        )
+        .map_err(unavailable)?;
+    SNAPSHOT_HEADS.with(|heads| {
+        let mut heads = heads.borrow_mut();
+        let heads = heads.get_or_insert_with(BTreeMap::new);
+        for row in rows {
+            let dataset: String = row.get(0);
+            let head = row.get::<_, i64>(1) as u64;
+            let at = heads.entry(dataset).or_insert(head);
+            *at = (*at).min(head);
+        }
+    });
+    Ok(())
+}
+
 /// Names the schema lock: distinct from every other store's. `migrate`
 /// holds it, its backfills included, so whatever else takes it waits for a
 /// migrate under way to finish and keeps the next from starting.
@@ -1444,6 +1497,8 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // Its heads from this snapshot, where its thread asked (stage C).
+        note_snapshot(&mut tx, &query.datasets)?;
         if let When::After(watermark) = &query.when {
             // The rows each partition named recorded after its sequence
             // there, by the partition's own key (contract v19, the plan's Q33).
@@ -1667,6 +1722,11 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // Its heads from this snapshot, where its thread asked (stage C).
+        note_snapshot(
+            &mut tx,
+            &places.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
+        )?;
         let code = data_type.code();
         let found = tx
             .query(
@@ -1707,6 +1767,8 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // Its heads from this snapshot, where its thread asked (stage C).
+        note_snapshot(&mut tx, datasets)?;
         let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
         let rows = tx
             .query(LISTING, &[&datasets, &subjects, &cut_off])

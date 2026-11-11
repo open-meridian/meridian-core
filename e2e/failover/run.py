@@ -275,7 +275,8 @@ def psql(sql, database="meridian", quiet=False, pod=None):
 
 
 def database_members():
-    return 3 if SHAPE in ("ha", "scaled") else 1
+    # The scaled shape adds a record-read replica (contract v30, stage C).
+    return {"ha": 3, "scaled": 4}.get(SHAPE, 1)
 
 
 def pods(component):
@@ -448,6 +449,10 @@ def install(s):
             # (contract v30, stage B; the spec's section 15 shape), each
             # serving its store's reads in the store's queue group.
             values += ["--set", f"lake.readers={READERS}", "--set", f"bor.readers={READERS}"]
+            if PROFILE == "scaled":
+                # A record-read replica beside the primary and its two
+                # standbys (contract v30, stage C; database.brought.readReplicas).
+                values += ["--set", "database.brought.readReplicas=1"]
         if TLS:
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
@@ -743,7 +748,7 @@ def shape(s):
     # database's three members under Patroni, the broker's three servers,
     # the dashboard's two copies and analytics' two of each, every set spread
     # over three zones (or two, for two), with a budget over it.
-    for component, want in (("database", 3), ("broker", 3), ("dashboard", 2),
+    for component, want in (("database", database_members()), ("broker", 3), ("dashboard", 2),
                             ("analytics-coordinator", 2), ("analytics-worker", 2)):
         settled = happens(lambda c=component, n=want: len(pods(c)) == n and all(ready(p) for p in pods(c)), 300)
         live = pods(component)
@@ -754,18 +759,25 @@ def shape(s):
             s.note(f"{component}: kept on the server node for this run")
         else:
             zones = {zone_of(p["spec"]["nodeName"]) for p in live}
-            s.check(len(zones) == want and "" not in zones,
+            s.check(len(zones) == min(want, 3) and "" not in zones,
                     f"{component}: one member per zone ({', '.join(sorted(zones))})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
     roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
-    s.check(roles == ["primary", "replica", "replica"], f"database: one primary, two standbys ({roles})")
+    s.check(roles == ["primary"] + ["replica"] * (database_members() - 1),
+            f"database: one primary, its standbys and record-read replicas ({roles})")
     # The synchronous standbys a quorum (contract v30, stage C): ANY 1 of
     # the two, each standing in it, strict.
     quorum = psql("select count(*) from pg_stat_replication where sync_state = 'quorum'", database="postgres")
     names = psql("show synchronous_standby_names", database="postgres")
     s.check(quorum == "2" and names.startswith("ANY 1 ("),
             f"database: both standbys in a quorum of one ({quorum}; {names})")
+    if SHAPE == "scaled":
+        # The record-read replica outside the quorum (nosync): asynchronous.
+        streaming = psql("select count(*) from pg_stat_replication where sync_state = 'async'",
+                         database="postgres")
+        s.check(streaming == "1", f"database: the record-read replica asynchronous, outside the quorum "
+                                  f"({streaming})")
     checksums = psql("show data_checksums", database="postgres")
     s.check(checksums == "on", f"database: made with page checksums ({checksums})")
     # Every store's probe names the primary it reaches, and its checksums.

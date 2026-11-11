@@ -96,6 +96,15 @@ database:
     # A firm running Postgres for production names an external managed one
     # with its provider's synchronous standby instead (database.existingSecret).
     # standbys:
+    # Record-read replicas (contract v30, stage C): 0, as by default, or 1,
+    # an asynchronous member under Patroni tagged nosync and nofailover --
+    # never in the synchronous quorum, never promoted -- from which a store's
+    # reader reads the record's past (`<release>-database-<n>.<release>-
+    # database-members`, named in a Secret by <store>.database.
+    # readExistingSecret). A record read there is stamped from its own
+    # snapshot. The HA standbys serve no reads. Each member is given the
+    # same memory and max_connections as the primary.
+    # readReplicas: 0
     # Its max_connections, counted from what this chart deploys (ruled
     # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
     # standby and a rollout's surge, and in ha 2 more for each lake member's

@@ -2839,7 +2839,15 @@ chart-check:
 		&& { echo "chart-check FAILED: lake.standby=0 under the ha profile still gives the lake a standby" >&2; exit 1; }; \
 	echo "$$over" | grep -q "\-\-route\|meridian.dev/database-manager: patroni" \
 		&& { echo "chart-check FAILED: the ha profile's broker and database counts are not overridable" >&2; exit 1; }; \
-	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1"; do \
+	read="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with a record-read replica" >&2; exit 1; }; \
+	echo "$$read" | grep -q "read-replica-check-meridian-runtime-database-3: |" \
+		|| { echo "chart-check FAILED: the record-read replica, member 3, has no tags of its own" >&2; exit 1; }; \
+	echo "$$read" | grep -A2 "read-replica-check-meridian-runtime-database-3: |" | grep -q "nosync: true" \
+		|| { echo "chart-check FAILED: the record-read replica is not kept out of the synchronous quorum (nosync)" >&2; exit 1; }; \
+	echo "$$read" | grep -q "read-replica-check-meridian-runtime-database-[012]:" \
+		&& { echo "chart-check FAILED: the primary or a standby is tagged as a record-read replica" >&2; exit 1; }; \
+	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1" "database.brought.readReplicas=2"; do \
 		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
 	done; \
