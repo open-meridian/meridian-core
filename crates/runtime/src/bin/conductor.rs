@@ -473,9 +473,9 @@ fn run() -> Result<(), String> {
         // What the deployment survives (W6.39; contract v30, stage D): the
         // Resilience page's read and the resilience profile, from the
         // members, the pods and Leases (its Role's reads), and each store's
-        // control partition. The chart's values as the release states them
-        // are not handed to the conductor yet (their name awaits a ruling):
-        // the profile judges what runs.
+        // control partition; the chart's values as the release states them
+        // (MERIDIAN_RESILIENCE_VALUES), or what runs where the chart says
+        // none.
         meridian_runtime::resilience::serve(
             &bus,
             meridian_runtime::resilience::Answering {
@@ -487,7 +487,7 @@ fn run() -> Result<(), String> {
                 cluster: meridian_first_run::cluster::ApiServer::in_cluster(clock())
                     .ok()
                     .map(Arc::new),
-                values: None,
+                values: meridian_runtime::resilience::values_from_env(),
                 history: Default::default(),
             },
         );

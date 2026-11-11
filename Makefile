@@ -2703,6 +2703,23 @@ chart-check:
 		echo "$$said" | grep -q 'serviceAccountName: check-meridian-runtime-conductor$$' \
 			|| { echo "chart-check FAILED: the conductor does not run under its own account ($${profile:-tolerant})" >&2; exit 1; }; \
 	done
+	@# Stage D (W6.39; approved 2026-11-11): the chart's values the resilience
+	@# profile reads reach the conductor alone, as JSON resolved by the
+	@# profile, and carry no secret, credential or address.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	all="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
+		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor, or not at all" >&2; exit 1; }; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		value="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null \
+			| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')"; \
+		[ -n "$$value" ] || { echo "chart-check FAILED: the conductor is not told the chart's values ($${profile:-tolerant})" >&2; exit 1; }; \
+		! echo "$$value" | grep -qiE 'secret|password|token|://|svc\.cluster' \
+			|| { echo "chart-check FAILED: the resilience values carry a secret, a credential or an address: $$value" >&2; exit 1; }; \
+		want='\\"standby\\":0'; [ -n "$$profile" ] && want='\\"standby\\":1'; \
+		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
+			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
+	done
 	@# Stage M (the resilience spec's section 10a): every component and every
 	@# sidecar is told its container's limit, memory.budgetPercent and
 	@# memory.shedPercent and glibc's settings; a percent out of range, or a

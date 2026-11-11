@@ -188,7 +188,9 @@ impl Values {
         Ok(Values {
             stated: true,
             standby,
-            external_database: said["database"]["external"].as_bool().unwrap_or(false),
+            external_database: !said["database"]["brought"]["enabled"]
+                .as_bool()
+                .unwrap_or(true),
             database_standbys: count(&said["database"]["brought"]["standbys"]),
             broker_replicas: count(&said["broker"]["replicas"]),
             zones: said["zones"]
@@ -259,6 +261,23 @@ impl Values {
             scrub_days,
             analytics_coordinators: of("analytics-coordinator").count() as u32,
             analytics_workers: of("analytics-worker").count() as u32,
+        }
+    }
+}
+
+/// Where the chart hands the conductor its values as the release states
+/// them (approved 2026-11-11): JSON, by chart path, no secret.
+pub const VALUES_VAR: &str = "MERIDIAN_RESILIENCE_VALUES";
+
+/// The chart's values from [`VALUES_VAR`], where the chart set it and it
+/// reads; none otherwise (said once), and the profile judges what runs.
+pub fn values_from_env() -> Option<Values> {
+    let said = crate::var(VALUES_VAR)?;
+    match Values::from_json(&said) {
+        Ok(values) => Some(values),
+        Err(failed) => {
+            tracing::warn!(%failed, "the chart's values for the resilience profile did not read: it judges what runs");
+            None
         }
     }
 }

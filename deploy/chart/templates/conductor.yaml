@@ -212,6 +212,12 @@ spec:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "conductor" "values" $.Values.conductor) | nindent 12 }}
+            # The chart's values the resilience profile reads, as the release
+            # states them (W6.39; contract v30, stage D; approved
+            # 2026-11-11): counts and settings by their chart paths, never a
+            # secret or an address.
+            - name: MERIDIAN_RESILIENCE_VALUES
+              value: {{ include "meridian-runtime.resilienceValues" . | quote }}
             # Optional, and that is what lets first run happen at all: the
             # database is what the wizard configures, and the wizard needs the
             # conductor up to enrol this deployment and to relay its claim

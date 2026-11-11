@@ -304,7 +304,7 @@ fn the_tested_configurations_are_the_claims_ledgers() {
 fn the_charts_values_read_by_their_paths() {
     let values = Values::from_json(
         r#"{"bor": {"standby": 1, "scrub": {"intervalDays": 7}}, "lake": {"standby": 1},
-            "database": {"brought": {"standbys": 2}}, "broker": {"replicas": 3},
+            "database": {"brought": {"enabled": true, "standbys": 2}}, "broker": {"replicas": 3},
             "zones": ["a", "b", "c"], "backup": {"schedule": "0 2 * * *", "walArchive": {"enabled": true}},
             "analytics": {"coordinator": {"replicaCount": 2}, "worker": {"replicaCount": 2}}}"#,
     )
@@ -321,6 +321,12 @@ fn the_charts_values_read_by_their_paths() {
         (2, 3, 3)
     );
     assert_eq!(values.scrub_days, 7.0);
+    assert!(!values.external_database);
+    assert!(
+        Values::from_json(r#"{"database": {"brought": {"enabled": false}}}"#)
+            .unwrap()
+            .external_database
+    );
     assert!(Values::from_json("not json").is_err());
 }
 

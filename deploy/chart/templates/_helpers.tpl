@@ -1435,3 +1435,34 @@ rendered.
 {{ $out }}
 {{- end }}
 {{- end -}}
+
+{{/*
+The chart's values the resilience profile reads, as the release states them
+(contract v30, stage D; the resilience spec's section 12;
+`MERIDIAN_RESILIENCE_VALUES`, approved 2026-11-11): each count and setting
+of section 11 the profile judges, resolved as the chart resolves it -- by
+the profile where unset -- by its chart path, as JSON on the conductor
+alone. Never a secret, a credential, a Secret's name or an address: counts,
+zones, whether backups are scheduled and archived, the scrub's interval.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.resilienceValues" -}}
+{{- $said := dict -}}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" "launcher" -}}
+{{- $values := index $.Values $component | default dict -}}
+{{- $one := dict "standby" (int (include "meridian-runtime.standbys" (dict "top" $ "component" $component "values" $values))) "readers" (int (index $values "readers" | default 0)) -}}
+{{- if ne $component "launcher" -}}
+{{- $_ := set $one "scrub" (dict "intervalDays" (float64 (dig "scrub" "intervalDays" 7 $values))) -}}
+{{- end -}}
+{{- $_ := set $said $component $one -}}
+{{- end -}}
+{{- $brought := .Values.database.brought.enabled | default false -}}
+{{- $_ := set $said "database" (dict "brought" (dict "enabled" $brought "standbys" (int (include "meridian-runtime.databaseStandbys" .)) "readReplicas" (int (include "meridian-runtime.databaseReadReplicas" .)))) -}}
+{{- $_ := set $said "broker" (dict "replicas" (int (include "meridian-runtime.brokerReplicas" .)) "jetstream" (dict "replicas" (int (include "meridian-runtime.jetstreamReplicas" .)))) -}}
+{{- $_ := set $said "zones" (.Values.zones | default list) -}}
+{{- $b := .Values.backup | default dict -}}
+{{- $_ := set $said "backup" (dict "schedule" ($b.schedule | default "") "walArchive" (dict "enabled" (dig "walArchive" "enabled" false $b))) -}}
+{{- $_ := set $said "analytics" (dict "coordinator" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "coordinator" "replicaCount" nil .Values.analytics) "what" "analytics.coordinator.replicaCount")))) "worker" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "worker" "replicaCount" nil .Values.analytics) "what" "analytics.worker.replicaCount"))))) -}}
+{{- $_ := set $said "dashboard" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount")))) -}}
+{{- $said | toJson -}}
+{{- end -}}
