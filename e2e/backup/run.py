@@ -687,11 +687,12 @@ def main():
     return verdict(s)
 
 
-# ── J and K: what the core side of `meridian restore --to-time` and of
-# `meridian upgrade-deployment --enable-checksums` does, driven here as the
-# CLI drives it: every component and the database stopped, a Job made from
-# the database's offline CronJob with the act named, and everything started
-# again (templates/database-offline.yaml). ──
+# ── J and K: what the core side of `meridian restore --to-time`, of
+# `meridian restore --to-archive-end` and of `meridian upgrade-deployment
+# --enable-checksums` does, driven here as the CLI drives it: every
+# component and the database stopped, a Job made from the database's offline
+# CronJob with the act named, and everything started again
+# (templates/database-offline.yaml). ──
 
 
 def archive_said(words):
@@ -796,7 +797,38 @@ def probe_rows():
     return psql(f"select n || '|' || at::text || '|' || said from {PROBE} order by n")
 
 
+def archived_now():
+    """The segment holding the last commit archived, as archive_timeout would
+    within backup.walArchive.timeoutSeconds."""
+    wal = psql("select pg_walfile_name(pg_switch_wal())")
+    wait_for("the last segment to be archived", lambda: psql(
+        "select last_archived_wal from pg_stat_archiver") >= wal, seconds=120)
+    return wal
+
+
+def now_at_the_database():
+    """The database's clock, as the act takes a time."""
+    return psql("select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'")
+
+
+def timeline_now():
+    return psql("select timeline_id from pg_control_checkpoint()")
+
+
+def holds(log):
+    """The archive's first and last times, as a refusal names them."""
+    found = re.search(r"which holds (\d{4}-\d\d-\d\d [\d:.]+\+00) to (\d{4}-\d\d-\d\d [\d:.]+\+00)", log)
+    return found.groups() if found else None
+
+
 def restored_to_a_time(s, before):
+    """`meridian restore --to-time` twice across timelines, then `--to-archive-
+    end`, as the CLI drives them (step 3c; spec section 9: the timeline is
+    chosen, never asked): to a time T1; written to on T1's new timeline; to
+    a time T0 before T1, which only the earlier timeline held; written to
+    again; refused for times outside the archive, naming its first and last
+    times; and to the archive's end, the newest timeline's last commit. Rows
+    exact each time."""
     print("J: restored to a time between two commits, from the WAL archive", flush=True)
     s.check(archive_said("the stanza holds this database"), "the archive's stanza holds the database")
     s.check("a full base backup taken" in newest_base_backup_log(),
@@ -806,35 +838,85 @@ def restored_to_a_time(s, before):
     for n in (1, 2, 3):
         psql(f"insert into {PROBE} (n, said) values ({n}, 'before')")
     time.sleep(1.5)
-    to = psql("select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'")
+    t0 = now_at_the_database()
+    time.sleep(1.5)
+    held_at_t0 = probe_rows()
+    for n in (4, 5, 6):
+        psql(f"insert into {PROBE} (n, said) values ({n}, 'between')")
+    time.sleep(1.5)
+    to = now_at_the_database()
     time.sleep(1.5)
     held_at_the_time = probe_rows()
-    for n in (4, 5, 6):
+    for n in (7, 8, 9):
         psql(f"insert into {PROBE} (n, said) values ({n}, 'after')")
-    s.check(len(probe_rows().splitlines()) == 6, "six rows committed, three on each side of the time")
-    # The segment holding the last commit archived, as archive_timeout would
-    # within backup.walArchive.timeoutSeconds.
-    wal = psql("select pg_walfile_name(pg_switch_wal())")
-    wait_for("the last segment to be archived", lambda: psql(
-        "select last_archived_wal from pg_stat_archiver") >= wal, seconds=120)
-    s.check(True, f"the WAL through {wal} is archived")
+    s.check(len(probe_rows().splitlines()) == 9, "nine rows committed, three either side of each of two times")
+    s.check(True, f"the WAL through {archived_now()} is archived")
     running = deployments()
     began = time.time()
     stopped(running)
     ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to)
     s.check(ok, f"the offline Job restored the database to {to}")
     s.check("promoted at" in log and "on timeline" in log, "and said where it was promoted")
+    s.check("along timeline 1, the one that held it" in log, "along timeline 1, the one that held the time")
     started(running)
     took = time.time() - began
-    s.check(probe_rows() == held_at_the_time and len(held_at_the_time.splitlines()) == 3,
-            "row for row as it stood at the time: the three before it, none after")
+    s.check(probe_rows() == held_at_the_time and len(held_at_the_time.splitlines()) == 6,
+            "row for row as it stood at the time: the six before it, none after")
     s.check(held()["book"] == before["book"], "the book as it was")
     # The region row (ruling 1048: a region lost, back within 2 h); what a
     # restore into a new cluster can lose is what the archive had not yet
     # taken, at most backup.walArchive.timeoutSeconds (60 s here, 5 min asked).
     claim(s, "restore-to-time", "database", took, 7200, {"rpo_s": 60, "rpo_bound_s": 300})
-    timeline = psql("select timeline_id from pg_control_checkpoint()")
-    s.check(timeline not in ("", "1"), f"on a timeline of its own ({timeline})")
+    first_restore = timeline_now()
+    s.check(first_restore not in ("", "1"), f"on a timeline of its own ({first_restore})")
+    wait_for("the archive to take the new timeline", lambda: archive_said("the stanza holds this database"),
+             seconds=60)
+
+    print("J2: written to on the new timeline, then restored to an earlier time the first timeline held",
+          flush=True)
+    for n in (10, 11, 12):
+        psql(f"insert into {PROBE} (n, said) values ({n}, 'on the restored timeline')")
+    s.check(True, f"three rows on timeline {first_restore}, the WAL through {archived_now()} archived")
+    running = deployments()
+    stopped(running)
+    ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME=t0)
+    s.check(ok, f"the offline Job restored the database to {t0}, before the first restore's time")
+    s.check("along timeline 1, the one that held it" in log,
+            f"along timeline 1, which held {t0}, not the newest ({first_restore}), with no option asked")
+    started(running)
+    s.check(probe_rows() == held_at_t0 and len(held_at_t0.splitlines()) == 3,
+            "row for row as it stood at the earlier time: the three before it")
+    s.check(held()["book"] == before["book"], "the book as it was")
+    second_restore = timeline_now()
+    s.check(second_restore not in ("", "1", first_restore), f"on a timeline of its own again ({second_restore})")
+    wait_for("the archive to take the new timeline", lambda: archive_said("the stanza holds this database"),
+             seconds=60)
+
+    print("J3: times outside the archive refused, naming its first and last; then restored to its end",
+          flush=True)
+    psql(f"insert into {PROBE} (n, said) values (13, 'after the second restore')")
+    at_the_end = probe_rows()
+    s.check(True, f"one row on timeline {second_restore}, the WAL through {archived_now()} archived")
+    running = deployments()
+    stopped(running)
+    past = psql("select to_char((clock_timestamp() + interval '1 day') at time zone 'UTC', "
+                "'YYYY-MM-DD HH24:MI:SS.US') || '+00'")
+    ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME=past)
+    named = holds(log)
+    s.check(not ok and "is outside the archive" in log and named is not None,
+            f"a time past the archive, {past}, refused as outside it, naming its first and last times ({named})")
+    s.check(named is not None and named[0] < t0 and to < named[1] < past,
+            "its first time before the earliest time restored to, its last after the latest")
+    ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME="2000-01-01 00:00:00+00")
+    s.check(not ok and "is before its oldest base backup ended" in log and holds(log) == named,
+            "a time before the oldest base backup refused the same, naming the same first and last times")
+    ok, log = offline("restore-to-archive-end")
+    s.check(ok and "promoted at the archive's end" in log, "the offline Job restored the database to the archive's end")
+    s.check(f"along timeline {second_restore}" in log, f"along the newest timeline, {second_restore}")
+    started(running)
+    s.check(probe_rows() == at_the_end, "row for row as it stood when it stopped, the second restore's row with it")
+    s.check(held()["book"] == before["book"], "the book as it was")
+    s.check(timeline_now() not in ("", "1", first_restore, second_restore), "on a timeline of its own")
     wait_for("the archive to take the new timeline", lambda: archive_said("the stanza holds this database"),
              seconds=60)
 

@@ -300,7 +300,16 @@ archive, and the newest `backup.keep` of them are kept with the WAL they need.
   `<release>-meridian-runtime-database-offline` with the act
   `restore-to-time` and the time, and starts everything again: the archive's
   newest base backup before that time restored, the WAL replayed to it, and
-  the database promoted there on a timeline of its own.
+  the database promoted there on a timeline of its own. `meridian restore
+  --to-archive-end` does the same with the act `restore-to-archive-end`, to
+  the last commit the archive holds.
+- **The timeline is chosen, never asked:** each restore starts a timeline,
+  so a time can lie on an earlier one. The act reads the archive's timeline
+  history and restores along the timeline that held the time, from the
+  newest base backup on that timeline's history. A time before the oldest
+  base backup ended, at or past the last commit, or while the database was
+  stopped between two timelines is refused before the volume is touched,
+  naming the archive's first and last times.
 - **Page checksums on an older database:** the same CronJob's act
   `enable-checksums` runs `pg_checksums --enable` on the stopped volume, for
   `meridian upgrade-deployment --enable-checksums`; a database made by this

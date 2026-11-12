@@ -2650,7 +2650,7 @@ def restored_to_a_time(s):
     base backup's own, where the offline Job's start, a hot standby,
     paused for good (step 3b part 7). Three rows either side of a time;
     everything stopped as the CLI stops it; a time past the archive refused
-    in the act's own words and Postgres's, the volume left restorable; the
+    in the act's own words, naming its first and last times; the
     restore run; the standbys' volumes deleted and Patroni's record of the
     old primary cleared; everything started; and the rows as they stood at
     the time."""
@@ -2674,12 +2674,13 @@ def restored_to_a_time(s):
     wait_for("the last segment to be archived", lambda: psql(
         "select last_archived_wal from pg_stat_archiver", database="postgres") >= wal, seconds=180)
     running = stopped_everything()
-    # Past the archive's end: the act fails in its own words, with
-    # Postgres's last lines, and leaves the volume restorable.
+    # Past the archive's end: the act refuses it in its own words, naming
+    # the archive's first and last times, before the volume is touched
+    # (step 3c: it reads the archive's last commit first).
     ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=past,
                           MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
-    s.check(not ok and "is outside the archive" in log and "Postgres's log, its last lines:" in log,
-            f"restore: a time past the archive, {past}, refused as outside it, with Postgres's last lines")
+    s.check(not ok and "is outside the archive, which holds" in log,
+            f"restore: a time past the archive, {past}, refused as outside it, naming its first and last times")
     ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to,
                           MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
     s.check(ok and "promoted at" in log, f"restore: the offline Job restored the database to {to}, replaying "
