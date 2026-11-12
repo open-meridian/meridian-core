@@ -897,10 +897,11 @@ def restored_to_a_time(s, before):
     psql(f"insert into {PROBE} (n, said) values (13, 'after the second restore')")
     at_the_end = probe_rows()
     s.check(True, f"one row on timeline {second_restore}, the WAL through {archived_now()} archived")
-    running = deployments()
-    stopped(running)
+    # Read while the database still answers.
     past = psql("select to_char((clock_timestamp() + interval '1 day') at time zone 'UTC', "
                 "'YYYY-MM-DD HH24:MI:SS.US') || '+00'")
+    running = deployments()
+    stopped(running)
     ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME=past)
     named = holds(log)
     s.check(not ok and "is outside the archive" in log and named is not None,
