@@ -1093,6 +1093,10 @@ fn at_of(item: &ResilienceHistoryItem) -> i64 {
         Some(Item::SourceSwitched(r)) => r.switched_at_ns,
         Some(Item::AccountMoved(r)) => r.moved_at_ns,
         Some(Item::IntegrityFinding(r)) => r.found_at_ns,
+        // Contract v30's 3d records (approved 2026-11-12): none is recorded
+        // until 3d builds the split and the move.
+        Some(Item::PartitionSplit(r)) => r.split_at_ns,
+        Some(Item::PartitionMoveAborted(r)) => r.aborted_at_ns,
         None => 0,
     }
 }

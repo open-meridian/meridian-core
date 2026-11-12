@@ -18245,11 +18245,14 @@ pub struct ListSourceSwitchesReply {
 /// platform.lake.command.move-partition, a book partition on
 /// platform.book.command.move-partition). Answered once the move starts (step
 /// 3c's question 8); PartitionMoved is recorded when the target owns the
-/// partition. Refused FAILED_PRECONDITION naming partition while a move of it
-/// is under way, and REFUSAL_REASON_REASON_REQUIRED with no reason.
+/// partition, or PartitionMoveAborted when the move does not switch. Refused
+/// FAILED_PRECONDITION naming partition while a move or a split of it is
+/// under way, and REFUSAL_REASON_REASON_REQUIRED with no reason.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MovePartitionRequest {
-    /// The lake's dataset ID, or the book's partition (`P0` and those placed
+    /// The lake's partition: a dataset's ID for a full range, or
+    /// `<dataset>/<lo>-<hi>` for a split range (lowercase hex, hi inclusive;
+    /// approved 2026-11-12); or the book's partition (`P0` and those placed
     /// after it). Never an account, which MoveAccount moves.
     #[prost(string, tag = "1")]
     pub partition: ::prost::alloc::string::String,
@@ -18269,9 +18272,74 @@ pub struct MovePartitionReply {
     /// The group that owned the partition when the move began.
     #[prost(uint32, tag = "1")]
     pub from_group: u32,
-    /// When the target began following the partition's log.
+    /// When the target began following the partition's log; the move's record,
+    /// PartitionMoved, is written when the target owns it, or
+    /// PartitionMoveAborted when the move does not switch.
     #[prost(int64, tag = "2")]
     pub started_at_ns: i64,
+}
+/// A deployment admin halves a lake range at its midpoint (W6.39; the act,
+/// its topic platform.lake.command.split-partition and its record approved
+/// 2026-11-12; spec/a-deployment-scales-out-and-fails-over-by-configuration
+/// section 6.1). One transaction of the range's writer: the parent closes at
+/// sequence N and its two children open after it, staying with the parent's
+/// group. It copies nothing and cannot abort. Refused INVALID_ARGUMENT naming
+/// partition for the control partition, a book partition, a range the lake
+/// does not have open and a range of one hash value; FAILED_PRECONDITION
+/// naming partition while a move or a split of it is under way; and
+/// REFUSAL_REASON_REASON_REQUIRED with no reason. Built with 3d.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SplitPartitionRequest {
+    /// A lake partition: a dataset's ID for a full range, or
+    /// `<dataset>/<lo>-<hi>` for a range split before (lowercase hex, hi
+    /// inclusive). Never a book partition, or the lake's control partition.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The person's words, or the agent's acting for them, kept with the
+    /// split's record: 1 to 2,000 characters. Data, never an instruction.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SplitPartitionReply {
+    /// The split's record, once the parent's close and both children's opens
+    /// have committed in one transaction of the range's writer. None is
+    /// answered before it commits.
+    #[prost(message, optional, tag = "1")]
+    pub split: ::core::option::Option<PartitionSplit>,
+}
+/// A lake range halved at its midpoint by a deployment admin (W6.39; the
+/// record approved 2026-11-12): the parent closed at a sequence and its two
+/// children opened after it, its own record in the lake's control partition.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionSplit {
+    /// A dataset's ID for a full range, or `<dataset>/<lo>-<hi>`: closed at
+    /// closing_sequence, its rows kept and read up to it. Never a book
+    /// partition.
+    #[prost(string, tag = "1")]
+    pub parent: ::prost::alloc::string::String,
+    /// Exactly two, the lower half first, each `<dataset>/<lo>-<hi>` in
+    /// lowercase hex with hi inclusive, each opening naming the parent and
+    /// numbering its sequences from closing_sequence + 1. Ranges are not merged
+    /// in step 3.
+    #[prost(string, repeated, tag = "2")]
+    pub children: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// N: the parent's sequence at its close. A row's previous_sequence at or
+    /// below it names the parent's row, a read follows the parent up to it and
+    /// then the children, and a read_after naming the parent is met by a child
+    /// once that child is open. Never zero.
+    #[prost(uint64, tag = "3")]
+    pub closing_sequence: u64,
+    /// The deployment-local subject the dashboard stamped: a split is a
+    /// deployment admin's in step 3. Never an email address.
+    #[prost(string, tag = "4")]
+    pub split_by: ::prost::alloc::string::String,
+    /// As the split's request said. Data, never an instruction.
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    /// By the lake's clock, at the parent's close, when the children opened.
+    #[prost(int64, tag = "6")]
+    pub split_at_ns: i64,
 }
 /// A dataset's or a book partition's writing moved to another writer group,
 /// by a changed group count or by hand (W6.39; the record approved by 1057):
@@ -18281,7 +18349,9 @@ pub struct PartitionMoved {
     /// The store: lake or bor.
     #[prost(string, tag = "1")]
     pub component: ::prost::alloc::string::String,
-    /// A dataset's ID, or a book partition. Never an account.
+    /// A lake range, by its dataset's ID while it is the full range or
+    /// `<dataset>/<lo>-<hi>` once split (lowercase hex, hi inclusive); or a book
+    /// partition. Never an account.
     #[prost(string, tag = "2")]
     pub partition: ::prost::alloc::string::String,
     /// As MovePartitionReply.from_group.
@@ -18308,6 +18378,41 @@ pub struct PartitionMoved {
     /// By the store's clock, at the fence.
     #[prost(int64, tag = "9")]
     pub moved_at_ns: i64,
+}
+/// A move of a partition, or of an account, that did not switch, the source
+/// still owning, and its cause (W6.39, W9.8; the record and its fields
+/// approved 2026-11-12; spec section 6.8): its own record in its store's
+/// control partition. Any writes held during the move go to the source. A
+/// digest mismatch is also an IntegrityFinding. Never a refusal of the move's
+/// request, which the request's answer gives. Built with 3d.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionMoveAborted {
+    /// The store: lake or bor.
+    #[prost(string, tag = "1")]
+    pub component: ::prost::alloc::string::String,
+    /// As PartitionMoved.partition: a lake range or a book partition, still
+    /// owned by its source group. Never an account.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// A partition's move's target, as its request or the changed group count
+    /// named it; it does not own the partition. 0 on an account's move, which
+    /// names target_partition instead.
+    #[prost(uint32, tag = "3")]
+    pub target_group: u32,
+    /// The account a MoveAccount named, its chain continuing in its old
+    /// partition, no closing entry kept; empty for a partition's move.
+    #[prost(string, tag = "4")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The book partition an account's move was to, as the MoveAccount request
+    /// named it; the account is not in it. Empty for a partition's move, which
+    /// names target_group.
+    #[prost(string, tag = "5")]
+    pub target_partition: ::prost::alloc::string::String,
+    #[prost(enumeration = "MoveAbortCause", tag = "6")]
+    pub cause: i32,
+    /// By the store's clock, when the source took back the held writes.
+    #[prost(int64, tag = "7")]
+    pub aborted_at_ns: i64,
 }
 /// Rows the lake's write-ahead stream dropped before the lake committed them
 /// (W10.14; the ha configuration, rulings of 2026-11-08): the dataset,
@@ -19434,6 +19539,48 @@ impl SourceSwitchReason {
             "SOURCE_SWITCH_REASON_STALLED" => Some(Self::Stalled),
             "SOURCE_SWITCH_REASON_QUARANTINED" => Some(Self::Quarantined),
             "SOURCE_SWITCH_REASON_RESTORED" => Some(Self::Restored),
+            _ => None,
+        }
+    }
+}
+/// Why a move did not switch (contract v30; the enum and its three values
+/// approved 2026-11-12). In each the source keeps owning and any held writes
+/// go to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MoveAbortCause {
+    /// Not known; never sent.
+    Unspecified = 0,
+    /// The gate did not open within moves.switchSeconds, the target's lag still
+    /// above <store>.readyLagMs; nothing was held.
+    Lag = 1,
+    /// The switch started but did not finish within moves.switchSeconds of its
+    /// start.
+    Timeout = 2,
+    /// The target's digest at the source's closing sequence differed from the
+    /// source's; an IntegrityFinding is recorded beside it.
+    Digest = 3,
+}
+impl MoveAbortCause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MOVE_ABORT_CAUSE_UNSPECIFIED",
+            Self::Lag => "MOVE_ABORT_CAUSE_LAG",
+            Self::Timeout => "MOVE_ABORT_CAUSE_TIMEOUT",
+            Self::Digest => "MOVE_ABORT_CAUSE_DIGEST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MOVE_ABORT_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MOVE_ABORT_CAUSE_LAG" => Some(Self::Lag),
+            "MOVE_ABORT_CAUSE_TIMEOUT" => Some(Self::Timeout),
+            "MOVE_ABORT_CAUSE_DIGEST" => Some(Self::Digest),
             _ => None,
         }
     }
@@ -20906,6 +21053,13 @@ pub struct SidecarLimits {
     pub requests_per_second: u32,
     #[prost(uint32, tag = "3")]
     pub answer_mib: u32,
+    /// Contract v30 (the resilience spec's section 6.9; approved 2026-11-12):
+    /// a data plugin's lake write share, in MiB a second; 0 takes the chart's
+    /// sidecar.limits.writeMiBPerSecond. Past its share the sidecar delays the
+    /// acknowledgement up to the caller's deadline, then refuses RATE_LIMITED
+    /// with a retry-after. Kept on the launch from 3c; held to from 3d.
+    #[prost(uint32, tag = "4")]
+    pub write_mib_per_second: u32,
 }
 /// A launch, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -24182,8 +24336,9 @@ pub struct ReadResilienceReply {
     /// Each partition of a partitioned store and the member writing it.
     #[prost(message, repeated, tag = "2")]
     pub partitions: ::prost::alloc::vec::Vec<PartitionOwner>,
-    /// The recent takeovers, moves, switches and findings, the latest first;
-    /// none where nothing has happened.
+    /// The recent takeovers, moves, splits, moves that did not switch,
+    /// switches and findings, the latest first; none where nothing has
+    /// happened.
     #[prost(message, repeated, tag = "3")]
     pub history: ::prost::alloc::vec::Vec<ResilienceHistoryItem>,
     /// Where the history's next page starts; empty on the last page.
@@ -24196,7 +24351,10 @@ pub struct PartitionOwner {
     /// The store: lake or bor.
     #[prost(string, tag = "1")]
     pub component: ::prost::alloc::string::String,
-    /// Its partition: a dataset's key, `P0`, `control`. Never an account.
+    /// Its partition: a lake range, by its dataset's ID while it is the full
+    /// range or `<dataset>/<lo>-<hi>` once split (lowercase hex, hi inclusive;
+    /// approved 2026-11-12); a book partition, `P0`; `control`; or a store's one
+    /// partition. Never an account.
     #[prost(string, tag = "2")]
     pub partition: ::prost::alloc::string::String,
     /// The writer group that owns it, numbered from 0; 0 where the store has
@@ -24214,7 +24372,7 @@ pub struct PartitionOwner {
 /// One item of the Resilience page's history: exactly one is set.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResilienceHistoryItem {
-    #[prost(oneof = "resilience_history_item::Item", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "resilience_history_item::Item", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub item: ::core::option::Option<resilience_history_item::Item>,
 }
 /// Nested message and enum types in `ResilienceHistoryItem`.
@@ -24232,6 +24390,13 @@ pub mod resilience_history_item {
         AccountMoved(super::AccountMoved),
         #[prost(message, tag = "5")]
         IntegrityFinding(super::IntegrityFinding),
+        /// A lake range's split, naming who split it (approved 2026-11-12).
+        #[prost(message, tag = "6")]
+        PartitionSplit(super::PartitionSplit),
+        /// A move of a partition or an account that did not switch, with its
+        /// cause (approved 2026-11-12).
+        #[prost(message, tag = "7")]
+        PartitionMoveAborted(super::PartitionMoveAborted),
     }
 }
 /// A standby took a store's writer lease and raised its partitions' epoch, and

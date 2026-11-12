@@ -1114,8 +1114,9 @@ message ReadResilienceReply {
   repeated ComponentReport members = 1;
   // Each partition of a partitioned store and the member writing it.
   repeated PartitionOwner partitions = 2;
-  // The recent takeovers, moves, switches and findings, the latest first;
-  // none where nothing has happened.
+  // The recent takeovers, moves, splits, moves that did not switch,
+  // switches and findings, the latest first; none where nothing has
+  // happened.
   repeated ResilienceHistoryItem history = 3;
   // Where the history's next page starts; empty on the last page.
   string next_cursor = 4;
@@ -1125,7 +1126,10 @@ message ReadResilienceReply {
 message PartitionOwner {
   // The store: lake or bor.
   string component = 1;
-  // Its partition: a dataset's key, `P0`, `control`. Never an account.
+  // Its partition: a lake range, by its dataset's ID while it is the full
+  // range or `<dataset>/<lo>-<hi>` once split (lowercase hex, hi inclusive;
+  // approved 2026-11-12); a book partition, `P0`; `control`; or a store's one
+  // partition. Never an account.
   string partition = 2;
   // The writer group that owns it, numbered from 0; 0 where the store has
   // one writer group.
@@ -1146,6 +1150,11 @@ message ResilienceHistoryItem {
     // An account's move, naming who moved it (approved 2026-11-09).
     AccountMoved account_moved = 4;
     IntegrityFinding integrity_finding = 5;
+    // A lake range's split, naming who split it (approved 2026-11-12).
+    PartitionSplit partition_split = 6;
+    // A move of a partition or an account that did not switch, with its
+    // cause (approved 2026-11-12).
+    PartitionMoveAborted partition_move_aborted = 7;
   }
 }
 

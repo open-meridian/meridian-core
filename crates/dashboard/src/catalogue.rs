@@ -909,6 +909,9 @@ pub(crate) fn sidecar_limits(
         in_flight: said(in_flight, "in_flight")?,
         requests_per_second: said(requests_per_second, "requests_per_second")?,
         answer_mib: said(answer_mib, "answer_mib")?,
+        // The lake write share (approved 2026-11-12) is 3d's: the sheet
+        // asks none, so the chart's.
+        write_mib_per_second: 0,
     };
     Ok((limits != meridian_domain::v1::SidecarLimits::default()).then_some(limits))
 }
@@ -967,6 +970,8 @@ async fn launch(
                 in_flight: l.in_flight,
                 requests_per_second: l.requests_per_second,
                 answer_mib: l.answer_mib,
+                // The lake write share (approved 2026-11-12) is 3d's.
+                write_mib_per_second: 0,
             })
             .filter(|l| *l != meridian_domain::v1::SidecarLimits::default()),
         // Contract v30's shards and standby (W8.3), built with 3d.

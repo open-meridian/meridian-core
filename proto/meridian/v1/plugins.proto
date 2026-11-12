@@ -246,6 +246,12 @@ message SidecarLimits {
   uint32 in_flight = 1;
   uint32 requests_per_second = 2;
   uint32 answer_mib = 3;
+  // Contract v30 (the resilience spec's section 6.9; approved 2026-11-12):
+  // a data plugin's lake write share, in MiB a second; 0 takes the chart's
+  // sidecar.limits.writeMiBPerSecond. Past its share the sidecar delays the
+  // acknowledgement up to the caller's deadline, then refuses RATE_LIMITED
+  // with a retry-after. Kept on the launch from 3c; held to from 3d.
+  uint32 write_mib_per_second = 4;
 }
 
 enum PluginLaunchState {

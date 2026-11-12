@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use meridian_bus::BusError;
 use meridian_domain::v1::{
-    resilience_history_item::Item, ComponentReport, IntegrityCheck, NeverBlindLine, PartitionOwner,
-    ReadResilienceProfileReply, ReadResilienceProfileRequest, ReadResilienceReply,
+    resilience_history_item::Item, ComponentReport, IntegrityCheck, MoveAbortCause, NeverBlindLine,
+    PartitionOwner, ReadResilienceProfileReply, ReadResilienceProfileRequest, ReadResilienceReply,
     ReadResilienceRequest, ResilienceHistoryItem, ResilienceLine, ResilienceState, ServiceLevel,
     TakeoverReason,
 };
@@ -168,6 +168,17 @@ pub fn takeover_word(reason: i32) -> &'static str {
     }
 }
 
+/// Why a move did not switch, in words (MoveAbortCause, approved
+/// 2026-11-12).
+pub fn abort_word(cause: i32) -> &'static str {
+    match MoveAbortCause::try_from(cause).unwrap_or(MoveAbortCause::Unspecified) {
+        MoveAbortCause::Lag => "its target still lagged when the switch's time ran out",
+        MoveAbortCause::Timeout => "its switch did not finish in time",
+        MoveAbortCause::Digest => "the two digests differed",
+        MoveAbortCause::Unspecified => "not said",
+    }
+}
+
 pub fn check_word(check: i32) -> &'static str {
     match IntegrityCheck::try_from(check).unwrap_or(IntegrityCheck::Unspecified) {
         IntegrityCheck::PageChecksum => "a page's checksum",
@@ -205,6 +216,40 @@ pub fn history_words(item: &ResilienceHistoryItem) -> (i64, &'static str, String
                 "{} {}: group {} to {}, epoch {}",
                 r.component, r.partition, r.from_group, r.to_group, r.epoch
             ),
+        ),
+        // Contract v30's 3d records (approved 2026-11-12), shown once 3d
+        // records them: a lake range's split, and a move that did not switch.
+        Some(Item::PartitionSplit(r)) => (
+            r.split_at_ns,
+            "partition split",
+            format!(
+                "lake {}: into {} after sequence {}, by {}",
+                r.parent,
+                r.children.join(" and "),
+                r.closing_sequence,
+                r.split_by
+            ),
+        ),
+        Some(Item::PartitionMoveAborted(r)) => (
+            r.aborted_at_ns,
+            "move aborted",
+            if r.account_id.is_empty() {
+                format!(
+                    "{} {}: to group {} not switched, {}",
+                    r.component,
+                    r.partition,
+                    r.target_group,
+                    abort_word(r.cause)
+                )
+            } else {
+                format!(
+                    "{} account {}: to {} not switched, {}",
+                    r.component,
+                    r.account_id,
+                    r.target_partition,
+                    abort_word(r.cause)
+                )
+            },
         ),
         Some(Item::SourceSwitched(r)) => (
             r.switched_at_ns,
@@ -676,6 +721,69 @@ mod tests {
         assert!(!body.to_lowercase().contains("move partition"));
         assert!(!body.to_lowercase().contains("move account"));
         assert!(!body.contains("<dialog"));
+    }
+
+    /// Contract v30's 3d records (approved 2026-11-12), said once 3d records
+    /// them: a lake range's split, naming its children and who split it;
+    /// a partition's move and an account's that did not switch, each with
+    /// its cause.
+    #[test]
+    fn a_split_and_a_move_not_switched_are_said() {
+        use meridian_domain::v1::{PartitionMoveAborted, PartitionSplit};
+        let split = ResilienceHistoryItem {
+            item: Some(Item::PartitionSplit(PartitionSplit {
+                parent: "kraken-1:quotes".into(),
+                children: vec![
+                    "kraken-1:quotes/0000-7fff".into(),
+                    "kraken-1:quotes/8000-ffff".into(),
+                ],
+                closing_sequence: 41,
+                split_by: "local|ada".into(),
+                reason: "hot".into(),
+                split_at_ns: 7,
+            })),
+        };
+        assert_eq!(
+            history_words(&split),
+            (
+                7,
+                "partition split",
+                "lake kraken-1:quotes: into kraken-1:quotes/0000-7fff and \
+                 kraken-1:quotes/8000-ffff after sequence 41, by local|ada"
+                    .to_string()
+            )
+        );
+        let digest = ResilienceHistoryItem {
+            item: Some(Item::PartitionMoveAborted(PartitionMoveAborted {
+                component: "lake".into(),
+                partition: "kraken-1:quotes".into(),
+                target_group: 1,
+                cause: MoveAbortCause::Digest as i32,
+                aborted_at_ns: 8,
+                ..Default::default()
+            })),
+        };
+        let (at, kind, words) = history_words(&digest);
+        assert_eq!((at, kind), (8, "move aborted"));
+        assert_eq!(
+            words,
+            "lake kraken-1:quotes: to group 1 not switched, the two digests differed"
+        );
+        let account = ResilienceHistoryItem {
+            item: Some(Item::PartitionMoveAborted(PartitionMoveAborted {
+                component: "bor".into(),
+                partition: "P0".into(),
+                account_id: "ACC-1".into(),
+                target_partition: "P1".into(),
+                cause: MoveAbortCause::Timeout as i32,
+                aborted_at_ns: 9,
+                ..Default::default()
+            })),
+        };
+        assert_eq!(
+            history_words(&account).2,
+            "bor account ACC-1: to P1 not switched, its switch did not finish in time"
+        );
     }
 
     /// Where the conductor does not answer, each tab says so in place.

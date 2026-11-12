@@ -2814,6 +2814,9 @@ fn a_launchs_own_limits_are_kept_on_its_record() {
         in_flight: 4,
         requests_per_second: 50,
         answer_mib: 0,
+        // The lake write share (approved 2026-11-12): kept on the launch
+        // from 3c, held to from 3d.
+        write_mib_per_second: 8,
     };
     let mut asked = launch("snaptrade-1");
     asked.limits = Some(limits);

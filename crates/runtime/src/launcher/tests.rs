@@ -452,6 +452,8 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
             in_flight: 4,
             requests_per_second: 0,
             answer_mib: 8,
+            // The lake write share is 3d's: carried, written nowhere yet.
+            write_mib_per_second: 2,
         }),
         ..request()
     };

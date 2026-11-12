@@ -1046,6 +1046,7 @@ fn a_launchs_limits_are_read_each_empty_for_the_deployments() {
             in_flight: 4,
             requests_per_second: 0,
             answer_mib: 8,
+            write_mib_per_second: 0,
         }))
     );
     for (in_flight, per_second, answer, named) in [

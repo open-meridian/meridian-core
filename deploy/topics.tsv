@@ -190,6 +190,7 @@ platform.lake.command.record-statistics	command	data	lake
 platform.lake.command.record-trades	command	data	lake
 platform.lake.command.renew-wants	command	sidecar	lake
 platform.lake.command.set-source-priority	command	dashboard	lake
+platform.lake.command.split-partition	command	dashboard	lake
 platform.lake.event.observations-wanted	event	lake	data
 platform.lake.event.want-withdrawn	event	lake	data
 platform.lake.query.list-bars	query	reporting,portfolio,compliance,signal	lake
