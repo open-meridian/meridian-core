@@ -341,6 +341,7 @@ dialog::backdrop{background:var(--backdrop)}\
 .dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
 .dialog-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
 .dialog-foot button{margin:0}\
+.sheet-foot{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:.5rem}.sheet-foot button{margin:0}\
 .menu-pop>button.menu-close,header.bar .menu-pop>button.menu-close{display:block;width:auto;margin:0 0 .15rem auto;\
 padding:.05rem .45rem;border:0;background:none;font-size:1.15rem;line-height:1;color:var(--ink-faint)}\
 .menu-pop>button.menu-close:hover{color:var(--ink);background:var(--hover)}\

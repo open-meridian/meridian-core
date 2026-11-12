@@ -1312,6 +1312,12 @@ def the_registry_pages(browser, prefix):
                     clipped = page.evaluate("""() => { const f = document.querySelector('[data-limits]');
                         return f.scrollHeight - f.clientHeight; }""")
                     check(clipped <= 1, f"launch-sheet at {size}, {scheme} shows its limits whole: {clipped}px hidden")
+                    # Cancel and Launch apart, as a dialog's foot spaces its
+                    # buttons (they touched: step 3c's fold-in).
+                    apart = page.evaluate("""() => { const f = document.querySelector('.sheet-foot');
+                        const [a, b] = [...f.children].map(c => c.getBoundingClientRect());
+                        return b.top < a.bottom ? b.left - a.right : b.top - a.bottom; }""")
+                    check(apart >= 6, f"launch-sheet at {size}, {scheme} keeps Cancel and Launch apart: {apart}px")
                     # Kept for a person's look (M2's follow-up): CI keeps
                     # them as the run's launch-sheet artifact.
                     page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-{size}-{scheme}.png"))
