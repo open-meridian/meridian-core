@@ -687,8 +687,22 @@ pub fn term_refused(
     path: &str,
     value: &str,
 ) -> Result<(), (&'static str, String)> {
+    match term_placed(kind, path, value)? {
+        None => Ok(()),
+        Some(placed) => read_terms(kind, &placed)
+            .map_err(|why| ("value", why.trim_start_matches('.').to_string())),
+    }
+}
+
+/// The terms' JSON holding `value` at `path` alone, as [`term_refused`]
+/// reads it; `None` for a type with no debt terms.
+fn term_placed(
+    kind: InstrumentType,
+    path: &str,
+    value: &str,
+) -> Result<Option<Value>, (&'static str, String)> {
     let Some(every) = every_term(kind) else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(parts) = steps(path) else {
         return Err((
@@ -756,8 +770,122 @@ pub fn term_refused(
         }
         Value::from(trimmed)
     };
-    read_terms(kind, &placed(&parts, said, scalar_rows))
-        .map_err(|why| ("value", why.trim_start_matches('.').to_string()))
+    Ok(Some(placed(&parts, said, scalar_rows)))
+}
+
+/// `over` laid on `base`: an object's fields each laid on the base's, a
+/// repeated group's rows each on the base's row at its index -- a row the
+/// path only passed through (an empty object or text, [`placed`]'s) keeping
+/// the base's -- and any other value replacing the base's.
+fn laid_on(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(held), Value::Object(fields)) => {
+            for (name, value) in fields {
+                laid_on(held.entry(name).or_insert(Value::Null), value);
+            }
+        }
+        (Value::Array(held), Value::Array(rows)) => {
+            for (at, row) in rows.into_iter().enumerate() {
+                let passed = row.as_object().is_some_and(Map::is_empty)
+                    || row.as_str().is_some_and(str::is_empty);
+                match held.get_mut(at) {
+                    Some(_) if passed => {}
+                    Some(existing) => laid_on(existing, row),
+                    None => held.push(row),
+                }
+            }
+        }
+        (held, over) => *held = over,
+    }
+}
+
+/// A bond's terms with each term offered at its path laid on the terms held
+/// (contract v30, W3.10; ruling 433, with the term offers of W3.23): what a
+/// source's term offers make of the record's bond, as the wire's
+/// `InstrumentValue.bond` carries it. `None` where a term is not one of a
+/// bond's or its value not of its type.
+pub fn bond_with_terms(held: Option<&Bond>, terms: &[(&str, &str)]) -> Option<Bond> {
+    let mut said = bond_json(held.unwrap_or(&Bond::default()));
+    for (path, value) in terms {
+        let placed = term_placed(InstrumentType::Bond, path, value).ok()??;
+        laid_on(&mut said, placed);
+    }
+    bond_from(&said, "").ok()
+}
+
+/// What is wrong with a bond's terms a person puts in force (contract v30,
+/// W3.10; ruling 433), each by its path: a date that is not a plain date, a
+/// decimal out of range, an enum the schema does not define. Empty where
+/// they stand. Whether they are complete is the record's lacks', never a
+/// refusal.
+pub fn bond_refused(bond: &Bond) -> Vec<(String, String)> {
+    let mut wrong = Vec::new();
+    let said = bond_json(bond);
+    if let Err(why) = bond_from(&said, "") {
+        wrong.push(("bond".to_string(), why.trim_start_matches('.').to_string()));
+    }
+    let mut dates = vec![
+        ("issue_date", bond.issue_date.as_str()),
+        ("dated_date", bond.dated_date.as_str()),
+        ("first_coupon_date", bond.first_coupon_date.as_str()),
+        ("maturity_date", bond.maturity_date.as_str()),
+    ]
+    .into_iter()
+    .map(|(name, date)| (name.to_string(), date.to_string()))
+    .collect::<Vec<_>>();
+    for (group, rows) in [("calls", &bond.calls), ("puts", &bond.puts)] {
+        for (at, row) in rows.iter().enumerate() {
+            dates.push((format!("{group}[{at}].from_date"), row.from_date.clone()));
+            dates.push((format!("{group}[{at}].to_date"), row.to_date.clone()));
+        }
+    }
+    for (at, step) in bond.coupon_steps.iter().enumerate() {
+        dates.push((
+            format!("coupon_steps[{at}].from_date"),
+            step.from_date.clone(),
+        ));
+    }
+    for (at, fund) in bond.sinking_funds.iter().enumerate() {
+        dates.push((format!("sinking_funds[{at}].date"), fund.date.clone()));
+    }
+    for (path, date) in dates {
+        if !date.is_empty() && !crate::date::is_date(&date) {
+            wrong.push((path, format!("{date:?} is not a plain date (YYYY-MM-DD)")));
+        }
+    }
+    let decimals = [
+        ("coupon_rate", bond.coupon_rate.as_ref()),
+        ("minimum_denomination", bond.minimum_denomination.as_ref()),
+        (
+            "denomination_increment",
+            bond.denomination_increment.as_ref(),
+        ),
+        ("original_issue_amount", bond.original_issue_amount.as_ref()),
+        ("base_index_level", bond.base_index_level.as_ref()),
+    ];
+    for (path, decimal) in decimals {
+        if let Some(Err(out)) = decimal.map(Exact::from_wire) {
+            wrong.push((path.to_string(), format!("the value {out}")));
+        }
+    }
+    wrong
+}
+
+/// A bond's terms in a few words, as a record's history says them: its
+/// coupon and its maturity, where it states them.
+pub fn bond_words(bond: &Bond) -> String {
+    let coupon = bond
+        .coupon_rate
+        .as_ref()
+        .and_then(|rate| Exact::from_wire(rate).ok())
+        .map(|rate| format!("{rate}%"));
+    let maturity = (!bond.maturity_date.is_empty()).then(|| format!("due {}", bond.maturity_date));
+    let said: Vec<String> = [coupon, maturity].into_iter().flatten().collect();
+    if said.is_empty() {
+        "a bond's terms".to_string()
+    } else {
+        format!("a bond's terms: {}", said.join(", "))
+    }
 }
 
 /// The term in force at `path` in a debt record's terms, as the JSON writes

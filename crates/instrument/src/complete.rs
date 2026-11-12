@@ -196,6 +196,9 @@ fn complete_one(
     let mut changes: Vec<Change> = Vec::new();
     let mut problems: Vec<(RefusalReason, String, String)> = Vec::new();
     let mut changes_held = false;
+    // Where a bond's terms were put in force (contract v30), for the type's
+    // check below.
+    let mut bond_at: Option<usize> = None;
 
     for (at, value) in completion.values.iter().enumerate() {
         let path = |name: &str| format!("values[{at}].{name}");
@@ -320,15 +323,79 @@ fn complete_one(
                     }
                 }
             }
-            // Contract v30's bond terms as a value (W3.10, ruling 433): put in
-            // force by core's stage commits (step 3c); refused until then,
-            // naming the field, never applied in part.
-            instrument_value::Value::Bond(_) => {
-                problems.push((
-                    RefusalReason::Incomplete,
-                    path("bond"),
-                    "a bond's terms are not yet set as a value in this version".into(),
-                ));
+            // Contract v30 (W3.10; ruling 433, with core #84's term offers):
+            // a bond's terms put in force whole, as a source offered them or
+            // a deployment admin states them, sourced under
+            // INSTRUMENT_FIELD_BOND; the terms offered that they now say are
+            // offers no longer. Refused naming the field on a record whose
+            // type is not bond (below).
+            instrument_value::Value::Bond(bond) => {
+                let wrong = meridian_domain::debt::bond_refused(bond);
+                if !wrong.is_empty() {
+                    for (field, words) in wrong {
+                        problems.push((
+                            RefusalReason::Incomplete,
+                            path(&if field == "bond" {
+                                field
+                            } else {
+                                format!("bond.{field}")
+                            }),
+                            words,
+                        ));
+                    }
+                    continue;
+                }
+                bond_at = Some(at);
+                let text = meridian_domain::instrument_type::terms_to_text(
+                    &meridian_domain::v1::InstrumentRecord {
+                        bond: Some(bond.clone()),
+                        ..Default::default()
+                    },
+                );
+                let before = record.listed_terms.clone();
+                if before == text {
+                    continue;
+                }
+                if !before.is_empty() {
+                    changes_held = true;
+                }
+                record.listed_terms = text;
+                record.set_source(Source {
+                    acting_through_delegation: delegation.to_string(),
+                    client_name: client.to_string(),
+                    prepared_call_id: prepared.to_string(),
+                    field: Field::Term,
+                    identifier: None,
+                    source: source.to_string(),
+                    person: person.to_string(),
+                    instance_id: String::new(),
+                    recorded_at_ns: now_ns,
+                    note: completion.note.trim().to_string(),
+                });
+                let words = |terms: &str| {
+                    meridian_domain::instrument_type::terms_from_text::<meridian_domain::v1::Bond>(
+                        terms,
+                    )
+                    .map(|held| meridian_domain::debt::bond_words(&held))
+                    .unwrap_or_default()
+                };
+                changes.push(Change {
+                    field: "bond".into(),
+                    scheme: String::new(),
+                    namespace: String::new(),
+                    before: words(&before),
+                    after: meridian_domain::debt::bond_words(bond),
+                    source: source.to_string(),
+                });
+                // A term offered that the terms in force now say is an offer
+                // no longer.
+                let terms = record.listed_terms.clone();
+                record.offers.retain(|offer| {
+                    offer.field != Field::Term
+                        || meridian_domain::debt::term_at(InstrumentType::Bond, &terms, &offer.path)
+                            .as_deref()
+                            != Some(offer.value.as_str())
+                });
                 continue;
             }
             instrument_value::Value::Identifier(identifier) => {
@@ -498,6 +565,16 @@ fn complete_one(
              market fund"
                 .into(),
         ));
+    }
+    // And a bond's terms to a bond (contract v30, W3.10; ruling 433).
+    if let Some(at) = bond_at {
+        if kind != InstrumentType::Bond {
+            problems.push((
+                RefusalReason::Incomplete,
+                format!("values[{at}].bond"),
+                "a bond's terms are set only on a record whose type is bond".into(),
+            ));
+        }
     }
     // And a binary event contract's to one (contract v19, W3.10).
     if !record.binary_event_contract.is_empty() && kind != InstrumentType::BinaryEventContract {
@@ -1520,6 +1597,28 @@ mod tests {
         let conflicts = store.conflicts().unwrap();
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].instrument_ids.contains(&l2));
+    }
+
+    /// Contract v30 (W3.10; ruling 433): a bond's terms are set only on a
+    /// record whose type is bond, refused naming the value.
+    #[test]
+    fn a_bonds_terms_on_a_record_not_a_bond_are_refused_naming_them() {
+        let store = MemoryStore::new();
+        let id = minted(&store, "symbol", "SNAP", "snaptrade");
+        let mut values = equity_in_usd();
+        values.push(value(
+            instrument_value::Value::Bond(meridian_domain::v1::Bond {
+                maturity_date: "2036-02-05".into(),
+                ..Default::default()
+            }),
+            "a prospectus",
+        ));
+        let result = one(&store, &completing(&id, 1, values, ""));
+        let refusal = result.refusal.clone().unwrap();
+        assert_eq!(refusal.fields, vec!["values[2].bond"]);
+        assert!(result
+            .detail
+            .contains("only on a record whose type is bond"));
     }
 
     #[test]

@@ -2682,13 +2682,45 @@ mod tests {
         assert_eq!(coupon.instance_id, "terrapin-1");
         let provenance: Provenance = prost::Message::decode(&coupon.provenance[..]).unwrap();
         assert_eq!(provenance.field, "coupon_rate");
-        // Never in force: the terms are the platform's as they were, and no
-        // wire member names a term until the contract gives one.
+        // Never in force: the terms are the platform's as they were. On the
+        // wire (contract v30, W3.10; ruling 433) the source's terms are one
+        // bond value, the record's terms with each laid on them, sourced
+        // naming the paths.
         assert_eq!(kept.listed_terms, held.listed_terms);
+        let wire = crate::record::to_wire(&kept);
         assert_eq!(
-            crate::record::to_wire(&kept).offers.len(),
-            crate::record::to_wire(&held).offers.len()
+            wire.offers.len(),
+            crate::record::to_wire(&held).offers.len() + 1
         );
+        let bond_offer = wire
+            .offers
+            .iter()
+            .find(|offer| {
+                matches!(
+                    offer.value.as_ref().and_then(|v| v.value.as_ref()),
+                    Some(meridian_domain::v1::instrument_value::Value::Bond(_))
+                )
+            })
+            .unwrap();
+        assert_eq!(bond_offer.instance_id, "terrapin-1");
+        let Some(meridian_domain::v1::instrument_value::Value::Bond(offered_bond)) =
+            bond_offer.value.as_ref().and_then(|v| v.value.clone())
+        else {
+            unreachable!()
+        };
+        assert_eq!(offered_bond.maturity_date, "2036-02-05", "the terms held");
+        assert_eq!(offered_bond.calls.len(), 2);
+        assert_eq!(offered_bond.calls[1].from_date, "2035-11-05");
+        assert_eq!(
+            offered_bond.municipal.unwrap().federal_tax_status,
+            meridian_domain::v1::FederalTaxStatus::Taxable as i32
+        );
+        assert!(bond_offer
+            .value
+            .as_ref()
+            .unwrap()
+            .source
+            .starts_with("offered by terrapin-1 from terrapin: coupon_rate, calls[0].kind"));
         assert_eq!(store.by_id("INS-01JBOND").unwrap().unwrap(), kept);
 
         // The same offer again changes nothing.
@@ -2753,6 +2785,83 @@ mod tests {
         assert_eq!(
             store.by_id("INS-01JBOND").unwrap().unwrap().version,
             fewer.version
+        );
+
+        // Contract v30 (W3.10; ruling 433): a deployment admin puts the
+        // offered terms in force whole, with the offer's source, sourced
+        // under INSTRUMENT_FIELD_BOND; the terms offered that they now say
+        // are offers no longer.
+        use meridian_domain::v1::{
+            instrument_value, CompleteInstrumentsRequest, InstrumentCompletion, InstrumentField,
+            InstrumentValue,
+        };
+        let wire = crate::record::to_wire(&fewer);
+        let offered = wire
+            .offers
+            .iter()
+            .filter_map(|offer| offer.value.clone())
+            .find(|value| matches!(value.value, Some(instrument_value::Value::Bond(_))))
+            .unwrap();
+        let accept = |value: InstrumentValue, version: i64| CompleteInstrumentsRequest {
+            completions: vec![InstrumentCompletion {
+                instrument_id: "INS-01JBOND".into(),
+                against_version: version,
+                values: vec![value],
+                note: "the issuer's offering memorandum".into(),
+            }],
+        };
+        let done = crate::complete::complete(
+            &store,
+            &accept(offered.clone(), fewer.version),
+            "local|ada",
+            NOW + 5,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(done.results[0].refusal.is_none(), "{:?}", done.results[0]);
+        let accepted = store.by_id("INS-01JBOND").unwrap().unwrap();
+        let in_force: Bond =
+            meridian_domain::instrument_type::terms_from_text(&accepted.listed_terms).unwrap();
+        let Some(instrument_value::Value::Bond(offered_bond)) = offered.value.clone() else {
+            unreachable!()
+        };
+        assert_eq!(in_force, offered_bond);
+        assert!(
+            terms_offered(&accepted).is_empty(),
+            "{:?}",
+            terms_offered(&accepted)
+        );
+        let wire = crate::record::to_wire(&accepted);
+        let sourced = wire
+            .sources
+            .iter()
+            .find(|source| source.field == InstrumentField::Bond as i32)
+            .unwrap();
+        assert_eq!(sourced.person, "local|ada");
+        assert_eq!(sourced.source, offered.source);
+        assert_eq!(wire.bond, Some(offered_bond.clone()));
+
+        // Refused, naming the field: a date that is no date, and a bond's
+        // terms on a record whose type is not bond.
+        let mut bad = offered_bond.clone();
+        bad.maturity_date = "2036-02-30".into();
+        let refused = crate::complete::complete(
+            &store,
+            &accept(
+                InstrumentValue {
+                    value: Some(instrument_value::Value::Bond(bad)),
+                    source: "a typo".into(),
+                },
+                accepted.version,
+            ),
+            "local|ada",
+            NOW + 6,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            refused.results[0].refusal.as_ref().unwrap().fields,
+            vec!["values[0].bond.maturity_date"]
         );
     }
 
