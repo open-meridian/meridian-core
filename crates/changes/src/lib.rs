@@ -38,6 +38,7 @@ pub use meridian_domain::v1::{Change, ReadChangesReply, ReadChangesRequest};
 use prost::Message;
 
 pub mod captured;
+pub mod group_commit;
 pub mod integrity;
 pub mod records;
 pub mod serving;

@@ -498,6 +498,24 @@ pub trait Store: Send + Sync {
     /// row key, a restatement, or unchanged; recorded at `now_ns`.
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded>;
 
+    /// Several batches of one dataset recorded as one (step 3d, group
+    /// commit; the resilience spec's section 6.5): numbered in turn, each
+    /// decided as [`Store::record`] decides a batch against what is held and
+    /// what the parts before it numbered, and answered with what it did, in
+    /// the parts' order. A store that commits them together tries each
+    /// again alone after an unexpected database error.
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        parts
+            .into_iter()
+            .map(|rows| self.record(dataset, rows, now_ns))
+            .collect()
+    }
+
     /// A batch of a dataset whose licence forbids keeping it: numbered from
     /// its partition's head as any batch is, each row version 1, its values
     /// kept nowhere; only that it was served, and to whom (W10.7).

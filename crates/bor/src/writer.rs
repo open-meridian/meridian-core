@@ -138,6 +138,10 @@ pub struct Writer {
     bus: Arc<Bus>,
     books: Mutex<Books>,
     bound: usize,
+    /// Whether the store tells each batch's commits itself (step 3d, group
+    /// commit): then they are published as the batch's one page, in order,
+    /// and not again as each act returns.
+    batched: bool,
 }
 
 impl Writer {
@@ -147,11 +151,24 @@ impl Writer {
 
     /// The same, its books bounded by `bound` bytes.
     pub fn bounded(inner: Arc<dyn Store>, bus: Arc<Bus>, bound: usize) -> Self {
+        let telling = Arc::clone(&bus);
+        let batched = inner.on_commit(Box::new(move |epoch, decided| {
+            let Some(first) = decided.first() else {
+                return;
+            };
+            let changes: Vec<meridian_changes::Change> = decided
+                .iter()
+                .map(|decided| decided.entry.to_change(epoch, meridian_changes::origin()))
+                .collect();
+            let after = first.entry.first_sequence.saturating_sub(1);
+            meridian_changes::publish(&telling, DOMAIN, after, &changes);
+        }));
         Self {
             inner,
             bus,
             books: Mutex::new(Books::default()),
             bound,
+            batched,
         }
     }
 
@@ -180,6 +197,9 @@ impl Store for Writer {
             .act(account_id, message_id, idempotency_key, request, decide)?;
         if let Acted::Committed(decided) = &acted {
             self.books().put(decided.book.clone(), self.bound);
+            if self.batched {
+                return Ok(acted);
+            }
             let change = decided
                 .entry
                 .to_change(self.inner.epoch(), meridian_changes::origin());

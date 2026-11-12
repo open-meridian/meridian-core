@@ -97,6 +97,12 @@ pub enum StoreError {
     /// decides again ([`with_bodies`]). Never leaves the store.
     #[error("the book holds no body for entries {0:?}")]
     BodiesNeeded(Vec<String>),
+
+    /// An account found, under its partition's lock, in another partition
+    /// than the one its act was queued in (step 3d; the resilience spec's
+    /// section 6.3): the act goes on in that one. Never leaves the store.
+    #[error("the account is in partition {0}")]
+    Moved(String),
 }
 
 /// How many times a decision may ask for bodies before it is a fault: each
@@ -466,6 +472,11 @@ pub struct Decided {
     pub reply: Vec<u8>,
 }
 
+/// What a store tells of a batch's commits, once they commit (step 3d,
+/// group commit): the epoch they committed under, and each decision in its
+/// order in the partition.
+pub type Committed = Box<dyn Fn(u64, &[&Decided]) + Send + Sync>;
+
 /// What acting did.
 pub enum Acted {
     /// The same command again, by its message identifier or its idempotency
@@ -493,6 +504,14 @@ pub trait Store: Send + Sync {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted>;
+
+    /// Have `observer` told of each batch's commits, in order, once they
+    /// commit (step 3d, group commit), and answer whether this store tells
+    /// it. One that does not leaves its wrapper to tell each act's own.
+    fn on_commit(&self, observer: Committed) -> bool {
+        let _ = observer;
+        false
+    }
 
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;

@@ -53,6 +53,7 @@ pub mod deadline;
 pub mod decide;
 pub mod factors;
 pub mod fixed_income_backfill;
+pub mod group_commit;
 pub mod ids;
 pub mod journal;
 pub mod lifecycle;

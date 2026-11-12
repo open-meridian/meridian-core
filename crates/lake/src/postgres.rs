@@ -1165,8 +1165,28 @@ SELECT body FROM lake_row
    AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
  ORDER BY dataset, row_key, version";
 
-impl Store for PostgresStore {
-    fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+/// The same refusal again, for each part of a batch.
+fn again(failed: &StoreError) -> StoreError {
+    match failed {
+        StoreError::Fenced(fenced) => StoreError::Fenced(*fenced),
+        StoreError::PositionMoved(words) => StoreError::PositionMoved(words.clone()),
+        StoreError::SchemaAhead(words) => StoreError::SchemaAhead(words.clone()),
+        StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
+    }
+}
+
+impl PostgresStore {
+    /// Batches of one dataset recorded in one transaction (step 3d, group
+    /// commit; section 6.5), numbered in turn as one, each answered with what
+    /// it did: the epoch checked once, every row's latest version and every
+    /// subject's last sequence read in one look each, and the rows written
+    /// in one INSERT (ruled 2026-11-10).
+    fn record_together(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Result<Vec<Recorded>> {
         // Adopted before a connection is taken: one store never waits on
         // itself for a second (step 3a).
         self.epoch_now()?;
@@ -1175,14 +1195,13 @@ impl Store for PostgresStore {
         let mut head = self.head(&mut tx, dataset)?;
         let epoch = self.fence.epoch();
         // Read what each row is decided against first, then number: the
-        // closures cannot borrow the transaction the inserts need. Each in
-        // one look for the whole batch -- every key's latest version, every
-        // subject's last sequence -- and the batch written in one INSERT
-        // (ruled 2026-11-10): before, two round trips a row.
-        let latest = latest_of_each(&mut tx, dataset, &rows)?;
-        let previous = previous_of_each(&mut tx, dataset, &rows)?;
-        let done = number(
-            rows,
+        // closures cannot borrow the transaction the inserts need.
+        let every: Vec<Observation> = parts.iter().flatten().cloned().collect();
+        let latest = latest_of_each(&mut tx, dataset, &every)?;
+        let previous = previous_of_each(&mut tx, dataset, &every)?;
+        drop(every);
+        let done = number_parts(
+            parts,
             &mut head,
             now_ns,
             |row| {
@@ -1197,12 +1216,60 @@ impl Store for PostgresStore {
                     .unwrap_or(0)
             },
         );
-        insert_all(&mut tx, dataset, &done.rows, epoch)?;
+        let numbered: Vec<Observation> = done
+            .iter()
+            .flat_map(|part| part.rows.iter().cloned())
+            .collect();
+        insert_all(&mut tx, dataset, &numbered, epoch)?;
         // Each row numbered version 1 is a key the partition held no
         // version of; every other replaces its key's last.
-        Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;
+        let new_keys: u64 = done.iter().map(|part| u64::from(part.recorded)).sum();
+        Self::move_head(&mut tx, dataset, head, new_keys)?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
+    }
+}
+
+impl Store for PostgresStore {
+    fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        Ok(self
+            .record_together(dataset, vec![rows], now_ns)?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        if parts.len() < 2 {
+            return parts
+                .into_iter()
+                .map(|rows| self.record(dataset, rows, now_ns))
+                .collect();
+        }
+        // Kept to be tried again alone: a batch is at most 512 KiB.
+        let each = parts.clone();
+        match self.record_together(dataset, parts, now_ns) {
+            Ok(done) => done.into_iter().map(Ok).collect(),
+            // An unexpected database error: each part tried again alone
+            // (section 6.5), so it is refused only for the part it was. A
+            // part that did commit is decided unchanged the second time.
+            Err(StoreError::Unavailable(failed)) => {
+                tracing::warn!(
+                    dataset,
+                    parts = each.len(),
+                    failed,
+                    "a batch's transaction failed: each of its parts is tried alone"
+                );
+                each.into_iter()
+                    .map(|rows| self.record(dataset, rows, now_ns))
+                    .collect()
+            }
+            Err(failed) => each.iter().map(|_| Err(again(&failed))).collect(),
+        }
     }
 
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {

@@ -410,6 +410,12 @@ pub struct Lake {
     /// recorded their switches (contract v30, W10.6; the resilience spec's
     /// section 8): rebuilt from the records at start.
     switches: Mutex<crate::switches::Switches>,
+    /// Each dataset's lane (step 3d, group commit; the resilience spec's
+    /// section 6.5): the batches waiting for its transaction in flight.
+    lanes: meridian_changes::group_commit::Lanes<
+        (Vec<Observation>, i64),
+        Result<crate::store::Recorded, String>,
+    >,
 }
 
 /// A gap asked again of its data plugin (W10.14): recovered once every want
@@ -802,6 +808,7 @@ impl Lake {
             read_handlers: RwLock::new(BTreeMap::new()),
             refetching: Mutex::new(BTreeMap::new()),
             switches: Mutex::new(switches),
+            lanes: Default::default(),
             store,
         })
     }
@@ -1948,12 +1955,7 @@ impl Lake {
     ) -> Result<crate::store::Recorded, String> {
         let config = self.config();
         if config.licence(dataset).kept {
-            let done = self
-                .store
-                .record(dataset, rows, now)
-                .map_err(|failed| failed.to_string())?;
-            self.publish_changes(dataset, &done, None, now);
-            return Ok(done);
+            return self.recorded_together(dataset, rows, now);
         }
         let readers: Vec<String> = self
             .wants
@@ -1972,6 +1974,44 @@ impl Lake {
         self.publish_changes(dataset, &served, Some(&readers), now);
         self.hand_to_waiting(want_id, Heard::Served(served.rows.clone()));
         Ok(served)
+    }
+
+    /// One dataset's rows of a batch kept through its lane (step 3d, group
+    /// commit; the resilience spec's section 6.5): at once where no
+    /// transaction of the dataset is in flight, else with the batches that
+    /// arrived meanwhile, in one transaction of at most 512 KiB. Its change
+    /// log's page is published by the batch, every part's in order, before
+    /// any part is answered.
+    fn recorded_together(
+        &self,
+        dataset: &str,
+        rows: Vec<Observation>,
+        now: i64,
+    ) -> Result<crate::store::Recorded, String> {
+        let bytes: usize = rows.iter().map(Observation::encoded_len).sum();
+        self.lanes.lane(dataset).commit(
+            (rows, now),
+            bytes,
+            |batch| {
+                // Recorded at the latest time of the batch's parts.
+                let now = batch.iter().map(|(_, at)| *at).max().unwrap_or(now);
+                let parts = batch.into_iter().map(|(rows, _)| rows).collect();
+                self.store
+                    .record_parts(dataset, parts, now)
+                    .into_iter()
+                    .map(|done| {
+                        let done = done.map_err(|failed| failed.to_string())?;
+                        self.publish_changes(dataset, &done, None, now);
+                        Ok(done)
+                    })
+                    .collect()
+            },
+            || {
+                Err(format!(
+                    "the batch of {dataset} this write waited in stopped before it committed"
+                ))
+            },
+        )
     }
 
     /// One dataset's part of a batch, once it committed: each row recorded

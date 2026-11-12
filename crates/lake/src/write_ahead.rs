@@ -45,6 +45,10 @@ pub const CONNECTIONS: u32 = 2;
 /// The most writes taken in one batch.
 pub const MOST_WRITES: usize = 256;
 
+/// The most bytes of writes taken in one batch, its last write's taken
+/// whole: the change log's page (step 3d, group commit; section 6.5).
+pub const BATCH_MOST_BYTES: usize = meridian_changes::group_commit::BATCH_MOST_BYTES;
+
 /// How long the writer waits before it asks again, after a batch the store
 /// could not take.
 const AGAIN_AFTER: Duration = Duration::from_millis(500);
@@ -506,7 +510,35 @@ pub async fn write_forever(
                     break;
                 }
             };
+            // Kept to be tried again one write at a time (step 3d, group
+            // commit; section 6.5): a batch is at most 512 KiB.
+            let each = (batch.len() > 1).then(|| batch.clone());
             let took = tokio::task::block_in_place(|| writer.take(batch));
+            let took = match (took, each) {
+                // An unexpected database error: each write tried alone, in
+                // the stream's order, so the batch is held up only by the
+                // write it was. One that fails alone too stops here, and the
+                // writer goes on from the position the lake holds, as ever.
+                (Err(StoreError::Unavailable(failed)), Some(each)) => {
+                    tracing::warn!(
+                        failed,
+                        writes = each.len(),
+                        "a batch from the write-ahead stream failed: each of its writes is tried alone"
+                    );
+                    let mut alone = Ok(Vec::new());
+                    for write in each {
+                        match tokio::task::block_in_place(|| writer.take(vec![write])) {
+                            Ok(answers) => answer(&client, answers).await,
+                            Err(failed) => {
+                                alone = Err(failed);
+                                break;
+                            }
+                        }
+                    }
+                    alone
+                }
+                (took, _) => took,
+            };
             match took {
                 Ok(answers) => answer(&client, answers).await,
                 Err(StoreError::Fenced(fenced)) => {
@@ -540,13 +572,19 @@ async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, St
         .await
         .ok_or("the stream's reader ended")?
         .map_err(|failed| failed.to_string())?;
+    let mut bytes = first.payload.len();
     batch.push(taken(&first)?);
     // What has already come, and no wait for more: a write alone is
     // recorded at once, and under load the writes that came while the last
-    // batch was recorded go together.
-    while batch.len() < MOST_WRITES {
+    // batch was recorded go together, until they reach 512 KiB (step 3d,
+    // group commit; section 6.5): the stream hands a write over whole, so
+    // the last one taken may carry the batch past it.
+    while batch.len() < MOST_WRITES && bytes < BATCH_MOST_BYTES {
         match futures_util::FutureExt::now_or_never(messages.next()) {
-            Some(Some(Ok(message))) => batch.push(taken(&message)?),
+            Some(Some(Ok(message))) => {
+                bytes += message.payload.len();
+                batch.push(taken(&message)?);
+            }
             Some(Some(Err(failed))) => return Err(failed.to_string()),
             Some(None) => return Err("the stream's reader ended".into()),
             None => break,

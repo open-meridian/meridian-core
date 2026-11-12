@@ -19,6 +19,9 @@
 //! against a projection; the projections are written beside the entry, read
 //! by the reads, and rebuilt from the journal whole by [`Store::rebuild`].
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use postgres::{GenericClient, IsolationLevel, Row, Transaction};
 use prost::Message;
 use r2d2_postgres::PostgresConnectionManager;
@@ -28,14 +31,15 @@ use meridian_domain::v1::{
 };
 
 use crate::book::{agreement_key, Book, Changes};
+use crate::group_commit::{Command, Decider, Lane, Pending};
 use crate::journal::{Body, Entry};
 use crate::migrations;
 use crate::order_reads;
 use crate::reads;
 use crate::store::{
-    first_partition_of, Acted, AttributesRead, BreaksRead, Decide, FiguresRead, HistoryRead,
-    InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead, Record,
-    Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
+    first_partition_of, Acted, AttributesRead, BreaksRead, Committed, Decide, Decided, FiguresRead,
+    HistoryRead, InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead,
+    Record, Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
 thread_local! {
@@ -105,6 +109,13 @@ pub struct PostgresStore {
     /// Its database's identity as its connections found it (contract v30,
     /// stage C): a new timeline raises the epoch before a command there.
     watch: std::sync::Arc<meridian_changes::timeline::Watch>,
+    /// Each partition's lane: the commands waiting for its transaction in
+    /// flight (step 3d, group commit).
+    lanes: Mutex<HashMap<String, Arc<Lane>>>,
+    /// The partition each account was last found in.
+    placed: Mutex<HashMap<String, String>>,
+    /// Told of each batch's commits, in their order, once it commits.
+    committed: Mutex<Option<Committed>>,
 }
 
 impl PostgresStore {
@@ -127,6 +138,9 @@ impl PostgresStore {
             snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
             fence: meridian_changes::Fence::new(),
             watch,
+            lanes: Mutex::default(),
+            placed: Mutex::default(),
+            committed: Mutex::default(),
         })
     }
 
@@ -1413,68 +1427,219 @@ fn decoded<M: Message + Default>(rows: Vec<Row>, column: usize) -> Result<Vec<M>
         .collect()
 }
 
-impl Store for PostgresStore {
-    fn act(
-        &self,
-        account_id: &str,
-        message_id: &str,
-        idempotency_key: &str,
-        request: &[u8],
-        decide: &mut Decide<'_>,
-    ) -> Result<Acted> {
-        // The writer's epoch, adopted before a connection is taken, so a
-        // store of one connection never waits on itself (step 3a).
-        if self.fence.epoch() == 0 {
-            self.adopt()?;
+/// How many times an act follows its account to another partition before it
+/// is refused: a move between the guess and the lock is rare, two rarer.
+const MOVES_FOLLOWED: usize = 4;
+
+/// A batch's transaction that did not commit.
+enum Unbatched {
+    /// Nothing in it can commit now -- no connection, the epoch fenced, the
+    /// commit itself failed -- so each command is answered this.
+    Whole(StoreError),
+    /// An unexpected database error mid-batch: the batch is tried again one
+    /// command at a time, so it is refused only for the command it was.
+    Broken(StoreError),
+}
+
+/// The same refusal again, for each command of a batch.
+fn again(failed: &StoreError) -> StoreError {
+    match failed {
+        StoreError::Fenced(fenced) => StoreError::Fenced(*fenced),
+        StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
+        other => StoreError::Unavailable(other.to_string()),
+    }
+}
+
+impl PostgresStore {
+    /// The partition `account_id` was last found in by this store; where it
+    /// has not been, the partition an account starts in.
+    fn placed(&self, account_id: &str) -> String {
+        self.placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| first_partition_of(account_id).to_string())
+    }
+
+    fn place(&self, account_id: &str, partition: &str) {
+        let mut placed = self.placed.lock().expect("placements poisoned");
+        if placed.get(account_id).map(String::as_str) != Some(partition) {
+            placed.insert(account_id.to_string(), partition.to_string());
         }
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        let partition: String = tx
+    }
+
+    /// `partition`'s lane: the commands waiting for its transaction in flight.
+    fn lane(&self, partition: &str) -> Arc<Lane> {
+        Arc::clone(
+            self.lanes
+                .lock()
+                .expect("lanes poisoned")
+                .entry(partition.to_string())
+                .or_default(),
+        )
+    }
+
+    /// One batch of `partition`'s commands in one transaction (section 6.5),
+    /// each answered its own outcome in order. An unexpected database error
+    /// mid-batch tries the batch again one command at a time.
+    fn batch(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> Vec<Result<Acted>> {
+        let outcomes = match self.try_batch(partition, batch, decider) {
+            Ok(outcomes) => outcomes,
+            Err(Unbatched::Broken(failed)) if batch.len() > 1 => {
+                tracing::warn!(
+                    partition,
+                    commands = batch.len(),
+                    %failed,
+                    "a batch's transaction failed: each of its commands is tried alone"
+                );
+                batch
+                    .iter()
+                    .map(|pending| {
+                        match self.try_batch(partition, std::slice::from_ref(pending), decider) {
+                            Ok(mut alone) => alone.pop().unwrap_or_else(|| Err(again(&failed))),
+                            Err(Unbatched::Whole(failed) | Unbatched::Broken(failed)) => {
+                                Err(failed)
+                            }
+                        }
+                    })
+                    .collect()
+            }
+            Err(Unbatched::Whole(failed) | Unbatched::Broken(failed)) => {
+                return batch.iter().map(|_| Err(again(&failed))).collect();
+            }
+        };
+        // Its commits told in their order, the batch's whole page at once.
+        if let Some(observer) = self.committed.lock().expect("observer poisoned").as_ref() {
+            let committed: Vec<&Decided> = outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    Ok(Acted::Committed(decided)) => Some(decided.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if !committed.is_empty() {
+                observer(self.fence.epoch(), &committed);
+            }
+        }
+        outcomes
+    }
+
+    fn try_batch(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> std::result::Result<Vec<Result<Acted>>, Unbatched> {
+        let whole = |failed: postgres::Error| Unbatched::Whole(unavailable(failed));
+        let mut conn = self.conn().map_err(Unbatched::Whole)?;
+        let mut tx = conn.transaction().map_err(whole)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&partition_lock(partition)],
+        )
+        .map_err(whole)?;
+        // The head under its lock, its epoch the writer's (step 3a), checked
+        // once for the batch (section 6.5): a batch commits only while the
+        // head row's epoch is its own.
+        let held = tx
+            .query_opt(
+                "SELECT sequence, epoch, last_digest FROM book_partition_head WHERE partition = $1 FOR UPDATE",
+                &[&partition],
+            )
+            .map_err(whole)?
+            .ok_or_else(|| {
+                Unbatched::Whole(StoreError::Unavailable(format!(
+                    "the book has no partition {partition}"
+                )))
+            })?;
+        self.fence
+            .admits(held.get::<_, i64>(1) as u64)
+            .map_err(|fenced| Unbatched::Whole(fenced.into()))?;
+        // The epoch the entries are committed under: the head row's, which
+        // the fence has just admitted as the writer's own -- never one read
+        // before the connection was taken, which a connection opened on a
+        // new database timeline raises (contract v30, stage C; failover-
+        // repeat 43015006850, torn-write).
+        let epoch = held.get::<_, i64>(1) as u64;
+        let mut head = held.get::<_, i64>(0).max(0) as u64;
+        // The partition's last digest, its chain's end (step 3b).
+        let mut last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
+        let began = head;
+        let mut outcomes = Vec::with_capacity(batch.len());
+        for pending in batch {
+            let outcome = self
+                .one(
+                    &mut tx,
+                    partition,
+                    epoch,
+                    (&mut head, &mut last_digest),
+                    pending,
+                    decider,
+                )
+                .map_err(Unbatched::Broken)?;
+            outcomes.push(outcome);
+        }
+        if head != began {
+            tx.execute(
+                "UPDATE book_partition_head SET sequence = $1, last_digest = $3 WHERE partition = $2",
+                &[&(head as i64), &partition, &last_digest],
+            )
+            .map_err(|failed| Unbatched::Broken(unavailable(failed)))?;
+        }
+        tx.commit().map_err(whole)?;
+        Ok(outcomes)
+    }
+
+    /// One command of a batch, in its transaction: its outcome, or the
+    /// database error that broke the batch. A refusal is its own and
+    /// writes nothing; the batch goes on.
+    fn one(
+        &self,
+        tx: &mut Transaction<'_>,
+        partition: &str,
+        epoch: u64,
+        (head, last_digest): (&mut u64, &mut Vec<u8>),
+        pending: &Pending,
+        decider: &mut Decider<'_, '_>,
+    ) -> Result<Result<Acted>> {
+        let Command {
+            account_id,
+            message_id,
+            idempotency_key,
+            request,
+        } = &pending.command;
+        // Its account's partition read again under the partition's lock
+        // (section 6.3): an account found in another is acted on there.
+        let now: String = tx
             .query_opt(
                 "SELECT partition FROM book_account WHERE account_id = $1",
-                &[&account_id],
+                &[account_id],
             )
             .map_err(unavailable)?
             .map(|row| row.get(0))
             .unwrap_or_else(|| first_partition_of(account_id).to_string());
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&partition_lock(&partition)],
-        )
-        .map_err(unavailable)?;
-        // The head under its lock, its epoch the writer's (step 3a): a
-        // command commits only while the head row's epoch is its own.
-        let held = tx
-            .query_one(
-                "SELECT sequence, epoch, last_digest FROM book_partition_head WHERE partition = $1 FOR UPDATE",
-                &[&partition],
-            )
-            .map_err(unavailable)?;
-        self.fence.admits(held.get::<_, i64>(1) as u64)?;
-        // The epoch the entry is committed under: the head row's, which the
-        // fence has just admitted as the writer's own -- never one read
-        // before the connection was taken, which a connection opened on a
-        // new database timeline raises (contract v30, stage C). Read before,
-        // an entry was kept at the old epoch after the raise's first one
-        // (failover-repeat 43015006850, torn-write: "book: 1 commit(s) at
-        // an epoch below one before it").
-        let epoch = held.get::<_, i64>(1) as u64;
-        let head: i64 = held.get(0);
-        // The partition's last digest, its chain's end (step 3b).
-        let last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
-
+        if now != partition {
+            return Ok(Err(StoreError::Moved(now)));
+        }
         // A duplicate is answered with the first's reply, nothing applied:
         // the same message, or the same command under the same key. Another
-        // command under a key the account holds is refused (Q12).
+        // command under a key the account holds is refused (Q12). A batch's
+        // earlier command is seen: it is in this transaction.
         if !message_id.is_empty() {
             if let Some(row) = tx
                 .query_opt(
                     "SELECT reply FROM book_entry WHERE message_id = $1",
-                    &[&message_id],
+                    &[message_id],
                 )
                 .map_err(unavailable)?
             {
-                return Ok(Acted::Duplicate(row.get(0)));
+                return Ok(Ok(Acted::Duplicate(row.get(0))));
             }
         }
         if !idempotency_key.is_empty() {
@@ -1482,30 +1647,37 @@ impl Store for PostgresStore {
                 .query_opt(
                     "SELECT reply, request FROM book_entry
                       WHERE account_id = $1 AND idempotency_key = $2",
-                    &[&account_id, &idempotency_key],
+                    &[account_id, idempotency_key],
                 )
                 .map_err(unavailable)?
             {
                 let held: Vec<u8> = row.get(1);
-                if held != request {
-                    return Err(StoreError::conflict(idempotency_key, account_id));
+                if &held != request {
+                    return Ok(Err(StoreError::conflict(idempotency_key, account_id)));
                 }
-                return Ok(Acted::Duplicate(row.get(0)));
+                return Ok(Ok(Acted::Duplicate(row.get(0))));
             }
         }
 
         // From its latest snapshot and the journal's tail (contract v25,
         // W9.10), never the whole journal once one is kept.
-        let (mut book, replayed) = book_from(&mut tx, account_id, &partition)?;
-        // Each entry's body the decision asks for, read in this transaction
-        // (contract v26, W9.10), and the decision made again with it.
-        let mut decided = crate::store::with_bodies(
-            &mut book,
-            |account, ids| bodies_of(&mut tx, account, ids),
-            |book| decide(book, head.max(0) as u64),
-        )?;
+        let (book, replayed) = book_from(tx, account_id, partition)?;
+        // Decided by its own caller, each entry's body the decision asks for
+        // read in this transaction (contract v26, W9.10). A read that failed
+        // broke the transaction, and so the batch.
+        let mut broke = None;
+        let decided = pending.decide(decider, book, *head, |account, ids| {
+            bodies_of(tx, account, ids).inspect_err(|failed| broke = Some(again(failed)))
+        });
+        if let Some(failed) = broke {
+            return Err(failed);
+        }
+        let mut decided = match decided {
+            Ok(decided) => decided,
+            Err(refused) => return Ok(Err(refused)),
+        };
         // Its place in the partition's chain (step 3b, integrity at rest).
-        decided.entry.previous_digest = last_digest;
+        decided.entry.previous_digest = last_digest.clone();
         decided.entry.digest = meridian_changes::integrity::chained(
             &decided.entry.previous_digest,
             &decided.entry.canonical(),
@@ -1515,7 +1687,7 @@ impl Store for PostgresStore {
         tx.execute(
             "INSERT INTO book_account (account_id, partition) VALUES ($1, $2)
              ON CONFLICT (account_id) DO NOTHING",
-            &[&account_id, &partition],
+            &[account_id, &partition],
         )
         .map_err(unavailable)?;
         tx.execute(
@@ -1541,25 +1713,16 @@ impl Store for PostgresStore {
                 &entry.body.to_bytes(),
                 &decided.reply,
                 &actor_named(entry.meta.actor.as_ref()),
-                &request,
+                request,
                 &(epoch as i64),
                 &entry.previous_digest,
                 &entry.digest,
             ],
         )
         .map_err(unavailable)?;
-        tx.execute(
-            "UPDATE book_partition_head SET sequence = $1, last_digest = $3 WHERE partition = $2",
-            &[
-                &(entry.last_sequence as i64),
-                &entry.partition,
-                &entry.digest,
-            ],
-        )
-        .map_err(unavailable)?;
-        project(&mut tx, account_id, &decided.changes)?;
+        project(tx, account_id, &decided.changes)?;
         project_order_entries(
-            &mut tx,
+            tx,
             account_id,
             &entry.entry_id,
             entry.first_sequence,
@@ -1568,10 +1731,65 @@ impl Store for PostgresStore {
         // A snapshot once the tail since the last one reaches the interval,
         // as at this entry, in the same transaction.
         if replayed.entries as u64 + 1 >= self.snapshot_interval {
-            keep_snapshot(&mut tx, &decided.book, entry.cause.committed_at_ns)?;
+            keep_snapshot(tx, &decided.book, entry.cause.committed_at_ns)?;
         }
-        tx.commit().map_err(unavailable)?;
-        Ok(Acted::Committed(Box::new(decided)))
+        *head = entry.last_sequence;
+        last_digest.clone_from(&entry.digest);
+        Ok(Ok(Acted::Committed(Box::new(decided))))
+    }
+}
+
+impl Store for PostgresStore {
+    fn act(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // The writer's epoch, adopted before a connection is taken, so a
+        // store of one connection never waits on itself (step 3a).
+        if self.fence.epoch() == 0 {
+            self.adopt()?;
+        }
+        let command = Command {
+            account_id: account_id.to_string(),
+            message_id: message_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            request: request.to_vec(),
+        };
+        // The partition the account was last found in: a guess its batch
+        // checks under the partition's lock (step 3d; section 6.3), and an
+        // account found elsewhere there is acted on in its partition.
+        let mut partition = self.placed(account_id);
+        for _ in 0..MOVES_FOLLOWED {
+            let lane = self.lane(&partition);
+            let acted =
+                crate::group_commit::act(&lane, command.clone(), decide, |batch, decider| {
+                    self.batch(&partition, batch, decider)
+                });
+            match acted {
+                Err(StoreError::Moved(now)) => {
+                    self.place(account_id, &now);
+                    partition = now;
+                }
+                other => {
+                    if other.is_ok() {
+                        self.place(account_id, &partition);
+                    }
+                    return other;
+                }
+            }
+        }
+        Err(StoreError::Unavailable(format!(
+            "account {account_id} was found in another partition {MOVES_FOLLOWED} times while it was acted on"
+        )))
+    }
+
+    fn on_commit(&self, observer: Committed) -> bool {
+        *self.committed.lock().expect("observer poisoned") = Some(observer);
+        true
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {

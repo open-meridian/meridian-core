@@ -732,6 +732,20 @@ impl Store for HotStore {
         Ok(done)
     }
 
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        let done = self.inner.record_parts(dataset, parts, now_ns);
+        // Held in the parts' order, as they were numbered.
+        for part in done.iter().flatten() {
+            self.committed(dataset, &part.rows);
+        }
+        done
+    }
+
     fn write_ahead_position(
         &self,
         stream: &str,

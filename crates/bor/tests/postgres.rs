@@ -1894,6 +1894,182 @@ async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_beh
     });
 }
 
+/// Group commit (step 3d; the resilience spec's sections 6.5 and 15): the
+/// commands arriving while a partition's transaction is in flight join the
+/// next, each decided and refused alone, the epoch checked once and the
+/// batch's commits told in their order; and a batch an unexpected database
+/// error broke is tried again one command at a time, so only the command it
+/// was is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alone() {
+    use meridian_bor::decide::{set_attribute, Context};
+    use meridian_bor::store::{Acted, Decided, StoreError};
+    use std::sync::Mutex;
+    let store = blocking(store);
+    // Each batch's commits as the store tells them: how many, and their
+    // sequences, which run on from one to the next.
+    let batches: Arc<Mutex<Vec<Vec<u64>>>> = Arc::default();
+    {
+        let batches = Arc::clone(&batches);
+        assert!(store.on_commit(Box::new(move |_, decided| {
+            batches.lock().unwrap().push(
+                decided
+                    .iter()
+                    .map(|decided| decided.entry.first_sequence)
+                    .collect(),
+            );
+        })));
+    }
+    let run = unique("GC");
+    let shared_entry = format!("ENT-{run}-shared");
+    const COMMANDS: usize = 24;
+    const REFUSED: usize = 7;
+    const BROKEN: usize = 11;
+    const SAME_ENTRY_AS: usize = 3;
+    let act = |n: usize| {
+        let store = Arc::clone(&store);
+        let (account, shared) = (format!("ACC-{run}-{n}"), shared_entry.clone());
+        std::thread::spawn(move || {
+            let request = SetAccountAttributeRequest {
+                account_id: account.clone(),
+                attribute: Some(
+                    set_account_attribute_request::Attribute::WaitsForCompliance(false),
+                ),
+                reason: "group commit's test".into(),
+            };
+            let ctx = Context {
+                acting_for: PERSON.into(),
+                ..Default::default()
+            };
+            Store::act(
+                store.as_ref(),
+                &account,
+                "",
+                &format!("{account}-key"),
+                &request.encode_to_vec(),
+                &mut |book, head| {
+                    if n == 0 {
+                        // The first batch held in flight while the others
+                        // queue behind it.
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    if n == REFUSED {
+                        return Err(StoreError::Invalid(format!("{n} is refused alone")));
+                    }
+                    let mut made = set_attribute(book, head, &ctx, &request)?;
+                    if n == SAME_ENTRY_AS || n == BROKEN {
+                        // An entry ID taken twice: the second's insert breaks
+                        // its batch's transaction.
+                        made.entry.entry_id = shared.clone();
+                    }
+                    Ok(Decided {
+                        entry: made.entry,
+                        book: made.book,
+                        changes: made.changes,
+                        reply: n.to_string().into_bytes(),
+                    })
+                },
+            )
+        })
+    };
+    let first = act(0);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let others: Vec<_> = (1..COMMANDS).map(act).collect();
+    let mut outcomes = vec![first.join().unwrap()];
+    outcomes.extend(others.into_iter().map(|other| other.join().unwrap()));
+    let mut committed = 0;
+    for (n, outcome) in outcomes.into_iter().enumerate() {
+        match (n, outcome) {
+            (REFUSED, Err(StoreError::Invalid(words))) => assert!(words.contains("alone")),
+            (REFUSED, other) => panic!("{n} was not refused alone: {:?}", other.is_ok()),
+            (BROKEN, Err(StoreError::Unavailable(words))) => {
+                assert!(words.contains("duplicate key"), "{words}")
+            }
+            (BROKEN, other) => panic!("{n} committed an entry ID taken: {:?}", other.is_ok()),
+            (_, Ok(Acted::Committed(decided))) => {
+                assert_eq!(decided.reply, n.to_string().into_bytes());
+                committed += 1;
+            }
+            (_, Err(failed)) => panic!("{n} was refused for another's sake: {failed}"),
+            (_, Ok(Acted::Duplicate(_))) => panic!("{n} answered as a duplicate"),
+        }
+    }
+    assert_eq!(committed, COMMANDS - 2);
+    // Each command's account holds its one entry, the refused none.
+    blocking(|| {
+        for n in 0..COMMANDS {
+            let held = store.journal(&format!("ACC-{run}-{n}")).unwrap().len();
+            let expected = usize::from(n != REFUSED && n != BROKEN);
+            assert_eq!(held, expected, "account {n}");
+        }
+    });
+    let batches = batches.lock().unwrap().clone();
+    let told: usize = batches.iter().map(Vec::len).sum();
+    assert_eq!(told, committed, "every commit told once: {batches:?}");
+    assert!(
+        batches.iter().any(|batch| batch.len() > 1),
+        "the commands queued behind the first committed together: {batches:?}"
+    );
+    for batch in &batches {
+        assert!(
+            batch.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "a batch's commits told in their order: {batch:?}"
+        );
+    }
+    // Its connections closed off the runtime's threads.
+    blocking(move || drop(store));
+}
+
+/// An act reads its account's partition under that partition's lock (step
+/// 3d; the resilience spec's section 6.3): an account found in another
+/// partition than the one its act was queued in -- moved between the
+/// guess and the lock -- is acted on in its partition now, numbered there.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_act_reads_its_partition_under_the_lock_and_follows_the_account_moved() {
+    let (url, store) = blocking(isolated);
+    let (bus, store) = wired_with(store);
+    let mut admin = blocking(|| postgres::Client::connect(&url, postgres::NoTls).unwrap());
+    // A second partition beside P0, as `bor.partitions` makes one (stage B).
+    blocking(|| {
+        admin
+            .batch_execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch, origin)
+                 SELECT 'P1', 0, epoch, origin FROM book_partition_head WHERE partition = 'P0'",
+            )
+            .unwrap()
+    });
+    let account = unique("MOVED");
+    let set = |reason: &str| SetAccountAttributeRequest {
+        account_id: account.clone(),
+        attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+        reason: reason.into(),
+    };
+    send(&bus, SET_ACCOUNT_ATTRIBUTE, &set("first"), Some(PERSON))
+        .await
+        .unwrap();
+    // Moved beneath the store, which last found it in P0.
+    blocking(|| {
+        admin
+            .execute(
+                "UPDATE book_account SET partition = 'P1' WHERE account_id = $1",
+                &[&account],
+            )
+            .unwrap()
+    });
+    send(&bus, SET_ACCOUNT_ATTRIBUTE, &set("second"), Some(PERSON))
+        .await
+        .unwrap();
+    let journal = blocking(|| store.journal(&account)).unwrap();
+    let partitions: Vec<&str> = journal.iter().map(|e| e.partition.as_str()).collect();
+    assert_eq!(partitions, ["P0", "P1"], "the second act numbered in P1");
+    let heads = blocking(|| store.heads()).unwrap();
+    assert_eq!(heads.get("P1"), Some(&1));
+    blocking(move || {
+        drop(admin);
+        drop(store);
+    });
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the
