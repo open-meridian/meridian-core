@@ -3633,6 +3633,99 @@ def verdict(s):
     return 0
 
 
+# ── Two writer groups (step 3d, stage G) ──────────────────────────────────
+
+# The internal topics a write is handed to its owning group on (the
+# resilience spec's section 6.7).
+HANDED_ON = ("platform.lake.internal.record", "platform.book.internal.command")
+
+
+def handed_on_counts():
+    """Each internal hand-off topic's messages, by its subscription's queue
+    group, as the broker's own monitoring counts them (`/connz`, on the
+    server's loopback)."""
+    counts = {}
+    for server in broker_servers():
+        said = monitored(server, ["/connz?subs=detail&limit=4096"])
+        status, text = said.get("/connz?subs=detail&limit=4096", (0, ""))
+        if status != 200:
+            continue
+        for connection in json.loads(text).get("connections", []):
+            for sub in connection.get("subscriptions_list_detail", []) or []:
+                if sub.get("subject") in HANDED_ON:
+                    key = (sub["subject"], sub.get("qgroup", ""))
+                    counts[key] = counts.get(key, 0) + int(sub.get("msgs", 0))
+    return counts
+
+
+def writer_groups(s):
+    """The lake and the book at two writer groups (step 3d, stage G; the
+    resilience spec's sections 6.1, 6.3 and 6.7), last, under the driver's
+    load: `lake.writerGroups` and `bor.writerGroups` set to 2 by an upgrade,
+    as `meridian upgrade-deployment --set` sets them; each group's writer
+    serving; the driver's prices and orders acknowledged again and kept; the
+    driver's dataset (`drive-data:drive`, group 1's) and its accounts' P0
+    (group 1's) written by group 1, under group 1's own epoch, the flood's
+    dataset (group 0's) and each store's `control` under group 0's; the
+    lake's assignment recorded in its control partition; and writes handed
+    to their owners on the internal topics, as the broker counts them."""
+    print("G: the lake and the book at two writer groups", flush=True)
+    began_ms = int(time.time() * 1000)
+    upgraded = upgrade("lake.writerGroups=2", "bor.writerGroups=2")
+    s.check(upgraded.returncode == 0, "writer groups: helm upgrade to two writer groups applied"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        return
+    for component in ("lake", "bor"):
+        for deployment in (f"{FULL}-{component}", f"{FULL}-{component}-group-1"):
+            rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+                         "--timeout=420s", check=False)
+            s.check(rolled.returncode == 0, f"writer groups: {deployment} rolled out and ready")
+    groups_ok = happens(lambda: all(any(ready(p) for p in pods(c)) for c in
+                                    ("lake", "lake-group-1", "bor", "bor-group-1")), 300)
+    s.check(groups_ok, "writer groups: each store's group 0 and group 1 writer ready")
+    since_ms = int(time.time() * 1000)
+    writing = happens(lambda: all(sum(1 for at in driver_acked().get(kind, {}).values() if at > since_ms) >= 20
+                                  for kind in ("price", "order")), 300, every=3)
+    s.check(writing, "writer groups: the driver's prices and orders acknowledged again at two groups")
+    since_ns = since_ms * 1_000_000
+    # The lake: each group's datasets under its own epoch.
+    lake_one = psql("select epoch from lake_writer_group where writer_group = 1").strip()
+    control = psql("select epoch from lake_change_head where partition = 'control'").strip()
+    drive = psql("select epoch from lake_partition where dataset = 'drive-data:drive'").strip()
+    flood = psql("select epoch from lake_partition where dataset = 'drive-flood:drive'").strip()
+    s.check(lake_one and drive == lake_one and control != lake_one,
+            f"writer groups: the lake's group 1 owns drive-data:drive under its own epoch "
+            f"(group 1 {lake_one or 'none'}, the dataset {drive}, control {control})")
+    s.check(flood == control, f"writer groups: the lake's group 0 keeps drive-flood:drive under control's epoch "
+            f"({flood} and {control})")
+    by_one = psql("select count(*) from lake_row where dataset = 'drive-data:drive' "
+                  f"and recorded_at_ns >= {since_ns} and epoch = {lake_one or 0}").strip()
+    s.check(by_one.isdigit() and int(by_one) > 0,
+            f"writer groups: the driver's prices committed by the lake's group 1 since ({by_one} rows)")
+    owners = psql("select count(*) from lake_control_change where kind = 'meridian.v1.PartitionOwner'").strip()
+    s.check(owners.isdigit() and int(owners) > 0,
+            f"writer groups: the lake's datasets' groups recorded in its control partition ({owners} records)")
+    # The book: P0 group 1's, control group 0's, each its own epoch.
+    p0 = psql("select epoch from book_partition_head where partition = 'P0'").strip()
+    book_control = psql("select epoch from book_partition_head where partition = 'control'").strip()
+    s.check(p0 and book_control and p0 != book_control,
+            f"writer groups: the book's P0 (group 1's) and control (group 0's) under their own epochs "
+            f"({p0} and {book_control})")
+    acted = psql("select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
+                 f"and committed_at_ns >= {since_ns} and partition = 'P0' and epoch = {p0 or 0}").strip()
+    s.check(acted.isdigit() and int(acted) > 0,
+            f"writer groups: the driver's orders committed in P0 by the book's group 1 since ({acted} entries)")
+    # Handed on: each internal topic's messages to its group-1 queue group.
+    counts = handed_on_counts()
+    for topic in HANDED_ON:
+        to_one = sum(n for (subject, group), n in counts.items() if subject == topic and group.endswith(".group-1"))
+        s.check(to_one > 0, f"writer groups: writes handed to group 1 on {topic} ({to_one} as the broker counts)")
+    s.note(f"writer groups: the hand-offs by topic and queue group: {counts}")
+    driver_rpo_held(s, "writer groups")
+    print(f"G: two writer groups held, {(time.time() * 1000 - began_ms) / 1000:.0f}s", flush=True)
+
+
 def main():
     s = Scorecard()
     asked = [f for f in os.environ.get("FAILURE", "").split(",") if f]
@@ -3704,6 +3797,13 @@ def main():
             driver_history(s)
         except SystemExit as stopped:
             s.check(False, f"the write driver's record could not be read: {stopped}")
+    # Two writer groups (step 3d, stage G), last of the tolerant run's, with
+    # every class run: its stores' groups then stay as this leaves them.
+    if PROFILE == "tolerant" and DRIVEN and not asked:
+        try:
+            writer_groups(s)
+        except SystemExit as stopped:
+            s.check(False, f"writer groups: {stopped}")
     if PROFILE == "reconfigure":
         # Last: a restore to a time takes back what the driver wrote after
         # it, which every reading above holds kept.
