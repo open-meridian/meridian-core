@@ -40107,13 +40107,20 @@
     {
       "name": "meridian.v1.ListSourcePrioritiesReply.priorities",
       "type": "repeated message SourcePriority",
-      "empty": "none set",
+      "empty": "none set, or none naming a dataset the asker may read",
       "intent": "lists the deployment's priorities",
-      "meaning": "each with who set it and when",
+      "meaning": "each with who set it and when: to the dashboard every one whole; from v30 to a plugin of the eight roles that read the lake, each with only the datasets it is entitled to read, a priority with none left not answered (W10.2; ruling 454; step 3c's question 7)",
       "not_meaning": "the datasets themselves",
       "filled": "decided",
       "filled_by": "lake",
       "since": "v18",
+      "changes": [
+        {
+          "version": "v30",
+          "kind": "clarified",
+          "what": "read by the eight roles that read the lake too, each answered within its entitlements (ruling 454)"
+        }
+      ],
       "stability": "preview",
       "store": "lake"
     },
@@ -58215,7 +58222,7 @@
       "unit": "pods of one instance",
       "empty": "0: one pod, as 1 is",
       "intent": "asks for an instance's shards (W8.3; the launch setting approved by 1057)",
-      "meaning": "the pods of the instance that share its subjects by rendezvous hashing, at most the version's most_shards; one more is refused INVALID_ARGUMENT naming shards; built with 3d",
+      "meaning": "the pods of the instance that share its subjects by rendezvous hashing, at most the version's most_shards; one more is refused INVALID_ARGUMENT naming shards; kept on the launch from 3c, the pods built with 3d",
       "not_meaning": "separate instances: a shard is a pod of the one instance",
       "filled": "entered",
       "filled_by": "dashboard",
@@ -58228,7 +58235,7 @@
       "type": "boolean",
       "empty": "false: no standby pod",
       "intent": "asks for an instance's standby pod (W8.3; the launch setting approved by 1057)",
-      "meaning": "true: a second pod whose sidecar holds no lease and whose role classes' run() starts only when it takes the instance's Lease; recommended for oms, ems, connectivity and live data instances; built with 3d",
+      "meaning": "true: a second pod whose sidecar holds no lease and whose role classes' run() starts only when it takes the instance's Lease; recommended for oms, ems, connectivity and live data instances; kept on the launch from 3c, the pod built with 3d",
       "not_meaning": "a second instance, or a shard: a standby shares nothing until it takes over",
       "filled": "entered",
       "filled_by": "dashboard",
