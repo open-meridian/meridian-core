@@ -109,6 +109,50 @@ async fn a_standby_follows_its_writers_tail_and_reads_a_page_it_missed() {
     following.abort();
 }
 
+/// A page missed whose catch-up found the writer's head below what this
+/// member applied (a member answering behind, a moment after a takeover)
+/// hands the partition to the read-back, and the read-back finding the
+/// record holds all it applied leaves it caught up: the gap's own wait is
+/// let go, never left to grow the member's lag for good (failover-repeat
+/// 43146764089, ha run 1: the lake's reader unready after the apiserver
+/// class, no warning said).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_that_found_the_head_below_and_a_read_back_that_found_it_whole_leave_no_lag() {
+    let bus = Arc::new(Bus::single(
+        "member-test-diverged-kept",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Log {
+        head: AtomicU64::new(0),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let following = tokio::spawn(follow(
+        Arc::clone(&bus),
+        "book",
+        Duration::from_secs(1),
+        None,
+    ));
+    until("the standby's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.head.store(3, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 2, &[change(3)]);
+    until("3 held", || said().partitions() == vec!["P0".to_string()]).await;
+    // A page after a gap, read from a log whose head is below what was
+    // applied: the catch-up finds it diverged.
+    log.head.store(2, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 5, &[change(6)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The record holds it all after all: the read-back finds it kept, and
+    // the member is not left behind.
+    log.head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    until("no lag after the read-back", || said().lag_ms() < 1_000).await;
+    following.abort();
+}
+
 /// What a reader applied, in order, and what it reset.
 #[derive(Default)]
 struct Applied {

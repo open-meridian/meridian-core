@@ -1006,9 +1006,19 @@ async fn follow(
                             }
                             // The record no longer reaches what this member
                             // applied: read it back (contract v30, stage C).
+                            // The gap is then the read-back's: its own
+                            // since measures the wait, and the gap's is let
+                            // go -- left set, it outlived a read-back that
+                            // found the record holding all this member
+                            // applied, and the member's lag grew from it for
+                            // good, silently (failover-repeat 43146764089,
+                            // ha run 1: the lake's reader unready after the
+                            // apiserver class, no warning said).
                             Err(failed) if failed.starts_with(DIVERGED) => {
+                                tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
                                 unchecked.insert(partition.clone());
                                 unchecked_since.get_or_insert_with(Instant::now);
+                                gap_since = None;
                             }
                             // Behind the writer's retention: a reader holds
                             // the partition again from its head, as a
