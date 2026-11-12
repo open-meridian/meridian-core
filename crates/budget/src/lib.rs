@@ -99,6 +99,8 @@ pub struct Process {
     pub gate: Gate,
     /// The most resident memory its sweep has read, in bytes.
     peak_resident: std::sync::atomic::AtomicU64,
+    /// Requests refused for load outside its gate and budget ([`count_refusal`]).
+    refused_elsewhere: std::sync::atomic::AtomicU64,
 }
 
 /// A component's memory and what its budget did, all in one place, for its
@@ -154,6 +156,7 @@ impl Process {
             budget: Budget::new(working),
             gate: Gate::new(permits),
             peak_resident: Default::default(),
+            refused_elsewhere: Default::default(),
         })
     }
 
@@ -167,6 +170,7 @@ impl Process {
             budget: Budget::new(None),
             gate: Gate::new(permits),
             peak_resident: Default::default(),
+            refused_elsewhere: Default::default(),
         }
     }
 
@@ -187,7 +191,11 @@ impl Process {
                 .peak_resident
                 .load(std::sync::atomic::Ordering::Relaxed),
             granted: counts.granted,
-            refused: counts.refused + self.gate.refused(),
+            refused: counts.refused
+                + self.gate.refused()
+                + self
+                    .refused_elsewhere
+                    .load(std::sync::atomic::Ordering::Relaxed),
             shed: counts.shed,
         }
     }
@@ -216,6 +224,16 @@ impl Process {
             .await?;
         Ok(Admitted { turn, reservation })
     }
+}
+
+/// Count a request refused for load by this process outside its own gate
+/// and budget -- the dashboard's turns for its pages, its terminals and
+/// `/mcp`; a query its database cancelled -- so its report's refusals
+/// include it.
+pub fn count_refusal() {
+    process()
+        .refused_elsewhere
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 static INSTALLED: OnceLock<Process> = OnceLock::new();
@@ -290,6 +308,13 @@ pub(crate) const MIB: u64 = 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_at_a_gate_of_the_components_own_is_counted_in_its_report() {
+        let before = process().accounting().refused;
+        count_refusal();
+        assert!(process().accounting().refused > before);
+    }
 
     #[test]
     fn the_bound_is_sixteen_unless_a_positive_number_is_set() {

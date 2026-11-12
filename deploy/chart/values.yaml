@@ -966,13 +966,16 @@ sidecar:
   # flight for it. Past any of them only that plugin is refused,
   # RESOURCE_EXHAUSTED with REFUSAL_REASON_RATE_LIMITED and a retry-after; a
   # bulk act counts as one request. A sidecars[] entry's own `limits`
-  # overrides these for that plugin. Above what a data plugin's relaunch
-  # asks (71 reads in two minutes on dev, 2026-11-09), until the throughput
-  # bench sets the floor.
+  # overrides these for that plugin, as does a launch's. Set from the
+  # throughput bench (ruled 2026-11-11): the book takes the most proposals
+  # with about 8 in flight, past which its rate falls and its latency
+  # climbs, and takes more a second than 200 across many accounts; a page
+  # is at most 1 MiB, so 32 MiB holds every request in flight's answer
+  # twice over.
   limits:
-    inFlight: 32
-    requestsPerSecond: 200
-    answerMiB: 64
+    inFlight: 16
+    requestsPerSecond: 400
+    answerMiB: 32
 
 nameOverride: ""
 fullnameOverride: ""

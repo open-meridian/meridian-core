@@ -2745,8 +2745,10 @@ chart-check:
 		|| { echo "chart-check FAILED: glibc's arenas are not set on every component" >&2; exit 1; }; \
 	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_IN_FLIGHT$$' | grep -q 'value: "4"' \
 		|| { echo "chart-check FAILED: a sidecars[] entry's limits.inFlight does not override sidecar.limits.inFlight" >&2; exit 1; }; \
-	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_REQUESTS_PER_SECOND$$' | grep -q 'value: "200"' \
-		|| { echo "chart-check FAILED: sidecar.limits.requestsPerSecond does not reach a sidecar as 200" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_REQUESTS_PER_SECOND$$' | grep -q 'value: "400"' \
+		|| { echo "chart-check FAILED: sidecar.limits.requestsPerSecond does not reach a sidecar as 400" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_ANSWER_MIB$$' | grep -q 'value: "32"' \
+		|| { echo "chart-check FAILED: sidecar.limits.answerMiB does not reach a sidecar as 32" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set memory.shedPercent=85 2>/dev/null | grep -A1 'name: MERIDIAN_MEMORY_SHED_PERCENT$$' | grep -q 'value: "85"' \
 		|| { echo "chart-check FAILED: memory.shedPercent=85 does not reach the components" >&2; exit 1; }; \
 	for refused in memory.budgetPercent=5 memory.budgetPercent=96 memory.shedPercent=80 memory.shedPercent=100 sidecar.limits.inFlight=0 resources.limits.memory=128Mi \

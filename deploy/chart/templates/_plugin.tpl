@@ -185,7 +185,7 @@ spec:
                    own budget, so a plugin flooding it cannot starve the
                    sidecar's own work; a share that leaves it nothing is
                    refused here. */}}
-            {{- $answerMiB := (.limits | default dict).answerMiB | default ($top.Values.sidecar.limits | default dict).answerMiB | default 64 }}
+            {{- $answerMiB := (.limits | default dict).answerMiB | default ($top.Values.sidecar.limits | default dict).answerMiB | default 32 }}
             {{- include "meridian-runtime.memoryEnv" (dict "top" $top "container" "sidecar" "values" ($top.Values.sidecar | default dict) "resources" $top.Values.resources "heldMiB" (add 1 (int64 $answerMiB)) "name" "sidecar") | nindent 12 }}
             {{- include "meridian-runtime.sidecarLimitsEnv" (dict "top" $top "limits" .limits) | nindent 12 }}
             {{- if $top.Values.dashboard.enabled }}

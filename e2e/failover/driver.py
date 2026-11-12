@@ -624,11 +624,12 @@ async def drive_desk(plugin):
 #   Each reader is impatient, as a client in a retry storm is: a read not
 #   answered within FLOOD_PATIENCE is given up and asked again at once. What
 #   the lake already took keeps its turn there, so the flood's demand on
-#   each member answering it is no longer capped by the flooder's own 32 in
-#   flight at its sidecar (`sidecar.limits.inFlight`), which, split over the
-#   lake's writer and its reader in ha, matched their 16 turns each
-#   (MERIDIAN_HANDLERS_AT_ONCE) and was refused only as the split ran
-#   uneven (8, 23 and 0 times in part 3's three runs); no bound is changed;
+#   each member answering it is no longer capped by the flooder's own
+#   requests in flight at its sidecar (`sidecar.limits.inFlight`, 32 then,
+#   16 since 2026-11-11), which, split over the lake's writer and its reader
+#   in ha, matched their 16 turns each (MERIDIAN_HANDLERS_AT_ONCE) and was
+#   refused only as the split ran uneven (8, 23 and 0 times in part 3's
+#   three runs); no bound is changed;
 # - `noisy`: FLOOD_NOISY readers at once, each asking for one page as fast
 #   as it is answered -- past this plugin's share at its sidecar, refused
 #   REFUSAL_REASON_RATE_LIMITED.

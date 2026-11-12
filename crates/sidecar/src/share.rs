@@ -50,14 +50,15 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// Where neither the chart nor the launch says: above what a data
-    /// plugin's relaunch asks (71 reads in two minutes on dev, 2026-11-09)
-    /// and what the order driver sends, until
-    /// kernel/throughput-at-wealth-platform-scale's targets set the floor.
+    /// Where neither the chart nor the launch says: the chart's own,
+    /// set from kernel/throughput-at-wealth-platform-scale's bench (ruled
+    /// 2026-11-11). The book takes the most proposals with about 8 in
+    /// flight and more than 200 a second across many accounts; a page is
+    /// at most 1 MiB.
     pub const DEFAULT: Limits = Limits {
-        in_flight: 32,
-        requests_per_second: 200,
-        answer_mib: 64,
+        in_flight: 16,
+        requests_per_second: 400,
+        answer_mib: 32,
     };
 
     /// The limits as given, each refused naming its chart value where it is
@@ -376,10 +377,10 @@ mod tests {
         let mib = 1024 * 1024;
         assert_eq!(
             Limits::DEFAULT.held_apart(),
-            64 * mib + crate::read_after::MOST_BYTES as u64
+            32 * mib + crate::read_after::MOST_BYTES as u64
         );
         // The chart's own: 256 MiB at 80 %, less the default share, leaves
-        // the sidecar its own work's 140 MiB or so.
+        // the sidecar its own work's 170 MiB or so.
         let settings = |limit_mib: u64| meridian_budget::Settings {
             limit_bytes: Some(limit_mib * mib),
             ..meridian_budget::Settings::unbounded()
@@ -392,7 +393,7 @@ mod tests {
         )
         .expect("the default share leaves the sidecar its own budget");
         let own = process.budget.working().unwrap();
-        assert!(own > 128 * mib && own < 141 * mib, "{own}");
+        assert!(own > 160 * mib && own < 173 * mib, "{own}");
         // A share as large as the sidecar's whole budget leaves it nothing.
         let greedy = Limits {
             answer_mib: 205,

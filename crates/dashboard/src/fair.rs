@@ -59,9 +59,15 @@ impl Turns {
     /// `caller`'s turn, within [`meridian_budget::WAIT`]; refused for load
     /// where it does not come.
     pub async fn turn(&self, caller: &str) -> Result<Turn, Overloaded> {
-        self.gate
+        let turn = self
+            .gate
             .admit(Class::Rest, caller, meridian_budget::WAIT)
-            .await
+            .await;
+        if turn.is_err() {
+            // In the dashboard's report beside its process's own refusals.
+            meridian_budget::count_refusal();
+        }
+        turn
     }
 
     /// Requests refused for load since the dashboard started.
