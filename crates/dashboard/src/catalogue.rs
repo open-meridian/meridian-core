@@ -945,6 +945,13 @@ struct Launch {
     /// Its own share at its sidecar (contract v30); none for the chart's.
     #[serde(default)]
     limits: Option<LaunchLimits>,
+    /// Its shards and standby pod (contract v30, W8.3; `meridian plugin
+    /// launch --shards`, `--standby`, approved by 1057 and 1060): kept on
+    /// the launch, the launcher still running one pod (3d builds them).
+    #[serde(default)]
+    shards: u32,
+    #[serde(default)]
+    standby: bool,
 }
 
 async fn launch(
@@ -974,8 +981,10 @@ async fn launch(
                 write_mib_per_second: 0,
             })
             .filter(|l| *l != meridian_domain::v1::SidecarLimits::default()),
-        // Contract v30's shards and standby (W8.3), built with 3d.
-        ..Default::default()
+        // Contract v30's shards and standby (W8.3), kept on the launch;
+        // the pods are 3d's.
+        shards: asked.shards,
+        standby: asked.standby,
     };
     // Longer than the conductor gives the launcher, so its answer arrives.
     let launched: Result<PluginLaunch, String> = ask(

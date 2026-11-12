@@ -581,7 +581,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
             format!(
                 "<tr data-id=\"{id}\"><td title=\"{id}\"><button type=\"button\" class=\"link\" \
                  data-dialog-open=\"licence\" data-title=\"Licence {id}\" data-fill=\"{fill}\">{id}</button></td>\
-                 <td class=\"wide\" title=\"{carried}\">{carried}</td>\
+                 <td class=\"wide\" title=\"{carried_said}\">{carried}</td>\
                  <td class=\"wide\" title=\"{serves}; {modes}\">{serves}</td>\
                  <td title=\"{licence_said}, {source}\">{licence_said}{badge}</td>\
                  <td class=\"wide\" title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
@@ -595,6 +595,17 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 fill = escape(&fill.to_string()),
                 entitle = escape(&entitle.to_string()),
                 carried = escape(&crate::mcp::others_words(&carried)),
+                // Contract v30 (W10.1; ruling 1032): the vendor's terms and
+                // pricing in its words, read whole in the cell's title.
+                carried_said = escape(&if declaration.terms_and_pricing.is_empty() {
+                    crate::mcp::others_words(&carried)
+                } else {
+                    format!(
+                        "{}; terms and pricing: {}",
+                        crate::mcp::others_words(&carried),
+                        crate::mcp::others_words(&declaration.terms_and_pricing)
+                    )
+                }),
                 serves = escape(&serves.join(", ")),
                 modes = escape(&modes.join(", ")),
                 licence_said = escape(&licence_said(licence)),
@@ -1118,6 +1129,33 @@ mod tests {
         assert!(body.contains("not licensed: kept and read, each use right restrictive"));
         assert!(body.contains("&quot;derived_use&quot;:[]"), "{body}");
         assert!(body.contains("&quot;kept&quot;:[&quot;1&quot;]"), "{body}");
+    }
+
+    /// Contract v30 (W10.1; ruling 1032): a dataset's terms and pricing, as
+    /// its upload declares them, read whole in its vendor's cell's title.
+    #[test]
+    fn a_datasets_terms_and_pricing_are_read_in_its_vendors_title() {
+        let mut reply = listed(false);
+        reply.datasets[0]
+            .declaration
+            .as_mut()
+            .unwrap()
+            .terms_and_pricing = "Free; no redistribution.".into();
+        let body = page(
+            &Ok(reply),
+            &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(
+            body.contains("; terms and pricing: Free; no redistribution.\">"),
+            "{body}"
+        );
     }
 
     /// Contract 28, amended 2026-10-31 (rulings 896, 906): the class of

@@ -13,8 +13,9 @@ use meridian_pb::bounds::{
     CATALOGUE_DATASETS_COUNT, DATASET_DECLARATION_AGGREGATOR_LENGTH,
     DATASET_DECLARATION_DATA_TYPES_COUNT, DATASET_DECLARATION_DAY_END_MINUTE_RANGE,
     DATASET_DECLARATION_DAY_TIME_ZONE_LENGTH, DATASET_DECLARATION_KEY_LENGTH,
-    DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_VENDOR_LENGTH,
-    DATASET_LICENCE_DEFAULT_FIELDS_COUNT, DATASET_LICENCE_RETENTION_DAYS_RANGE,
+    DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH,
+    DATASET_DECLARATION_VENDOR_LENGTH, DATASET_LICENCE_DEFAULT_FIELDS_COUNT,
+    DATASET_LICENCE_RETENTION_DAYS_RANGE,
 };
 use meridian_pb::v1::{
     Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode, OutsideComputation,
@@ -1326,6 +1327,27 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
                 dataset.venue_id
             ));
         }
+        // Contract v30 (W10.1; ruling 1032): the vendor's terms and pricing
+        // in plain words, at most 2,000 characters.
+        if !DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH
+            .admits(dataset.terms_and_pricing.chars().count())
+        {
+            return Some(format!(
+                "{at}.terms_and_pricing is {} characters; at most {}",
+                dataset.terms_and_pricing.chars().count(),
+                DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH.most
+            ));
+        }
+        // Contract v30 (W10.1; ruling 455): the trading-sessions calendar its
+        // live data follows; empty names none.
+        if !dataset.sessions_calendar_id.is_empty()
+            && !dataset.sessions_calendar_id.starts_with("CAL-")
+        {
+            return Some(format!(
+                "{at}.sessions_calendar_id {:?} is not a platform calendar's ID (CAL-...)",
+                dataset.sessions_calendar_id
+            ));
+        }
     }
     None
 }
@@ -1508,6 +1530,21 @@ mod tests {
                 },
                 "calendar_id",
             ),
+            // Contract v30 (W10.1; rulings 1032, 455).
+            (
+                DatasetDeclaration {
+                    terms_and_pricing: "x".repeat(2001),
+                    ..daily()
+                },
+                "terms_and_pricing is 2001 characters; at most 2000",
+            ),
+            (
+                DatasetDeclaration {
+                    sessions_calendar_id: "FX24X5".into(),
+                    ..daily()
+                },
+                "sessions_calendar_id",
+            ),
         ] {
             let said = refused(wrong, &["data"]).expect(words);
             assert!(said.contains(words), "{words}: {said}");
@@ -1520,6 +1557,19 @@ mod tests {
         )
         .unwrap();
         assert!(twice.contains("twice"), "{twice}");
+        // Contract v30: a vendor's terms in words up to 2,000 characters and
+        // a sessions calendar are admitted.
+        assert_eq!(
+            refused(
+                DatasetDeclaration {
+                    terms_and_pricing: "é".repeat(2000),
+                    sessions_calendar_id: "CAL-FX24X5".into(),
+                    ..daily()
+                },
+                &["data"]
+            ),
+            None
+        );
     }
 
     #[test]

@@ -117,7 +117,7 @@ fn interface(
 /// The registered declaration against the uploaded one, naming the first
 /// field that differs.
 fn declaration(registered: &PluginDeclaration, uploaded: &PluginDeclaration) -> Option<String> {
-    let differs: [(&str, bool); 11] = [
+    let differs: [(&str, bool); 12] = [
         (
             "secret_settings",
             registered.secret_settings != uploaded.secret_settings,
@@ -143,6 +143,11 @@ fn declaration(registered: &PluginDeclaration, uploaded: &PluginDeclaration) -> 
         (
             "affirmation_deadline",
             registered.affirmation_deadline != uploaded.affirmation_deadline,
+        ),
+        // Contract v30 (W8.1): read from the upload, so held to it.
+        (
+            "most_shards",
+            registered.most_shards != uploaded.most_shards,
         ),
     ];
     let (field, _) = differs.iter().find(|(_, differs)| *differs)?;
@@ -227,7 +232,7 @@ mod tests {
     #[test]
     fn the_first_difference_is_named() {
         type Change = fn(&mut RegisterRequest);
-        let cases: [(Change, &str); 9] = [
+        let cases: [(Change, &str); 10] = [
             (
                 |r| r.settings.insert(1, setting("extra")),
                 "registers the setting extra where its version declared the setting region",
@@ -270,6 +275,11 @@ mod tests {
             (
                 |r| r.declaration.as_mut().unwrap().documentation.clear(),
                 "it registers a declaration whose documentation differs",
+            ),
+            // Contract v30 (W8.1): most_shards, read from the upload, held.
+            (
+                |r| r.declaration.as_mut().unwrap().most_shards = 4,
+                "it registers a declaration whose most_shards differs",
             ),
         ];
         for (change, says) in cases {
@@ -331,6 +341,55 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(difference(&request, &uploaded), None);
+    }
+
+    /// Contract v30 (W8.1, W10.1): a data plugin built for v30 uploads its
+    /// catalogue's terms and pricing, sessions calendar and gap recovery and
+    /// its most shards (JSON, read by core) and registers the same on the
+    /// wire: the two agree and the plugin registers as its upload says. One
+    /// that registers other terms is named.
+    #[test]
+    fn a_v30_catalogue_registers_as_its_upload_says() {
+        use meridian_pb::v1::{Catalogue, DatasetDeclaration, GapRecovery, ObservationMode};
+        let declared: meridian_domain::declaration::Declared =
+            serde_json::from_value(serde_json::json!({
+                "most_shards": 2,
+                "catalogue": {"datasets": [{
+                    "key": "rates", "vendor": "Central bank", "modes": ["pull"],
+                    "terms_and_pricing": "Free, with attribution.",
+                    "sessions_calendar_id": "CAL-FX24X5",
+                    "gap_recovery": "backfill"
+                }]}
+            }))
+            .unwrap();
+        let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
+        let registered = |terms: &str| RegisterRequest {
+            schema_version: "v30".into(),
+            declaration: Some(PluginDeclaration {
+                most_shards: 2,
+                catalogue: Some(Catalogue {
+                    datasets: vec![DatasetDeclaration {
+                        key: "rates".into(),
+                        vendor: "Central bank".into(),
+                        modes: vec![ObservationMode::Pull as i32],
+                        terms_and_pricing: terms.into(),
+                        sessions_calendar_id: "CAL-FX24X5".into(),
+                        gap_recovery: GapRecovery::Backfill as i32,
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            difference(&registered("Free, with attribution."), &uploaded),
+            None
+        );
+        assert_eq!(
+            difference(&registered("Paid."), &uploaded).as_deref(),
+            Some("it registers a declaration whose catalogue differs")
+        );
     }
 
     /// A setting named like a window setting for a kind the version does

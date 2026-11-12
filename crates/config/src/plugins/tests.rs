@@ -913,6 +913,95 @@ async fn an_affirmation_deadline_is_operations_and_a_time_of_day() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_versions_most_shards_is_kept_as_uploaded_within_its_bound() {
+    // Contract v30 (W8.1; approved by 1057): the most pods of one instance
+    // its vendor allows, 0 to 64, kept on the version as its upload says.
+    let (bus, _) = harness();
+    let with = |most: u32, version: &str| {
+        let mut upload = snaptrade(version);
+        upload.metadata.as_mut().unwrap().declaration = Some(meridian_pb::v1::PluginDeclaration {
+            most_shards: most,
+            ..Default::default()
+        });
+        upload
+    };
+    let refused = upload(&bus, with(65, "0.1.0")).await.unwrap_err();
+    assert!(refused.contains("most_shards is 65"), "{refused}");
+    let recorded = upload(&bus, with(4, "0.1.1")).await.unwrap();
+    assert_eq!(
+        recorded.metadata.unwrap().declaration.unwrap().most_shards,
+        4
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards() {
+    // Contract v30 (W8.3; the launch settings and the refusal approved by
+    // 1057): shards past the version's most_shards refused INVALID_ARGUMENT
+    // naming shards, 0 and 1 each one pod; within it, the shards and the
+    // standby pod kept on the launch's record. The launcher still runs one
+    // pod (3d).
+    let (bus, _) = harness();
+    let mut shardable = snaptrade("0.1.0");
+    shardable.metadata.as_mut().unwrap().declaration = Some(meridian_pb::v1::PluginDeclaration {
+        most_shards: 2,
+        ..Default::default()
+    });
+    upload(&bus, shardable).await.unwrap();
+    let refused = launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 3,
+            ..launching("snaptrade-1", &["custody"])
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("[refusal-status invalid-argument") && refused.contains("shards"),
+        "{refused}"
+    );
+    assert!(refused.contains("at most 2"), "{refused}");
+    let launched = launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 2,
+            standby: true,
+            ..launching("snaptrade-1", &["custody"])
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((launched.shards, launched.standby), (2, true));
+    let kept = catalogue(&bus).await;
+    let held = kept
+        .launches
+        .iter()
+        .find(|l| l.instance_id == "snaptrade-1")
+        .unwrap();
+    assert_eq!((held.shards, held.standby), (2, true));
+    // A version declaring none is one pod: 1 is admitted, 2 refused.
+    upload(&bus, snaptrade("0.1.1")).await.unwrap();
+    let one = LaunchPluginRequest {
+        version: "0.1.1".into(),
+        shards: 1,
+        ..launching("snaptrade-2", &["custody"])
+    };
+    launch(&bus, one.clone()).await.unwrap();
+    let refused = launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 2,
+            instance_id: "snaptrade-3".into(),
+            ..one
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("at most 1"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pricing_versions_models_are_pricings_each_named_once() {
     // Contract v27 (W12.3; ruling 324): refused on a version not holding
     // pricing; each model id and version once, each version 1 or more.

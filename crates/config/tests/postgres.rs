@@ -2820,6 +2820,9 @@ fn a_launchs_own_limits_are_kept_on_its_record() {
     };
     let mut asked = launch("snaptrade-1");
     asked.limits = Some(limits);
+    // Its shards and standby pod (contract v30, W8.3; migration 32): kept.
+    asked.shards = 2;
+    asked.standby = true;
     assert!(store.begin_launch(&asked, "").unwrap());
     assert!(store.begin_launch(&launch("snaptrade-2"), "").unwrap());
     let launches = store.snapshot().unwrap().catalogue.launches;
@@ -2832,4 +2835,13 @@ fn a_launchs_own_limits_are_kept_on_its_record() {
     };
     assert_eq!(of("snaptrade-1"), Some(limits));
     assert_eq!(of("snaptrade-2"), None);
+    let pods = |instance: &str| {
+        launches
+            .iter()
+            .find(|l| l.instance_id == instance)
+            .map(|l| (l.shards, l.standby))
+            .unwrap()
+    };
+    assert_eq!(pods("snaptrade-1"), (2, true));
+    assert_eq!(pods("snaptrade-2"), (0, false));
 }

@@ -423,6 +423,9 @@ impl Plugins {
             // The share at its sidecar it was launched with, kept (contract
             // v30; ruled 2026-11-11).
             limits: running.limits,
+            // Its shards and standby pod, kept (contract v30; W8.3).
+            shards: running.shards,
+            standby: running.standby,
             ..Default::default()
         };
         self.store

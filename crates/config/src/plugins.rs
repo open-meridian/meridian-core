@@ -370,6 +370,17 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             ));
         }
     }
+    // Contract v30 (W8.1; approved by 1057): the most pods of one instance
+    // its vendor allows, 0 to 64.
+    {
+        use meridian_pb::bounds::PLUGIN_DECLARATION_MOST_SHARDS_RANGE;
+        if !PLUGIN_DECLARATION_MOST_SHARDS_RANGE.admits(i64::from(declaration.most_shards)) {
+            return Err(format!(
+                "declaration.most_shards is {}; the most pods of one instance, 0 to {}",
+                declaration.most_shards, PLUGIN_DECLARATION_MOST_SHARDS_RANGE.most
+            ));
+        }
+    }
     // An operations plugin's affirmation deadline (W11.28, W11.34; contract
     // v25): minutes after midnight, 1 to 1440, 0 declaring none; refused on
     // a version not holding operations.
@@ -568,6 +579,24 @@ pub fn launch<'a>(
             listed(&declared)
         ));
     }
+    // Contract v30 (W8.3; the launch settings and the refusal approved by
+    // 1057): at most the version's most_shards, 0 and 1 each one pod.
+    let most = metadata
+        .declaration
+        .as_ref()
+        .map_or(0, |declaration| declaration.most_shards)
+        .max(1);
+    if request.shards > most {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["shards".to_string()],
+            format!(
+                "shards is {}, and {} {} allows at most {most} pod(s) of one instance (its \
+                 most_shards)",
+                request.shards, request.name, request.version
+            ),
+        ));
+    }
     Ok(version)
 }
 
@@ -705,6 +734,10 @@ impl Plugins {
             prepared_call_id: by.prepared_call_id,
             // Its own share at its sidecar (contract v30; ruled 2026-11-11).
             limits: request.limits,
+            // Its shards and standby pod as asked (contract v30; W8.3),
+            // kept on its record; the launcher still runs one pod (3d).
+            shards: request.shards,
+            standby: request.standby,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never

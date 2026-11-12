@@ -213,6 +213,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0031_launch_limits.sql"),
         then: None,
     },
+    Migration {
+        version: 32,
+        name: "launch_shards",
+        sql: include_str!("../migrations/0032_launch_shards.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding

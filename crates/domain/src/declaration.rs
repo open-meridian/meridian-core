@@ -57,6 +57,10 @@ pub struct Declared {
     /// ruling 324): absent from a version declaring none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pricing_models: Vec<DeclaredPricingModel>,
+    /// The most pods of one instance its vendor allows (W8.1, contract v30;
+    /// approved by 1057): absent or 0 from a version not shardable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub most_shards: u32,
 }
 
 /// One pricing model as an upload's declaration names it (contract v27).
@@ -136,6 +140,16 @@ pub struct DeclaredDataset {
     /// absent for none declared, read as `none`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gap_recovery: String,
+    /// The vendor's terms and pricing in plain words (W10.1, contract v30;
+    /// ruling 1032): the vendor's words, data to every reader; absent or
+    /// empty for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terms_and_pricing: String,
+    /// The trading-sessions calendar its live data follows (W10.1, contract
+    /// v30; ruling 455): a platform calendar's `CAL-` ID; absent or empty
+    /// names none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sessions_calendar_id: String,
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -292,9 +306,10 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 model_version: model.model_version,
             })
             .collect(),
-        // Contract v30's most_shards (W8.1): not yet read from an upload;
-        // core's stage commits read it (step 3c).
-        most_shards: 0,
+        // Contract v30's most_shards (W8.1): as the upload declares it, so
+        // a v30 plugin registers as its upload says. The launcher still runs
+        // one pod (3d builds the shards).
+        most_shards: declared.most_shards,
     })
 }
 
@@ -435,10 +450,9 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             declared_delay_ns: dataset.declared_delay_ns,
             price_source_class: price_source_class as i32,
             // Contract v30's terms and pricing and sessions calendar
-            // (W10.1): not yet read from an upload; Track 6's core part
-            // reads them (step 3c).
-            terms_and_pricing: String::new(),
-            sessions_calendar_id: String::new(),
+            // (W10.1; rulings 1032, 455), as the upload declares them.
+            terms_and_pricing: dataset.terms_and_pricing.clone(),
+            sessions_calendar_id: dataset.sessions_calendar_id.clone(),
             // How a gap in it is recovered (W10.14; core's stage E).
             gap_recovery: gap_recovery as i32,
         });
@@ -490,6 +504,15 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
     if !recovery.is_empty() {
         said["gap_recovery"] = serde_json::Value::from(recovery);
     }
+    // Contract v30 (W10.1; rulings 1032, 455): the vendor's terms and
+    // pricing, its words, and the sessions calendar, where declared.
+    if !dataset.terms_and_pricing.is_empty() {
+        said["terms_and_pricing"] = serde_json::Value::from(dataset.terms_and_pricing.as_str());
+    }
+    if !dataset.sessions_calendar_id.is_empty() {
+        said["sessions_calendar_id"] =
+            serde_json::Value::from(dataset.sessions_calendar_id.as_str());
+    }
     said
 }
 
@@ -537,6 +560,8 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
             "model_id": model.model_id,
             "model_version": model.model_version,
         })).collect::<Vec<_>>(),
+        // Contract v30 (W8.1): the most pods of one instance, 0 for none.
+        "most_shards": declaration.most_shards,
     })
 }
 
@@ -576,6 +601,62 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("not_carried[0].reason"));
+    }
+
+    /// Contract v30 (W8.1, W10.1; rulings 1032, 455; approved by 1057 and
+    /// 2026-11-09): a v30 upload's terms and pricing, sessions calendar, gap
+    /// recovery and most shards are read, so the plugin registers as its
+    /// upload says; each printed back, and absent where not declared.
+    #[test]
+    fn a_v30_upload_s_terms_sessions_gap_recovery_and_most_shards_are_read() {
+        let declared: Declared = serde_json::from_value(serde_json::json!({
+            "most_shards": 4,
+            "catalogue": {"datasets": [{
+                "key": "ticker", "vendor": "Kraken", "modes": ["stream"],
+                "data_types": ["meridian.v1.Quote"],
+                "terms_and_pricing": "Public market data: free, no key, no redistribution.",
+                "sessions_calendar_id": "CAL-FX24X5",
+                "gap_recovery": "stream_only"
+            }]}
+        }))
+        .unwrap();
+        let declaration = from_json(&declared).unwrap();
+        assert_eq!(declaration.most_shards, 4);
+        let dataset = &declaration.catalogue.as_ref().unwrap().datasets[0];
+        assert_eq!(
+            dataset.terms_and_pricing,
+            "Public market data: free, no key, no redistribution."
+        );
+        assert_eq!(dataset.sessions_calendar_id, "CAL-FX24X5");
+        assert_eq!(dataset.gap_recovery, GapRecovery::StreamOnly as i32);
+        let back = to_json(&declaration);
+        assert_eq!(back["most_shards"], 4);
+        assert_eq!(
+            back["catalogue"]["datasets"][0]["terms_and_pricing"],
+            "Public market data: free, no key, no redistribution."
+        );
+        assert_eq!(
+            back["catalogue"]["datasets"][0]["sessions_calendar_id"],
+            "CAL-FX24X5"
+        );
+        assert_eq!(
+            back["catalogue"]["datasets"][0]["gap_recovery"],
+            "stream_only"
+        );
+        // Printed back, the same declaration.
+        let again: Declared = serde_json::from_value(back).unwrap();
+        assert_eq!(from_json(&again).unwrap(), declaration);
+        // A v29 upload declares none of them: none read, none printed.
+        let older: Declared = serde_json::from_value(serde_json::json!({
+            "catalogue": {"datasets": [{"key": "ticker", "vendor": "Kraken", "modes": ["stream"]}]}
+        }))
+        .unwrap();
+        let older = from_json(&older).unwrap();
+        assert_eq!(older.most_shards, 0);
+        let printed = &to_json(&older)["catalogue"]["datasets"][0];
+        assert!(printed.get("terms_and_pricing").is_none());
+        assert!(printed.get("sessions_calendar_id").is_none());
+        assert!(printed.get("gap_recovery").is_none());
     }
 
     #[test]
