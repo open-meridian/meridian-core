@@ -753,7 +753,7 @@ fn draw_launch_sheet(
                 format!("<p class=\"hint\">At most {most} shards; empty runs one pod.</p>")
             },
             format!(
-                "<label>Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
+                "<label class=\"num\">Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
                  inputmode=\"numeric\" value=\"{value}\"{invalid}></label>",
                 value = escape(&entered.shards),
                 invalid = if refused_shards.is_some() {
@@ -774,12 +774,12 @@ fn draw_launch_sheet(
          <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\" value=\"{note}\"></label>\
          <fieldset class=\"checks limits\" data-limits><legend>Limits at its sidecar</legend>\
          <p class=\"hint\">Empty takes the deployment's.</p>\
-         <label>Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{in_flight}\"></label>\
-         <label>Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{per_second}\"></label>\
-         <label>Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{answer_mib}\"></label>\
+         <label class=\"num\">Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{in_flight}\"></label>\
+         <label class=\"num\">Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{per_second}\"></label>\
+         <label class=\"num\">Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{answer_mib}\"></label>\
          </fieldset>\
-         <div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods><div class=\"pods-row\">{shards}\
-         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label></div>{refused}{hint}</div>\
+         <div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods>{shards}\
+         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label>{refused}{hint}</div>\
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{back}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">Launch</button></div></form></section>",
         n = escape(name),

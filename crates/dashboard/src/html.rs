@@ -311,14 +311,10 @@ th button.sort{margin:0;padding:0;border:0;background:none;font:inherit;color:in
 th[aria-sort=ascending] button.sort::after{content:\" \\2191\"}th[aria-sort=descending] button.sort::after{content:\" \\2193\"}\
 .more{color:var(--ink-faint)}\
 fieldset.checks.picker,fieldset.checks.limits{max-height:none;overflow:visible;min-width:0}\
-fieldset.checks.limits label:not(:has(>input[type=checkbox])){display:flex;align-items:center;justify-content:space-between;\
-gap:.75rem;margin:.3rem 0}fieldset.checks.limits label>input[type=number]{flex:0 0 6.5rem;width:6.5rem;margin:0;\
-padding:.35rem .55rem}fieldset.checks.limits .hint{margin:0 0 .35rem}\
-.pods{margin:0 0 .9rem}.pods .hint{margin:.15rem 0 0}\
-.pods-row{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1.25rem}.pods-row>label{flex:0 0 auto;margin:0}\
-.pods-row>label:not(:has(>input[type=checkbox])){display:flex;align-items:center;gap:.75rem}\
-.pods-row>label>input[type=number]{width:6.5rem;margin:0;padding:.35rem .55rem}\
-p.field-refused{color:var(--danger);font-size:.84rem;margin:.2rem 0 0}\
+label.num{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin:.3rem 0}\
+label.num>input[type=number][name]{flex:0 0 6.5rem;width:6.5rem;margin:0;padding:.35rem .55rem}.limits .hint{margin:0 0 .35rem}\
+.pods{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1.25rem;margin:0 0 .9rem}.pods>label{margin:0}\
+.pods>p{flex:0 0 100%;margin:0}.field-refused{color:var(--danger);font-size:.84rem}\
 .picker-tools{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.25rem 0 .5rem}\
 .picker-tools input[type=search]{flex:1 1 12rem;min-width:0}.picker-tools button{margin:0;padding:.3rem .7rem;font-size:.84rem}\
 .picker-status{margin:0 0 .35rem;color:var(--ink-faint);font-size:.84rem}\
