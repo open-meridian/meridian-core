@@ -505,6 +505,12 @@ def install(s):
                 *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
+        # Formed again before first run starts the stores, which make their
+        # streams on it: CI run 43185314225's lake write-ahead stream, made
+        # as the servers came back, had no leader for ten minutes, every
+        # write refused "nothing serves", until the servers' next roll.
+        wait_for("the broker's servers formed again, JetStream healthy on each",
+                 lambda: broker_formed(servers), seconds=300)
         cluster_services_on_server()
 
 
@@ -975,6 +981,10 @@ def driver_fixtures(s):
         for instance in DRIVERS:
             said = kubectl("logs", driver_pod(instance), "-c", "plugin", "--tail=15", check=False)
             s.note(f"{instance} said: {said.stdout.decode(errors='replace')[-1500:]}")
+        # The cluster's and the broker's own view kept at once (CI run
+        # 43185314225 kept the broker's logs only from its servers' later
+        # roll).
+        cluster_said("the write driver writing through the stores")
 
 
 def driver_pod(instance):
@@ -2307,57 +2317,81 @@ BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=tru
                "/routez", "/varz")
 
 
+def broker_servers():
+    """The broker's servers' pods, by name."""
+    return [p["metadata"]["name"] for p in json.loads(
+        out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+            "-o", "json", check=False) or "{}").get("items", [])]
+
+
 def broker_said():
     """Each broker server's monitoring endpoint's answers, in text, for a
     failed check's dump: never raises."""
     parts = []
     try:
-        servers = [p["metadata"]["name"] for p in json.loads(
-            out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
-                "-o", "json", check=False) or "{}").get("items", [])]
+        servers = broker_servers()
     except (ValueError, SystemExit) as failed:
         return [f"== the broker's servers could not be listed: {failed}"]
     for server in servers:
-        forward = subprocess.Popen(
-            ["kubectl", "--namespace", NAMESPACE, "port-forward", f"pod/{server}", f":{BROKER_MONITOR_PORT}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        try:
-            # Read on a thread of its own: a port-forward that can reach
-            # nothing (the API server cut, a node gone) may say nothing and
-            # never end, and the dump must not wait on it.
-            lines = queue.Queue()
-            threading.Thread(target=lambda: [lines.put(line) for line in forward.stdout],
-                             daemon=True).start()
-            local = None
-            began = time.time()
-            while local is None and time.time() - began < 10:
-                try:
-                    line = lines.get(timeout=1).decode(errors="replace")
-                except queue.Empty:
-                    continue
-                found = re.search(r"Forwarding from 127\.0\.0\.1:(\d+)", line)
-                if found:
-                    local = found.group(1)
-            if local is None:
-                parts.append(f"== {server}, its monitoring endpoint: no port-forward within 10 s")
-                continue
-            for path in BROKER_SAID:
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{local}{path}", timeout=5) as answered:
-                        said = answered.read().decode(errors="replace")
-                except urllib.error.HTTPError as refused:
-                    said = f"HTTP {refused.code}: {refused.read().decode(errors='replace')}"
-                except (urllib.error.URLError, OSError) as failed:
-                    said = f"unanswered: {failed}"
-                parts.append(f"== {server}, {path}")
-                parts.append(said)
-        finally:
-            forward.terminate()
-            try:
-                forward.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                forward.kill()
+        for path, (_, said) in monitored(server, BROKER_SAID).items():
+            parts.append(f"== {server}, {path}")
+            parts.append(said)
     return parts
+
+
+def monitored(server, paths):
+    """One broker server's monitoring endpoint's answers to `paths`, each
+    its HTTP status (0 where none came) and its text: never raises."""
+    answers = {}
+    forward = subprocess.Popen(
+        ["kubectl", "--namespace", NAMESPACE, "port-forward", f"pod/{server}", f":{BROKER_MONITOR_PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        # Read on a thread of its own: a port-forward that can reach
+        # nothing (the API server cut, a node gone) may say nothing and
+        # never end, and the dump must not wait on it.
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(line) for line in forward.stdout],
+                         daemon=True).start()
+        local = None
+        began = time.time()
+        while local is None and time.time() - began < 10:
+            try:
+                line = lines.get(timeout=1).decode(errors="replace")
+            except queue.Empty:
+                continue
+            found = re.search(r"Forwarding from 127\.0\.0\.1:(\d+)", line)
+            if found:
+                local = found.group(1)
+        if local is None:
+            return {path: (0, "its monitoring endpoint: no port-forward within 10 s") for path in paths}
+        for path in paths:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{local}{path}", timeout=5) as answered:
+                    answers[path] = (answered.status, answered.read().decode(errors="replace"))
+            except urllib.error.HTTPError as refused:
+                answers[path] = (refused.code,
+                                 f"HTTP {refused.code}: {refused.read().decode(errors='replace')}")
+            except (urllib.error.URLError, OSError) as failed:
+                answers[path] = (0, f"unanswered: {failed}")
+    finally:
+        forward.terminate()
+        try:
+            forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+    return answers
+
+
+def broker_formed(servers):
+    """Every one of the broker's `servers` up and saying JetStream is
+    healthy -- its routes, a meta leader and its own state current
+    (`/healthz`, NATS's full check) -- so nothing makes a stream on a
+    cluster still forming."""
+    names = broker_servers()
+    if len(names) != servers:
+        return False
+    return all(monitored(name, ("/healthz",))["/healthz"][0] == 200 for name in names)
 
 
 def cluster_said(when):
