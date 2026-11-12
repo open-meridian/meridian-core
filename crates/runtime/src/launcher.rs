@@ -361,6 +361,86 @@ pub fn with_archive(
     Ok(manifest)
 }
 
+/// The Deployment with the instance's own share at its sidecar (contract
+/// v30, W8.3; the resilience spec's section 10a; ruled 2026-11-11): each
+/// field its launch set written into the `sidecar` container's
+/// MERIDIAN_SIDECAR_* over the chart's sidecar.limits; a field 0, or none
+/// set, leaves the chart's. Refused where its answers in flight would leave
+/// the sidecar nothing of its own budget, as the chart refuses the same.
+pub fn with_limits(
+    mut manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    let Some(limits) = &request.limits else {
+        return Ok(manifest);
+    };
+    let said = [
+        (
+            "MERIDIAN_SIDECAR_IN_FLIGHT",
+            "limits.in_flight",
+            limits.in_flight,
+        ),
+        (
+            "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND",
+            "limits.requests_per_second",
+            limits.requests_per_second,
+        ),
+        (
+            "MERIDIAN_SIDECAR_ANSWER_MIB",
+            "limits.answer_mib",
+            limits.answer_mib,
+        ),
+    ];
+    if said.iter().all(|(_, _, value)| *value == 0) {
+        return Ok(manifest);
+    }
+    let container = manifest["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "sidecar"))
+        .ok_or("the template has no container named sidecar to give the plugin's share to")?;
+    if limits.answer_mib > 0 {
+        let env_of = |name: &str| {
+            container["env"].as_array().and_then(|env| {
+                env.iter()
+                    .find(|e| e["name"] == name)
+                    .and_then(|e| e["value"].as_str().map(str::to_string))
+            })
+        };
+        let percent = env_of("MERIDIAN_MEMORY_BUDGET_PERCENT")
+            .and_then(|p| p.parse::<u64>().ok())
+            .unwrap_or(80);
+        if let Some(limit) = container["resources"]["limits"]["memory"]
+            .as_str()
+            .and_then(crate::preflight::quantity)
+        {
+            let working = limit / 1024 / 1024 * percent / 100;
+            let held = u64::from(limits.answer_mib) + 1;
+            if working < held + 4 {
+                return Err(format!(
+                    "limits.answer_mib {} leaves {}'s sidecar nothing of its own budget: its \
+                     {} MiB working budget less the plugin's answers in flight and its \
+                     session; at most {}",
+                    limits.answer_mib,
+                    request.instance_id,
+                    working,
+                    working.saturating_sub(5)
+                ));
+            }
+        }
+    }
+    let env = container["env"]
+        .as_array_mut()
+        .ok_or("the template's sidecar container has no environment")?;
+    for (name, _, value) in said {
+        if value == 0 {
+            continue;
+        }
+        env.retain(|e| e["name"] != name);
+        env.push(serde_json::json!({"name": name, "value": value.to_string()}));
+    }
+    Ok(manifest)
+}
+
 /// A `__NAME__` still in the text, which a newer chart's template would
 /// have and this launcher would not know to fill.
 fn placeholder(text: &str) -> Option<&str> {

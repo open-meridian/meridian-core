@@ -226,9 +226,26 @@ message LaunchPluginRequest {
   // data instances. A standby shares nothing until it takes over.
   bool standby = 9;
 
+  // Contract v30 (W8.3; the resilience spec's section 10a; ruled
+  // 2026-11-11): this instance's own share at its sidecar, over the chart's
+  // sidecar.limits. Unset, or a field 0, takes the chart's.
+  SidecarLimits limits = 10;
+
   // Tags, retired with them (decisions/026).
   reserved 5;
   reserved "approved_tags";
+}
+
+// A plugin's share at its sidecar (the resilience spec's section 10a): at
+// most in_flight requests at once, requests_per_second with a burst of a
+// second's worth, and answer_mib MiB of answers held or paged in flight for
+// it. Past any of them only that plugin is refused, RESOURCE_EXHAUSTED with
+// REFUSAL_REASON_RATE_LIMITED and a retry-after. A field 0 takes the
+// chart's sidecar.limits.
+message SidecarLimits {
+  uint32 in_flight = 1;
+  uint32 requests_per_second = 2;
+  uint32 answer_mib = 3;
 }
 
 enum PluginLaunchState {
@@ -294,6 +311,10 @@ message PluginLaunch {
   // Not what runs now, which the members' reports say. 0: one pod.
   uint32 shards = 23;
   bool standby = 24;
+  // Contract v30 (W8.3; ruled 2026-11-11): the share at its sidecar the
+  // instance was launched with, as the launch asked; unset where it asked
+  // none, and on every launch before it.
+  SidecarLimits limits = 25;
 
   // Tags, retired with them (decisions/026).
   reserved 6;
@@ -325,6 +346,11 @@ message CreatePluginRequest {
   // MERIDIAN_ARCHIVE_BUCKET with a credential scoped to it. Unset or not
   // allowed, none.
   PluginArchive archive = 8;
+
+  // Contract v30 (W8.3; ruled 2026-11-11): the instance's own share at its
+  // sidecar, as its launch asked: the launcher writes each field set into
+  // the sidecar's MERIDIAN_SIDECAR_* over the chart's sidecar.limits.
+  SidecarLimits limits = 9;
 
   // Tags, retired with them (decisions/026).
   reserved 4;

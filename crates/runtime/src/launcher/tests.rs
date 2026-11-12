@@ -414,3 +414,59 @@ fn no_archive_unless_one_is_allowed_and_the_chart_keeps_one() {
     )
     .is_err());
 }
+
+/// Contract v30 (W8.3; ruled 2026-11-11): a launch's own share at its
+/// sidecar is written over the chart's, field by field; one leaving the
+/// sidecar nothing of its own budget is refused naming it.
+#[test]
+fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_is_refused() {
+    let shape = || {
+        serde_json::json!({
+            "metadata": {"labels": {"meridian.dev/launched": "true"}},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "sidecar",
+                 "resources": {"limits": {"memory": "256Mi"}},
+                 "env": [
+                    {"name": "MERIDIAN_MEMORY_BUDGET_PERCENT", "value": "80"},
+                    {"name": "MERIDIAN_SIDECAR_IN_FLIGHT", "value": "16"},
+                    {"name": "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND", "value": "400"},
+                    {"name": "MERIDIAN_SIDECAR_ANSWER_MIB", "value": "32"}]},
+                {"name": "plugin", "env": []}]}}}
+        })
+    };
+    let said = |made: &serde_json::Value, name: &str| -> Vec<String> {
+        made["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == name)
+            .map(|e| e["value"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // None asked: the chart's, untouched.
+    let made = with_limits(shape(), &request()).unwrap();
+    assert_eq!(said(&made, "MERIDIAN_SIDECAR_IN_FLIGHT"), ["16"]);
+    // Two asked, one left at 0: those two over the chart's, the third kept.
+    let asked = CreatePluginRequest {
+        limits: Some(meridian_domain::v1::SidecarLimits {
+            in_flight: 4,
+            requests_per_second: 0,
+            answer_mib: 8,
+        }),
+        ..request()
+    };
+    let made = with_limits(shape(), &asked).unwrap();
+    assert_eq!(said(&made, "MERIDIAN_SIDECAR_IN_FLIGHT"), ["4"]);
+    assert_eq!(said(&made, "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND"), ["400"]);
+    assert_eq!(said(&made, "MERIDIAN_SIDECAR_ANSWER_MIB"), ["8"]);
+    // Answers in flight that leave the sidecar nothing: refused, naming it.
+    let greedy = CreatePluginRequest {
+        limits: Some(meridian_domain::v1::SidecarLimits {
+            answer_mib: 200,
+            ..Default::default()
+        }),
+        ..request()
+    };
+    let refused = with_limits(shape(), &greedy).unwrap_err();
+    assert!(refused.contains("limits.answer_mib 200"), "{refused}");
+}

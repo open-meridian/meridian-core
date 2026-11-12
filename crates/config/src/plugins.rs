@@ -23,7 +23,7 @@ use meridian_domain::v1::{
     PluginArchive, PluginCatalogue, PluginCatalogueRequest, PluginLaunch, PluginLaunchState,
     PluginMetadata, PluginVersion, ReadPluginDocumentationReply, ReadPluginDocumentationRequest,
     RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, RetirePluginVersionRequest,
-    StopPluginRequest, WithdrawArchiveRequest,
+    SidecarLimits, StopPluginRequest, WithdrawArchiveRequest,
 };
 use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
@@ -703,6 +703,8 @@ impl Plugins {
             client_name: by.client,
             note: request.note.clone(),
             prepared_call_id: by.prepared_call_id,
+            // Its own share at its sidecar (contract v30; ruled 2026-11-11).
+            limits: request.limits,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
@@ -722,6 +724,7 @@ impl Plugins {
             version,
             request.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
+            request.limits,
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
@@ -763,6 +766,7 @@ impl Plugins {
         version: &PluginVersion,
         live: bool,
         archive: Option<PluginArchive>,
+        limits: Option<SidecarLimits>,
     ) -> CreatePluginRequest {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
@@ -786,6 +790,9 @@ impl Plugins {
             // The archive a deployment admin allowed it, beside its storage
             // (W8.3, W8.7, contract v16); none otherwise.
             archive,
+            // Its own share at its sidecar, as its launch asked (contract
+            // v30; ruled 2026-11-11); the chart's otherwise.
+            limits,
         }
     }
 
@@ -964,7 +971,7 @@ impl Plugins {
             .map_err(|failed| {
                 format!("recorded; the launcher did not stop {instance} to restart it: {failed}")
             })?;
-        let create = self.create_request(instance, version, launch.live, archive);
+        let create = self.create_request(instance, version, launch.live, archive, launch.limits);
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",

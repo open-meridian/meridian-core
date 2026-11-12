@@ -693,6 +693,18 @@ fn launch_schema() -> Value {
             "approved_roles": {"type": "array", "items": {"type": "string"}},
             "live": {"type": "boolean"},
             "note": note_schema(),
+            // Contract v30 (W8.3; ruled 2026-11-11): its own share at its
+            // sidecar, as the Launch sheet's Limits; each absent for the
+            // deployment's.
+            "limits": {
+                "type": "object",
+                "properties": {
+                    "in_flight": {"type": "integer", "minimum": 1},
+                    "requests_per_second": {"type": "integer", "minimum": 1},
+                    "answer_mib": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": false,
+            },
         },
         "required": ["name", "version", "instance_id", "approved_roles", "note"],
         "additionalProperties": false,
@@ -812,6 +824,13 @@ fn launch_json(launch: &PluginLaunch) -> Value {
         "stopped_client_name": launch.stopped_client_name,
         "note": others_words(&launch.note),
         "stopped_note": others_words(&launch.stopped_note),
+        // Its own share at its sidecar as its launch asked (contract v30):
+        // null where it asked none, the deployment's.
+        "limits": launch.limits.as_ref().map(|l| json!({
+            "in_flight": l.in_flight,
+            "requests_per_second": l.requests_per_second,
+            "answer_mib": l.answer_mib,
+        })),
     })
 }
 
@@ -2493,11 +2512,46 @@ impl Context<'_> {
                 "approved_roles",
                 "live",
                 "note",
+                "limits",
             ],
             &mut problems,
         ) else {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());
         };
+        // Its own share at its sidecar (contract v30): each a whole number
+        // above 0, absent for the deployment's.
+        let mut limits = meridian_domain::v1::SidecarLimits::default();
+        match top.get("limits") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(asked)) => {
+                for (name, value) in asked {
+                    let into = match name.as_str() {
+                        "in_flight" => &mut limits.in_flight,
+                        "requests_per_second" => &mut limits.requests_per_second,
+                        "answer_mib" => &mut limits.answer_mib,
+                        _ => {
+                            problems.add(
+                                &format!("limits.{name}"),
+                                "not a limit: in_flight, requests_per_second or answer_mib",
+                            );
+                            continue;
+                        }
+                    };
+                    match value
+                        .as_u64()
+                        .filter(|n| *n > 0 && *n <= u64::from(u32::MAX))
+                    {
+                        Some(n) => *into = n as u32,
+                        None => problems.add(&format!("limits.{name}"), "a whole number above 0"),
+                    }
+                }
+            }
+            Some(_) => problems.add(
+                "limits",
+                "an object of in_flight, requests_per_second and answer_mib",
+            ),
+        }
+        let limits = (limits != meridian_domain::v1::SidecarLimits::default()).then_some(limits);
         let name = text(top, "name", "", true, &mut problems);
         let version = text(top, "version", "", true, &mut problems);
         let instance_id = text(top, "instance_id", "", true, &mut problems);
@@ -2534,6 +2588,7 @@ impl Context<'_> {
                     approved_roles,
                     live,
                     note,
+                    limits,
                     // Contract v30's shards and standby (W8.3), built with 3d.
                     ..Default::default()
                 },

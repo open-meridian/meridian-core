@@ -1265,8 +1265,9 @@ def the_documentation_pages(browser, prefix):
 def the_registry_pages(browser, prefix):
     """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
     Browse and Registries tabs, a listing's Overview, Documentation and
-    Versions, a plugin's Versions (ruling 305), and the install, update and
-    keep-or-stop sheets -- the install and update sheets the form at once,
+    Versions, a plugin's Versions (ruling 305), and the install, update,
+    keep-or-stop and launch sheets (the launch sheet's Limits, contract v30)
+    -- the install and update sheets the form at once,
     with one line linking the Terms (ruling 274) -- each on one screen at the
     three sizes, in light and dark, with no sideways scroll."""
     plugins = f"{BASE}/admin/plugins/versions?tab="
@@ -1285,6 +1286,9 @@ def the_registry_pages(browser, prefix):
         ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
         ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
         ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
+        # Contract v30 (W8.3; ruled 2026-11-11): the Launch sheet's Limits,
+        # the instance's own share at its sidecar.
+        ("launch-sheet", f"{BASE}/admin/plugins/versions/snaptrade/launch?version=0.13.0", "Limits"),
     ]
     for scheme in ("light", "dark"):
         for size, width, height in V24_SIZES:
@@ -1299,7 +1303,11 @@ def the_registry_pages(browser, prefix):
                 check(says in text, f"{name} at {size}, {scheme} says {says!r}")
                 check("not an endorsement" not in text and "nsupervised" not in text,
                       f"{name} at {size}, {scheme} carries no notice (ruling 274)")
-                if name.endswith("-sheet") and name != "keep-or-stop-sheet":
+                if name == "launch-sheet":
+                    limits = page.locator("[data-limits] input[type=number]")
+                    check(limits.count() == 3 and all(limits.nth(i).is_visible() for i in range(3)),
+                          f"launch-sheet at {size}, {scheme} offers its three limits")
+                if name.endswith("-sheet") and name not in ("keep-or-stop-sheet", "launch-sheet"):
                     line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
                     check(line.count() == 1 and line.is_visible(),
                           f"{name} at {size}, {scheme} keeps the one line linking the Terms")

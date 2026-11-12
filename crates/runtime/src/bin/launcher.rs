@@ -18,8 +18,8 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    checked, claim, manifest, reusable, template_for, with_archive, Shapes, StorageShapes,
-    CREATE_PLUGIN, REMOVE_PLUGIN,
+    checked, claim, manifest, reusable, template_for, with_archive, with_limits, Shapes,
+    StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -88,6 +88,8 @@ impl Launcher {
             &request,
             &edge,
         )?;
+        // Its own share at its sidecar, over the chart's (contract v30).
+        let made = with_limits(made, &request)?;
         if let Some(template) = chosen.claim {
             self.storage(template, &request)?;
         }

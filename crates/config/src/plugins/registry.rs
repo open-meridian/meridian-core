@@ -420,6 +420,9 @@ impl Plugins {
             client_name: by.client,
             note: request.note.clone(),
             prepared_call_id: by.prepared_call_id,
+            // The share at its sidecar it was launched with, kept (contract
+            // v30; ruled 2026-11-11).
+            limits: running.limits,
             ..Default::default()
         };
         self.store
@@ -430,6 +433,7 @@ impl Plugins {
             &version,
             running.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
+            running.limits,
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,

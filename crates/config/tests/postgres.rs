@@ -2800,3 +2800,33 @@ fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_
         300
     );
 }
+
+/// Contract v30 (W8.3; ruled 2026-11-11; migration 31): a launch's own
+/// share at its sidecar is kept on its record and read back with it; one
+/// that asked none reads none.
+#[test]
+fn a_launchs_own_limits_are_kept_on_its_record() {
+    let store = store("launch_limits");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let limits = meridian_domain::v1::SidecarLimits {
+        in_flight: 4,
+        requests_per_second: 50,
+        answer_mib: 0,
+    };
+    let mut asked = launch("snaptrade-1");
+    asked.limits = Some(limits);
+    assert!(store.begin_launch(&asked, "").unwrap());
+    assert!(store.begin_launch(&launch("snaptrade-2"), "").unwrap());
+    let launches = store.snapshot().unwrap().catalogue.launches;
+    let of = |instance: &str| {
+        launches
+            .iter()
+            .find(|l| l.instance_id == instance)
+            .unwrap()
+            .limits
+    };
+    assert_eq!(of("snaptrade-1"), Some(limits));
+    assert_eq!(of("snaptrade-2"), None);
+}

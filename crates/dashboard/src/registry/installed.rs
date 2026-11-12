@@ -667,6 +667,12 @@ pub(super) async fn launch_sheet(
          <form method=\"post\" action=\"{PLUGINS_PATH}/launch\" class=\"sheet-act\">{token}{hn}{hv}{hr}\
          <label>Instance <input type=\"text\" name=\"instance_id\" required maxlength=\"63\" value=\"{suggested}\"></label>\
          <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\"></label>\
+         <fieldset class=\"checks limits\" data-limits><legend>Limits</legend>\
+         <p class=\"hint\">Its share at its sidecar. Empty takes the deployment's.</p>\
+         <label>Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
+         <label>Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
+         <label>Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
+         </fieldset>\
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{back}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">Launch</button></div></form></section>",
         n = escape(&name),
@@ -720,6 +726,15 @@ pub(super) async fn launch(
             Err("this form did not come from your session".into()),
         );
     }
+    // Its own share at its sidecar, where entered (contract v30).
+    let limits = match crate::catalogue::sidecar_limits(
+        field(&fields, "in_flight"),
+        field(&fields, "requests_per_second"),
+        field(&fields, "answer_mib"),
+    ) {
+        Ok(limits) => limits,
+        Err(refused) => return to_versions(&name, Err(refused)),
+    };
     let launched: Result<PluginLaunch, String> = ask(
         &app,
         &session.subject,
@@ -736,6 +751,7 @@ pub(super) async fn launch(
                 .collect(),
             live: false,
             note: field(&fields, "note").into(),
+            limits,
             // Contract v30's shards and standby (W8.3), built with 3d.
             ..Default::default()
         },

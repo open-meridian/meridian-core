@@ -20886,6 +20886,26 @@ pub struct LaunchPluginRequest {
     /// data instances. A standby shares nothing until it takes over.
     #[prost(bool, tag = "9")]
     pub standby: bool,
+    /// Contract v30 (W8.3; the resilience spec's section 10a; ruled
+    /// 2026-11-11): this instance's own share at its sidecar, over the chart's
+    /// sidecar.limits. Unset, or a field 0, takes the chart's.
+    #[prost(message, optional, tag = "10")]
+    pub limits: ::core::option::Option<SidecarLimits>,
+}
+/// A plugin's share at its sidecar (the resilience spec's section 10a): at
+/// most in_flight requests at once, requests_per_second with a burst of a
+/// second's worth, and answer_mib MiB of answers held or paged in flight for
+/// it. Past any of them only that plugin is refused, RESOURCE_EXHAUSTED with
+/// REFUSAL_REASON_RATE_LIMITED and a retry-after. A field 0 takes the
+/// chart's sidecar.limits.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SidecarLimits {
+    #[prost(uint32, tag = "1")]
+    pub in_flight: u32,
+    #[prost(uint32, tag = "2")]
+    pub requests_per_second: u32,
+    #[prost(uint32, tag = "3")]
+    pub answer_mib: u32,
 }
 /// A launch, as the conductor records it.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -20958,6 +20978,11 @@ pub struct PluginLaunch {
     pub shards: u32,
     #[prost(bool, tag = "24")]
     pub standby: bool,
+    /// Contract v30 (W8.3; ruled 2026-11-11): the share at its sidecar the
+    /// instance was launched with, as the launch asked; unset where it asked
+    /// none, and on every launch before it.
+    #[prost(message, optional, tag = "25")]
+    pub limits: ::core::option::Option<SidecarLimits>,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -20990,6 +21015,11 @@ pub struct CreatePluginRequest {
     /// allowed, none.
     #[prost(message, optional, tag = "8")]
     pub archive: ::core::option::Option<PluginArchive>,
+    /// Contract v30 (W8.3; ruled 2026-11-11): the instance's own share at its
+    /// sidecar, as its launch asked: the launcher writes each field set into
+    /// the sidecar's MERIDIAN_SIDECAR_* over the chart's sidecar.limits.
+    #[prost(message, optional, tag = "9")]
+    pub limits: ::core::option::Option<SidecarLimits>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreatePluginReply {

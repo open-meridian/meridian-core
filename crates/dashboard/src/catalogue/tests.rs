@@ -1032,3 +1032,28 @@ async fn a_bundle_is_pushed_into_its_listing_s_repository_and_carried_whole() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
     }
 }
+
+/// Contract v30 (W8.3; ruled 2026-11-11): a launch's own share at its
+/// sidecar, as the Launch sheet takes it: each empty for the deployment's,
+/// none at all where all are, and one not a whole number above 0 refused
+/// naming it.
+#[test]
+fn a_launchs_limits_are_read_each_empty_for_the_deployments() {
+    assert_eq!(super::sidecar_limits("", " ", ""), Ok(None));
+    assert_eq!(
+        super::sidecar_limits("4", "", "8"),
+        Ok(Some(meridian_domain::v1::SidecarLimits {
+            in_flight: 4,
+            requests_per_second: 0,
+            answer_mib: 8,
+        }))
+    );
+    for (in_flight, per_second, answer, named) in [
+        ("0", "", "", "limits.in_flight"),
+        ("", "-3", "", "limits.requests_per_second"),
+        ("", "", "lots", "limits.answer_mib"),
+    ] {
+        let refused = super::sidecar_limits(in_flight, per_second, answer).unwrap_err();
+        assert!(refused.contains(named), "{refused}");
+    }
+}

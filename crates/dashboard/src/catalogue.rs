@@ -886,6 +886,45 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     )
 }
 
+/// A launch's own share at its sidecar (contract v30, W8.3; the
+/// resilience spec's section 10a; ruled 2026-11-11), from what was entered:
+/// each a whole number above 0, or empty for the chart's sidecar.limits.
+/// None where every one is empty. Refused naming the first that is not.
+pub(crate) fn sidecar_limits(
+    in_flight: &str,
+    requests_per_second: &str,
+    answer_mib: &str,
+) -> Result<Option<meridian_domain::v1::SidecarLimits>, String> {
+    let said = |value: &str, name: &str| -> Result<u32, String> {
+        match value.trim() {
+            "" => Ok(0),
+            text => text
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("limits.{name} is {text:?}: a whole number above 0, or empty for the deployment's")),
+        }
+    };
+    let limits = meridian_domain::v1::SidecarLimits {
+        in_flight: said(in_flight, "in_flight")?,
+        requests_per_second: said(requests_per_second, "requests_per_second")?,
+        answer_mib: said(answer_mib, "answer_mib")?,
+    };
+    Ok((limits != meridian_domain::v1::SidecarLimits::default()).then_some(limits))
+}
+
+/// A launch's limits as the terminal sends them (contract v30): each
+/// optional, 0 or absent for the chart's.
+#[derive(serde::Deserialize, Default)]
+struct LaunchLimits {
+    #[serde(default)]
+    in_flight: u32,
+    #[serde(default)]
+    requests_per_second: u32,
+    #[serde(default)]
+    answer_mib: u32,
+}
+
 #[derive(serde::Deserialize)]
 struct Launch {
     name: String,
@@ -900,6 +939,9 @@ struct Launch {
     /// Why, kept with the launch (contract v17); the CLI sends none yet.
     #[serde(default)]
     note: String,
+    /// Its own share at its sidecar (contract v30); none for the chart's.
+    #[serde(default)]
+    limits: Option<LaunchLimits>,
 }
 
 async fn launch(
@@ -918,6 +960,15 @@ async fn launch(
         approved_roles: asked.approved_roles,
         live: asked.live,
         note: asked.note,
+        // Its own share at its sidecar (contract v30; ruled 2026-11-11).
+        limits: asked
+            .limits
+            .map(|l| meridian_domain::v1::SidecarLimits {
+                in_flight: l.in_flight,
+                requests_per_second: l.requests_per_second,
+                answer_mib: l.answer_mib,
+            })
+            .filter(|l| *l != meridian_domain::v1::SidecarLimits::default()),
         // Contract v30's shards and standby (W8.3), built with 3d.
         ..Default::default()
     };

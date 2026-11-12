@@ -1526,8 +1526,8 @@ impl Store for PostgresStore {
                 "INSERT INTO config_plugin_launch
                         (instance_id, name, version, image_digest, roles, launched_by,
                          launched_at_ns, state, live, launched_through_delegation,
-                         launched_client_name, launch_note, prepared_call_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12)
+                         launched_client_name, launch_note, prepared_call_id, sidecar_limits)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -1542,6 +1542,7 @@ impl Store for PostgresStore {
                     &launch.client_name,
                     &note,
                     &launch.prepared_call_id,
+                    &launch.limits.as_ref().map(prost::Message::encode_to_vec),
                 ],
             )
             .map_err(unavailable)?;
@@ -3001,7 +3002,7 @@ const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
      stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id, \
-     pull_acknowledgement";
+     pull_acknowledgement, sidecar_limits";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
@@ -3078,6 +3079,11 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         // kept, so one pod and no standby.
         shards: 0,
         standby: false,
+        // Its own share at its sidecar, as its launch asked (contract v30;
+        // ruled 2026-11-11).
+        limits: row.get::<_, Option<Vec<u8>>>(21).and_then(|bytes| {
+            <meridian_domain::v1::SidecarLimits as prost::Message>::decode(&bytes[..]).ok()
+        }),
     }
 }
 
