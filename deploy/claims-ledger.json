@@ -8,14 +8,14 @@
       "bound_s": 5,
       "measured_s": {
         "runs": 4,
-        "min": 0.42,
-        "median": 0.57,
-        "max": 0.61
+        "min": 0.44,
+        "median": 0.51,
+        "max": 0.56
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=apiserver"
     },
@@ -26,14 +26,14 @@
       "bound_s": 5,
       "measured_s": {
         "runs": 4,
-        "min": 0.51,
-        "median": 0.53,
-        "max": 0.59
+        "min": 0.52,
+        "median": 0.54,
+        "max": 0.55
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=apiserver"
     },
@@ -50,8 +50,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=apiserver"
     },
@@ -62,14 +62,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 0.55,
-        "median": 0.68,
-        "max": 0.96
+        "min": 0.6,
+        "median": 0.76,
+        "max": 0.88
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bit-rot"
     },
@@ -86,8 +86,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bit-rot"
     },
@@ -98,14 +98,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 5.61,
-        "median": 5.86,
-        "max": 6.17
+        "min": 5.17,
+        "median": 5.81,
+        "max": 7.13
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bor-writer"
     },
@@ -122,8 +122,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bor-writer"
     },
@@ -134,14 +134,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 3.13,
-        "median": 3.64,
-        "max": 5.46
+        "min": 3.25,
+        "median": 3.45,
+        "max": 3.59
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=broker"
     },
@@ -158,8 +158,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=broker"
     },
@@ -170,20 +170,20 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 22.31,
-        "median": 22.69,
-        "max": 23.65
+        "min": 23.18,
+        "median": 23.59,
+        "max": 24.01
       },
       "rpo": {
-        "acknowledged_commits_min": 314,
+        "acknowledged_commits_min": 320,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -195,20 +195,20 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 22.63,
-        "median": 23.12,
-        "max": 24.05
+        "min": 23.58,
+        "median": 24.02,
+        "max": 24.28
       },
       "rpo": {
-        "acknowledged_commits_min": 314,
+        "acknowledged_commits_min": 320,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -226,8 +226,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary"
     },
@@ -238,14 +238,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 4.96,
-        "median": 5.21,
-        "max": 7.24
+        "min": 5.07,
+        "median": 6.58,
+        "max": 7.13
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=instrument-writer"
     },
@@ -262,8 +262,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=instrument-writer"
     },
@@ -274,14 +274,14 @@
       "bound_s": 15,
       "measured_s": {
         "runs": 4,
-        "min": 5.26,
-        "median": 6.08,
-        "max": 7.21
+        "min": 5.86,
+        "median": 6.61,
+        "max": 6.91
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=lake-writer"
     },
@@ -298,8 +298,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=lake-writer"
     },
@@ -310,14 +310,14 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 2.06,
-        "median": 2.29,
-        "max": 4.34
+        "min": 2.18,
+        "median": 2.63,
+        "max": 2.79
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=memory-pressure"
     },
@@ -334,8 +334,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=memory-pressure"
     },
@@ -352,8 +352,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=network-policy"
     },
@@ -364,14 +364,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 0.42,
-        "median": 0.45,
-        "max": 0.6
+        "min": 0.38,
+        "median": 0.56,
+        "max": 0.64
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=network-policy"
     },
@@ -382,14 +382,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 5.34,
-        "median": 5.74,
-        "max": 6.87
+        "min": 6.38,
+        "median": 6.6,
+        "max": 6.75
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node"
     },
@@ -406,8 +406,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node"
     },
@@ -418,14 +418,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 6.14,
-        "median": 8.56,
-        "max": 8.69
+        "min": 6.07,
+        "median": 7.37,
+        "max": 8.87
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node-freeze"
     },
@@ -442,8 +442,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node-freeze"
     },
@@ -460,8 +460,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=noisy-plugin"
     },
@@ -472,14 +472,14 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 0.69,
-        "median": 0.77,
-        "max": 1.09
+        "min": 0.68,
+        "median": 0.95,
+        "max": 1.06
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=noisy-plugin"
     },
@@ -490,22 +490,22 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 1.29,
-        "median": 2.2,
-        "max": 2.52
+        "min": 2.05,
+        "median": 2.42,
+        "max": 3.01
       },
       "rpo": {
-        "acknowledged_commits_min": 1613,
+        "acknowledged_commits_min": 1624,
         "commits_lost_max": 0,
         "duplicated_max": 0
       },
       "detected_s": {
-        "max": 1.42,
+        "max": 1.73,
         "bound": 10
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=order-plugin",
       "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
@@ -523,8 +523,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=order-plugin",
       "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
@@ -536,14 +536,14 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.78,
-        "median": 2.34,
-        "max": 2.87
+        "min": 1.77,
+        "median": 2.31,
+        "max": 2.85
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=replica-rot"
     },
@@ -554,14 +554,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 3.11,
-        "median": 3.5,
-        "max": 4.04
+        "min": 3.45,
+        "median": 3.79,
+        "max": 3.98
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=replica-rot"
     },
@@ -578,8 +578,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=replica-rot"
     },
@@ -590,14 +590,14 @@
       "bound_s": 15,
       "measured_s": {
         "runs": 4,
-        "min": 6.5,
-        "median": 8.78,
-        "max": 9.1
+        "min": 8.81,
+        "median": 9.26,
+        "max": 9.35
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=split-brain"
     },
@@ -614,8 +614,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=split-brain"
     },
@@ -626,14 +626,14 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 2.18,
-        "median": 5.83,
-        "max": 15.44
+        "min": 3.37,
+        "median": 9.11,
+        "max": 15.2
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=standing-coordinator"
     },
@@ -650,8 +650,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=standing-coordinator"
     },
@@ -668,8 +668,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=street-writer"
     },
@@ -680,14 +680,14 @@
       "bound_s": 10,
       "measured_s": {
         "runs": 4,
-        "min": 5.77,
-        "median": 6.29,
-        "max": 7.38
+        "min": 6.02,
+        "median": 6.8,
+        "max": 7.26
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=street-writer"
     },
@@ -698,20 +698,20 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 22.59,
-        "median": 23.25,
-        "max": 23.96
+        "min": 22.8,
+        "median": 23.38,
+        "max": 23.46
       },
       "rpo": {
-        "acknowledged_commits_min": 259,
+        "acknowledged_commits_min": 266,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -723,20 +723,20 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 22.92,
-        "median": 23.69,
-        "max": 24.43
+        "min": 23.23,
+        "median": 23.77,
+        "max": 23.8
       },
       "rpo": {
-        "acknowledged_commits_min": 259,
+        "acknowledged_commits_min": 266,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -754,8 +754,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write"
     },
@@ -766,14 +766,14 @@
       "bound_s": 300,
       "measured_s": {
         "runs": 4,
-        "min": 7.55,
-        "median": 8.27,
-        "max": 10.23
+        "min": 7.62,
+        "median": 8.18,
+        "max": 8.59
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=volume-lost"
     },
@@ -790,8 +790,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=volume-lost"
     },
@@ -802,14 +802,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 1.83,
-        "median": 2.0,
-        "max": 2.28
+        "min": 0.97,
+        "median": 1.5,
+        "max": 2.1
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=write-ahead-bound"
     },
@@ -826,8 +826,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=write-ahead-bound"
     },
@@ -838,20 +838,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.61,
-        "median": 6.34,
-        "max": 6.75
+        "min": 1.2,
+        "median": 1.79,
+        "max": 7.39
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -863,20 +863,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.3,
-        "median": 4.31,
-        "max": 6.92
+        "min": 1.66,
+        "median": 5.63,
+        "max": 6.27
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -888,20 +888,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.29,
-        "median": 1.83,
-        "max": 6.92
+        "min": 6.27,
+        "median": 6.77,
+        "max": 7.41
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -913,20 +913,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.42,
-        "median": 5.52,
-        "max": 6.39
+        "min": 1.2,
+        "median": 5.78,
+        "max": 6.72
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -938,20 +938,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.3,
-        "median": 5.38,
-        "max": 6.77
+        "min": 1.66,
+        "median": 3.59,
+        "max": 6.82
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -969,8 +969,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
     },
@@ -981,20 +981,20 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.81,
-        "median": 5.64,
-        "max": 6.39
+        "min": 1.58,
+        "median": 3.34,
+        "max": 6.72
       },
       "rpo": {
-        "acknowledged_commits_min": 237,
+        "acknowledged_commits_min": 238,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0,
         "lake_seconds_bound": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
       "ruled": "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go through a JetStream stream kept on three servers, and a data plugin's write is answered only once the stream holds it. The lake's writer commits each batch with its position in the stream in the same transaction, and after a database failover resumes from the position the promoted standby holds, so no acknowledged row is lost (lake_seconds_bound 0). Each dataset declares how it recovers: history fetched again through the plugin's backfill, a buffer only, or not fetchable again; a gap is recorded and read. Tolerant is unchanged."
@@ -1006,18 +1006,18 @@
       "bound_s": null,
       "measured_s": {
         "runs": 2,
-        "min": 55.99,
-        "median": 77.66,
-        "max": 99.32
+        "min": 56.41,
+        "median": 75.11,
+        "max": 93.81
       },
       "rpo": {
-        "acknowledged_commits_min": 123,
+        "acknowledged_commits_min": 111,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615"
+        "43171838245"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=reconfigure FAILURE=reconfigure-ha"
     },
@@ -1028,18 +1028,18 @@
       "bound_s": null,
       "measured_s": {
         "runs": 1,
-        "min": 49.41,
-        "median": 49.41,
-        "max": 49.41
+        "min": 49.25,
+        "median": 49.25,
+        "max": 49.25
       },
       "rpo": {
-        "acknowledged_commits_min": 59,
+        "acknowledged_commits_min": 67,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615"
+        "43171838245"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=reconfigure FAILURE=reconfigure-tolerant"
     },
@@ -1050,14 +1050,14 @@
       "bound_s": 5,
       "measured_s": {
         "runs": 4,
-        "min": 0.43,
-        "median": 0.49,
-        "max": 0.52
+        "min": 0.48,
+        "median": 0.52,
+        "max": 0.57
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=apiserver"
     },
@@ -1074,8 +1074,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=apiserver"
     },
@@ -1092,8 +1092,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=apiserver"
     },
@@ -1104,14 +1104,14 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 0.44,
-        "median": 0.46,
-        "max": 0.51
+        "min": 0.35,
+        "median": 0.48,
+        "max": 0.56
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bit-rot"
     },
@@ -1128,8 +1128,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bit-rot"
     },
@@ -1140,14 +1140,14 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.19,
-        "median": 1.29,
-        "max": 1.76
+        "min": 1.29,
+        "median": 1.67,
+        "max": 2.01
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bor-writer"
     },
@@ -1164,8 +1164,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bor-writer"
     },
@@ -1176,14 +1176,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 4.7,
-        "median": 4.72,
-        "max": 4.85
+        "min": 4.45,
+        "median": 4.83,
+        "max": 5.29
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=broker"
     },
@@ -1200,8 +1200,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=broker"
     },
@@ -1212,19 +1212,19 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 2.45,
-        "median": 2.63,
-        "max": 2.69
+        "min": 1.82,
+        "median": 2.08,
+        "max": 3.12
       },
       "rpo": {
-        "acknowledged_commits_min": 299,
+        "acknowledged_commits_min": 297,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=db-primary"
     },
@@ -1235,19 +1235,19 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 2.71,
-        "median": 2.9,
-        "max": 3.01
+        "min": 2.1,
+        "median": 2.32,
+        "max": 3.36
       },
       "rpo": {
-        "acknowledged_commits_min": 299,
+        "acknowledged_commits_min": 297,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=db-primary"
     },
@@ -1264,8 +1264,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=db-primary"
     },
@@ -1276,13 +1276,13 @@
       "bound_s": null,
       "measured_s": {
         "runs": 1,
-        "min": 4.51,
-        "median": 4.51,
-        "max": 4.51
+        "min": 4.58,
+        "median": 4.58,
+        "max": 4.58
       },
       "rpo": {},
       "runs": [
-        "43140995615"
+        "43171838245"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup"
     },
@@ -1293,14 +1293,14 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.18,
-        "median": 1.46,
-        "max": 1.91
+        "min": 0.84,
+        "median": 1.45,
+        "max": 1.74
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=lake-writer"
     },
@@ -1317,8 +1317,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=lake-writer"
     },
@@ -1329,14 +1329,14 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 0.71,
-        "median": 1.52,
-        "max": 2.58
+        "min": 0.5,
+        "median": 1.46,
+        "max": 2.38
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=memory-pressure"
     },
@@ -1353,8 +1353,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=memory-pressure"
     },
@@ -1371,8 +1371,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=network-policy"
     },
@@ -1383,14 +1383,14 @@
       "bound_s": 60,
       "measured_s": {
         "runs": 4,
-        "min": 0.13,
-        "median": 0.14,
-        "max": 0.17
+        "min": 0.12,
+        "median": 0.15,
+        "max": 0.2
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=network-policy"
     },
@@ -1407,8 +1407,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=noisy-plugin"
     },
@@ -1419,14 +1419,14 @@
       "bound_s": 30,
       "measured_s": {
         "runs": 4,
-        "min": 0.66,
-        "median": 1.34,
-        "max": 1.94
+        "min": 0.76,
+        "median": 1.3,
+        "max": 1.86
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=noisy-plugin"
     },
@@ -1437,22 +1437,22 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 1.56,
-        "median": 2.48,
-        "max": 2.68
+        "min": 1.49,
+        "median": 1.98,
+        "max": 2.86
       },
       "rpo": {
-        "acknowledged_commits_min": 515,
+        "acknowledged_commits_min": 465,
         "commits_lost_max": 0,
         "duplicated_max": 0
       },
       "detected_s": {
-        "max": 1.54,
+        "max": 1.14,
         "bound": 10
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=order-plugin",
       "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
@@ -1470,8 +1470,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=order-plugin",
       "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
@@ -1483,16 +1483,16 @@
       "bound_s": 7200,
       "measured_s": {
         "runs": 1,
-        "min": 49.53,
-        "median": 49.53,
-        "max": 49.53
+        "min": 21.62,
+        "median": 21.62,
+        "max": 21.62
       },
       "rpo": {
         "seconds_max": 60,
         "seconds_bound": 300
       },
       "runs": [
-        "43140995615"
+        "43171838245"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup"
     },
@@ -1503,19 +1503,19 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 2.59,
-        "median": 2.95,
-        "max": 3.19
+        "min": 2.77,
+        "median": 2.88,
+        "max": 3.14
       },
       "rpo": {
-        "acknowledged_commits_min": 233,
+        "acknowledged_commits_min": 218,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=torn-write"
     },
@@ -1526,19 +1526,19 @@
       "bound_s": 120,
       "measured_s": {
         "runs": 4,
-        "min": 2.82,
-        "median": 3.22,
-        "max": 3.47
+        "min": 3.04,
+        "median": 3.12,
+        "max": 3.37
       },
       "rpo": {
-        "acknowledged_commits_min": 233,
+        "acknowledged_commits_min": 218,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
         "lake_rpo_s_max": 0
       },
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=torn-write"
     },
@@ -1555,8 +1555,8 @@
       },
       "rpo": {},
       "runs": [
-        "43140995615",
-        "43141042746"
+        "43171838245",
+        "43171859973"
       ],
       "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=torn-write"
     }
