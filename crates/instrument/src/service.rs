@@ -201,6 +201,22 @@ pub fn serve_all_within(
             let started = std::time::Instant::now();
             let request: ResolveIdentifierRequest =
                 decode(&envelope, "meridian.v1.ResolveIdentifierRequest")?;
+            // Contract v30 (W3.1; ruling 1035): an event contract's terms as
+            // stated, held to the record's rules but for a payout, which a
+            // statement may leave unstated.
+            if let Some((field, words)) = request
+                .stated_binary_event_contract
+                .as_ref()
+                .map(meridian_domain::instrument_type::stated_contract_refused)
+                .and_then(|wrong| wrong.into_iter().next())
+            {
+                let named = format!("stated_binary_event_contract.{field}");
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    std::slice::from_ref(&named),
+                    format!("{named}: {words}"),
+                ));
+            }
             let instance = envelope
                 .meta
                 .as_ref()

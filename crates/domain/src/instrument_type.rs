@@ -491,6 +491,68 @@ pub fn contract_from_text(text: &str) -> Option<BinaryEventContract> {
     })
 }
 
+/// A contract's terms as a data plugin stated them on resolving it
+/// (contract v30, W3.1; ruling 1035), from what [`contract_to_text`] wrote of
+/// them: as [`contract_from_text`], but a payout may be unstated -- a
+/// statement may name its category and not its payout -- an empty amount,
+/// code and instrument reading as none.
+pub fn stated_contract_from_text(text: &str) -> Option<BinaryEventContract> {
+    let mut parts: Vec<String> = text.splitn(8, '|').map(str::to_string).collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let unstated = parts[0].is_empty() && parts[1].is_empty() && parts[2].is_empty();
+    if unstated {
+        parts[0] = "1".into();
+    }
+    let mut contract = contract_from_text(&parts.join("|"))?;
+    if unstated {
+        contract.payout = None;
+    }
+    Some(contract)
+}
+
+/// The terms a statement offers over those a record holds (contract v30,
+/// W3.1; ruling 1035): each term the statement states, the held one where it
+/// states none -- its payout, its close, its range (bounds and unit
+/// together) and its category.
+pub fn contract_stated_over(
+    held: &BinaryEventContract,
+    stated: &BinaryEventContract,
+) -> BinaryEventContract {
+    let ranged = stated.floor.is_some() || stated.cap.is_some();
+    BinaryEventContract {
+        payout: stated.payout.clone().or_else(|| held.payout.clone()),
+        closes_at_ns: if stated.closes_at_ns != 0 {
+            stated.closes_at_ns
+        } else {
+            held.closes_at_ns
+        },
+        floor: if ranged { stated.floor } else { held.floor },
+        cap: if ranged { stated.cap } else { held.cap },
+        bound_unit: if ranged {
+            stated.bound_unit.clone()
+        } else {
+            held.bound_unit.clone()
+        },
+        category: if stated.category.trim().is_empty() {
+            held.category.clone()
+        } else {
+            stated.category.trim().to_string()
+        },
+    }
+}
+
+/// What is wrong with a binary event contract's terms as a data plugin
+/// states them on resolving it (contract v30, W3.1; ruling 1035): as
+/// [`contract_refused`], but its payout may be unstated.
+pub fn stated_contract_refused(contract: &BinaryEventContract) -> Vec<(&'static str, String)> {
+    contract_refused(contract)
+        .into_iter()
+        .filter(|(field, _)| contract.payout.is_some() || !field.starts_with("payout"))
+        .collect()
+}
+
 /// What is wrong with a binary event contract's attributes, each by its
 /// field and in words: a payout naming no asset, naming a token's code, or
 /// not more than zero; a close before the epoch. Empty when they stand.
@@ -833,6 +895,77 @@ mod tests {
         };
         let fields: Vec<&str> = contract_refused(&long).iter().map(|(f, _)| *f).collect();
         assert_eq!(fields, vec!["category"]);
+    }
+
+    /// Contract v30 (W3.1; ruling 1035): a data plugin's statement of an
+    /// event contract may leave its payout unstated -- read back as none,
+    /// and not refused for it -- and is otherwise held to the record's
+    /// rules; stated over terms held, each term it states replaces the held.
+    #[test]
+    fn a_stated_contract_may_leave_its_payout_unstated() {
+        let category_only = BinaryEventContract {
+            category: "Economics".into(),
+            ..Default::default()
+        };
+        let text = contract_to_text(&category_only);
+        assert_eq!(
+            stated_contract_from_text(&text),
+            Some(category_only.clone())
+        );
+        assert!(stated_contract_refused(&category_only).is_empty());
+        assert_eq!(contract_from_text(&text), None, "never a record's terms");
+        let wrong = BinaryEventContract {
+            category: "x".repeat(65),
+            floor: Some(EventContractBound {
+                value: None,
+                inclusive: true,
+            }),
+            bound_unit: "percent".into(),
+            ..Default::default()
+        };
+        let fields: Vec<&str> = stated_contract_refused(&wrong)
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(fields, vec!["category", "floor.value"]);
+        let held = BinaryEventContract {
+            payout: Some(Money {
+                amount: Some(Exact::new(1, 0).unwrap().to_wire()),
+                currency_code: "USD".into(),
+                instrument_id: String::new(),
+            }),
+            closes_at_ns: 5,
+            category: "Economics".into(),
+            ..Default::default()
+        };
+        let over = contract_stated_over(
+            &held,
+            &BinaryEventContract {
+                closes_at_ns: 9,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            over,
+            BinaryEventContract {
+                closes_at_ns: 9,
+                ..held.clone()
+            }
+        );
+        let zero = BinaryEventContract {
+            payout: Some(Money {
+                amount: Some(Exact::new(0, 0).unwrap().to_wire()),
+                ..held.payout.clone().unwrap()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            stated_contract_refused(&zero)
+                .iter()
+                .map(|(f, _)| *f)
+                .collect::<Vec<_>>(),
+            vec!["payout.amount"]
+        );
     }
 
     #[test]

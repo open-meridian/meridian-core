@@ -843,6 +843,15 @@ pub(crate) fn stated(
             ));
         }
     }
+    // Contract v30 (W3.1; ruling 1035): an event contract's terms as its
+    // venue gives them, its payout perhaps unstated; [`take_stated`] records
+    // its category the first time and offers the rest.
+    if let Some(contract) = request.stated_binary_event_contract.as_ref() {
+        offers.push(offer(
+            Field::BinaryEventContract,
+            meridian_domain::instrument_type::contract_to_text(contract),
+        ));
+    }
     offers
 }
 
@@ -943,6 +952,12 @@ pub(crate) fn take_stated(
     let mut applied = Vec::new();
     let mut offered = Vec::new();
     for offer in offers {
+        if offer.field == Field::BinaryEventContract {
+            let (recorded, rest) = take_stated_contract(record, offer, now_ns);
+            applied.extend(recorded);
+            offered.extend(rest);
+            continue;
+        }
         let person = picker_person(&offer.instance_id);
         if person.is_empty()
             || !PICKER_APPLIES.contains(&offer.field)
@@ -982,6 +997,71 @@ pub(crate) fn take_stated(
     }
     let changed = keep_offers(record, offered);
     (applied, changed)
+}
+
+/// An event contract's terms as a data plugin stated them (contract v30,
+/// W3.1; ruling 1035, with 954). The store records the venue's `category`
+/// the first time it sees the contract: where the record's terms hold none,
+/// the stated one is put in force on them, sourced to the plugin, a change
+/// of the record's version. Every other term stated, and a category that
+/// differs from one held, is kept as an offer, as every stated value is
+/// (W3's invariant): the statement's terms over those held, or whole where
+/// the record holds none and the statement states a payout. A record's
+/// payout is never unset, so a statement of a category alone on a record
+/// holding no terms has nothing to record it on, and offers nothing.
+fn take_stated_contract(
+    record: &mut Instrument,
+    mut offer: Offer,
+    now_ns: i64,
+) -> (Option<Change>, Option<Offer>) {
+    use meridian_domain::instrument_type::{
+        contract_from_text, contract_stated_over, contract_to_text, stated_contract_from_text,
+    };
+    let Some(stated) = stated_contract_from_text(&offer.value) else {
+        return (None, None);
+    };
+    let category = stated.category.trim().to_string();
+    let mut recorded = None;
+    if let Some(mut held) = contract_from_text(&record.binary_event_contract) {
+        if held.category.trim().is_empty() && !category.is_empty() {
+            let before = record.binary_event_contract.clone();
+            held.category = category;
+            record.binary_event_contract = contract_to_text(&held);
+            record.set_source(Source {
+                acting_through_delegation: String::new(),
+                client_name: String::new(),
+                prepared_call_id: String::new(),
+                field: Field::BinaryEventContract,
+                identifier: None,
+                source: offer.source.clone(),
+                person: picker_person(&offer.instance_id).to_string(),
+                instance_id: offer.instance_id.clone(),
+                recorded_at_ns: now_ns,
+                note: String::new(),
+            });
+            recorded = Some(Change {
+                field: Field::BinaryEventContract.name().into(),
+                scheme: String::new(),
+                namespace: String::new(),
+                before: crate::record::value_words(Field::BinaryEventContract, &before),
+                after: crate::record::value_words(
+                    Field::BinaryEventContract,
+                    &record.binary_event_contract,
+                ),
+                source: offer.source.clone(),
+            });
+        }
+    }
+    let offered = match contract_from_text(&record.binary_event_contract) {
+        Some(held) => Some(contract_stated_over(&held, &stated)),
+        None if stated.payout.is_some() => Some(stated),
+        None => None,
+    };
+    let offered = offered.map(|contract| {
+        offer.value = contract_to_text(&contract);
+        offer
+    });
+    (recorded, offered)
 }
 
 /// List a conflict for a person, or bring it up to date.
@@ -1404,6 +1484,173 @@ mod tests {
             .offers
             .iter()
             .all(|offer| offer.field != Field::Currency));
+    }
+
+    /// Contract v30 (W3.1; ruling 1035, with 954): a data plugin states an
+    /// event contract's terms. The store records `category` the first time
+    /// it sees the contract -- on terms held with none -- sourced to the
+    /// plugin, a change of the record's version; every other term, and a
+    /// category unlike the one held, is kept as an offer. A statement of a
+    /// category alone on a record holding no terms offers nothing, and one
+    /// stating none resolves as before.
+    #[test]
+    fn an_event_contracts_category_is_recorded_the_first_time_and_its_terms_offered() {
+        use meridian_domain::instrument_type::{contract_from_text, contract_to_text};
+        use meridian_domain::v1::{BinaryEventContract, Money};
+        let terms = BinaryEventContract {
+            payout: Some(Money {
+                amount: Some(
+                    "1".parse::<meridian_domain::exact::Exact>()
+                        .unwrap()
+                        .to_wire(),
+                ),
+                currency_code: "USD".into(),
+                instrument_id: "LCL-USD".into(),
+            }),
+            closes_at_ns: 1_793_548_800_000_000_000,
+            ..Default::default()
+        };
+        let store = MemoryStore::new();
+        let mut held = platform_record(
+            "INS-01J8XQ4M7K00000000KXCPI",
+            vec![("symbol", "KXCPI-26NOV", "kalshi", 0)],
+        );
+        held.binary_event_contract = contract_to_text(&terms);
+        hold(&store, held);
+        let stating = |contract: BinaryEventContract| ResolveIdentifierRequest {
+            stated_binary_event_contract: Some(contract),
+            ..request(vec![asked("symbol", "KXCPI-26NOV", "kalshi")])
+        };
+        // The first statement naming a category: recorded on the terms held.
+        let first = resolve_identifier(
+            &store,
+            &stating(BinaryEventContract {
+                category: "Economics".into(),
+                ..Default::default()
+            }),
+            "data-kalshi-1",
+            NOW,
+        )
+        .unwrap()
+        .changed
+        .expect("the category recorded");
+        let recorded = contract_from_text(&first.binary_event_contract).unwrap();
+        assert_eq!(recorded.category, "Economics");
+        assert_eq!(
+            recorded.payout, terms.payout,
+            "the rest of the terms as held"
+        );
+        let source = first
+            .sources
+            .iter()
+            .find(|s| s.field == Field::BinaryEventContract)
+            .unwrap();
+        assert_eq!(source.instance_id, "data-kalshi-1");
+        assert!(
+            first
+                .offers
+                .iter()
+                .all(|o| o.field != Field::BinaryEventContract),
+            "no other term stated: no offer of terms"
+        );
+        let history = store.history(&first.instrument_id).unwrap();
+        let completed = history.iter().find(|v| v.version == first.version).unwrap();
+        assert_eq!(completed.operation, "complete");
+        assert_eq!(completed.changes[0].field, "binary_event_contract");
+        assert_eq!(completed.instance_id, "data-kalshi-1");
+        // Stated again: nothing changes.
+        assert!(resolve_identifier(
+            &store,
+            &stating(BinaryEventContract {
+                category: "Economics".into(),
+                ..Default::default()
+            }),
+            "data-kalshi-1",
+            NOW + 1,
+        )
+        .unwrap()
+        .changed
+        .is_none());
+        // Thereafter a category unlike the one held, and a close, are offers,
+        // the terms held in force.
+        let later = resolve_identifier(
+            &store,
+            &stating(BinaryEventContract {
+                category: "Inflation".into(),
+                closes_at_ns: 1_793_552_400_000_000_000,
+                ..Default::default()
+            }),
+            "data-kalshi-1",
+            NOW + 2,
+        )
+        .unwrap()
+        .changed
+        .unwrap();
+        assert_eq!(
+            contract_from_text(&later.binary_event_contract)
+                .unwrap()
+                .category,
+            "Economics"
+        );
+        let offered: Vec<_> = later
+            .offers
+            .iter()
+            .filter(|o| o.field == Field::BinaryEventContract)
+            .collect();
+        assert_eq!(offered.len(), 1);
+        let offered = contract_from_text(&offered[0].value).unwrap();
+        assert_eq!(offered.category, "Inflation");
+        assert_eq!(offered.closes_at_ns, 1_793_552_400_000_000_000);
+        assert_eq!(offered.payout, terms.payout);
+
+        // A record holding no terms: a category alone offers nothing; terms
+        // with a payout are offered whole, nothing in force.
+        let bare = request(vec![asked("symbol", "KXRAIN-26NOV", "kalshi")]);
+        let alone = resolve_identifier(
+            &store,
+            &ResolveIdentifierRequest {
+                stated_binary_event_contract: Some(BinaryEventContract {
+                    category: "Climate".into(),
+                    ..Default::default()
+                }),
+                ..bare.clone()
+            },
+            "data-kalshi-1",
+            NOW,
+        )
+        .unwrap()
+        .changed
+        .unwrap();
+        assert!(alone.binary_event_contract.is_empty());
+        assert!(alone
+            .offers
+            .iter()
+            .all(|o| o.field != Field::BinaryEventContract));
+        let whole = resolve_identifier(
+            &store,
+            &ResolveIdentifierRequest {
+                stated_binary_event_contract: Some(BinaryEventContract {
+                    category: "Climate".into(),
+                    ..terms.clone()
+                }),
+                ..bare
+            },
+            "data-kalshi-1",
+            NOW + 1,
+        )
+        .unwrap()
+        .changed
+        .unwrap();
+        assert!(whole.binary_event_contract.is_empty(), "never in force");
+        let offered = whole
+            .offers
+            .iter()
+            .find(|o| o.field == Field::BinaryEventContract)
+            .unwrap();
+        assert_eq!(
+            contract_from_text(&offered.value).unwrap().category,
+            "Climate"
+        );
     }
 
     #[test]
