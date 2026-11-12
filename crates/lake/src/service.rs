@@ -160,6 +160,18 @@ pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
 /// dataset's liveness, which only the writer's commands set. The answer
 /// never depends on which member takes the read.
 pub const READ_FROM_WRITER: &str = "platform.lake.internal.read-from-writer";
+/// A write handed to the writer group owning its datasets (step 3d; the
+/// resilience spec's section 6.7): the public write, unchanged.
+pub const INTERNAL_RECORD: &str = "platform.lake.internal.record";
+
+/// Whether `topic` is a lake write of datasets' rows, which a member hands
+/// to the writer group owning each dataset: every `record-` command but a
+/// dataset's liveness and an assessment, which are group 0's own.
+pub fn is_record_write(topic: &str) -> bool {
+    topic.starts_with("platform.lake.command.record-")
+        && topic != RECORD_LIVENESS
+        && topic != RECORD_QUALITY_ASSESSMENTS
+}
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -416,6 +428,9 @@ pub struct Lake {
         (Vec<Observation>, i64),
         Result<crate::store::Recorded, String>,
     >,
+    /// Its writer group and the lake's count (step 3d; section 6.1): the
+    /// datasets it writes, and those it hands to their owners.
+    groups: meridian_changes::groups::Groups,
 }
 
 /// A gap asked again of its data plugin (W10.14): recovered once every want
@@ -809,8 +824,58 @@ impl Lake {
             refetching: Mutex::new(BTreeMap::new()),
             switches: Mutex::new(switches),
             lanes: Default::default(),
+            groups: meridian_changes::groups::Groups::one(),
             store,
         })
+    }
+
+    /// The same lake, writing for writer group `groups` (step 3d).
+    fn grouped(
+        bus: Arc<Bus>,
+        store: Arc<dyn Store>,
+        clock: Arc<dyn Clock>,
+        groups: meridian_changes::groups::Groups,
+    ) -> Arc<Lake> {
+        let mut lake = Lake::new(bus, store, clock);
+        if let Some(only) = Arc::get_mut(&mut lake) {
+            only.groups = groups;
+            // A writer of a group past the first serves its writes alone,
+            // and is no reader: it keeps what it writes.
+            if !groups.holds_control() {
+                only.reads_only = false;
+            }
+        }
+        lake
+    }
+
+    /// Each dataset's writer group recorded where it changed (step 3d;
+    /// section 6.1): its `PartitionOwner`, in the control partition, and
+    /// told on its tail. Group 0's: at its start, and with several groups at
+    /// each sweep, a dataset begun since recorded at the next.
+    pub fn assign(&self) {
+        match self
+            .store
+            .record_assignments(self.groups, self.clock.now_ns())
+        {
+            Ok(0) => {}
+            Ok(recorded) => {
+                tracing::info!(
+                    recorded,
+                    groups = self.groups.count(),
+                    "the datasets' writer groups recorded where they changed"
+                );
+                self.publish_control();
+            }
+            Err(failed) => tracing::warn!(%failed, "the datasets' writer groups were not recorded"),
+        }
+    }
+
+    /// Whether this member does the lake's own work -- its control records,
+    /// its wants and its sweeps -- as a writer of the group holding the
+    /// control partition does; a reader member and a writer of another
+    /// group do none of it (step 3d).
+    fn keeps(&self) -> bool {
+        !self.reads_only && self.groups.holds_control()
     }
 
     /// Each dataset's latest sign of life, its liveness over every venue
@@ -1887,11 +1952,97 @@ impl Lake {
         let by_dataset = self.prepared(field, rows, envelope)?;
         let now = self.clock.now_ns();
         let mut said = Said::default();
+        let by_dataset = if self.groups.several() {
+            match self.routed(by_dataset, want_id, envelope, &mut said)? {
+                Some(mine) => mine,
+                None => return Err("handed to the lake's writer group 0".into()),
+            }
+        } else {
+            by_dataset
+        };
         for (dataset, rows) in by_dataset {
             let done = self.write_one(&dataset, rows, want_id, now)?;
             self.published(&dataset, &done, &mut said);
         }
         self.answered(said, want_id, envelope, now)
+    }
+
+    /// A write's datasets with several writer groups (step 3d; the
+    /// resilience spec's section 6.7): this group's own answered here, and
+    /// each other group's handed to it -- the public write unchanged,
+    /// addressed to its writer group, which takes its own datasets of it --
+    /// and counted in `said` once it committed. A write handed here is this
+    /// group's part alone. A write answering a want is group 0's to answer,
+    /// since its reads and their wants are held there: handed to it whole
+    /// (`None`), and its parts handed on from there.
+    fn routed(
+        &self,
+        by_dataset: BTreeMap<String, Vec<Observation>>,
+        want_id: &str,
+        envelope: &Envelope,
+        said: &mut Said,
+    ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
+        let handed = meridian_bus::owners::handed();
+        if !handed && !want_id.is_empty() && !self.groups.holds_control() {
+            meridian_bus::owners::hand_to(0);
+            return Ok(None);
+        }
+        let coordinates = !handed || (!want_id.is_empty() && self.groups.holds_control());
+        let mut mine = BTreeMap::new();
+        let mut theirs: BTreeMap<u32, Vec<(String, Vec<Observation>)>> = BTreeMap::new();
+        for (dataset, rows) in by_dataset {
+            match self.groups.owner(&dataset) {
+                group if group == self.groups.mine() => {
+                    mine.insert(dataset, rows);
+                }
+                group => theirs.entry(group).or_default().push((dataset, rows)),
+            }
+        }
+        if !coordinates {
+            return Ok(Some(mine));
+        }
+        let config = self.config();
+        for (group, parts) in theirs {
+            let topic = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.topic.clone())
+                .unwrap_or_default();
+            let (_, answer) = self.bus.hand_to_owner(group, &topic, envelope.clone())?;
+            let reply = RecordObservationsReply::decode(answer.as_slice()).map_err(|failed| {
+                format!("writer group {group}'s answer did not read: {failed}")
+            })?;
+            let named: BTreeSet<&str> = reply
+                .watermark
+                .iter()
+                .flat_map(|watermark| watermark.partitions.iter())
+                .map(|at| at.partition.as_str())
+                .collect();
+            for (dataset, rows) in parts {
+                if !named.contains(dataset.as_str()) {
+                    return Err(meridian_bus::refusal_with_status(
+                        RefusalStatus::Unavailable,
+                        &[],
+                        format!(
+                            "writer group {group} did not take dataset {dataset}'s rows: its \
+                             route has changed; ask again"
+                        ),
+                    ));
+                }
+                said.subjects
+                    .extend(rows.iter().flat_map(|row| row.subjects()));
+                // What another group served of a dataset kept nowhere, to
+                // the reads here waiting on the want it answers (W10.7).
+                if !config.licence(&dataset).kept {
+                    self.hand_to_waiting(want_id, Heard::Served(rows));
+                }
+                said.datasets.insert(dataset);
+            }
+            said.reply.recorded += reply.recorded;
+            said.reply.restated += reply.restated;
+            said.reply.unchanged += reply.unchanged;
+        }
+        Ok(Some(mine))
     }
 
     /// A batch's bound and every row checked, as [`Lake::checked`] checks
@@ -3456,7 +3607,8 @@ impl Lake {
         let config = self.config();
         for dataset in config.datasets.keys() {
             let licence = config.licence(dataset);
-            if licence.retention_days == 0 {
+            // Each writer group its own datasets' (step 3d).
+            if licence.retention_days == 0 || !self.groups.owns(dataset) {
                 continue;
             }
             let before = now - i64::from(licence.retention_days) * 86_400 * 1_000_000_000;
@@ -5698,8 +5850,8 @@ impl Lake {
         *self.config.write().expect("config poisoned") = DataConfig::from_event(event);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // A reader holds it; the writer keeps it.
-        if self.reads_only {
+        // A reader holds it; the writer keeps it, group 0's (step 3d).
+        if !self.keeps() {
             return;
         }
         if let Err(failed) = self.store.keep_configuration(event) {
@@ -6657,9 +6809,30 @@ impl Lake {
 /// Register every handler, and subscribe to every event the lake hears,
 /// before returning; the loops consuming them are spawned.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc<Lake> {
+    serve_grouped(bus, store, clock, meridian_changes::groups::Groups::one())
+}
+
+/// [`serve`], for writer group `groups` of the lake's (step 3d; section 6.7):
+/// with several groups, each write's datasets of another group handed to
+/// it. A group past the first serves its writes and the change log alone
+/// (the member's bus serves only those); group 0 does the lake's own work.
+pub fn serve_grouped(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    groups: meridian_changes::groups::Groups,
+) -> Arc<Lake> {
     // Lake::new reads the configuration last heard from the store, which
     // blocks: off the runtime's own threads.
-    let lake = tokio::task::block_in_place(|| Lake::new(Arc::clone(&bus), store, clock));
+    let lake = tokio::task::block_in_place(|| {
+        let lake = Lake::grouped(Arc::clone(&bus), store, clock, groups);
+        // Each dataset's group as it starts, where it changed: the count
+        // raised, or lowered back to one.
+        if lake.keeps() {
+            lake.assign();
+        }
+        lake
+    });
     // The change log, asked a page at a time by the lake's own members and
     // the analytics component (step 3a; topics.md, "Component topics").
     meridian_changes::serve(&bus, "lake", Arc::new(LakeLog(Arc::clone(&lake.store))));
@@ -7431,8 +7604,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             every.tick().await;
             let lake = Arc::clone(&sweeping);
             let _ = tokio::task::spawn_blocking(move || {
-                if !lake.reads_only {
+                if lake.keeps() {
                     lake.sweep_wants();
+                    if lake.groups.several() {
+                        lake.assign();
+                    }
                 }
                 lake.return_freed();
             })
@@ -7480,8 +7656,9 @@ impl Lake {
                     let said = (record.asset_class, record.instrument_type);
                     let stays = record.instrument_id;
                     if !event.replaced_instrument_id.is_empty() && !stays.is_empty() {
-                        // A reader holds what it heard; the writer keeps it.
-                        if !self.reads_only {
+                        // A reader holds what it heard; the writer keeps it,
+                        // group 0's (step 3d).
+                        if self.keeps() {
                             if let Err(failed) =
                                 self.store
                                     .keep_alias(&event.replaced_instrument_id, &stays, now)
@@ -7503,7 +7680,7 @@ impl Lake {
             "meridian.v1.MissingInstrumentDetectedEvent"
             | "meridian.v1.MissingVenueDetectedEvent"
             | "meridian.v1.CalendarAppliedEvent"
-                if self.reads_only => {}
+                if !self.keeps() => {}
             "meridian.v1.MissingInstrumentDetectedEvent" => {
                 if let Ok(event) = MissingInstrumentDetectedEvent::decode(&envelope.payload[..]) {
                     self.miss(&event.publisher_instance_id, now);

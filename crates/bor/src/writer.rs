@@ -34,6 +34,16 @@ use crate::store::{
 /// The book's change log's domain in its component topics.
 pub const DOMAIN: &str = "book";
 
+/// The topic a command is handed to its partition's writer group on (step
+/// 3d; the resilience spec's section 6.7): the public command, unchanged.
+pub const INTERNAL_COMMAND: &str = "platform.book.internal.command";
+
+/// Whether `topic` is one of the book's commands, which a member hands to
+/// the writer group owning its account's partition.
+pub fn is_command(topic: &str) -> bool {
+    topic.starts_with("platform.book.command.")
+}
+
 /// The default bound: 128 MiB of books, within the book's 512 MiB.
 pub const DEFAULT_BOOKS_BYTES: usize = 128 * 1024 * 1024;
 
@@ -209,6 +219,10 @@ impl Store for Writer {
         Ok(acted)
     }
 
+    fn writes(&self, account_id: &str) -> bool {
+        self.inner.writes(account_id)
+    }
+
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         self.inner.journal(account_id)
     }
@@ -257,6 +271,11 @@ impl Store for Writer {
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
+        // Another writer group's account (step 3d): read from the record,
+        // never held, since its commits are never this member's.
+        if !self.inner.writes(account_id) {
+            return self.inner.book(account_id);
+        }
         if let Some(held) = self.books().get(account_id) {
             return Ok(held);
         }

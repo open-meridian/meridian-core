@@ -121,6 +121,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "unattributed_gap",
         sql: include_str!("../migrations/0017_unattributed_gap.sql"),
     },
+    // Writer groups (step 3d; approved 2026-11-12): each group past the
+    // first's epoch, which a dataset its writer begins is checked against.
+    Migration {
+        version: 18,
+        name: "writer_group",
+        sql: include_str!("../migrations/0018_writer_group.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

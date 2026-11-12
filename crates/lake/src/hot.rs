@@ -377,9 +377,25 @@ pub struct HotStore {
     layer: Mutex<Layer>,
     /// The loader waits here for keys wanted.
     wake: Condvar,
+    /// Its member's writer group (step 3d): a dataset another group writes
+    /// is read from the record, since its commits never reach this layer.
+    groups: std::sync::RwLock<meridian_changes::groups::Groups>,
 }
 
 impl HotStore {
+    /// Its member writes for writer group `groups` (step 3d): only its own
+    /// datasets are answered from memory.
+    pub fn for_group(&self, groups: meridian_changes::groups::Groups) {
+        *self.groups.write().expect("groups poisoned") = groups;
+    }
+
+    /// Whether every one of `datasets` is this member's group's, so memory
+    /// holds what each committed.
+    fn holds(&self, datasets: &[String]) -> bool {
+        let groups = *self.groups.read().expect("groups poisoned");
+        !groups.several() || datasets.iter().all(|dataset| groups.owns(dataset))
+    }
+
     /// The store, its hot layer bounded by `bounds`, and a loader thread
     /// that loads each key asked and not held.
     pub fn new(inner: Arc<dyn Store>, bounds: Bounds) -> Arc<Self> {
@@ -395,6 +411,7 @@ impl HotStore {
                 counts: Counts::default(),
             }),
             wake: Condvar::new(),
+            groups: std::sync::RwLock::new(meridian_changes::groups::Groups::one()),
         });
         let held = Arc::downgrade(&hot);
         std::thread::Builder::new()
@@ -780,6 +797,14 @@ impl Store for HotStore {
         self.inner.record_gap(gap)
     }
 
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        self.inner.record_assignments(groups, at_ns)
+    }
+
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
         self.inner.dataset_gaps()
     }
@@ -813,7 +838,7 @@ impl Store for HotStore {
     }
 
     fn read(&self, query: &Query) -> Result<Vec<Observation>> {
-        if answers_latest(query) {
+        if answers_latest(query) && self.holds(&query.datasets) {
             if let Some(rows) = self.latest_from_memory(query) {
                 noted::memory("latest");
                 return Ok(rows);
@@ -828,7 +853,7 @@ impl Store for HotStore {
         query: &Query,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        if answers_latest(query) {
+        if answers_latest(query) && self.holds(&query.datasets) {
             if let Some(rows) = self.latest_from_memory(query) {
                 noted::memory("latest");
                 for row in rows {
@@ -858,7 +883,7 @@ impl Store for HotStore {
         subjects: &[String],
         as_of_ns: i64,
     ) -> Result<Vec<Listed>> {
-        if as_of_ns == 0 {
+        if as_of_ns == 0 && self.holds(datasets) {
             if let Some(listed) = self.listing_from_memory(datasets, subjects) {
                 noted::memory("listings");
                 return Ok(listed);

@@ -36,6 +36,11 @@ pub enum StoreError {
     /// position again and goes on from there.
     #[error("{0}")]
     PositionMoved(String),
+
+    /// A write to a dataset another writer group owns (step 3d; the
+    /// resilience spec's section 6.7): handed to that group's writer.
+    #[error("dataset {partition} is writer group {group}'s to write; this member's group does not own it")]
+    NotOwned { partition: String, group: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -152,6 +157,11 @@ pub const CONTROL_GAP: &str = "meridian.v1.DatasetGap";
 /// A default read's source switched, or switched back (W10.6; the
 /// resilience spec's section 8): its control change's kind.
 pub const CONTROL_SWITCH: &str = "meridian.v1.SourceSwitched";
+
+/// A dataset's assignment to a writer group (step 3d; section 6.1, approved
+/// 2026-11-12): its `PartitionOwner`, in the `control` partition, recorded
+/// only when its group changes. None recorded means group 0.
+pub const CONTROL_OWNER: &str = "meridian.v1.PartitionOwner";
 
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -576,6 +586,20 @@ pub trait Store: Send + Sync {
     }
 
     /// Every switch recorded, in the order recorded (W10.6).
+    /// Each dataset whose writer group under `groups` is not the one its
+    /// assignments last recorded (none recorded: group 0) recorded in the
+    /// `control` partition as its `PartitionOwner` (step 3d): its group and
+    /// its epoch now. Answers how many it recorded. A store with no
+    /// partitions records none.
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        let _ = (groups, at_ns);
+        Ok(0)
+    }
+
     fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
         Ok(Vec::new())
     }

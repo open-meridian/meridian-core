@@ -1542,6 +1542,8 @@ pub fn expire_due(bus: &Bus, store: &Arc<dyn Store>) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }
@@ -1619,6 +1621,8 @@ pub fn backfill_waits(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }

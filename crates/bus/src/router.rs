@@ -248,7 +248,7 @@ pub struct Bus {
     backends: HashMap<String, Arc<dyn Backend>>,
     rules: Vec<RouteRule>,
     default_backend: String,
-    handlers: RwLock<HashMap<String, Handler>>,
+    handlers: Arc<RwLock<HashMap<String, Handler>>>,
     instance_id: String,
     default_timeout: Duration,
 
@@ -270,7 +270,29 @@ pub struct Bus {
     /// spec's section 1): the topics it serves, every other declined. Unset,
     /// as every writer and every other component, everything is served.
     serves_only: RwLock<Option<Serves>>,
+
+    /// Where this member hands a write its writer group does not own (step
+    /// 3d; the resilience spec's section 6.7): unset, as with one group,
+    /// nothing is handed on.
+    routing: Arc<RwLock<Option<Routing>>>,
 }
+
+/// A member's hand-off of writes to their owners.
+#[derive(Clone)]
+struct Routing {
+    /// The store's internal topic a write is handed on.
+    internal: String,
+    /// Which of its topics are writes.
+    writes: Serves,
+    /// This member's writer group.
+    group: u32,
+    backend: Arc<dyn Backend>,
+    timeout: Duration,
+}
+
+/// What a write handed to its owner leaves of its caller's deadline for its
+/// answer's way back through this member.
+const HANDED_BACK: Duration = Duration::from_millis(250);
 
 /// Which topics a reader member serves.
 type Serves = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -350,13 +372,14 @@ impl Bus {
             backends,
             rules: Vec::new(),
             default_backend: "default".to_string(),
-            handlers: RwLock::new(HashMap::new()),
+            handlers: Arc::default(),
             instance_id: instance_id.into(),
             default_timeout: Duration::from_secs(5),
             clock,
             observer: RwLock::new(None),
             reads: Arc::default(),
             serves_only: RwLock::new(None),
+            routing: Arc::default(),
         }
     }
 
@@ -466,7 +489,12 @@ impl Bus {
             let (_, rx) = tokio::sync::mpsc::channel(1);
             return Subscription::new(rx, pattern, Default::default());
         }
-        let group = format!("{}.{work}", self.instance_id);
+        // A store of several writer groups (step 3d): each group shares the
+        // work among its own members, and does it for its own partitions.
+        let group = match self.routing.read().expect("routing poisoned").as_ref() {
+            Some(route) => format!("{}.{work}.group-{}", self.instance_id, route.group),
+            None => format!("{}.{work}", self.instance_id),
+        };
         self.backend_for(pattern).subscribe_shared(pattern, &group)
     }
 
@@ -483,6 +511,7 @@ impl Bus {
             return;
         }
         let handler = self.held_to_read_after(topic, Arc::new(handler));
+        let handler = self.routed(topic, handler);
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -500,6 +529,102 @@ impl Bus {
     /// member keeps its position here, a sidecar its session.
     pub fn reads_after(&self) -> &Arc<crate::read_after::Reads> {
         &self.reads
+    }
+
+    /// Hand each write this member's writer group `group` does not own to
+    /// its owner (step 3d; the resilience spec's section 6.7): every topic
+    /// `writes` says is a write is answered as ever, but where its store
+    /// says, by [`crate::owners::hand_to`], that the write is another
+    /// group's, the request is handed on `internal`, unchanged and
+    /// addressed to that group, and answered with the owner's reply. And
+    /// `internal` offered to this group alone: a write handed here is
+    /// answered by its public topic's own handler, never handed on again.
+    /// With one writer group nothing calls this, and nothing is handed on.
+    pub fn hand_writes_on(
+        &self,
+        internal: &str,
+        group: u32,
+        writes: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) {
+        let writes: Serves = Arc::new(writes);
+        *self.routing.write().expect("routing poisoned") = Some(Routing {
+            internal: internal.to_string(),
+            writes: Arc::clone(&writes),
+            group,
+            backend: Arc::clone(self.backend_for(internal)),
+            timeout: self.default_timeout,
+        });
+        let handlers = Arc::clone(&self.handlers);
+        let handed_on: Handler = Arc::new(move |envelope: Envelope| {
+            let topic = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.topic.clone())
+                .unwrap_or_default();
+            if !writes(&topic) {
+                return Err(format!(
+                    "{topic:?} is no write of this store: only a write is handed on"
+                ));
+            }
+            let handler = handlers
+                .read()
+                .expect("handler lock poisoned")
+                .get(&topic)
+                .cloned()
+                .ok_or_else(|| format!("{topic:?} is not served here"))?;
+            crate::owners::arriving();
+            handler(envelope)
+        });
+        self.backend_for(internal).serve_group(
+            internal,
+            &format!("{}.group-{group}", self.instance_id),
+            group,
+            handed_on,
+        );
+    }
+
+    /// `envelope`, a write of `topic`, handed to writer group `group` on the
+    /// internal topic [`Bus::hand_writes_on`] named, and answered with the
+    /// owner's reply (step 3d): what a member does with each other group's
+    /// part of a write spanning several. Called from a handler, off the
+    /// runtime's own threads. Refused where no hand-off is configured.
+    pub fn hand_to_owner(&self, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
+        let route = self.routing.read().expect("routing poisoned").clone();
+        match route {
+            Some(route) => hand(&route, group, topic, envelope),
+            None => Err(format!(
+                "{topic} is writer group {group}'s to write, and this member hands nothing on"
+            )),
+        }
+    }
+
+    /// A write's handler, handed to its owner where its store says so.
+    fn routed(&self, topic: &str, handler: Handler) -> Handler {
+        let routing = Arc::clone(&self.routing);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            let route = routing
+                .read()
+                .expect("routing poisoned")
+                .clone()
+                .filter(|route| (route.writes)(&topic));
+            let Some(route) = route else {
+                return handler(envelope);
+            };
+            let handed = crate::owners::take_arriving();
+            crate::owners::begin(handed);
+            let kept = envelope.clone();
+            let answered = handler(envelope);
+            match crate::owners::take_hand_to() {
+                None => answered,
+                Some(_) if handed => Err(crate::refusal_with_status(
+                    crate::RefusalStatus::Unavailable,
+                    &[],
+                    crate::owners::NOT_THIS_GROUPS,
+                )),
+                Some(group) => hand(&route, group, &topic, kept),
+            }
+        })
     }
 
     /// Serve only the topics `serves` says, from now on: a store's reader
@@ -1292,13 +1417,14 @@ mod tests {
                 backend: "reference".into(),
             }],
             default_backend: "default".into(),
-            handlers: RwLock::new(HashMap::new()),
+            handlers: Arc::default(),
             instance_id: "core-1".into(),
             default_timeout: Duration::from_secs(5),
             clock: Arc::new(ManualClock::at(NOW)),
             observer: RwLock::new(None),
             reads: Arc::default(),
             serves_only: RwLock::new(None),
+            routing: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");
@@ -1447,5 +1573,55 @@ mod acting_for {
             "https://directory.example.org|8812"
         );
         assert_eq!(subject_seen(None).await, "");
+    }
+}
+
+/// `envelope`, a write of `topic`, handed to writer group `group` on its
+/// store's internal topic, and answered with the owner's reply: its answer,
+/// or its refusal word for word. An owner that does not answer -- none
+/// serving, mid-failover, or past the caller's deadline -- is refused
+/// UNAVAILABLE, which the caller may ask again.
+fn hand(route: &Routing, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
+    let unavailable = |why: String| {
+        crate::refusal_with_status(
+            crate::RefusalStatus::Unavailable,
+            &[],
+            format!("{topic} is writer group {group}'s to write, and {why}; ask again"),
+        )
+    };
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| unavailable("this member has no runtime to hand it on".into()))?;
+    let timeout = match crate::read_after::deadline() {
+        Some(deadline) => deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .saturating_sub(HANDED_BACK),
+        None => route.timeout,
+    };
+    if timeout.is_zero() {
+        return Err(unavailable(
+            "the caller's deadline left no time to hand it on".into(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let answered = handle.block_on(route.backend.request_to_group(
+        &route.internal,
+        envelope,
+        timeout,
+        group,
+    ));
+    let ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3);
+    match answered {
+        Ok(answer) => {
+            tracing::debug!(topic, group, ms, "a write handed to its owner: answered");
+            Ok((answer.payload_type, answer.payload))
+        }
+        Err(BusError::HandlerFailed { detail, .. }) => {
+            tracing::debug!(topic, group, ms, "a write handed to its owner: refused");
+            Err(detail)
+        }
+        Err(failed) => {
+            tracing::warn!(topic, group, ms, %failed, "a write handed to its owner: not answered");
+            Err(unavailable(format!("it did not answer ({failed})")))
+        }
     }
 }

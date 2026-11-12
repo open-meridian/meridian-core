@@ -443,6 +443,29 @@ pub trait Backend: Send + Sync {
         Box::pin(async move { Err(BusError::NoHandler(topic.to_string())) })
     }
 
+    /// Ask writer group `group` of whoever serves `topic` (step 3d; the
+    /// resilience spec's section 6.7): a write handed to its partition's
+    /// owner. Defaulted to an unaddressed ask: a backend with one member of
+    /// everything has one group.
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: u32,
+    ) -> Answer<'a> {
+        let _ = group;
+        self.request(topic, envelope, timeout)
+    }
+
+    /// Offer `topic` to writer group `group`'s callers alone, one member of
+    /// `queue` taking each: a request addressed to another group is left
+    /// unanswered, for that group's member.
+    fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
+        let _ = group;
+        self.serve(topic, queue, handler);
+    }
+
     /// Offer this topic's answer to callers in other processes.
     ///
     /// Defaulted to nothing, because an in-process backend has nowhere else to

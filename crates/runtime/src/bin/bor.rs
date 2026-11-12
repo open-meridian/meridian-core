@@ -138,6 +138,9 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its writer group and the book's count (step 3d; section 6.3): the
+    // partitions it writes, and those it hands to their owners.
+    let groups = meridian_changes::groups::Groups::from_env()?;
     // Its own database login and its sessions' bounds (section 10a).
     meridian_runtime::serve_database_as("bor");
     let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
@@ -145,7 +148,7 @@ fn run() -> Result<(), String> {
         &url,
         |url| {
             PostgresStore::connect(url, 8)
-                .map(|store| store.with_snapshot_interval(interval))
+                .map(|store| store.with_snapshot_interval(interval).with_groups(groups))
                 .map_err(|failed| failed.to_string())
         },
         |store| {
@@ -263,23 +266,44 @@ fn run() -> Result<(), String> {
                     .map_err(|failed| failed.to_string())
             },
         );
-        // The scrub, under the lease (step 3b, integrity at rest).
+        // Several writer groups (step 3d; section 6.7): each command whose
+        // account another group writes handed to it, unchanged, and the
+        // commands handed to this group answered here. Before the book's
+        // handlers and its shared work, which are this group's own.
+        if groups.several() {
+            bus.hand_writes_on(
+                meridian_bor::writer::INTERNAL_COMMAND,
+                groups.mine(),
+                meridian_bor::writer::is_command,
+            );
+            tracing::info!(
+                group = groups.mine(),
+                groups = groups.count(),
+                "the book writes its writer group's partitions, and hands every other's commands to their owners"
+            );
+        }
+        // The scrub, under the lease (step 3b, integrity at rest): the
+        // control partition's group's, which reads every partition.
         let scrubbing = url.clone();
-        meridian_runtime::scrub::forever("book", move || {
-            meridian_runtime::scrub::run_once(
-                "book",
-                || {
-                    let store = PostgresStore::connect(&scrubbing, 1)
-                        .map_err(|failed| failed.to_string())?;
-                    store.scrub().map_err(|failed| failed.to_string())
-                },
-                |scrubbed, member, started, finished| {
-                    PostgresStore::connect(&scrubbing, 1)
-                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
-                        .map_err(|failed| failed.to_string())
-                },
-            )
-        });
+        if groups.holds_control() {
+            meridian_runtime::scrub::forever("book", move || {
+                meridian_runtime::scrub::run_once(
+                    "book",
+                    || {
+                        let store = PostgresStore::connect(&scrubbing, 1)
+                            .map_err(|failed| failed.to_string())?;
+                        store.scrub().map_err(|failed| failed.to_string())
+                    },
+                    |scrubbed, member, started, finished| {
+                        PostgresStore::connect(&scrubbing, 1)
+                            .and_then(|store| {
+                                store.record_scrub(scrubbed, member, started, finished)
+                            })
+                            .map_err(|failed| failed.to_string())
+                    },
+                )
+            });
+        }
         // Every commit, whichever path makes it, told on its partition's
         // tail (step 3a).
         // and each account's book at its head held in memory, bounded by

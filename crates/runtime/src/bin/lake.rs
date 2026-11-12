@@ -112,6 +112,17 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its writer group and the lake's count (step 3d; section 6.1): the
+    // datasets it writes, and those it hands to their owners.
+    let groups = meridian_changes::groups::Groups::from_env()?;
+    if groups.several() && write_ahead_on() {
+        return Err(format!(
+            "lake.writerGroups is {} with the write-ahead stream on (ha): a writer group's \
+             own consumer of the stream comes with the lake's hash ranges (step 3d, stage H); \
+             until then the lake writes as one group in ha",
+            groups.count()
+        ));
+    }
     // Its pool of 8, and in ha 2 more for the write-ahead stream's writer --
     // its batch's transaction and its position -- so its commits never wait
     // behind the lake's reads (the chart's databaseConnections counts them).
@@ -125,7 +136,11 @@ fn run() -> Result<(), String> {
     let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
         "the lake's database",
         &url,
-        |url| PostgresStore::connect(url, pool).map_err(|failed| failed.to_string()),
+        |url| {
+            PostgresStore::connect(url, pool)
+                .map(|store| store.with_groups(groups))
+                .map_err(|failed| failed.to_string())
+        },
         |store| {
             store.verify().map_err(|failed| match failed {
                 StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
@@ -274,25 +289,55 @@ fn run() -> Result<(), String> {
                 .follow_timeline()
                 .map_err(|failed| failed.to_string())
         });
-        // The scrub, under the lease (step 3b, integrity at rest).
+        // Several writer groups (step 3d; section 6.7): each write's
+        // datasets of another group handed to it, and the writes handed to
+        // this group answered here; a group past the first serves its
+        // writes and the change log alone, and does none of the lake's own
+        // work. Before the lake's handlers.
+        if groups.several() {
+            hot.for_group(groups);
+            bus.hand_writes_on(
+                meridian_lake::service::INTERNAL_RECORD,
+                groups.mine(),
+                meridian_lake::service::is_record_write,
+            );
+            if !groups.holds_control() {
+                let changes = meridian_changes::read_changes_topic("lake");
+                bus.serve_only(move |topic| {
+                    meridian_lake::service::is_record_write(topic) || topic == changes
+                });
+            }
+            tracing::info!(
+                group = groups.mine(),
+                groups = groups.count(),
+                "the lake writes its writer group's datasets, and hands every other's to their owners"
+            );
+        }
+        // The scrub, under the lease (step 3b, integrity at rest): the
+        // control partition's group's, which reads every dataset.
         let scrubbing = url.clone();
-        meridian_runtime::scrub::forever("lake", move || {
-            meridian_runtime::scrub::run_once(
-                "lake",
-                || {
-                    let store = PostgresStore::connect(&scrubbing, 1)
-                        .map_err(|failed| failed.to_string())?;
-                    store.scrub().map_err(|failed| failed.to_string())
-                },
-                |scrubbed, member, started, finished| {
-                    PostgresStore::connect(&scrubbing, 1)
-                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
-                        .map_err(|failed| failed.to_string())
-                },
-            )
-        });
+        if groups.holds_control() {
+            meridian_runtime::scrub::forever("lake", move || {
+                meridian_runtime::scrub::run_once(
+                    "lake",
+                    || {
+                        let store = PostgresStore::connect(&scrubbing, 1)
+                            .map_err(|failed| failed.to_string())?;
+                        store.scrub().map_err(|failed| failed.to_string())
+                    },
+                    |scrubbed, member, started, finished| {
+                        PostgresStore::connect(&scrubbing, 1)
+                            .and_then(|store| {
+                                store.record_scrub(scrubbed, member, started, finished)
+                            })
+                            .map_err(|failed| failed.to_string())
+                    },
+                )
+            });
+        }
         // Every handler and subscription in place before this returns.
-        let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
+        let lake =
+            meridian_lake::service::serve_grouped(bus.clone(), Arc::clone(&store), clock(), groups);
         lake.build_at_most(answers_at_once);
 
         // The write-ahead stream in `ha` (the resilience spec's section 4;

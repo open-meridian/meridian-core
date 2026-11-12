@@ -334,6 +334,8 @@ fn said(
         }
         Ok(Acted::Duplicate(_)) => 0,
         Err(StoreError::Invalid(said)) if said == NOTHING_OWED => 0,
+        // Another writer group's account (step 3d): its own writer does it.
+        Err(StoreError::NotOwned { .. }) => 0,
         Err(failed) => {
             tracing::warn!(%failed, "a booking's child entry could not be made; the sweep makes it");
             0
@@ -539,6 +541,8 @@ pub fn backfill_agent_orders_demo_only(bus: &Bus, store: &dyn Store) -> Result<b
         Ok(Acted::Committed(_)) => Ok(true),
         Ok(Acted::Duplicate(_)) => Ok(false),
         Err(StoreError::Invalid(said)) if said == NOTHING_OWED => Ok(false),
+        // Another writer group's account (step 3d): its own writer does it.
+        Err(StoreError::NotOwned { .. }) => Ok(false),
         Err(failed) => Err(failed.to_string()),
     }
 }
@@ -591,6 +595,8 @@ pub fn backfill_local_record_orders(bus: &Bus, store: &dyn Store) -> Result<bool
         Ok(Acted::Committed(_)) => Ok(true),
         Ok(Acted::Duplicate(_)) => Ok(false),
         Err(StoreError::Invalid(said)) if said == NOTHING_OWED => Ok(false),
+        // Another writer group's account (step 3d): its own writer does it.
+        Err(StoreError::NotOwned { .. }) => Ok(false),
         Err(failed) => Err(failed.to_string()),
     }
 }

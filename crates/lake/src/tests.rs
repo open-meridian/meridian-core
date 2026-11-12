@@ -22,6 +22,7 @@ use crate::store::Store;
 use crate::MemoryStore;
 
 mod changes;
+mod groups;
 mod hot;
 mod quality;
 mod read_from_writer;

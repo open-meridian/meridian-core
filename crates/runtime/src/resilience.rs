@@ -125,6 +125,12 @@ pub fn lease_holders(list: &Value) -> BTreeMap<String, String> {
     let mut held = BTreeMap::new();
     for lease in list["items"].as_array().into_iter().flatten() {
         let name = lease["metadata"]["name"].as_str().unwrap_or_default();
+        // A writer group past the first's Lease (step 3d):
+        // `<release>-<store>-group-<g>`, held as `<store>-group-<g>`.
+        let (name, group) = match name.rsplit_once("-group-") {
+            Some((store, group)) if group.parse::<u32>().is_ok() => (store, Some(group)),
+            _ => (name, None),
+        };
         let Some((component, _)) = STORES
             .iter()
             .find(|(component, _)| name.ends_with(&format!("-{component}")))
@@ -132,7 +138,11 @@ pub fn lease_holders(list: &Value) -> BTreeMap<String, String> {
             continue;
         };
         let holder = lease["spec"]["holderIdentity"].as_str().unwrap_or_default();
-        held.insert(component.to_string(), crate::member::holder_member(holder));
+        let key = match group {
+            Some(group) => format!("{component}-group-{group}"),
+            None => component.to_string(),
+        };
+        held.insert(key, crate::member::holder_member(holder));
     }
     held
 }
@@ -167,9 +177,21 @@ pub struct Values {
     /// `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount`.
     pub analytics_coordinators: u32,
     pub analytics_workers: u32,
+    /// The lake's and the book's writer groups (`lake.writerGroups`,
+    /// `bor.writerGroups`; step 3d), where above 1; none means one.
+    pub writer_groups: BTreeMap<String, u32>,
 }
 
 impl Values {
+    /// `component`'s writer groups: 1 where the values say none.
+    pub fn writer_groups(&self, component: &str) -> u32 {
+        self.writer_groups
+            .get(component)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// The chart's values as the release states them: a JSON object of the
     /// settings above by their chart paths. Carries no secret and no
     /// credential; a key it does not know is passed over.
@@ -214,6 +236,13 @@ impl Values {
             },
             analytics_coordinators: count(&said["analytics"]["coordinator"]["replicaCount"]),
             analytics_workers: count(&said["analytics"]["worker"]["replicaCount"]),
+            writer_groups: ["lake", "bor"]
+                .into_iter()
+                .filter_map(|component| {
+                    let groups = count(&said[component]["writerGroups"]);
+                    (groups > 1).then(|| (component.to_string(), groups))
+                })
+                .collect(),
         })
     }
 
@@ -261,6 +290,7 @@ impl Values {
             scrub_days,
             analytics_coordinators: of("analytics-coordinator").count() as u32,
             analytics_workers: of("analytics-worker").count() as u32,
+            writer_groups: BTreeMap::new(),
         }
     }
 }
@@ -1329,7 +1359,22 @@ impl Answering {
                 Some(holder) => holder.clone(),
                 None => writer.map(|w| w.member.clone()).unwrap_or_default(),
             };
+            // Each partition's writer group (step 3d): by the store's count
+            // of groups, its writer the holder of that group's Lease.
+            let groups = self
+                .values
+                .as_ref()
+                .map_or(1, |values| values.writer_groups(component));
             for partition in partitions {
+                let group = meridian_changes::groups::owner(&partition, groups);
+                let named = if group == 0 {
+                    named.clone()
+                } else {
+                    holders
+                        .get(&format!("{component}-group-{group}"))
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 let asked = meridian_changes::ReadChangesRequest {
                     partition: partition.clone(),
                     after_sequence: i64::MAX as u64,
@@ -1357,8 +1402,8 @@ impl Answering {
                 owners.push(PartitionOwner {
                     component: component.to_string(),
                     partition,
-                    group: 0,
-                    writer: named.clone(),
+                    group,
+                    writer: named,
                     epoch,
                 });
             }

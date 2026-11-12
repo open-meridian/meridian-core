@@ -39,6 +39,7 @@ use prost::Message;
 
 pub mod captured;
 pub mod group_commit;
+pub mod groups;
 pub mod integrity;
 pub mod records;
 pub mod serving;

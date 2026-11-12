@@ -100,9 +100,42 @@ pub struct PostgresStore {
     /// Its database's identity as its connections found it (contract v30,
     /// stage C): a new timeline raises the epoch before a batch there.
     watch: std::sync::Arc<meridian_changes::timeline::Watch>,
+    /// Its writer group and the lake's count (step 3d; section 6.1): the
+    /// datasets it may commit to, and those it raises the epoch of.
+    groups: meridian_changes::groups::Groups,
+    /// One adoption at once where it may raise the epoch (several groups).
+    adopting: std::sync::Mutex<()>,
+}
+
+/// The dataset locks' space (several writer groups): a dataset's batch
+/// takes its lock, so a takeover ends its own group's deposed writer alone.
+const DATASET_LOCKS: i64 = 0x6c61_6b65_0000_0000_u64 as i64;
+
+/// A 32-bit hash of a dataset's ID, stable across releases (FNV-1a), in
+/// [`DATASET_LOCKS`]' low half.
+fn dataset_lock(dataset: &str) -> i64 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in dataset.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    DATASET_LOCKS | i64::from(hash)
 }
 
 impl PostgresStore {
+    /// The same store, writing for writer group `groups` (step 3d; section
+    /// 6.1): it commits only to the datasets its group owns, and its
+    /// takeover raises only theirs.
+    pub fn with_groups(mut self, groups: meridian_changes::groups::Groups) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// Its writer group and the lake's count.
+    pub fn groups(&self) -> meridian_changes::groups::Groups {
+        self.groups
+    }
+
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let mut config = meridian_changes::database_config(url).map_err(unavailable)?;
         // The lake's batches commit locally, never waiting on a synchronous
@@ -136,6 +169,8 @@ impl PostgresStore {
             pool,
             fence: meridian_changes::Fence::new(),
             watch,
+            groups: meridian_changes::groups::Groups::one(),
+            adopting: std::sync::Mutex::new(()),
         })
     }
 
@@ -245,13 +280,20 @@ impl PostgresStore {
             why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
             at_ns: meridian_changes::now_ns(),
         };
+        // A new timeline is the whole database's: group 0's writer, which
+        // holds the control partition, raises every group's epoch, and each
+        // other group's writer, fenced by it, steps down and starts again
+        // (step 3d).
+        if !self.groups.holds_control() {
+            return Ok(Timeline::Same);
+        }
         let mut tx = conn.transaction().map_err(unavailable)?;
         let (found, identity) = meridian_changes::timeline::follow(
             &mut tx,
             "lake_change_head",
             meridian_changes::CONTROL,
             mine,
-            |tx| raise(tx, &by),
+            |tx| raise(tx, &by, None),
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
@@ -274,6 +316,20 @@ impl PostgresStore {
             0 => self.adopt(),
             epoch => Ok(epoch),
         }
+    }
+
+    /// Refused where another writer group owns `dataset` (step 3d): its
+    /// writes are handed to that group's writer, never committed here.
+    fn owned(&self, dataset: &str) -> Result<()> {
+        if self.groups.owns(dataset) {
+            return Ok(());
+        }
+        let group = self.groups.owner(dataset);
+        meridian_bus::owners::hand_to(group);
+        Err(StoreError::NotOwned {
+            partition: dataset.to_string(),
+            group,
+        })
     }
 
     /// Log what is not a dataset's row in the `control` partition, in this
@@ -319,7 +375,15 @@ impl PostgresStore {
     /// `control` partition's checked first, so a takeover that raised it is
     /// never undone by a dataset its deposed writer begins.
     fn head(&self, tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
+        self.owned(dataset)?;
         let epoch = self.epoch_now()?;
+        if self.groups.several() {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&dataset_lock(dataset)],
+            )
+            .map_err(unavailable)?;
+        }
         let begun = tx
             .execute(
                 "INSERT INTO lake_partition (dataset, head, epoch, origin) VALUES ($1, 0, $2, $3)
@@ -328,14 +392,22 @@ impl PostgresStore {
             )
             .map_err(unavailable)?;
         if begun == 1 {
-            let control: i64 = tx
-                .query_one(
+            // The group's own epoch: the control partition's for group 0,
+            // its own row past it (step 3d).
+            let anchor: Option<i64> = if self.groups.holds_control() {
+                tx.query_opt(
                     "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
                     &[],
                 )
-                .map_err(unavailable)?
-                .get(0);
-            self.fence.admits(control as u64)?;
+            } else {
+                tx.query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
+                    &[&(self.groups.mine() as i32)],
+                )
+            }
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+            self.fence.admits(anchor.unwrap_or(0) as u64)?;
         }
         let row = tx
             .query_one(
@@ -1172,6 +1244,10 @@ fn again(failed: &StoreError) -> StoreError {
         StoreError::PositionMoved(words) => StoreError::PositionMoved(words.clone()),
         StoreError::SchemaAhead(words) => StoreError::SchemaAhead(words.clone()),
         StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
+        StoreError::NotOwned { partition, group } => StoreError::NotOwned {
+            partition: partition.clone(),
+            group: *group,
+        },
     }
 }
 
@@ -1485,6 +1561,57 @@ impl Store for PostgresStore {
             .collect();
         self.log_control(&mut tx, &logged)?;
         tx.commit().map_err(unavailable)
+    }
+
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // Each dataset's group as last recorded: none, group 0.
+        let mut recorded: BTreeMap<String, u32> = BTreeMap::new();
+        for row in tx
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
+                &[&crate::store::CONTROL_OWNER],
+            )
+            .map_err(unavailable)?
+        {
+            let body: Vec<u8> = row.get(0);
+            let owner =
+                meridian_domain::v1::PartitionOwner::decode(&body[..]).map_err(unreadable)?;
+            recorded.insert(owner.partition, owner.group);
+        }
+        let mut changed = Vec::new();
+        for row in tx
+            .query(
+                "SELECT dataset, epoch FROM lake_partition ORDER BY dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let (dataset, epoch): (String, i64) = (row.get(0), row.get(1));
+            let group = groups.owner(&dataset);
+            if recorded.get(&dataset).copied().unwrap_or(0) != group {
+                let owner = meridian_domain::v1::PartitionOwner {
+                    component: "lake".into(),
+                    partition: dataset,
+                    group,
+                    writer: String::new(),
+                    epoch: (epoch as u64).max(1),
+                };
+                changed.push((crate::store::CONTROL_OWNER, owner.encode_to_vec(), at_ns));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.log_control(&mut tx, &changed)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(changed.len())
     }
 
     fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
@@ -2101,6 +2228,7 @@ impl Store for PostgresStore {
         why: &str,
         now_ns: i64,
     ) -> Result<u64> {
+        self.owned(dataset)?;
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -2704,14 +2832,34 @@ impl Store for PostgresStore {
             &[&meridian_changes::origin()],
         )
         .map_err(unavailable)?;
-        let epoch: i64 = conn
-            .query_one(
-                "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
-                &[],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        Ok(self.fence.adopt_once(epoch as u64))
+        if !self.groups.several() {
+            let epoch: i64 = conn
+                .query_one(
+                    "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .get(0);
+            return Ok(self.fence.adopt_once(epoch as u64));
+        }
+        // Several groups (step 3d; section 6.1): the group's own epoch,
+        // where every dataset it owns holds it and no other group's does;
+        // else its datasets were assigned to it -- the count changed -- and
+        // it takes them over, so the writer that held them is fenced.
+        let _alone = self.adopting.lock().expect("adopting poisoned");
+        if self.fence.epoch() != 0 {
+            return Ok(self.fence.epoch());
+        }
+        let (anchor, mine, others) = epochs_of(&mut *conn, self.groups)?;
+        drop(conn);
+        match anchor {
+            Some(epoch) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                Ok(self.fence.adopt_once(epoch))
+            }
+            _ => self.take_over(&meridian_changes::TookOver::unnamed(
+                meridian_changes::groups::ASSIGNED,
+            )),
+        }
     }
 
     fn epoch(&self) -> u64 {
@@ -2722,9 +2870,15 @@ impl Store for PostgresStore {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // A deposed writer stopped mid-batch holds the rows it took.
-        meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
-            .map_err(unavailable)?;
-        let epoch = raise(&mut tx, by).map_err(unavailable)?;
+        if self.groups.several() {
+            // Only its own group's deposed writer, by its datasets' locks:
+            // another group's writer holds its own.
+            end_deposed_holders(&mut tx, self.groups).map_err(unavailable)?;
+        } else {
+            meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
+                .map_err(unavailable)?;
+        }
+        let epoch = raise(&mut tx, by, Some(self.groups)).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
@@ -2736,8 +2890,18 @@ impl Store for PostgresStore {
     }
 
     fn head_epoch(&self) -> Result<u64> {
-        let epoch: i64 = self
-            .conn()?
+        let mut conn = self.conn()?;
+        if !self.groups.holds_control() {
+            // A group past the first: its own row's (step 3d).
+            return Ok(conn
+                .query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1",
+                    &[&(self.groups.mine() as i32)],
+                )
+                .map_err(unavailable)?
+                .map_or(0, |row| row.get::<_, i64>(0) as u64));
+        }
+        let epoch: i64 = conn
             .query_one(
                 "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
                 &[],
@@ -2908,41 +3072,80 @@ impl Store for PostgresStore {
 }
 
 /// Raise the epoch of the `control` partition and of every dataset's head
-/// in `tx`, and record who raised it and why (step 3b, `WriterTookOver`):
-/// answer the epoch. What a takeover does, and a writer on a new database
-/// timeline (contract v30, stage C).
+/// in `tx` -- with several writer groups (step 3d), of `groups`' group's
+/// datasets and its own epoch alone, past every epoch the lake holds; with
+/// `None`, of every group's, as a new database timeline does -- and record
+/// who raised it and why (step 3b, `WriterTookOver`): answer the epoch. What
+/// a takeover does, and a writer on a new database timeline (contract v30,
+/// stage C).
 fn raise(
     tx: &mut Transaction<'_>,
     by: &meridian_changes::TookOver,
+    groups: Option<meridian_changes::groups::Groups>,
 ) -> std::result::Result<u64, postgres::Error> {
     // The control partition first: a dataset a deposed writer is beginning
     // holds it shared until it commits, and is then raised with the rest.
     let control: i64 = tx
         .query_one(
-            "UPDATE lake_change_head SET epoch = epoch + 1 WHERE partition = 'control'
-             RETURNING epoch",
+            "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR UPDATE",
             &[],
         )?
         .get(0);
-    let highest: Option<i64> = tx
-        .query_one("SELECT max(epoch) FROM lake_partition", &[])?
+    let highest: i64 = tx
+        .query_one(
+            "SELECT greatest(coalesce((SELECT max(epoch) FROM lake_partition), 0),
+                             coalesce((SELECT max(epoch) FROM lake_writer_group), 0))",
+            &[],
+        )?
         .get(0);
-    let epoch = control.max(highest.unwrap_or(0) + 1);
+    let epoch = control.max(highest) + 1;
+    let datasets: Vec<String> = tx
+        .query(
+            "SELECT dataset FROM lake_partition ORDER BY dataset FOR UPDATE",
+            &[],
+        )?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|dataset| groups.is_none_or(|groups| groups.owns(dataset)))
+        .collect();
+    let holds_control = groups.is_none_or(|groups| groups.holds_control());
+    if holds_control {
+        tx.execute(
+            "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
+            &[&epoch],
+        )?;
+    }
     tx.execute(
-        "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
-        &[&epoch],
+        "UPDATE lake_partition SET epoch = $1 WHERE dataset = ANY($2)",
+        &[&epoch, &datasets],
     )?;
-    tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])?;
+    match groups {
+        // Every group's own epoch with the rest: each writer past the first
+        // is fenced, and takes its datasets over again as it starts.
+        None => {
+            tx.execute("UPDATE lake_writer_group SET epoch = $1", &[&epoch])?;
+        }
+        Some(groups) if !groups.holds_control() => {
+            tx.execute(
+                "INSERT INTO lake_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+                 ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
+                &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+            )?;
+        }
+        Some(_) => {}
+    }
+    let mut partitions = datasets;
+    if holds_control {
+        partitions.push(meridian_changes::CONTROL.to_string());
+    }
     // Who raised it and why, in the same transaction (step 3b).
     tx.execute(
         "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-         SELECT $1, $2,
-                array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control'),
-                $3, $4, $5
-           FROM lake_partition",
+         VALUES ($1, $2, $3, $4, $5, $6)",
         &[
             &epoch,
             &by.member,
+            &partitions,
             &by.why,
             &meridian_changes::origin(),
             &by.at_ns,
@@ -2950,13 +3153,6 @@ fn raise(
     )?;
     // And in the control partition, in the same transaction (contract v30,
     // stage D): the record the conductor reads.
-    let partitions: Vec<String> = tx
-        .query_one(
-            "SELECT array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control')
-               FROM lake_partition",
-            &[],
-        )?
-        .get(0);
     log_record(
         tx,
         &meridian_changes::records::Record::TookOver(meridian_changes::records::took_over(
@@ -2968,6 +3164,87 @@ fn raise(
         by.at_ns,
     )?;
     Ok(epoch as u64)
+}
+
+/// `groups`' group's own epoch where it has one -- the control partition's
+/// for group 0, its row's past it -- the epochs of the datasets it owns,
+/// and every other group's epoch, its datasets' and its own.
+fn epochs_of(
+    client: &mut impl postgres::GenericClient,
+    groups: meridian_changes::groups::Groups,
+) -> Result<(Option<u64>, Vec<u64>, std::collections::BTreeSet<u64>)> {
+    let control: i64 = client
+        .query_one(
+            "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+            &[],
+        )
+        .map_err(unavailable)?
+        .get(0);
+    let mut others = std::collections::BTreeSet::new();
+    let mut anchor = None;
+    if groups.holds_control() {
+        anchor = Some(control as u64);
+    } else {
+        others.insert(control as u64);
+    }
+    for row in client
+        .query("SELECT writer_group, epoch FROM lake_writer_group", &[])
+        .map_err(unavailable)?
+    {
+        let (group, epoch): (i32, i64) = (row.get(0), row.get(1));
+        if group as u32 == groups.mine() {
+            anchor = Some(epoch as u64);
+        } else {
+            others.insert(epoch as u64);
+        }
+    }
+    let mut mine = Vec::new();
+    for row in client
+        .query("SELECT dataset, epoch FROM lake_partition", &[])
+        .map_err(unavailable)?
+    {
+        let (dataset, epoch): (String, i64) = (row.get(0), row.get(1));
+        if groups.owns(&dataset) {
+            mine.push(epoch as u64);
+        } else {
+            others.insert(epoch as u64);
+        }
+    }
+    Ok((anchor, mine, others))
+}
+
+/// End every other session holding a dataset lock of `groups`' group before
+/// its takeover raises their epoch (step 3d): its own deposed writer stopped
+/// mid-batch, never another group's.
+fn end_deposed_holders(
+    tx: &mut Transaction<'_>,
+    groups: meridian_changes::groups::Groups,
+) -> std::result::Result<i64, postgres::Error> {
+    let keys: Vec<i64> = tx
+        .query("SELECT dataset FROM lake_partition", &[])?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|dataset| groups.owns(dataset))
+        .map(|dataset| dataset_lock(&dataset))
+        .collect();
+    let ended: i64 = tx
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, $2))
+               FROM (SELECT DISTINCT l.pid
+                       FROM pg_locks l
+                      WHERE l.locktype = 'advisory' AND l.granted
+                        AND l.pid <> pg_backend_pid()
+                        AND ((l.classid::bigint << 32) | l.objid::bigint) = ANY($1)) AS held",
+            &[&keys, &meridian_changes::DEPOSED_GONE_WITHIN_MS],
+        )?
+        .get(0);
+    if ended > 0 {
+        tracing::warn!(
+            sessions = ended,
+            "ended this writer group's deposed writer's sessions still holding its datasets' locks"
+        );
+    }
+    Ok(ended)
 }
 
 /// A finding of the lake's, kept for the first time, appended to its

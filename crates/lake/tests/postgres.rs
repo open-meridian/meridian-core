@@ -5204,3 +5204,77 @@ fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
     store.read(&query).unwrap();
     assert!(meridian_lake::postgres::snapshot_heads().is_none());
 }
+
+/// Two writer groups of one lake (step 3d; the resilience spec's sections
+/// 6.1 and 6.7): each commits to its own datasets alone, under its own
+/// epoch -- group 0's the control partition's, a group past it its own row
+/// in `lake_writer_group` -- and a takeover of one raises its datasets and
+/// its row alone, so the other writes on; the deposed writer of the group
+/// taken over is refused a batch, and a dataset it begins after it.
+#[test]
+fn writer_groups_commit_their_own_datasets_under_their_own_epochs() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::store::StoreError;
+    let (url, migrated) = isolated("lake-groups");
+    drop(migrated);
+    let of_group = |group: u32| {
+        (0..)
+            .map(|n| unique(&format!("coinbase-1:g{n}")))
+            .find(|dataset| meridian_changes::groups::owner(dataset, 2) == group)
+            .unwrap()
+    };
+    let (zeros, ones) = (of_group(0), of_group(1));
+    let member = |group: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, 2).unwrap())
+    };
+    let (zero, one) = (member(0), member(1));
+    let subject = unique("LCL-BTC");
+    let row = |dataset: &str, key: &str| vec![close(dataset, key, &subject, "2026-10-01", 1)];
+    // Group 1 first takes its group's epoch: past every epoch the lake holds.
+    let zero_epoch = zero.adopt().unwrap();
+    let one_epoch = one.adopt().unwrap();
+    assert!(one_epoch > zero_epoch, "{one_epoch} past {zero_epoch}");
+    zero.record(&zeros, row(&zeros, "a"), 10).unwrap();
+    one.record(&ones, row(&ones, "a"), 10).unwrap();
+    // Each refused the other's dataset, nothing written.
+    for (store, dataset, group) in [(&zero, &ones, 1), (&one, &zeros, 0)] {
+        match store.record(dataset, row(dataset, "b"), 20) {
+            Err(StoreError::NotOwned { group: said, .. }) => assert_eq!(said, group),
+            other => panic!("another group's dataset written: {:?}", other.is_ok()),
+        }
+    }
+    // Group 1 taken over: its datasets and its row raised, group 0's not.
+    let standby = member(1);
+    let raised = standby
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    assert!(raised > one_epoch);
+    assert_eq!(one.head_epoch().unwrap(), raised, "its row raised");
+    zero.record(&zeros, row(&zeros, "c"), 30)
+        .expect("group 0 writes on");
+    standby.record(&ones, row(&ones, "c"), 30).unwrap();
+    // The deposed writer of group 1: refused a batch, and a dataset begun.
+    assert!(matches!(
+        one.record(&ones, row(&ones, "d"), 40),
+        Err(StoreError::Fenced(_))
+    ));
+    let begun = of_group(1);
+    assert!(matches!(
+        one.record(&begun, row(&begun, "a"), 40),
+        Err(StoreError::Fenced(_))
+    ));
+    standby.record(&begun, row(&begun, "a"), 40).unwrap();
+    // Group 0's writer records each dataset's group where it changed: once.
+    assert_eq!(
+        zero.record_assignments(Groups::new(0, 2).unwrap(), 50)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        zero.record_assignments(Groups::new(0, 2).unwrap(), 60)
+            .unwrap(),
+        0
+    );
+}

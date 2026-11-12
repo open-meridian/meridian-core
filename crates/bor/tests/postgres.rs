@@ -16,7 +16,7 @@ use std::sync::Arc;
 use meridian_bor::service::*;
 use meridian_bor::store::{BreaksRead, PositionsRead, Scope, Store};
 use meridian_bor::PostgresStore;
-use meridian_bus::{Bus, MemoryBackend, Stamp};
+use meridian_bus::{Bus, Envelope, MemoryBackend, Stamp};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::*;
 use prost::Message;
@@ -2067,6 +2067,200 @@ async fn an_act_reads_its_partition_under_the_lock_and_follows_the_account_moved
     blocking(move || {
         drop(admin);
         drop(store);
+    });
+}
+
+/// The broker, stood in for two writer groups' members (step 3d): each
+/// bus's publishes and subscriptions the in-process backend's, and a
+/// hand-off addressed to a writer group answered by that group's member
+/// alone, as each group's own queue group on the internal topic gives it.
+struct GroupsBroker {
+    inner: MemoryBackend,
+    groups: std::sync::Mutex<std::collections::BTreeMap<(String, u32), meridian_bus::Handler>>,
+    handed: AtomicU64,
+}
+
+impl meridian_bus::Backend for GroupsBroker {
+    fn publish(&self, topic: &str, envelope: Envelope) -> Result<u64, meridian_bus::BusError> {
+        self.inner.publish(topic, envelope)
+    }
+
+    fn subscribe(&self, pattern: &str) -> meridian_bus::Subscription {
+        self.inner.subscribe(pattern)
+    }
+
+    fn subscribe_shared(&self, pattern: &str, group: &str) -> meridian_bus::Subscription {
+        self.inner.subscribe_shared(pattern, group)
+    }
+
+    fn dropped(&self) -> u64 {
+        self.inner.dropped()
+    }
+
+    fn serve_group(&self, topic: &str, _: &str, group: u32, handler: meridian_bus::Handler) {
+        self.groups
+            .lock()
+            .unwrap()
+            .insert((topic.to_string(), group), handler);
+    }
+
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        _: std::time::Duration,
+        group: u32,
+    ) -> meridian_bus::Answer<'a> {
+        self.handed.fetch_add(1, Ordering::SeqCst);
+        let handler = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&(topic.to_string(), group))
+            .cloned();
+        Box::pin(async move {
+            let Some(handler) = handler else {
+                return Err(meridian_bus::BusError::NoHandler(topic.to_string()));
+            };
+            match tokio::task::spawn_blocking(move || handler(envelope))
+                .await
+                .unwrap()
+            {
+                Ok((payload_type, payload)) => Ok(Envelope {
+                    meta: None,
+                    payload_type,
+                    payload,
+                }),
+                Err(detail) => Err(meridian_bus::BusError::HandlerFailed {
+                    topic: topic.to_string(),
+                    detail,
+                }),
+            }
+        })
+    }
+}
+
+/// Two writer groups of one book (step 3d; the resilience spec's sections
+/// 6.3 and 6.7): a command sent to the member of the group that does not
+/// own its account's partition is handed to the owner's writer, which
+/// commits it; and an account found under the partition's lock in a
+/// partition another group owns -- moved beneath the act -- is handed to
+/// that group and numbered there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_groups_hand_a_command_to_its_partitions_owner_and_follow_a_move() {
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::{owner, Groups};
+    // At two groups: control and P3 group 0's, P0 group 1's.
+    assert_eq!((owner("P0", 2), owner("P3", 2)), (1, 0));
+    let (url, migrated) = blocking(isolated);
+    let mut admin = blocking(|| postgres::Client::connect(&url, postgres::NoTls).unwrap());
+    blocking(|| {
+        admin
+            .batch_execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch, origin)
+                 SELECT 'P3', 0, epoch, origin FROM book_partition_head WHERE partition = 'P0'",
+            )
+            .unwrap()
+    });
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let member = |group: u32| {
+        let store = blocking(|| {
+            Arc::new(
+                PostgresStore::connect(&url, 4)
+                    .unwrap()
+                    .with_groups(Groups::new(group, 2).unwrap()),
+            )
+        });
+        let bus = Arc::new(Bus::single(
+            "bor-groups-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        let writer: Arc<dyn Store> = Arc::new(Writer::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&bus),
+        ));
+        serve(bus.clone(), writer, bus.clock());
+        (bus, store)
+    };
+    let (zero, zero_store) = member(0);
+    let (one, one_store) = member(1);
+    let account = unique("GROUPED");
+    let set = |reason: &str| SetAccountAttributeRequest {
+        account_id: account.clone(),
+        attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+        reason: reason.into(),
+    };
+    // Sent to group 0's member: the account starts in P0, group 1's.
+    send(&zero, SET_ACCOUNT_ATTRIBUTE, &set("first"), Some(PERSON))
+        .await
+        .unwrap();
+    assert_eq!(broker.handed.load(Ordering::SeqCst), 1, "handed once");
+    let journal = blocking(|| one_store.journal(&account)).unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].partition, "P0");
+    assert!(
+        journal[0].cause.committed_at_ns > 0,
+        "committed by group 1's writer"
+    );
+    // Its epochs its own: group 0's raised past P0's as it adopted.
+    let (zero_epoch, one_epoch) = (
+        Store::epoch(zero_store.as_ref()),
+        Store::epoch(one_store.as_ref()),
+    );
+    assert!(zero_epoch > 0 && one_epoch > 0 && zero_epoch != one_epoch);
+    // Moved to P3 beneath group 1's member, which last found it in P0.
+    blocking(|| {
+        admin
+            .execute(
+                "UPDATE book_account SET partition = 'P3' WHERE account_id = $1",
+                &[&account],
+            )
+            .unwrap()
+    });
+    send(&one, SET_ACCOUNT_ATTRIBUTE, &set("second"), Some(PERSON))
+        .await
+        .unwrap();
+    assert_eq!(broker.handed.load(Ordering::SeqCst), 2, "handed to group 0");
+    let journal = blocking(|| zero_store.journal(&account)).unwrap();
+    let partitions: Vec<&str> = journal.iter().map(|e| e.partition.as_str()).collect();
+    assert_eq!(
+        partitions,
+        ["P0", "P3"],
+        "the second numbered in P3, by group 0"
+    );
+    // A command handed to a group whose partition it is not -- a stale
+    // route -- is refused, never handed on again.
+    let refused = blocking(|| {
+        let handed = Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                topic: SET_ACCOUNT_ATTRIBUTE.into(),
+                acting_for_subject: PERSON.into(),
+                message_id: unique("STALE"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.SetAccountAttributeRequest".into(),
+            payload: set("third").encode_to_vec(),
+        };
+        let handler = broker
+            .groups
+            .lock()
+            .unwrap()
+            .get(&(INTERNAL_COMMAND.to_string(), 1))
+            .cloned()
+            .unwrap();
+        handler(handed)
+    });
+    let refused = refused.unwrap_err();
+    assert!(refused.contains("does not own its partition"), "{refused}");
+    blocking(move || {
+        drop(admin);
+        drop((zero_store, one_store, migrated));
     });
 }
 

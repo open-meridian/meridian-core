@@ -1548,6 +1548,8 @@ async fn move_accounts(
                 }
                 Ok(Acted::Duplicate(_)) => {}
                 Err(StoreError::Invalid(said)) if said == NOTHING_HELD => {}
+                // Another writer group's account (step 3d): its own writer does it.
+                Err(StoreError::NotOwned { .. }) => {}
                 Err(failed) => return Err(failed.to_string()),
             }
         }

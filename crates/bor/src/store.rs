@@ -103,6 +103,11 @@ pub enum StoreError {
     /// section 6.3): the act goes on in that one. Never leaves the store.
     #[error("the account is in partition {0}")]
     Moved(String),
+
+    /// An act on a partition another writer group owns (step 3d; the
+    /// resilience spec's section 6.7): handed to that group's writer.
+    #[error("partition {partition} is writer group {group}'s to write; this member's group does not own it")]
+    NotOwned { partition: String, group: u32 },
 }
 
 /// How many times a decision may ask for bodies before it is a fault: each
@@ -511,6 +516,14 @@ pub trait Store: Send + Sync {
     fn on_commit(&self, observer: Committed) -> bool {
         let _ = observer;
         false
+    }
+
+    /// Whether this store's writer group writes `account_id`'s partition
+    /// (step 3d; section 6.3): a book of another group's is never held in
+    /// this member's memory, which that group's commits never reach.
+    fn writes(&self, account_id: &str) -> bool {
+        let _ = account_id;
+        true
     }
 
     /// An account's journal, in order.
