@@ -14,6 +14,8 @@
 //! on again ([`handed`]).
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The target writer group's number on a hand-off (approved 2026-11-12),
 /// beside `Meridian-Timeout-Ms`.
@@ -62,3 +64,28 @@ pub(crate) fn begin(handed: bool) {
 /// with: the route was stale, and the caller asks again.
 pub const NOT_THIS_GROUPS: &str =
     "handed to this writer group, which does not own its partition: ask again";
+
+/// The writes this process handed to their owners and answered: how many,
+/// their time in all, and the longest.
+static HANDED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HANDED_NS: AtomicU64 = AtomicU64::new(0);
+static HANDED_MOST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// One write handed on and answered, in `took`.
+pub(crate) fn note_handed(took: Duration) {
+    let ns = took.as_nanos() as u64;
+    HANDED_COUNT.fetch_add(1, Ordering::Relaxed);
+    HANDED_NS.fetch_add(ns, Ordering::Relaxed);
+    HANDED_MOST_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// The writes this process has handed to their owners and had answered:
+/// how many, their time in all, and the longest (the hand-off's cost, the
+/// resilience spec's section 6.7, measured against decisions/024).
+pub fn handed_on() -> (u64, Duration, Duration) {
+    (
+        HANDED_COUNT.load(Ordering::Relaxed),
+        Duration::from_nanos(HANDED_NS.load(Ordering::Relaxed)),
+        Duration::from_nanos(HANDED_MOST_NS.load(Ordering::Relaxed)),
+    )
+}

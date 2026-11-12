@@ -2401,3 +2401,146 @@ async fn capacity_book_proposals_at_wealth_scale() {
     }
     counting.abort();
 }
+
+/// What a command handed to its writer group costs (step 3d; the resilience
+/// spec's section 6.7: measured against decisions/024's budget, a bus hop's
+/// 5 ms and a command to its journal entry's 25 ms, p99), through a real
+/// broker: `make bench`'s, by hand, MERIDIAN_BENCH_BROKER_URL naming one.
+///
+/// At one group and at two, each over a database of its own, the book's
+/// members serving its commands in one queue group, as a deployment runs
+/// them: `MERIDIAN_BENCH_COMMANDS` proposals (2,000) asked one at a time by
+/// a plugin's bus. At two the broker gives about half to group 0's member,
+/// which hands each to group 1's, P0's owner. It prints each run's latency
+/// (p50, p90, p99, the most) and, at two, the hand-offs' count, mean and
+/// most, as the handing member timed them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_book_hand_off() {
+    use meridian_bor::order_service::*;
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    let broker = std::env::var("MERIDIAN_BENCH_BROKER_URL")
+        .expect("MERIDIAN_BENCH_BROKER_URL names the broker the bench asks through");
+    let commands: usize = std::env::var("MERIDIAN_BENCH_COMMANDS")
+        .unwrap_or_else(|_| "2000".into())
+        .parse()
+        .unwrap();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    for groups in [1u32, 2] {
+        let (url, migrated) = blocking(isolated);
+        let run = unique("HANDOFF");
+        let instance = format!("bor-bench-{run}");
+        let mut held = vec![migrated];
+        for group in 0..groups {
+            let store = blocking(|| {
+                Arc::new(
+                    PostgresStore::connect(&url, 8)
+                        .unwrap()
+                        .with_groups(Groups::new(group, groups).unwrap()),
+                )
+            });
+            let backend = Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap());
+            let bus = Arc::new(Bus::single(
+                instance.clone(),
+                backend,
+                Arc::new(meridian_clock::SystemClock),
+            ));
+            if groups > 1 {
+                bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+            }
+            let writer: Arc<dyn Store> = Arc::new(Writer::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                Arc::clone(&bus),
+            ));
+            meridian_bor::service::serve(bus.clone(), writer, bus.clock());
+            bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+                let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+                Ok((
+                    "meridian.v1.ResolveInstrumentReply".into(),
+                    ResolveInstrumentReply {
+                        found: true,
+                        instrument: Some(InstrumentRecord {
+                            instrument_id: asked.instrument_id,
+                            asset_class: AssetClass::Equity as i32,
+                            currency: "USD".into(),
+                            version: 1,
+                            ..Default::default()
+                        }),
+                    }
+                    .encode_to_vec(),
+                ))
+            });
+            held.push(store);
+        }
+        let client = Arc::new(Bus::single(
+            format!("operations-bench-{run}"),
+            Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        // The broker learns every member's subscriptions before the first ask.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let accounts: Vec<String> = (0..50).map(|n| format!("ACC-{run}-{n}")).collect();
+        for account in &accounts {
+            send_order(
+                &client,
+                SET_ACCOUNT_ATTRIBUTE,
+                &SetAccountAttributeRequest {
+                    account_id: account.clone(),
+                    attribute: Some(
+                        set_account_attribute_request::Attribute::WaitsForCompliance(false),
+                    ),
+                    reason: "the bench proposes without a compliance plugin".into(),
+                },
+                Some(PERSON),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let (count_before, total_before, _) = meridian_bus::owners::handed_on();
+        let mut took = Vec::with_capacity(commands);
+        let started = std::time::Instant::now();
+        for n in 0..commands {
+            let proposal = ProposeOrderRequest {
+                account_id: accounts[n % accounts.len()].clone(),
+                instrument_id: "INS-AAPL".into(),
+                sleeve: "core".into(),
+                side: Side::Buy as i32,
+                quantity: d("10"),
+                order_type: OrderType::Limit as i32,
+                limit_price: usd("227.50"),
+                time_in_force: TimeInForce::Day as i32,
+                idempotency_key: format!("{run}-{n}"),
+                ..Default::default()
+            };
+            let began = std::time::Instant::now();
+            send_order(&client, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                .await
+                .unwrap_or_else(|refused| panic!("proposal {n} refused: {refused}"));
+            took.push(began.elapsed());
+        }
+        let elapsed = started.elapsed();
+        took.sort();
+        let at = |q: f64| took[((took.len() as f64 * q) as usize).min(took.len() - 1)];
+        let (count_after, total_after, most) = meridian_bus::owners::handed_on();
+        let handed = count_after - count_before;
+        let mean_ms = if handed > 0 {
+            (total_after - total_before).as_secs_f64() * 1e3 / handed as f64
+        } else {
+            0.0
+        };
+        println!(
+            "CAPACITY book hand-off groups={groups} commands={commands} rate_per_s={:.0} \
+             p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} most_ms={:.2} handed={handed} \
+             handed_mean_ms={mean_ms:.2} handed_most_ms={:.2}",
+            commands as f64 / elapsed.as_secs_f64(),
+            at(0.50).as_secs_f64() * 1e3,
+            at(0.90).as_secs_f64() * 1e3,
+            at(0.99).as_secs_f64() * 1e3,
+            took.last().unwrap().as_secs_f64() * 1e3,
+            most.as_secs_f64() * 1e3,
+        );
+        blocking(move || drop(held));
+    }
+}

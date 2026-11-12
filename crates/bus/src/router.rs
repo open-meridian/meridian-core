@@ -1609,7 +1609,11 @@ fn hand(route: &Routing, group: u32, topic: &str, envelope: Envelope) -> Handler
         timeout,
         group,
     ));
-    let ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3);
+    let took = started.elapsed();
+    let ms = format!("{:.1}", took.as_secs_f64() * 1e3);
+    if matches!(answered, Ok(_) | Err(BusError::HandlerFailed { .. })) {
+        crate::owners::note_handed(took);
+    }
     match answered {
         Ok(answer) => {
             tracing::debug!(topic, group, ms, "a write handed to its owner: answered");
