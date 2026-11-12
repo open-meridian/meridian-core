@@ -549,6 +549,63 @@ async fn a_curve_for_a_date_is_its_points_and_a_tenor_not_published_is_source_si
         .any(|u| u.dataset == UST && u.reason == UnansweredReason::SourceSilent as i32));
 }
 
+/// Contract v30 (W10.4; ruling 431; RATE_KIND_BENCHMARK_YIELD approved
+/// 2026-11-09; the fixture's "v30, a benchmark's yield"): an on-the-run
+/// benchmark's yield as its publisher states it, on the curve's record by
+/// its tenor, beside the par yield fitted at the same tenor -- two rows,
+/// each read by its kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_benchmarks_yield_sits_on_the_curve_by_tenor_beside_its_par_yield() {
+    let h = harness();
+    let benchmark = Rate {
+        tenor: tenor(10, TenorUnit::Year),
+        convention: bond_equivalent(),
+        ..rate(
+            UST,
+            PAR,
+            &format!("PAR:benchmark_yield:10Y:act_act/compounded/2:2026-10-07@{PAR}"),
+            RateKind::BenchmarkYield,
+            "4.10",
+            "2026-10-07",
+            NOW - 6 * HOUR,
+            "benchmarks/2026-10-07/10Y",
+        )
+    };
+    record(
+        &h,
+        "us-treasury-1",
+        vec![par(UST, "10Y", 10, TenorUnit::Year, "4.12"), benchmark],
+    )
+    .unwrap();
+    let by_kind = |kind: RateKind| {
+        list(
+            &h,
+            ListRatesRequest {
+                subjects: subjects(&[PAR]),
+                business_date: "2026-10-07".into(),
+                kinds: vec![kind as i32],
+                ..Default::default()
+            },
+        )
+    };
+    let benchmarks = by_kind(RateKind::BenchmarkYield);
+    assert_eq!(benchmarks.rates.len(), 1, "{:?}", benchmarks.rates);
+    assert_eq!(value_of(&benchmarks.rates[0]), "4.10");
+    assert_eq!(benchmarks.rates[0].kind, RateKind::BenchmarkYield as i32);
+    let fitted = by_kind(RateKind::ParYield);
+    assert_eq!(fitted.rates.len(), 1);
+    assert_eq!(value_of(&fitted.rates[0]), "4.12");
+    let both = list(
+        &h,
+        ListRatesRequest {
+            subjects: subjects(&[PAR]),
+            business_date: "2026-10-07".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(both.rates.len(), 2, "one row per kind at the tenor");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_conventions_for_one_tenor_are_two_rows() {
     // two-conventions-one-tenor: a bill's discount and coupon-equivalent
