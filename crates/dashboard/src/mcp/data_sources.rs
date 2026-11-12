@@ -86,7 +86,9 @@ sign of life and its backlog's peak. Measured by the plugins and core, never a p
         "every dataset a launched plugin's catalogue serves the lake: its catalogue entry (vendor, \
 aggregator, data types, modes, cadence, history, its business day's time zone and end, its venue, \
 the class of source its prices come from -- traded, firm_quote, composite or evaluated, empty for \
-not stated), the licence enforced -- the deployment's, or the catalogue's default until one is set, \
+not stated), the licence enforced -- the deployment's, or until one is set the dataset kept and read \
+with each use right restrictive (no derived data outside the deployment, no redistribution, no \
+outside computation, every listed use prohibited), \
 with the source behind the vendor or whose aggregate it serves -- the \
 plugins entitled to it, how many of its rows in force carry a value left unconverted and how many \
 identifiers and venues its plugin reported missing, how many of its rows in force are dated on a \

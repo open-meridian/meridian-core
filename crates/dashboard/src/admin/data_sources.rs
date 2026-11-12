@@ -9,7 +9,8 @@
 //!   2026-10-31 (rulings 896 and 906), the source behind the vendor or whose
 //!   aggregate it serves and the class of source its prices come from, what
 //!   it serves, the licence enforced --
-//!   the deployment's, or the catalogue's default until one is set -- the
+//!   the deployment's, or until one is set the dataset kept and read with
+//!   each use right restrictive (ruling 1030; step 3c's question 6) -- the
 //!   plugins entitled to it, and the lake's counts of values left
 //!   unconverted and of identifiers and venues its instance reported
 //!   missing, and from contract v23 of its daily values dated on a closed
@@ -316,7 +317,8 @@ pub struct Row {
     pub dataset: DatasetRef,
     /// The licence enforced.
     pub licence: DatasetLicence,
-    /// Whether the deployment set it, rather than the catalogue's default.
+    /// Whether the deployment set it, rather than the restrictive reading
+    /// of a dataset not licensed.
     pub licence_set: bool,
     /// The instances entitled to it, allowed now.
     pub entitled: Vec<DatasetEntitlement>,
@@ -572,7 +574,9 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                     crate::tickets::display_name(records, &licence.updated_by)
                 )
             } else {
-                "the catalogue's default".into()
+                // Step 3c's question 6 (ruling 1030): kept and read as
+                // before, each use right read restrictively.
+                "not licensed: kept and read, each use right restrictive".into()
             };
             format!(
                 "<tr data-id=\"{id}\"><td title=\"{id}\"><button type=\"button\" class=\"link\" \
@@ -944,7 +948,8 @@ pub fn page(
             "datasets",
             "Datasets",
             "What each launched plugin's catalogue serves the lake, on the terms enforced: the \
-             deployment's licence, or the catalogue's default until one is set. Prices are read \
+             deployment's licence, or until one is set the dataset kept and read with each use \
+             right restrictive. Prices are read \
              by the plugins entitled to them, never shown here.",
             "",
             &datasets_body
@@ -1080,10 +1085,8 @@ mod tests {
              1 outside its coverage\">3 (1 outside)</td>"
         ));
         assert!(body.contains("<td class=\"wide num\" data-misses>1</td>"));
-        assert!(
-            body.contains("the catalogue&#39;s default")
-                || body.contains("the catalogue's default")
-        );
+        assert!(body.contains("each use right restrictive"));
+        assert!(!body.contains("not licensed:"));
         assert!(body.contains("data-entitled=\"1\""));
         assert!(body.contains("data-entitlements=\"1\""));
         assert!(body.contains("No priority is set"));
@@ -1091,6 +1094,30 @@ mod tests {
         for (id, _) in TABS {
             assert!(body.contains(&format!("id=\"{id}\"")), "{id}");
         }
+    }
+
+    /// Step 3c's question 6 (ruling 1030): a dataset no deployment admin
+    /// has licensed is said so, kept and read with each use right
+    /// restrictive, and its licence's form opens kept with derived data not
+    /// ticked.
+    #[test]
+    fn a_dataset_not_licensed_is_kept_and_read_each_use_right_restrictive() {
+        let mut reply = listed(false);
+        reply.licences.clear();
+        let body = page(
+            &Ok(reply),
+            &Ok(ListSourcePrioritiesReply::default()),
+            &Ok(Vec::new()),
+            &Ok(Vec::new()),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(body.contains("not licensed: kept and read, each use right restrictive"));
+        assert!(body.contains("&quot;derived_use&quot;:[]"), "{body}");
+        assert!(body.contains("&quot;kept&quot;:[&quot;1&quot;]"), "{body}");
     }
 
     /// Contract 28, amended 2026-10-31 (rulings 896, 906): the class of

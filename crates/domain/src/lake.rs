@@ -16,7 +16,10 @@ use meridian_pb::bounds::{
     DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_VENDOR_LENGTH,
     DATASET_LICENCE_DEFAULT_FIELDS_COUNT, DATASET_LICENCE_RETENTION_DAYS_RANGE,
 };
-use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode};
+use meridian_pb::v1::{
+    Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode, OutsideComputation,
+    ProhibitedUse, Redistribution,
+};
 
 /// A price of one kind for one subject.
 pub const PRICE: &str = "meridian.v1.Price";
@@ -1015,10 +1018,20 @@ pub fn entitled_fields(
 }
 
 /// The licence enforced (W10.1; spec/the-lake, Q8): the deployment's, or
-/// the default until one is set, with no retention set. The lake keeps by
-/// it, and the Data sources page draws it. From contract v30 a catalogue
-/// declares no default terms (ruling 1032 retired licence_default), so the
-/// declaration is not read here.
+/// the default until one is set. The lake keeps and answers by it, a
+/// plugin reads it with the datasets it lists, and the Data sources page
+/// and its tools draw it. From contract v30 a catalogue declares no default
+/// terms (ruling 1032 retired licence_default), so the declaration is not
+/// read here.
+///
+/// A dataset no deployment admin has licensed is kept and read as before
+/// -- kept with no retention bound, every field read, shown -- and each use
+/// right is read restrictively (step 3c's question 6, ruled 2026-11-09;
+/// ruling 1030): derived data stays inside the deployment, nothing is
+/// redistributed or reaches a computation outside it, multi-instrument
+/// outputs are restricted as single ones are, and every listed use is
+/// prohibited, until a licence says otherwise. A firm keeps a vendor's data
+/// for its own use; redistribution and derived use wait for the licence.
 pub fn effective_licence(
     dataset: &str,
     set: Option<&DatasetLicence>,
@@ -1031,11 +1044,28 @@ pub fn effective_licence(
         dataset: dataset.to_string(),
         kept: true,
         display: true,
-        derived_use_terms: DerivedUse::NotRestricted as i32,
         ..Default::default()
     };
-    derived_use_both(&mut licence);
+    restrictive_use_rights(&mut licence);
     licence
+}
+
+/// Each use right of a licence at its restrictive reading (ruling 1030;
+/// the licence's §1c): derived data internal only, single- and
+/// multi-instrument alike; no redistribution; no computation outside the
+/// deployment; every listed use prohibited. Keeping, retention, fields and
+/// display are not use rights and are left as they are.
+pub fn restrictive_use_rights(licence: &mut DatasetLicence) {
+    licence.derived_use_terms = DerivedUse::InternalOnly as i32;
+    derived_use_both(licence);
+    licence.derived_multi_instrument_free = Some(false);
+    licence.redistribution = Redistribution::NotAllowed as i32;
+    licence.outside_computation = OutsideComputation::NotAllowed as i32;
+    licence.prohibited_uses = vec![
+        ProhibitedUse::ModelTraining as i32,
+        ProhibitedUse::ReplicateService as i32,
+        ProhibitedUse::IndexCreation as i32,
+    ];
 }
 
 /// A licence's derived-data answer as read (contract v27, ruling 479): its
@@ -1303,6 +1333,55 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Step 3c's question 6 (ruled 2026-11-09; ruling 1030): a dataset no
+    /// deployment admin has licensed is kept and read as before, and each
+    /// use right is read restrictively -- one assertion per right.
+    #[test]
+    #[allow(deprecated)]
+    fn a_dataset_nobody_licensed_is_kept_and_read_each_use_right_restrictively() {
+        let unlicensed = effective_licence("kraken-1:ticker", None, None);
+        assert_eq!(unlicensed.dataset, "kraken-1:ticker");
+        // Kept and read as before: kept, no retention bound, every field,
+        // shown.
+        assert!(unlicensed.kept);
+        assert_eq!(unlicensed.retention_days, 0);
+        assert!(unlicensed.default_fields.is_empty());
+        assert!(unlicensed.display);
+        // Derived data: made inside the deployment only, the deprecated
+        // boolean saying the same (ruling 479).
+        assert_eq!(derived_use_terms(&unlicensed), DerivedUse::InternalOnly);
+        assert!(!unlicensed.derived_use);
+        assert!(!derived_use_bool(&unlicensed));
+        // A multi-instrument output restricted as a single one is.
+        assert_eq!(unlicensed.derived_multi_instrument_free, Some(false));
+        // Never redistributed.
+        assert_eq!(unlicensed.redistribution, Redistribution::NotAllowed as i32);
+        // Never outside the deployment.
+        assert_eq!(
+            unlicensed.outside_computation,
+            OutsideComputation::NotAllowed as i32
+        );
+        // Every listed use prohibited.
+        assert_eq!(
+            unlicensed.prohibited_uses,
+            vec![
+                ProhibitedUse::ModelTraining as i32,
+                ProhibitedUse::ReplicateService as i32,
+                ProhibitedUse::IndexCreation as i32,
+            ]
+        );
+        // A licence a deployment admin set is enforced as set, nothing read
+        // into it.
+        let set = DatasetLicence {
+            dataset: "kraken-1:ticker".into(),
+            kept: true,
+            derived_use_terms: DerivedUse::NotRestricted as i32,
+            redistribution: Redistribution::AllowedWithAttribution as i32,
+            ..Default::default()
+        };
+        assert_eq!(effective_licence("kraken-1:ticker", Some(&set), None), set);
+    }
 
     #[test]
     fn a_futures_series_is_keyed_by_one_ticker_carrying_its_venue() {
