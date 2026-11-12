@@ -574,10 +574,14 @@ def apply(manifest):
 
 
 def wait_for(what, ready, seconds=420):
+    """Wait until `ready()` answers something true, and answer what it
+    answered: a reading taken again later can differ from the one that
+    ended the wait."""
     for _ in range(seconds):
         try:
-            if ready():
-                return
+            said = ready()
+            if said:
+                return said
         except Exception:
             pass
         time.sleep(1)
@@ -774,8 +778,11 @@ def main():
                 "where a.usename like 'meridian\\_%' and a.client_addr is not null")
             return said if said and not said.startswith("0|") else ""
 
-        wait_for("the deployment's connections to the external database", counted, seconds=120)
-        secured, clear = (int(n) for n in counted().split("|"))
+        # The reading that ended the wait, never a second one: between two
+        # reads every pooled connection can be idle-closed and the count
+        # read as none (CI run 43179029235, int('')).
+        said = wait_for("the deployment's connections to the external database", counted, seconds=120)
+        secured, clear = (int(n) for n in said.split("|"))
         s.check(secured > 0 and clear == 0,
                 f"the external database under a private CA: {secured} connections over TLS, "
                 f"verified by database.caSecret's CA, {clear} in the clear")
