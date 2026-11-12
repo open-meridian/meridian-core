@@ -468,6 +468,16 @@ fn each_stores_change_log_is_held_by_its_members_and_no_plugin() {
         instrument,
         "platform.lake.internal.read-from-writer"
     ));
+    // A write handed to its owning writer group (step 3d): each store's
+    // members alone, never another component.
+    for internal in [
+        "platform.lake.internal.record",
+        "platform.book.internal.command",
+    ] {
+        assert!(holds(runtime, internal));
+        assert!(!holds(analytics, internal));
+        assert!(!holds(instrument, internal));
+    }
     for other in users
         .iter()
         .filter(|u| !["runtime", "instrument", "analytics"].contains(&u.user.as_str()))
