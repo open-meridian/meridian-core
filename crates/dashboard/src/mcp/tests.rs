@@ -1946,6 +1946,108 @@ async fn a_deployment_admin_administering_no_role_reads_the_overview_and_holds_t
     );
 }
 
+/// Contract v30 (W8.3; MCP at function parity): dashboard__launch_plugin
+/// takes shards and standby as the Launch sheet sends them, each sent on
+/// the launch; shards past the version's most_shards refused by the
+/// conductor naming shards; either of the wrong type refused at its path,
+/// nothing sent.
+#[tokio::test]
+async fn launch_plugin_takes_shards_and_standby_as_the_launch_sheet_does() {
+    let (app, _) = area_app(area_records(&[], true));
+    let sent: Arc<Mutex<Vec<meridian_domain::v1::LaunchPluginRequest>>> = Arc::default();
+    let hearing = Arc::clone(&sent);
+    app.bus.serve(crate::catalogue::LAUNCH_PLUGIN, move |envelope| {
+        let request =
+            meridian_domain::v1::LaunchPluginRequest::decode(&envelope.payload[..]).unwrap();
+        hearing.lock().unwrap().push(request.clone());
+        if request.shards > 2 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["shards".to_string()],
+                "shards is 3, and snaptrade 0.13.0 allows at most 2 pod(s) of one instance (its most_shards)",
+            ));
+        }
+        Ok((
+            "meridian.v1.PluginLaunch".into(),
+            meridian_domain::v1::PluginLaunch {
+                instance_id: request.instance_id,
+                shards: request.shards,
+                standby: request.standby,
+                state: 1,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let token = token(&app, covering_roles(&[], true), Resource::Mcp).await;
+    let launch = |more: Value| {
+        let mut arguments = json!({"name": "snaptrade", "version": "0.13.0", "instance_id": "snaptrade-2",
+            "approved_roles": ["custody"], "note": "Two pods and a standby."});
+        for (key, value) in more.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        call("dashboard__launch_plugin", arguments)
+    };
+    // Listed with both, as the sheet's Pods.
+    let (_, said, _) = rpc(&app, Some(&token), &[], list()).await;
+    let tool = said["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "dashboard__launch_plugin")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["shards"]["type"], "integer",
+        "{tool}"
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["standby"]["type"], "boolean",
+        "{tool}"
+    );
+
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        launch(json!({"shards": 2, "standby": true})),
+    )
+    .await;
+    assert_eq!(structured(&said)["outcome"], "made", "{said}");
+    let request = sent.lock().unwrap().pop().unwrap();
+    assert_eq!((request.shards, request.standby), (2, true));
+    // Absent: one pod, no standby.
+    let (_, said, _) = rpc(&app, Some(&token), &[], launch(json!({}))).await;
+    assert_eq!(structured(&said)["outcome"], "made", "{said}");
+    let request = sent.lock().unwrap().pop().unwrap();
+    assert_eq!((request.shards, request.standby), (0, false));
+    // Past most_shards: the conductor's refusal, naming shards.
+    let (_, said, _) = rpc(&app, Some(&token), &[], launch(json!({"shards": 3}))).await;
+    let refused = structured(&said);
+    assert_eq!(refused["outcome"], "refused", "{said}");
+    assert_eq!(refused["fields"][0]["path"], "shards", "{said}");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap()
+            .contains("at most 2 pod(s)"),
+        "{said}"
+    );
+    // The wrong type: refused at its path, nothing sent.
+    sent.lock().unwrap().clear();
+    for (more, path) in [
+        (json!({"shards": -1}), "shards"),
+        (json!({"shards": "two"}), "shards"),
+        (json!({"standby": "yes"}), "standby"),
+    ] {
+        let (_, said, _) = rpc(&app, Some(&token), &[], launch(more.clone())).await;
+        let refused = structured(&said);
+        assert_eq!(refused["outcome"], "refused", "{more}: {said}");
+        assert_eq!(refused["fields"][0]["path"], path, "{more}: {said}");
+    }
+    assert!(sent.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_delegation_covering_one_instance_is_refused_another_naming_what_it_reaches() {
     let (app, _) = area_app(area_records(&[("custody", AccessLevel::Admin)], false));

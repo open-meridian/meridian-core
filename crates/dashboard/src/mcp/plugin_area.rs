@@ -236,7 +236,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "launch_plugin",
         "Launch a plugin",
-        "launch a version in the catalogue as an instance, as `meridian plugin launch` does: approved_roles exactly the version's roles, refused otherwise; live only on a development deployment; and a note.",
+        "launch a version in the catalogue as an instance, as the Launch sheet and `meridian plugin launch` do: approved_roles exactly the version's roles, refused otherwise; live only on a development deployment; its own limits at its sidecar, each absent for the deployment's; its shards, pods of the one instance sharing its subjects, at most the version's most_shards (0 or 1 one pod; more refused naming shards); standby true for a standby pod, which takes over when the instance's pod stops; and a note.",
         false,
         Gate::DeploymentAdmin,
         launch_schema,
@@ -693,6 +693,10 @@ fn launch_schema() -> Value {
             "approved_roles": {"type": "array", "items": {"type": "string"}},
             "live": {"type": "boolean"},
             "note": note_schema(),
+            // Contract v30 (W8.3): its shards, at most the version's
+            // most_shards, and a standby pod, as the Launch sheet's Pods.
+            "shards": {"type": "integer", "minimum": 0},
+            "standby": {"type": "boolean"},
             // Contract v30 (W8.3; ruled 2026-11-11): its own share at its
             // sidecar, as the Launch sheet's Limits; each absent for the
             // deployment's.
@@ -2513,11 +2517,22 @@ impl Context<'_> {
                 "live",
                 "note",
                 "limits",
+                "shards",
+                "standby",
             ],
             &mut problems,
         ) else {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());
         };
+        // Its shards and standby pod (contract v30, W8.3), as the Launch
+        // sheet sends them: the conductor refuses shards past the version's
+        // most_shards, naming shards.
+        let shards = integer(top, "shards", "", false, &mut problems);
+        let shards = u32::try_from(shards).unwrap_or_else(|_| {
+            problems.add("shards", "a whole number of pods, 0 or 1 for one");
+            0
+        });
+        let standby = boolean(top, "standby", &mut problems);
         // Its own share at its sidecar (contract v30): each a whole number
         // above 0, absent for the deployment's.
         let mut limits = meridian_domain::v1::SidecarLimits::default();
@@ -2589,8 +2604,8 @@ impl Context<'_> {
                     live,
                     note,
                     limits,
-                    // Contract v30's shards and standby (W8.3), built with 3d.
-                    ..Default::default()
+                    shards,
+                    standby,
                 },
                 RESTARTING,
             )
