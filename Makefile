@@ -2674,6 +2674,18 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.maxConcurrentAnswers=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.maxConcurrentAnswers=$$refused rendered; it takes 1 to 8" >&2; exit 1; }; \
 	done
+	@# The write-ahead stream's bounds (contract v30, stage E): set under
+	@# lake: -- where the templates read them -- each reaches the lake in ha,
+	@# 10m and 256MB where unset; a value it does not read renders nothing.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
+	for said in "MAX_AGE:10m:" "MAX_AGE:30s:--set lake.writeAhead.maxAge=30s" "MAX_BYTES:256MB:" "MAX_BYTES:512MB:--set lake.writeAhead.maxBytes=512MB"; do \
+		name="$${said%%:*}"; rest="$${said#*:}"; want="$${rest%%:*}"; flag="$${rest#*:}"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$flag 2>/dev/null \
+			| grep -A1 "name: MERIDIAN_LAKE_WRITE_AHEAD_$$name\$$" | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: lake.writeAhead $${flag:-unset} does not tell the lake MERIDIAN_LAKE_WRITE_AHEAD_$$name=$$want" >&2; exit 1; }; \
+	done; \
+	! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxAge=ten >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }
 	@# Ruling 972: lake.mallocMmapThreshold reaches the lake as glibc's
 	@# MALLOC_MMAP_THRESHOLD_, 131072 by default, and only a whole number of
 	@# bytes above 0 renders.

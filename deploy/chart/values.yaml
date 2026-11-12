@@ -378,23 +378,6 @@ bor:
     # replica where database.brought.readReplicas is above 0, wired by the
     # chart (stage C2); the primary otherwise.
     readExistingSecret: ""
-  # The write-ahead stream's bounds (contract v30, stage E; the resilience
-  # spec's sections 4 and 11): in ha a data plugin's lake writes are held by
-  # a JetStream stream on the broker's three servers until the lake records
-  # them; off in tolerant, which has no stream. maxAge: how long it holds a
-  # write the lake has not recorded -- a writer gone longer leaves a gap,
-  # recorded and recovered by its dataset's declaration -- as 30s, 10m or
-  # 1h. maxBytes: how much it holds, in MB or GB; full, it refuses a new
-  # write, its plugin refused for load with a retry-after, and drops none it
-  # holds. Sized from the measured rate: a 100-row batch takes about 117
-  # bytes a row in the stream, so 256MB is about 2.2 million rows -- ten
-  # minutes at 3,600 rows a second, three at the lake's 12,000 -- beyond
-  # the two minutes of the slowest recovery that stops the writer (a
-  # zone's). Each server's JetStream store is sized to hold it beside the
-  # analytics units' queue.
-  writeAhead:
-    maxAge: 10m
-    maxBytes: 256MB
   # The book replays an account's journal for each command and each dated
   # read, so it needs more room than the other components (approved
   # 2026-10-15, after a development pod at 256Mi was OOMKilled). Replaces
@@ -489,6 +472,23 @@ lake:
     # replica where database.brought.readReplicas is above 0, wired by the
     # chart (stage C2); the primary otherwise.
     readExistingSecret: ""
+  # The write-ahead stream's bounds (contract v30, stage E; the resilience
+  # spec's sections 4 and 11): in ha a data plugin's lake writes are held by
+  # a JetStream stream on the broker's three servers until the lake records
+  # them; off in tolerant, which has no stream. maxAge: how long it holds a
+  # write the lake has not recorded -- a writer gone longer leaves a gap,
+  # recorded and recovered by its dataset's declaration -- as 30s, 10m or
+  # 1h. maxBytes: how much it holds, in MB or GB; full, it refuses a new
+  # write, its plugin refused for load with a retry-after, and drops none it
+  # holds. Sized from the measured rate: a 100-row batch takes about 117
+  # bytes a row in the stream, so 256MB is about 2.2 million rows -- ten
+  # minutes at 3,600 rows a second, three at the lake's 12,000 -- beyond
+  # the two minutes of the slowest recovery that stops the writer (a
+  # zone's). Each server's JetStream store is sized to hold it beside the
+  # analytics units' queue.
+  writeAhead:
+    maxAge: 10m
+    maxBytes: 256MB
 
 # The analytics component (contract v26, W12): a coordinator and a pool of
 # workers, its own image from the same commit, its own credential.
