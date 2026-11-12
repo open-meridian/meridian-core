@@ -3077,10 +3077,10 @@ def reader_hands_on(s):
     the lake's reader: the flood instance reads its dataset served, not kept,
     a price at a time, each read raising a want -- the writer's recorded act
     -- that the instance serves. The reader takes some of them (the queue
-    group), hands each to the writer on platform.lake.internal.read-from-
-    writer and answers its reply, so every read is answered the price served
-    for it, whichever member took it (the spec's section 5, approved
-    2026-11-10)."""
+    group), hands each to the writer on
+    platform.lake.internal.read-from-writer and answers its reply, so every
+    read is answered the price served for it, whichever member took it (the
+    spec's section 5, approved 2026-11-10)."""
     print("R: a lake reader hands its writer a read that depends on it", flush=True)
     readers = pods("lake-reader")
     if not readers:

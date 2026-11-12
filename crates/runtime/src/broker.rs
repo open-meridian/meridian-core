@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 
+use meridian_bus::write_ahead;
 use meridian_sidecar::Contract;
 
 /// Where a reply lands. A caller has to hear its own answer, and a responder
@@ -33,11 +34,6 @@ const RUNTIME_COMPONENTS: [&str; 4] = ["street", "bor", "lake", "conductor"];
 /// "Pattern"): the lake publishes on every dataset's, and a plugin subscribes
 /// to the datasets it is entitled to alone (contract v18, W10.1).
 const DATASET: &str = "{dataset}";
-
-/// A data plugin's lake writes in `ha`, by the lake's write-ahead stream
-/// (contract v30, stage E; [`meridian_bus::write_ahead`]): the stream's
-/// subjects of its own instance's datasets, `{instance}.{key}` after this.
-const WRITE_AHEAD: &str = "platform.lake.internal.write-ahead";
 
 /// Components holding a credential of their own rather than the runtime's.
 ///
@@ -88,7 +84,7 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// to the lake's credential, so its writer makes the stream and reads it.
 /// No other stream is reached by it, and the analytics component's stays
 /// its own. A data plugin's credential publishes to the stream's subjects of
-/// its own instance alone ([`WRITE_AHEAD`]).
+/// its own instance alone ([`write_ahead::instance_subjects`]).
 const COMPONENT_TOPICS: [(&str, &str); 20] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
     ("analytics", "platform.analytics.internal.members"),
@@ -307,12 +303,14 @@ pub fn permissions_entitled(
     // A data plugin's rows go by the lake's write-ahead stream in `ha`: on
     // its own instance's subjects alone, so it writes no other's datasets.
     if roles.iter().any(|role| role == "data") && dataset_reads(instance_id) {
-        publish.insert(format!("{WRITE_AHEAD}.{instance_id}.*"));
+        publish.insert(write_ahead::instance_subjects(instance_id));
         // And the last write of each of its own datasets read back from the
         // stream, by subject, as a restarted sidecar goes on with its chain
         // (contract v30, stage C): its own instance's subjects alone.
         publish.insert(format!(
-            "$JS.API.DIRECT.GET.LAKE_WRITE_AHEAD.{WRITE_AHEAD}.{instance_id}.*"
+            "$JS.API.DIRECT.GET.{}.{}",
+            write_ahead::STREAM,
+            write_ahead::instance_subjects(instance_id)
         ));
     }
     for topic in granted.subscribe.iter().chain(&sidecar.subscribe) {
