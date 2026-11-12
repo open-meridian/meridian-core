@@ -352,6 +352,13 @@ street:
 # kept apart from the street's by the credential.
 bor:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its partitions: `control` group 0's, each account partition by rendezvous hashing; each group past
+  # the first is a writer Deployment of its own, <release>-bor-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.
@@ -411,6 +418,13 @@ bor:
 # credential.
 lake:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its datasets by rendezvous hashing, `control` group 0's; each group past
+  # the first is a writer Deployment of its own, <release>-lake-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.

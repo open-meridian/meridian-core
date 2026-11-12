@@ -107,3 +107,6 @@ spec:
        Deployment in a reads-only mode, `bor.readers` of them. */}}
 {{ include "meridian-runtime.readers" (dict "top" $ "component" "bor" "values" .Values.bor "readUrl" "MERIDIAN_BOR_READ_DATABASE_URL" "rendered" (include "meridian-runtime.bor.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}
+{{- /* Each writer group past the first (step 3d): its own writer
+       Deployment, Lease and standby, `bor.writerGroups` in all. */}}
+{{ include "meridian-runtime.writerGroupDeployments" (dict "top" $ "component" "bor" "values" .Values.bor "rendered" (include "meridian-runtime.bor.deployment" .)) }}

@@ -243,6 +243,62 @@ when it lapses. More are refused: a count CI does not test is not offered
 {{- end -}}
 
 {{/*
+A store's writer groups (step 3d; the resilience spec's sections 6.1, 6.3
+and 6.7; `lake.writerGroups`, `bor.writerGroups`, approved by 1057): 1, the
+default, one writer over every partition, as ever. Above it each group owns
+a share of the store's partitions by rendezvous hashing -- the lake's
+datasets, the book's partitions, `control` always group 0's -- and every
+group past the first is a writer Deployment of its own,
+`<release>-<store>-group-<g>` (approved 2026-11-12), with its own Lease and
+standby (`<store>.standby` counts per group); every member serves the
+store's public writes and hands each to the group owning it. The lake's
+above 1 with the write-ahead stream on (ha) is refused until a group's own
+consumer of the stream comes, with the lake's hash ranges (stage H). Zero is
+refused, and more than 64. Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.writerGroups" -}}
+{{- $groups := 1 -}}
+{{- if hasKey .values "writerGroups" -}}{{- $groups = index .values "writerGroups" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $groups)) -}}
+{{- fail (printf "%s.writerGroups is %v; a whole number of writer groups from 1, each owning a share of the %s's partitions (1, the default, for one writer over all)" .component $groups .component) -}}
+{{- end -}}
+{{- if gt (int $groups) 64 -}}
+{{- fail (printf "%s.writerGroups is %v; at most 64" .component $groups) -}}
+{{- end -}}
+{{- if and (eq .component "lake") (gt (int $groups) 1) (gt (int (include "meridian-runtime.jetstreamReplicas" .top)) 0) -}}
+{{- fail (printf "lake.writerGroups is %v with the lake's write-ahead stream on (broker.jetstream.replicas above 0, as resilience.profile ha sets it): a writer group's own consumer of the stream comes with the lake's hash ranges (step 3d, stage H). Until then the lake writes as one group with the stream on; set lake.writerGroups: 1, or broker.jetstream.replicas: 0." $groups) -}}
+{{- end -}}
+{{- int $groups -}}
+{{- end -}}
+
+{{/*
+Each writer group past the first of a store (step 3d): group 0's writer
+Deployment as `rendered`, made again as `<release>-<store>-group-<g>` --
+its name, its component label (so its writer and its standby repel each
+other alone), its group in MERIDIAN_WRITER_GROUP and its own Lease -- and
+its PodDisruptionBudget. Nothing with one group. Takes a dict: top,
+component, values, rendered.
+*/}}
+{{- define "meridian-runtime.writerGroupDeployments" -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
+{{- if and (gt $groups 1) (gt (int $count) 0) }}
+{{- range $group := untilStep 1 $groups 1 }}
+{{- $component := printf "%s-group-%d" $.component $group -}}
+{{- $out := $.rendered -}}
+{{- $out = regexReplaceAll "(?m)^  name: (\\S+)$" $out (printf "  name: ${1}-group-%d" $group) -}}
+{{- $out = regexReplaceAll (printf "(?m)^(\\s+)meridian.dev/component: %s$" $.component) $out (printf "${1}meridian.dev/component: %s" $component) -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+- name: MERIDIAN_WRITER_GROUP\\n\\s+value: )\"0\"$" $out (printf "${1}\"%d\"" $group) -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+- name: MERIDIAN_LEASE_NAME\\n\\s+value: )\"(\\S+)\"$" $out (printf "${1}\"${2}-group-%d\"" $group) }}
+---
+{{ $out }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $.top "component" $component "values" $.values) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 "true" when a component runs a standby, so its members take a lease
 (coordination.k8s.io/v1, in the release's namespace) to say which writes.
 Takes a dict: component, values.
@@ -319,6 +375,18 @@ under (`<component>.readyLagMs`). Takes a dict: top, component, values.
        never. */}}
 - name: MERIDIAN_SCRUB_INTERVAL_DAYS
   value: {{ dig "scrub" "intervalDays" 7 .values | toString | quote }}
+{{- /* Its writer group and the store's count (step 3d; approved
+       2026-11-12): said only with several groups, group 0's here, each
+       other's where writerGroupDeployments makes it. */}}
+{{- if has .component (list "lake" "bor") }}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) }}
+{{- if gt $groups 1 }}
+- name: MERIDIAN_WRITER_GROUP
+  value: "0"
+- name: MERIDIAN_WRITER_GROUPS
+  value: {{ $groups | quote }}
+{{- end }}
+{{- end }}
 {{- if include "meridian-runtime.leased" . }}
 - name: MERIDIAN_LEASE_NAME
   value: {{ printf "%s-%s" (include "meridian-runtime.fullname" .top) .component | quote }}
@@ -799,6 +867,10 @@ stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
 {{- $members := int (include "meridian-runtime.memberCount" (dict "top" $ "component" $component "values" $values)) -}}
 {{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
 {{- $members = add1 $members -}}
+{{- end -}}
+{{- /* Each writer group's members (step 3d). */ -}}
+{{- if has $component (list "lake" "bor") -}}
+{{- $members = mul $members (int (include "meridian-runtime.writerGroups" (dict "top" $ "component" $component "values" $values))) -}}
 {{- end -}}
 {{- $each := 10 -}}
 {{- if and $writeAhead (eq $component "lake") }}{{ $each = 12 }}{{ end -}}
@@ -1453,6 +1525,9 @@ Takes the chart.
 {{- $one := dict "standby" (int (include "meridian-runtime.standbys" (dict "top" $ "component" $component "values" $values))) "readers" (int (index $values "readers" | default 0)) -}}
 {{- if ne $component "launcher" -}}
 {{- $_ := set $one "scrub" (dict "intervalDays" (float64 (dig "scrub" "intervalDays" 7 $values))) -}}
+{{- end -}}
+{{- if has $component (list "lake" "bor") -}}
+{{- $_ := set $one "writerGroups" (int (include "meridian-runtime.writerGroups" (dict "top" $ "component" $component "values" $values))) -}}
 {{- end -}}
 {{- $_ := set $said $component $one -}}
 {{- end -}}

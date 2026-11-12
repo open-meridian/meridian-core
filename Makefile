@@ -2736,6 +2736,50 @@ chart-check:
 		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
 			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
 	done
+	@# Step 3d, stage G (the resilience spec's sections 6.1, 6.3, 6.7 and 11;
+	@# names approved 2026-11-12): lake.writerGroups and bor.writerGroups, 1
+	@# by default and nothing changed; above it each group past the first a
+	@# writer Deployment of its own, <release>-<store>-group-<g>, its group
+	@# and the count in its environment, its own Lease, and with a standby
+	@# its standby and PodDisruptionBudget; the resilience values carry the
+	@# count; the lake's above 1 with the write-ahead stream refused until
+	@# stage H, and 0 refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -q "MERIDIAN_WRITER_GROUP\|-group-[0-9]" \
+		&& { echo "chart-check FAILED: one writer group, the default, renders a writer group's Deployment or environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render at two writer groups for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store.writerGroups=2 renders no writer Deployment check-meridian-runtime-$$store-group-1 (step 3d)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-2$$" \
+			&& { echo "chart-check FAILED: $$store.writerGroups=2 renders a third group's Deployment" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store's writer group 1 is not labelled $$store-group-1, apart from group 0's members" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUPS$$' | grep -c 'value: "2"')" = 4 ] \
+		|| { echo "chart-check FAILED: each writer group's member of the lake and the book is not told the count, 2 (MERIDIAN_WRITER_GROUPS)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "1"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-1 writers are not told their group, 1 (MERIDIAN_WRITER_GROUP)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "0"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-0 writers are not told their group, 0" >&2; exit 1; }; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with the book at two writer groups" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-bor-group-1"' \
+		|| { echo "chart-check FAILED: the book's writer group 1 does not take a Lease of its own, check-meridian-runtime-bor-group-1" >&2; exit 1; }; \
+	echo "$$ha" | grep -A2 "kind: PodDisruptionBudget" | grep -q "name: check-meridian-runtime-bor-group-1$$" \
+		|| { echo "chart-check FAILED: the book's writer group 1 has no PodDisruptionBudget of its own" >&2; exit 1; }; \
+	echo "$$ha" | awk '/^  name: check-meridian-runtime-bor-group-1$$/{f=1} f&&/^  replicas:/{print; exit}' | grep -q "replicas: 2" \
+		|| { echo "chart-check FAILED: bor.standby does not count per writer group: group 1 runs no standby beside its writer" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | grep -q '\\"writerGroups\\":2' \
+		|| { echo "chart-check FAILED: the resilience values do not carry bor.writerGroups" >&2; exit 1; }; \
+	refused="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set lake.writerGroups=2 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: lake.writerGroups=2 rendered with the write-ahead stream on, before a group's own consumer of it (stage H)" >&2; exit 1; }; \
+	echo "$$refused" | grep -q "lake.writerGroups is 2 with the lake's write-ahead stream on" \
+		|| { echo "chart-check FAILED: lake.writerGroups=2 in ha is refused without naming it: $$refused" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.writerGroups=0 rendered; a store has one writer group at least" >&2; exit 1; }; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and
