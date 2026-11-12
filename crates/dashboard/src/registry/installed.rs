@@ -734,30 +734,37 @@ fn draw_launch_sheet(
             .unwrap_or_default()
     });
     // Its pods (contract v30, W8.3): Shards only where the version declares
-    // more than one, at most its most_shards; a standby pod for any.
-    // A refusal naming shards under the field, or atop Pods where the
-    // version offers none (a launch not sent from this sheet).
+    // more than one, at most its most_shards, beside a standby pod for any,
+    // on one line under the Limits; a refusal naming shards under them, in
+    // place of the hint (it says the bound), or alone where the version
+    // offers no Shards (a launch not sent from this sheet).
     let most = most_shards(version);
     let refused = refused_shards.map_or(String::new(), |words| {
         format!(
-            "<p class=\"refused\" id=\"shards-refused\" role=\"alert\" data-refused=\"shards\">{}</p>",
+            "<p class=\"field-refused\" id=\"shards-refused\" role=\"alert\" data-refused=\"shards\">{}</p>",
             escape(words)
         )
     });
-    let shards = if most > 1 {
-        format!(
-            "<p class=\"hint\">At most {most} shards; empty runs one pod.</p>\
-             <label>Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
-             inputmode=\"numeric\" value=\"{value}\"{invalid}></label>{refused}",
-            value = escape(&entered.shards),
-            invalid = if refused_shards.is_some() {
-                " aria-invalid=\"true\" aria-describedby=\"shards-refused\" autofocus"
+    let (hint, shards) = if most > 1 {
+        (
+            if refused_shards.is_some() {
+                String::new()
             } else {
-                ""
+                format!("<p class=\"hint\">At most {most} shards; empty runs one pod.</p>")
             },
+            format!(
+                "<label>Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
+                 inputmode=\"numeric\" value=\"{value}\"{invalid}></label>",
+                value = escape(&entered.shards),
+                invalid = if refused_shards.is_some() {
+                    " aria-invalid=\"true\" aria-describedby=\"shards-refused\" autofocus"
+                } else {
+                    ""
+                },
+            ),
         )
     } else {
-        refused
+        (String::new(), String::new())
     };
     let page = format!(
         "<section class=\"sheet-dialog\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">Launch {n} {v}</h1>\
@@ -765,16 +772,14 @@ fn draw_launch_sheet(
          <form method=\"post\" action=\"{PLUGINS_PATH}/launch\" class=\"sheet-act\">{token}{hn}{hv}{hr}\
          <label>Instance <input type=\"text\" name=\"instance_id\" required maxlength=\"63\" value=\"{suggested}\"></label>\
          <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\" value=\"{note}\"></label>\
-         <div class=\"grid-2\">\
          <fieldset class=\"checks limits\" data-limits><legend>Limits at its sidecar</legend>\
          <p class=\"hint\">Empty takes the deployment's.</p>\
          <label>Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{in_flight}\"></label>\
          <label>Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{per_second}\"></label>\
          <label>Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{answer_mib}\"></label>\
          </fieldset>\
-         <fieldset class=\"checks limits\" data-pods><legend>Pods</legend>{shards}\
-         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label>\
-         </fieldset></div>\
+         <div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods><div class=\"pods-row\">{shards}\
+         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label></div>{refused}{hint}</div>\
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{back}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">Launch</button></div></form></section>",
         n = escape(name),
