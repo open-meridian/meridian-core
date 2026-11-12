@@ -1744,18 +1744,13 @@ fn history_rows(conn: &mut Connection, instrument_id: &str) -> Result<Vec<postgr
     .map_err(unavailable)
 }
 
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    // With the cause, because this driver's own message for most failures is
-    // the words "db error" and everything useful is one level down.
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
-
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
 /// The instrument store's change log, read a page at a time (step 3a).

@@ -301,6 +301,8 @@ fn run() -> Result<(), String> {
     // during first run, which signs nobody in and may be the very thing
     // making the database.
     let signs_people_in = provider.is_some() || directory.is_some() || accounts_url.is_some();
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("dashboard");
     let database = match var("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL") {
         Some(url) if signs_people_in => Some(wait_for_store(
             "the dashboard's database",

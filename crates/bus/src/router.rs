@@ -200,12 +200,43 @@ pub(crate) async fn admitted(
             Ok(Err(crate::backend::overloaded(&over)))
         }
         Ok(admitted) => {
-            tokio::task::spawn_blocking(move || {
+            let answered = tokio::task::spawn_blocking(move || {
                 admitted
                     .within(|| crate::read_after::within_deadline(deadline, || handler(envelope)))
             })
-            .await
+            .await;
+            Ok(cancelled_for_load(topic, answered?))
         }
+    }
+}
+
+/// What a store's error carries in its words when the database cancelled
+/// its query at the serving session's `statement_timeout` (SQLSTATE 57014;
+/// meridian_changes::serving).
+pub const CANCELLED_QUERY: &str = "[sqlstate 57014]";
+
+/// How long a request whose query was cancelled is told to wait.
+const CANCELLED_RETRY_AFTER_SECONDS: u32 = 5;
+
+/// An answer whose query the database cancelled at its statement_timeout:
+/// this component's own refusal for load, with a retry-after (the
+/// resilience spec's section 10a), never the database's failure.
+pub(crate) fn cancelled_for_load(topic: &str, answered: HandlerReply) -> HandlerReply {
+    match answered {
+        Err(said) if said.contains(CANCELLED_QUERY) => {
+            tracing::info!(
+                topic,
+                "a query past its statement_timeout was cancelled: {said}"
+            );
+            meridian_budget::count_refusal();
+            Err(crate::backend::overloaded(&meridian_budget::Overloaded {
+                retry_after_seconds: CANCELLED_RETRY_AFTER_SECONDS,
+                words: format!(
+                    "overloaded: {topic}'s query ran past its statement_timeout and was cancelled"
+                ),
+            }))
+        }
+        answered => answered,
     }
 }
 
@@ -719,10 +750,16 @@ impl Bus {
         // Its deadline known to it, so a read held to its read_after waits no
         // longer than its caller does (ruled 2026-11-10).
         let deadline = std::time::Instant::now() + timeout;
+        let asked_topic = topic_owned.clone();
         let joined = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                crate::read_after::within_deadline(Some(deadline), || handler(envelope))
+                // A query cancelled at its statement_timeout is this
+                // process's own refusal for load, as on the broker's path.
+                cancelled_for_load(
+                    &asked_topic,
+                    crate::read_after::within_deadline(Some(deadline), || handler(envelope)),
+                )
             }),
         )
         .await;
@@ -881,6 +918,20 @@ mod reads_only_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_query_cancelled_at_its_statement_timeout_is_refused_for_load_by_its_component() {
+        let said = "the lake's store is unavailable: db error: ERROR: canceling statement due to statement timeout [sqlstate 57014]";
+        let refused =
+            super::cancelled_for_load("platform.lake.query.list-prices", Err(said.into()))
+                .unwrap_err();
+        assert_eq!(crate::backend::refusal_retry_after(&refused), Some(5));
+        assert!(refused.contains("statement_timeout"), "{refused}");
+        // Any other failure is answered as it was.
+        let other = super::cancelled_for_load("t", Err("db error [sqlstate 23505]".into()));
+        assert_eq!(other.unwrap_err(), "db error [sqlstate 23505]");
+        assert!(super::cancelled_for_load("t", Ok(("k".into(), vec![1]))).is_ok());
+    }
     use super::*;
     use crate::MemoryBackend;
     use meridian_clock::ManualClock;

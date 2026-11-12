@@ -219,9 +219,12 @@ impl Database {
             config.tcp_user_timeout(give_up);
         }
         // TLS where the deployment's internal TLS is on (ruling 1084).
-        let (config, tls) =
+        let (mut config, tls) =
             meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
                 .map_err(|failed| failed.to_string())?;
+        // Its own login in the serving role's place, and its sessions'
+        // bounds (the resilience spec's section 10a).
+        meridian_changes::serving::applied(&mut config);
         let manager = r2d2_postgres::PostgresConnectionManager::new(config, tls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))

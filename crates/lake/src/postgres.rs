@@ -1223,6 +1223,10 @@ impl Store for PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // The stream's batch is written whatever its size, and waits on its
+        // position's lock: without the serving session's statement_timeout
+        // (the resilience spec's section 10a).
+        meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
         // The position first, under its lock: a batch that does not follow
         // the position the store holds is refused, never recorded past a
         // gap -- after a failover lost the commits since the one it holds,
@@ -2033,6 +2037,9 @@ impl Store for PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // A dataset's rows before a time, however many: without the
+        // serving session's statement_timeout (section 10a).
+        meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
         // The partition held as a batch holds it, so no row key's next
         // version is recorded between finding a key left with none and
         // counting it out of the rows in force (contract v29, ruling 619
@@ -3017,13 +3024,11 @@ fn unreadable(failed: prost::DecodeError) -> StoreError {
     StoreError::Unavailable(format!("a row of the lake did not read: {failed}"))
 }
 
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }

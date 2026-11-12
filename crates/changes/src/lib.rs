@@ -40,6 +40,7 @@ use prost::Message;
 pub mod captured;
 pub mod integrity;
 pub mod records;
+pub mod serving;
 pub mod timeline;
 pub mod tls;
 
@@ -80,6 +81,8 @@ pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
     // TLS where the deployment's internal TLS is on, or the URL asks for
     // it; in the clear, as always, otherwise (ruling 1084).
     tls::database_tls_mode(&mut config, tls::names_ssl_mode(url));
+    // A serving process's own login and its session's bounds (section 10a).
+    serving::applied(&mut config);
     Ok(config)
 }
 

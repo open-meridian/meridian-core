@@ -624,6 +624,18 @@ pub async fn bus_from_env_writing_ahead(instance_id: &str) -> Result<Arc<Bus>, S
     bus_from_env_budgeted(instance_id, on).await
 }
 
+/// This serving component's own database login and its sessions' bounds
+/// (the resilience spec's section 10a): `meridian_<component>` in the
+/// serving role's place, `statement_timeout` 5 s, and `work_mem` from its
+/// working budget (meridian_changes::serving). Called by a serving binary
+/// before it connects, never by its migration or its scrub.
+pub fn serve_database_as(component: &str) {
+    let working = meridian_budget::Settings::from_env()
+        .ok()
+        .and_then(|settings| settings.working_bytes(0).ok().flatten());
+    meridian_changes::serving::serve_as(component, working);
+}
+
 /// This component's budget, installed from the chart's memory settings, less
 /// `held` bytes of hot layer and held answers (section 10a); refused, and the
 /// component stopped, where they leave nothing to answer with -- as the
@@ -1381,6 +1393,79 @@ pub fn required(name: &str) -> Result<String, String> {
 ///
 /// Idempotent, and a no-op when both roles are the same, which is what an
 /// administrator who supplied one connection has.
+/// Each component's own login on the database this chart brings (the
+/// resilience spec's section 10a), made or kept by its superuser, with the
+/// serving role's password -- where the chart gives the brought database's
+/// superuser (`MERIDIAN_FIRST_RUN_BROUGHT_*`, as first run reads them) and
+/// the serving URL is the brought database's. Nothing on a database
+/// somebody else runs: its administrator makes them, as the upgrade's
+/// preflight says.
+pub fn component_logins_on_brought(serving_url: &str) -> Result<(), String> {
+    let (Some(host), Some(superuser), Some(password), Some(serving_password)) = (
+        var("MERIDIAN_FIRST_RUN_BROUGHT_HOST"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD"),
+    ) else {
+        return Ok(());
+    };
+    let serving: postgres::Config = serving_url
+        .parse()
+        .map_err(|failed| format!("the serving database URL is unreadable: {failed}"))?;
+    let brought = serving.get_hosts().iter().any(|named| match named {
+        postgres::config::Host::Tcp(name) => name == &host || host.starts_with(&format!("{name}.")),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    });
+    let (Some(role), Some(database)) = (serving.get_user(), serving.get_dbname()) else {
+        return Ok(());
+    };
+    if !brought {
+        return Ok(());
+    }
+    let named = |name: &str| -> Result<String, String> {
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            Ok(format!("\"{name}\""))
+        } else {
+            Err(format!("{name} is not a name this can grant to"))
+        }
+    };
+    let mut config = serving.clone();
+    config
+        .user(&superuser)
+        .password(password.as_bytes())
+        .connect_timeout(Duration::from_secs(5));
+    let (config, tls) =
+        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(serving_url))
+            .map_err(|failed| format!("the database's TLS: {failed}"))?;
+    let (role, database) = (named(role)?, named(database)?);
+    std::thread::scope(|threads| {
+        threads
+            .spawn(|| {
+                let mut client = config.connect(tls).map_err(|failed| {
+                    format!(
+                        "the brought database could not be reached as its superuser: {}",
+                        meridian_changes::serving::described(&failed)
+                    )
+                })?;
+                meridian_changes::serving::ensure_logins(
+                    &mut client,
+                    &role,
+                    &serving_password,
+                    &database,
+                )
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the components' logins could not be made".into()))
+    })?;
+    tracing::info!("each component's own database login is made or kept on the brought database");
+    Ok(())
+}
+
 pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), String> {
     let serving: postgres::Config = serving_url
         .parse()

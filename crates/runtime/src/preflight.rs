@@ -234,6 +234,32 @@ pub fn judge_memory(
     }
 }
 
+/// Each component's own login (the resilience spec's section 10a): one not
+/// made yet is named with the SQL that makes it. Until it is, that
+/// component connects as the serving role, as before, so this warns and
+/// never blocks: on the database the chart brings this upgrade's migration
+/// makes them; on one somebody else runs, its administrator does.
+pub fn judge_logins(missing: &[String]) -> Finding {
+    if missing.is_empty() {
+        return finding(
+            "database_logins",
+            Verdict::Ready,
+            "each component connects as its own login",
+        );
+    }
+    finding(
+        "database_logins",
+        Verdict::Warning,
+        format!(
+            "{} not made yet: those components connect as the serving role until they are. \
+             On the database this chart brings, this upgrade's migration makes them; on one \
+             somebody else runs, its administrator makes them: {}",
+            missing.join(", "),
+            meridian_changes::serving::logins_sql(missing)
+        ),
+    )
+}
+
 /// The connections in use against those allowed.
 pub fn judge_connections(in_use: u64, max: u64) -> Finding {
     let why = format!(
@@ -780,6 +806,12 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
         };
         if !seen_urls.contains(&url.as_str()) {
             seen_urls.push(url);
+            findings.push(
+                match meridian_changes::serving::missing_logins(&mut client) {
+                    Ok(missing) => judge_logins(&missing),
+                    Err(failed) => finding("database_logins", Verdict::NotChecked, failed),
+                },
+            );
             match client.query_one("SELECT pg_database_size(current_database())", &[]) {
                 Ok(row) => findings.push(judge_disk(
                     row.get::<_, i64>(0).max(0) as u64,

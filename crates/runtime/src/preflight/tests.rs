@@ -343,3 +343,18 @@ fn a_database_that_does_not_answer_blocks_and_says_why() {
     );
     assert_eq!(overall(&findings), Verdict::Blocked);
 }
+
+#[test]
+fn a_component_login_not_made_is_named_with_the_sql_that_makes_it_and_warns() {
+    let all = judge_logins(&[]);
+    assert_eq!(all.verdict, Verdict::Ready);
+    let missing = judge_logins(&["meridian_lake".into(), "meridian_bor".into()]);
+    assert_eq!(missing.verdict, Verdict::Warning);
+    assert!(
+        missing.why.contains("meridian_lake, meridian_bor")
+            && missing.why.contains("CREATE ROLE meridian_bor LOGIN")
+            && missing.why.contains("IN ROLE meridian_app"),
+        "{}",
+        missing.why
+    );
+}

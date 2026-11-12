@@ -255,8 +255,12 @@ impl PostgresStore {
     /// latest entry, each in its own transaction under its partition's lock.
     /// Says how many were kept.
     pub fn backfill_snapshots(&self, only: Option<&str>) -> Result<usize> {
-        let due: Vec<(String, String)> = self
-            .conn()?
+        // Every account's, at start: without the serving session's
+        // statement_timeout (section 10a).
+        let mut conn = self.conn()?;
+        let mut looking = conn.transaction().map_err(unavailable)?;
+        meridian_changes::serving::unbounded(&mut looking).map_err(unavailable)?;
+        let due: Vec<(String, String)> = looking
             .query(
                 "SELECT a.account_id, a.partition FROM book_account a
                    LEFT JOIN LATERAL (
@@ -281,10 +285,13 @@ impl PostgresStore {
             .into_iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
+        looking.commit().map_err(unavailable)?;
+        drop(conn);
         let mut kept = 0;
         for (account, partition) in due {
             let mut conn = self.conn()?;
             let mut tx = conn.transaction().map_err(unavailable)?;
+            meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
             tx.execute(
                 "SELECT pg_advisory_xact_lock($1)",
                 &[&partition_lock(&partition)],
@@ -2042,6 +2049,9 @@ impl Store for PostgresStore {
         }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // The whole book, however large: without the serving session's
+        // statement_timeout (section 10a).
+        meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
         // Every partition's writer held off for the length of it.
         let partitions: Vec<String> = tx
             .query(
@@ -2629,18 +2639,13 @@ fn unreadable(failed: prost::DecodeError) -> StoreError {
     StoreError::Unavailable(format!("a record of the book did not read: {failed}"))
 }
 
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    // With the cause: this driver's own message for most failures is "db
-    // error", and everything useful is one level down. A refusal the trigger
-    // raised is said as it is.
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
 /// Raise every partition's epoch in `tx`, and record who raised it and why

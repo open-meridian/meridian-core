@@ -138,6 +138,8 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("bor");
     let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
         "the book's database",
         &url,

@@ -117,6 +117,8 @@ fn run() -> Result<(), String> {
 
     // Waited for rather than refused: in an upgrade this starts beside the Job
     // that migrates for it.
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("instrument");
     let postgres = Arc::new(wait_for_store(
         "the instrument store's database",
         &url,

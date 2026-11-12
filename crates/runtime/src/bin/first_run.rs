@@ -358,6 +358,18 @@ fn connect_and_provision(
             .map_err(|failed| format!("{name} could not be let into {database}: {failed}"))?;
     }
 
+    // Each component's own login, a member of the serving role with its
+    // password, and the serving session's statement_timeout on it (the
+    // resilience spec's section 10a).
+    if let Some(serving) = plan.roles.iter().find(|role| !role.may_create) {
+        meridian_changes::serving::ensure_logins(
+            &mut server,
+            &identifier(&serving.name)?,
+            &serving.password,
+            &database,
+        )?;
+    }
+
     // The schema's grants are made from inside the database, by the only role
     // entitled to make them. Postgres warns rather than refuses when somebody
     // else tries, which is why this connects again rather than hoping.

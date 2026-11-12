@@ -519,7 +519,7 @@ test-store: network tests-image
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: serving:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
@@ -2723,6 +2723,20 @@ chart-check:
 		want='\\"standby\\":0'; [ -n "$$profile" ] && want='\\"standby\\":1'; \
 		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
 			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
+	done
+	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
+	@# profiles the migration's conductor alone is given the brought
+	@# database's superuser, to make each component's own login there, and
+	@# only where the chart brings one.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		all="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile 2>/dev/null)"; \
+		job="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/migrate-job.yaml 2>/dev/null)"; \
+		none="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --set database.brought.enabled=false 2>/dev/null)"; \
+		[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD$$')" = 2 ] \
+			&& [ "$$(echo "$$job" | grep -c 'name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD$$')" = 1 ] \
+			&& [ "$$(echo "$$none" | grep -c 'MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD$$')" = 0 ] \
+			|| { echo "chart-check FAILED: the brought database's superuser reaches something besides first run and the migration's conductor, or not them ($${profile:-tolerant})" >&2; exit 1; }; \
 	done
 	@# Stage M (the resilience spec's section 10a): every component and every
 	@# sidecar is told its container's limit, memory.budgetPercent and

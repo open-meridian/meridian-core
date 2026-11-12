@@ -120,6 +120,8 @@ fn run() -> Result<(), String> {
     } else {
         0
     };
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("lake");
     let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
         "the lake's database",
         &url,

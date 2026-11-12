@@ -37,7 +37,7 @@ pub use backend::{
 };
 pub use memory::MemoryBackend;
 pub use nats::{NatsBackend, INTERNAL_TLS_CA};
-pub use router::caller_of;
+pub use router::{caller_of, CANCELLED_QUERY};
 pub use router::{
     calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, Stamp,
     TimedCall,

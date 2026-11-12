@@ -190,6 +190,8 @@ fn run() -> Result<(), String> {
     // The configuration store's change log, where it is in a database: its
     // URL and its store, for the log served and its tail (step 3a).
     let mut logged: Option<(String, Arc<PostgresStore>)> = None;
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("conductor");
     let store: Arc<dyn meridian_config::Store> = match var("MERIDIAN_CONFIG_DATABASE_URL") {
         Some(url) => {
             // Verified, never applied, for the reason every store gives; and
@@ -822,7 +824,13 @@ fn install_named_administrator(store: &dyn meridian_config::Store) {
 /// does nothing.
 fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
     match var("MERIDIAN_SERVING_DATABASE_URL") {
-        Some(serving) => meridian_runtime::grant_serving(migrating_url, &serving),
+        Some(serving) => {
+            meridian_runtime::grant_serving(migrating_url, &serving)?;
+            // On the database this chart brings, each component's own login
+            // made or kept by its superuser (section 10a): a deployment
+            // installed before them gains them at its next upgrade.
+            meridian_runtime::component_logins_on_brought(&serving)
+        }
         None => Ok(()),
     }
 }

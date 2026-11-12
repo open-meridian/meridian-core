@@ -101,6 +101,28 @@ spec:
                   name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.conductor.database.key | default .Values.database.key }}
                   optional: true
+            {{- if .Values.database.brought.enabled }}
+            # The database this chart brings, as first run reads it: where
+            # the serving URL is its, each component's own login is made or
+            # kept by its superuser, with the serving role's password (the
+            # resilience spec's section 10a), so a deployment installed
+            # before them gains them here. Nothing on a database somebody
+            # else runs.
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_HOST
+              value: {{ printf "%s-database.%s.svc.cluster.local" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER
+              value: postgres
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: superuser
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-database-passwords" (include "meridian-runtime.fullname" .) | quote }}
+                  key: serving
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with (include "meridian-runtime.broughtDatabaseEnv" $) }}{{ . | nindent 12 }}{{- end }}

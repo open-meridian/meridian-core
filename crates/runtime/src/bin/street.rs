@@ -101,6 +101,8 @@ fn run() -> Result<(), String> {
     // customer's database because somebody restarted a pod. So a schema the
     // migration Job has not reached yet is waited for, not applied, and one a
     // newer release made is refused.
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("street");
     let postgres = Arc::new(wait_for_store(
         "the street store's database",
         &url,
