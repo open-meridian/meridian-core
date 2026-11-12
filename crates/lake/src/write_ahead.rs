@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::jetstream::{self, consumer, stream};
-use meridian_bus::write_ahead::{AFTER_HEADER, REPLY_HEADER, STREAM, SUBJECTS, TOPIC_HEADER};
+use meridian_bus::write_ahead::{
+    stream_subjects, AFTER_HEADER, REPLY_HEADER, STREAM, TOPIC_HEADER,
+};
 use meridian_bus::{Envelope, HandlerReply};
 use prost::Message as _;
 
@@ -223,7 +225,7 @@ impl Writer {
 
 /// The stream, as the lake's writer makes it where no writer has yet: on
 /// file at its replicas -- three, the broker's servers, in `ha` -- every
-/// subject of [`SUBJECTS`], kept by its bounds and never past them.
+/// subject of [`stream_subjects`], kept by its bounds and never past them.
 ///
 /// Full, it refuses a new write (`discard: new`), and its plugin is refused
 /// for load with a retry-after (approved 2026-11-10, the research batch's
@@ -235,7 +237,7 @@ impl Writer {
 pub fn stream_config(bounds: &Bounds) -> stream::Config {
     stream::Config {
         name: STREAM.to_string(),
-        subjects: vec![format!("{SUBJECTS}.>")],
+        subjects: vec![stream_subjects()],
         retention: stream::RetentionPolicy::Limits,
         storage: stream::StorageType::File,
         num_replicas: bounds.replicas,
@@ -569,7 +571,10 @@ mod tests {
         assert_eq!(config.storage, stream::StorageType::File);
         assert_eq!((config.num_replicas, config.max_bytes), (3, MAX_BYTES));
         assert_eq!(config.max_age, MAX_AGE);
-        assert_eq!(config.subjects, vec![format!("{SUBJECTS}.>")]);
+        assert_eq!(
+            config.subjects,
+            vec!["platform.lake.internal.write-ahead.>".to_string()]
+        );
     }
 
     #[test]

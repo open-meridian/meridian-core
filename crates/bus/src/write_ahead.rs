@@ -43,10 +43,24 @@ use crate::backend::{Answer, Backend, BusError, Handler, Subscription};
 /// The stream's name.
 pub const STREAM: &str = "LAKE_WRITE_AHEAD";
 
-/// Where a dataset's writes go: this, its instance and its key,
-/// `platform.lake.internal.write-ahead.{instance}.{key}`, one subject a
+/// Where a dataset's writes go: its instance and its key, one subject a
 /// dataset; a plugin's credential publishes on its own instance's alone.
-pub const SUBJECTS: &str = "platform.lake.internal.write-ahead";
+/// Spelled as the topic registry names it.
+pub fn subject(instance: &str, key: &str) -> String {
+    format!("platform.lake.internal.write-ahead.{instance}.{key}")
+}
+
+/// Every subject of one instance's datasets: what its plugin's credential
+/// publishes on, and reads its last writes back from.
+pub fn instance_subjects(instance: &str) -> String {
+    subject(instance, "*")
+}
+
+/// The stream's subject filter: every dataset's subject, NATS's `>` in
+/// place of the instance and the key.
+pub fn stream_subjects() -> String {
+    subject("*", "*").replace(".*.*", ".>")
+}
 
 /// The lake topic a write was asked on, beside it in the stream.
 pub const TOPIC_HEADER: &str = "Meridian-Topic";
@@ -119,7 +133,7 @@ pub fn subject_of(dataset: &str) -> Option<String> {
                 .bytes()
                 .all(|b| b.is_ascii_graphic() && !matches!(b, b'.' | b'*' | b'>' | b':'))
     };
-    (segment(instance) && segment(key)).then(|| format!("{SUBJECTS}.{instance}.{key}"))
+    (segment(instance) && segment(key)).then(|| subject(instance, key))
 }
 
 /// Every record request holds its rows as its first field, and every row
@@ -219,7 +233,7 @@ impl WriteAhead {
             .subscribe(format!("{prefix}.*"))
             .await
             .map_err(|failed| BusError::HandlerFailed {
-                topic: SUBJECTS.to_string(),
+                topic: stream_subjects(),
                 detail: format!("the write-ahead stream's answers could not be heard: {failed}"),
             })?;
         let replies = Arc::new(Replies {
@@ -532,6 +546,21 @@ mod tests {
             payload: Vec::new(),
         };
         assert_eq!(dataset_of(&empty), None);
+    }
+
+    #[test]
+    fn the_stream_s_filter_and_a_dataset_s_subjects_are_the_bytes_on_the_wire() {
+        // Spelled as the topic registry names them, the subjects on the wire,
+        // the stream's filter and a credential's own are unchanged.
+        assert_eq!(stream_subjects(), "platform.lake.internal.write-ahead.>");
+        assert_eq!(
+            subject("truefx", "live"),
+            "platform.lake.internal.write-ahead.truefx.live"
+        );
+        assert_eq!(
+            instance_subjects("truefx"),
+            "platform.lake.internal.write-ahead.truefx.*"
+        );
     }
 
     #[test]
