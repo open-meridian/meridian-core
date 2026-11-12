@@ -667,8 +667,8 @@ pub(super) async fn launch_sheet(
          <form method=\"post\" action=\"{PLUGINS_PATH}/launch\" class=\"sheet-act\">{token}{hn}{hv}{hr}\
          <label>Instance <input type=\"text\" name=\"instance_id\" required maxlength=\"63\" value=\"{suggested}\"></label>\
          <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\"></label>\
-         <fieldset class=\"checks limits\" data-limits><legend>Limits</legend>\
-         <p class=\"hint\">Its share at its sidecar. Empty takes the deployment's.</p>\
+         <fieldset class=\"checks limits\" data-limits><legend>Limits at its sidecar</legend>\
+         <p class=\"hint\">Empty takes the deployment's.</p>\
          <label>Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
          <label>Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
          <label>Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\"></label>\
