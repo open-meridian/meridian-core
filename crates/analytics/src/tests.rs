@@ -378,6 +378,16 @@ fn coordinator(stores: &Stores, config: Config, pooled: bool) -> Arc<Coordinator
 
 /// A coordinator whose clock reads `now_ns`.
 fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) -> Arc<Coordinator> {
+    coordinator_on(stores, config, pooled, Arc::new(ManualClock::at(now_ns)))
+}
+
+/// A coordinator on the clock given.
+fn coordinator_on(
+    stores: &Stores,
+    config: Config,
+    pooled: bool,
+    clock: Arc<dyn meridian_clock::Clock>,
+) -> Arc<Coordinator> {
     let handle = tokio::runtime::Handle::current();
     let executor = if pooled {
         worker::serve(&stores.bus, Arc::new(Cache::new(64)));
@@ -388,7 +398,7 @@ fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) ->
     let coordinator = Coordinator::new(
         Arc::clone(&stores.bus),
         handle,
-        Arc::new(ManualClock::at(now_ns)),
+        clock,
         Config {
             engine_version: "0.1.0".into(),
             ..config
@@ -2733,7 +2743,10 @@ async fn run_and_read(stores: &Stores, request: RunJobRequest) -> Result<JobAnsw
 /// coordinator keeping 4 MiB: what the coordinator holds after them grows
 /// by at most [`KEPT_HEAP_MOST_MIB`], however many ran; the latest answer
 /// is still read whole, an early one has left the cache and says so, and
-/// an answer kept longer than its time has left too.
+/// an answer kept longer than its time has left too. Its clock is held
+/// still, so each job's inline window -- the coordinator's clock's -- stays
+/// open until it answers, however loaded the machine (it missed the 2 s
+/// window under load on 2026-11-11; the window is unchanged).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_answers_kept_are_bounded_by_bytes_and_age_not_count_alone() {
     let (stores, _) = wide_stores(1_500, Duration::ZERO);
@@ -2818,7 +2831,7 @@ const KEPT_HEAP_MOST_MIB: f64 = 8.0;
 /// prices are read: the heap's peak stays within [`BURST_JOBS_MOST`] times
 /// what one job alone takes, at most two are reading at once, and every
 /// job answers what one alone does. Then, with no room to wait, a burst past the bound is refused
-/// with FAILED_PRECONDITION, and the jobs taken still answer.
+/// overloaded with a retry-after, and the jobs taken still answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
     let (stores, most) = wide_stores(1_500, Duration::from_millis(300));
@@ -2831,9 +2844,12 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         let (_, peak) = counted::take();
         (answer, peak - before)
     };
+    // Every job answered later: the inline window is the coordinator's
+    // clock's, held still here, so a window of 0 closes at once.
     let config = Config {
         jobs_at_once: 2,
         jobs_waiting: 64,
+        inline: Duration::ZERO,
         ..Config::default()
     };
     coordinator(&stores, config, false);
@@ -2880,6 +2896,7 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
             Config {
                 jobs_at_once: 2,
                 jobs_waiting: 0,
+                inline: Duration::ZERO,
                 ..Config::default()
             },
             false,
@@ -2907,11 +2924,20 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         match reply.await.unwrap() {
             Ok(_) => taken += 1,
             Err(said) => {
-                assert!(
-                    said.contains("[refusal-status failed-precondition")
-                        && said.contains("run the job again"),
+                // Overloaded with a retry-after (the resilience spec's
+                // section 10a), never FAILED_PRECONDITION.
+                let refusal = &said[said.find("[refusal-reason").unwrap_or(0)..];
+                assert_eq!(
+                    meridian_bus::read_refusal(refusal).map(|(reason, _)| reason),
+                    Some(meridian_pb::v1::RefusalReason::Overloaded as i32),
                     "{said}"
                 );
+                assert!(
+                    meridian_bus::refusal_retry_after(refusal).is_some_and(|after| after >= 1),
+                    "{said}"
+                );
+                assert!(!said.contains("failed-precondition"), "{said}");
+                assert!(said.contains("run the job again"), "{said}");
                 refused += 1;
             }
         }
@@ -2920,9 +2946,17 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         taken >= 2 && refused >= 1,
         "taken {taken}, refused {refused}"
     );
-    // The coordinator carries on: a job after the burst answers.
-    let after = run_and_read(&full, wide_job()).await.unwrap();
-    assert_eq!(after.figures.len(), alone.figures.len());
+    // The coordinator carries on: a job asked again once the two taken
+    // have finished -- its retry-after waited out -- answers.
+    let mut after = run_and_read(&full, wide_job()).await;
+    for _ in 0..100 {
+        if after.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = run_and_read(&full, wide_job()).await;
+    }
+    assert_eq!(after.unwrap().figures.len(), alone.figures.len());
 }
 
 /// What sixteen jobs at once may add to the heap at their peak, in jobs
@@ -2984,7 +3018,9 @@ async fn one_client_flooding_jobs_waits_behind_itself_and_another_runs_in_its_tu
         Config {
             jobs_at_once: 1,
             jobs_waiting: 8,
-            inline: Duration::from_millis(1),
+            // The coordinator's clock is held still: a window of 0 closes
+            // at once, so each job asked after the first waits its turn.
+            inline: Duration::ZERO,
             ..Config::default()
         },
         false,

@@ -417,16 +417,18 @@ impl Coordinator {
             let mut slots = self.slots.lock().expect("not poisoned");
             let at_once = self.config.jobs_at_once.max(1);
             let full = slots.running >= at_once;
+            // Its whole queue full: overloaded, with a retry-after, as every
+            // refusal for load is (the resilience spec's section 10a).
             if full && slots.waiting >= self.config.jobs_waiting {
-                return Err(refusal_with_status(
-                    RefusalStatus::FailedPrecondition,
-                    &[],
-                    format!(
-                        "the analytics component is running {} jobs with {} waiting, the most \
-                         it holds at once: run the job again shortly",
+                return Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: (self.config.inline.as_secs() as u32).max(1),
+                    words: format!(
+                        "overloaded: the analytics component is running {} jobs with {} \
+                         waiting, the most it holds at once: run the job again after the \
+                         retry-after",
                         slots.running, slots.waiting
                     ),
-                ));
+                }));
             }
             let share = self.client_share();
             let mine = slots.waiting_for(&client);
@@ -468,7 +470,7 @@ impl Coordinator {
                 me.finished(&id, &finishing_client, answered);
             }
         });
-        match heard.recv_timeout(self.config.inline) {
+        match self.within_window(&heard) {
             Ok(Ok(answer)) if crate::pages::whole_fits(&answer, self.config.page_budget) => {
                 self.keep(&job_id, &client, Ok(answer.clone()));
                 Ok(RunJobReply {
@@ -494,6 +496,31 @@ impl Coordinator {
                 job_id,
                 answer: None,
             }),
+        }
+    }
+
+    /// What the job's thread answers within the request's window, measured
+    /// on the coordinator's clock -- the one clock its kept answers age by
+    /// -- so the window is the clock's, never the machine's load: a test's
+    /// clock held still holds it open until the job answers, and the
+    /// deployment's wall clock closes it as before.
+    fn within_window<T>(&self, heard: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
+        /// How often the clock is read again while the job runs.
+        const LOOK: Duration = Duration::from_millis(20);
+        let window = i64::try_from(self.config.inline.as_nanos()).unwrap_or(i64::MAX);
+        let until = self.clock.now_ns().saturating_add(window);
+        loop {
+            let left = until.saturating_sub(self.clock.now_ns());
+            if left <= 0 {
+                return heard.try_recv().map_err(|empty| match empty {
+                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+                });
+            }
+            match heard.recv_timeout(Duration::from_nanos(left as u64).min(LOOK)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                answered => return answered,
+            }
         }
     }
 
