@@ -18,8 +18,8 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    checked, claim, manifest, reusable, template_for, with_archive, Shapes, StorageShapes,
-    CREATE_PLUGIN, REMOVE_PLUGIN,
+    checked, claim, manifest, reusable, template_for, with_archive, with_limits, Shapes,
+    StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -88,6 +88,8 @@ impl Launcher {
             &request,
             &edge,
         )?;
+        // Its own share at its sidecar, over the chart's (contract v30).
+        let made = with_limits(made, &request)?;
         if let Some(template) = chosen.claim {
             self.storage(template, &request)?;
         }
@@ -267,7 +269,7 @@ fn run() -> Result<(), String> {
             let holding = member.wait_to_write(&bus).await?;
             // The launcher keeps no store, so no epoch: its lease alone says
             // which member launches, and a member that loses it stops.
-            holding.keep(0, || Ok(0));
+            holding.keep(|| 0, || Ok(0));
             // Not, or no longer, a development deployment: nothing it made live
             // stays (spec/live-plugin-development, ruling 2). The launcher
             // restarts when the chart changes, so this is the next moment

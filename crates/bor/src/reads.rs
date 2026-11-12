@@ -138,10 +138,21 @@ pub fn positions_as_of(store: &dyn Store, read: &PositionsRead) -> Result<Page<B
     } else {
         Some(from_position_cursor(&read.cursor)?)
     };
+    // An account at a time, in the key's order -- its first part is the
+    // account -- from the cursor's on, until the page and one more are held
+    // (stage M; the store memory audit of 2026-11-09, item 7): one book
+    // replayed at a time and a page's records kept, never every account's.
     let mut records = Vec::new();
-    for account in replayed_accounts(store, &read.scope, &read.account_id)? {
+    for account in accounts_from(
+        replayed_accounts(store, &read.scope, &read.account_id)?,
+        after.as_ref().map(|after| after.0.as_str()),
+    ) {
+        if records.len() > read.limit {
+            break;
+        }
         // From the latest snapshot holding nothing later (contract v25).
         let book = store.book_as_of(&account, &as_of, until)?;
+        let mut held = Vec::new();
         for position in book.positions.values() {
             if position.removed {
                 continue;
@@ -153,10 +164,11 @@ pub fn positions_as_of(store: &dyn Store, read: &PositionsRead) -> Result<Page<B
             {
                 continue;
             }
-            records.push(record);
+            held.push(record);
         }
+        held.sort_by_key(position_key);
+        records.extend(held);
     }
-    records.sort_by_key(position_key);
     records.truncate(read.limit + 1);
     Ok(paged(records, read.limit, position_cursor, as_of))
 }
@@ -165,20 +177,35 @@ pub fn positions_as_of(store: &dyn Store, read: &PositionsRead) -> Result<Page<B
 pub fn figures_as_of(store: &dyn Store, read: &FiguresRead) -> Result<Page<AccountFigures>> {
     let heads = store.heads()?;
     let as_of = read.at.clone().unwrap_or_else(|| heads.clone());
-    let mut records = Vec::new();
-    for account in replayed_accounts(store, &read.scope, &read.account_id)? {
-        let book = store.book_as_of(&account, &as_of, None)?;
-        records.extend(book.figures.into_values());
-    }
-    let mut records: Vec<AccountFigures> = records
-        .into_iter()
-        .filter(|record| figures_match(record, read))
-        .collect();
-    records.sort_by_key(figures_key);
-    if !read.cursor.is_empty() {
+    let after = if read.cursor.is_empty() {
+        None
+    } else {
         let held = parts(&read.cursor, 3)?;
-        let after = (held[0].clone(), held[1].clone(), held[2].clone());
-        records.retain(|record| figures_key(record) > after);
+        Some((held[0].clone(), held[1].clone(), held[2].clone()))
+    };
+    // An account at a time, in the key's order, until the page and one more
+    // are held (stage M; audit item 7), as the positions are.
+    let mut records: Vec<AccountFigures> = Vec::new();
+    for account in accounts_from(
+        replayed_accounts(store, &read.scope, &read.account_id)?,
+        after.as_ref().map(|after| after.0.as_str()),
+    ) {
+        if records.len() > read.limit {
+            break;
+        }
+        let book = store.book_as_of(&account, &as_of, None)?;
+        let mut held: Vec<AccountFigures> = book
+            .figures
+            .into_values()
+            .filter(|record| figures_match(record, read))
+            .filter(|record| {
+                after
+                    .as_ref()
+                    .is_none_or(|after| figures_key(record) > *after)
+            })
+            .collect();
+        held.sort_by_key(figures_key);
+        records.extend(held);
     }
     records.truncate(read.limit + 1);
     Ok(paged(records, read.limit, figures_cursor, as_of))
@@ -190,6 +217,15 @@ pub fn figures_match(record: &AccountFigures, read: &FiguresRead) -> bool {
     (wanted.is_empty() || agreement_key(record.agreement.as_ref()) == wanted)
         && (read.from_date.is_empty() || record.business_date >= read.from_date)
         && (read.to_date.is_empty() || record.business_date <= read.to_date)
+}
+
+/// The accounts in order, from `from` on (inclusive): a page's walk.
+fn accounts_from(mut accounts: Vec<String>, from: Option<&str>) -> Vec<String> {
+    accounts.sort();
+    if let Some(from) = from {
+        accounts.retain(|account| account.as_str() >= from);
+    }
+    accounts
 }
 
 fn replayed_accounts(

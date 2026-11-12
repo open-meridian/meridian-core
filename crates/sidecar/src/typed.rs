@@ -205,6 +205,9 @@ const UNPLACED_KIND: &str = "unplaced-fact-recorded";
 /// The orders read (W11.17, contract v22): a connectivity plugin's answers
 /// only the orders behind placements naming its instance.
 const LIST_ORDERS: &str = "meridian.v1.ListOrdersRequest";
+/// Contract v30 (W12.4): a job run, which the sidecar remembers its plugin
+/// registered where it asked one standing.
+const RUN_JOB: &str = "meridian.v1.RunJobRequest";
 
 /// The role whose venue facts take their account from the venue account map
 /// (contract v22, W11.22).
@@ -271,6 +274,8 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         account_scope: None,
         // The analytics component's alone (W12.2); a sidecar never sets it.
         on_behalf_of_instance_id: String::new(),
+        // Named by the bus's session as the read is asked (contract v30).
+        read_after: None,
     }
 }
 
@@ -579,6 +584,9 @@ impl Sidecar {
         // requirement 15): given longer than that, every other call the
         // bus's default.
         let within = (topic == RESOLVE_IDENTIFIER).then_some(RESOLVE_WITHIN);
+        let standing = payload_type == RUN_JOB
+            && domain::RunJobRequest::decode(&message.encode_to_vec()[..])
+                .is_ok_and(|asked| asked.job.is_some_and(|job| job.standing));
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -591,6 +599,13 @@ impl Sidecar {
             )
             .await
             .map_err(refused)?;
+        // Contract v30 (W12.4): a standing job this plugin registered, which
+        // a subscription may name (SubscribeRequest.job_ids).
+        if standing {
+            if let Ok(reply) = domain::RunJobReply::decode(&payload[..]) {
+                self.subscriptions.registered(&reply.job_id);
+            }
+        }
         // A connectivity plugin reads the orders behind the placements naming
         // its instance, and the records of those alone (W11.17, as a
         // placement is heard at the instance it names, matrix/directed.tsv).
@@ -1499,6 +1514,29 @@ pub(crate) fn refused_naming(
     reason: RefusalReason,
     fields: Vec<String>,
 ) -> Status {
+    refused_with(code, words, reason, fields, 0)
+}
+
+/// A refusal for load (contract v30; W4.4): RESOURCE_EXHAUSTED, its reason
+/// -- REFUSAL_REASON_OVERLOADED or REFUSAL_REASON_RATE_LIMITED -- and how
+/// long to wait before asking again, at least a second.
+pub fn refused_for_load(reason: RefusalReason, retry_after_seconds: u32, words: String) -> Status {
+    refused_with(
+        Code::ResourceExhausted,
+        words,
+        reason,
+        Vec::new(),
+        retry_after_seconds.max(1),
+    )
+}
+
+fn refused_with(
+    code: Code,
+    words: String,
+    reason: RefusalReason,
+    fields: Vec<String>,
+    retry_after_seconds: u32,
+) -> Status {
     let mut metadata = MetadataMap::new();
     metadata.insert_bin(
         REFUSAL_METADATA,
@@ -1506,6 +1544,7 @@ pub(crate) fn refused_naming(
             &Refusal {
                 reason: reason as i32,
                 fields,
+                retry_after_seconds,
             }
             .encode_to_vec(),
         ),
@@ -1534,6 +1573,9 @@ pub(crate) fn refused(failed: BusError) -> Status {
                     meridian_bus::RefusalStatus::PermissionDenied => Code::PermissionDenied,
                     meridian_bus::RefusalStatus::NotFound => Code::NotFound,
                     meridian_bus::RefusalStatus::FailedPrecondition => Code::FailedPrecondition,
+                    // Contract v30 (W4.4, ruled 2026-11-10): a read whose
+                    // read_after its store cannot reach, to be asked again.
+                    meridian_bus::RefusalStatus::Unavailable => Code::Unavailable,
                 },
                 words.to_string(),
                 RefusalReason::Unspecified,
@@ -1543,6 +1585,15 @@ pub(crate) fn refused(failed: BusError) -> Status {
         BusError::HandlerFailed { detail, .. } => match meridian_bus::read_refusal(&detail)
             .and_then(|(reason, words)| Some((RefusalReason::try_from(reason).ok()?, words)))
         {
+            // A component's budget full (contract v30; W4.4): refused for
+            // load, with its retry-after, nothing recorded.
+            Some((reason @ (RefusalReason::Overloaded | RefusalReason::RateLimited), words)) => {
+                refused_for_load(
+                    reason,
+                    meridian_bus::refusal_retry_after(&detail).unwrap_or(1),
+                    words.to_string(),
+                )
+            }
             // A store that could not check the command, nothing recorded:
             // to be tried again, so the status a caller retries (contract
             // v10). Every other refusal of a component's is `aborted`.

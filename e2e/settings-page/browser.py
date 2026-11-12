@@ -1265,8 +1265,9 @@ def the_documentation_pages(browser, prefix):
 def the_registry_pages(browser, prefix):
     """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
     Browse and Registries tabs, a listing's Overview, Documentation and
-    Versions, a plugin's Versions (ruling 305), and the install, update and
-    keep-or-stop sheets -- the install and update sheets the form at once,
+    Versions, a plugin's Versions (ruling 305), and the install, update,
+    keep-or-stop and launch sheets (the launch sheet's Limits, contract v30)
+    -- the install and update sheets the form at once,
     with one line linking the Terms (ruling 274) -- each on one screen at the
     three sizes, in light and dark, with no sideways scroll."""
     plugins = f"{BASE}/admin/plugins/versions?tab="
@@ -1285,6 +1286,9 @@ def the_registry_pages(browser, prefix):
         ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
         ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
         ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
+        # Contract v30 (W8.3; ruled 2026-11-11): the Launch sheet's Limits,
+        # the instance's own share at its sidecar.
+        ("launch-sheet", f"{BASE}/admin/plugins/versions/snaptrade/launch?version=0.13.0", "Limits"),
     ]
     for scheme in ("light", "dark"):
         for size, width, height in V24_SIZES:
@@ -1299,7 +1303,40 @@ def the_registry_pages(browser, prefix):
                 check(says in text, f"{name} at {size}, {scheme} says {says!r}")
                 check("not an endorsement" not in text and "nsupervised" not in text,
                       f"{name} at {size}, {scheme} carries no notice (ruling 274)")
-                if name.endswith("-sheet") and name != "keep-or-stop-sheet":
+                if name == "launch-sheet":
+                    limits = page.locator("[data-limits] input[type=number]")
+                    check(limits.count() == 3 and all(limits.nth(i).is_visible() for i in range(3)),
+                          f"launch-sheet at {size}, {scheme} offers its three limits")
+                    # Each shown whole: the fieldset scrolls nothing away
+                    # (the checks list's 14rem cap clipped the third).
+                    clipped = page.evaluate("""() => { const f = document.querySelector('[data-limits]');
+                        return f.scrollHeight - f.clientHeight; }""")
+                    check(clipped <= 1, f"launch-sheet at {size}, {scheme} shows its limits whole: {clipped}px hidden")
+                    # Cancel and Launch apart, as a dialog's foot spaces its
+                    # buttons (they touched: step 3c's fold-in).
+                    apart = page.evaluate("""() => { const f = document.querySelector('.sheet-foot');
+                        const [a, b] = [...f.children].map(c => c.getBoundingClientRect());
+                        return b.top < a.bottom ? b.left - a.right : b.top - a.bottom; }""")
+                    check(apart >= 6, f"launch-sheet at {size}, {scheme} keeps Cancel and Launch apart: {apart}px")
+                    # Contract v30 (W8.3): its Pods beside the Limits -- Shards,
+                    # at most 0.13.0's four, and a standby pod -- shown whole.
+                    shards = page.locator("[data-pods] input[name=shards]")
+                    standby = page.locator("[data-pods] input[name=standby][type=checkbox]")
+                    check(shards.count() == 1 and shards.is_visible() and shards.get_attribute("max") == "4"
+                          and standby.count() == 1 and standby.is_visible(),
+                          f"launch-sheet at {size}, {scheme} offers Shards, at most 4, and a standby pod")
+                    clipped = page.evaluate("""() => { const f = document.querySelector('[data-pods]');
+                        return f.scrollHeight - f.clientHeight; }""")
+                    check(clipped <= 1, f"launch-sheet at {size}, {scheme} shows its pods whole: {clipped}px hidden")
+                    # Past four the browser holds it at the field, unsent.
+                    shards.fill("9")
+                    check(page.evaluate("() => document.querySelector('[data-pods] input[name=shards]').validity.rangeOverflow"),
+                          f"launch-sheet at {size}, {scheme} holds 9 shards at the field")
+                    shards.fill("")
+                    # Kept for a person's look (M2's follow-up): CI keeps
+                    # them as the run's launch-sheet artifact.
+                    page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-{size}-{scheme}.png"))
+                if name.endswith("-sheet") and name not in ("keep-or-stop-sheet", "launch-sheet"):
                     line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
                     check(line.count() == 1 and line.is_visible(),
                           f"{name} at {size}, {scheme} keeps the one line linking the Terms")
@@ -1337,6 +1374,27 @@ def the_registry_pages(browser, prefix):
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            # Contract v30 (W8.3): shards past most_shards sent all the same
+            # (the field's bound lifted) come back refused by the conductor,
+            # naming shards, at the field, the sheet as it was filled, and on
+            # one screen still.
+            page.goto(f"{BASE}/admin/plugins/versions/snaptrade/launch?version=0.13.0")
+            settled(page)
+            page.evaluate("() => document.querySelector('[data-pods] input[name=shards]').removeAttribute('max')")
+            page.fill("[data-pods] input[name=shards]", "9")
+            page.fill("input[name=note]", "Nine pods")
+            page.click(".sheet-foot button[type=submit]")
+            settled(page)
+            refusal = page.locator("[data-pods] [data-refused=shards]")
+            check(refusal.count() == 1 and refusal.is_visible() and "at most 4" in refusal.text_content(),
+                  f"launch-sheet at {size}, {scheme} shows 9 shards refused at the field")
+            check(page.locator("[data-pods] input[name=shards][aria-invalid=true]").input_value() == "9"
+                  and page.locator("input[name=note]").input_value() == "Nine pods",
+                  f"launch-sheet at {size}, {scheme} keeps what was entered beside the refusal")
+            m = page.evaluate(MEASURE)
+            measured(page, f"launch-sheet refused at {size}, {scheme}", f"v25-{prefix}-registry-launch-refused-{size}-{scheme}.png")
+            check(m["tall"] <= 0, f"launch-sheet refused at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-refused-{size}-{scheme}.png"))
             check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
             ctx.close()
 

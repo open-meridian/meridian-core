@@ -136,6 +136,13 @@ fn conductor(bus: &Bus) {
                     name: "snaptrade".into(),
                     version: "0.1.0".into(),
                     state: PluginLaunchState::Launched as i32,
+                    limits: Some(meridian_domain::v1::SidecarLimits {
+                        in_flight: 4,
+                        answer_mib: 64,
+                        ..Default::default()
+                    }),
+                    shards: 2,
+                    standby: true,
                     ..Default::default()
                 }],
             }
@@ -363,6 +370,7 @@ async fn harness() -> Harness {
         health: Arc::default(),
         kit: None,
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::default(),
@@ -485,6 +493,45 @@ async fn the_books_health_is_read_from_a_deployment_admins_terminal() {
     assert_eq!(accounts[1]["account_id"], "ACC-2");
     assert_eq!(accounts[0]["entries_since_snapshot"], 400);
     assert_eq!(accounts[0]["last_snapshot_at_ns"], T0.to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resilience_profile_is_read_from_a_deployment_admins_terminal() {
+    // ReadResilienceProfile (contract v30, W6.39): what `meridian status
+    // --profile` prints, a deployment admin's alone, as the MCP tool answers.
+    let h = harness().await;
+    h.app.bus.serve(
+        crate::admin::resilience::READ_RESILIENCE_PROFILE,
+        |envelope| {
+            stamped(&envelope)?;
+            Ok((
+                "meridian.v1.ReadResilienceProfileReply".into(),
+                meridian_domain::v1::ReadResilienceProfileReply {
+                    level: meridian_domain::v1::ServiceLevel::SingleNode as i32,
+                    failures: vec![meridian_domain::v1::ResilienceLine {
+                        subject: "a pod".into(),
+                        state: meridian_domain::v1::ResilienceState::MetByRestart as i32,
+                        reason: "one book writer, no standby".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
+    assert_eq!(
+        send(&h, "GET", "/terminal/resilience-profile", Some(&h.bob), "")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, body) = send(&h, "GET", "/terminal/resilience-profile", Some(&h.ada), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["level"], "single_node", "{body}");
+    assert_eq!(read["failures"][0]["state"], "met_by_restart", "{body}");
+    assert_eq!(read["failures"][0]["reason"], "one book writer, no standby");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -761,6 +808,14 @@ async fn the_catalogue_launching_and_stopping() {
         "pulled: a breach of the Platform Terms"
     );
     assert_eq!(listed["launches"][0]["pull_kept"], false);
+    // Contract v30 (W8.3): what the launch asked, read back by `meridian
+    // plugin list`.
+    assert_eq!(
+        listed["launches"][0]["limits"],
+        serde_json::json!({"in_flight": 4, "requests_per_second": 0, "answer_mib": 64})
+    );
+    assert_eq!(listed["launches"][0]["shards"], 2);
+    assert_eq!(listed["launches"][0]["standby"], true);
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
@@ -1029,5 +1084,31 @@ async fn a_bundle_is_pushed_into_its_listing_s_repository_and_carried_whole() {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
+    }
+}
+
+/// Contract v30 (W8.3; ruled 2026-11-11): a launch's own share at its
+/// sidecar, as the Launch sheet takes it: each empty for the deployment's,
+/// none at all where all are, and one not a whole number above 0 refused
+/// naming it.
+#[test]
+fn a_launchs_limits_are_read_each_empty_for_the_deployments() {
+    assert_eq!(super::sidecar_limits("", " ", ""), Ok(None));
+    assert_eq!(
+        super::sidecar_limits("4", "", "8"),
+        Ok(Some(meridian_domain::v1::SidecarLimits {
+            in_flight: 4,
+            requests_per_second: 0,
+            answer_mib: 8,
+            write_mib_per_second: 0,
+        }))
+    );
+    for (in_flight, per_second, answer, named) in [
+        ("0", "", "", "limits.in_flight"),
+        ("", "-3", "", "limits.requests_per_second"),
+        ("", "", "lots", "limits.answer_mib"),
+    ] {
+        let refused = super::sidecar_limits(in_flight, per_second, answer).unwrap_err();
+        assert!(refused.contains(named), "{refused}");
     }
 }

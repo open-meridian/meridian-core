@@ -172,7 +172,6 @@ import meridian  # noqa: E402
 from meridian import (  # noqa: E402
     Bar,
     DatasetDeclaration,
-    DatasetLicence,
     Declaration,
     Interface,
     Money,
@@ -228,7 +227,7 @@ CATALOGUE = [
         modes=["pull", "push"],
         cadence=86_400,
         history=3650,
-        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        terms_and_pricing="Kept by the lake; derived use not restricted; display allowed.",
         day_time_zone="Etc/UTC",
         day_end_minute=0,
         venue_id=VENUE,
@@ -239,7 +238,7 @@ CATALOGUE = [
         data_types=["meridian.v1.Price"],
         modes=["stream"],
         cadence=30,
-        licence_default=DatasetLicence(kept=True, display=True),
+        terms_and_pricing="Kept by the lake; display allowed.",
         day_time_zone="Etc/UTC",
     ),
     # Contract v19: trades and quotes, streamed, kept two days. The SDK's
@@ -250,7 +249,7 @@ CATALOGUE = [
         vendor="Coinbase",
         data_types=["meridian.v1.Price"],
         modes=["stream"],
-        licence_default=DatasetLicence(kept=True, retention_days=2, display=True),
+        terms_and_pricing="Kept by the lake; kept 2 days at most; display allowed.",
         day_time_zone="Etc/UTC",
         day_end_minute=0,
         venue_id=VENUE,
@@ -262,7 +261,7 @@ CATALOGUE = [
         data_types=["meridian.v1.Rate"],
         modes=["pull", "push"],
         cadence=86_400,
-        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        terms_and_pricing="Kept by the lake; derived use not restricted; display allowed.",
         day_time_zone="America/New_York",
     ),
     # Contract v28, the filings slice: EDGAR-like rows, pushed.
@@ -273,7 +272,7 @@ CATALOGUE = [
                     "meridian.v1.RatingAction", "meridian.v1.HoldingsReport",
                     "meridian.v1.Holding"],
         modes=["push"],
-        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        terms_and_pricing="Kept by the lake; derived use not restricted; display allowed.",
         day_time_zone="America/New_York",
     ),
     # Contract v29, track C: a fixed-income source's prints, quotes and an
@@ -283,7 +282,7 @@ CATALOGUE = [
         vendor="FINRA",
         data_types=["meridian.v1.Price"],
         modes=["push"],
-        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        terms_and_pricing="Kept by the lake; derived use not restricted; display allowed.",
         day_time_zone="America/New_York",
     ), ["meridian.v1.Trade", "meridian.v1.Quote", "meridian.v1.Factor"]),
     DatasetDeclaration(
@@ -292,7 +291,7 @@ CATALOGUE = [
         data_types=["meridian.v1.Price"],
         modes=["push"],
         cadence=604_800,
-        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        terms_and_pricing="Kept by the lake; derived use not restricted; display allowed.",
         day_time_zone="America/New_York",
     ),
 ]

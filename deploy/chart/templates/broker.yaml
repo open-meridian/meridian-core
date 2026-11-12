@@ -358,6 +358,15 @@ spec:
             - {{ $name }}-launched
             - --broker
             - {{ $address }}
+            # The broker's bounds (stage M; the resilience spec's section
+            # 10a): each client's pending bytes, the largest message, and
+            # JetStream's memory.
+            - --max-pending
+            - {{ (.Values.broker.limits | default dict).maxPending | default "64MB" | toString | quote }}
+            - --max-payload
+            - {{ (.Values.broker.limits | default dict).maxPayload | default "1MB" | toString | quote }}
+            - --jetstream-memory
+            - {{ (.Values.broker.jetstream | default dict).maxMemory | default "16MB" | toString | quote }}
             {{- if gt $servers 1 }}
             # Its routes to the other servers, its own included (a server
             # ignores its route to itself), each named by the variable
@@ -370,10 +379,11 @@ spec:
             {{- end }}
             {{- end }}
             {{- if gt $jetstream 0 }}
-            # JetStream for the analytics units' work queue, on this
+            # JetStream for the analytics units' work queue and, in ha, the
+            # lake's write-ahead stream (contract v30, stage E), on this
             # server's own volume, at most this much of it.
             - --jetstream
-            - "256MB"
+            - {{ include "meridian-runtime.jetstreamFileStore" . | quote }}
             - --jetstream-store
             - /data/jetstream
             {{- end }}

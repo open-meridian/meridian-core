@@ -1117,3 +1117,191 @@ async fn a_server_gone_silent_is_left_for_another_within_the_heartbeat() {
         "heard again only {after:?} after the silence (at most {most:?})"
     );
 }
+
+#[tokio::test]
+async fn a_connection_lost_counts_a_loss_on_every_subscription_and_hears_again() {
+    // The resilience spec's section 10a: whatever the broker held for a
+    // client while its connection was down is gone, and the library's
+    // resubscription says nothing of it. Counted on each subscription, a
+    // sidecar puts a `Lost` in its plugin's stream and the plugin reads again.
+    let publisher = backend().await;
+    let subscriber = backend().await;
+    let (one, two) = (topic("event.before-a-break"), topic("event.also-before"));
+    let mut first = subscriber.subscribe(&one);
+    let second = subscriber.subscribe(&two);
+    settle().await;
+    assert_eq!((first.dropped(), second.dropped()), (0, 0));
+
+    subscriber
+        .reconnect()
+        .await
+        .expect("the connection is made again");
+    assert_eq!(
+        reaches(|| first.dropped(), 1).await,
+        1,
+        "no loss counted on the first"
+    );
+    assert_eq!(
+        reaches(|| second.dropped(), 1).await,
+        1,
+        "no loss counted on the second"
+    );
+    assert!(subscriber.dropped() >= 2, "the backend's total disagrees");
+
+    // And heard again once it is back.
+    let mut heard = None;
+    for attempt in 0..50 {
+        publisher
+            .publish(&one, envelope(&format!("after-{attempt}")))
+            .unwrap();
+        if let Ok(Some(delivery)) =
+            tokio::time::timeout(Duration::from_millis(200), first.recv()).await
+        {
+            heard = Some(delivery);
+            break;
+        }
+    }
+    assert!(
+        heard.is_some(),
+        "nothing heard after the connection came back"
+    );
+}
+
+/// A number the broker said in its JSON, by its key: `"key":123`.
+fn said_number(json: &str, key: &str) -> Option<u64> {
+    let (_, after) = json.split_once(&format!("\"{key}\":"))?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// A string the broker said in its JSON, by its key: `"key": "text"`.
+fn said_text(json: &str, key: &str) -> Option<String> {
+    let (_, after) = json.split_once(&format!("\"{key}\":"))?;
+    let (_, text) = after.trim_start().split_once('"')?;
+    text.split_once('"').map(|(said, _)| said.to_string())
+}
+
+/// One request to the test broker's monitoring endpoint, its body.
+async fn monitored(path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let monitor = std::env::var("MERIDIAN_TEST_BROKER_MONITOR")
+        .expect("MERIDIAN_TEST_BROKER_MONITOR is not set; run these with `make test-broker`");
+    let host = monitor.trim_start_matches("http://").trim_end_matches('/');
+    let mut stream = tokio::net::TcpStream::connect(host)
+        .await
+        .expect("the broker's monitoring endpoint answers");
+    stream
+        .write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut said = String::new();
+    stream.read_to_string(&mut said).await.unwrap();
+    said.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(said)
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_is_cut_off_alone_and_every_other_keeps_its_deliveries() {
+    // The resilience spec's section 10a: the broker bounds each client's
+    // pending bytes (`broker.limits.maxPending`, the broker's own 64 MB by
+    // default); a client that stops reading is cut off alone, as NATS does
+    // with a slow consumer, and a healthy subscriber of the same subject
+    // hears every message.
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    const EACH: usize = 256 * 1024;
+    const SENT: usize = 512; // 128 MiB, twice the pending bound
+    let url =
+        std::env::var("MERIDIAN_TEST_BROKER_URL").expect("MERIDIAN_TEST_BROKER_URL is not set");
+    let rest = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+    let (credential, host) = rest.rsplit_once('@').expect("the test URL names its user");
+    let (user, pass) = credential.split_once(':').unwrap();
+    let subject = topic("event.read-by-nobody");
+
+    // A client that subscribes and then never reads its socket again.
+    let stalled = tokio::net::TcpStream::connect(host).await.unwrap();
+    let (reading, mut writing) = stalled.into_split();
+    let mut reading = tokio::io::BufReader::new(reading);
+    let mut info = String::new();
+    reading.read_line(&mut info).await.unwrap();
+    let cid = said_number(&info, "client_id").expect("the server names this client");
+    writing
+        .write_all(
+            format!(
+                "CONNECT {{\"user\":{user:?},\"pass\":{pass:?},\"verbose\":false,\"pedantic\":false}}\r\n\
+                 SUB {subject} 1\r\nPING\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut pong = String::new();
+    reading.read_line(&mut pong).await.unwrap();
+    assert_eq!(
+        pong.trim(),
+        "PONG",
+        "the stalled client was not admitted: {pong}"
+    );
+
+    let subscriber = backend().await;
+    let mut healthy = subscriber.subscribe(&subject);
+    settle().await;
+    let hearing = tokio::spawn(async move {
+        let mut heard = 0;
+        while heard < SENT {
+            match next(&mut healthy).await {
+                Some(_) => heard += 1,
+                None => break,
+            }
+        }
+        (heard, healthy)
+    });
+
+    let publisher = backend().await;
+    for sent in 0..SENT {
+        let mut message = envelope(&format!("bulk-{sent}"));
+        message.payload = vec![7u8; EACH];
+        publisher.publish(&subject, message).unwrap();
+    }
+    let (heard, healthy) = hearing.await.unwrap();
+    assert_eq!(heard, SENT, "the healthy subscriber missed messages");
+    assert_eq!(
+        healthy.dropped(),
+        0,
+        "the healthy subscriber counted a loss"
+    );
+
+    // The stalled one was closed by the broker as a slow consumer, not
+    // dropped as stale.
+    let mut reason = String::new();
+    for _ in 0..50 {
+        let closed = monitored(&format!("/connz?state=closed&cid={cid}")).await;
+        if let Some(said) = said_text(&closed, "reason") {
+            reason = said;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        reason.contains("Slow Consumer"),
+        "the stalled client was not cut off as a slow consumer: {reason:?}"
+    );
+    // And what it was sent ends: closed, short of what was published.
+    let mut left = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), reading.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => left += n,
+            Err(_) => panic!("the stalled client's connection is still open after {left} bytes"),
+        }
+    }
+    assert!(
+        left < SENT * EACH,
+        "the stalled client was sent everything: {left} bytes"
+    );
+}

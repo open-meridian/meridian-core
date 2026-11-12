@@ -9,7 +9,7 @@
 //! it is refused naming it, and every store read carries both.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use meridian_analytics_engine::canonical;
@@ -32,6 +32,7 @@ use prost::Message;
 use serde_json::{json, Value};
 
 use crate::resolve::{self, Ask};
+use crate::standing::{self, Peers};
 use crate::{topics, wire};
 
 /// How the coordinator runs.
@@ -68,6 +69,8 @@ pub struct Config {
     /// Where a page of an answer ends, in bytes (ruling 794): an answer past
     /// it is never given inline, and is read in pages of it.
     pub page_budget: usize,
+    /// Contract v30 (W12.4): how standing jobs are held.
+    pub standing: standing::Settings,
 }
 
 impl Default for Config {
@@ -83,6 +86,7 @@ impl Default for Config {
             jobs_at_once: JOBS_AT_ONCE,
             jobs_waiting: JOBS_WAITING,
             page_budget: crate::pages::PAGE_BUDGET,
+            standing: standing::Settings::default(),
         }
     }
 }
@@ -158,16 +162,75 @@ impl Jobs {
 }
 
 /// The jobs running and waiting, so that only so many hold their inputs at
-/// once.
+/// once; and the waiting in fair shares (the resilience spec's section
+/// 10a): each client's jobs wait in their own queue, and a freed place goes
+/// to the clients waiting in turn (weighted fair queuing, every weight one),
+/// so one client's burst waits behind itself and every other client's next
+/// job is run after at most one of its. Standing recomputations take their
+/// turns as one more client ([`STANDING`]), so neither starves the other.
 #[derive(Default)]
 struct Slots {
     running: usize,
     waiting: usize,
+    /// Each client's tickets waiting, oldest first.
+    queues: BTreeMap<String, VecDeque<u64>>,
+    /// The clients with a ticket waiting, in the order their turn comes.
+    turn: VecDeque<String>,
+    /// Tickets given a place, not yet taken up by their job.
+    granted: std::collections::BTreeSet<u64>,
+    next_ticket: u64,
+}
+
+/// The queue standing recomputations wait in, beside the clients'.
+const STANDING: &str = "standing recomputations";
+
+impl Slots {
+    /// A ticket in `client`'s queue.
+    fn wait_in(&mut self, client: &str) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        let queue = self.queues.entry(client.to_string()).or_default();
+        if queue.is_empty() {
+            self.turn.push_back(client.to_string());
+        }
+        queue.push_back(ticket);
+        self.waiting += 1;
+        ticket
+    }
+
+    /// Free places handed to the clients waiting, in turn.
+    fn hand_out(&mut self, at_once: usize) {
+        while self.running < at_once {
+            let Some(client) = self.turn.pop_front() else {
+                return;
+            };
+            let Some(queue) = self.queues.get_mut(&client) else {
+                continue;
+            };
+            let Some(ticket) = queue.pop_front() else {
+                self.queues.remove(&client);
+                continue;
+            };
+            if queue.is_empty() {
+                self.queues.remove(&client);
+            } else {
+                self.turn.push_back(client);
+            }
+            self.granted.insert(ticket);
+            self.waiting -= 1;
+            self.running += 1;
+        }
+    }
+
+    /// How many of `client`'s jobs wait.
+    fn waiting_for(&self, client: &str) -> usize {
+        self.queues.get(client).map_or(0, VecDeque::len)
+    }
 }
 
 /// A job's place among those running, given back when it finishes, however
 /// it finishes.
-struct Slot<'a> {
+pub(crate) struct Slot<'a> {
     coordinator: &'a Coordinator,
 }
 
@@ -175,7 +238,8 @@ impl Drop for Slot<'_> {
     fn drop(&mut self) {
         let mut slots = self.coordinator.slots.lock().expect("not poisoned");
         slots.running -= 1;
-        self.coordinator.slot_freed.notify_one();
+        slots.hand_out(self.coordinator.config.jobs_at_once.max(1));
+        self.coordinator.slot_freed.notify_all();
     }
 }
 
@@ -187,24 +251,33 @@ struct Batches {
 }
 
 pub struct Coordinator {
-    bus: Arc<Bus>,
-    handle: tokio::runtime::Handle,
-    clock: Arc<dyn Clock>,
-    config: Config,
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) config: Config,
     executor: Arc<dyn Executor>,
     jobs: Mutex<Jobs>,
     slots: Mutex<Slots>,
     slot_freed: Condvar,
     batches: Mutex<Batches>,
     batch_answered: Condvar,
+    /// Contract v30 (W12.4): the standing jobs this coordinator holds, told
+    /// when one's answer is in and when one is dirtied.
+    pub(crate) standing: Mutex<standing::Registry>,
+    pub(crate) standing_changed: Condvar,
+    /// The live coordinators, and how one is asked (question 13).
+    pub(crate) peers: RwLock<Arc<dyn Peers>>,
+    /// A budget the standing answers reserve against in place of the
+    /// process's: a test's.
+    pub(crate) standing_budget: RwLock<Option<Arc<meridian_budget::Budget>>>,
 }
 
 /// The store reads for one job, each stamped with the client and its scope.
-struct OnBehalf {
-    bus: Arc<Bus>,
-    handle: tokio::runtime::Handle,
-    stamp: Stamp,
-    timeout: Duration,
+pub(crate) struct OnBehalf {
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) stamp: Stamp,
+    pub(crate) timeout: Duration,
 }
 
 impl Ask for OnBehalf {
@@ -235,7 +308,7 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
 
 /// The client: the instance that asked, and the read scope its sidecar
 /// stamped, None for a core component reading as itself.
-fn client_of(envelope: &Envelope) -> (String, Option<Vec<String>>) {
+pub(crate) fn client_of(envelope: &Envelope) -> (String, Option<Vec<String>>) {
     let meta = envelope.meta.clone().unwrap_or_default();
     let scope = meta.account_scope_applies.then_some(meta.account_scope);
     (meta.publisher_instance_id, scope)
@@ -284,6 +357,12 @@ impl Coordinator {
             slot_freed: Condvar::new(),
             batches: Mutex::new(Batches::default()),
             batch_answered: Condvar::new(),
+            standing: Mutex::new(standing::Registry::default()),
+            standing_changed: Condvar::new(),
+            standing_budget: RwLock::new(None),
+            peers: RwLock::new(Arc::new(standing::Alone(standing::member_named(
+                crate::INSTANCE,
+            )))),
         })
     }
 
@@ -294,6 +373,18 @@ impl Coordinator {
         envelope: &Envelope,
     ) -> Result<RunJobReply, String> {
         let (client, scope) = client_of(envelope);
+        self.run_job_for(request, client, scope, false)
+    }
+
+    /// W12.1: a job run for `client` within `scope`; `handed`, asked by
+    /// another coordinator, which a standing job is never handed on from.
+    pub(crate) fn run_job_for(
+        self: &Arc<Self>,
+        request: RunJobRequest,
+        client: String,
+        scope: Option<Vec<String>>,
+        handed: bool,
+    ) -> Result<RunJobReply, String> {
         let job = request.job.unwrap_or_default();
         if let Some(scope) = &scope {
             for (i, account) in job.account_ids.iter().enumerate() {
@@ -306,6 +397,8 @@ impl Coordinator {
                 }
             }
         }
+        // Contract v30 (W12.1): a standing job's own refusals first.
+        standing::refused(&job)?;
         let compiled = compile::compile(&job).map_err(|refused| {
             refusal_with_status(
                 RefusalStatus::InvalidArgument,
@@ -313,25 +406,46 @@ impl Coordinator {
                 refused.to_string(),
             )
         })?;
+        if job.standing {
+            return self.run_standing(job, client, scope, handed);
+        }
         // A place among the jobs running, or among those waiting for one;
-        // past both, refused, never another thread holding its inputs.
-        {
+        // past both, refused, never another thread holding its inputs. Its
+        // client's own share of those waiting first (section 10a), so one
+        // client's burst cannot fill the queue every other waits in.
+        let ticket = {
             let mut slots = self.slots.lock().expect("not poisoned");
-            if slots.running >= self.config.jobs_at_once.max(1)
-                && slots.waiting >= self.config.jobs_waiting
-            {
-                return Err(refusal_with_status(
-                    RefusalStatus::FailedPrecondition,
-                    &[],
-                    format!(
-                        "the analytics component is running {} jobs with {} waiting, the most \
-                         it holds at once: run the job again shortly",
+            let at_once = self.config.jobs_at_once.max(1);
+            let full = slots.running >= at_once;
+            // Its whole queue full: overloaded, with a retry-after, as every
+            // refusal for load is (the resilience spec's section 10a).
+            if full && slots.waiting >= self.config.jobs_waiting {
+                return Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: (self.config.inline.as_secs() as u32).max(1),
+                    words: format!(
+                        "overloaded: the analytics component is running {} jobs with {} \
+                         waiting, the most it holds at once: run the job again after the \
+                         retry-after",
                         slots.running, slots.waiting
                     ),
-                ));
+                }));
             }
-            slots.waiting += 1;
-        }
+            let share = self.client_share();
+            let mine = slots.waiting_for(&client);
+            if full && mine >= share {
+                return Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: (self.config.inline.as_secs() as u32).max(1),
+                    words: format!(
+                        "overloaded: {client} already has {mine} job(s) waiting at the analytics \
+                         component, its share"
+                    ),
+                }));
+            }
+            let ticket = slots.wait_in(&client);
+            slots.hand_out(at_once);
+            self.slot_freed.notify_all();
+            ticket
+        };
         let job_id = job_id(self.clock.now_ns());
         let (told, heard) = mpsc::channel();
         let me = Arc::clone(self);
@@ -348,7 +462,7 @@ impl Coordinator {
         };
         let finishing_client = client.clone();
         std::thread::spawn(move || {
-            let slot = me.slot();
+            let slot = me.slot(ticket);
             let answered = me.answer(&asker, &job, &compiled, &id);
             drop(slot);
             if told.send(answered.clone()).is_err() {
@@ -356,7 +470,7 @@ impl Coordinator {
                 me.finished(&id, &finishing_client, answered);
             }
         });
-        match heard.recv_timeout(self.config.inline) {
+        match self.within_window(&heard) {
             Ok(Ok(answer)) if crate::pages::whole_fits(&answer, self.config.page_budget) => {
                 self.keep(&job_id, &client, Ok(answer.clone()));
                 Ok(RunJobReply {
@@ -385,16 +499,60 @@ impl Coordinator {
         }
     }
 
+    /// What the job's thread answers within the request's window, measured
+    /// on the coordinator's clock -- the one clock its kept answers age by
+    /// -- so the window is the clock's, never the machine's load: a test's
+    /// clock held still holds it open until the job answers, and the
+    /// deployment's wall clock closes it as before.
+    fn within_window<T>(&self, heard: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
+        /// How often the clock is read again while the job runs.
+        const LOOK: Duration = Duration::from_millis(20);
+        let window = i64::try_from(self.config.inline.as_nanos()).unwrap_or(i64::MAX);
+        let until = self.clock.now_ns().saturating_add(window);
+        loop {
+            let left = until.saturating_sub(self.clock.now_ns());
+            if left <= 0 {
+                return heard.try_recv().map_err(|empty| match empty {
+                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+                });
+            }
+            match heard.recv_timeout(Duration::from_nanos(left as u64).min(LOOK)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                answered => return answered,
+            }
+        }
+    }
+
     /// A place among the jobs running: waits, counted among those waiting,
     /// until one is free.
-    fn slot(&self) -> Slot<'_> {
+    /// Contract v30 (W12.4): a standing job's recomputation's place among
+    /// the jobs running, as a job's: waits until one is free, never refused
+    /// -- its holders keep the figures they have meanwhile.
+    pub(crate) fn standing_slot(&self) -> Slot<'_> {
+        let ticket = {
+            let mut slots = self.slots.lock().expect("not poisoned");
+            let ticket = slots.wait_in(STANDING);
+            slots.hand_out(self.config.jobs_at_once.max(1));
+            self.slot_freed.notify_all();
+            ticket
+        };
+        self.slot(ticket)
+    }
+
+    /// The place `ticket` was given, once its turn has come.
+    fn slot(&self, ticket: u64) -> Slot<'_> {
         let mut slots = self.slots.lock().expect("not poisoned");
-        while slots.running >= self.config.jobs_at_once.max(1) {
+        while !slots.granted.remove(&ticket) {
             slots = self.slot_freed.wait(slots).expect("not poisoned");
         }
-        slots.waiting -= 1;
-        slots.running += 1;
         Slot { coordinator: self }
+    }
+
+    /// How many jobs one client may have waiting: a quarter of those that
+    /// may wait in all, at least one.
+    fn client_share(&self) -> usize {
+        (self.config.jobs_waiting / 4).max(1)
     }
 
     /// A job's answer: its inputs resolved, its routed batches priced, its
@@ -406,6 +564,18 @@ impl Coordinator {
         compiled: &compile::Compiled,
         job_id: &str,
     ) -> Result<JobAnswer, String> {
+        self.answer_read(asker, job, compiled, job_id)
+            .map(|(answer, _)| answer)
+    }
+
+    /// A job's answer, and the inputs document it was computed from.
+    pub(crate) fn answer_read(
+        &self,
+        asker: &dyn Ask,
+        job: &meridian_domain::v1::Job,
+        compiled: &compile::Compiled,
+        job_id: &str,
+    ) -> Result<(JobAnswer, serde_json::Value), String> {
         let resolved = resolve::resolve(
             asker,
             job,
@@ -422,7 +592,7 @@ impl Coordinator {
         if answer.asks_execution_cost {
             self.record_execution_costs(&wire::execution_costs(&answer, &resolved.executions));
         }
-        wire::job_answer(job_id, &answer)
+        Ok((wire::job_answer(job_id, &answer)?, inputs))
     }
 
     /// Contract v27 (W10.11; ruling 481): the rows an `execution_cost` job
@@ -500,6 +670,13 @@ impl Coordinator {
             .map(|p| p.answer_hash.clone())
             .unwrap_or_default();
         self.keep(job_id, client, answer);
+        self.tell(job_id, client, answer_hash);
+    }
+
+    /// The client told a job it ran has finished, sequenced for its
+    /// catch-up (W12.4): a one-off job's, and from contract v30 a standing
+    /// job's first answer, where its `RunJob` was answered before it was in.
+    pub(crate) fn tell(&self, job_id: &str, client: &str, answer_hash: String) {
         let event = {
             let mut jobs = self.jobs.lock().expect("not poisoned");
             let now_ms = self.clock.now_ns() / 1_000_000;
@@ -538,7 +715,35 @@ impl Coordinator {
         request: ReadJobAnswerRequest,
         envelope: &Envelope,
     ) -> Result<JobAnswer, String> {
-        let (client, _) = client_of(envelope);
+        let (client, scope) = client_of(envelope);
+        self.read_job_answer_for(request, &client, &scope, false)
+    }
+
+    /// W12.4: a job's answer read for `client`: a standing job's held here,
+    /// a one-off job's kept here, or, not `handed`, either held by another
+    /// coordinator (question 13).
+    pub(crate) fn read_job_answer_for(
+        &self,
+        request: ReadJobAnswerRequest,
+        client: &str,
+        scope: &Option<Vec<String>>,
+        handed: bool,
+    ) -> Result<JobAnswer, String> {
+        if let Some(read) = self.read_standing(&request, client) {
+            return read;
+        }
+        let held_here = self
+            .jobs
+            .lock()
+            .expect("not poisoned")
+            .answers
+            .contains_key(&request.job_id);
+        if !held_here && !handed {
+            if let Some(read) = self.read_elsewhere(&request, client, scope) {
+                return read;
+            }
+        }
+        let client = client.to_string();
         let mut jobs = self.jobs.lock().expect("not poisoned");
         jobs.trim(&self.config, self.clock.now_ns());
         match jobs.answers.get(&request.job_id) {
@@ -932,6 +1137,8 @@ pub fn serve(bus: &Arc<Bus>, coordinator: &Arc<Coordinator>) {
         ),
         |c, reply: PriceBatchReply, envelope| c.answer_price_batch(reply, envelope),
     );
+    // Contract v30 (W12.4): a sidecar's renewal of its standing jobs.
+    crate::standing::coordinator::serve_renewals(bus, coordinator);
 }
 
 /// The executor the coordinator answers with: the worker pool over the bus.

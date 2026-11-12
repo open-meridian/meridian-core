@@ -1580,3 +1580,454 @@ fn an_entry_kept_before_digests_is_chained_by_migrate_even_one_the_book_cannot_r
     let scrubbed = store.scrub().expect("scrubs");
     assert!(scrubbed.findings.is_empty(), "{:?}", scrubbed.findings);
 }
+
+/// Stage M (the store memory audit of 2026-11-09, item 7): a keyed page --
+/// locates, trading instructions, bookings, alerts -- reads its own rows
+/// from the database, after its cursor and in its key's order, never every
+/// row decoded and sorted for one page. 3,000 instructions, each with a long
+/// reason, read ten at a time: every one once, in order, and a page's heap
+/// a small part of the whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_page_reads_its_own_rows_never_every_row() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    let tag = unique("plugin");
+    let reason = "a pause set for the memory bound of a page of instructions ".repeat(6);
+    for n in 0..3_000 {
+        let set = SetTradingInstructionRequest {
+            target: Some(TradingInstructionTarget {
+                // Sorted after every other test's targets, which read
+                // their first page and look for their own on it.
+                instance_id: format!("zz-{tag}-{n:05}"),
+                ..Default::default()
+            }),
+            value: TradingInstructionValue::Pause as i32,
+            reason: reason.clone(),
+            setter_level: SetterLevel::PluginAdmin as i32,
+        };
+        send_order(&bus, SET_TRADING_INSTRUCTION, &set, Some(PERSON), None)
+            .await
+            .unwrap();
+    }
+    let page = |cursor: &str, limit: usize| {
+        let cursor = cursor.to_string();
+        let store = Arc::clone(&store);
+        blocking(move || {
+            store
+                .instructions(&meridian_bor::store::InstructionsRead {
+                    since: None,
+                    limit,
+                    cursor,
+                })
+                .unwrap()
+        })
+    };
+    // Warm the pool's connections, then measured.
+    page("", 10);
+    let first = tokio::task::block_in_place(|| {
+        counted::take();
+        let first = store
+            .instructions(&meridian_bor::store::InstructionsRead {
+                since: None,
+                limit: 10,
+                cursor: String::new(),
+            })
+            .unwrap();
+        (first, counted::take().1)
+    });
+    let (first, peak) = first;
+    assert_eq!(first.records.len(), 10);
+    let whole_mib = 3_000.0 * reason.len() as f64 / 1048576.0;
+    println!("KEYED heap_peak_mib={peak:.2} reasons_alone_mib={whole_mib:.2}");
+    assert!(
+        peak * 4.0 < whole_mib,
+        "a page's heap peaked at {peak:.2} MiB; the reasons alone are {whole_mib:.2} MiB"
+    );
+    // Every instruction of the run, once, in order, ten at a time.
+    let mut seen = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let read = page(&cursor, 10);
+        for held in &read.records {
+            let named = held
+                .target
+                .as_ref()
+                .map(|t| t.instance_id.clone())
+                .unwrap_or_default();
+            if named.starts_with(&format!("zz-{tag}")) {
+                seen.push(named);
+            }
+        }
+        if read.next_cursor.is_empty() {
+            break;
+        }
+        cursor = read.next_cursor;
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(seen.len(), 3_000, "every one once");
+    assert_eq!(seen, sorted, "in the key's order");
+}
+
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    /// Counted on the thread that allocates, so what a read holds is told
+    /// apart from what the book's own background work does meanwhile.
+    pub struct Counting;
+
+    std::thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn by(change: isize) {
+        let _ = LIVE.try_with(|live| {
+            live.set(live.get() + change);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(live.get())));
+        });
+    }
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                by(layout.size() as isize);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(at, layout) };
+            by(-(layout.size() as isize));
+        }
+    }
+
+    /// This thread's heap peak since the last take, above where it stood
+    /// then, in MiB; and where it stands now.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.with(Cell::get);
+        let peak = PEAK.with(|peak| peak.replace(live));
+        (
+            live as f64 / 1048576.0,
+            (peak - live).max(0) as f64 / 1048576.0,
+        )
+    }
+}
+
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3): the identity a writer first sees is kept;
+/// another raises every partition's epoch, recorded with that cause.
+#[test]
+fn a_new_database_timeline_raises_the_books_epoch() {
+    use meridian_changes::timeline::Timeline;
+    let (url, store) = isolated();
+    let epoch = store.adopt().unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::First);
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Same);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .execute(
+            "UPDATE book_partition_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Moved(epoch + 1));
+    assert_eq!(store.epoch(), epoch + 1);
+    let why: String = admin
+        .query_one(
+            "SELECT why FROM book_writer_took_over WHERE epoch = $1",
+            &[&((epoch + 1) as i64)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+    assert_eq!(store.head_epoch().unwrap(), epoch + 1);
+}
+
+/// A record read on a read replica is stamped from its own snapshot
+/// (contract v30, stage C2; the resilience spec's section 5): asked, the
+/// book's reads of its past each answer from one repeatable-read snapshot
+/// and say its partitions' head rows; not asked, nothing. A reader member
+/// answering the record's past from the replica says those heads as the
+/// read's position -- never its own applied position -- and the next read
+/// says its own again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
+    use meridian_bor::postgres::{snapshot_heads, stamp_from_snapshot};
+    let (bus, store) = wired();
+    let account = unique("ACC-STAMP");
+    open(&bus, &account, &unique("INS-STAMP")).await;
+    blocking(|| {
+        stamp_from_snapshot();
+        let entries = store.journal(&account).unwrap();
+        let said = snapshot_heads().expect("the snapshot's heads");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let head = said[&entry.partition];
+        assert!(
+            head >= entry.last_sequence && head <= store.heads().unwrap()[&entry.partition],
+            "the snapshot's head ({head}) holds the entry it answered and no more than the record"
+        );
+        // Not asked: nothing said, and nothing kept from before.
+        store.journal(&account).unwrap();
+        assert!(snapshot_heads().is_none());
+
+        // A reader member whose replica is this store, applied to nothing.
+        let reader = meridian_bor::reader::ReaderStore::new(
+            store.clone(),
+            Some(store.clone() as Arc<dyn Store>),
+            1 << 20,
+            Arc::new(meridian_bor::store::Mark::new),
+        );
+        meridian_bus::read_after::begin_read();
+        let past = Store::journal(&reader, &account).unwrap();
+        assert_eq!(past.len(), 1);
+        let stamped = Store::heads(&reader).unwrap();
+        assert!(
+            stamped.get(&entry.partition).copied().unwrap_or(0) >= entry.last_sequence,
+            "the replica's snapshot, not the member's applied position: {stamped:?}"
+        );
+        meridian_bus::read_after::begin_read();
+        assert!(
+            Store::heads(&reader).unwrap().is_empty(),
+            "the next read says the member's own position again"
+        );
+    });
+}
+
+fn a_break(account: &str) -> RecordBreakRequest {
+    RecordBreakRequest {
+        account_id: account.into(),
+        subject: Some(record_break_request::Subject::Position(PositionKey {
+            instrument_id: "INS-AAPL".into(),
+            side: HoldingSide::Long as i32,
+        })),
+        category: BreakCategory::TradeDateQuantity as i32,
+        differences: vec![BreakDifference {
+            field: "trade_date_quantity".into(),
+            book: None,
+            street: None,
+        }],
+        business_date: "2026-09-09".into(),
+        ..Default::default()
+    }
+}
+
+/// A write, then a record read naming its watermark, against a read replica
+/// held behind (contract v30, stage C2; the resilience spec's section 5): the
+/// reader never answers with less than the watermark. Its replica's snapshot
+/// behind it, the primary answers, the write in what it said, and the
+/// read's position is the primary's; once the replica holds the write, the
+/// replica answers, its position its own snapshot's, at or past the
+/// watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_behind_it() {
+    use meridian_bus::read_after::{answered_by_primary, begin_read, Reads};
+    use meridian_pb::v1::{PartitionSequence, Watermark};
+    let (_, primary) = blocking(isolated);
+    let (_, replica) = blocking(isolated);
+    let (bus, primary) = wired_with(primary);
+    let (replica_bus, replica) = wired_with(replica);
+    let account = unique("ACC-LAG");
+    // Both hold the account's opening; the replica is held there.
+    open(&bus, &account, "INS-AAPL").await;
+    open(&replica_bus, &account, "INS-AAPL").await;
+    // The write the read names: on the primary alone.
+    send(&bus, RECORD_BREAK, &a_break(&account), None)
+        .await
+        .unwrap();
+    let written = blocking(|| primary.journal(&account)).unwrap();
+    assert_eq!(written.len(), 2);
+    let last = written.last().unwrap();
+    let watermark = Watermark {
+        partitions: vec![PartitionSequence {
+            partition: last.partition.clone(),
+            sequence: last.last_sequence,
+        }],
+    };
+    let reader = meridian_bor::reader::ReaderStore::new(
+        primary.clone(),
+        Some(replica.clone() as Arc<dyn Store>),
+        1 << 20,
+        Arc::new(meridian_bor::store::Mark::new),
+    );
+    let reads = Reads::default();
+    let read = |reads: &Reads| {
+        begin_read();
+        reads.answer(
+            "platform.bor.query.list-lifecycle-events",
+            &watermark,
+            || Store::journal(&reader, &account).map_err(|failed| failed.to_string()),
+        )
+    };
+    blocking(|| {
+        let said = read(&reads).unwrap();
+        assert_eq!(said.len(), 2, "the write named is in what the read said");
+        assert!(
+            answered_by_primary(),
+            "the replica behind it: the primary answered"
+        );
+        let at = Store::heads(&reader).unwrap();
+        assert!(at[&last.partition] >= last.last_sequence, "{at:?}");
+    });
+    // The replica takes the write: it answers, stamped from its snapshot.
+    send(&replica_bus, RECORD_BREAK, &a_break(&account), None)
+        .await
+        .unwrap();
+    blocking(|| {
+        let held = replica.journal(&account).unwrap();
+        assert_eq!(held.last().unwrap().last_sequence, last.last_sequence);
+        let said = read(&reads).unwrap();
+        assert_eq!(said.len(), 2);
+        assert!(
+            !answered_by_primary(),
+            "the replica, at the watermark, answered"
+        );
+        let at = Store::heads(&reader).unwrap();
+        assert!(at[&last.partition] >= last.last_sequence, "{at:?}");
+    });
+}
+
+/// The book's proposals at a wealth platform's volume (stage M2;
+/// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
+/// 100,000-order proposal end to end through the book), against the
+/// sidecar's per-plugin caps and the broker's pending bound: `make bench`
+/// runs it by hand, never the gate.
+///
+/// One plugin proposing `MERIDIAN_BENCH_ORDERS` orders (10,000 by default)
+/// across `MERIDIAN_BENCH_ACCOUNTS` accounts (1,000), with
+/// `MERIDIAN_BENCH_IN_FLIGHT` requests at once (each of 1, 8, 16, 32 and
+/// 64 in turn): there is no bulk proposal, so each order is one request,
+/// as through a sidecar. Per level it prints the book's rate and each
+/// request's latency (p50, p99, the most), and per order the bytes asked,
+/// answered and published on the book's events -- what a subscriber's
+/// pending bytes at the broker grow by while it falls behind. The book's
+/// pool and its handlers at once are the deployment's (8; 16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_book_proposals_at_wealth_scale() {
+    use meridian_bor::order_service::*;
+    let from_env =
+        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let orders: usize = from_env("MERIDIAN_BENCH_ORDERS", "10000").parse().unwrap();
+    let accounts: usize = from_env("MERIDIAN_BENCH_ACCOUNTS", "1000").parse().unwrap();
+    let levels: Vec<usize> = from_env("MERIDIAN_BENCH_IN_FLIGHT", "1,8,16,32,64")
+        .split(',')
+        .map(|n| n.trim().parse().unwrap())
+        .collect();
+    let (bus, _store) = wired();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let run = unique("BENCH");
+    let accounts: Vec<String> = (0..accounts).map(|n| format!("ACC-{run}-{n}")).collect();
+    for account in &accounts {
+        send_order(
+            &bus,
+            SET_ACCOUNT_ATTRIBUTE,
+            &SetAccountAttributeRequest {
+                account_id: account.clone(),
+                attribute: Some(
+                    set_account_attribute_request::Attribute::WaitsForCompliance(false),
+                ),
+                reason: "the bench proposes without a compliance plugin".into(),
+            },
+            Some(PERSON),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    // What the book publishes, counted as a subscriber's pending bytes would.
+    let published = Arc::new(AtomicU64::new(0));
+    let events = Arc::new(AtomicU64::new(0));
+    let mut heard = bus.subscribe_every("platform.book.event.**");
+    let drops = heard.drop_count();
+    let counting = {
+        let (published, events) = (Arc::clone(&published), Arc::clone(&events));
+        tokio::spawn(async move {
+            while let Some(delivery) = heard.recv().await {
+                published.fetch_add(delivery.envelope.encoded_len() as u64, Ordering::Relaxed);
+                events.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    for at_once in levels {
+        let (published_before, events_before) = (
+            published.load(Ordering::Relaxed),
+            events.load(Ordering::Relaxed),
+        );
+        let next = Arc::new(AtomicU64::new(0));
+        let asked_bytes = Arc::new(AtomicU64::new(0));
+        let answered_bytes = Arc::new(AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        let mut workers = Vec::new();
+        for _ in 0..at_once {
+            let (bus, accounts, next, run) = (
+                Arc::clone(&bus),
+                accounts.clone(),
+                Arc::clone(&next),
+                run.clone(),
+            );
+            let (asked_bytes, answered_bytes) =
+                (Arc::clone(&asked_bytes), Arc::clone(&answered_bytes));
+            workers.push(tokio::spawn(async move {
+                let mut took = Vec::new();
+                loop {
+                    let n = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    if n >= orders {
+                        return took;
+                    }
+                    let proposal = ProposeOrderRequest {
+                        account_id: accounts[n % accounts.len()].clone(),
+                        instrument_id: "INS-AAPL".into(),
+                        sleeve: "core".into(),
+                        side: Side::Buy as i32,
+                        quantity: d("10"),
+                        order_type: OrderType::Limit as i32,
+                        limit_price: usd("227.50"),
+                        time_in_force: TimeInForce::Day as i32,
+                        idempotency_key: format!("{run}-{at_once}-{n}"),
+                        ..Default::default()
+                    };
+                    asked_bytes.fetch_add(proposal.encoded_len() as u64, Ordering::Relaxed);
+                    let began = std::time::Instant::now();
+                    let answer = send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                        .await
+                        .unwrap_or_else(|refused| panic!("order {n} refused: {refused}"));
+                    took.push(began.elapsed());
+                    answered_bytes.fetch_add(answer.len() as u64, Ordering::Relaxed);
+                }
+            }));
+        }
+        let mut took = Vec::new();
+        for worker in workers {
+            took.extend(worker.await.unwrap());
+        }
+        let elapsed = started.elapsed();
+        // The events of the last few orders are still on their way.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        took.sort();
+        let at = |q: f64| took[((took.len() as f64 * q) as usize).min(took.len() - 1)];
+        let per_order = |bytes: u64| bytes as f64 / orders as f64;
+        println!(
+            "CAPACITY book proposals orders={orders} in_flight={at_once} rate_per_s={:.0} \
+             p50_ms={:.2} p99_ms={:.2} most_ms={:.2} asked_bytes={:.0} answered_bytes={:.0} \
+             events_per_order={:.2} event_bytes_per_order={:.0} events_dropped={}",
+            orders as f64 / elapsed.as_secs_f64(),
+            at(0.50).as_secs_f64() * 1e3,
+            at(0.99).as_secs_f64() * 1e3,
+            took.last().unwrap().as_secs_f64() * 1e3,
+            per_order(asked_bytes.load(Ordering::Relaxed)),
+            per_order(answered_bytes.load(Ordering::Relaxed)),
+            (events.load(Ordering::Relaxed) - events_before) as f64 / orders as f64,
+            per_order(published.load(Ordering::Relaxed) - published_before),
+            drops.get(),
+        );
+    }
+    counting.abort();
+}

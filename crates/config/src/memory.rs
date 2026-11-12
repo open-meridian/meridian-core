@@ -260,8 +260,33 @@ fn redact(
 }
 
 impl Store for MemoryStore {
+    fn launches(&self) -> Result<Vec<PluginLaunch>> {
+        Ok(self
+            .state
+            .lock()
+            .expect("store lock poisoned")
+            .catalogue
+            .launches
+            .clone())
+    }
+
     fn snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = self.state.lock().expect("store lock poisoned").clone();
+        // Each instance's latest launch alone, as Postgres answers it.
+        let launches = std::mem::take(&mut snapshot.catalogue.launches);
+        let latest: std::collections::BTreeSet<usize> = {
+            let mut last: std::collections::BTreeMap<&str, usize> = Default::default();
+            for (at, launch) in launches.iter().enumerate() {
+                last.insert(launch.instance_id.as_str(), at);
+            }
+            last.into_values().collect()
+        };
+        snapshot.catalogue.launches = launches
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| latest.contains(at))
+            .map(|(_, launch)| launch)
+            .collect();
         snapshot.records.known_plugins = known_plugins(&snapshot.plugins);
         // Each role's latest hold, a cleared one left out; each instance's
         // latest archive.

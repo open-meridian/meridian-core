@@ -227,6 +227,8 @@ impl Sidecar {
                 "launched with roles that are refused: {refusal}"
             );
         }
+        // Its plugin's reads named by what it has seen (contract v30, stage B).
+        crate::read_after::Seen::keep_on(&bus);
         let configuration = crate::configuration::Configuration::new(
             Arc::clone(&bus),
             identity.instance_id.clone(),
@@ -1375,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v30"] {
+        for declared in ["v1", "v31"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -1384,7 +1386,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v29"));
+            assert!(reply.refusal_reason.contains("v2 through v30"));
             assert!(sc.registration().is_none());
         }
     }

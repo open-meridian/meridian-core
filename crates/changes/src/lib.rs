@@ -39,6 +39,9 @@ use prost::Message;
 
 pub mod captured;
 pub mod integrity;
+pub mod records;
+pub mod serving;
+pub mod timeline;
 pub mod tls;
 
 /// The most a page of changes holds, encoded (1056: 512 KiB pages).
@@ -78,6 +81,8 @@ pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
     // TLS where the deployment's internal TLS is on, or the URL asks for
     // it; in the clear, as always, otherwise (ruling 1084).
     tls::database_tls_mode(&mut config, tls::names_ssl_mode(url));
+    // A serving process's own login and its session's bounds (section 10a).
+    serving::applied(&mut config);
     Ok(config)
 }
 
@@ -219,6 +224,10 @@ pub trait ChangeLog: Send + Sync {
 
 /// Serve `platform.{domain}.internal.read-changes` from `log`.
 pub fn serve(bus: &Arc<Bus>, domain: &str, log: Arc<dyn ChangeLog>) {
+    // Its reads held to their `read_after` (contract v30, stage B): never
+    // answered from behind the watermark a read names, by this log's heads.
+    bus.reads_after()
+        .keep(domain, Arc::new(LogPosition(Arc::clone(&log))));
     let topic = read_changes_topic(domain);
     let named = topic.clone();
     let serving = interest_key(bus, domain);
@@ -318,6 +327,12 @@ pub fn followed(bus: &Bus, domain: &str) -> bool {
 pub fn publish(bus: &Bus, domain: &str, after: u64, changes: &[Change]) {
     if changes.is_empty() {
         return;
+    }
+    // Committed by this process, so a read naming no more is answered with
+    // no look at the record (contract v30, stage B).
+    for change in changes {
+        bus.reads_after()
+            .committed(domain, &change.partition, change.sequence);
     }
     if !followed(bus, domain) {
         TAIL_WITHHELD.fetch_add(changes.len() as u64, Ordering::Relaxed);
@@ -432,6 +447,22 @@ pub fn set_origin(deployment_id: &str) {
 /// This process's deployment, as every change it makes carries it.
 pub fn origin() -> &'static str {
     ORIGIN.get().map(String::as_str).unwrap_or("")
+}
+
+/// This process's member, its pod's name (step 3b): who a store's writer
+/// says raised its epoch, where it raises one itself on a new database
+/// timeline (contract v30, stage C). Set once by the runtime; empty in a
+/// test.
+static MEMBER: OnceLock<String> = OnceLock::new();
+
+/// Name this process's member, once.
+pub fn set_member(name: &str) {
+    let _ = MEMBER.set(name.to_string());
+}
+
+/// This process's member.
+pub fn member() -> &'static str {
+    MEMBER.get().map(String::as_str).unwrap_or("")
 }
 
 /// How long a takeover waits for each deposed writer's session it ends to
@@ -555,6 +586,10 @@ impl Fence {
 pub struct TookOver {
     /// The member taking over: its pod's name.
     pub member: String,
+    /// The member that held the lease before, its pod's name; empty where
+    /// none did or it is not known (contract v30, stage D: the record's
+    /// `previous_member`).
+    pub previous: String,
     /// Why: the lease lapsed, the writer released it, or nobody held it.
     pub why: String,
     /// When, in the deployment's time.
@@ -566,6 +601,7 @@ impl TookOver {
     pub fn unnamed(why: &str) -> Self {
         Self {
             member: String::new(),
+            previous: String::new(),
             why: why.to_string(),
             at_ns: now_ns(),
         }
@@ -613,3 +649,28 @@ impl std::error::Error for Fenced {}
 
 #[cfg(test)]
 mod tests;
+
+/// A store's member's position in its record, for `read_after` (contract
+/// v30, stage B): each partition's head, as its change log reads it. A
+/// partition the record does not hold is absent, so a read naming it waits.
+struct LogPosition(Arc<dyn ChangeLog>);
+
+impl meridian_bus::read_after::Position for LogPosition {
+    fn heads(
+        &self,
+        partitions: &[String],
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
+        let mut heads = std::collections::HashMap::new();
+        for partition in partitions {
+            // From past the head: the head alone, no change read.
+            match self.0.read_changes(partition, i64::MAX as u64, 1) {
+                Ok(reply) => {
+                    heads.insert(partition.clone(), reply.head);
+                }
+                Err(ReadError::UnknownPartition(_)) => {}
+                Err(failed) => return Err(failed.to_string()),
+            }
+        }
+        Ok(heads)
+    }
+}

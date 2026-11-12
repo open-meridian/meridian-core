@@ -88,21 +88,36 @@ database:
     # Standbys beside the primary (step 3b; spec/a-deployment-scales-out-
     # and-fails-over-by-configuration section 4): 0, the tolerant default,
     # one database restarted on its volume; or 2, a primary and two standbys
-    # under Patroni, each on its own volume and node, one synchronous and
-    # strict, so the book's, the street store's, the instrument store's and
+    # under Patroni, each on its own volume and node, a quorum of either
+    # (ANY 1, strict; contract v30, stage C), so the book's, the street store's, the instrument store's and
     # the configuration's commits survive the primary (RPO 0) and a primary
     # lost is answered for within 30 s (ruling 1048). By the profile: 0
     # tolerant, 2 ha. Patroni keeps its state in this namespace's ConfigMaps.
     # A firm running Postgres for production names an external managed one
     # with its provider's synchronous standby instead (database.existingSecret).
     # standbys:
+    # Record-read replicas (contract v30, stage C): 0, as by default, or 1,
+    # an asynchronous member under Patroni tagged nosync and nofailover --
+    # never in the synchronous quorum, never promoted -- from which each
+    # store's readers read the record's past. The chart wires them itself
+    # (stage C2, approved 2026-11-11): the store's own URL on the replica's
+    # host, `<release>-database-<n>`, a Service of its own; nothing to edit
+    # by hand. A store's <store>.database.readExistingSecret, where set,
+    # names its own instead. A record read there is stamped from its own
+    # snapshot. The HA standbys serve no reads. Each member is given the
+    # same memory and max_connections as the primary.
+    # readReplicas: 0
     # Its max_connections, counted from what this chart deploys (ruled
     # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
-    # standby and a rollout's surge; each dashboard copy's 4 and 1; 6 for
+    # standby and a rollout's surge, and in ha 2 more for each lake member's
+    # write-ahead writer (stage E); each dashboard copy's 4 and 1; 6 for
     # jobs; 4 kept for the superuser and Patroni; a quarter over that. 82
-    # tolerant, 213 ha. Set it to override; below what the pods hold is
+    # tolerant, 220 ha. Set it to override; below what the pods hold is
     # refused. Each connection may take work_mem (4 MiB) under load, which
-    # the preflight counts against the memory limit above.
+    # the preflight counts against the memory limit above. With standbys
+    # the limit is the preflight's own count -- shared buffers and work_mem
+    # for every connection allowed -- with a quarter's room, 1280Mi at 220,
+    # or the limit above where that is more.
     # maxConnections:
     # The image the members run under Patroni: postgres:16-alpine's server
     # with Patroni and pgBackRest (deploy/database). Once a database has run
@@ -268,6 +283,20 @@ instrument:
   # standby:
   # A standby's readiness bound: its lag behind the writer's change log.
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
+  # A read replica's URL, in this Secret under database.key (contract v30,
+  # stage B): a reader answers a record's history from it once it has
+  # reached the read's watermark. Empty, as by default: the brought
+  # database's record-read replica where database.brought.readReplicas is
+  # above 0, wired by the chart (stage C2); the primary otherwise.
+  database:
+    readExistingSecret: ""
   image:
     tag: ""
   # The hot layer (step 3a): records by ID and what each became, answered
@@ -330,11 +359,25 @@ bor:
     intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
   image:
     tag: ""
   database:
     existingSecret: ""
     key: ""
+    # A read replica's URL, in this Secret under the same key (contract
+    # v30, stage B): a reader answers the record's past -- as of a time,
+    # ranges, past dates, history -- from it once it has reached the read's
+    # watermark. Empty, as by default: the brought database's record-read
+    # replica where database.brought.readReplicas is above 0, wired by the
+    # chart (stage C2); the primary otherwise.
+    readExistingSecret: ""
   # The book replays an account's journal for each command and each dated
   # read, so it needs more room than the other components (approved
   # 2026-10-15, after a development pod at 256Mi was OOMKilled). Replaces
@@ -375,6 +418,13 @@ lake:
     intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
+  # Reader members (contract v30, stage B; spec section 5): the same image
+  # in a reads-only mode, serving this store's latest and by-ID reads from a
+  # hot layer the writer's change log keeps current, ready while its lag is
+  # under readyLagMs. A read naming a watermark a reader has not reached
+  # waits up to readyLagMs or the call's deadline less a second, then is
+  # answered from the primary. 0, as by default, for none.
+  readers: 0
   image:
     tag: ""
   # glibc's allocator arenas, at most this many, as the book's: a chain
@@ -415,6 +465,30 @@ lake:
   database:
     existingSecret: ""
     key: ""
+    # A read replica's URL, in this Secret under the same key (contract
+    # v30, stage B): a reader answers the record's past -- as of a time,
+    # ranges, past dates, history -- from it once it has reached the read's
+    # watermark. Empty, as by default: the brought database's record-read
+    # replica where database.brought.readReplicas is above 0, wired by the
+    # chart (stage C2); the primary otherwise.
+    readExistingSecret: ""
+  # The write-ahead stream's bounds (contract v30, stage E; the resilience
+  # spec's sections 4 and 11): in ha a data plugin's lake writes are held by
+  # a JetStream stream on the broker's three servers until the lake records
+  # them; off in tolerant, which has no stream. maxAge: how long it holds a
+  # write the lake has not recorded -- a writer gone longer leaves a gap,
+  # recorded and recovered by its dataset's declaration -- as 30s, 10m or
+  # 1h. maxBytes: how much it holds, in MB or GB; full, it refuses a new
+  # write, its plugin refused for load with a retry-after, and drops none it
+  # holds. Sized from the measured rate: a 100-row batch takes about 117
+  # bytes a row in the stream, so 256MB is about 2.2 million rows -- ten
+  # minutes at 3,600 rows a second, three at the lake's 12,000 -- beyond
+  # the two minutes of the slowest recovery that stops the writer (a
+  # zone's). Each server's JetStream store is sized to hold it beside the
+  # analytics units' queue.
+  writeAhead:
+    maxAge: 10m
+    maxBytes: 256MB
 
 # The analytics component (contract v26, W12): a coordinator and a pool of
 # workers, its own image from the same commit, its own credential.
@@ -456,6 +530,17 @@ analytics:
   # How long a routed pricing plugin has to answer a batch before the
   # figures through it are not evaluated (W12.3, requirement 22).
   priceDeadlineMs: 5000
+  # Contract v30 (W12.4; spec/one-data-access-model section 4): standing
+  # jobs, each computed once for every client with its key and kept
+  # current. A job no sidecar's renewal named within leaseSeconds is
+  # stopped (a sidecar renews every 20 s, so 30 or more); one past `most`
+  # held by a coordinator is refused FAILED_PRECONDITION naming standing.
+  # `most` is an interim value until core's bench sets it: each job holds
+  # its current answer (a chain's about 1.2 MB on dev) beside the answers
+  # kept.
+  standing:
+    leaseSeconds: 30
+    most: 256
 
 # Installed for development (spec/live-plugin-development, ruling 2): it may
 # run plugin code as it is being written, which nobody has reviewed, and every
@@ -587,6 +672,16 @@ broker:
   jetstream:
     size: 1Gi
     storageClassName: ""
+    # What JetStream holds in memory on each server (stage M; section 10a).
+    maxMemory: 16MB
+  # The broker's bounds (stage M; section 10a; approved 2026-11-09): a
+  # client that stops reading is cut off alone, as a slow consumer, once
+  # maxPending bytes wait for it, and every other keeps its deliveries; the
+  # largest message is maxPayload, the 1 MiB every paged answer is budgeted
+  # under -- never raised to fit an answer: page it.
+  limits:
+    maxPending: 64MB
+    maxPayload: 1MB
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so
@@ -836,6 +931,21 @@ resources:
 
 logLevel: info
 
+# Each component's working memory (stage M; the resilience spec's section
+# 10a; approved 2026-11-09): a component's budget is its container's memory
+# limit times budgetPercent, less its hot layer's and held answers' bounds,
+# and every request reserves its working memory against it before it runs;
+# with the budget full a request waits briefly, then is refused
+# RESOURCE_EXHAUSTED with REFUSAL_REASON_OVERLOADED and a retry-after.
+# Above shedPercent of its limit a component cancels its largest request in
+# flight with the same refusal, so the kernel's OOM killer never fires. A
+# configuration that leaves a component nothing to answer with is refused
+# before it is applied. Raising a limit is not the fix for a component that
+# refuses (808); lowering the bound that holds the memory is.
+memory:
+  budgetPercent: 80
+  shedPercent: 90
+
 sidecar:
   # Where a plugin dials its sidecar, on loopback. A plugin runs as a second
   # container in its sidecar's pod, which is what sharing a network namespace
@@ -850,6 +960,22 @@ sidecar:
   # and closed by a NetworkPolicy to everything but the dashboard's pods. The
   # plugin's own page stays on loopback, where only its sidecar reaches it.
   frontDoorPort: 9292
+  # Each plugin's own share at its sidecar (stage M; section 10a; approved
+  # 2026-11-09): at most inFlight requests at once, requestsPerSecond with a
+  # burst of a second's worth, and answerMiB of answers held or paged in
+  # flight for it. Past any of them only that plugin is refused,
+  # RESOURCE_EXHAUSTED with REFUSAL_REASON_RATE_LIMITED and a retry-after; a
+  # bulk act counts as one request. A sidecars[] entry's own `limits`
+  # overrides these for that plugin, as does a launch's. Set from the
+  # throughput bench (ruled 2026-11-11): the book takes the most proposals
+  # with about 8 in flight, past which its rate falls and its latency
+  # climbs, and takes more a second than 200 across many accounts; a page
+  # is at most 1 MiB, so 32 MiB holds every request in flight's answer
+  # twice over.
+  limits:
+    inFlight: 16
+    requestsPerSecond: 400
+    answerMiB: 32
 
 nameOverride: ""
 fullnameOverride: ""

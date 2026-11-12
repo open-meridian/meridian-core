@@ -25,6 +25,9 @@ pub const ISO_4217: &str = "ISO 4217";
 pub fn to_wire(instrument: &Instrument) -> PbInstrument {
     let mut offers: Vec<OfferedValue> =
         instrument.offers.iter().filter_map(offer_to_wire).collect();
+    // Contract v30 (W3.10; ruling 433): a bond's terms offered at their
+    // paths, one bond value per source over the terms held.
+    offers.extend(bond_offers(instrument));
     offers.extend(derived_offers(instrument).iter().filter_map(offer_to_wire));
     let mut wire = PbInstrument {
         instrument_id: instrument.instrument_id.clone(),
@@ -118,9 +121,63 @@ fn source_to_wire(source: &Source) -> InstrumentValueSource {
     }
 }
 
+/// A bond record's terms offered at their paths (W3.23), as the wire
+/// carries them from contract v30 (W3.10; ruling 433): one
+/// `InstrumentValue.bond` per plugin instance offering, the record's terms
+/// with each of that source's terms laid on them, its words naming the
+/// paths, at the latest offer's time. A term no bond carries, or one on a
+/// record of another debt type, which `InstrumentValue` has no member for,
+/// stays kept in the store only.
+fn bond_offers(instrument: &Instrument) -> Vec<OfferedValue> {
+    if instrument_type::read(&instrument.instrument_type) != Some(InstrumentType::Bond) {
+        return Vec::new();
+    }
+    let held: Option<meridian_domain::v1::Bond> =
+        instrument_type::terms_from_text(&instrument.listed_terms);
+    let mut sources: Vec<&str> = Vec::new();
+    for offer in instrument.offers.iter().filter(|o| o.field == Field::Term) {
+        if !sources.contains(&offer.instance_id.as_str()) {
+            sources.push(&offer.instance_id);
+        }
+    }
+    sources
+        .into_iter()
+        .filter_map(|instance| {
+            let terms: Vec<&Offer> = instrument
+                .offers
+                .iter()
+                .filter(|o| o.field == Field::Term && o.instance_id == instance)
+                .collect();
+            let laid: Vec<(&str, &str)> = terms
+                .iter()
+                .map(|o| (o.path.as_str(), o.value.as_str()))
+                .collect();
+            let bond = meridian_domain::debt::bond_with_terms(held.as_ref(), &laid)?;
+            let mut said: Vec<&str> = terms.iter().map(|o| o.source.as_str()).collect();
+            said.dedup();
+            Some(OfferedValue {
+                value: Some(InstrumentValue {
+                    value: Some(instrument_value::Value::Bond(bond)),
+                    source: format!(
+                        "{}: {}",
+                        said.join("; "),
+                        terms
+                            .iter()
+                            .map(|o| o.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }),
+                instance_id: instance.to_string(),
+                offered_at_ns: terms.iter().map(|o| o.offered_at_ns).max().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 /// An offer as the wire carries it; `None` for a term offered at its
-/// template path (W3.23), which `InstrumentValue` has no member for until
-/// the contract gives it one: kept in the store, its provenance with it.
+/// template path (W3.23), which a bond's terms carry together
+/// ([`bond_offers`]).
 fn offer_to_wire(offer: &Offer) -> Option<OfferedValue> {
     Some(OfferedValue {
         value: Some(InstrumentValue {
@@ -196,8 +253,9 @@ pub fn field_to_wire(field: Field) -> InstrumentField {
         Field::InstrumentType => InstrumentField::InstrumentType,
         Field::MoneyMarketFund => InstrumentField::MoneyMarketFund,
         Field::BinaryEventContract => InstrumentField::BinaryEventContract,
-        // No member names a term until the contract gives it one.
-        Field::Term => InstrumentField::Unspecified,
+        // Contract v30 (W3.10; ruling 433): a term in force is a bond's,
+        // the only terms a person puts in force as a value.
+        Field::Term => InstrumentField::Bond,
     }
 }
 
@@ -210,6 +268,8 @@ pub fn field_from_wire(value: i32) -> Option<Field> {
         InstrumentField::InstrumentType => Some(Field::InstrumentType),
         InstrumentField::MoneyMarketFund => Some(Field::MoneyMarketFund),
         InstrumentField::BinaryEventContract => Some(Field::BinaryEventContract),
+        // Contract v30's bond terms (W3.10; ruling 433): the record's terms.
+        InstrumentField::Bond => Some(Field::Term),
         InstrumentField::Unspecified => None,
     }
 }

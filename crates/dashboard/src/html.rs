@@ -310,7 +310,11 @@ input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins 
 th button.sort{margin:0;padding:0;border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}\
 th[aria-sort=ascending] button.sort::after{content:\" \\2191\"}th[aria-sort=descending] button.sort::after{content:\" \\2193\"}\
 .more{color:var(--ink-faint)}\
-fieldset.checks.picker{max-height:none;overflow:visible;min-width:0}\
+fieldset.checks.picker,fieldset.checks.limits{max-height:none;overflow:visible;min-width:0}\
+label.num{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin:.3rem 0}\
+label.num>input[type=number][name]{flex:0 0 6.5rem;width:6.5rem;margin:0;padding:.35rem .55rem}.limits .hint{margin:0 0 .35rem}\
+.pods{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1.25rem;margin:0 0 .9rem}.pods>label{margin:0}\
+.pods>p{flex:0 0 100%;margin:0}.field-refused{color:var(--danger);font-size:.84rem}\
 .picker-tools{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.25rem 0 .5rem}\
 .picker-tools input[type=search]{flex:1 1 12rem;min-width:0}.picker-tools button{margin:0;padding:.3rem .7rem;font-size:.84rem}\
 .picker-status{margin:0 0 .35rem;color:var(--ink-faint);font-size:.84rem}\
@@ -341,6 +345,7 @@ dialog::backdrop{background:var(--backdrop)}\
 .dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
 .dialog-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
 .dialog-foot button{margin:0}\
+.sheet-foot{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:.5rem}.sheet-foot button{margin:0}\
 .menu-pop>button.menu-close,header.bar .menu-pop>button.menu-close{display:block;width:auto;margin:0 0 .15rem auto;\
 padding:.05rem .45rem;border:0;background:none;font-size:1.15rem;line-height:1;color:var(--ink-faint)}\
 .menu-pop>button.menu-close:hover{color:var(--ink);background:var(--hover)}\
@@ -1593,6 +1598,14 @@ const SIDEBAR: [(&str, &[SidebarItem]); 5] = [
         "Deployment",
         &[
             ("time-zone", "Time zone", "/admin#time-zone", "clock", &[]),
+            // Contract v30 (W6.39): what the deployment survives.
+            (
+                "resilience",
+                "Resilience",
+                "/admin/resilience",
+                "shield",
+                &[],
+            ),
             (
                 "fx-pivots",
                 "FX pivot currencies",

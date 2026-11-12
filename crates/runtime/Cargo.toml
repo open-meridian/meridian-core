@@ -58,6 +58,7 @@ path = "src/bin/analytics.rs"
 
 [dependencies]
 meridian-clock.workspace = true
+meridian-budget.workspace = true
 meridian-bus = { path = "../bus" }
 meridian-instrument = { path = "../instrument" }
 meridian-street = { path = "../street" }

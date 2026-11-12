@@ -166,6 +166,10 @@ pub fn tables_sql(prefix: &str) -> String {
 }
 
 /// Keep a scrub's findings, each once, and its run: in one transaction.
+/// Each finding kept for the first time is also handed to `log`, in the same
+/// transaction, which appends it to the store's `control` partition as its
+/// `IntegrityFinding` (contract v30, stage D; [`crate::records`]); a store
+/// whose control log does not carry them yet passes [`unlogged`].
 pub fn record(
     client: &mut impl GenericClient,
     prefix: &str,
@@ -173,10 +177,11 @@ pub fn record(
     member: &str,
     started_at_ns: i64,
     finished_at_ns: i64,
+    log: impl Fn(&mut postgres::Transaction<'_>, &Finding, i64) -> Result<(), postgres::Error>,
 ) -> Result<(), postgres::Error> {
     let mut tx = client.transaction()?;
     for finding in &scrubbed.findings {
-        tx.execute(
+        let kept = tx.execute(
             &format!(
                 "INSERT INTO {prefix}_integrity_finding
                      (partition, sequence, committed_at_ns, what, member, origin, found_at_ns)
@@ -193,6 +198,9 @@ pub fn record(
                 &finished_at_ns,
             ],
         )?;
+        if kept == 1 {
+            log(&mut tx, finding, finished_at_ns)?;
+        }
     }
     tx.execute(
         &format!(
@@ -210,6 +218,35 @@ pub fn record(
         ],
     )?;
     tx.commit()
+}
+
+/// [`record`]'s `log` for a store whose control log does not carry its
+/// findings: the book's, until its journal does (contract v30, stage D).
+pub fn unlogged(
+    _: &mut postgres::Transaction<'_>,
+    _: &Finding,
+    _: i64,
+) -> Result<(), postgres::Error> {
+    Ok(())
+}
+
+/// [`record`]'s `log` for a captured store (`spec`): each finding appended
+/// to its control partition.
+pub fn logged_in(
+    spec: &crate::captured::Spec,
+) -> impl Fn(&mut postgres::Transaction<'_>, &Finding, i64) -> Result<(), postgres::Error> + '_ {
+    move |tx, finding, found_at_ns| {
+        spec.log_control(
+            tx,
+            &crate::records::Record::Finding(crate::records::finding(
+                spec.component,
+                meridian_domain::v1::IntegrityCheck::RowDigest,
+                finding,
+                found_at_ns,
+            )),
+            found_at_ns,
+        )
+    }
 }
 
 /// The last scrub, as `status` and the probe read it: when it finished,

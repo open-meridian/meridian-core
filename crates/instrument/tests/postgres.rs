@@ -1115,11 +1115,67 @@ fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() 
         "no hole where the refused commit was"
     );
     assert_eq!(page.epoch, 2);
-    assert!(standby
+    // The control partition holds the takeover's record alone, under the
+    // epoch it raised (contract v30, stage D): the record the conductor
+    // reads. The store's own partition is untouched by it.
+    let control = standby
         .read_changes("control", 0, meridian_changes::PAGE_MOST)
-        .unwrap()
+        .unwrap();
+    let numbered: Vec<(u64, u64)> = control
         .changes
-        .is_empty());
+        .iter()
+        .map(|c| (c.sequence, c.epoch))
+        .collect();
+    assert_eq!(numbered, vec![(1, 2)]);
+    assert_eq!(
+        meridian_changes::integrity::digest(&control.changes[0].body),
+        control.changes[0].digest
+    );
+    let records = meridian_changes::records::of_change(&control.changes[0]);
+    let [meridian_changes::records::Record::TookOver(took)] = records.as_slice() else {
+        panic!("the takeover's record: {records:?}")
+    };
+    assert_eq!(
+        (took.component.as_str(), took.epoch, took.partitions.clone()),
+        (
+            "instrument",
+            2,
+            vec!["instrument".to_string(), "control".to_string()]
+        )
+    );
+    // A finding kept is the store's `IntegrityFinding` there too, once
+    // however often it is kept.
+    let scrubbed = meridian_changes::integrity::Scrubbed {
+        checked: 1,
+        filled: 0,
+        findings: vec![meridian_changes::integrity::Finding {
+            partition: "instrument".into(),
+            sequence: 1,
+            committed_at_ns: 5,
+            what: "a row does not match its digest: the record changed beneath the store".into(),
+        }],
+    };
+    standby.record_scrub(&scrubbed, "test", 1, 2).unwrap();
+    standby.record_scrub(&scrubbed, "test", 3, 4).unwrap();
+    let control = standby
+        .read_changes("control", 1, meridian_changes::PAGE_MOST)
+        .unwrap();
+    let records: Vec<_> = control
+        .changes
+        .iter()
+        .flat_map(meridian_changes::records::of_change)
+        .collect();
+    let [meridian_changes::records::Record::Finding(found)] = records.as_slice() else {
+        panic!("the finding's record, once: {records:?}")
+    };
+    assert_eq!(
+        (
+            found.component.as_str(),
+            found.first_bad_sequence,
+            found.found_at_ns
+        ),
+        ("instrument", 1, 2)
+    );
     assert!(standby
         .read_changes("elsewhere", 0, meridian_changes::PAGE_MOST)
         .is_err());
@@ -1158,4 +1214,168 @@ fn a_store_that_held_rows_before_its_log_sends_a_follower_from_the_start_to_relo
         .unwrap();
     assert_eq!(after.changes.len(), 1);
     assert_eq!(after.lowest_kept, 2);
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 3): the list of
+/// records to complete reads the store a chunk at a time, counting each
+/// record as it is read and keeping only those its page reaches; its heap
+/// holds a chunk and a page, never every record. 10,000 records, each with a
+/// long description, read for a page of ten.
+#[test]
+fn the_list_to_complete_holds_a_chunk_and_its_page_never_every_record() {
+    use meridian_domain::v1::ListInstrumentsToCompleteRequest;
+    let store = store();
+    let tag = unique("LIST");
+    for n in 0..10_000 {
+        let id = format!("LCL-{tag}-{n:05}");
+        let symbol = format!("{tag}-{n}");
+        let mut held = record(&id, vec![identifier("symbol", &symbol, "snaptrade", 0)]);
+        held.description = format!(
+            "{tag} {n} {}",
+            "a long description of the record ".repeat(40)
+        );
+        let key = IdentifierSet::new([asked("symbol", &symbol, "snaptrade")]).key();
+        store.mint(held, &key, entry(&id, 1, "mint")).unwrap();
+    }
+    let request = ListInstrumentsToCompleteRequest {
+        page_size: 10,
+        include_complete: true,
+        search: tag.to_lowercase(),
+        ..Default::default()
+    };
+    // Once to warm the pool's connections, then measured.
+    meridian_instrument::list::list_to_complete(&store, &request).unwrap();
+    counted::take();
+    let listed = meridian_instrument::list::list_to_complete(&store, &request).unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(listed.instruments.len(), 10);
+    assert!(!listed.next_cursor.is_empty(), "more pages");
+    let whole_mib = 10_000.0 * 1_400.0 / 1048576.0;
+    println!("LIST heap_peak_mib={peak:.2} descriptions_alone_mib={whole_mib:.1}");
+    assert!(
+        peak * 3.0 < whole_mib,
+        "the list's heap peaked at {peak:.2} MiB; the descriptions alone are {whole_mib:.1} MiB"
+    );
+    // The page reads on: its next page starts where this one ended.
+    let next = meridian_instrument::list::list_to_complete(
+        &store,
+        &ListInstrumentsToCompleteRequest {
+            cursor: listed.next_cursor.clone(),
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    let first: Vec<_> = listed
+        .instruments
+        .iter()
+        .map(|i| i.instrument.as_ref().unwrap().instrument_id.clone())
+        .collect();
+    let second: Vec<_> = next
+        .instruments
+        .iter()
+        .map(|i| i.instrument.as_ref().unwrap().instrument_id.clone())
+        .collect();
+    assert!(
+        first.iter().all(|id| !second.contains(id)),
+        "no record on both pages"
+    );
+    assert!(first.last() < second.first(), "in the list's order");
+}
+
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Counting;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(at, layout) };
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+    }
+
+    /// The heap's peak since the last take, and now, in MiB.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.load(Ordering::Relaxed);
+        let peak = PEAK.swap(live, Ordering::Relaxed);
+        (live as f64 / 1048576.0, peak as f64 / 1048576.0)
+    }
+}
+
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3), in a store that captures its log: the
+/// identity a writer first sees is kept; another raises the epoch, recorded
+/// with that cause, and the writer's connections are named with it.
+#[test]
+fn a_new_database_timeline_raises_a_captured_stores_epoch() {
+    use meridian_changes::timeline::Timeline;
+    let (url, store) = isolated();
+    let epoch = store.adopt().unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::First);
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Same);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .execute(
+            "UPDATE instrument_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::Moved(epoch + 1));
+    assert_eq!(store.epoch(), epoch + 1);
+    assert_eq!(store.head_epoch().unwrap(), epoch + 1);
+    let why: String = admin
+        .query_one(
+            "SELECT why FROM instrument_writer_took_over WHERE epoch = $1",
+            &[&((epoch + 1) as i64)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+}
+
+/// A record read on a read replica answers from one snapshot and says its
+/// change log's head rows (contract v30, stage C2; the resilience spec's
+/// section 5): a record's history and a match as of a time each read in one
+/// repeatable-read snapshot with the heads beside, which the reader holds to
+/// the read's `read_after`. Not asked, nothing is said; and the connection
+/// goes back to the pool in no transaction, so the next write commits.
+#[test]
+fn a_record_read_answers_from_one_snapshot_and_says_its_heads() {
+    use meridian_instrument::postgres::{snapshot_heads, stamp_from_snapshot};
+    let store = store();
+    let held = minted(&store, "STAMP");
+    let symbol = held.identifiers[0].value.clone();
+    stamp_from_snapshot();
+    let history = store.history(&held.instrument_id).unwrap();
+    let heads = snapshot_heads().expect("the snapshot's heads");
+    assert_eq!(history.len(), 1);
+    assert!(heads.contains_key("instrument"), "{heads:?}");
+    stamp_from_snapshot();
+    let found = store
+        .matching("symbol", &symbol, "snaptrade", i64::MAX)
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(snapshot_heads().is_some_and(|heads| heads.contains_key("instrument")));
+    // Not asked: nothing said.
+    store.history(&held.instrument_id).unwrap();
+    assert!(snapshot_heads().is_none());
+    // Every pooled connection free of the snapshots: writes go on.
+    for _ in 0..6 {
+        minted(&store, "AFTER");
+    }
 }

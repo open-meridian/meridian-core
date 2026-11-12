@@ -251,6 +251,9 @@ spec:
                   key: {{ .Values.launcher.instanceId }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Its working memory (stage M; the resilience spec's section 10a),
+            # and glibc's arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "launcher" "values" .Values.launcher "resources" .Values.resources "heldMiB" 0 "name" "launcher") | nindent 12 }}
             {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
             {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}

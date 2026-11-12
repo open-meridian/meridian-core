@@ -283,6 +283,229 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
     assert_eq!(store.lowest_kept(&unique("none")).unwrap(), None);
 }
 
+/// Stage M (the store memory audit of 2026-11-09, item 4): a catch-up from
+/// an old watermark -- the whole dataset -- is handed on a chunk at a time as
+/// the database answers it, each row key at its version in force and in the
+/// order recorded, never read whole first. Its heap holds a chunk: well under
+/// a tenth of the set decoded whole.
+#[test]
+fn a_catch_up_from_an_old_watermark_holds_a_chunk_never_the_dataset() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    const ROWS: usize = 40_000;
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                trade(
+                    &dataset,
+                    &format!("t{}", batch * 500 + n),
+                    &subject,
+                    1_000 + n as i64,
+                )
+            })
+            .collect();
+        store.record(&dataset, rows, 1_000 + batch as i64).unwrap();
+    }
+    // Ten row keys restated: each answered once, at its later version.
+    let restated: Vec<Observation> = (0..10)
+        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .collect();
+    store.record(&dataset, restated, 5_000).unwrap();
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Trade,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::After([(dataset.clone(), 0)].into()),
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    let mut whole_bytes = 0usize;
+    let mut answered = 0usize;
+    let mut last_sequence = 0u64;
+    let mut versions_two = 0usize;
+    counted::take();
+    store
+        .read_each(&query, &mut |row| {
+            whole_bytes += meridian_lake::pages::row_bytes(&row);
+            answered += 1;
+            assert!(row.meta().sequence > last_sequence, "in the order recorded");
+            last_sequence = row.meta().sequence;
+            if row.meta().version == 2 {
+                versions_two += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(answered, ROWS, "each row key once");
+    assert_eq!(versions_two, 10, "a restated key at its version in force");
+    let whole_mib = whole_bytes as f64 / 1048576.0;
+    println!("CATCH_UP heap_peak_mib={peak:.1} whole_set_mib={whole_mib:.1}");
+    assert!(
+        peak * 10.0 < whole_mib,
+        "the catch-up's heap peaked at {peak:.1} MiB against the set's {whole_mib:.1} MiB decoded"
+    );
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 12): a read loads the
+/// closed-day re-checks of the rows it answers, beside each chunk, never
+/// every re-check its dataset ever had. A day's read of a dataset re-checked
+/// 20,000 times holds a few kilobytes of them, and still answers the flag
+/// as re-checked.
+#[test]
+fn a_read_loads_the_closed_day_rechecks_of_its_rows_alone() {
+    use meridian_domain::v1::{DateCheck, DateCheckReason};
+    use meridian_lake::store::ClosedDayAmendment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let other = unique("LCL-ETH");
+    const ROWS: usize = 20_000;
+    let mut sequences = Vec::new();
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                close(
+                    &dataset,
+                    &format!("k{}", batch * 500 + n),
+                    &other,
+                    "2026-10-12",
+                    10,
+                )
+            })
+            .collect();
+        let done = store.record(&dataset, rows, 1_000).unwrap();
+        sequences.extend(done.rows.iter().map(|row| row.meta().sequence));
+    }
+    let asked = store
+        .record(
+            &dataset,
+            vec![close(&dataset, "asked", &subject, "2026-10-13", 10)],
+            1_000,
+        )
+        .unwrap()
+        .rows[0]
+        .meta()
+        .sequence;
+    sequences.push(asked);
+    let recheck = |sequence: u64| ClosedDayAmendment {
+        dataset: dataset.clone(),
+        sequence,
+        closed_day: Some(DateCheck {
+            date: "2026-10-13".into(),
+            reason: DateCheckReason::Holiday as i32,
+            holiday_name: format!("A closure re-checked for row {sequence} of the dataset"),
+            ..Default::default()
+        }),
+        why: "calendar CAL-USSS version 2 applied".into(),
+        at_ns: 2_000,
+    };
+    for chunk in sequences.chunks(1_000) {
+        let rechecks: Vec<ClosedDayAmendment> = chunk.iter().map(|s| recheck(*s)).collect();
+        store.amend_closed_day(&rechecks).unwrap();
+    }
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    // Once to warm the pool's connections, then measured.
+    store.read(&query).unwrap();
+    counted::take();
+    let read = store.read(&query).unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        read[0].meta().closed_day.as_ref().unwrap().reason,
+        DateCheckReason::Holiday as i32,
+        "the flag as re-checked"
+    );
+    println!(
+        "RECHECKS heap_peak_mib={peak:.2} rechecks={}",
+        sequences.len()
+    );
+    assert!(
+        peak < 1.0,
+        "a read of one row held {peak:.2} MiB; every re-check of the dataset is about 4 MiB"
+    );
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 6): a whole dataset's
+/// read -- how one account's execution costs and the saved scenarios are
+/// read -- hands each row key on at its version in force, a chunk at a time,
+/// in sequence order, the same rows `read_dataset` answers; the reader keeps
+/// what it answers, and the heap holds a chunk, never the dataset.
+#[test]
+fn a_whole_datasets_read_hands_on_a_chunk_at_a_time() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    const ROWS: usize = 40_000;
+    for batch in 0..ROWS / 500 {
+        let rows = (0..500)
+            .map(|n| {
+                trade(
+                    &dataset,
+                    &format!("t{}", batch * 500 + n),
+                    &subject,
+                    1_000 + n as i64,
+                )
+            })
+            .collect();
+        store.record(&dataset, rows, 1_000 + batch as i64).unwrap();
+    }
+    let restated: Vec<Observation> = (0..10)
+        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .collect();
+    store.record(&dataset, restated, 5_000).unwrap();
+    let mut whole_bytes = 0usize;
+    let mut kept = Vec::new();
+    let mut answered = 0usize;
+    let mut last = 0u64;
+    counted::take();
+    store
+        .read_dataset_each(&dataset, DataType::Trade, 0, &mut |row| {
+            whole_bytes += meridian_lake::pages::row_bytes(&row);
+            answered += 1;
+            assert!(row.meta().sequence > last, "in sequence order");
+            last = row.meta().sequence;
+            // What a reader keeps: one row in a thousand.
+            if row.meta().row_key.ends_with("000") {
+                kept.push(row);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (_, peak) = counted::take();
+    assert_eq!(answered, ROWS, "each row key once");
+    let whole = store.read_dataset(&dataset, DataType::Trade, 0, 0).unwrap();
+    assert_eq!(whole.len(), ROWS, "the rows read_dataset answers");
+    assert_eq!(
+        whole.iter().filter(|row| row.meta().version == 2).count(),
+        10,
+        "a restated key at its version in force"
+    );
+    let whole_mib = whole_bytes as f64 / 1048576.0;
+    println!(
+        "DATASET heap_peak_mib={peak:.1} whole_set_mib={whole_mib:.1} kept={}",
+        kept.len()
+    );
+    assert!(
+        peak * 10.0 < whole_mib,
+        "the read's heap peaked at {peak:.1} MiB against the set's {whole_mib:.1} MiB decoded"
+    );
+}
+
 fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation {
     Observation::Outcome(Box::new(meridian_domain::v1::Outcome {
         meta: Some(ObservationMeta {
@@ -1439,11 +1662,20 @@ fn said(m: &LakeMeasure) -> String {
 /// The floors are a quarter of what the gate's container measured
 /// (INSTALL.md, "Capacity"), so a slower CI runner passes and a
 /// regression of four times does not.
+///
+/// It runs alone (.config/nextest.toml, `lake-speed`), and says what it
+/// measured, beside its floors, on every run, passing or not: test-store
+/// prints the line, and its JUnit keeps it.
 #[test]
 fn a_chains_latest_loads_one_row_per_series() {
     let store = store();
     let measured = measure_chain(&store, 200, 100);
-    eprintln!("bench: {}", said(&measured));
+    println!(
+        "SPEED lake {} floors: record_rows_per_s>={GUARD_RECORD_ROWS_PER_S:.0} \
+         read_rows_per_s>={GUARD_READ_ROWS_PER_S:.0} latest_ms<={}",
+        said(&measured),
+        GUARD_LATEST.as_millis()
+    );
     assert!(
         measured.record_rows_per_s >= GUARD_RECORD_ROWS_PER_S,
         "the lake records {:.0} rows a second; its guard is {GUARD_RECORD_ROWS_PER_S}",
@@ -1461,9 +1693,11 @@ fn a_chains_latest_loads_one_row_per_series() {
     );
 }
 
-/// The guard's floors: a quarter of the stated capacity at 20,000 rows
-/// (2,449 rows a second recorded, 102,429 read, the latest in 222 ms), and
-/// four times its latest read.
+/// The guard's floors, set from the capacity stated on 2026-10-26 at 20,000
+/// rows (a quarter of 2,449 rows a second recorded and 102,429 read, and
+/// four times its latest read of 222 ms), and kept as they were when the
+/// record path was batched (2026-11-10; INSTALL.md now states about 15,000
+/// recorded and the latest in 14 ms).
 const GUARD_RECORD_ROWS_PER_S: f64 = 600.0;
 const GUARD_READ_ROWS_PER_S: f64 = 25_000.0;
 const GUARD_LATEST: std::time::Duration = std::time::Duration::from_millis(900);
@@ -1767,7 +2001,7 @@ mod chain_page {
     use meridian_lake::row::Observation;
     use meridian_lake::service;
     use meridian_lake::{PostgresStore, Store};
-    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+    use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
     use prost::Message;
 
     /// The reader: a plugin's instance, as its sidecar asks.
@@ -1884,10 +2118,6 @@ mod chain_page {
                     ],
                     modes: vec![ObservationMode::Pull as i32],
                     cadence: 60,
-                    licence_default: Some(DatasetLicence {
-                        kept: true,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3779,8 +4009,34 @@ fn the_control_partition_logs_what_is_not_a_row_and_is_fenced() {
     let after = standby
         .read_changes(meridian_changes::CONTROL, 4, meridian_changes::PAGE_MOST)
         .unwrap();
-    assert_eq!(after.changes.len(), 1);
-    assert_eq!(after.changes[0].epoch, 2);
+    // The takeover is a change in the control partition itself, under the
+    // epoch it raised, before the new writer's first (contract v30, stage
+    // D): the record the conductor reads.
+    let kinds: Vec<(&str, u64, u64)> = after
+        .changes
+        .iter()
+        .map(|c| (c.kind.as_str(), c.sequence, c.epoch))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (meridian_changes::records::TOOK_OVER, 5, 2),
+            (CONTROL_ALIAS, 6, 2)
+        ]
+    );
+    let took = meridian_changes::records::of_change(&after.changes[0]);
+    let [meridian_changes::records::Record::TookOver(took)] = took.as_slice() else {
+        panic!("the takeover's record: {took:?}")
+    };
+    assert_eq!(
+        (took.component.as_str(), took.epoch, took.partitions.last()),
+        ("lake", 2, Some(&"control".to_string()))
+    );
+    assert_eq!(
+        meridian_changes::integrity::digest(&after.changes[0].body),
+        after.changes[0].digest,
+        "carried with its digest"
+    );
 }
 
 // ── Integrity at rest (step 3b) ─────────────────────────────────────────────
@@ -3847,6 +4103,40 @@ fn each_row_keeps_its_digest_and_the_scrub_names_one_changed_beneath_the_lake() 
         .unwrap()
         .get(0);
     assert!(filled, "the row kept before digests now has its own");
+    // Each finding kept is also the lake's `IntegrityFinding` in its control
+    // partition, once however often it is kept (contract v30, stage D).
+    store.record_scrub(&scrubbed, "test", 1, 2).expect("kept");
+    store
+        .record_scrub(&scrubbed, "test", 3, 4)
+        .expect("kept again, once");
+    let mut found = Vec::new();
+    meridian_changes::catch_up(
+        |after| store.read_changes(meridian_changes::CONTROL, after, 0),
+        0,
+        |change| {
+            for record in meridian_changes::records::of_change(change) {
+                if let meridian_changes::records::Record::Finding(f) = record {
+                    if f.partition == dataset {
+                        found.push(f);
+                    }
+                }
+            }
+        },
+    )
+    .expect("the control partition reads");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (
+            found[0].component.as_str(),
+            found[0].first_bad_sequence,
+            found[0].check
+        ),
+        (
+            "lake",
+            2,
+            meridian_domain::v1::IntegrityCheck::RowDigest as i32
+        )
+    );
 }
 
 /// The lake's whole-dataset reads, each bounded by a chunk (found on dev
@@ -3873,7 +4163,7 @@ mod bounded {
     use meridian_lake::service;
     use meridian_lake::store::Store;
     use meridian_lake::PostgresStore;
-    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+    use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
     use prost::Message;
 
     pub const READER: &str = "sample-bounded";
@@ -3967,10 +4257,8 @@ mod bounded {
                     modes: vec![ObservationMode::Pull as i32],
                     cadence: 86_400,
                     calendar_id,
-                    licence_default: Some(DatasetLicence {
-                        kept: true,
-                        ..Default::default()
-                    }),
+                    // Kept: no licence says otherwise (contract v30 retired
+                    // a catalogue's licence_default, ruling 1032).
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -4588,4 +4876,331 @@ fn a_dataset_read_as_published_keeps_a_row_a_key_never_every_version() {
         peak * 2.0 <= whole_peak,
         "the read's heap peaked at {peak:.1} MiB, choosing from every version {whole_peak:.1} MiB"
     );
+}
+
+/// Contract v30, stage E (the resilience spec's section 4): writes from the
+/// write-ahead stream recorded as one -- each dataset's parts numbered in
+/// turn, as one batch of it -- with the stream's position in the same
+/// commit; a batch that does not follow the position held is refused and
+/// records nothing, so a writer behind a failover goes back and takes the
+/// writes again, each recorded once.
+#[test]
+fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
+    use meridian_lake::store::{StoreError, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let stream = unique("STREAM");
+    let a = unique("coinbase-1:a");
+    let b = unique("coinbase-1:b");
+    let subject = unique("LCL-BTC");
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), None);
+    let at = |sequence: u64| WriteAheadPosition {
+        sequence,
+        at_ns: 1_000 + sequence as i64,
+    };
+    let done = store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: None,
+                through: at(3),
+                parts: vec![
+                    (a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 10)]),
+                    (b.clone(), vec![close(&b, "y", &subject, "2026-10-07", 20)]),
+                    // The same key again, a later part of the same dataset:
+                    // its next version, numbered after the first part.
+                    (a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)]),
+                ],
+                ..Default::default()
+            },
+            5_000,
+        )
+        .unwrap();
+    assert_eq!(
+        done.iter()
+            .map(|part| (part.recorded, part.restated, part.unchanged, part.head))
+            .collect::<Vec<_>>(),
+        vec![(1, 0, 0, 1), (1, 0, 0, 1), (0, 1, 0, 2)]
+    );
+    let second = done[2].rows[0].meta();
+    assert_eq!(
+        (second.sequence, second.version, second.previous_sequence),
+        (2, 2, 1)
+    );
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(3)));
+
+    // A writer that believes the stream is elsewhere is refused, and
+    // nothing of its batch is recorded.
+    let refused = store.record_write_ahead(
+        WriteAheadBatch {
+            stream: stream.clone(),
+            after: Some(at(2)),
+            through: at(4),
+            parts: vec![(a.clone(), vec![close(&a, "z", &subject, "2026-10-07", 30)])],
+            ..Default::default()
+        },
+        6_000,
+    );
+    assert!(
+        matches!(refused, Err(StoreError::PositionMoved(_))),
+        "{refused:?}"
+    );
+    assert_eq!(store.heads().unwrap()[&a], 2);
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(3)));
+
+    // From the position held, a write taken again changes nothing.
+    let again = store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: Some(at(3)),
+                through: at(4),
+                parts: vec![(a.clone(), vec![close(&a, "x", &subject, "2026-10-07", 11)])],
+                ..Default::default()
+            },
+            7_000,
+        )
+        .unwrap();
+    assert_eq!(
+        (again[0].recorded, again[0].restated, again[0].unchanged),
+        (0, 0, 1)
+    );
+    assert_eq!(store.heads().unwrap()[&a], 2);
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at(4)));
+}
+
+/// Contract v30, stage E (W10.14): what a batch from the write-ahead stream
+/// found -- the runs the stream dropped, each dataset's latest valid time,
+/// each gap -- commits with it, and each gap's next state is its own
+/// record, read back in order.
+#[test]
+fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
+    use meridian_domain::v1::{DatasetGap, GapCause, GapState};
+    use meridian_lake::store::{Dropped, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let stream = unique("STREAM");
+    let dataset = unique("coinbase-1:gaps");
+    let subject = unique("LCL-BTC");
+    let gap = DatasetGap {
+        gap_id: unique("GAP-TEST"),
+        dataset: dataset.clone(),
+        subjects: vec![subject.clone()],
+        valid_from_ns: 100,
+        valid_until_ns: 200,
+        cause: GapCause::WriteAheadBound as i32,
+        state: GapState::Refetching as i32,
+        recorded_at_ns: 5_000,
+        found_in_gap_id: String::new(),
+    };
+    // The run keeps the unattributed gap recorded for it (contract v30,
+    // stage C2), so a writer that starts names it too.
+    let dropped = Dropped {
+        first: 2,
+        last: 4,
+        after_at_ns: 1_001,
+        until_at_ns: 1_005,
+        gap_id: unique("GAP-UNATTRIBUTED"),
+    };
+    store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 5,
+                    at_ns: 1_005,
+                },
+                parts: vec![(
+                    dataset.clone(),
+                    vec![close(&dataset, "x", &subject, "2026-10-07", 10)],
+                )],
+                dropped: vec![dropped.clone()],
+                valid: vec![(dataset.clone(), 100)],
+                gaps: vec![gap.clone()],
+            },
+            5_000,
+        )
+        .unwrap();
+    let (found, valid) = store.write_ahead_found(&stream).unwrap();
+    assert_eq!(found, vec![dropped]);
+    assert_eq!(valid.get(&dataset), Some(&100));
+    let recovered = DatasetGap {
+        state: GapState::Recovered as i32,
+        recorded_at_ns: 6_000,
+        ..gap.clone()
+    };
+    store.record_gap(&recovered).unwrap();
+    let mine: Vec<DatasetGap> = store
+        .dataset_gaps()
+        .unwrap()
+        .into_iter()
+        .filter(|g| g.gap_id == gap.gap_id)
+        .collect();
+    assert_eq!(mine, vec![gap, recovered]);
+}
+
+/// Never blind (contract v30, W10.6; the resilience spec's section 8): a
+/// default read's source switches, and switches back, each its own record in
+/// the `control` partition, read back in the order recorded.
+#[test]
+fn a_source_switch_and_its_switch_back_are_kept_in_the_control_partition() {
+    use meridian_domain::v1::{SourceSwitchReason, SourceSwitched};
+    let store = store();
+    store.adopt().unwrap();
+    let from = unique("switch-a");
+    let to = unique("switch-b");
+    let before = store
+        .read_changes(meridian_changes::CONTROL, i64::MAX as u64, 1)
+        .unwrap()
+        .head;
+    let switch = |reason: SourceSwitchReason, a: &str, b: &str, at: i64| SourceSwitched {
+        data_type: "meridian.v1.Quote".into(),
+        kind: 0,
+        from_dataset: a.into(),
+        to_dataset: b.into(),
+        subjects: Vec::new(),
+        reason: reason as i32,
+        switched_at_ns: at,
+    };
+    store
+        .record_switches(&[switch(SourceSwitchReason::Stalled, &from, &to, 10)])
+        .unwrap();
+    store
+        .record_switches(&[switch(SourceSwitchReason::Restored, &to, &from, 20)])
+        .unwrap();
+    let mine: Vec<SourceSwitched> = store
+        .source_switches()
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.from_dataset == from || s.to_dataset == from)
+        .collect();
+    assert_eq!(
+        mine.iter().map(|s| s.reason).collect::<Vec<_>>(),
+        vec![
+            SourceSwitchReason::Stalled as i32,
+            SourceSwitchReason::Restored as i32
+        ]
+    );
+    let control = store
+        .read_changes(
+            meridian_changes::CONTROL,
+            before,
+            meridian_changes::PAGE_MOST,
+        )
+        .unwrap();
+    assert!(
+        control
+            .changes
+            .iter()
+            .filter(|c| c.kind == "meridian.v1.SourceSwitched")
+            .count()
+            >= 2
+    );
+}
+
+/// A new database timeline raises the epoch (contract v30, stage C; the
+/// resilience spec's section 3): the identity a writer first sees is kept,
+/// nothing raised; one unlike it -- a failover or a restore -- raises the
+/// epoch on every head row, recorded with that cause, and the writer's next
+/// batch commits under it; a writer whose epoch another raised does nothing.
+#[test]
+fn a_new_database_timeline_raises_the_epoch_and_the_next_batch_commits_under_it() {
+    use meridian_changes::timeline::Timeline;
+    let (url, writer) = isolated("lake-timeline");
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "a", &subject, "2026-10-01", 1)],
+            10,
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::First);
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Same);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As a failover or a restore leaves the record: another database's.
+    admin
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Moved(2));
+    assert_eq!(writer.epoch(), 2);
+    let why: String = admin
+        .query_one("SELECT why FROM lake_writer_took_over WHERE epoch = 2", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "b", &subject, "2026-10-02", 2)],
+            20,
+        )
+        .unwrap();
+    let epochs: Vec<u64> = every_change(&writer, &dataset, meridian_changes::PAGE_MOST)
+        .iter()
+        .map(|c| c.epoch)
+        .collect();
+    assert_eq!(epochs, vec![1, 2]);
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::Same);
+    // Another took the lake over: a writer whose epoch is gone raises none.
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    assert_eq!(
+        standby
+            .take_over(&meridian_changes::TookOver::unnamed("a test"))
+            .unwrap(),
+        3
+    );
+    admin
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'yet another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::NotMine(3));
+}
+
+/// A record read on a read replica is stamped from its own snapshot
+/// (contract v30, stage C; the resilience spec's section 5): asked, a read
+/// says the head row of each dataset it read from the same repeatable-read
+/// transaction as its rows; not asked, it says nothing.
+#[test]
+fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    store
+        .record(
+            &dataset,
+            vec![
+                close(&dataset, "a", &subject, "2026-10-01", 1),
+                close(&dataset, "b", &subject, "2026-10-02", 2),
+            ],
+            10,
+        )
+        .unwrap();
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: Vec::new(),
+        interval_ns: 0,
+        when: When::Latest { at_ns: 0 },
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: false,
+    };
+    meridian_lake::postgres::stamp_from_snapshot();
+    let rows = store.read(&query).unwrap();
+    let heads = meridian_lake::postgres::snapshot_heads().expect("the snapshot's heads");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(heads.get(&dataset), Some(&2), "{heads:?}");
+    // Not asked: nothing said.
+    store.read(&query).unwrap();
+    assert!(meridian_lake::postgres::snapshot_heads().is_none());
 }

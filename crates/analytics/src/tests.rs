@@ -18,19 +18,19 @@ use prost::Message;
 use crate::service::{self, Config, Coordinator};
 use crate::{topics, worker};
 
-const NOW: i64 = 1_792_300_000_000_000_000;
-const USD: &str = "INS-CASHUSD";
-const USDT: &str = "INS-USDT";
-const AAPL: &str = "INS-AAPL";
-const BTC: &str = "INS-BTC";
+pub(crate) const NOW: i64 = 1_792_300_000_000_000_000;
+pub(crate) const USD: &str = "INS-CASHUSD";
+pub(crate) const USDT: &str = "INS-USDT";
+pub(crate) const AAPL: &str = "INS-AAPL";
+pub(crate) const BTC: &str = "INS-BTC";
 const YES: &str = "INS-E1";
 const NO: &str = "INS-E2";
 
-fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
+pub(crate) fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
     Some(Exact::from_str(text).unwrap().to_wire())
 }
 
-fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
+pub(crate) fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
     Some(Money {
         amount: d(amount),
         currency_code: code.into(),
@@ -38,7 +38,13 @@ fn money(amount: &str, instrument: &str, code: &str) -> Option<Money> {
     })
 }
 
-fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset: &str) -> Price {
+pub(crate) fn price(
+    subject: &str,
+    kind: PriceKind,
+    amount: &str,
+    instrument: &str,
+    dataset: &str,
+) -> Price {
     Price {
         meta: Some(ObservationMeta {
             subjects: vec![SubjectRef {
@@ -79,13 +85,13 @@ fn record(id: &str, class: AssetClass, currency: &str, template: &str) -> Instru
 
 /// What the stores were asked, and how: every envelope's stamp.
 #[derive(Default)]
-struct Heard {
+pub(crate) struct Heard {
     stamps: Vec<(String, MessageMeta)>,
 }
 
-struct Stores {
-    bus: Arc<Bus>,
-    heard: Arc<Mutex<Heard>>,
+pub(crate) struct Stores {
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) heard: Arc<Mutex<Heard>>,
     routing: Arc<Mutex<Vec<ModelRouting>>>,
     /// Contract v28 (ruling 619): AAPL's close invalid, left out of a
     /// default read and answered to one naming alpaca-1:daily with
@@ -95,7 +101,7 @@ struct Stores {
     quarantined_quote: Arc<Mutex<bool>>,
 }
 
-fn serve_store<Req, Rep, F>(
+pub(crate) fn serve_store<Req, Rep, F>(
     stores: &Stores,
     topic: &'static str,
     reply_type: &'static str,
@@ -120,7 +126,7 @@ fn serve_store<Req, Rep, F>(
 /// The book, the instrument store, the lake and the conductor, as their
 /// reads answer, for one account: AAPL with a lot in USD, cash, half a BTC
 /// priced in USDT, a local line, and a member of an event group.
-fn stores() -> Stores {
+pub(crate) fn stores() -> Stores {
     let bus = Arc::new(Bus::single(
         crate::INSTANCE,
         Arc::new(MemoryBackend::new()),
@@ -372,6 +378,16 @@ fn coordinator(stores: &Stores, config: Config, pooled: bool) -> Arc<Coordinator
 
 /// A coordinator whose clock reads `now_ns`.
 fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) -> Arc<Coordinator> {
+    coordinator_on(stores, config, pooled, Arc::new(ManualClock::at(now_ns)))
+}
+
+/// A coordinator on the clock given.
+fn coordinator_on(
+    stores: &Stores,
+    config: Config,
+    pooled: bool,
+    clock: Arc<dyn meridian_clock::Clock>,
+) -> Arc<Coordinator> {
     let handle = tokio::runtime::Handle::current();
     let executor = if pooled {
         worker::serve(&stores.bus, Arc::new(Cache::new(64)));
@@ -382,7 +398,7 @@ fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) ->
     let coordinator = Coordinator::new(
         Arc::clone(&stores.bus),
         handle,
-        Arc::new(ManualClock::at(now_ns)),
+        clock,
         Config {
             engine_version: "0.1.0".into(),
             ..config
@@ -393,7 +409,7 @@ fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) ->
     coordinator
 }
 
-fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
+pub(crate) fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
     RunJobRequest {
         job: Some(Job {
             account_ids: vec!["ACC-1".into()],
@@ -410,9 +426,11 @@ fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
                     version: 1,
                     breakdowns: breakdowns.iter().map(|b| b.to_string()).collect(),
                     event_group_id: group.to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             what_if: None,
+            standing: false,
         }),
     }
 }
@@ -1471,9 +1489,9 @@ async fn an_execution_cost_job_reads_the_order_path_and_records_its_rows() {
 
 // ── Contract v28: a job over a chain, and a grid on a saved scenario set ────
 
-const OSI_CALL: &str = "AAPL  261120C00230000";
-const OSI_PUT: &str = "AAPL  261120P00230000";
-const OSI_DEEP: &str = "AAPL  261120C00150000";
+pub(crate) const OSI_CALL: &str = "AAPL  261120C00230000";
+pub(crate) const OSI_PUT: &str = "AAPL  261120P00230000";
+pub(crate) const OSI_DEEP: &str = "AAPL  261120C00150000";
 const VENUE: &str = "VEN-XCBO";
 
 fn series_row(osi: &str, right: &str, strike: &str) -> ListedSeries {
@@ -1516,7 +1534,7 @@ fn series_row(osi: &str, right: &str, strike: &str) -> ListedSeries {
     }
 }
 
-fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
+pub(crate) fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
     Quote {
         meta: Some(ObservationMeta {
             series_key: vec![Identifier {
@@ -1538,7 +1556,7 @@ fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
     }
 }
 
-fn chain_stores() -> Stores {
+pub(crate) fn chain_stores() -> Stores {
     chain_stores_with(true)
 }
 
@@ -2725,7 +2743,10 @@ async fn run_and_read(stores: &Stores, request: RunJobRequest) -> Result<JobAnsw
 /// coordinator keeping 4 MiB: what the coordinator holds after them grows
 /// by at most [`KEPT_HEAP_MOST_MIB`], however many ran; the latest answer
 /// is still read whole, an early one has left the cache and says so, and
-/// an answer kept longer than its time has left too.
+/// an answer kept longer than its time has left too. Its clock is held
+/// still, so each job's inline window -- the coordinator's clock's -- stays
+/// open until it answers, however loaded the machine (it missed the 2 s
+/// window under load on 2026-11-11; the window is unchanged).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_answers_kept_are_bounded_by_bytes_and_age_not_count_alone() {
     let (stores, _) = wide_stores(1_500, Duration::ZERO);
@@ -2810,7 +2831,7 @@ const KEPT_HEAP_MOST_MIB: f64 = 8.0;
 /// prices are read: the heap's peak stays within [`BURST_JOBS_MOST`] times
 /// what one job alone takes, at most two are reading at once, and every
 /// job answers what one alone does. Then, with no room to wait, a burst past the bound is refused
-/// with FAILED_PRECONDITION, and the jobs taken still answer.
+/// overloaded with a retry-after, and the jobs taken still answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
     let (stores, most) = wide_stores(1_500, Duration::from_millis(300));
@@ -2823,9 +2844,12 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         let (_, peak) = counted::take();
         (answer, peak - before)
     };
+    // Every job answered later: the inline window is the coordinator's
+    // clock's, held still here, so a window of 0 closes at once.
     let config = Config {
         jobs_at_once: 2,
         jobs_waiting: 64,
+        inline: Duration::ZERO,
         ..Config::default()
     };
     coordinator(&stores, config, false);
@@ -2872,6 +2896,7 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
             Config {
                 jobs_at_once: 2,
                 jobs_waiting: 0,
+                inline: Duration::ZERO,
                 ..Config::default()
             },
             false,
@@ -2899,11 +2924,20 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         match reply.await.unwrap() {
             Ok(_) => taken += 1,
             Err(said) => {
-                assert!(
-                    said.contains("[refusal-status failed-precondition")
-                        && said.contains("run the job again"),
+                // Overloaded with a retry-after (the resilience spec's
+                // section 10a), never FAILED_PRECONDITION.
+                let refusal = &said[said.find("[refusal-reason").unwrap_or(0)..];
+                assert_eq!(
+                    meridian_bus::read_refusal(refusal).map(|(reason, _)| reason),
+                    Some(meridian_pb::v1::RefusalReason::Overloaded as i32),
                     "{said}"
                 );
+                assert!(
+                    meridian_bus::refusal_retry_after(refusal).is_some_and(|after| after >= 1),
+                    "{said}"
+                );
+                assert!(!said.contains("failed-precondition"), "{said}");
+                assert!(said.contains("run the job again"), "{said}");
                 refused += 1;
             }
         }
@@ -2912,11 +2946,97 @@ async fn jobs_run_a_few_at_once_and_one_past_the_bound_is_refused_never_held() {
         taken >= 2 && refused >= 1,
         "taken {taken}, refused {refused}"
     );
-    // The coordinator carries on: a job after the burst answers.
-    let after = run_and_read(&full, wide_job()).await.unwrap();
-    assert_eq!(after.figures.len(), alone.figures.len());
+    // The coordinator carries on: a job asked again once the two taken
+    // have finished -- its retry-after waited out -- answers.
+    let mut after = run_and_read(&full, wide_job()).await;
+    for _ in 0..100 {
+        if after.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = run_and_read(&full, wide_job()).await;
+    }
+    assert_eq!(after.unwrap().figures.len(), alone.figures.len());
 }
 
 /// What sixteen jobs at once may add to the heap at their peak, in jobs
 /// alone: the two running, and the answers kept and read as they finish.
 const BURST_JOBS_MOST: f64 = 5.0;
+
+/// The resilience spec's section 10a, fair shares: one client flooding the
+/// coordinator with jobs does not move another client's answer out of its
+/// band. Each client's jobs wait in their own queue and a freed place goes
+/// to the clients waiting in turn, so the quiet client's one job runs after
+/// at most one more of the flooder's -- never behind the whole burst -- and
+/// past its share of those waiting the flooder alone is refused for load,
+/// with a retry-after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn one_client_flooding_jobs_waits_behind_itself_and_another_runs_in_its_turn() {
+    let (stores, _) = wide_stores(200, Duration::from_millis(150));
+    let running = coordinator(
+        &stores,
+        Config {
+            jobs_at_once: 1,
+            jobs_waiting: 64,
+            inline: Duration::from_secs(30),
+            ..Config::default()
+        },
+        false,
+    );
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let ask = |client: &'static str, n: usize| {
+        let (coordinator, finished) = (Arc::clone(&running), Arc::clone(&finished));
+        std::thread::spawn(move || {
+            let answered = coordinator.run_job_for(wide_job(), client.to_string(), None, false);
+            assert!(answered.is_ok(), "{client} {n}: {answered:?}");
+            finished.lock().unwrap().push(format!("{client}-{n}"));
+        })
+    };
+    let mut asked = Vec::new();
+    for n in 0..6 {
+        asked.push(ask("flooder", n));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    asked.push(ask("quiet", 0));
+    for thread in asked {
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+    }
+    let order = finished.lock().unwrap().clone();
+    let quiet = order.iter().position(|said| said == "quiet-0").unwrap();
+    assert!(
+        quiet <= 2,
+        "the quiet client's job finished behind {quiet} of the flooder's: {order:?}"
+    );
+
+    // Past its share of those waiting (a quarter of jobs_waiting), the
+    // flooder alone is refused for load; the quiet client still waits its turn.
+    let (stores, _) = wide_stores(200, Duration::from_millis(150));
+    let full = coordinator(
+        &stores,
+        Config {
+            jobs_at_once: 1,
+            jobs_waiting: 8,
+            // The coordinator's clock is held still: a window of 0 closes
+            // at once, so each job asked after the first waits its turn.
+            inline: Duration::ZERO,
+            ..Config::default()
+        },
+        false,
+    );
+    let mut flooded = Vec::new();
+    for _ in 0..4 {
+        flooded.push(full.run_job_for(wide_job(), "flooder".into(), None, false));
+    }
+    assert!(flooded[..3].iter().all(Result::is_ok), "{flooded:?}");
+    let refused = flooded[3].as_ref().unwrap_err();
+    assert!(
+        refused.contains("its share")
+            && meridian_bus::refusal_retry_after(refused).is_some_and(|after| after >= 1),
+        "{refused}"
+    );
+    assert!(full
+        .run_job_for(wide_job(), "quiet".into(), None, false)
+        .is_ok());
+}

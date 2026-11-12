@@ -791,8 +791,12 @@ struct Context {
 }
 
 impl Context {
-    fn snapshot(&self) -> Result<Snapshot, String> {
-        self.store.snapshot().map_err(|failed| failed.to_string())
+    /// The configuration, shared until it changes (stage M; audit item 8):
+    /// one snapshot answers every question asked meanwhile.
+    fn snapshot(&self) -> Result<std::sync::Arc<Snapshot>, String> {
+        self.store
+            .snapshot_shared()
+            .map_err(|failed| failed.to_string())
     }
 
     /// What the instrument store says a record became (contract v24, W3.8):
@@ -1076,7 +1080,7 @@ impl Context {
 
     /// The deployment's data configuration, published whole (W10.1).
     fn publish_data(&self) -> Result<(), String> {
-        let event = crate::data::configuration(&self.snapshot()?, self.clock.now_ns());
+        let event = crate::data::configuration(&*self.snapshot()?, self.clock.now_ns());
         self.bus
             .publish(
                 crate::data::ENTITLEMENTS_CHANGED,
@@ -1307,30 +1311,36 @@ pub fn serve(
 /// (decisions/015): what the conductor serves on the bus, and what the
 /// upgrade preflight measures against the broker's 1 MiB payload limit.
 pub fn access_records_of(snapshot: Snapshot, now_ns: i64) -> meridian_domain::v1::AccessRecords {
+    access_records_from(&snapshot, now_ns)
+}
+
+/// [`access_records_of`], from a snapshot borrowed: a shared snapshot's
+/// parts copied into the answer, never the whole (stage M; audit item 8).
+pub fn access_records_from(snapshot: &Snapshot, now_ns: i64) -> meridian_domain::v1::AccessRecords {
     // Each connectivity plugin's link and each ems's map (W11.21,
     // W11.22, contract v22), for the dashboard's pages and its read
     // tool.
     let connectivity_links = snapshot.connectivity.values().cloned().collect();
-    let venue_account_maps = crate::connectivity::maps(&snapshot);
+    let venue_account_maps = crate::connectivity::maps(snapshot);
     // Each known plugin's settings form (W6.11): what it declared,
     // and which secrets are set, never what they are.
     let plugin_settings = snapshot
         .plugins
         .iter()
-        .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
+        .map(|plugin| settings_record(snapshot, &plugin.plugin_instance_id))
         .collect();
-    let mut records = snapshot.records;
+    let mut records = snapshot.records.clone();
     records.read_at_ns = now_ns;
     records.plugin_settings = plugin_settings;
     // With the links, so the dashboard can tell which of the accounts
     // a connector reports have none (W2.8, W6.4). Only the dashboard
     // asks this, and it may already see every account.
-    records.links = snapshot.links;
+    records.links = snapshot.links.clone();
     // The holds standing, for the deployment's Settings and each
     // edge plugin's Summary (W6.25, contract v16).
-    records.holds = snapshot.holds;
+    records.holds = snapshot.holds.clone();
     // Each instance's linkable accounts (W6.30, contract v20).
-    records.linkable_accounts = snapshot.linkable.into_values().collect();
+    records.linkable_accounts = snapshot.linkable.values().cloned().collect();
     records.connectivity_links = connectivity_links;
     records.venue_account_maps = venue_account_maps;
     records
@@ -1425,7 +1435,7 @@ pub fn serve_with(
         ),
         |cx, _: AccessRecordsRequest, _| {
             let snapshot = cx.snapshot()?;
-            Ok(access_records_of(snapshot, cx.clock.now_ns()))
+            Ok(access_records_from(&snapshot, cx.clock.now_ns()))
         },
     );
 
@@ -1458,7 +1468,7 @@ pub fn serve_with(
         |cx, request: meridian_domain::v1::SetDatasetLicenceRequest, envelope| {
             let licence = crate::data::set_licence(
                 cx.store.as_ref(),
-                &cx.snapshot()?,
+                &*cx.snapshot()?,
                 &request,
                 &author(envelope),
                 cx.clock.now_ns(),
@@ -1478,7 +1488,7 @@ pub fn serve_with(
         |cx, request: meridian_domain::v1::SetDatasetEntitlementRequest, envelope| {
             let entitlement = crate::data::set_entitlement(
                 cx.store.as_ref(),
-                &cx.snapshot()?,
+                &*cx.snapshot()?,
                 &request,
                 &author(envelope),
                 cx.clock.now_ns(),
@@ -1518,7 +1528,7 @@ pub fn serve_with(
         |cx, request: meridian_pb::v1::RecordMoveRequest, envelope| {
             crate::archive::record_move(
                 cx.store.as_ref(),
-                &cx.snapshot()?,
+                &*cx.snapshot()?,
                 &publisher(envelope),
                 request,
                 &author(envelope),
@@ -1532,7 +1542,7 @@ pub fn serve_with(
         crate::archive::READ_MOVES,
         ("meridian.v1.ReadMovesRequest", "meridian.v1.ReadMovesReply"),
         |cx, request: meridian_domain::v1::ReadMovesRequest, _| {
-            crate::archive::read_moves(cx.store.as_ref(), &cx.snapshot()?, &request)
+            crate::archive::read_moves(cx.store.as_ref(), &*cx.snapshot()?, &request)
         },
     );
 
@@ -1688,7 +1698,7 @@ pub fn serve_with(
                 );
                 cx.announce(&before)?;
             }
-            Ok(settings_record(&cx.snapshot()?, plugin))
+            Ok(settings_record(&*cx.snapshot()?, plugin))
         },
     );
 
@@ -1936,7 +1946,7 @@ pub fn serve_with(
                 return Err("reason: at most 4,000 characters".into());
             }
             let implementation = request.implementation.trim();
-            if implementation != BUILT_IN && !runs_pricing(&cx.snapshot()?, implementation) {
+            if implementation != BUILT_IN && !runs_pricing(&*cx.snapshot()?, implementation) {
                 return Err(format!(
                     "failed_precondition: [fields=implementation] implementation: \
                      {implementation:?} is not a pricing instance this deployment runs; \
@@ -1948,7 +1958,7 @@ pub fn serve_with(
             // one; a version built before v27 declares none and is read as
             // before.
             if implementation != BUILT_IN {
-                let declared = launched_declaration(&cx.snapshot()?, implementation)
+                let declared = launched_declaration(&*cx.snapshot()?, implementation)
                     .map(|declaration| declaration.pricing_models.clone())
                     .unwrap_or_default();
                 if !declared.is_empty() && !declared.iter().any(|m| m.model_id == model) {
@@ -2070,7 +2080,7 @@ pub fn serve_with(
                 tracing::info!(zone, by, "the deployment's time zone changed");
             }
             Ok(time_zone_setting(
-                &cx.snapshot()?,
+                &*cx.snapshot()?,
                 cx.store.deployment_time_zone().map_err(|f| f.to_string())?,
             ))
         },
@@ -2084,7 +2094,7 @@ pub fn serve_with(
         ),
         |cx, _request: meridian_domain::v1::ReadDeploymentTimeZoneRequest, _| {
             Ok(time_zone_setting(
-                &cx.snapshot()?,
+                &*cx.snapshot()?,
                 cx.store.deployment_time_zone().map_err(|f| f.to_string())?,
             ))
         },
@@ -2558,8 +2568,9 @@ pub fn serve_with(
                 accounts: snapshot
                     .records
                     .accounts
-                    .into_iter()
+                    .iter()
                     .filter(|account| granted.contains(&account.account_id))
+                    .cloned()
                     .collect(),
             })
         },
@@ -2882,7 +2893,7 @@ pub fn serve_with(
         ),
         |cx, _: PluginConfigurationRequest, envelope| {
             let plugin = publisher(envelope);
-            Ok(configuration(&cx.snapshot()?, &plugin, &cx.key))
+            Ok(configuration(&*cx.snapshot()?, &plugin, &cx.key))
         },
     );
 
@@ -2977,7 +2988,7 @@ pub fn serve_with(
                 "venue account mapping set"
             );
             cx.announce(&before)?;
-            Ok(crate::connectivity::told(&cx.snapshot()?, &ems)
+            Ok(crate::connectivity::told(&*cx.snapshot()?, &ems)
                 .venue_account_map
                 .unwrap_or_else(|| meridian_pb::v1::VenueAccountMap {
                     ems_instance_id: ems.clone(),

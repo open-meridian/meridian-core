@@ -17,7 +17,7 @@ use meridian_domain::v1::{
     ResolveCompanyRequest, ResolveIdentifierReply, ResolveIdentifierRequest,
     ResolveInstrumentReply, ResolveInstrumentRequest, Source, SubjectRef, SubjectRole, Watermark,
 };
-use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
 use prost::Message;
 
 use crate::row::Observation;
@@ -119,10 +119,6 @@ fn configuration() -> EntitlementsChangedEvent {
                 vendor: "SEC EDGAR".into(),
                 data_types: vec!["meridian.v1.CorporateActionAnnounced".into()],
                 modes: vec![ObservationMode::Push as i32],
-                licence_default: Some(DatasetLicence {
-                    kept: true,
-                    ..Default::default()
-                }),
                 ..Default::default()
             }),
             ..Default::default()

@@ -190,6 +190,8 @@ fn run() -> Result<(), String> {
     // The configuration store's change log, where it is in a database: its
     // URL and its store, for the log served and its tail (step 3a).
     let mut logged: Option<(String, Arc<PostgresStore>)> = None;
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("conductor");
     let store: Arc<dyn meridian_config::Store> = match var("MERIDIAN_CONFIG_DATABASE_URL") {
         Some(url) => {
             // Verified, never applied, for the reason every store gives; and
@@ -213,7 +215,10 @@ fn run() -> Result<(), String> {
             meridian_changes::set_clock(clock());
             let store = Arc::new(store);
             logged = Some((url, Arc::clone(&store)));
-            store as Arc<dyn meridian_config::Store>
+            // One snapshot shared per change (stage M; audit item 8).
+            Arc::new(meridian_config::shared::Shared::new(
+                store as Arc<dyn meridian_config::Store>,
+            )) as Arc<dyn meridian_config::Store>
         }
         None => {
             tracing::info!(
@@ -256,8 +261,17 @@ fn run() -> Result<(), String> {
             })?;
             tracing::info!(epoch, "the configuration store writes under its epoch");
             let watched = Arc::clone(postgres);
-            holding.keep(epoch, move || {
-                watched.head_epoch().map_err(|failed| failed.to_string())
+            let writing = Arc::clone(postgres);
+            holding.keep(
+                move || writing.epoch(),
+                move || watched.head_epoch().map_err(|failed| failed.to_string()),
+            );
+            // A new database timeline raises the epoch (contract v30, stage C).
+            let following = Arc::clone(postgres);
+            holding.follow_timeline(&bus, "config", move || {
+                following
+                    .follow_timeline()
+                    .map_err(|failed| failed.to_string())
             });
             // The scrub, under the lease (step 3b, integrity at rest).
             let scrubbing = scrub_url.clone();
@@ -441,6 +455,44 @@ fn run() -> Result<(), String> {
         let reporting = Arc::clone(&platform);
         let collecting = Arc::clone(&bus);
         let schema = meridian_config::migrations::latest();
+        // Every member's health, and this conductor's own, for the
+        // dashboard's judge (W6.40; stage M).
+        let started_at_ns = now_ns();
+        let pods: meridian_runtime::PodRestarts = Default::default();
+        if let Ok(api) = meridian_first_run::cluster::ApiServer::in_cluster(clock()) {
+            meridian_runtime::background(meridian_runtime::pod_restarts_forever(
+                api,
+                Arc::clone(&pods),
+            ));
+        }
+        let heard = meridian_runtime::members_heard(&bus);
+        meridian_runtime::serve_component_health(
+            &bus,
+            Arc::clone(&heard),
+            Arc::clone(&pods),
+            move || meridian_runtime::member::member_report("conductor", schema, started_at_ns),
+        );
+        // What the deployment survives (W6.39; contract v30, stage D): the
+        // Resilience page's read and the resilience profile, from the
+        // members, the pods and Leases (its Role's reads), and each store's
+        // control partition; the chart's values as the release states them
+        // (MERIDIAN_RESILIENCE_VALUES), or what runs where the chart says
+        // none.
+        meridian_runtime::resilience::serve(
+            &bus,
+            meridian_runtime::resilience::Answering {
+                heard,
+                restarts: pods,
+                own: Arc::new(move || {
+                    meridian_runtime::member::member_report("conductor", schema, started_at_ns)
+                }),
+                cluster: meridian_first_run::cluster::ApiServer::in_cluster(clock())
+                    .ok()
+                    .map(Arc::new),
+                values: meridian_runtime::resilience::values_from_env(),
+                history: Default::default(),
+            },
+        );
         meridian_runtime::background(async move {
             report_forever(reporting, collecting, "conductor", schema).await
         });
@@ -772,7 +824,13 @@ fn install_named_administrator(store: &dyn meridian_config::Store) {
 /// does nothing.
 fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
     match var("MERIDIAN_SERVING_DATABASE_URL") {
-        Some(serving) => meridian_runtime::grant_serving(migrating_url, &serving),
+        Some(serving) => {
+            meridian_runtime::grant_serving(migrating_url, &serving)?;
+            // On the database this chart brings, each component's own login
+            // made or kept by its superuser (section 10a): a deployment
+            // installed before them gains them at its next upgrade.
+            meridian_runtime::component_logins_on_brought(&serving)
+        }
         None => Ok(()),
     }
 }

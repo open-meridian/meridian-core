@@ -67,6 +67,7 @@ pub mod instruments;
 pub mod lake_rows;
 pub mod plugin_area;
 pub mod prepared;
+pub mod resilience;
 pub mod service_accounts;
 pub mod tickets;
 
@@ -455,6 +456,9 @@ pub enum Area {
     /// W10.1): any delegation that reaches anything; a deployment admin
     /// may change another's with a note.
     ProfessionalTest,
+    /// The Resilience page's reads (contract v30, W6.39): the deployment
+    /// admin's capabilities.
+    Resilience,
 }
 
 impl Area {
@@ -471,6 +475,7 @@ impl Area {
             Area::AccountReads => "Accounts",
             Area::DataUse => "Data sources",
             Area::ProfessionalTest => "Professional test",
+            Area::Resilience => "Resilience",
         }
     }
 
@@ -497,7 +502,7 @@ impl Area {
                     || access.all_plugins_admin
                     || access.plugins.values().any(|held| held.holds_any())
             }
-            Area::DataUse => access.deployment_admin,
+            Area::DataUse | Area::Resilience => access.deployment_admin,
         }
     }
 }
@@ -590,7 +595,9 @@ impl Tool {
                             Area::DataSources => data_sources::described(spec),
                             Area::Prepared | Area::ServiceAccounts => spec.description.to_string(),
                             Area::Accounts | Area::Trading | Area::AccountReads => book::described(spec),
-                            Area::DataUse | Area::ProfessionalTest => spec.description.to_string(),
+                            Area::DataUse | Area::ProfessionalTest | Area::Resilience => {
+                                spec.description.to_string()
+                            }
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -783,6 +790,7 @@ pub fn listed_to(
         .chain(service_accounts::SPECS)
         .chain(book::SPECS)
         .chain(data_use::SPECS)
+        .chain(resilience::SPECS)
     {
         if spec.area.open_to(access) {
             tools.push(Tool {
@@ -895,6 +903,7 @@ pub fn core_spec(name: &str) -> Option<&'static Spec> {
         .chain(service_accounts::SPECS)
         .chain(book::SPECS)
         .chain(data_use::SPECS)
+        .chain(resilience::SPECS)
         .find(|spec| spec.name == bare)
 }
 
@@ -920,6 +929,7 @@ pub async fn run_core(app: &App, caller: &Caller, spec: &'static Spec, arguments
         Area::DataUse | Area::ProfessionalTest => {
             data_use::call(app, caller, spec, arguments).await
         }
+        Area::Resilience => resilience::call(app, caller, spec, arguments).await,
     }
 }
 
@@ -949,10 +959,20 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
     // instance is the name's owner, which a plugin's tool always names.
     let (owner, _) = name.split_once("__").unwrap_or((name, ""));
     let instance = (owner != DASHBOARD && crate::plugins::is_instance(owner)).then_some(owner);
+    // Admitted by the bounds, then taken in the delegation's turn among the
+    // dashboard's callers (the resilience spec's section 10a): the bounds
+    // are its caps, and no second rate is added.
     let admitted = match app
         .bounds
         .admit(called_at_ns, &caller.delegation_id, instance)
     {
+        Ok(admitted) => match app.turns.turn(&format!("d:{}", caller.delegation_id)).await {
+            Ok(turn) => Ok((admitted, turn)),
+            Err(over) => Err(u64::from(over.retry_after_seconds)),
+        },
+        Err(wait) => Err(wait),
+    };
+    let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(wait) => {
             let record = crate::delegation::ToolCall {
@@ -1085,6 +1105,11 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
             Area::ProfessionalTest => (
                 data_use::call(app, caller, spec, arguments).await,
                 String::new(),
+            ),
+            // Reads at the deployment admin's capabilities (contract v30).
+            Area::Resilience => (
+                resilience::call(app, caller, spec, arguments).await,
+                "deployment admin".to_string(),
             ),
         },
         Owner::Plugin {

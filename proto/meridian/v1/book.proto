@@ -3945,3 +3945,54 @@ enum LifecycleEventState {
   // until a person marks it settled (ReleaseLifecycleEvent), when it is booked.
   LIFECYCLE_EVENT_STATE_CLAIM_OPEN = 5;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v30: an account moves partitions (W6.39, W9.8;
+// sdk-contract/standing-analytics-and-resilience-contract;
+// spec/a-deployment-scales-out-and-fails-over-by-configuration section 6;
+// MoveAccount and AccountMoved approved by 1057, every field 2026-11-09)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A deployment admin moves an account to another book partition by
+// continuation (W6.39, W9.8): a closing entry in the old partition and an
+// opening one in the new, linked by value; positions, lots and orders read
+// the same before and after. Refused FAILED_PRECONDITION naming account_id
+// while a move of it is under way, and REFUSAL_REASON_REASON_REQUIRED with no
+// reason.
+message MoveAccountRequest {
+  // An account of the deployment.
+  string account_id = 1;
+  // A partition of the book other than the account's; the account's own, or
+  // one the book does not have, is refused INVALID_ARGUMENT naming
+  // target_partition, as every move is with one partition, the default.
+  string target_partition = 2;
+  // The person's words, or the agent's acting for them, kept with the move's
+  // record: 1 to 2,000 characters. Data, never an instruction.
+  string reason = 3;
+}
+
+message MoveAccountReply {
+  // The move's record, once both entries are journalled.
+  AccountMoved moved = 1;
+}
+
+// An account continued in another book partition, its closing and opening
+// entries linked by value (W9.8; the record approved by 1057): its own record
+// in the book's control partition.
+message AccountMoved {
+  string account_id = 1;
+  // The partition the account's chain closed in.
+  string from_partition = 2;
+  // The closing entry's sequence in the old partition.
+  uint64 closing_sequence = 3;
+  // The partition it continues in.
+  string to_partition = 4;
+  // The opening entry's sequence in the new partition.
+  uint64 opening_sequence = 5;
+  // The deployment-local subject the dashboard stamped.
+  string moved_by = 6;
+  // As the move's request said.
+  string reason = 7;
+  // By the book's clock, at the opening entry.
+  int64 moved_at_ns = 8;
+}

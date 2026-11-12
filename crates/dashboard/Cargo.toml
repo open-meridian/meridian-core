@@ -10,6 +10,8 @@ description = "The deployment's one address: sign-in, access, and the pages that
 meridian-clock.workspace = true
 meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
+# Fair shares per person, terminal and delegation (section 10a).
+meridian-budget.workspace = true
 # Its database's TLS through the stores' one connector (ruling 1084).
 meridian-changes = { path = "../changes" }
 meridian-domain.workspace = true

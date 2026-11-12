@@ -88,6 +88,8 @@ pub fn routes() -> Router<Arc<App>> {
         )
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
+        // Contract v30 (W6.39): the Resilience page, a deployment admin's.
+        .route(resilience::PATH, get(resilience_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
             "/admin/data-sources/entitlement",
@@ -481,6 +483,7 @@ pub mod holds;
 pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
+pub mod resilience;
 pub mod series_rule;
 pub mod sources_view;
 pub mod stale_reference;
@@ -1329,6 +1332,10 @@ pub(crate) struct Manage<'a> {
     /// Whether the settings act's second pair of eyes is on for the person:
     /// the form then offers only Prepare (contract v20, Q21).
     pub eyes: bool,
+    /// Each default read standing on a backup that one of its datasets is
+    /// switched from or to (contract v30; the resilience spec's section 8):
+    /// its Summary says "switched to backup source".
+    pub switched: Vec<meridian_domain::v1::SourceSwitched>,
 }
 
 pub mod setting_up;
@@ -1544,6 +1551,30 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
             .unwrap_or_default(),
     );
     let figures = crate::figures::section(manage.report, manage.now);
+    // A default read standing on a backup, one of its datasets switched from
+    // or to (contract v30; the resilience spec's section 8).
+    let switched = if manage.switched.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<dt>Source</dt><dd data-switched>{}: {}</dd>",
+            data_sources::SWITCHED,
+            escape(
+                &manage
+                    .switched
+                    .iter()
+                    .map(|s| format!(
+                        "{} {} to {}, {}",
+                        data_sources::type_word(&s.data_type),
+                        s.from_dataset,
+                        s.to_dataset,
+                        data_sources::reason_word(s.reason)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        )
+    };
     // Its sessions' latency and its datasets' ages, and an episode open
     // (contract v28; W4.16; ruling 427).
     let latency = crate::latency::summary_line(manage.instance, manage.now);
@@ -1569,7 +1600,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}{latency}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{switched}{seen}{tokens}{latency}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
@@ -4209,9 +4240,13 @@ async fn data_sources_page(
         Ok(gated) => gated,
         Err(response) => return *response,
     };
-    let (listed, priorities) = tokio::join!(
+    let (listed, priorities, open_gaps, standing) = tokio::join!(
         data_sources::datasets(&app.bus, &session.subject),
         data_sources::priorities(&app.bus, &session.subject),
+        // Contract v30 (W10.6, W10.14): the gaps not recovered, and each
+        // default read standing on a backup.
+        data_sources::open_gaps(&app.bus, &session.subject),
+        data_sources::standing(&app.bus, &session.subject),
     );
     // Contract v28 (W10.13): the Use tab, the month and the counting asked.
     let month = Some(field(&query, "month")).filter(|m| !m.is_empty());
@@ -4228,6 +4263,8 @@ async fn data_sources_page(
     let body = data_sources::page(
         &listed,
         &priorities,
+        &open_gaps,
+        &standing,
         &records,
         &token_input(&session),
         field(&query, "done"),
@@ -4243,6 +4280,36 @@ async fn data_sources_page(
 }
 
 const DATA_SOURCES: &str = "/admin/data-sources";
+
+// ── The Resilience page ─────────────────────────────────────────────────────
+
+/// W6.39 (contract v30, stage D): the Resilience page, for a deployment
+/// admin: the profile, the members, the partitions and the history.
+async fn resilience_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let cursor = field(&query, "cursor");
+    let (profile, read) = tokio::join!(
+        resilience::profile(&app.bus, &session.subject),
+        resilience::resilience(&app.bus, &session.subject, resilience::HISTORY_PAGE, cursor),
+    );
+    let body = resilience::page(&profile, &read, cursor);
+    let chrome = Chrome {
+        crumbs: format!(
+            "{}{}",
+            crate::html::crumb_link("/admin", "Settings"),
+            crate::html::crumb_here("Resilience", None)
+        ),
+        ..admin_chrome(&session)
+    };
+    Html(page_with("Resilience", &body, &chrome)).into_response()
+}
 
 /// A list typed as words between commas, blanks dropped.
 fn words(fields: &Fields, name: &str) -> Vec<String> {

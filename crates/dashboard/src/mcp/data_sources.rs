@@ -33,9 +33,10 @@ use crate::admin::data_sources::{self as page, kind_of, kind_word, type_word};
 use crate::web::App;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    DatasetEntitlement, ListDatasetsReply, ListDatasetsRequest, ListSourcePrioritiesReply,
-    ListSourcePrioritiesRequest, PriceKind, SetDatasetEntitlementRequest, SetDatasetLicenceRequest,
-    SetSourcePriorityRequest, SourcePriority,
+    DatasetEntitlement, DatasetGap, GapState, ListDatasetGapsReply, ListDatasetGapsRequest,
+    ListDatasetsReply, ListDatasetsRequest, ListSourcePrioritiesReply, ListSourcePrioritiesRequest,
+    ListSourceSwitchesReply, ListSourceSwitchesRequest, PriceKind, SetDatasetEntitlementRequest,
+    SetDatasetLicenceRequest, SetSourcePriorityRequest, SourcePriority, SourceSwitched,
 };
 use meridian_pb::v1::DatasetLicence;
 
@@ -85,7 +86,9 @@ sign of life and its backlog's peak. Measured by the plugins and core, never a p
         "every dataset a launched plugin's catalogue serves the lake: its catalogue entry (vendor, \
 aggregator, data types, modes, cadence, history, its business day's time zone and end, its venue, \
 the class of source its prices come from -- traded, firm_quote, composite or evaluated, empty for \
-not stated), the licence enforced -- the deployment's, or the catalogue's default until one is set, \
+not stated), the licence enforced -- the deployment's, or until one is set the dataset kept and read \
+with each use right restrictive (no derived data outside the deployment, no redistribution, no \
+outside computation, every listed use prohibited), \
 with the source behind the vendor or whose aggregate it serves -- the \
 plugins entitled to it, how many of its rows in force carry a value left unconverted and how many \
 identifiers and venues its plugin reported missing, how many of its rows in force are dated on a \
@@ -135,6 +138,34 @@ priority's updated_at_ns as it was read (0 when none is set), with a note saying
 changed when another set it since: read it again. Answers the priority as recorded.",
         false,
         priority_schema,
+    ),
+    // Contract v30 (W10.6; the resilience spec's section 8): the switches of
+    // the default reads' sources, the page's "switched to backup source".
+    spec(
+        "list_source_switches",
+        "List source switches",
+        "each switch of a default read's source, and each switch back, newest first: the data \
+type and, for prices, the kind, the dataset it switched from and to, the subjects, why (silent, \
+stalled, quarantined, or restored for a switch back) and when; of one data type or one dataset \
+(from or to) where named, a page at a time (cursor: next_cursor from the page before). \
+`standing` names each default read standing on a backup now, as Data sources shows it \
+\"switched to backup source\". Never a price. Answers `unchanged`.",
+        true,
+        switches_schema,
+    ),
+    // Contract v30 (W10.14; the resilience spec's section 4): the gaps the
+    // write-ahead stream left, the page's Gaps tab.
+    spec(
+        "list_dataset_gaps",
+        "List dataset gaps",
+        "each gap the lake's write-ahead stream left, in its latest state, newest first: its ID, \
+its dataset (empty while not yet known: the gap found the moment the stream skipped, before any \
+dataset wrote again, each dataset's own gap naming it in found_in_gap_id), its subjects and valid \
+range, why (write_ahead_bound) and its state (refetching, recovered, unrecovered); of one dataset \
+or one state where named, a page at a time (cursor: next_cursor from the page before). Rows \
+inside a gap are not invented. Never a price. Answers `unchanged`.",
+        true,
+        gaps_schema,
     ),
 ];
 
@@ -217,6 +248,45 @@ fn priority_schema() -> Value {
         "required": ["data_type", "datasets", "against_updated_at_ns", "note"],
         "additionalProperties": false,
     })
+}
+
+fn page_schema() -> serde_json::Map<String, Value> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "page_size".into(),
+        json!({"type": "integer", "minimum": 0, "maximum": 500, "description": "rows a page holds; 0 for the lake's default, 100"}),
+    );
+    properties.insert(
+        "cursor".into(),
+        json!({"type": "string", "description": "next_cursor from the page before; empty for the first page"}),
+    );
+    properties
+}
+
+fn switches_schema() -> Value {
+    let mut properties = page_schema();
+    properties.insert(
+        "data_type".into(),
+        json!({"type": "string", "description": "a data type by its message's full name (meridian.v1.Quote); empty for every one"}),
+    );
+    properties.insert(
+        "dataset".into(),
+        json!({"type": "string", "description": "a dataset switched from or to; empty for every one"}),
+    );
+    json!({"type": "object", "properties": properties, "additionalProperties": false})
+}
+
+fn gaps_schema() -> Value {
+    let mut properties = page_schema();
+    properties.insert(
+        "dataset".into(),
+        json!({"type": "string", "description": "a dataset's gaps; empty for every gap, the unattributed among them"}),
+    );
+    properties.insert(
+        "state".into(),
+        json!({"type": "string", "enum": ["refetching", "recovered", "unrecovered"], "description": "gaps in this state; unset for every state"}),
+    );
+    json!({"type": "object", "properties": properties, "additionalProperties": false})
 }
 
 // ── Reading arguments ───────────────────────────────────────────────────
@@ -331,6 +401,33 @@ fn entitlement_json(e: &DatasetEntitlement) -> Value {
     })
 }
 
+fn switch_json(s: &SourceSwitched) -> Value {
+    json!({
+        "data_type": s.data_type,
+        "kind": match kind_word(s.kind) { "" => Value::Null, word => word.into() },
+        "from_dataset": s.from_dataset,
+        "to_dataset": s.to_dataset,
+        "subjects": s.subjects,
+        "reason": page::reason_word(s.reason),
+        "switched_at_ns": stamp_said(s.switched_at_ns),
+    })
+}
+
+fn gap_json(g: &DatasetGap) -> Value {
+    json!({
+        "gap_id": g.gap_id,
+        "dataset": g.dataset,
+        "dataset_known": !g.dataset.is_empty(),
+        "subjects": g.subjects,
+        "valid_from_ns": stamp_said(g.valid_from_ns),
+        "valid_until_ns": stamp_said(g.valid_until_ns),
+        "cause": match page::gap_cause_word(g.cause) { "write-ahead bound" => "write_ahead_bound", other => other },
+        "state": page::gap_state_word(g.state),
+        "recorded_at_ns": stamp_said(g.recorded_at_ns),
+        "found_in_gap_id": g.found_in_gap_id,
+    })
+}
+
 fn priority_json(p: &SourcePriority) -> Value {
     json!({
         "data_type": p.data_type,
@@ -355,6 +452,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_dataset_entitlement" => set_entitlement(app, caller, &arguments).await,
         "list_source_priorities" => list_priorities(app, caller, &arguments).await,
         "set_source_priority" => set_priority(app, caller, &arguments).await,
+        "list_source_switches" => list_switches(app, caller, &arguments).await,
+        "list_dataset_gaps" => list_gaps(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -364,6 +463,116 @@ fn nothing(arguments: &Value) -> Option<Value> {
     let top = object(arguments, "", &mut problems)?;
     only(top, &[], "", &mut problems);
     (!problems.is_empty()).then(|| problems.refusal())
+}
+
+/// A page's size and cursor, as the lake's reads take them.
+fn paged(top: &Map<String, Value>, problems: &mut Problems) -> (u32, String) {
+    let size = integer(top, "page_size", "", false, problems);
+    if !(0..=500).contains(&size) {
+        problems.add("page_size", "0 to 500");
+    }
+    (
+        u32::try_from(size).unwrap_or_default(),
+        text(top, "cursor", "", false, problems),
+    )
+}
+
+async fn list_switches(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["data_type", "dataset", "page_size", "cursor"],
+        "",
+        &mut problems,
+    );
+    let (page_size, cursor) = paged(top, &mut problems);
+    let request = ListSourceSwitchesRequest {
+        data_type: text(top, "data_type", "", false, &mut problems),
+        dataset: text(top, "dataset", "", false, &mut problems),
+        page_size,
+        cursor,
+    };
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: ListSourceSwitchesReply = match ask(
+        app,
+        caller,
+        page::LIST_SOURCE_SWITCHES,
+        "meridian.v1.ListSourceSwitchesRequest",
+        request,
+        WAIT,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(failed) => return bus_refused(failed, ""),
+    };
+    // What stands on a backup now, as the page shows it.
+    let standing = match page::standing(&app.bus, &caller.subject).await {
+        Ok(standing) => standing.iter().map(switch_json).collect::<Vec<_>>(),
+        Err(why) => return refused("unavailable", &why, Vec::new()),
+    };
+    json!({"outcome": "unchanged", "data": {
+        "switches": reply.switches.iter().map(switch_json).collect::<Vec<_>>(),
+        "next_cursor": reply.next_cursor,
+        "standing": standing,
+        "standing_words": page::SWITCHED,
+    }})
+}
+
+async fn list_gaps(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["dataset", "state", "page_size", "cursor"],
+        "",
+        &mut problems,
+    );
+    let (page_size, cursor) = paged(top, &mut problems);
+    let state = match text(top, "state", "", false, &mut problems).as_str() {
+        "" => GapState::Unspecified,
+        "refetching" => GapState::Refetching,
+        "recovered" => GapState::Recovered,
+        "unrecovered" => GapState::Unrecovered,
+        _ => {
+            problems.add("state", "refetching, recovered or unrecovered");
+            GapState::Unspecified
+        }
+    };
+    let request = ListDatasetGapsRequest {
+        dataset: text(top, "dataset", "", false, &mut problems),
+        state: state as i32,
+        page_size,
+        cursor,
+    };
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: ListDatasetGapsReply = match ask(
+        app,
+        caller,
+        page::LIST_DATASET_GAPS,
+        "meridian.v1.ListDatasetGapsRequest",
+        request,
+        WAIT,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(failed) => return bus_refused(failed, ""),
+    };
+    json!({"outcome": "unchanged", "data": {
+        "gaps": reply.gaps.iter().map(gap_json).collect::<Vec<_>>(),
+        "next_cursor": reply.next_cursor,
+        "dataset_not_known_words": page::NOT_YET_KNOWN,
+    }})
 }
 
 async fn list_datasets(app: &App, caller: &Caller, arguments: &Value) -> Value {
@@ -679,12 +888,17 @@ async fn set_priority(app: &App, caller: &Caller, arguments: &Value) -> Value {
 pub const PARITY: &[(&str, &str)] = &[
     ("tab datasets", "list_datasets"),
     ("tab entitlements", "list_datasets set_dataset_entitlement"),
-    ("tab priority", "list_source_priorities set_source_priority"),
+    (
+        "tab priority",
+        "list_source_priorities set_source_priority list_source_switches",
+    ),
+    // Contract v30 (W10.14): the Gaps tab.
+    ("tab gaps", "list_dataset_gaps"),
     // Contract v28 (W10.9): the Age tab.
     ("tab age", "read_data_age"),
     (
         "/admin/data-sources",
-        "list_datasets list_source_priorities",
+        "list_datasets list_source_priorities list_source_switches list_dataset_gaps",
     ),
     ("/admin/data-sources/licence", "set_dataset_licence"),
     ("/admin/data-sources/entitlement", "set_dataset_entitlement"),

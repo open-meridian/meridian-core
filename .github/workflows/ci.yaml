@@ -557,7 +557,9 @@ jobs:
           DOCKER_BUILDKIT: "1"
           STAGE: ${{ matrix.stage }}
           MERIDIAN_VERSION: ${{ needs.images.outputs.version }}
-        run: make -k ci-stage STAGE="$STAGE" IMAGES=pulled MERIDIAN_VERSION="$MERIDIAN_VERSION" NEXTEST_PROFILE=ci
+        # SHOTS: e2e-settings-page keeps a screenshot of each page and size
+        # it checks there, the Launch sheet's kept below.
+        run: make -k ci-stage STAGE="$STAGE" IMAGES=pulled MERIDIAN_VERSION="$MERIDIAN_VERSION" NEXTEST_PROFILE=ci SHOTS=.e2e-shots
 
       # A test that failed and then passed on its retry (nextest's ci
       # profile) named on the run and in its summary (tools/ci-flaky.py):
@@ -581,6 +583,23 @@ jobs:
           path: .junit/*.xml
           reporter: java-junit
           fail-on-error: false
+
+      # The Launch sheet at 375, 582 and 1280 wide, light and dark (contract
+      # v30, its Limits), kept on every run of the settings-page leg for a
+      # person's look -- the coordinator's browser check of the sheet (M2's
+      # follow-up) -- whether the stage passed or not.
+      - name: Keep the Launch sheet's screenshots
+        if: steps.tier.outputs.run == 'true' && matrix.stage == 'settings-page' && (!cancelled())
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: launch-sheet-screenshots
+          path: workspace/meridian-core/.e2e-shots/*launch-sheet*.png
+          # The folder is a dotfile, which v4 leaves out unless told.
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
 
       # What the services said, kept only when something failed. The e2e
       # targets write these beside the checkout and the runner names them on

@@ -24,6 +24,10 @@ use crate::MemoryStore;
 mod changes;
 mod hot;
 mod quality;
+mod read_from_writer;
+mod reader;
+mod switches;
+mod write_ahead;
 
 const NOW: i64 = 1_791_417_600_000_000_000; // 2026-10-08T00:00Z
 const DAY: i64 = 86_400 * 1_000_000_000;
@@ -46,6 +50,21 @@ fn harness() -> Harness {
         Arc::new(MemoryBackend::new()),
         clock.clone(),
     ));
+    stand_ins(&bus);
+    let store = Arc::new(MemoryStore::new());
+    let lake = service::serve(bus.clone(), store.clone(), clock.clone());
+    lake.configured(&configuration(true, &[]));
+    Harness {
+        bus,
+        store,
+        clock,
+        lake,
+    }
+}
+
+/// The instrument store and the conductor, stood in on `bus`: four records,
+/// USD by its code, and one plugin launched.
+fn stand_ins(bus: &Bus) {
     // The instrument store, stood in: four records, USD by its code.
     bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
@@ -95,18 +114,9 @@ fn harness() -> Harness {
             .encode_to_vec(),
         ))
     });
-    let store = Arc::new(MemoryStore::new());
-    let lake = service::serve(bus.clone(), store.clone(), clock.clone());
-    lake.configured(&configuration(true, &[]));
-    Harness {
-        bus,
-        store,
-        clock,
-        lake,
-    }
 }
 
-fn declaration(key: &str, cadence: u32, kept: bool) -> DatasetDeclaration {
+fn declaration(key: &str, cadence: u32) -> DatasetDeclaration {
     DatasetDeclaration {
         key: key.into(),
         vendor: "Coinbase".into(),
@@ -115,10 +125,6 @@ fn declaration(key: &str, cadence: u32, kept: bool) -> DatasetDeclaration {
         cadence,
         history: 3650,
         day_time_zone: "Etc/UTC".into(),
-        licence_default: Some(DatasetLicence {
-            kept,
-            ..Default::default()
-        }),
         ..Default::default()
     }
 }
@@ -130,7 +136,7 @@ fn configuration(kept: bool, bar_fields: &[&str]) -> EntitlementsChangedEvent {
         dataset: format!("{instance}:{key}"),
         instance: instance.into(),
         vendor: "Coinbase".into(),
-        declaration: Some(declaration(key, 0, kept)),
+        declaration: Some(declaration(key, 0)),
         ..Default::default()
     };
     let entitled = |dataset: &str, fields: &[&str]| DatasetEntitlement {
@@ -140,9 +146,20 @@ fn configuration(kept: bool, bar_fields: &[&str]) -> EntitlementsChangedEvent {
         fields: fields.iter().map(|f| f.to_string()).collect(),
         ..Default::default()
     };
+    // Not kept is the deployment's licence (contract v30 retired a
+    // catalogue's licence_default, ruling 1032); kept is the default.
+    let licence = |dataset: &str| DatasetLicence {
+        dataset: dataset.into(),
+        kept,
+        ..Default::default()
+    };
     EntitlementsChangedEvent {
         datasets: vec![dataset("coinbase-1", "daily"), dataset("kraken-1", "daily")],
-        licences: vec![],
+        licences: if kept {
+            vec![]
+        } else {
+            vec![licence("coinbase-1:daily"), licence("kraken-1:daily")]
+        },
         entitlements: vec![
             entitled("coinbase-1:daily", bar_fields),
             entitled("kraken-1:daily", &[]),
@@ -2824,4 +2841,118 @@ async fn a_corrected_row_counts_once_in_force_as_reported_and_on_a_closed_day() 
         (6, 1),
         "kept"
     );
+}
+
+/// Stage M (the resilience spec's section 10a): a read reserves its working
+/// memory from the rows it holds as it reads them; past its component's
+/// budget it stops reading and is refused for load, with a retry-after,
+/// never grown past the budget -- and the same read with room is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_past_its_budget_is_refused_for_load_and_answered_with_room() {
+    let h = harness();
+    for batch in 0..6 {
+        let rows: Vec<Price> = (0..500)
+            .map(|n| {
+                let key = format!("BTC-USD:{:05}", batch * 500 + n);
+                close("coinbase-1", &key, BTC, "2026-10-07", "62000.5")
+            })
+            .collect();
+        record(&h, "coinbase-1", rows, "").unwrap();
+    }
+    let mib = 1024 * 1024;
+    let read_within = |budget: &meridian_budget::Budget| {
+        let reservation = budget
+            .reserve(
+                64 * 1024,
+                "list-prices for reporting-1",
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        tokio::task::block_in_place(|| {
+            meridian_budget::within(&reservation, || {
+                h.lake.read(
+                    ReadRequest {
+                        data_type: DataType::Price,
+                        subjects: vec![SubjectRef {
+                            entity_id: BTC.into(),
+                            ..Default::default()
+                        }],
+                        kinds: vec![],
+                        interval_ns: 0,
+                        sources: Some(SourceChoice::default()),
+                        at_ns: 0,
+                        business_date: "2026-10-07".into(),
+                        valid_from_ns: 0,
+                        valid_until_ns: 0,
+                        as_of_ns: 0,
+                        page_size: 0,
+                        cursor: String::new(),
+                        after: None,
+                        tenors: Vec::new(),
+                        published_as_of_ns: 0,
+                        series_keys: Vec::new(),
+                        all_series: false,
+                        dates: None,
+                        window: Default::default(),
+                        fields: Vec::new(),
+                    },
+                    &envelope("reporting-1", true, ""),
+                )
+            })
+        })
+    };
+    let tight = meridian_budget::Budget::new(Some(256 * 1024));
+    let Err(refused) = read_within(&tight) else {
+        panic!("past the budget, and answered");
+    };
+    assert_eq!(
+        meridian_bus::read_refusal(&refused).map(|(reason, _)| reason),
+        Some(meridian_pb::v1::RefusalReason::Overloaded as i32),
+        "{refused}"
+    );
+    assert!(meridian_bus::refusal_retry_after(&refused).unwrap() >= 1);
+    assert_eq!(tight.reserved(), 0, "everything it held given back");
+    let roomy = meridian_budget::Budget::new(Some(64 * mib));
+    let answered = read_within(&roomy).expect("answered with room");
+    assert!(!answered.rows.is_empty(), "rows answered");
+}
+
+/// Stage M (the store memory audit of 2026-11-09, item 11): the declines the
+/// lake holds are those that still stand; one past its day is let go when
+/// the next is recorded, so a source declining for months holds a day's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decline_past_its_day_is_let_go_when_the_next_is_recorded() {
+    let h = harness();
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut decline_for = |date: &str| {
+        read(&h, "reporting-1", &[AAPL], date, SourceChoice::default(), 0);
+        let want = futures_lite_recv(&mut wanted);
+        tokio::task::block_in_place(|| {
+            h.lake.decline(
+                DeclineWantRequest {
+                    want_id: want.want_id,
+                    subjects: vec![SubjectRef {
+                        entity_id: AAPL.into(),
+                        ..Default::default()
+                    }],
+                    reason: UnansweredReason::NotCovered as i32,
+                },
+                &envelope("coinbase-1", true, ""),
+            )
+        })
+        .unwrap();
+    };
+    decline_for("2026-10-07");
+    decline_for("2026-10-06");
+    assert_eq!(h.lake.declines_held(), 2);
+    h.clock.advance(2 * 86_400 * 1_000_000_000);
+    decline_for("2026-10-05");
+    assert_eq!(h.lake.declines_held(), 1, "the two past their day let go");
+}
+
+fn futures_lite_recv(heard: &mut meridian_bus::Subscription) -> ObservationsWantedEvent {
+    let delivery =
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(heard.recv()))
+            .unwrap();
+    ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap()
 }

@@ -301,6 +301,8 @@ fn run() -> Result<(), String> {
     // during first run, which signs nobody in and may be the very thing
     // making the database.
     let signs_people_in = provider.is_some() || directory.is_some() || accounts_url.is_some();
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("dashboard");
     let database = match var("MERIDIAN_LOCAL_ACCOUNTS_DATABASE_URL") {
         Some(url) if signs_people_in => Some(wait_for_store(
             "the dashboard's database",
@@ -572,6 +574,7 @@ fn run() -> Result<(), String> {
             health,
             kit,
             bounds: Arc::default(),
+            turns: Arc::default(),
             tickets,
             prepared,
             service_accounts,
@@ -586,6 +589,18 @@ fn run() -> Result<(), String> {
         // Its judge: each whole minute, each episode opened or closed a
         // notice to the people it concerns (W4.16; ruling 427).
         meridian_runtime::keep(meridian_dashboard::latency::notices::judge_forever(
+            Arc::clone(&app),
+        ));
+        // Each component's and plugin's health, asked of the conductor each
+        // minute and judged (W6.40; stage M): a restart, a crossed budget,
+        // a shed, restarts again and again, memory climbing, each a notice
+        // to the people who look after it.
+        // A gap's notice, once per gap, to every deployment admin (W10.14;
+        // contract v30, stage D; `gap_found`, ruled 2026-11-11).
+        meridian_runtime::keep(meridian_dashboard::dataset_gaps::judge_forever(Arc::clone(
+            &app,
+        )));
+        meridian_runtime::keep(meridian_dashboard::component_health::judge_forever(
             Arc::clone(&app),
         ));
         // The prepared change a page was opened from, and a person's own

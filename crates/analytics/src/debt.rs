@@ -415,14 +415,25 @@ pub fn treasury_curve_record(asker: &dyn Ask, as_of: i64) -> Result<String, Stri
     }
 }
 
+/// Whether a quoted yield is one the engine may compute with: from contract
+/// v30 a yield whose source states no day count is kept as quoted and never
+/// computed with (ruling 433; W10.4).
+pub fn computed_with(quoted: &v1::QuotedYield) -> bool {
+    quoted.convention.as_ref().is_some_and(|convention| {
+        v1::DayCount::try_from(convention.day_count).unwrap_or(v1::DayCount::Unspecified)
+            != v1::DayCount::Unspecified
+    })
+}
+
 /// A row's fixed-income fields (contract v29, W10.4), added to its market
-/// row only where set, so every earlier row's text is unchanged.
+/// row only where set, so every earlier row's text is unchanged; a yield
+/// stating no day count left out (contract v30, ruling 433).
 pub fn extras(price: &v1::Price, row: &mut Value) {
     let basis = v1::PriceBasis::try_from(price.basis).unwrap_or(v1::PriceBasis::Unspecified);
     if !matches!(basis, v1::PriceBasis::Unspecified | v1::PriceBasis::PerUnit) {
         row["basis"] = json!(basis.as_str_name());
     }
-    if let Some(y) = price.r#yield.as_ref() {
+    if let Some(y) = price.r#yield.as_ref().filter(|y| computed_with(y)) {
         if let Some(value) = y.value.as_ref().and_then(|v| text_of(v.value.as_ref())) {
             row["yield"] = json!({
                 "value": value,
@@ -436,5 +447,48 @@ pub fn extras(price: &v1::Price, row: &mut Value) {
     }
     if !price.benchmark_instrument_id.is_empty() {
         row["benchmark_instrument_id"] = json!(price.benchmark_instrument_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Contract v30 (ruling 433; W10.4): a yield whose source states no day
+    /// count is kept as quoted and never computed with -- left out of the
+    /// row the engine reads -- while one stating it is carried as before.
+    #[test]
+    fn a_yield_stating_no_day_count_is_never_computed_with() {
+        let quoted = |day_count: v1::DayCount| v1::Price {
+            r#yield: Some(v1::QuotedYield {
+                value: Some(v1::UnitValue {
+                    value: Some(
+                        "4.312"
+                            .parse::<meridian_domain::exact::Exact>()
+                            .unwrap()
+                            .to_wire(),
+                    ),
+                    ..Default::default()
+                }),
+                convention: Some(v1::RateConvention {
+                    day_count: day_count as i32,
+                    compounding: v1::Compounding::Compounded as i32,
+                    periods_per_year: 2,
+                }),
+                kind: v1::YieldKind::ToMaturity as i32,
+                to_date: String::new(),
+            }),
+            ..Default::default()
+        };
+        let stated = quoted(v1::DayCount::ActActIcma);
+        let unstated = quoted(v1::DayCount::Unspecified);
+        assert!(computed_with(stated.r#yield.as_ref().unwrap()));
+        assert!(!computed_with(unstated.r#yield.as_ref().unwrap()));
+        let mut row = json!({});
+        extras(&stated, &mut row);
+        assert_eq!(row["yield"]["value"], "4.312");
+        let mut row = json!({});
+        extras(&unstated, &mut row);
+        assert!(row.get("yield").is_none(), "{row}");
     }
 }

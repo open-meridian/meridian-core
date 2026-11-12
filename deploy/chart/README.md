@@ -200,9 +200,22 @@ each still overridable by its own value:
 | `<store>.standby` (lake, bor, instrument, street, conductor, launcher) | 0 | 1 |
 | `database.brought.standbys` | 0 | 2, under Patroni |
 | `broker.replicas` | 1 | 3, a NATS cluster |
-| `broker.jetstream.replicas` | 0 | 3, the analytics units' work queue |
+| `broker.jetstream.replicas` | 0 | 3, the analytics units' work queue and the lake's write-ahead stream |
 | `dashboard.replicaCount` | 1 | 2 |
 | `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount` | 1 | 2 |
+
+Reader members are a value of their own, in either profile:
+`<store>.readers` (lake, bor, instrument; 0 by default) runs that many of the
+store's own image in a reads-only mode, as a Deployment `<store>-reader`
+beside the writer's. A reader serves the store's reads in its query queue
+group, its hot layer kept current by following the writer's change log, and
+is ready while its lag is under `<store>.readyLagMs`. A read naming a
+watermark the reader has not reached waits up to that bound or the call's
+deadline less a second, then is answered from the primary database.
+`<store>.database.readExistingSecret` names a Secret holding a Postgres read
+replica's URL, under the store's database key: a reader answers the record's
+past (as of a time, ranges, past dates, history) from it once the replica has
+reached the read's watermark, and from the primary otherwise.
 
 `ha` needs the deployment's key in a Kubernetes Secret named by
 `key.existingSecret`: the conductor's standby runs on another node, and a key
@@ -214,7 +227,8 @@ same Postgres 16 with Patroni and pgBackRest: a primary and two standbys,
 each on its own volume and node, one standby synchronous and strict, so a
 primary cut off from every standby cannot acknowledge a commit alone. The
 book's, the street store's, the instrument store's and the configuration's
-commits wait for that standby; the lake's commit locally. Patroni keeps its
+commits wait for that standby; the lake's commit locally, its write-ahead
+stream holding what a failover takes back. Patroni keeps its
 state in this namespace's ConfigMaps and its members' labels, under a
 namespaced Role, and the database's Service follows the primary. A database
 made by this chart has page checksums from initdb on; one made before keeps
@@ -227,6 +241,21 @@ and `broker.jetstream.storageClassName`), so a server restarted, one at a
 time as an upgrade rolls them, rejoins with what it held. Without JetStream
 the broker keeps nothing on disk. Every client checks its server answers
 each second and moves to another when one has not for 2 s.
+
+In `ha` a data plugin's lake writes go to the lake's write-ahead stream on
+those three servers first, and its plugin is answered once the stream holds
+the write and the lake has recorded it; the lake's writer records each batch
+with its place in the stream in one transaction, and after a database
+failover goes back to the place the promoted standby holds, so no
+acknowledged row is lost. `lake.writeAhead.maxAge` (10m) is how long the
+stream holds a write the lake has not recorded, and `lake.writeAhead.maxBytes`
+(256MB) how much it holds: full, it refuses a new write, the plugin refused
+for load with a retry-after, and drops none it holds. A writer gone longer
+than `maxAge` leaves a gap in each dataset whose writes the stream dropped,
+recorded, asked again of the data plugin where its dataset declares
+`backfill`, and marked unrecovered otherwise. Each server's JetStream store
+is sized to hold `maxBytes` beside the analytics units' queue, and the chart
+refuses a `broker.jetstream.size` too small for it.
 
 A profile is changed on a live install by an upgrade (`meridian
 upgrade-deployment --set resilience.profile=ha`, and back). A StatefulSet's
@@ -271,7 +300,16 @@ archive, and the newest `backup.keep` of them are kept with the WAL they need.
   `<release>-meridian-runtime-database-offline` with the act
   `restore-to-time` and the time, and starts everything again: the archive's
   newest base backup before that time restored, the WAL replayed to it, and
-  the database promoted there on a timeline of its own.
+  the database promoted there on a timeline of its own. `meridian restore
+  --to-archive-end` does the same with the act `restore-to-archive-end`, to
+  the last commit the archive holds.
+- **The timeline is chosen, never asked:** each restore starts a timeline,
+  so a time can lie on an earlier one. The act reads the archive's timeline
+  history and restores along the timeline that held the time, from the
+  newest base backup on that timeline's history. A time before the oldest
+  base backup ended, at or past the last commit, or while the database was
+  stopped between two timelines is refused before the volume is touched,
+  naming the archive's first and last times.
 - **Page checksums on an older database:** the same CronJob's act
   `enable-checksums` runs `pg_checksums --enable` on the stopped volume, for
   `meridian upgrade-deployment --enable-checksums`; a database made by this

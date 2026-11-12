@@ -236,6 +236,15 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 }
             }
         }
+        if let Some(held0) = message.stated_binary_event_contract.as_ref() {
+            self.exact_money("stated_binary_event_contract.payout", held0.payout.as_ref())?;
+            if let Some(held1) = held0.floor.as_ref() {
+                self.exact("stated_binary_event_contract.floor.value", held1.value.as_ref())?;
+            }
+            if let Some(held1) = held0.cap.as_ref() {
+                self.exact("stated_binary_event_contract.cap.value", held1.value.as_ref())?;
+            }
+        }
         self.known("stated_asset_class", message.stated_asset_class, domain::AssetClass::try_from(message.stated_asset_class).is_ok())?;
         self.known("stated_instrument_type", message.stated_instrument_type, domain::InstrumentType::try_from(message.stated_instrument_type).is_ok())?;
         for stamped0 in message.identifiers.iter_mut() {
@@ -1343,6 +1352,16 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.reference.query.read-template", "meridian.v1.ReadTemplateRequest", message, account, None).await
     }
 
+    /// W10.2: `platform.lake.query.list-source-priorities` (preview).
+    async fn list_source_priorities(
+        &self,
+        request: Request<plugin::ListSourcePrioritiesParams>,
+    ) -> Result<Response<plugin::ListSourcePrioritiesResult>, Status> {
+        let message: domain::ListSourcePrioritiesRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-source-priorities", "meridian.v1.ListSourcePrioritiesRequest", message, account, None).await
+    }
+
     /// W10.4: `platform.lake.command.record-prices` (preview).
     async fn record_prices(
         &self,
@@ -1833,6 +1852,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<plugin::RunJobResult>, Status> {
         let mut message: domain::RunJobRequest = self.as_domain(request.into_inner())?;
         if let Some(held0) = message.job.as_ref() {
+            for (i1, held1) in held0.measures.iter().enumerate() {
+                self.known(&format!("job.measures[{i1}].refresh"), held1.refresh, domain::Refresh::try_from(held1.refresh).is_ok())?;
+            }
             if let Some(held1) = held0.what_if.as_ref() {
                 for (i2, held2) in held1.trades.iter().enumerate() {
                     self.known(&format!("job.what_if.trades[{i2}].side"), held2.side, domain::Side::try_from(held2.side).is_ok())?;
@@ -2493,6 +2515,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.exact(&format!("values[{i0}].value.value"), held1.value.as_ref())?;
                 self.known(&format!("values[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
             }
+            if let Some(held1) = held0.rule.as_ref() {
+                self.known(&format!("values[{i0}].rule.refresh"), held1.refresh, domain::Refresh::try_from(held1.refresh).is_ok())?;
+            }
             self.exact_money(&format!("values[{i0}].money_value"), held0.money_value.as_ref())?;
         }
         for stamped0 in message.values.iter_mut() {
@@ -2957,6 +2982,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             }
             self.known(&format!("actions[{i0}].kind"), held0.kind, domain::CorporateActionKind::try_from(held0.kind).is_ok())?;
             self.exact_money(&format!("actions[{i0}].amount_per_share"), held0.amount_per_share.as_ref())?;
+            if let Some(held1) = held0.rule.as_ref() {
+                self.known(&format!("actions[{i0}].rule.refresh"), held1.refresh, domain::Refresh::try_from(held1.refresh).is_ok())?;
+            }
         }
         for stamped0 in message.actions.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -3486,6 +3514,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.FactorsRecordedEvent",
         read: factors_recorded,
     },
+    crate::receive::Row {
+        name: "DerivedSeriesUpdated",
+        step: "W12.4",
+        topic: "platform.analytics.event.derived-series-updated",
+        payload_type: "meridian.v1.DerivedSeriesUpdatedEvent",
+        read: derived_series_updated,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -3929,5 +3964,17 @@ fn factors_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Decod
         journal: None,
         cause: None,
         item: plugin::delivery::Item::FactorsRecorded(message),
+    })
+}
+
+/// W12.4: a DerivedSeriesUpdatedEvent, conflated, unscoped.
+fn derived_series_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::DerivedSeriesUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: vec![("reporting", message.client_instance_id.clone()), ("portfolio", message.client_instance_id.clone()), ("compliance", message.client_instance_id.clone()), ("signal", message.client_instance_id.clone())],
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::DerivedSeriesUpdated(message),
     })
 }

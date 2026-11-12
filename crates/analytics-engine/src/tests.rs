@@ -171,6 +171,7 @@ fn realized_is_version_two_and_served() {
             version,
             breakdowns: vec![],
             event_group_id: String::new(),
+            ..Default::default()
         }],
         what_if: None,
         ..Default::default()

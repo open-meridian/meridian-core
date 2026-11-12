@@ -12,10 +12,13 @@
 //! Who this serves is launch configuration and never what registers: a plugin
 //! that named its own roles would be choosing its own privileges.
 
-use meridian_runtime::{bus_from_env, names_from, required, shutdown, var};
+use meridian_runtime::{
+    bus_from_env, bus_from_env_writing_ahead, names_from, required, shutdown, var,
+};
 use std::sync::Arc;
 
 use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
+use meridian_sidecar::share::{Limits, Share, Shared};
 use meridian_sidecar::{
     Identity, OlderPagesRead, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
 };
@@ -121,12 +124,38 @@ fn run() -> Result<(), String> {
         .or_else(|| var("MERIDIAN_INSTANCE_ID"))
         .unwrap_or_else(|| "sidecar-1".into());
 
+    // Whether its plugin records the lake's rows: the data role's (W10.4).
+    let writes_rows = identity.roles.iter().any(|role| role == "data");
+
+    // The plugin's share, refused at start where the chart or the launch
+    // set it to something that is not one.
+    let limits = Limits::from_env()?;
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
-            let bus = bus_from_env(&instance_id).await?;
+            // Its own budget (stage M), inside the desktop footprint's +15 %
+            // (1058): the plugin's share keeps a flood off it. The plugin's
+            // answers in flight (answerMiB) and its read_after session are
+            // held apart, so what is left is the sidecar's own work's,
+            // whatever the plugin does; a share that leaves it nothing is
+            // refused at start, as the chart refuses it.
+            meridian_budget::install(
+                "sidecar",
+                limits.held_apart(),
+                meridian_budget::permits_from_env(),
+            )?;
+            // A data plugin's lake writes go by the lake's write-ahead stream
+            // in `ha` (the resilience spec's section 4): held by the stream
+            // before the lake records them, so none it was answered for is
+            // lost.
+            let bus = if writes_rows {
+                bus_from_env_writing_ahead(&instance_id).await?
+            } else {
+                bus_from_env(&instance_id).await?
+            };
             // Its own hops' ages -- a record batch accepted, a row delivered
             // -- to the monitor, under its plugin's instance (W4.16; 606).
             tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
@@ -182,14 +211,24 @@ fn run() -> Result<(), String> {
                 }
             };
 
+            // The plugin's own share (stage M; the resilience spec's section
+            // 10a): past it, only this plugin is refused.
+            tracing::info!(
+                in_flight = limits.in_flight,
+                requests_per_second = limits.requests_per_second,
+                answer_mib = limits.answer_mib,
+                "the plugin's share at its sidecar"
+            );
+            let share = Share::new(limits);
             let serving = tonic::transport::Server::builder()
                 // An older plugin's admin pages, read as pages at `admin`
                 // while its contract is accepted (W4.8).
-                .add_service(OlderPagesRead::new(SidecarServiceServer::from_arc(
-                    Arc::clone(&sidecar),
-                )))
+                .add_service(Shared::new(
+                    OlderPagesRead::new(SidecarServiceServer::from_arc(Arc::clone(&sidecar))),
+                    Arc::clone(&share),
+                ))
                 // The typed operations (spec/typed-sidecar-operations).
-                .add_service(PluginOperationsServer::from_arc(sidecar))
+                .add_service(Shared::new(PluginOperationsServer::from_arc(sidecar), share))
                 .serve(listening);
 
             tokio::select! {

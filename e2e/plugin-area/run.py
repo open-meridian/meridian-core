@@ -515,6 +515,15 @@ def run():
          f"step 7, the harness's instance has no catalogue version to read: {by_instance}")
 
     # 8. A launch verified again from the deployment's own registry.
+    # Contract v30 (W8.3): first its shards, past the version's most_shards
+    # (1.4.0 declares none: one pod), refused by the conductor naming
+    # shards before anything is verified or launched.
+    sharded = call(*as_admin, "dashboard__launch_plugin",
+                   {"name": STAND_IN, "version": "1.4.0", "instance_id": "stand-in-1",
+                    "approved_roles": ["custody"], "shards": 2, "standby": True,
+                    "note": "Two pods of the listed stand-in."}, "refused")
+    must(refused_at(sharded, "shards") and "most_shards" in sharded.get("detail", ""),
+         f"step 8, two shards of a version allowing one pod refused naming shards: {sharded}")
     reached = call(*as_admin, "dashboard__launch_plugin",
                    {"name": STAND_IN, "version": "1.4.0", "instance_id": "stand-in-1",
                     "approved_roles": ["custody"], "note": "The listed stand-in."}, "refused")

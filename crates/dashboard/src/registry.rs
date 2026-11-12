@@ -119,6 +119,21 @@ async fn ask<R: Message + Default>(
     request: impl Message,
     wait: Duration,
 ) -> Result<R, String> {
+    ask_naming(app, subject, topic, request_type, request, wait)
+        .await
+        .map_err(|(_, words)| words)
+}
+
+/// As [`ask`], a refusal with the fields it names too (the Launch sheet
+/// shows a refusal naming shards at its field, contract v30).
+async fn ask_naming<R: Message + Default>(
+    app: &App,
+    subject: &str,
+    topic: &str,
+    request_type: &str,
+    request: impl Message,
+    wait: Duration,
+) -> Result<R, (Vec<String>, String)> {
     let (_, bytes) = app
         .bus
         .call_for(
@@ -134,15 +149,15 @@ async fn ask<R: Message + Default>(
             // A refusal's words, its code or its status (a starter pack's
             // refusal names its field, v28) left out of what a page says.
             BusError::HandlerFailed { detail, .. } => meridian_bus::read_refusal(&detail)
-                .map(|(_, words)| words.to_string())
+                .map(|(_, words)| (meridian_bus::refusal_fields(&detail), words.to_string()))
                 .or_else(|| {
                     meridian_bus::read_refusal_status(&detail)
-                        .map(|(_, _, words)| words.to_string())
+                        .map(|(_, fields, words)| (fields, words.to_string()))
                 })
-                .unwrap_or(detail),
-            other => other.to_string(),
+                .unwrap_or((Vec::new(), detail)),
+            other => (Vec::new(), other.to_string()),
         })?;
-    R::decode(&bytes[..]).map_err(|failed| format!("an undecodable reply: {failed}"))
+    R::decode(&bytes[..]).map_err(|failed| (Vec::new(), format!("an undecodable reply: {failed}")))
 }
 
 /// Browse's copy, as the conductor keeps it.

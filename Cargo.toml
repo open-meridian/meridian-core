@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clock", "crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/bor", "crates/lake", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run", "crates/analytics-engine", "crates/analytics", "crates/changes"]
+members = ["crates/clock", "crates/budget", "crates/bus", "crates/sidecar", "crates/instrument", "crates/street", "crates/bor", "crates/lake", "crates/symbology", "crates/conductor", "crates/runtime", "crates/domain", "crates/access", "crates/config", "crates/dashboard", "crates/first-run", "crates/analytics-engine", "crates/analytics", "crates/changes"]
 
 [workspace.package]
 edition = "2021"
@@ -14,13 +14,16 @@ license = "AGPL-3.0-or-later"
 # reviewable change rather than something that drifts in on a rebuild -- a
 # schema change lands in every consumer as one arc or it is not landed.
 [workspace.dependencies]
-meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "79118200a051df68c3de7e5e6b6ced23bf29fc8d" }
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "978c758c726353c16827c5b0bb690034eaa258bd" }
 # The domain messages, generated here from proto/ rather than taken from the
 # schema: they are the runtime's own traffic past the sidecar.
 meridian-domain = { path = "crates/domain" }
 # The deployment's one clock (decisions/024), which every component reads time
 # through and the runtime's composition roots construct.
 meridian-clock = { path = "crates/clock" }
+# A component's working memory (stage M; the resilience spec's section 10a):
+# its budget, each request's reservation, fair shares, the shed line.
+meridian-budget = { path = "crates/budget" }
 meridian-access = { path = "crates/access" }
 meridian-config = { path = "crates/config" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -146,6 +149,17 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# Third-party crates without debug info in the debug and test builds: the
+# workspace's own keep their line tables, so a stack trace through our code
+# stays readable. Measured on e48cefb in a fresh target directory (the
+# workspace's debug build and every test binary, as CI's compile stage
+# makes them): 8,463 MiB without this, 6,976 MiB with it.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
 
 [profile.release]
 debug = false

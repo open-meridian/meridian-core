@@ -101,6 +101,8 @@ fn run() -> Result<(), String> {
     // customer's database because somebody restarted a pod. So a schema the
     // migration Job has not reached yet is waited for, not applied, and one a
     // newer release made is refused.
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("street");
     let postgres = Arc::new(wait_for_store(
         "the street store's database",
         &url,
@@ -145,8 +147,17 @@ fn run() -> Result<(), String> {
         })?;
         tracing::info!(epoch, "the street store writes under its epoch");
         let watched = postgres.clone();
-        holding.keep(epoch, move || {
-            watched.head_epoch().map_err(|failed| failed.to_string())
+        let writing = postgres.clone();
+        holding.keep(
+            move || writing.epoch(),
+            move || watched.head_epoch().map_err(|failed| failed.to_string()),
+        );
+        // A new database timeline raises the epoch (contract v30, stage C).
+        let following = postgres.clone();
+        holding.follow_timeline(&bus, "street", move || {
+            following
+                .follow_timeline()
+                .map_err(|failed| failed.to_string())
         });
         // The scrub, under the lease (step 3b, integrity at rest).
         let scrubbing = scrub_url.clone();

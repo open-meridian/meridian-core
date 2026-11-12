@@ -99,6 +99,9 @@ pub struct App {
     /// The deployment's MCP surface's bounds, per delegation and per plugin
     /// instance (W6.20, Q7), held for every request this process serves.
     pub bounds: Arc<crate::mcp::bounds::Bounds>,
+    /// The dashboard's turns (the resilience spec's section 10a): each
+    /// request in its person's, terminal's or delegation's turn.
+    pub turns: Arc<crate::fair::Turns>,
     /// Tickets, their notes, notices and each reader's place in an inbox
     /// (W6.21 to W6.24, contract v13), kept in the dashboard's own tables.
     pub tickets: Arc<crate::tickets::Tickets>,
@@ -155,6 +158,11 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(Arc::clone(&app))
         // The route each request matched, for its timing line (ruling 798).
         .route_layer(axum::middleware::from_fn(crate::timing::named))
+        // Each request in its caller's turn (section 10a's fair shares).
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&app),
+            crate::fair::in_turn,
+        ))
         // The dashboard's pages are framed by nobody but itself: a plugin's
         // page, on a host below this one, could otherwise frame the admin
         // portal under something of its own and have a click land on it.

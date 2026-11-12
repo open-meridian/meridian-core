@@ -82,9 +82,10 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
             spec.name
         );
     }
-    // The five of contract v23, and from contract v28 the data age's read
-    // (W10.9; 517).
-    assert_eq!(SPECS.len(), 6, "the six approved tools");
+    // The five of contract v23, from contract v28 the data age's read
+    // (W10.9; 517), and from contract v30 the source switches' and the gaps'
+    // (W10.6, W10.14; approved by 1057 and 2026-11-09).
+    assert_eq!(SPECS.len(), 8, "the eight approved tools");
 }
 
 #[test]

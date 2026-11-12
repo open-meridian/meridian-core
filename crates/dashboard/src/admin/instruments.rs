@@ -1315,6 +1315,18 @@ pub fn accepting(listed: &[InstrumentToComplete], chosen: &[String]) -> Complete
                 values.push(offer.clone());
             }
         }
+        // Contract v30 (W3.10; ruling 433): a bond's terms a source offers,
+        // the first offer, put in force whole with its source.
+        if record.instrument_type == InstrumentType::Bond as i32 {
+            if let Some(offer) = record
+                .offers
+                .iter()
+                .filter_map(|offered| offered.value.as_ref())
+                .find(|value| matches!(value.value, Some(instrument_value::Value::Bond(_))))
+            {
+                values.push(offer.clone());
+            }
+        }
         if !values.is_empty() {
             completions.push(InstrumentCompletion {
                 instrument_id: record.instrument_id.clone(),
@@ -1338,6 +1350,8 @@ fn field_of(value: &InstrumentValue) -> i32 {
         Some(instrument_value::Value::BinaryEventContract(_)) => {
             InstrumentField::BinaryEventContract
         }
+        // Contract v30 (ruling 433).
+        Some(instrument_value::Value::Bond(_)) => InstrumentField::Bond,
         None => InstrumentField::Unspecified,
     }) as i32
 }
@@ -1355,6 +1369,9 @@ fn value_words(value: &InstrumentValue) -> String {
         Some(instrument_value::Value::BinaryEventContract(contract)) => {
             instrument_type::contract_words(&instrument_type::contract_to_text(contract))
         }
+        // Contract v30 (ruling 433): its coupon and maturity; the whole on
+        // the Terms tab.
+        Some(instrument_value::Value::Bond(bond)) => meridian_domain::debt::bond_words(bond),
         None => String::new(),
     }
 }

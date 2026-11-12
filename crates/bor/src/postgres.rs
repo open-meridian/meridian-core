@@ -38,6 +38,52 @@ use crate::store::{
     Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
+thread_local! {
+    /// Whether a read on this thread is to say the heads of its own snapshot
+    /// (contract v30, stage C2; the resilience spec's section 5): a record
+    /// read on a read replica, stamped from the snapshot it answered from.
+    static STAMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The heads its snapshots read, the lowest of each where it took more
+    /// than one.
+    static SNAPSHOT_HEADS: std::cell::RefCell<Option<Mark>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The next reads on this thread each answer from one repeatable-read
+/// snapshot and say its partitions' head rows ([`snapshot_heads`]): a read
+/// replica's record read (contract v30, stage C2; the resilience spec's
+/// section 5). Its watermark is then exact, with no write position mapped:
+/// the head rows replicate with the entries, as the lake's do.
+pub fn stamp_from_snapshot() {
+    STAMPING.with(|stamping| stamping.set(true));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take());
+}
+
+/// The heads the reads since [`stamp_from_snapshot`] answered from, each the
+/// lowest any of them read; none where none read any. Stops the stamping.
+pub fn snapshot_heads() -> Option<Mark> {
+    STAMPING.with(|stamping| stamping.set(false));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+fn stamping() -> bool {
+    STAMPING.with(std::cell::Cell::get)
+}
+
+/// In a read's repeatable-read transaction: every partition's head row from
+/// the same snapshot the read answers from, kept for [`snapshot_heads`].
+fn note_snapshot(tx: &mut Transaction<'_>) -> Result<()> {
+    let heads = heads_of(tx)?;
+    SNAPSHOT_HEADS.with(|noted| {
+        let mut noted = noted.borrow_mut();
+        let noted = noted.get_or_insert_with(Mark::new);
+        for (partition, head) in heads {
+            let at = noted.entry(partition).or_insert(head);
+            *at = (*at).min(head);
+        }
+    });
+    Ok(())
+}
+
 type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 type Connection =
     r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
@@ -56,6 +102,9 @@ pub struct PostgresStore {
     snapshot_interval: u64,
     /// The epoch this writer's commands commit under (step 3a).
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a command there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 impl PostgresStore {
@@ -65,14 +114,19 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
         Ok(Self {
             pool,
             snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -114,6 +168,9 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            // The book's control partition is its journal: its findings
+            // stay in book_integrity_finding alone for now (stage D).
+            meridian_changes::integrity::unlogged,
         )
         .map_err(unavailable)
     }
@@ -140,7 +197,55 @@ impl PostgresStore {
     }
 
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
+        Ok(conn)
+    }
+
+    /// Follow the database's timeline on `conn` for this writer (contract
+    /// v30, stage C): on a new one every partition's epoch raised as a
+    /// takeover raises it, adopted, and the takeover recorded with that
+    /// cause. Nothing where it writes under no epoch.
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let _alone = self.watch.alone();
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let by = meridian_changes::TookOver {
+            member: meridian_changes::member().to_string(),
+            previous: String::new(),
+            why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
+            at_ns: meridian_changes::now_ns(),
+        };
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let (found, identity) = meridian_changes::timeline::follow(
+            &mut tx,
+            "book_partition_head",
+            CONTROL_PARTITION,
+            mine,
+            |tx| raise(tx, &by),
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the book's database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The start-up's snapshots (v26's core; W9.10's note "when a snapshot
@@ -150,8 +255,12 @@ impl PostgresStore {
     /// latest entry, each in its own transaction under its partition's lock.
     /// Says how many were kept.
     pub fn backfill_snapshots(&self, only: Option<&str>) -> Result<usize> {
-        let due: Vec<(String, String)> = self
-            .conn()?
+        // Every account's, at start: without the serving session's
+        // statement_timeout (section 10a).
+        let mut conn = self.conn()?;
+        let mut looking = conn.transaction().map_err(unavailable)?;
+        meridian_changes::serving::unbounded(&mut looking).map_err(unavailable)?;
+        let due: Vec<(String, String)> = looking
             .query(
                 "SELECT a.account_id, a.partition FROM book_account a
                    LEFT JOIN LATERAL (
@@ -176,10 +285,13 @@ impl PostgresStore {
             .into_iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
+        looking.commit().map_err(unavailable)?;
+        drop(conn);
         let mut kept = 0;
         for (account, partition) in due {
             let mut conn = self.conn()?;
             let mut tx = conn.transaction().map_err(unavailable)?;
+            meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
             tx.execute(
                 "SELECT pg_advisory_xact_lock($1)",
                 &[&partition_lock(&partition)],
@@ -204,6 +316,10 @@ impl PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // Its heads from this snapshot, where its thread asked (stage C2).
+        if stamping() {
+            note_snapshot(&mut tx)?;
+        }
         let out = read(&mut tx)?;
         tx.commit().map_err(unavailable)?;
         Ok(out)
@@ -613,6 +729,53 @@ fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64)
         )
         .map_err(unavailable)?;
     Ok(())
+}
+
+/// The accounts the book holds, in order.
+fn accounts_of(client: &mut impl GenericClient) -> Result<Vec<String>> {
+    Ok(client
+        .query(
+            "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
+              ORDER BY account_id COLLATE \"C\"",
+            &[],
+        )
+        .map_err(unavailable)?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// An account's book as of `at` (and `until`), from its latest snapshot
+/// holding nothing later, with the entries replayed and the sequence it was
+/// held to in its partition.
+fn book_as_of_in(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    at: &Mark,
+    until: Option<&str>,
+) -> Result<(Book, (Vec<Entry>, u64))> {
+    let partition: String = client
+        .query_opt(
+            "SELECT partition FROM book_account WHERE account_id = $1",
+            &[&account_id],
+        )
+        .map_err(unavailable)?
+        .map(|row| row.get(0))
+        .unwrap_or_else(|| FIRST_PARTITION.to_string());
+    let at = at.get(&partition).copied().unwrap_or(0);
+    let (book, entries) = match snapshot_of(client, account_id, Some(at), until)? {
+        Some(kept) => {
+            let after = crate::snapshot::last_sequence(&kept);
+            let tail = journal_after(client, account_id, after)?;
+            (kept.resume_as_of(&tail, Some(at), until)?, tail)
+        }
+        None => {
+            let entries = journal_of(client, account_id)?;
+            let book = Book::as_of(account_id, &partition, &entries, Some(at), until)?;
+            (book, entries)
+        }
+    };
+    Ok((book, (entries, at)))
 }
 
 fn heads_of(client: &mut impl GenericClient) -> Result<Mark> {
@@ -1261,10 +1424,9 @@ impl Store for PostgresStore {
     ) -> Result<Acted> {
         // The writer's epoch, adopted before a connection is taken, so a
         // store of one connection never waits on itself (step 3a).
-        let epoch = match self.fence.epoch() {
-            0 => self.adopt()?,
-            epoch => epoch,
-        };
+        if self.fence.epoch() == 0 {
+            self.adopt()?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let partition: String = tx
@@ -1289,6 +1451,14 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         self.fence.admits(held.get::<_, i64>(1) as u64)?;
+        // The epoch the entry is committed under: the head row's, which the
+        // fence has just admitted as the writer's own -- never one read
+        // before the connection was taken, which a connection opened on a
+        // new database timeline raises (contract v30, stage C). Read before,
+        // an entry was kept at the old epoch after the raise's first one
+        // (failover-repeat 43015006850, torn-write: "book: 1 commit(s) at
+        // an epoch below one before it").
+        let epoch = held.get::<_, i64>(1) as u64;
         let head: i64 = held.get(0);
         // The partition's last digest, its chain's end (step 3b).
         let last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
@@ -1405,6 +1575,10 @@ impl Store for PostgresStore {
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
+        if stamping() {
+            // A read replica's: one snapshot, its heads beside (stage C2).
+            return self.reading(|tx| journal_of(tx, account_id));
+        }
         journal_of(&mut *self.conn()?, account_id)
     }
 
@@ -1435,34 +1609,15 @@ impl Store for PostgresStore {
         // A deposed writer stopped mid-entry holds the head row it took.
         meridian_changes::end_deposed_writers(&mut tx, &["book_partition_head"])
             .map_err(unavailable)?;
-        let epoch: i64 = tx
-            .query_one(
-                "WITH raised AS (
-                    UPDATE book_partition_head
-                       SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
-                    RETURNING epoch)
-                 SELECT max(epoch) FROM raised",
-                &[],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        // Who took it over and why, in the same transaction (step 3b).
-        tx.execute(
-            "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-             SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
-               FROM book_partition_head",
-            &[
-                &epoch,
-                &by.member,
-                &by.why,
-                &meridian_changes::origin(),
-                &by.at_ns,
-            ],
-        )
-        .map_err(unavailable)?;
+        let epoch = raise(&mut tx, by).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
-        self.fence.adopt(epoch as u64);
-        Ok(epoch as u64)
+        self.fence.adopt(epoch);
+        Ok(epoch)
+    }
+
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
     }
 
     fn head_epoch(&self) -> Result<u64> {
@@ -1548,6 +1703,9 @@ impl Store for PostgresStore {
     }
 
     fn bodies(&self, account_id: &str, entry_ids: &[String]) -> Result<Vec<(String, Body)>> {
+        if stamping() {
+            return self.reading(|tx| bodies_of(tx, account_id, entry_ids));
+        }
         bodies_of(&mut *self.conn()?, account_id, entry_ids)
     }
 
@@ -1606,28 +1764,14 @@ impl Store for PostgresStore {
     }
 
     fn book_as_of(&self, account_id: &str, at: &Mark, until: Option<&str>) -> Result<Book> {
+        if stamping() {
+            // A read replica's: replayed in one snapshot, its heads beside,
+            // and no read's snapshot kept -- a replica writes nothing.
+            return self
+                .reading(|tx| book_as_of_in(tx, account_id, at, until).map(|(book, _)| book));
+        }
         let mut conn = self.conn()?;
-        let partition: String = conn
-            .query_opt(
-                "SELECT partition FROM book_account WHERE account_id = $1",
-                &[&account_id],
-            )
-            .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| FIRST_PARTITION.to_string());
-        let at = at.get(&partition).copied().unwrap_or(0);
-        let (book, entries) = match snapshot_of(&mut *conn, account_id, Some(at), until)? {
-            Some(kept) => {
-                let after = crate::snapshot::last_sequence(&kept);
-                let tail = journal_after(&mut *conn, account_id, after)?;
-                (kept.resume_as_of(&tail, Some(at), until)?, tail)
-            }
-            None => {
-                let entries = journal_of(&mut *conn, account_id)?;
-                let book = Book::as_of(account_id, &partition, &entries, Some(at), until)?;
-                (book, entries)
-            }
-        };
+        let (book, (entries, at)) = book_as_of_in(&mut *conn, account_id, at, until)?;
         // A read that reached the journal's end with no date is the book
         // now, kept as a read's snapshot where it replayed past the interval
         // (v26's core).
@@ -1642,22 +1786,18 @@ impl Store for PostgresStore {
         Ok(book)
     }
 
-    fn accounts(&self) -> Result<Vec<String>> {
-        Ok(self
-            .conn()?
-            .query(
-                "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
-                  ORDER BY account_id COLLATE \"C\"",
-                &[],
-            )
-            .map_err(unavailable)?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect())
+    fn heads(&self) -> Result<Mark> {
+        if stamping() {
+            return self.reading(|tx| heads_of(tx));
+        }
+        heads_of(&mut *self.conn()?)
     }
 
-    fn heads(&self) -> Result<Mark> {
-        heads_of(&mut *self.conn()?)
+    fn accounts(&self) -> Result<Vec<String>> {
+        if stamping() {
+            return self.reading(|tx| accounts_of(tx));
+        }
+        accounts_of(&mut *self.conn()?)
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {
@@ -1909,6 +2049,9 @@ impl Store for PostgresStore {
         }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // The whole book, however large: without the serving session's
+        // statement_timeout (section 10a).
+        meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
         // Every partition's writer held off for the length of it.
         let partitions: Vec<String> = tx
             .query(
@@ -2154,6 +2297,11 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone, after its cursor, in its key's order (stage
+        // M; the store memory audit of 2026-11-09, item 7): never every row
+        // decoded and sorted for one page.
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2162,9 +2310,12 @@ impl Store for PostgresStore {
                           WHERE ($1::text[] IS NULL OR account_id = ANY($1))
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
-                            AND {filter}"
+                            AND {filter}
+                            AND ($5 = '' OR (account_id || chr(31) || locate_record_id) COLLATE \"C\" > $5)
+                          ORDER BY (account_id || chr(31) || locate_record_id) COLLATE \"C\"
+                          LIMIT $6"
                     ),
-                    &[&scope, &read.account_id, &partitions, &sequences],
+                    &[&scope, &read.account_id, &partitions, &sequences, &after, &rows_read],
                 )
                 .map_err(unavailable)?;
             let mut records = Vec::new();
@@ -2191,11 +2342,20 @@ impl Store for PostgresStore {
         } else {
             "$1::text[] IS NOT NULL AND $2::bigint[] IS NOT NULL".to_string()
         };
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
-                    &format!("SELECT instruction_key, record FROM book_instruction WHERE {filter}"),
-                    &[&partitions, &sequences],
+                    &format!(
+                        "SELECT instruction_key, record FROM book_instruction
+                          WHERE {filter}
+                            AND ($3 = '' OR instruction_key COLLATE \"C\" > $3)
+                          ORDER BY instruction_key COLLATE \"C\"
+                          LIMIT $4"
+                    ),
+                    &[&partitions, &sequences, &after, &rows_read],
                 )
                 .map_err(unavailable)?;
             let mut records = Vec::new();
@@ -2246,6 +2406,9 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2255,7 +2418,10 @@ impl Store for PostgresStore {
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
-                            AND {filter}"
+                            AND {filter}
+                            AND ($6 = '' OR (account_id || chr(31) || booking_id) COLLATE \"C\" > $6)
+                          ORDER BY (account_id || chr(31) || booking_id) COLLATE \"C\"
+                          LIMIT $7"
                     ),
                     &[
                         &scope,
@@ -2263,6 +2429,8 @@ impl Store for PostgresStore {
                         &partitions,
                         &sequences,
                         &read.state,
+                        &after,
+                        &rows_read,
                     ],
                 )
                 .map_err(unavailable)?;
@@ -2289,6 +2457,9 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let scope = scope_param(&read.scope);
+        // The page's rows alone (stage M; audit item 7).
+        let after = order_reads::keyed_after(&read.cursor)?;
+        let rows_read = order_reads::keyed_rows(read.limit);
         self.reading(|tx| {
             let rows = tx
                 .query(
@@ -2299,7 +2470,10 @@ impl Store for PostgresStore {
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
                             AND ($6 = 0 OR kind = $6)
-                            AND {filter}"
+                            AND {filter}
+                            AND ($7 = '' OR (account_id || chr(31) || alert_id) COLLATE \"C\" > $7)
+                          ORDER BY (account_id || chr(31) || alert_id) COLLATE \"C\"
+                          LIMIT $8"
                     ),
                     &[
                         &scope,
@@ -2308,6 +2482,8 @@ impl Store for PostgresStore {
                         &sequences,
                         &read.state,
                         &read.kind,
+                        &after,
+                        &rows_read,
                     ],
                 )
                 .map_err(unavailable)?;
@@ -2463,16 +2639,44 @@ fn unreadable(failed: prost::DecodeError) -> StoreError {
     StoreError::Unavailable(format!("a record of the book did not read: {failed}"))
 }
 
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    // With the cause: this driver's own message for most failures is "db
-    // error", and everything useful is one level down. A refusal the trigger
-    // raised is said as it is.
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
+}
+
+/// Raise every partition's epoch in `tx`, and record who raised it and why
+/// (step 3b, `WriterTookOver`): answer the epoch. What a takeover does, and a
+/// writer on a new database timeline (contract v30, stage C).
+fn raise(
+    tx: &mut postgres::Transaction<'_>,
+    by: &meridian_changes::TookOver,
+) -> std::result::Result<u64, postgres::Error> {
+    let epoch: i64 = tx
+        .query_one(
+            "WITH raised AS (
+                UPDATE book_partition_head
+                   SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
+                RETURNING epoch)
+             SELECT max(epoch) FROM raised",
+            &[],
+        )?
+        .get(0);
+    // Who raised it and why, in the same transaction (step 3b).
+    tx.execute(
+        "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+         SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
+           FROM book_partition_head",
+        &[
+            &epoch,
+            &by.member,
+            &by.why,
+            &meridian_changes::origin(),
+            &by.at_ns,
+        ],
+    )?;
+    Ok(epoch as u64)
 }

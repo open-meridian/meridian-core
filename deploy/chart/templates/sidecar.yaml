@@ -23,6 +23,7 @@
       "brokerKey" .instanceId
       "plugin" .plugin
       "imageTag" .imageTag
+      "limits" .limits
       "launched" false
       "storage" $storage) }}
 ---

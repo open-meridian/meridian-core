@@ -30,6 +30,38 @@ use crate::store::{
     Store, StoreError, Version, Written,
 };
 
+thread_local! {
+    /// Whether a read on this thread is to answer from one snapshot and say
+    /// its head rows (contract v30, stage C2; the resilience spec's section
+    /// 5): a record read on a read replica.
+    static STAMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The heads its snapshots read, the lowest of each where it took more
+    /// than one.
+    static SNAPSHOT_HEADS: std::cell::RefCell<Option<std::collections::HashMap<String, u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The next reads on this thread each answer from one repeatable-read
+/// snapshot and say its change log's head rows ([`snapshot_heads`]): a read
+/// replica's record read (contract v30, stage C2; the resilience spec's
+/// section 5), held to its `read_after` by the snapshot it answered from,
+/// with no write position mapped: the head rows replicate with the records.
+pub fn stamp_from_snapshot() {
+    STAMPING.with(|stamping| stamping.set(true));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take());
+}
+
+/// The heads the reads since [`stamp_from_snapshot`] answered from, each the
+/// lowest any of them read; none where none read any. Stops the stamping.
+pub fn snapshot_heads() -> Option<std::collections::HashMap<String, u64>> {
+    STAMPING.with(|stamping| stamping.set(false));
+    SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+fn stamping() -> bool {
+    STAMPING.with(std::cell::Cell::get)
+}
+
 type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 type Connection =
     r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
@@ -78,16 +110,23 @@ fn from_the_platform(version: i64) -> String {
 const REPORTED_BEFORE_V10: &str = "reported before contract v10";
 
 /// The instrument store, in a database.
+/// How many records [`Store::each`] loads at once.
+const EACH_CHUNK: i64 = 500;
+
 pub struct PostgresStore {
     pool: Pool,
     /// The epoch this writer's commits are fenced by (step 3a); none until
     /// it adopts one, as the migration Job never does.
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a commit there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 /// The instrument store's change log (step 3a): every table its writes
 /// touch, captured in their own transaction under one store-wide sequence.
 pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    component: "instrument",
     prefix: "instrument",
     head: "instrument_change_head",
     partition: "instrument",
@@ -130,14 +169,19 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
 
         Ok(Self {
             pool,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -157,6 +201,42 @@ impl PostgresStore {
         let epoch = CHANGES.take_over(&mut *conn, by).map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
+    }
+
+    /// The epoch this writer commits under; 0 before it adopts one.
+    pub fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    /// Follow the database's timeline (contract v30, stage C; the
+    /// resilience spec's section 3): on a new one the epoch is raised, as a
+    /// takeover raises it, and adopted, the takeover recorded with that
+    /// cause. Nothing where this store writes under no epoch.
+    pub fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
+    }
+
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let _alone = self.watch.alone();
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let (found, identity) = CHANGES
+            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The store's epoch now, as its head row says (step 3b): a writer
@@ -188,6 +268,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            meridian_changes::integrity::logged_in(&CHANGES),
         )
         .map_err(unavailable)
     }
@@ -457,6 +538,14 @@ impl PostgresStore {
     /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
         let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
         CHANGES
             .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
             .map_err(unavailable)?;
@@ -464,6 +553,43 @@ impl PostgresStore {
     }
 
     /// The records with these IDs, whole, ordered by ID.
+    /// `read` in one repeatable-read, read-only snapshot, its change log's
+    /// head rows read in the same and kept for [`snapshot_heads`] (contract
+    /// v30, stage C2): a read replica's record read, stamped from the
+    /// snapshot it answered from. The snapshot ended either way, so the
+    /// connection goes back to the pool in none.
+    fn in_snapshot<T>(&self, read: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn()?;
+        conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(unavailable)?;
+        let answered = conn
+            .query(
+                &format!("SELECT partition, sequence FROM {}", CHANGES.head),
+                &[],
+            )
+            .map_err(unavailable)
+            .map(|rows| {
+                SNAPSHOT_HEADS.with(|noted| {
+                    let mut noted = noted.borrow_mut();
+                    let noted = noted.get_or_insert_with(Default::default);
+                    for row in rows {
+                        let head = row.get::<_, i64>(1).max(0) as u64;
+                        let at = noted.entry(row.get::<_, String>(0)).or_insert(head);
+                        *at = (*at).min(head);
+                    }
+                })
+            })
+            .and_then(|()| read(&mut conn));
+        let ended = conn.batch_execute(if answered.is_ok() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        });
+        let answered = answered?;
+        ended.map_err(unavailable)?;
+        Ok(answered)
+    }
+
     fn load(conn: &mut Connection, ids: &[String]) -> Result<Vec<Instrument>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -779,23 +905,28 @@ impl Store for PostgresStore {
         source: &str,
         as_of_ns: i64,
     ) -> Result<Vec<Instrument>> {
-        let mut conn = self.conn()?;
-        let ids: Vec<String> = conn
-            .query(
-                "SELECT DISTINCT instrument_id
-                   FROM instrument_identifier
-                  WHERE scheme = $1 AND value = $2 AND source = $3
-                    AND valid_from_ns <= $4
-                    AND (valid_to_ns IS NULL OR valid_to_ns > $4)",
-                &[&scheme, &value, &source, &as_of_ns],
-            )
-            .map_err(unavailable)?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        // `load` orders by ID, which is what makes an ambiguous resolution
-        // name the same candidates every time.
-        Self::load(&mut conn, &ids)
+        let read = |conn: &mut Connection| {
+            let ids: Vec<String> = conn
+                .query(
+                    "SELECT DISTINCT instrument_id
+                       FROM instrument_identifier
+                      WHERE scheme = $1 AND value = $2 AND source = $3
+                        AND valid_from_ns <= $4
+                        AND (valid_to_ns IS NULL OR valid_to_ns > $4)",
+                    &[&scheme, &value, &source, &as_of_ns],
+                )
+                .map_err(unavailable)?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            // `load` orders by ID, which is what makes an ambiguous resolution
+            // name the same candidates every time.
+            Self::load(conn, &ids)
+        };
+        if stamping() {
+            return self.in_snapshot(read);
+        }
+        read(&mut self.conn()?)
     }
 
     fn windows(
@@ -843,6 +974,38 @@ impl Store for PostgresStore {
             .map(|row| row.get(0))
             .collect();
         Self::load(&mut conn, &ids)
+    }
+
+    fn each(&self, every: &mut dyn FnMut(Instrument) -> Result<bool>) -> Result<()> {
+        // Keyset pages of IDs, each page's records loaded whole, so what is
+        // held is a chunk of records, never every one (stage M). The
+        // connection is given back before the chunk is handed on, so a
+        // reader that reads the store for each record takes its own.
+        let mut after = String::new();
+        loop {
+            let mut conn = self.conn()?;
+            let ids: Vec<String> = conn
+                .query(
+                    "SELECT instrument_id FROM instrument WHERE instrument_id > $1
+                      ORDER BY instrument_id LIMIT $2",
+                    &[&after, &EACH_CHUNK],
+                )
+                .map_err(unavailable)?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let Some(last) = ids.last().cloned() else {
+                return Ok(());
+            };
+            let chunk = Self::load(&mut conn, &ids)?;
+            drop(conn);
+            for record in chunk {
+                if !every(record)? {
+                    return Ok(());
+                }
+            }
+            after = last;
+        }
     }
 
     fn count(&self) -> Result<usize> {
@@ -969,18 +1132,11 @@ impl Store for PostgresStore {
     }
 
     fn history(&self, instrument_id: &str) -> Result<Vec<Version>> {
-        let rows = self
-            .conn()?
-            .query(
-                "SELECT version, operation, changes, person, instance_id, note,
-                        merged_instrument_id, record_time_ns, acting_through_delegation,
-                        client_name, prepared_call_id
-                   FROM instrument_version
-                  WHERE instrument_id = $1
-                  ORDER BY version DESC",
-                &[&instrument_id],
-            )
-            .map_err(unavailable)?;
+        let rows = if stamping() {
+            self.in_snapshot(|conn| history_rows(conn, instrument_id))?
+        } else {
+            history_rows(&mut self.conn()?, instrument_id)?
+        };
         Ok(rows
             .into_iter()
             .map(|row| Version {
@@ -1574,18 +1730,27 @@ impl Store for PostgresStore {
 /// Not a loss of meaning: nothing above this trait can act differently on a
 /// connection refused than on a syntax error, and a caller given the
 /// distinction would only be tempted to.
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    // With the cause, because this driver's own message for most failures is
-    // the words "db error" and everything useful is one level down.
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
+/// A record's versions, newest first, as their rows.
+fn history_rows(conn: &mut Connection, instrument_id: &str) -> Result<Vec<postgres::Row>> {
+    conn.query(
+        "SELECT version, operation, changes, person, instance_id, note,
+                merged_instrument_id, record_time_ns, acting_through_delegation,
+                client_name, prepared_call_id
+           FROM instrument_version
+          WHERE instrument_id = $1
+          ORDER BY version DESC",
+        &[&instrument_id],
+    )
+    .map_err(unavailable)
+}
 
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
 /// The instrument store's change log, read a page at a time (step 3a).

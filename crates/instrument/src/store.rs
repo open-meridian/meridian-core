@@ -652,6 +652,20 @@ pub trait Store: Send + Sync {
     /// them is a page's worth.
     fn all(&self) -> Result<Vec<Instrument>>;
 
+    /// Every record held, ordered by ID, handed on a chunk at a time (stage
+    /// M; the store memory audit of 2026-11-09, item 3): a reader keeps what
+    /// it answers -- a page, its counts -- never every record. `every`
+    /// answers whether to go on. A store that reads a chunk at a time says
+    /// so by overriding this.
+    fn each(&self, every: &mut dyn FnMut(Instrument) -> Result<bool>) -> Result<()> {
+        for record in self.all()? {
+            if !every(record)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// How many records are held. For a dashboard and for tests.
     fn count(&self) -> Result<usize>;
 

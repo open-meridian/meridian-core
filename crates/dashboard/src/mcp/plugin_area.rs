@@ -236,7 +236,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "launch_plugin",
         "Launch a plugin",
-        "launch a version in the catalogue as an instance, as `meridian plugin launch` does: approved_roles exactly the version's roles, refused otherwise; live only on a development deployment; and a note.",
+        "launch a version in the catalogue as an instance, as the Launch sheet and `meridian plugin launch` do: approved_roles exactly the version's roles, refused otherwise; live only on a development deployment; its own limits at its sidecar, each absent for the deployment's; its shards, pods of the one instance sharing its subjects, at most the version's most_shards (0 or 1 one pod; more refused naming shards); standby true for a standby pod, which takes over when the instance's pod stops; and a note.",
         false,
         Gate::DeploymentAdmin,
         launch_schema,
@@ -693,6 +693,22 @@ fn launch_schema() -> Value {
             "approved_roles": {"type": "array", "items": {"type": "string"}},
             "live": {"type": "boolean"},
             "note": note_schema(),
+            // Contract v30 (W8.3): its shards, at most the version's
+            // most_shards, and a standby pod, as the Launch sheet's Pods.
+            "shards": {"type": "integer", "minimum": 0},
+            "standby": {"type": "boolean"},
+            // Contract v30 (W8.3; ruled 2026-11-11): its own share at its
+            // sidecar, as the Launch sheet's Limits; each absent for the
+            // deployment's.
+            "limits": {
+                "type": "object",
+                "properties": {
+                    "in_flight": {"type": "integer", "minimum": 1},
+                    "requests_per_second": {"type": "integer", "minimum": 1},
+                    "answer_mib": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": false,
+            },
         },
         "required": ["name", "version", "instance_id", "approved_roles", "note"],
         "additionalProperties": false,
@@ -812,6 +828,13 @@ fn launch_json(launch: &PluginLaunch) -> Value {
         "stopped_client_name": launch.stopped_client_name,
         "note": others_words(&launch.note),
         "stopped_note": others_words(&launch.stopped_note),
+        // Its own share at its sidecar as its launch asked (contract v30):
+        // null where it asked none, the deployment's.
+        "limits": launch.limits.as_ref().map(|l| json!({
+            "in_flight": l.in_flight,
+            "requests_per_second": l.requests_per_second,
+            "answer_mib": l.answer_mib,
+        })),
     })
 }
 
@@ -1642,6 +1665,31 @@ impl Context<'_> {
             // W4.16, the Summary's latency part).
             "latency": crate::latency::summary_json(&instance, self.app.clock.now_ns()),
         });
+        // Its datasets' default reads standing on a backup, as its Summary
+        // says "switched to backup source" (contract v30; the resilience
+        // spec's section 8).
+        {
+            let mine = format!("{instance}:");
+            data["switched_to_backup_source"] =
+                crate::admin::data_sources::standing(&self.app.bus, &self.caller.subject)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|s| {
+                        s.from_dataset.starts_with(&mine) || s.to_dataset.starts_with(&mine)
+                    })
+                    .map(|s| {
+                        json!({
+                            "data_type": s.data_type,
+                            "from_dataset": s.from_dataset,
+                            "to_dataset": s.to_dataset,
+                            "reason": crate::admin::data_sources::reason_word(s.reason),
+                            "switched_at_ns": super::instruments::stamp_said(s.switched_at_ns),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+        }
         // The Summary's own parts, for an admin of any of its roles; a
         // deployment admin who is none reads the Overview's.
         if !admin_roles(self.access, &instance).is_empty() {
@@ -2468,11 +2516,57 @@ impl Context<'_> {
                 "approved_roles",
                 "live",
                 "note",
+                "limits",
+                "shards",
+                "standby",
             ],
             &mut problems,
         ) else {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());
         };
+        // Its shards and standby pod (contract v30, W8.3), as the Launch
+        // sheet sends them: the conductor refuses shards past the version's
+        // most_shards, naming shards.
+        let shards = integer(top, "shards", "", false, &mut problems);
+        let shards = u32::try_from(shards).unwrap_or_else(|_| {
+            problems.add("shards", "a whole number of pods, 0 or 1 for one");
+            0
+        });
+        let standby = boolean(top, "standby", &mut problems);
+        // Its own share at its sidecar (contract v30): each a whole number
+        // above 0, absent for the deployment's.
+        let mut limits = meridian_domain::v1::SidecarLimits::default();
+        match top.get("limits") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(asked)) => {
+                for (name, value) in asked {
+                    let into = match name.as_str() {
+                        "in_flight" => &mut limits.in_flight,
+                        "requests_per_second" => &mut limits.requests_per_second,
+                        "answer_mib" => &mut limits.answer_mib,
+                        _ => {
+                            problems.add(
+                                &format!("limits.{name}"),
+                                "not a limit: in_flight, requests_per_second or answer_mib",
+                            );
+                            continue;
+                        }
+                    };
+                    match value
+                        .as_u64()
+                        .filter(|n| *n > 0 && *n <= u64::from(u32::MAX))
+                    {
+                        Some(n) => *into = n as u32,
+                        None => problems.add(&format!("limits.{name}"), "a whole number above 0"),
+                    }
+                }
+            }
+            Some(_) => problems.add(
+                "limits",
+                "an object of in_flight, requests_per_second and answer_mib",
+            ),
+        }
+        let limits = (limits != meridian_domain::v1::SidecarLimits::default()).then_some(limits);
         let name = text(top, "name", "", true, &mut problems);
         let version = text(top, "version", "", true, &mut problems);
         let instance_id = text(top, "instance_id", "", true, &mut problems);
@@ -2509,6 +2603,9 @@ impl Context<'_> {
                     approved_roles,
                     live,
                     note,
+                    limits,
+                    shards,
+                    standby,
                 },
                 RESTARTING,
             )

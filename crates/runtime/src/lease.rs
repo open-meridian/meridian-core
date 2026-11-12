@@ -17,9 +17,13 @@
 //!   expired once it has not changed for `leaseDurationSeconds`;
 //! - **every write is conditional** on the `resourceVersion` read, so two
 //!   members taking an expired lease at once cannot both succeed;
-//! - **a holder steps down before its lease ends**: one that has not renewed
-//!   for its renew deadline (the duration less one renew interval) stops
-//!   writing, so a standby taking the lapsed lease never overlaps it;
+//! - **a holder that cannot renew writes on** (contract v30, stage C; the
+//!   resilience spec's section 2, approved 2026-11-10): a renewal error
+//!   alone -- the API server not answering -- never moves it, as Patroni's
+//!   failsafe_mode keeps a primary through its store's outage; it steps
+//!   down when the lease shows another holder or a commit is refused by the
+//!   epoch. A lease lasts at least three renewals, each giving up within
+//!   one renew ([`Settings::check`]);
 //! - **a holder stopping releases it**, so a planned stop hands over at once.
 
 use std::time::{Duration, Instant};
@@ -52,18 +56,22 @@ impl Settings {
         (self.renew / 2).max(Duration::from_millis(250))
     }
 
-    /// Refused where the numbers cannot work: a renew no shorter than the
-    /// lease leaves no time to renew in.
+    /// Refused where the numbers cannot work: a lease shorter than three
+    /// renewals (contract v30, stage C; the resilience spec's section 2,
+    /// approved 2026-11-10) -- Patroni's `loop_wait + 2 x retry_timeout <=
+    /// ttl`, each renewal giving up within one renew -- leaves a standby
+    /// taking a lease its holder is still renewing through one slow answer.
     pub fn check(&self) -> Result<(), String> {
         if self.name.is_empty() || self.holder.is_empty() {
             return Err("a lease needs its name and this member's name".into());
         }
-        if self.renew.is_zero() || self.duration <= self.renew {
+        if self.renew.is_zero() || self.duration < self.renew * 3 {
             return Err(format!(
-                "leases.renewSeconds ({}) must be above 0 and below leases.durationSeconds ({}): \
-                 a holder renews several times within its lease",
-                self.renew.as_secs(),
-                self.duration.as_secs()
+                "leases.durationSeconds ({}) must be at least three times leases.renewSeconds ({}), \
+                 which must be above 0: a holder renews at least three times within its lease, \
+                 each renewal giving up within one renew",
+                self.duration.as_secs(),
+                self.renew.as_secs()
             ));
         }
         Ok(())
@@ -166,6 +174,19 @@ impl<L: Leases> Elector<L> {
     /// deployment's time for the record's own fields (read by people, never
     /// by an election).
     pub async fn look(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
+        let looked = self.look_once(now, wall_ns).await;
+        if looked.is_err() {
+            // Not watched while the API server did not answer (contract v30,
+            // stage C): a lease's expiry is observed, and an unobserved
+            // stretch is never counted as its holder's silence -- else a
+            // standby cut off with its writer takes the lease the moment the
+            // API server answers again (CI 42958621081, FAILURE=apiserver).
+            self.observed = None;
+        }
+        looked
+    }
+
+    async fn look_once(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let me = self.settings.holder.clone();
         let stamp = micro_time(wall_ns);
         let Some(current) = self.api.get(&self.settings.name).await? else {

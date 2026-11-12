@@ -49,6 +49,25 @@ fn memory_past_its_limit_warns_and_connections_near_the_max_warn() {
     assert_eq!(judge_connections(95, 100).verdict, Verdict::Warning);
 }
 
+/// Ruled 2026-11-08, built in contract v30's stage E: the brought ha
+/// database's memory is what this judge counts at the max_connections the
+/// chart derives with the lake's write-ahead writer counted -- 220, Postgres's
+/// default shared buffers and work memory -- with a quarter's room, rounded
+/// up to 64 MiB: 1280Mi (the chart's databaseMemoryLimit). Before, 1 GiB
+/// held 213 connections' count at 96%; at 220 it would hold 98%.
+#[test]
+fn the_ha_databases_memory_is_this_judges_count_with_a_quarters_room() {
+    let counted = 128 * MIB + 4 * MIB * 220;
+    assert_eq!(counted, 1008 * MIB);
+    let limit = (counted * 5 / 4).div_ceil(64 * MIB) * 64 * MIB;
+    assert_eq!(limit, 1280 * MIB, "the chart's 1280Mi");
+    let judged = judge_memory(128 * MIB, 4 * MIB, 220, Some(limit));
+    assert_eq!(judged.verdict, Verdict::Ready);
+    assert!(judged.why.contains("(79%)"), "{}", judged.why);
+    let before = judge_memory(128 * MIB, 4 * MIB, 213, Some(GIB));
+    assert!(before.why.contains("(96%)"), "{}", before.why);
+}
+
 #[test]
 fn a_bus_answer_near_the_brokers_limit_warns_and_past_it_blocks() {
     assert_eq!(judge_answer("a", 100 * 1024, MIB).verdict, Verdict::Ready);
@@ -323,4 +342,19 @@ fn a_database_that_does_not_answer_blocks_and_says_why() {
         "the password is never said: {database:?}"
     );
     assert_eq!(overall(&findings), Verdict::Blocked);
+}
+
+#[test]
+fn a_component_login_not_made_is_named_with_the_sql_that_makes_it_and_warns() {
+    let all = judge_logins(&[]);
+    assert_eq!(all.verdict, Verdict::Ready);
+    let missing = judge_logins(&["meridian_lake".into(), "meridian_bor".into()]);
+    assert_eq!(missing.verdict, Verdict::Warning);
+    assert!(
+        missing.why.contains("meridian_lake, meridian_bor")
+            && missing.why.contains("CREATE ROLE meridian_bor LOGIN")
+            && missing.why.contains("IN ROLE meridian_app"),
+        "{}",
+        missing.why
+    );
 }

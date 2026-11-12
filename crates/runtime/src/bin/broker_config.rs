@@ -90,7 +90,7 @@ mod serve {
     use meridian_sidecar::Contract;
     use tokio::signal::unix::{signal, SignalKind};
 
-    use super::{chart_instances, HEADER};
+    use super::chart_instances;
 
     struct Args {
         nats: String,
@@ -108,6 +108,14 @@ mod serve {
         jetstream: String,
         /// Where JetStream keeps it: the server's own volume.
         jetstream_store: String,
+        /// The broker's bounds (stage M; the resilience spec's section
+        /// 10a): each client's pending bytes before it is cut off as a slow
+        /// consumer (`broker.limits.maxPending`), the largest message
+        /// (`broker.limits.maxPayload`), and JetStream's memory
+        /// (`broker.jetstream.maxMemory`).
+        max_pending: String,
+        max_payload: String,
+        jetstream_memory: String,
         /// The directory of this server's certificate, key and the
         /// internal CA, where the deployment's internal TLS is on; empty
         /// for none (ruling 1084).
@@ -126,6 +134,9 @@ mod serve {
             routes: Vec::new(),
             jetstream: String::new(),
             jetstream_store: "/data/jetstream".into(),
+            max_pending: super::MAX_PENDING.into(),
+            max_payload: super::MAX_PAYLOAD.into(),
+            jetstream_memory: super::JETSTREAM_MEMORY.into(),
             tls: String::new(),
         };
         let mut args = std::env::args().skip(2);
@@ -146,6 +157,15 @@ mod serve {
                 "--route" => parsed.routes.push(value),
                 "--jetstream" => parsed.jetstream = value,
                 "--jetstream-store" => parsed.jetstream_store = value,
+                "--max-pending" => {
+                    parsed.max_pending = super::size(&value, "broker.limits.maxPending")?
+                }
+                "--max-payload" => {
+                    parsed.max_payload = super::size(&value, "broker.limits.maxPayload")?
+                }
+                "--jetstream-memory" => {
+                    parsed.jetstream_memory = super::size(&value, "broker.jetstream.maxMemory")?
+                }
                 "--tls" => parsed.tls = value,
                 "--every" => {
                     parsed.every = Duration::from_secs(
@@ -175,13 +195,15 @@ mod serve {
     /// The header, with this server's cluster and JetStream where it has them.
     fn header(args: &Args) -> String {
         format!(
-            "{HEADER}{}{}",
+            "{}{}{}",
+            super::bounded(&args.max_pending, &args.max_payload),
             super::secured(&args.tls),
             super::clustered(
                 &args.cluster,
                 &args.routes,
                 &args.jetstream,
                 &args.jetstream_store,
+                &args.jetstream_memory,
                 &args.tls,
             )
         )
@@ -377,7 +399,60 @@ fn tls_block(dir: &str) -> String {
     )
 }
 
-fn clustered(cluster: &str, routes: &[String], jetstream: &str, store: &str, tls: &str) -> String {
+/// `broker.limits.maxPending`, `broker.limits.maxPayload` and
+/// `broker.jetstream.maxMemory` where the chart says nothing (stage M): the
+/// broker's own pending default, the 1 MiB every paged answer is budgeted
+/// under, and what JetStream held in memory before.
+const MAX_PENDING: &str = "64MB";
+const MAX_PAYLOAD: &str = "1MB";
+const JETSTREAM_MEMORY: &str = "16MB";
+
+/// A size as the broker reads one -- a whole number of bytes, or of KB, MB or
+/// GB -- or refused, naming the chart value it came from.
+fn size(value: &str, name: &str) -> Result<String, String> {
+    let value = value.trim();
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &value[digits.len()..];
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || digits.parse::<u64>().map_or(true, |n| n == 0)
+        || !["", "KB", "MB", "GB"].contains(&unit)
+    {
+        return Err(format!(
+            "{name} is {value:?}; a whole number above 0 of bytes, KB, MB or GB"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// The header with the broker's bounds (stage M; the resilience spec's
+/// section 10a): the largest message as the chart says, and each client's
+/// pending bytes, past which the broker cuts that client off alone as a
+/// slow consumer and every other keeps its deliveries.
+fn bounded(max_pending: &str, max_payload: &str) -> String {
+    let header = HEADER.replace(
+        &format!("\nmax_payload: {MAX_PAYLOAD}\n"),
+        &format!("\nmax_payload: {max_payload}\n"),
+    );
+    format!(
+        "{header}# A client that stops reading is cut off alone, as a slow consumer, once\n\
+         # this much is pending for it (broker.limits.maxPending; stage M).\n\
+         max_pending: {max_pending}\n\n\
+         # Its monitoring endpoint (/healthz, /jsz, /routez), on the pod's own\n\
+         # loopback alone: no other pod reaches it, and nothing outside the pod\n\
+         # is served. Read by a port-forward when a failover check fails.\n\
+         http: \"127.0.0.1:8222\"\n\n"
+    )
+}
+
+fn clustered(
+    cluster: &str,
+    routes: &[String],
+    jetstream: &str,
+    store: &str,
+    memory: &str,
+    tls: &str,
+) -> String {
     let mut said = String::new();
     if !cluster.is_empty() {
         said.push_str(
@@ -409,7 +484,7 @@ fn clustered(cluster: &str, routes: &[String], jetstream: &str, store: &str, tls
         said.push_str(&format!(
             "# The analytics units' work queue, kept on three servers, each on its own volume.\n\
              jetstream {{\n  store_dir: {store:?}\n  \
-             max_memory_store: 16MB\n  max_file_store: {jetstream}\n}}\n\n"
+             max_memory_store: {memory}\n  max_file_store: {jetstream}\n}}\n\n"
         ));
     }
     said
@@ -562,6 +637,31 @@ fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_brokers_bounds_are_the_charts_and_a_size_it_cannot_read_is_refused_naming_it() {
+        let said = super::bounded("32MB", "1MB");
+        assert!(said.contains("\nmax_payload: 1MB\n"), "{said}");
+        assert!(said.contains("\nmax_pending: 32MB\n"), "{said}");
+        // Monitored on the pod's loopback alone, never a port another pod reaches.
+        assert!(said.contains("\nhttp: \"127.0.0.1:8222\"\n"), "{said}");
+        assert!(super::bounded(super::MAX_PENDING, "512KB").contains("\nmax_payload: 512KB\n"));
+        assert!(!super::bounded(super::MAX_PENDING, "512KB").contains("max_payload: 1MB"));
+        assert_eq!(
+            super::size("64MB", "broker.limits.maxPending"),
+            Ok("64MB".into())
+        );
+        assert_eq!(
+            super::size("1048576", "broker.limits.maxPayload"),
+            Ok("1048576".into())
+        );
+        for bad in ["", "0MB", "lots", "1TB", "-1MB"] {
+            let refused = super::size(bad, "broker.jetstream.maxMemory").unwrap_err();
+            assert!(refused.contains("broker.jetstream.maxMemory"), "{refused}");
+        }
+        let memory = super::clustered("", &[], "256MB", "/data/jetstream", "48MB", "");
+        assert!(memory.contains("max_memory_store: 48MB\n"), "{memory}");
+    }
+
+    #[test]
     fn the_configuration_states_the_brokers_max_payload() {
         // H1 (ruling 586): stated, never the broker's default, so the 512 KiB
         // page budget is set against a limit the chart says.
@@ -570,12 +670,15 @@ mod tests {
 
     #[test]
     fn a_server_alone_says_no_cluster_and_three_say_one_with_no_password() {
-        assert_eq!(super::clustered("", &[], "", "/data/jetstream", ""), "");
+        assert_eq!(
+            super::clustered("", &[], "", "/data/jetstream", "16MB", ""),
+            ""
+        );
         let routes = [
             "MERIDIAN_NATS__ROUTE_0".to_string(),
             "MERIDIAN_NATS__ROUTE_1".to_string(),
         ];
-        let said = super::clustered("b", &routes, "256MB", "/data/jetstream", "");
+        let said = super::clustered("b", &routes, "256MB", "/data/jetstream", "16MB", "");
         assert!(said.contains("server_name: $MERIDIAN_BROKER_SERVER_NAME\n"));
         assert!(said.contains("cluster {\n  name: \"b\"\n"));
         assert!(said.contains("password: $MERIDIAN_NATS__ROUTES\n"));
@@ -603,7 +706,14 @@ mod tests {
         // No allow_non_tls: a server with tls refuses a plaintext client.
         assert!(!said.contains("allow_non_tls"));
         let routes = ["MERIDIAN_NATS__ROUTE_0".to_string()];
-        let clustered = super::clustered("b", &routes, "", "/data/jetstream", "/etc/meridian-tls");
+        let clustered = super::clustered(
+            "b",
+            &routes,
+            "",
+            "/data/jetstream",
+            "16MB",
+            "/etc/meridian-tls",
+        );
         assert!(clustered.contains("  ]\n  tls {\n    cert_file: \"/etc/meridian-tls/tls.crt\"\n"));
     }
 }

@@ -181,10 +181,11 @@ pub fn quoted_yield_words(quoted: &QuotedYield) -> String {
 }
 
 /// What the contract refuses of a quoted yield at `at` (W10.4, W11.1; the
-/// shared dictionary): its value or its convention unset, its kind or its
-/// convention's day count unspecified, its convention's compounding
-/// unspecified, a date its kind does not take or a date that is not a
-/// plain date. Each refusal names its field's path.
+/// shared dictionary): its value or its convention unset, its kind
+/// unspecified, its convention's compounding unspecified or its day count
+/// one the schema does not define -- from contract v30 an unstated day count
+/// is accepted (ruling 433) -- a date its kind does not take or a date that
+/// is not a plain date. Each refusal names its field's path.
 pub fn quoted_yield_refused(quoted: &QuotedYield, at: &str) -> Vec<(String, String)> {
     let mut refused = Vec::new();
     let present = quoted
@@ -204,12 +205,16 @@ pub fn quoted_yield_refused(quoted: &QuotedYield, at: &str) -> Vec<(String, Stri
             "a quoted yield states its convention".to_string(),
         )),
         Some(convention) => {
-            if DayCount::try_from(convention.day_count).unwrap_or(DayCount::Unspecified)
-                == DayCount::Unspecified
-            {
+            // From contract v30 a day count the source does not state is
+            // accepted (ruling 433), the yield kept as quoted and never
+            // computed with; one the schema does not define is still refused.
+            if DayCount::try_from(convention.day_count).is_err() {
                 refused.push((
                     format!("{at}.convention.day_count"),
-                    "a quoted yield's convention states its day count".to_string(),
+                    format!(
+                        "{} is no day count the contract defines",
+                        convention.day_count
+                    ),
                 ));
             }
             if Compounding::try_from(convention.compounding).unwrap_or(Compounding::Unspecified)
@@ -358,10 +363,19 @@ mod tests {
         assert!(refused(&quoted(Some("4"), YieldKind::ToWorst, "")).is_empty());
         let mut bare = quoted(Some("4"), YieldKind::Current, "");
         bare.convention = Some(RateConvention::default());
+        // From contract v30 (ruling 433) a day count the source does not
+        // state is accepted, the yield kept as quoted; its compounding still
+        // stated, and an undefined day count still refused.
+        assert_eq!(refused(&bare), ["yield.convention.compounding"]);
+        let mut unstated = quoted(Some("4.312"), YieldKind::ToMaturity, "");
+        unstated.convention.as_mut().unwrap().day_count = DayCount::Unspecified as i32;
+        assert!(refused(&unstated).is_empty());
         assert_eq!(
-            refused(&bare),
-            ["yield.convention.day_count", "yield.convention.compounding"]
+            quoted_yield_words(&unstated),
+            "4.312% to maturity (compounded semi-annually)"
         );
+        unstated.convention.as_mut().unwrap().day_count = 999;
+        assert_eq!(refused(&unstated), ["yield.convention.day_count"]);
     }
 
     #[test]

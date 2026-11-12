@@ -36,7 +36,29 @@ probe names the path and its address, and it heals with no restart);
 once; every store answers again from another zone within the zone tier);
 `order-plugin` (the ems stand-in's pod's processes killed outright mid-flow:
 found not ready, registered again, and the book's orders and placements
-held to what it was told, none lost and none twice).
+held to what it was told, none lost and none twice); `memory-pressure` and
+`noisy-plugin` (stage M, the resilience spec's section 10a: the flood
+instance reads past the lake's budget, or past its own share at its
+sidecar, and is refused for load alone, with a retry-after, every other
+instance within its band, nothing restarted and nothing OOMKilled);
+`standing-coordinator` (HA only; contract v30, W12.4: the analytics
+coordinator holding the standing driver's job killed outright, the job
+registered again with a live coordinator within 30 s); `apiserver`
+(contract v30, stage C: the API server cut from every pod of the release
+for 30 s under the driver's load: no takeover, no write outage, no
+readiness flap); `write-ahead-bound` (HA only, stage C: the lake's writer
+cut from the broker past a short `lake.writeAhead.maxAge`, so the stream
+drops what it held: the gap recorded with the next batch, asked again
+where its dataset declares backfill, and read where the dataset is).
+
+The buy-side trust targets (contract v30, stage C; the resilience spec's
+section 15), after every class: the data driver reads its own price back
+every second as a live page reads it (a default read of the latest), and
+from those reads and the lake's own rows the run holds that a page drawn
+from them (1) flagged the price stale within its data type's stale
+threshold plus 2 s of the lake's newest row turning stale, never showing it
+live past that, and (2) was never blank: no read answered without the last
+good row. A failed read leaves the page as it was drawn, its value ageing.
 
 The write driver (driver.py, step 3b part 5) writes through the stores for
 the whole run, from test-only plugin instances in the chart's sidecars[]
@@ -62,10 +84,15 @@ nobody gives. No value of a secret, a key or a password is ever printed.
 import base64
 import json
 import os
+import queue
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-failover-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "fo")
@@ -85,6 +112,14 @@ ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
 
 STORES = ["lake", "bor", "instrument", "street", "conductor", "launcher"]
+# The stores with a reader member in the HA runs (contract v30, stage B),
+# and how many each.
+READ_STORES = ["lake", "bor"]
+READERS = 1
+# TEST ONLY: where a reader is told to hold behind, while the file is there
+# (MERIDIAN_READER_HOLD_FILE, which the chart never sets): in its pod's own
+# scratch, the ready volume.
+HOLD_FILE = "/run/meridian-ready/hold"
 BINARY = {c: f"meridian-{c}" for c in STORES}
 
 # The bounds each profile is held to (rulings 1048 and 1056), in seconds.
@@ -124,11 +159,23 @@ RECONFIGURE = ["ha", "tolerant", "ha"]
 # the ems stand-in (desk). What a class lost is read in the stores' own rows
 # against what each acknowledged.
 DRIVEN = PROFILE in ("tolerant", "ha", "reconfigure")
-DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk"}
+DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk", "drive-flood": "flood",
+           "drive-standing": "standing"}
 # What each instance is launched with: the ems stand-in (desk) holds oms and
 # ems, as e2e/orders/stand_in.py's desk does; it is the order-plugin class's
 # subject.
-DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"]}
+DRIVER_ROLES = {"data": ["data", "reporting"], "oms": ["oms"], "desk": ["oms", "ems"],
+                # The memory and isolation classes' subject (stage M): it
+                # records its own dataset and reads it.
+                "flood": ["data", "reporting"],
+                # The standing-coordinator class's subject (contract v30): a
+                # standing job held by its view.
+                "standing": ["reporting"]}
+# The flood instance's own sidecar.limits.inFlight: its pressure readers'
+# count in driver.py (FLOOD_PRESSURE), each reaching the lake at once, as
+# under the chart's 32 the class was built against; its noisy readers (160)
+# stay past it.
+FLOOD_IN_FLIGHT = 32
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
 DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
@@ -149,10 +196,13 @@ HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
-                 "bit-rot", "torn-write", "order-plugin"],
+                 "bit-rot", "torn-write", "order-plugin", "memory-pressure", "noisy-plugin",
+                 "apiserver"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
-           "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin"],
+           "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin",
+           "memory-pressure", "noisy-plugin", "standing-coordinator", "apiserver",
+           "write-ahead-bound"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -235,7 +285,8 @@ def psql(sql, database="meridian", quiet=False, pod=None):
 
 
 def database_members():
-    return 3 if SHAPE in ("ha", "scaled") else 1
+    # The scaled shape adds a record-read replica (contract v30, stage C).
+    return {"ha": 3, "scaled": 4}.get(SHAPE, 1)
 
 
 def pods(component):
@@ -383,6 +434,11 @@ def install(s):
         # renders only beside it.
         "--set", "pluginStorage.enabled=false",
     ]
+    if PROFILE == "tolerant":
+        # A reader beside the lake's one writer (contract v30, stage C): the
+        # db-primary class holds it to what the record holds after the
+        # database restarts.
+        values += ["--set", f"lake.readers={READERS}"]
     if PROFILE in ("ha", "scaled", "reconfigure"):
         # The conductor's standby needs the key as a Secret: the generated
         # one's volume attaches to one node. A tolerant install that is to
@@ -399,6 +455,14 @@ def install(s):
         # the dashboard and analytics at two.
         if PROFILE != "reconfigure":
             values += ["--set", "resilience.profile=ha"]
+            # A reader beside the lake's and the book's writer and standby
+            # (contract v30, stage B; the spec's section 15 shape), each
+            # serving its store's reads in the store's queue group.
+            values += ["--set", f"lake.readers={READERS}", "--set", f"bor.readers={READERS}"]
+            if PROFILE == "scaled":
+                # A record-read replica beside the primary and its two
+                # standbys (contract v30, stage C; database.brought.readReplicas).
+                values += ["--set", "database.brought.readReplicas=1"]
         if TLS:
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
@@ -409,6 +473,9 @@ def install(s):
         values += driver_values()
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
+    if PROFILE == "ha":
+        # The book's reader may be held behind on purpose (reader_held).
+        kubectl("set", "env", f"deployment/{FULL}-bor-reader", f"MERIDIAN_READER_HOLD_FILE={HOLD_FILE}")
     if public:
         driver_trusted(public)
     if PROFILE == "ha":
@@ -423,9 +490,7 @@ def install(s):
         # so a test that stops or pauses an agent never stops them: theirs
         # are the db-primary and broker classes, injected apart. The shape
         # run (scaled) leaves them spread over the zones.
-        pin = json.dumps({"spec": {"template": {"spec": {
-            "nodeSelector": {"kubernetes.io/hostname": server_node()},
-            "affinity": None, "topologySpreadConstraints": None}}}})
+        pin = json.dumps(pinned())
         # The database's members are made by first run, after this.
         kubectl("patch", "statefulset", f"{FULL}-database", "--type", "merge", "-p", pin)
         # The broker's servers are made at install, each with JetStream's
@@ -440,7 +505,27 @@ def install(s):
                 *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
         kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
+        # Formed again before first run starts the stores, which make their
+        # streams on it: CI run 43185314225's lake write-ahead stream, made
+        # as the servers came back, had no leader for ten minutes, every
+        # write refused "nothing serves", until the servers' next roll.
+        wait_for("the broker's servers formed again, JetStream healthy on each",
+                 lambda: broker_formed(servers), seconds=300)
         cluster_services_on_server()
+
+
+def pinned():
+    """The pin on the database's and the broker's members in ha: the server
+    node by its name, the chart's spread taken off (install, above)."""
+    return {"spec": {"template": {"spec": {
+        "nodeSelector": {"kubernetes.io/hostname": server_node()},
+        "affinity": None, "topologySpreadConstraints": None}}}}
+
+
+def pinned_sets():
+    """The member sets this run pinned to the server node: ha's database
+    and broker; none in another profile."""
+    return [f"{FULL}-database", broker_set()] if PROFILE == "ha" else []
 
 
 # The cluster's own services, of which k3s runs one each, on any node.
@@ -511,6 +596,14 @@ def first_run(s):
     addresses["data"] = {
         "dashboard-url": base64.b64encode(b"http://failover-e2e.localhost").decode(),
         "administrator-login": base64.b64encode(ADMIN.encode()).decode(),
+        # The deployment holds its own accounts, as the wizard says for a
+        # local administrator (local|alice): so the dashboard keeps its
+        # tables -- the inbox's notices among them -- in the database every
+        # copy shares, and write-ahead-bound reads a gap's notice where an
+        # admin's inbox reads it (contract v30, stage D). Without it the
+        # dashboard signed nobody in and kept its notices in each copy's
+        # memory (failover-repeat 43071322484, PR CI 43070882389).
+        "local-accounts": base64.b64encode(b"on").decode(),
     }
     kubectl("replace", "-f", "-", input=json.dumps(addresses).encode(), quiet=True)
     del serving, migrating, passwords
@@ -673,6 +766,15 @@ def shape(s):
         s.check(modes == ["standby", "writer"], f"{component}: one writer, one standby ({modes})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
+    # The readers (contract v30, stage B): each store's reader ready, in the
+    # reader mode, a Deployment of its own beside the writer's.
+    for component in READ_STORES:
+        reader = f"{component}-reader"
+        settled = happens(lambda r=reader: len(pods(r)) == READERS and all(ready(p) for p in pods(r)), 300)
+        s.check(settled, f"{component}: {READERS} reader ready ({len(pods(reader))})")
+        modes = [(probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
+                 for p in pods(reader)]
+        s.check(modes == ["reader"] * READERS, f"{component}: its reader says it reads ({modes})")
     tolerated = all(
         any(t.get("key") == "node.kubernetes.io/unreachable" and t.get("tolerationSeconds") == 30
             for t in p["spec"].get("tolerations", []))
@@ -682,7 +784,7 @@ def shape(s):
     # database's three members under Patroni, the broker's three servers,
     # the dashboard's two copies and analytics' two of each, every set spread
     # over three zones (or two, for two), with a budget over it.
-    for component, want in (("database", 3), ("broker", 3), ("dashboard", 2),
+    for component, want in (("database", database_members()), ("broker", 3), ("dashboard", 2),
                             ("analytics-coordinator", 2), ("analytics-worker", 2)):
         settled = happens(lambda c=component, n=want: len(pods(c)) == n and all(ready(p) for p in pods(c)), 300)
         live = pods(component)
@@ -693,14 +795,44 @@ def shape(s):
             s.note(f"{component}: kept on the server node for this run")
         else:
             zones = {zone_of(p["spec"]["nodeName"]) for p in live}
-            s.check(len(zones) == want and "" not in zones,
+            s.check(len(zones) == min(want, 3) and "" not in zones,
                     f"{component}: one member per zone ({', '.join(sorted(zones))})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
     roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
-    s.check(roles == ["primary", "replica", "replica"], f"database: one primary, two standbys ({roles})")
-    sync = psql("select count(*) from pg_stat_replication where sync_state = 'sync'", database="postgres")
-    s.check(sync == "1", f"database: one standby synchronous ({sync})")
+    s.check(roles == ["primary"] + ["replica"] * (database_members() - 1),
+            f"database: one primary, its standbys and record-read replicas ({roles})")
+    if SHAPE == "scaled":
+        # Each store's reader wired to the record-read replica by the chart
+        # itself (contract v30, stage C2, approved 2026-11-11): its read pool
+        # is on that member, and on no standby, which serve no reads.
+        replica = f"{FULL}-database-{database_members() - 1}"
+        standbys = [f"{FULL}-database-{n}" for n in (1, 2)]
+
+        def held_on(member, address):
+            said = psql(f"select count(*) from pg_stat_activity where client_addr = '{address}'",
+                        database="postgres", quiet=True, pod=member)
+            return int(said or 0)
+        for component in READ_STORES:
+            for pod in pods(f"{component}-reader"):
+                address = pod["status"].get("podIP", "")
+                on = happens(lambda a=address: held_on(replica, a) > 0, 120)
+                s.check(on, f"{component}: its reader reads the record's past from the record-read replica "
+                        f"({replica}; {held_on(replica, address)} connection(s) from {pod['metadata']['name']})")
+                elsewhere = sum(held_on(member, address) for member in standbys)
+                s.check(elsewhere == 0, f"{component}: its reader holds nothing on a standby ({elsewhere})")
+    # The synchronous standbys a quorum (contract v30, stage C): ANY 1 of
+    # the two, each standing in it, strict.
+    quorum = psql("select count(*) from pg_stat_replication where sync_state = 'quorum'", database="postgres")
+    names = psql("show synchronous_standby_names", database="postgres")
+    s.check(quorum == "2" and names.startswith("ANY 1 ("),
+            f"database: both standbys in a quorum of one ({quorum}; {names})")
+    if SHAPE == "scaled":
+        # The record-read replica outside the quorum (nosync): asynchronous.
+        streaming = psql("select count(*) from pg_stat_replication where sync_state = 'async'",
+                         database="postgres")
+        s.check(streaming == "1", f"database: the record-read replica asynchronous, outside the quorum "
+                                  f"({streaming})")
     checksums = psql("show data_checksums", database="postgres")
     s.check(checksums == "on", f"database: made with page checksums ({checksums})")
     # Every store's probe names the primary it reaches, and its checksums.
@@ -766,8 +898,15 @@ def driver_values():
             "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
                     "DRIVER_ACCOUNTS": DESK_ACCOUNT if role == "desk" else ",".join(DRIVER_ACCOUNTS)},
         }})
-        if role != "data":
+        if role in ("oms", "desk"):
             sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
+        if role == "flood":
+            # Its own share at its sidecar, as a launch may set it (contract
+            # v30, ruled 2026-11-11): FLOOD_PRESSURE readers at once reach
+            # the lake past its budget, as memory-pressure asks, now that
+            # the chart's default is 16; noisy-plugin's FLOOD_NOISY are still
+            # past it. The chart's bounds and the lake's are unchanged.
+            sidecars[-1]["limits"] = {"inFlight": FLOOD_IN_FLIGHT}
     path = os.path.join(tempfile.mkdtemp(prefix="failover-driver-"), "driver.json")
     with open(path, "w", encoding="utf-8") as kept:
         json.dump({"sidecars": sidecars}, kept)
@@ -816,6 +955,25 @@ def driver_fixtures(s):
         with open(path, encoding="utf-8") as held:
             psql(held.read())
     s.check(True, "the driver's accounts, grant and instrument written")
+    # Written behind the instrument store, as e2e-book writes them before it
+    # starts: its hot layer holds the answer to every ID asked, a record not
+    # held among them, and the drivers start asking for the instrument as
+    # soon as they are up -- in tolerant before these were written (CI
+    # 42755783823: every price refused, "no record the deployment holds").
+    # Its members start again, as after an install, and read the record.
+    members = pods("instrument")
+    for pod in members:
+        kubectl("delete", "pod", pod["metadata"]["name"], "--wait=false")
+    restarted = happens(lambda: len([p for p in pods("instrument") if ready(p)]) >= len(members)
+                        and not ({p["metadata"]["name"] for p in pods("instrument")}
+                                 & {p["metadata"]["name"] for p in members})
+                        and answering("instrument") is not None
+                        # With a lease (ha), held by a member started again:
+                        # the gone writer's runs out first (CI 42760537409).
+                        and holder("instrument") in ({""} | {p["metadata"]["name"]
+                                                            for p in pods("instrument")}),
+                        300, every=2)
+    s.check(restarted, "the instrument store started again over the records written behind it")
     writing = happens(lambda: all(driver_acked().get(kind) for kind in ("price", "order")), 300, every=3)
     s.check(writing, "the write driver writing through the stores: prices to the lake, orders to the book "
             f"({', '.join(f'{k} {len(v)}' for k, v in sorted(driver_acked().items())) or 'nothing acknowledged'})")
@@ -823,6 +981,10 @@ def driver_fixtures(s):
         for instance in DRIVERS:
             said = kubectl("logs", driver_pod(instance), "-c", "plugin", "--tail=15", check=False)
             s.note(f"{instance} said: {said.stdout.decode(errors='replace')[-1500:]}")
+        # The cluster's and the broker's own view kept at once (CI run
+        # 43185314225 kept the broker's logs only from its servers' later
+        # roll).
+        cluster_said("the write driver writing through the stores")
 
 
 def driver_pod(instance):
@@ -891,9 +1053,9 @@ def store_rpo(since_ms=0, pod=None):
 
 def rpo_extra(rpo):
     """The claims' RPO fields: the book's acknowledged orders and those
-    lost (none may be: RPO 0 for the record), and the lake's, which
-    commits locally (spec section 4, durability) and whose loss is measured
-    and said, its bound not yet ruled."""
+    lost (none may be: RPO 0 for the record), and the lake's acknowledged
+    rows and those lost (none may be: in ha its writes are held by the
+    write-ahead stream before they are acknowledged, contract v30 stage E)."""
     return {"through": "the stores: RecordOrder to the book, RecordPrices to the lake",
             "acknowledged_commits": rpo["book"]["acknowledged"], "rpo_commits_lost": len(rpo["book"]["lost"]),
             "lake_rows_acknowledged": rpo["lake"]["acknowledged"], "lake_rows_lost": len(rpo["lake"]["lost"]),
@@ -901,9 +1063,9 @@ def rpo_extra(rpo):
 
 
 def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
-    """Every acknowledged order kept, after a class; and every price, but
-    where the class took the database's primary, whose lake commits are
-    local (measured and said there)."""
+    """Every acknowledged order kept, after a class; and every price, unless
+    the caller says the lake may lose some (no class does since the lake's
+    write-ahead stream, contract v30 stage E)."""
     rpo = rpo or store_rpo()
     book, lake = rpo["book"], rpo["lake"]
     s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
@@ -1179,10 +1341,23 @@ def pod_ip(pod_name):
     return json.loads(out("get", "pod", pod_name, "-o", "json"))["status"].get("podIP", "")
 
 
+# Where every cut's rules go: the mangle table, which every packet crosses
+# before the filter table and in which nothing of the cluster's reorders a
+# rule. The filter table's FORWARD and INPUT are kube-router's: on each of its
+# syncs, which pods coming and going start, it puts its own jump back above
+# whatever is first, and its pods' chains accept an established connection
+# before a rule below them is read. A cut placed first in filter's FORWARD was
+# lifted for the connections it was there to cut (diagnostic run 43100786136:
+# KUBE-ROUTER-FORWARD back at 1 above the write-ahead-bound cut half way
+# through it; 43090858893, ha run 3: the lake's writer, its connection to the
+# broker kept, never held from the stream, so no gap and the class red).
+CUT = "iptables -t mangle"
+
+
 def cut_rules(pod_name, targets, verb):
     """Drop every packet between a pod and each target, on the pod's node,
-    first in FORWARD: established connections too, which a NetworkPolicy
-    (kube-router's, as most) lets carry on.
+    first in the mangle table's FORWARD (CUT): established connections too,
+    which a NetworkPolicy (kube-router's, as most) lets carry on.
 
     Every rule in one exec on the node, so the cut starts (and ends) at
     once: a docker exec per rule, some thirty for the broker class, spent
@@ -1190,7 +1365,7 @@ def cut_rules(pod_name, targets, verb):
     taking it out (broker 9.46 s of 10 in a local run)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
     at = "1 " if verb == "-I" else ""
-    rules = [f"iptables {verb} FORWARD {at}-s {a} -d {b} -j DROP"
+    rules = [f"{CUT} {verb} FORWARD {at}-s {a} -d {b} -j DROP"
              for target in targets for a, b in ((ip, target), (target, ip))]
     # Put in, every one must hold; taken out, each is gone whether or not.
     joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
@@ -1331,7 +1506,7 @@ export PGPASSWORD="${PATRONI_SUPERUSER_PASSWORD:-$POSTGRES_PASSWORD}"
 end=$(( $(date +%s) + SECONDS_ ))
 while [ "$(date +%s)" -lt "$end" ]; do
   id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
-       -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
+       -c "insert into failover_e2e.marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
     && echo "ACKED $id"
   sleep 0.05
 done
@@ -1339,7 +1514,13 @@ done
 
 
 def marks_table():
-    psql("create table if not exists failover_marks (id bigserial primary key, at timestamptz not null)")
+    """The marks' table, in a schema of this run's own: in the stores'
+    `public` it was the superuser's, and every migration after it failed
+    granting the stores' role its tables ("permission denied for table
+    failover_marks": migrate-3 Init:Error in failover-repeat 43078770407, ha
+    run 1, and PR CI 43078729225, after write-ahead-bound's upgrades)."""
+    psql("create schema if not exists failover_e2e; "
+         "create table if not exists failover_e2e.marks (id bigserial primary key, at timestamptz not null)")
 
 
 def write_marks(pod_name, seconds, pause=0.05):
@@ -1365,7 +1546,7 @@ def acknowledged(writer):
 def database_writes(avoid=()):
     """The database's primary takes a commit: it is serving."""
     try:
-        psql("insert into failover_marks (at) values (clock_timestamp())", pod=primary(avoid))
+        psql("insert into failover_e2e.marks (at) values (clock_timestamp())", pod=primary(avoid))
         return True
     except SystemExit:
         return False
@@ -1374,15 +1555,23 @@ def database_writes(avoid=()):
 def db_primary(s, failure="db-primary"):
     """The database's primary killed outright under the write driver's
     load: RPO read through the stores, every order the book acknowledged
-    kept (RPO 0 for the record), the lake's loss measured and said (its
-    commits are local). torn-write adds heavy commits straight to the
+    kept (RPO 0 for the record), and every row the lake acknowledged (its
+    commits are local, and in ha its write-ahead stream holds each write
+    until the lake has it again). torn-write adds heavy commits straight to the
     database from a member that is not killed, as its load, each
     acknowledged one held too."""
+    if failure == "db-primary" and PROFILE != "tolerant" and DRIVEN:
+        for component in ("bor", "lake"):
+            wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+        standby_lost(s)
     if failure == "db-primary":
         print("F: db-primary: the database's primary killed outright (SIGKILL), under the driver's writes", flush=True)
     for component in ("bor", "lake"):
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     marks_table()
+    # In ha the driver's prices go by the lake's write-ahead stream (contract
+    # v30, stage E): the lake's place in it, read before and after, moves.
+    stream_before = write_ahead_position() if PROFILE != "tolerant" and DRIVEN else None
     victim = primary()
     members = [p["metadata"]["name"] for p in pods("database")]
     writer, acked_before = None, None
@@ -1393,8 +1582,8 @@ def db_primary(s, failure="db-primary"):
         writing_in = next((m for m in members if m != victim), None)
         writer = write_marks(writing_in, 45, pause=0) if writing_in else None
         time.sleep(3)
-        psql("insert into failover_marks (at) values (clock_timestamp())")
-        acked_before = int(psql("select max(id) from failover_marks") or 0)
+        psql("insert into failover_e2e.marks (at) values (clock_timestamp())")
+        acked_before = int(psql("select max(id) from failover_e2e.marks") or 0)
     began = time.time()
     # With standbys, the primary is kept down: cut off from everything on
     # its node, then killed, so its Patroni cannot renew the leader key as
@@ -1429,13 +1618,22 @@ def db_primary(s, failure="db-primary"):
         # the failover is all in, and read once it is.
         again = acks_again(int(began * 1000))
         s.check(again, f"{failure}: the write driver acknowledged by the book and the lake again")
-        rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary),
-                              lake_may_lose=PROFILE != "tolerant")
+        # Every row the lake acknowledged is in it, in either profile: in ha
+        # its writes are held by the write-ahead stream first, and its
+        # writer goes back to the position the promoted standby holds
+        # (contract v30, stage E; the resilience spec's section 4).
+        rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary))
         extra = rpo_extra(rpo)
+        if failure == "db-primary":
+            extra.update(STANDBY_LOST)
+        if stream_before is not None:
+            moved = happens(lambda: write_ahead_position(new_primary) > stream_before, 60, every=2)
+            s.check(moved, f"{failure}: the lake's writes went by its write-ahead stream, its place in it "
+                    f"moved past {stream_before} across the failover (now {write_ahead_position(new_primary)})")
     if acked_before is not None:
         acked = acknowledged(writer) if writer else set()
         acked.add(acked_before)
-        kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
+        kept = {int(i) for i in psql("select id from failover_e2e.marks", pod=new_primary).split()}
         lost = sorted(acked - kept)
         s.check(not lost, f"{failure}: every commit the database acknowledged under the heavy load kept "
                 f"({len(acked)} acknowledged, {len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
@@ -1450,14 +1648,25 @@ def db_primary(s, failure="db-primary"):
     s.check(healed, f"{failure}: the killed member back, as a standby where there are standbys")
 
 
+def write_ahead_position(pod=None):
+    """The lake's place in its write-ahead stream (ha; contract v30, stage
+    E), as its store committed it: 0 where it has none."""
+    try:
+        said = psql("select coalesce(max(sequence), 0) from lake_write_ahead", pod=pod, quiet=True)
+    except SystemExit:
+        return 0
+    return int(said or 0)
+
+
 def isolate(pod_name, verb):
     """Every packet to and from a pod dropped on its node, whatever its
     peer: routed through the node (FORWARD) or the node itself (INPUT,
-    OUTPUT), the API server and the kubelet included."""
+    OUTPUT), the API server and the kubelet included; in the mangle table
+    (CUT)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
     for chain, rule in (("FORWARD", ["-s", ip]), ("FORWARD", ["-d", ip]),
                         ("INPUT", ["-s", ip]), ("OUTPUT", ["-d", ip])):
-        run("docker", "exec", node, "iptables", verb, chain, *(["1"] if verb == "-I" else []),
+        run("docker", "exec", node, *CUT.split(), verb, chain, *(["1"] if verb == "-I" else []),
             *rule, "-j", "DROP", check=verb == "-I")
 
 
@@ -1859,8 +2068,30 @@ def upgrade(*sets):
     Helm 4 the chart's own counts taken back (--force-conflicts). CI runs it
     on Helm 4.2.3, the newest the CLI meets and the stricter (ci.yaml)."""
     values = [arg for value in sets for arg in ("--set", value)]
-    return run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
-               "--timeout", "15m", *helm_takes_counts(), *values, check=False)
+    # The pin is this run's, not the chart's: Helm puts the chart's spread
+    # back on the sets it pinned (Helm 3 merges it in, Helm 4 applies it),
+    # the zones' node affinity beside the pin's selector of the server node,
+    # which no zone holds, and the member each set rolled first could never
+    # be placed again (failover-repeat 43078770407, ha run 1, and PR CI
+    # 43078729225: broker-jetstream-2 and database-2 Pending, "4 node(s)
+    # didn't match Pod's node affinity/selector", from write-ahead-bound's
+    # upgrade on). So each pinned set is held from rolling through the
+    # upgrade (its partition at its count) and its pin put back after, the
+    # roll let go: a template the upgrade changed rolls as the pin places it,
+    # one it left as it was rolls nothing.
+    held = {name: int(out("get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+            for name in pinned_sets()}
+    for name, count in held.items():
+        kubectl("patch", "statefulset", name, "--type", "merge", "-p", json.dumps(
+            {"spec": {"updateStrategy": {"type": "RollingUpdate", "rollingUpdate": {"partition": count}}}}))
+    try:
+        return run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+                   "--timeout", "15m", *helm_takes_counts(), *values, check=False)
+    finally:
+        for name in held:
+            back = pinned()
+            back["spec"]["updateStrategy"] = {"type": "RollingUpdate", "rollingUpdate": {"partition": 0}}
+            kubectl("patch", "statefulset", name, "--type", "merge", "-p", json.dumps(back))
 
 
 def revision():
@@ -2067,80 +2298,219 @@ def under_patroni():
     return set_["spec"]["template"]["metadata"].get("labels", {}).get("meridian.dev/database-manager") == "patroni"
 
 
+# How much of each container's log a failed check keeps: the Makefile's
+# E2E_K3D_LOG_LINES, which .e2e-cluster.log keeps at a run's end too. 5000
+# lines: ten minutes and more of every quiet container (a database member
+# under Patroni says something every two seconds), and minutes of one
+# answering a flood (memory-pressure's refusals are a line each), so the
+# window a class failed in survives in the dump taken as it fails.
+SAID_LINES = os.environ.get("E2E_K3D_LOG_LINES", "5000")
+SAID_KEPT = []
+
+# The broker's own view of itself (stage D2's open item): each server's
+# health, JetStream (its meta leader, its streams' and consumers' state)
+# and routes, from its monitoring endpoint, which listens on the pod's
+# loopback alone (`http: 127.0.0.1:8222`, broker_config) and is reached by
+# a port-forward, which lands on the pod's own loopback.
+BROKER_MONITOR_PORT = 8222
+BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=true&config=true",
+               "/routez", "/varz")
+
+
+def broker_servers():
+    """The broker's servers' pods, by name."""
+    return [p["metadata"]["name"] for p in json.loads(
+        out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+            "-o", "json", check=False) or "{}").get("items", [])]
+
+
+def broker_said():
+    """Each broker server's monitoring endpoint's answers, in text, for a
+    failed check's dump: never raises."""
+    parts = []
+    try:
+        servers = broker_servers()
+    except (ValueError, SystemExit) as failed:
+        return [f"== the broker's servers could not be listed: {failed}"]
+    for server in servers:
+        for path, (_, said) in monitored(server, BROKER_SAID).items():
+            parts.append(f"== {server}, {path}")
+            parts.append(said)
+    return parts
+
+
+def monitored(server, paths):
+    """One broker server's monitoring endpoint's answers to `paths`, each
+    its HTTP status (0 where none came) and its text: never raises."""
+    answers = {}
+    forward = subprocess.Popen(
+        ["kubectl", "--namespace", NAMESPACE, "port-forward", f"pod/{server}", f":{BROKER_MONITOR_PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        # Read on a thread of its own: a port-forward that can reach
+        # nothing (the API server cut, a node gone) may say nothing and
+        # never end, and the dump must not wait on it.
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(line) for line in forward.stdout],
+                         daemon=True).start()
+        local = None
+        began = time.time()
+        while local is None and time.time() - began < 10:
+            try:
+                line = lines.get(timeout=1).decode(errors="replace")
+            except queue.Empty:
+                continue
+            found = re.search(r"Forwarding from 127\.0\.0\.1:(\d+)", line)
+            if found:
+                local = found.group(1)
+        if local is None:
+            return {path: (0, "its monitoring endpoint: no port-forward within 10 s") for path in paths}
+        for path in paths:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{local}{path}", timeout=5) as answered:
+                    answers[path] = (answered.status, answered.read().decode(errors="replace"))
+            except urllib.error.HTTPError as refused:
+                answers[path] = (refused.code,
+                                 f"HTTP {refused.code}: {refused.read().decode(errors='replace')}")
+            except (urllib.error.URLError, OSError) as failed:
+                answers[path] = (0, f"unanswered: {failed}")
+    finally:
+        forward.terminate()
+        try:
+            forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+    return answers
+
+
+def broker_formed(servers):
+    """Every one of the broker's `servers` up and saying JetStream is
+    healthy -- its routes, a meta leader and its own state current
+    (`/healthz`, NATS's full check) -- so nothing makes a stream on a
+    cluster still forming."""
+    names = broker_servers()
+    if len(names) != servers:
+        return False
+    return all(monitored(name, ("/healthz",))["/healthz"][0] == 200 for name in names)
+
+
+def cluster_said(when):
+    """What the cluster said when a check failed, kept at once beside the
+    run (.e2e-said-<n>.log, which CI keeps with .e2e-cluster.log): the
+    pods, the namespace's events in order, and each container's log and
+    its previous one, timestamped. For reconfigure, whose later moves
+    replace every pod a failed check was about."""
+    SAID_KEPT.append(when)
+    name = f".e2e-said-{len(SAID_KEPT)}.log"
+    parts = [f"== {when}, at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    parts.append(kubectl("get", "pods", "-o", "wide", check=False).stdout.decode(errors="replace"))
+    parts.append(kubectl("get", "events", "--sort-by=.lastTimestamp", check=False).stdout.decode(errors="replace"))
+    parts.extend(broker_said())
+    for pod in json.loads(out("get", "pods", "-o", "json", check=False) or "{}").get("items", []):
+        pod_name = pod["metadata"]["name"]
+        spec = pod.get("spec", {})
+        for container in [c["name"] for c in spec.get("initContainers", []) + spec.get("containers", [])]:
+            for previous in ((), ("--previous",)):
+                said = kubectl("logs", pod_name, "-c", container, "--timestamps", f"--tail={SAID_LINES}",
+                               *previous, check=False)
+                parts.append(f"== {pod_name}, {container}{', before, if it restarted' if previous else ''}")
+                parts.append((said.stdout or said.stderr).decode(errors="replace"))
+    with open(name, "w", encoding="utf-8") as kept:
+        kept.write("\n".join(parts))
+    print(f"R: {when}: what the cluster said, kept in {name}", flush=True)
+
+
 def reconfigure(s):
     global SHAPE
+    failed_before = len(s.failures)
     tls_turned_on(s)
     archived_in_tolerant(s)
+    if len(s.failures) > failed_before:
+        cluster_said("reconfigure's internal TLS and archive")
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
     for target in RECONFIGURE:
-        before = record_now()
-        # Alone, it moves under Patroni in two upgrades; under it already
-        # (back from ha), one upgrade gives it its standbys.
-        alone = not under_patroni()
-        print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
-        began = time.time()
-        upgraded = upgrade(f"resilience.profile={target}")
-        s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
-                + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
-        if upgraded.returncode != 0:
-            return
-        SHAPE = target
-        # Each upgrade's migration succeeds, the way back included, where
-        # the database's own restart for a start-only setting once cut it.
-        migrated(s, f"reconfigure to {target}")
-        if target == "ha" and alone:
-            # A database alone moves under Patroni first, alone, and is given
-            # its standbys by a second upgrade with the same values, as the
-            # chart says. Run once the first has rolled out, as `meridian
-            # upgrade-deployment` waits for every workload of the release
-            # before it returns: member 0's postgres answering on its own
-            # address is not the Service routing to it, which it does only
-            # once Patroni says the member is ready, and a second upgrade
-            # started before that met its preflight refused (CI runs
-            # 42453056096, 42462993343 and 42482853675's run 3: no ready
-            # endpoint for over a minute).
-            said = upgraded.stdout.decode(errors="replace")
-            moved = "upgrade again with" in said
-            s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
-            if moved:
-                wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
-                         lambda: not rollout_unfinished(), seconds=600)
-                print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
-                      flush=True)
-                member_now("before the second upgrade")
-                with HookLog("preflight") as preflight:
-                    again = upgrade(f"resilience.profile={target}")
-                print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
-                      f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
-                print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
-                member_now("after the second upgrade")
-                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
-                        + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
-                if again.returncode != 0:
-                    database_said(s, "the second upgrade")
-                else:
-                    migrated(s, f"reconfigure to {target}, the second upgrade")
-        settled = happens(settled_everywhere, 900, every=5)
-        took = time.time() - began
-        s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
-        if not settled:
-            for component in STORES:
-                explain(s, f"reconfigure to {target}", component)
-            return
-        connections_held(s, f"reconfigure to {target}")
-        extra = {"from": "tolerant" if target == "ha" else "ha"}
-        if DRIVEN:
-            # RPO through the stores across the move: the database moved
-            # under Patroni and back, every member replaced, and nothing
-            # acknowledged lost, the lake's included (no primary was lost).
-            s.check(acks_again(int(began * 1000), seconds=180),
-                    f"reconfigure to {target}: the write driver acknowledged by the book and the lake again")
-            extra.update(rpo_extra(driver_rpo_held(s, f"reconfigure to {target}", store_rpo(int(began * 1000)))))
-        claim(s, f"reconfigure-{target}", "deployment", took, None, extra)
-        after = record_now()
-        kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
-        s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
-        properties(s, f"reconfigure to {target}")
+        failed_before = len(s.failures)
+        # Ended early -- a wait that stopped the move, or a return after a
+        # failed check -- unless the move's last line is reached.
+        stopped = True
+        try:
+            before = record_now()
+            # Alone, it moves under Patroni in two upgrades; under it already
+            # (back from ha), one upgrade gives it its standbys.
+            alone = not under_patroni()
+            print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
+            began = time.time()
+            upgraded = upgrade(f"resilience.profile={target}")
+            s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
+                    + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+            if upgraded.returncode != 0:
+                return
+            SHAPE = target
+            # Each upgrade's migration succeeds, the way back included, where
+            # the database's own restart for a start-only setting once cut it.
+            migrated(s, f"reconfigure to {target}")
+            if target == "ha" and alone:
+                # A database alone moves under Patroni first, alone, and is given
+                # its standbys by a second upgrade with the same values, as the
+                # chart says. Run once the first has rolled out, as `meridian
+                # upgrade-deployment` waits for every workload of the release
+                # before it returns: member 0's postgres answering on its own
+                # address is not the Service routing to it, which it does only
+                # once Patroni says the member is ready, and a second upgrade
+                # started before that met its preflight refused (CI runs
+                # 42453056096, 42462993343 and 42482853675's run 3: no ready
+                # endpoint for over a minute).
+                said = upgraded.stdout.decode(errors="replace")
+                moved = "upgrade again with" in said
+                s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
+                if moved:
+                    wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
+                             lambda: not rollout_unfinished(), seconds=600)
+                    print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
+                          flush=True)
+                    member_now("before the second upgrade")
+                    with HookLog("preflight") as preflight:
+                        again = upgrade(f"resilience.profile={target}")
+                    print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
+                          f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                    print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
+                    member_now("after the second upgrade")
+                    s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
+                            + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
+                    if again.returncode != 0:
+                        database_said(s, "the second upgrade")
+                    else:
+                        migrated(s, f"reconfigure to {target}, the second upgrade")
+            settled = happens(settled_everywhere, 900, every=5)
+            took = time.time() - began
+            s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
+            if not settled:
+                for component in STORES:
+                    explain(s, f"reconfigure to {target}", component)
+                return
+            connections_held(s, f"reconfigure to {target}")
+            extra = {"from": "tolerant" if target == "ha" else "ha"}
+            if DRIVEN:
+                # RPO through the stores across the move: the database moved
+                # under Patroni and back, every member replaced, and nothing
+                # acknowledged lost, the lake's included (no primary was lost).
+                s.check(acks_again(int(began * 1000), seconds=180),
+                        f"reconfigure to {target}: the write driver acknowledged by the book and the lake again")
+                extra.update(rpo_extra(driver_rpo_held(s, f"reconfigure to {target}", store_rpo(int(began * 1000)))))
+            claim(s, f"reconfigure-{target}", "deployment", took, None, extra)
+            after = record_now()
+            kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
+            s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
+            properties(s, f"reconfigure to {target}")
+            stopped = False
+        finally:
+            # What every pod and the namespace said at the move a check
+            # failed in, kept now: the moves after it replace every member,
+            # so the run's own record at its end no longer holds them (PR CI
+            # 43022080248: the first move to ha failed once, its pods' logs
+            # gone by then).
+            if stopped or len(s.failures) > failed_before:
+                cluster_said(f"reconfigure to {target}")
 
 
 # ── reconfigure's archive and its last act: a restore to a time in ha ─────
@@ -2280,7 +2650,7 @@ def restored_to_a_time(s):
     base backup's own, where the offline Job's start, a hot standby,
     paused for good (step 3b part 7). Three rows either side of a time;
     everything stopped as the CLI stops it; a time past the archive refused
-    in the act's own words and Postgres's, the volume left restorable; the
+    in the act's own words, naming its first and last times; the
     restore run; the standbys' volumes deleted and Patroni's record of the
     old primary cleared; everything started; and the rows as they stood at
     the time."""
@@ -2304,12 +2674,13 @@ def restored_to_a_time(s):
     wait_for("the last segment to be archived", lambda: psql(
         "select last_archived_wal from pg_stat_archiver", database="postgres") >= wal, seconds=180)
     running = stopped_everything()
-    # Past the archive's end: the act fails in its own words, with
-    # Postgres's last lines, and leaves the volume restorable.
+    # Past the archive's end: the act refuses it in its own words, naming
+    # the archive's first and last times, before the volume is touched
+    # (step 3c: it reads the archive's last commit first).
     ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=past,
                           MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
-    s.check(not ok and "is outside the archive" in log and "Postgres's log, its last lines:" in log,
-            f"restore: a time past the archive, {past}, refused as outside it, with Postgres's last lines")
+    s.check(not ok and "is outside the archive, which holds" in log,
+            f"restore: a time past the archive, {past}, refused as outside it, naming its first and last times")
     ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to,
                           MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
     s.check(ok and "promoted at" in log, f"restore: the offline Job restored the database to {to}, replaying "
@@ -2390,6 +2761,840 @@ def properties(s, after):
             f"each epoch one recorded takeover{': ' + '; '.join(broken) if broken else ''}")
 
 
+# ── Memory and isolation (stage M; the resilience spec's section 10a) ───────
+#
+# `memory-pressure`: the flood instance reads its whole dataset with many
+# readers at once, past the lake's budget; `noisy-plugin`: it asks one page
+# at a time, as fast as it can, past its own share at its sidecar. Either
+# way, for FLOOD_SECONDS: refusals typed for load, each with a retry-after,
+# to the flooder alone (REFUSAL_REASON_OVERLOADED, REFUSAL_REASON_RATE_LIMITED);
+# every other instance writing within its band all the while; no pod
+# restarted and none OOMKilled; and the flooder answered again as the
+# flood ends (the plan's Track 7 table).
+
+FLOOD = "drive-flood"
+FLOOD_DATASET = f"{FLOOD}:drive"
+# Its dataset asked of it, licensed here as served, not kept: what a lake
+# reader hands to its writer (contract v30, stage B; reader_hands_on).
+FLOOD_UNKEPT = f"{FLOOD}:unkept"
+FLOOD_SECONDS = 60
+# Every other instance within its band during a flood: the data driver
+# records a price every half second and the oms driver an order about every
+# quarter to whole second, so each acknowledges at least this many in a
+# minute's flood, about a quarter of what each does unflooded.
+FLOOD_BAND = {"price": 25, "order": 15}
+# ── A standing job's coordinator killed (contract v30, W12.4) ───────────────
+#
+# Question 13: a standing job is held by one coordinator, by rendezvous
+# hashing of its key over the live ones. The coordinator holding the
+# standing driver's job killed outright, the job is back -- registered
+# again by the SDK with a live coordinator and its answer read -- within
+# 1048's 30 s for a component: a lease's renewal plus a first load.
+
+STANDING_BACK = 30
+
+
+def standing_lines():
+    """The standing driver's job IDs, each with when it was held (ms)."""
+    said = []
+    for line in driver_file("drive-standing", "/tmp/standing.log").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "HELD" and parts[2].isdigit():
+            said.append((parts[1], int(parts[2])))
+    return said
+
+
+def standing_held():
+    """The standing driver's job IDs, in the order it was held under each."""
+    return [job for job, _ in standing_lines()]
+
+
+def standing_settled(seconds=45):
+    """Its job held for `seconds` without moving: two renewals at least, so
+    the coordinators' set has settled after whatever came before."""
+    lines = standing_lines()
+    return bool(lines) and time.time() * 1000 - lines[-1][1] >= seconds * 1000
+
+
+def standing_holder(job_id):
+    """The analytics coordinator pod that holds `job_id`, by its line."""
+    for pod in pods("analytics-coordinator"):
+        name = pod["metadata"]["name"]
+        said = kubectl("logs", name, "-c", "analytics-coordinator", check=False)
+        for line in said.stdout.decode(errors="replace").splitlines():
+            if job_id in line and "a standing job held" in line:
+                return name
+    return ""
+
+
+def coordinators_said():
+    """Each coordinator's restarts and its last standing lines, for a check
+    that found none holding the job."""
+    said = []
+    for pod in pods("analytics-coordinator"):
+        name = pod["metadata"]["name"]
+        logs = kubectl("logs", name, "-c", "analytics-coordinator", check=False).stdout.decode(
+            errors="replace").splitlines()
+        standing = [line for line in logs if "standing" in line][-3:]
+        said.append(f"{name} restarts={restarts(name)} lines={len(logs)} standing={standing}")
+    return "; ".join(said)
+
+
+def standing_coordinator(s):
+    print("F: standing-coordinator: the coordinator holding a standing job killed", flush=True)
+    settled = happens(standing_settled, 300, every=3)
+    s.check(settled, f"standing-coordinator: the driver holds a standing job, settled ({standing_held()[-1:]})")
+    if not settled:
+        return
+    holder, job_id = "", ""
+
+    def found():
+        nonlocal holder, job_id
+        job_id = standing_held()[-1]
+        holder = standing_holder(job_id)
+        return bool(holder)
+    located = happens(found, 60, every=2)
+    s.check(located, f"standing-coordinator: {job_id} held by {holder or 'no coordinator found: ' + coordinators_said()}")
+    if not located:
+        return
+    began = time.time()
+    kubectl("delete", "pod", holder, "--grace-period=0", "--force", "--wait=false", check=False)
+    back = happens(lambda: (standing_held()[-1:] or [job_id])[0] != job_id, STANDING_BACK * 2, every=0.5)
+    seconds = time.time() - began if back else STANDING_BACK * 2
+    again = standing_held()[-1]
+    s.check(back, f"standing-coordinator: the job registered again as {again}")
+    if back:
+        # The job it settles on, held by a coordinator still running, whose
+        # line may follow the driver's by a moment.
+        settled = happens(standing_settled, 120, every=2)
+        now = standing_held()[-1]
+        live = happens(lambda: standing_holder(standing_held()[-1]) not in ("", holder), 30, every=2)
+        s.check(settled and live,
+                f"standing-coordinator: {now} held by a live coordinator "
+                f"({standing_holder(now) or 'none found: ' + coordinators_said()})")
+    claim(s, "standing-coordinator", "analytics", seconds, STANDING_BACK,
+          {"job_before": job_id, "job_after": again, "killed": holder})
+
+
+# How soon the flooder is answered again once it stops (the tolerant pod
+# bound; nothing restarts, so it is the refusals' retry-after that counts).
+FLOOD_RECOVERED = 30
+FLOOD_ENTITLED = []
+
+
+def varint(n):
+    said = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            said.append(byte | 0x80)
+        else:
+            said.append(byte)
+            return bytes(said)
+
+
+def text_field(number, value):
+    data = value.encode()
+    return varint(number << 3 | 2) + varint(len(data)) + data
+
+
+def flood_entitled(s):
+    """The flood instance entitled to its own datasets, as a deployment admin
+    entitles a reader (W10.1), and the one asked of it licensed as served,
+    not kept (W10.9): its DatasetEntitlements and that DatasetLicence
+    recorded where the conductor keeps them, which the conductor publishes
+    whole within a minute. Once a run."""
+    if FLOOD_ENTITLED:
+        return
+    now = time.time_ns()
+    for dataset, why in ((FLOOD_DATASET, "the memory and isolation classes read it"),
+                         (FLOOD_UNKEPT, "a lake reader hands its read to the writer")):
+        entitlement = (text_field(1, dataset) + text_field(2, FLOOD) + varint(3 << 3) + varint(1)
+                       + text_field(5, ADMIN) + varint(6 << 3) + varint(now) + text_field(9, why))
+        psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
+             f"VALUES ('{dataset}', '{FLOOD}', decode('{entitlement.hex()}', 'hex'), {now})")
+    # Served, not kept: `kept` (2) false, so left out.
+    licence = (text_field(1, FLOOD_UNKEPT) + text_field(8, ADMIN) + varint(9 << 3) + varint(now)
+               + text_field(12, "served when asked, not kept: the reader-hands-on step"))
+    psql("INSERT INTO config_dataset_licence_change (dataset, licence, changed_at_ns) "
+         f"VALUES ('{FLOOD_UNKEPT}', decode('{licence.hex()}', 'hex'), {now})")
+    seeded = happens(lambda: "SEEDED" in driver_file(FLOOD, "/tmp/seeded"), 300, every=5)
+    s.check(seeded, f"the flood instance's {FLOOD_DATASET} recorded")
+    # The conductor publishes the data configuration every minute.
+    time.sleep(75)
+    FLOOD_ENTITLED.append(True)
+
+
+def flood_set(mode):
+    pod = driver_pod(FLOOD)
+    kubectl("exec", pod, "-c", "plugin", "--", "sh", "-c", f"echo {mode} > /tmp/flood")
+
+
+def flood_heard(mode, ended=False):
+    """The flood's last count for `mode`, or the one it gave at its end."""
+    said = {}
+    for line in driver_file(FLOOD, "/tmp/flood.log").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "FLOOD" and parts[1] == mode and (not ended or parts[-1] == "END"):
+            said = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
+    return {k: int(v) for k, v in said.items() if v.isdigit()}
+
+
+def restarted_pods():
+    """Every pod's restarts, and each container's last ending reason."""
+    pods_now = json.loads(out("get", "pods", "-o", "json"))["items"]
+    said = {}
+    for pod in pods_now:
+        for container in pod["status"].get("containerStatuses", []):
+            reason = (container.get("lastState", {}).get("terminated") or {}).get("reason", "")
+            said[f"{pod['metadata']['name']}/{container['name']}"] = (container.get("restartCount", 0), reason)
+    return said
+
+
+def flood(s, failure, mode, reason, component):
+    print(f"F: {failure}: {FLOOD} floods {component} ({mode}) for {FLOOD_SECONDS}s", flush=True)
+    flood_entitled(s)
+    before = restarted_pods()
+    acked_before = {kind: len(ids) for kind, ids in driver_acked().items()}
+    flood_set(mode)
+    time.sleep(FLOOD_SECONDS)
+    acked_during = {kind: len(ids) for kind, ids in driver_acked().items()}
+    # What the flooder heard is read from its log from here: a calm before
+    # this one (memory-pressure's, before noisy-plugin) never stands for
+    # this one's. The flood's own END is written after the calm is set.
+    kubectl("exec", driver_pod(FLOOD), "-c", "plugin", "--", "sh", "-c", ": > /tmp/flood.log")
+    flood_set("calm")
+    ended = happens(lambda: flood_heard(mode, ended=True), 60, every=2)
+    heard = flood_heard(mode, ended=True)
+    s.check(ended, f"{failure}: the flood ended and said what it heard ({heard})")
+    s.check(heard.get(reason, 0) > 0,
+            f"{failure}: the flooder was refused for load, {reason} {heard.get(reason, 0)} time(s)")
+    s.check(heard.get("retry_after_min", 0) >= 1,
+            f"{failure}: every refusal for load carried a retry-after, the least {heard.get('retry_after_min', 0)} s")
+    for kind, band in FLOOD_BAND.items():
+        rose = acked_during.get(kind, 0) - acked_before.get(kind, 0)
+        s.check(rose >= band, f"{failure}: the other instances within their band, {rose} {kind}(s) "
+                f"acknowledged during the flood (at least {band})")
+    after = restarted_pods()
+    again = sorted(name for name, (count, _) in after.items() if count > before.get(name, (0, ""))[0])
+    killed = sorted(name for name, (_, why) in after.items() if why == "OOMKilled")
+    s.check(not again, f"{failure}: no pod restarted ({', '.join(again) or 'none'})")
+    s.check(not killed, f"{failure}: nothing OOMKilled ({', '.join(killed) or 'none'})")
+    began = time.time()
+    answered = happens(lambda: flood_heard("calm").get("answered", 0) > 0
+                       and flood_heard("calm").get(reason, 0) == 0, FLOOD_RECOVERED * 2, every=1)
+    flood_set("")
+    claim(s, failure, component, time.time() - began if answered else FLOOD_RECOVERED * 2, FLOOD_RECOVERED,
+          {"refused": heard.get(reason, 0), "answered": heard.get("answered", 0),
+           "retry_after_min_s": heard.get("retry_after_min", 0)})
+
+
+# ── A reader held behind (contract v30, stage B) ──────────────────────────
+
+def reader_log(pod_name, said, since="10m", container="bor"):
+    """How many times the reader's log says `said`, in the last `since`."""
+    logs = kubectl("logs", pod_name, "-c", container, f"--since={since}", check=False, quiet=True)
+    return logs.stdout.decode(errors="replace").count(said) if logs.returncode == 0 else 0
+
+
+FROM_PRIMARY = "answered from the primary"
+
+
+def reader_held(s):
+    """The book's reader held behind its writer on purpose while the oms
+    driver appends and reads its accounts through its sidecar: each read
+    names the watermark of the driver's own last write (read_after, stamped
+    by the sidecar), so one the held reader takes waits up to its bound or
+    the call's deadline less a second and is answered from the primary,
+    never from behind it, and the reader stays ready. Let go, it reads the
+    gap from the writer and answers from its own record again. What every
+    read saw is Elle's to hold, after the run (tools/elle-check.sh): every
+    acknowledged append in every later read, whichever member answered it
+    (the spec's section 5, "Tested")."""
+    print("R: a reader held behind answers from the primary", flush=True)
+    readers = pods("bor-reader")
+    if not readers:
+        s.check(False, "reader held: the book has no reader")
+        return
+    reader = readers[0]["metadata"]["name"]
+    before = reader_log(reader, FROM_PRIMARY)
+    kubectl("exec", reader, "-c", "bor", "--", "touch", HOLD_FILE)
+    try:
+        answered = happens(lambda: reader_log(reader, FROM_PRIMARY) > before, 90, every=3)
+        s.check(answered, f"reader held: the book's reader, behind, answered from the primary "
+                          f"({reader_log(reader, FROM_PRIMARY) - before} reads)")
+        s.check(ready_of(next((p for p in pods("bor-reader") if p["metadata"]["name"] == reader), None)),
+                "reader held: the reader stayed ready, serving")
+    finally:
+        kubectl("exec", reader, "-c", "bor", "--", "rm", "-f", HOLD_FILE, check=False)
+    # Let go: the next page heard is a gap, read from the writer; the reads
+    # after it are its own again.
+    time.sleep(5)
+    settled = reader_log(reader, FROM_PRIMARY, since="1m")
+    time.sleep(15)
+    s.check(reader_log(reader, FROM_PRIMARY, since="1m") <= settled,
+            "reader held: let go, it caught up and answers from its own record again")
+    probe_said = (probe(reader, "bor") or {}).get("member", {})
+    s.check(probe_said.get("mode") == "reader", f"reader held: still a reader ({probe_said.get('mode')})")
+
+
+HANDED_ON = "a read handed to the writer: answered by it"
+# Reads of the flood's dataset served, not kept, each answered the price
+# served for it: enough that the broker's queue group gives the lake's
+# reader some (each read goes to one of two members).
+UNKEPT_READS = 20
+
+
+def unkept_said():
+    """The flood's last word on its reads of the dataset served, not kept,
+    as it wrote it."""
+    said = {}
+    for line in driver_file(FLOOD, "/tmp/unkept.log").splitlines():
+        parts = line.split()
+        if parts and parts[0] == "UNKEPT":
+            said = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+    return said
+
+
+def unkept_heard():
+    """Its counts."""
+    return {k: int(v) for k, v in unkept_said().items() if v.isdigit()}
+
+
+def handed_list_prices(pod_name, since_s):
+    """The lake reader's list-prices reads handed to the writer and
+    answered by it, in the last `since_s` seconds."""
+    logs = kubectl("logs", pod_name, "-c", "lake", f"--since={since_s}s", check=False, quiet=True)
+    if logs.returncode != 0:
+        return 0
+    return sum(1 for line in logs.stdout.decode(errors="replace").splitlines()
+               if HANDED_ON in line and "platform.lake.query.list-prices" in line)
+
+
+def reader_hands_on(s):
+    """A read whose answer depends on the lake writer's own acts, taken by
+    the lake's reader: the flood instance reads its dataset served, not kept,
+    a price at a time, each read raising a want -- the writer's recorded act
+    -- that the instance serves. The reader takes some of them (the queue
+    group), hands each to the writer on platform.lake.internal.read-from-
+    writer and answers its reply, so every read is answered the price served
+    for it, whichever member took it (the spec's section 5, approved
+    2026-11-10)."""
+    print("R: a lake reader hands its writer a read that depends on it", flush=True)
+    readers = pods("lake-reader")
+    if not readers:
+        s.check(False, "reader hands on: the lake has no reader")
+        return
+    reader = readers[0]["metadata"]["name"]
+    flood_entitled(s)
+    started = time.time()
+    flood_set("unkept")
+    try:
+        # Until the licence and entitlement the run recorded are in force and
+        # the reads are served (the conductor publishes within a minute).
+        enough = happens(lambda: unkept_heard().get("served", 0) >= UNKEPT_READS, 240, every=3)
+    finally:
+        flood_set("")
+    said = unkept_said()
+    heard = unkept_heard()
+    wants = driver_file(FLOOD, "/tmp/unkept-wants.log").splitlines()
+    s.note(f"reader hands on: the flood's last read said {said}; it heard {len(wants)} want line(s), "
+           f"the last {wants[-3:]}")
+    s.check(enough, f"reader hands on: {UNKEPT_READS} reads of the flood's dataset served, not kept, "
+                    f"each answered the price served for its want ({heard})")
+    handed = handed_list_prices(reader, int(time.time() - started) + 5)
+    s.check(handed > 0, f"reader hands on: the lake's reader handed {handed} of those reads to the writer, "
+                        f"each answered by it")
+
+
+def api_addresses():
+    """The API server's addresses, as its Service's endpoints name them."""
+    said = run("kubectl", "get", "endpoints", "kubernetes", "-o",
+               "jsonpath={.subsets[*].addresses[*].ip}").stdout.decode().split()
+    return [a for a in said if a]
+
+
+def cut_api(verb):
+    """Every pod of the release cut from the API server, both ways, on its
+    node: routed through the node (FORWARD), and to the node itself where
+    the API server runs there (INPUT), in the mangle table (CUT). One exec
+    per node, so the cut starts and ends at once."""
+    api = api_addresses()
+    by_node = {}
+    for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+        ip, node = pod["status"].get("podIP"), pod["spec"].get("nodeName")
+        if ip and node and not pod["metadata"].get("deletionTimestamp"):
+            by_node.setdefault(node, set()).add(ip)
+    at = "1 " if verb == "-I" else ""
+    for node, ips in by_node.items():
+        rules = []
+        for ip in sorted(ips):
+            for target in api:
+                rules += [f"{CUT} {verb} FORWARD {at}-s {ip} -d {target} -j DROP",
+                          f"{CUT} {verb} FORWARD {at}-s {target} -d {ip} -j DROP",
+                          f"{CUT} {verb} INPUT {at}-s {ip} -d {target} -j DROP"]
+        joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
+        run("docker", "exec", node, "sh", "-c", joined or "true", check=verb == "-I")
+    return api
+
+
+def ack_gaps(began_ms, ended_ms):
+    """The longest pause, in seconds, between the driver's acknowledgements
+    of each kind within a window, its edges counted."""
+    said = {}
+    for kind in ("price", "order"):
+        times = sorted(at for at in driver_acked().get(kind, {}).values() if began_ms <= at <= ended_ms)
+        edges = [began_ms] + times + [ended_ms]
+        said[kind] = round(max(b - a for a, b in zip(edges, edges[1:])) / 1000, 2)
+    return said
+
+
+# How long the API server is cut off, and the pause in the driver's
+# acknowledgements that counts as a write outage: a write is acknowledged
+# every half second, so anything past a few seconds is the stores stopping.
+API_CUT_S = 30
+WRITE_PAUSE_S = 5
+
+
+def apiserver_lost(s):
+    """FAILURE=apiserver (contract v30, stage C; the resilience spec's
+    sections 2, 10 and 15, approved 2026-11-10): the API server cut from
+    every pod of the release for 30 s under the driver's load. Writers keep
+    writing under their epoch and stay ready: no takeover (each store's
+    epoch as it was), no write outage (the book and the lake acknowledging
+    the driver throughout), and no readiness flap (every store member, its
+    readers' included, ready throughout and after)."""
+    print(f"F: apiserver: the API server cut from the release's pods for {API_CUT_S} s, under the driver's "
+          "writes", flush=True)
+    # Every store settled first, so a member still coming back from an
+    # earlier class is never taken for one this one flapped.
+    for component in [c for c in STORES if c != "launcher"]:
+        wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+    watched = [c for c in STORES if c != "launcher"] + [f"{c}-reader" for c in ("lake", "bor")]
+    wait_for("every member ready", lambda: all(ready(p) for c in watched for p in pods(c)), seconds=300)
+    epochs = {c: epoch_now(c) for c in ("bor", "lake", "instrument", "street", "conductor")}
+    members = {p["metadata"]["name"]: c for c in watched for p in pods(c)}
+    restarted = {name: restarts(name) for name in members}
+    flaps = set()
+    began = time.time()
+    api = cut_api("-I")
+    s.note(f"apiserver: {len(api)} API server address(es) cut from every pod")
+    try:
+        while time.time() - began < API_CUT_S:
+            for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+                if pod["metadata"]["name"] in members and not ready(pod):
+                    flaps.add(pod["metadata"]["name"])
+            time.sleep(1)
+    finally:
+        cut_api("-D")
+    ended = time.time()
+    # And for a while after: a member that stepped down at the cut's end.
+    for _ in range(15):
+        for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
+            name = pod["metadata"]["name"]
+            if name in members and (not ready(pod) or restarts(name) > restarted[name]):
+                flaps.add(name)
+        time.sleep(1)
+    s.check(not flaps, f"apiserver: no member's readiness flapped ({', '.join(sorted(flaps)) or 'none'})")
+    after = {c: epoch_now(c) for c in epochs}
+    moved = {c: (epochs[c], after[c]) for c in epochs if after[c] != epochs[c]}
+    s.check(not moved, f"apiserver: no takeover, every store's epoch as it was "
+            f"({', '.join(f'{c} {a}->{b}' for c, (a, b) in moved.items()) or 'none moved'})")
+    if DRIVEN:
+        gaps = ack_gaps(int(began * 1000), int(ended * 1000))
+        s.check(all(g <= WRITE_PAUSE_S for g in gaps.values()),
+                f"apiserver: no write outage, the driver acknowledged throughout (longest pause: "
+                f"book {gaps['order']} s, lake {gaps['price']} s; at most {WRITE_PAUSE_S} s)")
+        claim(s, "apiserver", "bor", gaps["order"], WRITE_PAUSE_S,
+              {"what": "the longest pause in the book's acknowledgements while the API server was cut",
+               "cut_s": API_CUT_S, "takeovers": len(moved), "readiness_flaps": len(flaps)})
+        claim(s, "apiserver", "lake", gaps["price"], WRITE_PAUSE_S,
+              {"what": "the longest pause in the lake's acknowledgements while the API server was cut",
+               "cut_s": API_CUT_S, "takeovers": len(moved), "readiness_flaps": len(flaps)})
+
+
+# The write-ahead-bound class's stream bound, short, and how long past it
+# the lake's writer is held.
+SHORT_MAX_AGE_S = 20
+HELD_PAST_S = 25
+
+
+def gaps_of(dataset, since_ns):
+    """Each gap of `dataset` recorded since `since_ns`, by its ID, its states
+    in order (lake_dataset_gap; GapState numbers)."""
+    said = psql("select gap_id, state from lake_dataset_gap where dataset = "
+                f"'{dataset}' and recorded_at_ns >= {since_ns} order by change_id", quiet=True)
+    gaps = {}
+    for line in said.splitlines():
+        parts = line.split("|") if "|" in line else line.split()
+        if len(parts) == 2 and parts[1].strip().isdigit():
+            gaps.setdefault(parts[0].strip(), []).append(int(parts[1]))
+    return gaps
+
+
+def proto_text(body, number):
+    """A protobuf message's string field `number`, from its bytes; empty
+    where it is not set. Enough of the wire format to read one field."""
+    at = 0
+
+    def varint():
+        nonlocal at
+        value, shift = 0, 0
+        while True:
+            byte = body[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value
+    while at < len(body):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            varint()
+        elif wire == 1:
+            at += 8
+        elif wire == 5:
+            at += 4
+        elif wire == 2:
+            length = varint()
+            if field == number:
+                return body[at:at + length].decode()
+            at += length
+        else:
+            return ""
+    return ""
+
+
+def gap_notices():
+    """Each gap's `gap_found` notices in the dashboard's inbox, by the gap's
+    ID its words begin with: (when filed, to whom) each. Empty where the
+    dashboard's table cannot be read yet."""
+    try:
+        said = psql("select about, changed_ns, subject from dashboard_notice where kind = 'gap_found'",
+                    quiet=True)
+    except SystemExit:
+        return {}
+    found = {}
+    for line in said.splitlines():
+        # A subject holds a bar itself (local|alice): the about and the time
+        # first, the subject whole after them.
+        parts = line.split("|", 2)
+        if len(parts) == 3 and parts[0].startswith("GAP-") and parts[1].strip().isdigit():
+            found.setdefault(parts[0].split()[0], []).append((int(parts[1]), parts[2].strip()))
+    return found
+
+
+def gaps_found_in(dataset, since_ns):
+    """Each gap recorded since `since_ns` -- of `dataset`, or with it empty
+    the unattributed ones -- by its ID: the gap it was found from
+    (DatasetGap.found_in_gap_id, field 9) and when it was first recorded."""
+    said = psql("select gap_id, min(recorded_at_ns), encode((array_agg(body order by change_id))[1], 'hex') "
+                f"from lake_dataset_gap where dataset = '{dataset}' and recorded_at_ns >= {since_ns} "
+                "group by gap_id", quiet=True)
+    found = {}
+    for line in said.splitlines():
+        parts = line.split("|")
+        if len(parts) == 3 and parts[1].strip().isdigit():
+            found[parts[0].strip()] = (proto_text(bytes.fromhex(parts[2].strip()), 9), int(parts[1]))
+    return found
+
+
+def write_ahead_bound(s):
+    """FAILURE=write-ahead-bound (HA; contract v30, stage C; the resilience
+    spec's sections 4 and 15): the lake's write-ahead stream bounded short
+    (lake.writeAhead.maxAge), and the lake's writer cut from the broker past
+    it while the data driver writes, so the stream drops writes the lake
+    never took (none acknowledged: a write is answered after the lake
+    commits it). Let go, the writer finds the stream's sequence passed rows
+    it never committed: a gap recorded at once, its datasets not yet known
+    (dataset empty; stage C2, approved 2026-11-11), then the gap of the
+    driver's dataset recorded with its next write, naming it
+    (found_in_gap_id; GAP_CAUSE_WRITE_AHEAD_BOUND), asked again where the dataset
+    declares backfill and unrecovered where it declares none (the driver
+    declares none), and read where the dataset is (lake_dataset_gap, which
+    ListDatasetGaps answers). The bound set back after."""
+    print(f"F: write-ahead-bound: the lake's writer held from its stream past a {SHORT_MAX_AGE_S} s bound",
+          flush=True)
+    if not DRIVEN:
+        s.check(False, "write-ahead-bound: no driver writes ahead")
+        return
+    before = upgrade(f"lake.writeAhead.maxAge={SHORT_MAX_AGE_S}s")
+    s.check(before.returncode == 0, "write-ahead-bound: the stream's bound set short by an upgrade")
+    wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    # The upgrade's roll of the lake's members and readers finished, so no
+    # member listed below is one it is still replacing (failover-repeat
+    # 43015006850: a lake pod listed was gone by the cut, "get pod ...
+    # failed"); then the lease's holder a pod that runs.
+    for rolled in ("lake", "lake-reader"):
+        kubectl("rollout", "status", f"deployment/{FULL}-{rolled}", "--timeout=600s", check=False)
+    wait_for("the lake's writer running", lambda: writer_pod("lake") in
+             [p["metadata"]["name"] for p in pods("lake")], seconds=300)
+    since = int(time.time() * 1e9)
+    # Every lake member held from the broker, its standby and its readers
+    # too: a standby that took over would take the stream on in time.
+    held = [p["metadata"]["name"] for c in ("lake", "lake-reader") for p in pods(c)]
+    broker = [pod_ip(p["metadata"]["name"]) for p in pods("broker")]
+    began = time.time()
+    for member in held:
+        cut_rules(member, broker, "-I")
+    try:
+        time.sleep(SHORT_MAX_AGE_S + HELD_PAST_S)
+    finally:
+        for member in held:
+            cut_rules(member, broker, "-D")
+    let_go = time.time()
+    dataset = "drive-data:drive"
+    # Found the moment the stream skips: a gap, its datasets not yet known.
+    unattributed = happens(lambda: gaps_found_in("", since), 180, every=1)
+    first = gaps_found_in("", since)
+    found_at = min((at for _, at in first.values()), default=0)
+    at_once = (found_at / 1e9 - let_go) if found_at else None
+    s.check(unattributed, "write-ahead-bound: a gap recorded the moment the stream skipped, its datasets not "
+            f"yet known ({len(first)} gap(s)"
+            + (f", recorded {at_once:.1f}s after the writer was let go)" if at_once is not None else ")"))
+    found = happens(lambda: gaps_of(dataset, since), 180, every=3)
+    took = time.time() - let_go
+    gaps = gaps_of(dataset, since)
+    s.check(found, f"write-ahead-bound: the gap the stream left in {dataset} recorded "
+            f"({len(gaps)} gap(s), {took:.1f}s after the writer was let go)")
+    # Then the dataset's own gap, naming the one found when the stream
+    # skipped (found_in_gap_id).
+    named = gaps_found_in(dataset, since)
+    s.check(bool(named) and all(found_in in first for found_in, _ in named.values()),
+            f"write-ahead-bound: {dataset}'s gap names the gap found when the stream skipped "
+            f"({sorted(found_in for found_in, _ in named.values())} in {sorted(first)})")
+    s.check(bool(named) and found_at > 0 and all(at >= found_at for _, at in named.values()),
+            "write-ahead-bound: the unattributed gap recorded first, then the dataset's")
+    # Each gap's notice in the deployment admin's inbox (`gap_found`, ruled
+    # 2026-11-11; contract v30, stage D): the unattributed gap's, then the
+    # dataset's, once each to each admin, filed within the dashboard's ask
+    # (10 s) of the lake recording it.
+    wanted = sorted(first) + sorted(g for g in named if g not in first)
+    filed = happens(lambda: all(g in gap_notices() for g in wanted), 90, every=2) if wanted else False
+    notices = gap_notices()
+    s.check(filed, "write-ahead-bound: a gap_found notice in the deployment admin's inbox for each gap "
+            f"({', '.join(f'{g}: {len(notices.get(g, []))}' for g in wanted) or 'no gap'})")
+    once = all(len(notices.get(g, [])) == len({who for _, who in notices.get(g, [])}) for g in wanted)
+    s.check(filed and once, "write-ahead-bound: each gap's notice filed once to each admin")
+    first_at = min((at for g in first for at, _ in notices.get(g, [])), default=0)
+    named_at = min((at for g in named for at, _ in notices.get(g, [])), default=0)
+    s.check(filed and 0 < first_at <= named_at,
+            "write-ahead-bound: the unattributed gap's notice first, then the dataset's")
+    if not found:
+        # What the lake's members said of the stream meanwhile, before the
+        # bound set back rolls them away.
+        words = ("write-ahead", "dropped writes", "a gap in a dataset", "stepping down", "takes its writes")
+        for pod in pods("lake"):
+            said = kubectl("logs", pod["metadata"]["name"], "-c", "lake", "--since=6m", check=False, quiet=True)
+            lines = [line for line in said.stdout.decode(errors="replace").splitlines()
+                     if any(w in line for w in words)]
+            for line in lines[-12:]:
+                s.note(f"write-ahead-bound: {pod['metadata']['name']}: {line[-300:]}")
+    states = [states[-1] for states in gaps.values()]
+    # The driver's dataset declares no gap_recovery: none, the cautious
+    # reading, so its gap is unrecovered at once and asked of nobody.
+    s.check(bool(states) and all(state == 3 for state in states),
+            f"write-ahead-bound: each gap unrecovered, its dataset declaring no backfill ({states})")
+    if found:
+        claim(s, "write-ahead-bound", "lake", took, 60,
+              {"what": "from the writer let go to its dataset's gap recorded", "held_s":
+               round(let_go - began, 1), "max_age_s": SHORT_MAX_AGE_S, "gaps": len(gaps),
+               "unattributed_s": round(at_once, 1) if at_once is not None else None})
+    back = upgrade("lake.writeAhead.maxAge=10m")
+    s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
+    wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    # Every member of the sets this run pinned placed and ready after both
+    # upgrades: none left Pending where no node can hold it.
+    for name in pinned_sets():
+        count = int(out("get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+        placed = happens(lambda n=name, c=count: int(out("get", "statefulset", n, "-o",
+                                                          "jsonpath={.status.readyReplicas}") or 0) == c, 300)
+        s.check(placed, f"write-ahead-bound: {name}'s {count} members placed and ready after the upgrades")
+    # Nothing acknowledged was lost: the driver's rows held as every class's.
+    acks = acks_again(int(let_go * 1000), seconds=180)
+    s.check(acks, "write-ahead-bound: the driver acknowledged by the lake again")
+
+
+STANDBY_LOST = {}
+
+
+def standby_lost(s):
+    """In ha, one of the database's two synchronous standbys killed outright
+    under the driver's load (contract v30, stage C; the resilience spec's
+    section 4: a quorum of either, ANY 1): the book's commits go on within
+    their bound, never waiting on the lost standby."""
+    standbys = [p["metadata"]["name"] for p in pods("database")
+                if p["metadata"]["labels"].get("meridian.dev/database-role") == "replica"]
+    if len(standbys) < 2:
+        s.check(False, f"db-primary: two standbys to lose one of ({standbys})")
+        return
+    victim = standbys[0]
+    print(f"F: db-primary: a synchronous standby ({victim}) killed outright, under the driver's writes",
+          flush=True)
+    began = time.time()
+    isolate(victim, "-I")
+    crash(victim, "postgres")
+    try:
+        time.sleep(20)
+    finally:
+        isolate(victim, "-D")
+    ended = time.time()
+    gaps = ack_gaps(int(began * 1000), int(ended * 1000))
+    s.check(gaps["order"] <= HA["bor"],
+            f"db-primary: with a standby lost, the book's commits went on (longest pause "
+            f"{gaps['order']} s, within {HA['bor']} s)")
+    # Said in the db-primary class's claims, beside its RPO.
+    STANDBY_LOST.update({"one_standby_lost_book_pause_s": gaps["order"],
+                         "one_standby_lost_lake_pause_s": gaps["price"]})
+    healed = happens(lambda: len(pods("database")) == database_members()
+                     and all(ready(p) for p in pods("database")), 300)
+    s.check(healed, "db-primary: the lost standby back")
+
+
+# The buy-side trust targets (contract v30, stage C): a streamed price's
+# stale threshold (spec/sessions-and-data-report-their-latency-and-quality,
+# 5 s), and the 2 s past it a stale flag may take (approved 2026-11-11).
+STALE_AFTER_S = 5
+STALE_FLAG_S = 2
+
+
+def page_reads(since_ms):
+    """The data driver's page reads since `since_ms`: (unix ms, state, row
+    key, valid ms)."""
+    reads = []
+    for line in driver_file("drive-data", "/tmp/page.log").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "PAGE" and parts[1].isdigit() and int(parts[1]) >= since_ms:
+            row = parts[3] if parts[2] == "ok" and len(parts) == 5 else ""
+            valid = int(parts[4]) if parts[2] == "ok" and len(parts) == 5 and parts[4].isdigit() else 0
+            reads.append((int(parts[1]), parts[2], row, valid))
+    return reads
+
+
+def lake_newest(since_ms, until_ms):
+    """Each row of the driver's dataset the lake recorded in the window and
+    a little before: (recorded ms, valid ms), in recorded order."""
+    said = psql("select recorded_at_ns / 1000000, valid_from_ns / 1000000 from lake_row where dataset = "
+                f"'drive-data:drive' and recorded_at_ns >= {(since_ms - 60_000) * 1_000_000} and "
+                f"recorded_at_ns <= {until_ms * 1_000_000} order by recorded_at_ns", quiet=True)
+    rows = []
+    for line in said.splitlines():
+        parts = line.replace("|", " ").split()
+        if len(parts) == 2 and all(p.lstrip("-").isdigit() for p in parts):
+            rows.append((int(parts[0]), int(parts[1])))
+    return rows
+
+
+def trust_targets(s, failure, began_ms):
+    """The buy-side trust targets in a class (contract v30, stage C; the
+    resilience spec's section 15, approved 2026-11-10 and 2026-11-11), as a
+    live page drawn from the driver's reads would show its price:
+
+    - stale on time: the page ages its value every second from the row's own
+      valid time; it holds the newest row its reads answered. Each second of
+      the class where the lake's newest row (by what it had recorded then)
+      was past the threshold, the page must have flagged it by the threshold
+      plus 2 s, and never shown it live where the lake held nothing newer;
+    - never blank: every read answered drew a row -- the last good one at
+      least -- never an empty answer. A failed read leaves the page drawn.
+
+    What it cannot see: the kit's own cells (the kit's step), a page's
+    render, a browser's clock, deliveries a page hears between reads."""
+    if not DRIVEN:
+        return
+    # The page reads about once a second: a class shorter than that (the
+    # street's network-policy, healed in under one) is judged once the page
+    # has read in it, waited for at most 5 s.
+    reads = page_reads(began_ms)
+    waited = time.time()
+    while not reads and time.time() - waited < 5:
+        time.sleep(0.5)
+        reads = page_reads(began_ms)
+    ended_ms = int(time.time() * 1000)
+    if not reads:
+        s.check(False, f"{failure}: trust targets: the page read nothing in the class")
+        return
+    empty = sum(1 for r in reads if r[1] == "empty")
+    failed = sum(1 for r in reads if r[1] == "failed")
+    answered = [r for r in reads if r[1] == "ok"]
+    longest = 0
+    last = began_ms
+    for at, state, _, _ in reads:
+        if state == "ok":
+            longest = max(longest, at - last)
+            last = at
+    longest = max(longest, ended_ms - last)
+    s.check(empty == 0, f"{failure}: never blank: every read the page answered drew a row ({len(reads)} reads, "
+            f"{empty} empty, {failed} failed and left the page as drawn; longest without a fresh answer "
+            f"{longest / 1000:.1f} s)")
+    newest = lake_newest(began_ms, ended_ms)
+    late, live_while_stale, flagged = 0.0, 0, 0
+    held_valid = None
+    i, j = 0, 0
+    lake_valid = None
+    for tick in range(began_ms + 1000, ended_ms, 1000):
+        while i < len(answered) and answered[i][0] <= tick:
+            held_valid = answered[i][3] if held_valid is None else max(held_valid, answered[i][3])
+            i += 1
+        while j < len(newest) and newest[j][0] <= tick:
+            lake_valid = newest[j][1] if lake_valid is None else max(lake_valid, newest[j][1])
+            j += 1
+        if lake_valid is None or held_valid is None:
+            continue
+        due = lake_valid + STALE_AFTER_S * 1000
+        page_stale = tick - held_valid > STALE_AFTER_S * 1000
+        if tick > due:
+            if page_stale:
+                flagged += 1
+            else:
+                live_while_stale += 1
+                late = max(late, (tick - due) / 1000)
+    s.check(live_while_stale == 0 or late <= STALE_FLAG_S,
+            f"{failure}: stale on time: the page flagged its price stale within {STALE_AFTER_S} s + "
+            f"{STALE_FLAG_S} s of it turning stale ({flagged} stale second(s) flagged, "
+            f"{live_while_stale} shown live, at most {late:.1f} s late)")
+    claim(s, f"{failure}", "page", late, STALE_FLAG_S,
+          {"what": "the buy-side trust targets: the page's stale flag past its threshold, and blank reads",
+           "stale_after_s": STALE_AFTER_S, "stale_seconds_flagged": flagged,
+           "shown_live_while_stale": live_while_stale, "reads": len(reads), "blank_reads": empty,
+           "failed_reads": failed, "longest_without_fresh_s": round(longest / 1000, 1)})
+
+
+def rows_read_are_kept(s, failure, began_ms):
+    """Every row the page read in the class is one the lake's record holds:
+    no member -- a reader's hot layer above all -- answered a change the
+    record does not (contract v30, stage C; the resilience spec's section 3:
+    after a database failover, a reader holds exactly what the record
+    holds)."""
+    if not DRIVEN:
+        return
+    keys = sorted({r[2] for r in page_reads(began_ms) if r[1] == "ok" and r[2]})
+    if not keys:
+        return
+    held = set(psql("select row_key from lake_row where dataset = 'drive-data:drive' and row_key = any("
+                    "array[" + ",".join(f"'{k}'" for k in keys) + "])", quiet=True).split())
+    missing = [k for k in keys if k not in held]
+    s.check(not missing, f"{failure}: every row the page read is in the lake's record ({len(keys)} read, "
+            f"{len(missing)} not held{': ' + ', '.join(missing[:5]) if missing else ''})")
+
+
+def page_entitled(s):
+    """The data driver entitled to read its own dataset back, as a deployment
+    admin entitles a reader (W10.1): its DatasetEntitlement recorded where
+    the conductor keeps it, published whole within a minute. Once a run."""
+    now = time.time_ns()
+    dataset, instance = "drive-data:drive", "drive-data"
+    why = "the buy-side trust targets: the page reads the driver's price back"
+    entitlement = (text_field(1, dataset) + text_field(2, instance) + varint(3 << 3) + varint(1)
+                   + text_field(5, ADMIN) + varint(6 << 3) + varint(now) + text_field(9, why))
+    psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
+         f"VALUES ('{dataset}', '{instance}', decode('{entitlement.hex()}', 'hex'), {now})")
+    reading = happens(lambda: any(r[1] == "ok" for r in page_reads(0)), 240, every=5)
+    s.check(reading, "the page reads the driver's price back")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -2409,6 +3614,11 @@ FAILURES = {
     "zone": zone_lost,
     "replica-rot": replica_rot,
     "order-plugin": order_plugin,
+    "memory-pressure": lambda s: flood(s, "memory-pressure", "pressure", "overloaded", "lake"),
+    "noisy-plugin": lambda s: flood(s, "noisy-plugin", "noisy", "rate_limited", "sidecar"),
+    "standing-coordinator": standing_coordinator,
+    "apiserver": apiserver_lost,
+    "write-ahead-bound": write_ahead_bound,
 }
 
 
@@ -2440,21 +3650,45 @@ def main():
     first_run(s)
     if DRIVEN:
         driver_fixtures(s)
+        try:
+            page_entitled(s)
+        except SystemExit as stopped:
+            s.check(False, f"the page's entitlement: {stopped}")
     if TLS:
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
     properties(s, "the install")
+    if PROFILE == "ha" and DRIVEN:
+        try:
+            reader_held(s)
+        except SystemExit as stopped:
+            s.check(False, f"reader held: {stopped}")
+        try:
+            reader_hands_on(s)
+        except SystemExit as stopped:
+            s.check(False, f"reader hands on: {stopped}")
     if PROFILE == "reconfigure":
         try:
             reconfigure(s)
         except SystemExit as stopped:
             s.check(False, f"reconfigure: {stopped}")
     for failure in failures:
+        began_ms = int(time.time() * 1000)
+        failed_before = len(s.failures)
         try:
             FAILURES[failure](s)
         except SystemExit as stopped:
             s.check(False, f"{failure}: {stopped}")
+        # What the cluster and the broker said as the class failed, before
+        # the next class rolls the pods it was about.
+        if len(s.failures) > failed_before:
+            cluster_said(failure)
+        try:
+            trust_targets(s, failure, began_ms)
+            rows_read_are_kept(s, failure, began_ms)
+        except SystemExit as stopped:
+            s.check(False, f"{failure}: the trust targets could not be read: {stopped}")
         try:
             properties(s, failure)
         except SystemExit as stopped:

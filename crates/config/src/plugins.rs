@@ -23,7 +23,7 @@ use meridian_domain::v1::{
     PluginArchive, PluginCatalogue, PluginCatalogueRequest, PluginLaunch, PluginLaunchState,
     PluginMetadata, PluginVersion, ReadPluginDocumentationReply, ReadPluginDocumentationRequest,
     RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, RetirePluginVersionRequest,
-    StopPluginRequest, WithdrawArchiveRequest,
+    SidecarLimits, StopPluginRequest, WithdrawArchiveRequest,
 };
 use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
@@ -370,6 +370,17 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             ));
         }
     }
+    // Contract v30 (W8.1; approved by 1057): the most pods of one instance
+    // its vendor allows, 0 to 64.
+    {
+        use meridian_pb::bounds::PLUGIN_DECLARATION_MOST_SHARDS_RANGE;
+        if !PLUGIN_DECLARATION_MOST_SHARDS_RANGE.admits(i64::from(declaration.most_shards)) {
+            return Err(format!(
+                "declaration.most_shards is {}; the most pods of one instance, 0 to {}",
+                declaration.most_shards, PLUGIN_DECLARATION_MOST_SHARDS_RANGE.most
+            ));
+        }
+    }
     // An operations plugin's affirmation deadline (W11.28, W11.34; contract
     // v25): minutes after midnight, 1 to 1440, 0 declaring none; refused on
     // a version not holding operations.
@@ -568,14 +579,36 @@ pub fn launch<'a>(
             listed(&declared)
         ));
     }
+    // Contract v30 (W8.3; the launch settings and the refusal approved by
+    // 1057): at most the version's most_shards, 0 and 1 each one pod.
+    let most = metadata
+        .declaration
+        .as_ref()
+        .map_or(0, |declaration| declaration.most_shards)
+        .max(1);
+    if request.shards > most {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["shards".to_string()],
+            format!(
+                "shards is {}, and {} {} allows at most {most} pod(s) of one instance (its \
+                 most_shards)",
+                request.shards, request.name, request.version
+            ),
+        ));
+    }
     Ok(version)
 }
 
 // ── Serving them ────────────────────────────────────────────────────────────
 
 impl Plugins {
-    fn snapshot(&self) -> Result<Snapshot, String> {
-        self.store.snapshot().map_err(|failed| failed.to_string())
+    /// The configuration, shared until it changes (stage M; audit item 8):
+    /// one snapshot answers every question asked meanwhile.
+    fn snapshot(&self) -> Result<std::sync::Arc<Snapshot>, String> {
+        self.store
+            .snapshot_shared()
+            .map_err(|failed| failed.to_string())
     }
 
     /// Ask the launcher, from a handler's blocking thread.
@@ -699,6 +732,12 @@ impl Plugins {
             client_name: by.client,
             note: request.note.clone(),
             prepared_call_id: by.prepared_call_id,
+            // Its own share at its sidecar (contract v30; ruled 2026-11-11).
+            limits: request.limits,
+            // Its shards and standby pod as asked (contract v30; W8.3),
+            // kept on its record; the launcher still runs one pod (3d).
+            shards: request.shards,
+            standby: request.standby,
             ..Default::default()
         };
         // Recorded before the launcher is asked, so what runs is never
@@ -718,6 +757,7 @@ impl Plugins {
             version,
             request.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
+            request.limits,
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
@@ -759,6 +799,7 @@ impl Plugins {
         version: &PluginVersion,
         live: bool,
         archive: Option<PluginArchive>,
+        limits: Option<SidecarLimits>,
     ) -> CreatePluginRequest {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
@@ -782,6 +823,9 @@ impl Plugins {
             // The archive a deployment admin allowed it, beside its storage
             // (W8.3, W8.7, contract v16); none otherwise.
             archive,
+            // Its own share at its sidecar, as its launch asked (contract
+            // v30; ruled 2026-11-11); the chart's otherwise.
+            limits,
         }
     }
 
@@ -960,7 +1004,7 @@ impl Plugins {
             .map_err(|failed| {
                 format!("recorded; the launcher did not stop {instance} to restart it: {failed}")
             })?;
-        let create = self.create_request(instance, version, launch.live, archive);
+        let create = self.create_request(instance, version, launch.live, archive, launch.limits);
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",
@@ -1114,9 +1158,10 @@ impl Plugins {
         // history, and the lake's rows and the book's entries it recorded
         // name the version through it (the lake stamps each row's source
         // with the version its instance was launched at).
-        let mut naming: Vec<String> = snapshot
-            .catalogue
-            .launches
+        // Every launch ever, not the snapshot's latest per instance: an
+        // instance that ran this version once still names it.
+        let launches = self.store.launches().map_err(|failed| failed.to_string())?;
+        let mut naming: Vec<String> = launches
             .iter()
             .filter(|launch| launch.name == request.name && launch.version == request.version)
             .map(|launch| {
@@ -1396,8 +1441,13 @@ pub fn serve_plugins_and_registries(
         |plugins, request: PluginCatalogueRequest, _| -> Result<PluginCatalogue, String> {
             // A retired version is no longer listed (W8.15, contract v25);
             // its record is kept.
-            let mut catalogue = plugins.snapshot()?.catalogue;
+            let mut catalogue = plugins.snapshot()?.catalogue.clone();
             catalogue.versions.retain(|held| held.retired_at_ns == 0);
+            // Every launch, live or ended: the catalogue's history.
+            catalogue.launches = plugins
+                .store
+                .launches()
+                .map_err(|failed| failed.to_string())?;
             // One page of it (contract v28's amendment, ruling 696).
             catalogue::page(catalogue, &request)
         },

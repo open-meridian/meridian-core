@@ -271,6 +271,7 @@ fn dashboard(
         health: Arc::default(),
         kit: Some(Arc::new(kit())),
         bounds: Arc::default(),
+        turns: Arc::default(),
         tickets: Arc::default(),
         prepared: Arc::default(),
         service_accounts: Arc::default(),
@@ -3244,6 +3245,225 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
     )
     .await;
     assert!(summary.body.contains("data-pulled"), "{}", summary.body);
+}
+
+/// Contract v30 (W8.3): the Launch sheet's Pods -- Shards where the version
+/// declares more than one, at most its most_shards, and a standby pod, sent
+/// on the launch as `LaunchPluginRequest.shards` and `.standby`; shards past
+/// most_shards refused by the conductor naming shards, shown at the field
+/// with what was entered kept.
+#[tokio::test]
+async fn the_launch_sheet_sends_shards_and_standby_and_shows_a_shards_refusal_at_its_field() {
+    use prost::Message as _;
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.access_groups[0].entries[0].level = AccessLevel::Admin as i32;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    h.app.records.store(held, h.app.clock.now_ns());
+    let version = |v: &str, most_shards: u32| meridian_domain::v1::PluginVersion {
+        metadata: Some(meridian_domain::v1::PluginMetadata {
+            name: "snaptrade".into(),
+            version: v.into(),
+            roles: vec!["custody".into()],
+            declaration: Some(meridian_pb::v1::PluginDeclaration {
+                most_shards,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        source_registry: "local".into(),
+        ..Default::default()
+    };
+    let catalogue = meridian_domain::v1::PluginCatalogue {
+        versions: vec![version("0.1.0", 0), version("0.2.0", 4)],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    h.app
+        .bus
+        .serve(crate::catalogue::PLUGIN_CATALOGUE, move |_| {
+            Ok(("meridian.v1.PluginCatalogue".into(), catalogue.clone()))
+        });
+    let asked: Asked = Arc::default();
+    let heard = Arc::clone(&asked);
+    // As the conductor refuses it (crates/config): past most_shards,
+    // INVALID_ARGUMENT naming shards.
+    h.app.bus.serve(crate::catalogue::LAUNCH_PLUGIN, move |envelope| {
+        let request =
+            meridian_domain::v1::LaunchPluginRequest::decode(&envelope.payload[..]).unwrap();
+        heard
+            .lock()
+            .unwrap()
+            .push((crate::catalogue::LAUNCH_PLUGIN.into(), envelope.payload.clone()));
+        if request.shards > 4 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["shards".to_string()],
+                format!(
+                    "shards is {}, and snaptrade 0.2.0 allows at most 4 pod(s) of one instance (its most_shards)",
+                    request.shards
+                ),
+            ));
+        }
+        Ok((
+            "meridian.v1.PluginLaunch".into(),
+            meridian_domain::v1::PluginLaunch {
+                instance_id: request.instance_id,
+                name: request.name,
+                version: request.version,
+                shards: request.shards,
+                standby: request.standby,
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let cookie = [dashboard_cookie(&h)];
+
+    // A version declaring no shards: no Shards field, a standby pod offered.
+    let plain = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/snaptrade/launch?version=0.1.0",
+        &cookie,
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.body);
+    assert!(plain.body.contains("data-pods"), "{}", plain.body);
+    assert!(!plain.body.contains("name=\"shards\""), "{}", plain.body);
+    assert!(plain.body.contains("name=\"standby\""), "{}", plain.body);
+    // One declaring four: Shards, at most four, beside the Limits.
+    let sheet = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/snaptrade/launch?version=0.2.0",
+        &cookie,
+    )
+    .await;
+    assert!(
+        sheet.body.contains("name=\"shards\" min=\"1\" max=\"4\"")
+            && sheet.body.contains("At most 4 shards; empty runs one pod.")
+            && sheet.body.contains("data-limits"),
+        "{}",
+        sheet.body
+    );
+    let token = form_token(&sheet.body);
+    let form = |shards: &str, standby: bool| {
+        format!(
+            "form_token={token}&name=snaptrade&version=0.2.0&approved_role=custody&instance_id=snaptrade-2\
+             &note=Two+pods&in_flight=8&requests_per_second=&answer_mib=&shards={shards}{}",
+            if standby { "&standby=on" } else { "" }
+        )
+    };
+    let sent = |asked: &Asked| {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == crate::catalogue::LAUNCH_PLUGIN)
+            .map(|(_, payload)| {
+                meridian_domain::v1::LaunchPluginRequest::decode(&payload[..]).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Past most_shards: refused naming shards, at the field, the sheet
+    // drawn again as it was filled.
+    let refused = post_form_as(
+        &h.app,
+        "/admin/plugins/versions/launch",
+        &cookie,
+        &form("9", true),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        refused.body
+    );
+    let field_at = refused
+        .body
+        .find("name=\"shards\"")
+        .expect("the Shards field");
+    let refusal_at = refused
+        .body
+        .find("data-refused=\"shards\">shards is 9, and snaptrade 0.2.0 allows at most 4 pod(s)")
+        .expect("the refusal");
+    assert!(
+        field_at < refusal_at,
+        "the refusal follows its field: {}",
+        refused.body
+    );
+    assert!(
+        refused
+            .body
+            .contains("value=\"9\" aria-invalid=\"true\" aria-describedby=\"shards-refused\"")
+            && refused.body.contains("value=\"Two pods\"")
+            && refused.body.contains(
+                "name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"8\""
+            )
+            && refused.body.contains("name=\"standby\" checked"),
+        "{}",
+        refused.body
+    );
+    assert_eq!(sent(&asked)[0].shards, 9);
+    // Not a whole number: refused at the field, nothing sent.
+    asked.lock().unwrap().clear();
+    let refused = post_form_as(
+        &h.app,
+        "/admin/plugins/versions/launch",
+        &cookie,
+        &form("two", false),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        refused.body
+    );
+    assert!(
+        refused
+            .body
+            .contains("data-refused=\"shards\">shards is &quot;two&quot;"),
+        "{}",
+        refused.body
+    );
+    assert!(sent(&asked).is_empty());
+
+    // Within it: sent as LaunchPluginRequest.shards and .standby.
+    let done = post_form_as(
+        &h.app,
+        "/admin/plugins/versions/launch",
+        &cookie,
+        &form("3", true),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    assert!(done.headers[LOCATION].to_str().unwrap().contains("done="));
+    let launch = sent(&asked).pop().unwrap();
+    assert_eq!(
+        (
+            launch.shards,
+            launch.standby,
+            launch.limits.unwrap().in_flight
+        ),
+        (3, true, 8)
+    );
+    // Empty and unchecked: one pod, no standby.
+    let done = post_form_as(
+        &h.app,
+        "/admin/plugins/versions/launch",
+        &cookie,
+        &form("", false),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    let launch = sent(&asked).pop().unwrap();
+    assert_eq!((launch.shards, launch.standby), (0, false));
 }
 
 #[tokio::test]

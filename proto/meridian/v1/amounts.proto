@@ -116,7 +116,9 @@ message RateConvention {
 // (1950)'s values, ruling 678), each mapped to CDM's DayCountFractionEnum
 // where it has the value.
 enum DayCount {
-  // Not stated by the source; refused on an instrument's terms.
+  // Not stated by the source; refused on an instrument's terms. From contract
+  // v30 accepted on a QuotedYield's convention (ruling 433), the yield kept
+  // as quoted and never computed with.
   DAY_COUNT_UNSPECIFIED = 0;
   // Actual days over 360 (FIX CouponDayCount 1950 = 6; CDM ACT/360).
   DAY_COUNT_ACT_360 = 1;
@@ -201,7 +203,9 @@ message QuotedYield {
   // A percent: 4.312 percent is 4.312, never 0.04312. Never unset.
   UnitValue value = 1;
   // Semi-annual bond-equivalent for a US Treasury, corporate or agency; its day
-  // count the instrument's. Never unset.
+  // count the instrument's, or from contract v30 unspecified where the source
+  // states none (ruling 433), the yield then kept as quoted and never
+  // computed with. Never unset.
   RateConvention convention = 2;
   // To maturity, call, put or worst, current, or discount. Unspecified is
   // refused.

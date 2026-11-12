@@ -13,10 +13,14 @@ use meridian_pb::bounds::{
     CATALOGUE_DATASETS_COUNT, DATASET_DECLARATION_AGGREGATOR_LENGTH,
     DATASET_DECLARATION_DATA_TYPES_COUNT, DATASET_DECLARATION_DAY_END_MINUTE_RANGE,
     DATASET_DECLARATION_DAY_TIME_ZONE_LENGTH, DATASET_DECLARATION_KEY_LENGTH,
-    DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_VENDOR_LENGTH,
-    DATASET_LICENCE_DEFAULT_FIELDS_COUNT, DATASET_LICENCE_RETENTION_DAYS_RANGE,
+    DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH,
+    DATASET_DECLARATION_VENDOR_LENGTH, DATASET_LICENCE_DEFAULT_FIELDS_COUNT,
+    DATASET_LICENCE_RETENTION_DAYS_RANGE,
 };
-use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode};
+use meridian_pb::v1::{
+    Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode, OutsideComputation,
+    ProhibitedUse, Redistribution,
+};
 
 /// A price of one kind for one subject.
 pub const PRICE: &str = "meridian.v1.Price";
@@ -992,26 +996,19 @@ pub fn entitled_fields(
         .iter()
         .filter(|e| e.instance == instance && e.allowed)
     {
-        let Some(dataset) = event
+        if !event
             .datasets
             .iter()
-            .find(|d| d.dataset == entitlement.dataset)
-        else {
+            .any(|d| d.dataset == entitlement.dataset)
+        {
             continue;
-        };
+        }
         let fields = if entitlement.fields.is_empty() {
             event
                 .licences
                 .iter()
                 .find(|l| l.dataset == entitlement.dataset)
                 .map(|l| l.default_fields.clone())
-                .or_else(|| {
-                    dataset
-                        .declaration
-                        .as_ref()
-                        .and_then(|d| d.licence_default.as_ref())
-                        .map(|l| l.default_fields.clone())
-                })
                 .unwrap_or_default()
         } else {
             entitlement.fields.clone()
@@ -1022,34 +1019,54 @@ pub fn entitled_fields(
 }
 
 /// The licence enforced (W10.1; spec/the-lake, Q8): the deployment's, or
-/// the catalogue's default until one is set; a dataset declaring none is
-/// kept, with no retention set. The lake keeps by it, and the Data sources
-/// page draws it.
+/// the default until one is set. The lake keeps and answers by it, a
+/// plugin reads it with the datasets it lists, and the Data sources page
+/// and its tools draw it. From contract v30 a catalogue declares no default
+/// terms (ruling 1032 retired licence_default), so the declaration is not
+/// read here.
+///
+/// A dataset no deployment admin has licensed is kept and read as before
+/// -- kept with no retention bound, every field read, shown -- and each use
+/// right is read restrictively (step 3c's question 6, ruled 2026-11-09;
+/// ruling 1030): derived data stays inside the deployment, nothing is
+/// redistributed or reaches a computation outside it, multi-instrument
+/// outputs are restricted as single ones are, and every listed use is
+/// prohibited, until a licence says otherwise. A firm keeps a vendor's data
+/// for its own use; redistribution and derived use wait for the licence.
 pub fn effective_licence(
     dataset: &str,
     set: Option<&DatasetLicence>,
-    declaration: Option<&DatasetDeclaration>,
+    _declaration: Option<&DatasetDeclaration>,
 ) -> DatasetLicence {
     if let Some(licence) = set {
         return licence.clone();
     }
-    declaration
-        .and_then(|d| d.licence_default.clone())
-        .map(|terms| DatasetLicence {
-            dataset: dataset.to_string(),
-            ..terms
-        })
-        .unwrap_or_else(|| {
-            let mut licence = DatasetLicence {
-                dataset: dataset.to_string(),
-                kept: true,
-                display: true,
-                derived_use_terms: DerivedUse::NotRestricted as i32,
-                ..Default::default()
-            };
-            derived_use_both(&mut licence);
-            licence
-        })
+    let mut licence = DatasetLicence {
+        dataset: dataset.to_string(),
+        kept: true,
+        display: true,
+        ..Default::default()
+    };
+    restrictive_use_rights(&mut licence);
+    licence
+}
+
+/// Each use right of a licence at its restrictive reading (ruling 1030;
+/// the licence's §1c): derived data internal only, single- and
+/// multi-instrument alike; no redistribution; no computation outside the
+/// deployment; every listed use prohibited. Keeping, retention, fields and
+/// display are not use rights and are left as they are.
+pub fn restrictive_use_rights(licence: &mut DatasetLicence) {
+    licence.derived_use_terms = DerivedUse::InternalOnly as i32;
+    derived_use_both(licence);
+    licence.derived_multi_instrument_free = Some(false);
+    licence.redistribution = Redistribution::NotAllowed as i32;
+    licence.outside_computation = OutsideComputation::NotAllowed as i32;
+    licence.prohibited_uses = vec![
+        ProhibitedUse::ModelTraining as i32,
+        ProhibitedUse::ReplicateService as i32,
+        ProhibitedUse::IndexCreation as i32,
+    ];
 }
 
 /// A licence's derived-data answer as read (contract v27, ruling 479): its
@@ -1310,12 +1327,26 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
                 dataset.venue_id
             ));
         }
-        if let Some(licence) = &dataset.licence_default {
-            if let Some(refused) =
-                licence_refused(licence, Some(dataset), &format!("{at}.licence_default"))
-            {
-                return Some(refused);
-            }
+        // Contract v30 (W10.1; ruling 1032): the vendor's terms and pricing
+        // in plain words, at most 2,000 characters.
+        if !DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH
+            .admits(dataset.terms_and_pricing.chars().count())
+        {
+            return Some(format!(
+                "{at}.terms_and_pricing is {} characters; at most {}",
+                dataset.terms_and_pricing.chars().count(),
+                DATASET_DECLARATION_TERMS_AND_PRICING_LENGTH.most
+            ));
+        }
+        // Contract v30 (W10.1; ruling 455): the trading-sessions calendar its
+        // live data follows; empty names none.
+        if !dataset.sessions_calendar_id.is_empty()
+            && !dataset.sessions_calendar_id.starts_with("CAL-")
+        {
+            return Some(format!(
+                "{at}.sessions_calendar_id {:?} is not a platform calendar's ID (CAL-...)",
+                dataset.sessions_calendar_id
+            ));
         }
     }
     None
@@ -1324,6 +1355,55 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Step 3c's question 6 (ruled 2026-11-09; ruling 1030): a dataset no
+    /// deployment admin has licensed is kept and read as before, and each
+    /// use right is read restrictively -- one assertion per right.
+    #[test]
+    #[allow(deprecated)]
+    fn a_dataset_nobody_licensed_is_kept_and_read_each_use_right_restrictively() {
+        let unlicensed = effective_licence("kraken-1:ticker", None, None);
+        assert_eq!(unlicensed.dataset, "kraken-1:ticker");
+        // Kept and read as before: kept, no retention bound, every field,
+        // shown.
+        assert!(unlicensed.kept);
+        assert_eq!(unlicensed.retention_days, 0);
+        assert!(unlicensed.default_fields.is_empty());
+        assert!(unlicensed.display);
+        // Derived data: made inside the deployment only, the deprecated
+        // boolean saying the same (ruling 479).
+        assert_eq!(derived_use_terms(&unlicensed), DerivedUse::InternalOnly);
+        assert!(!unlicensed.derived_use);
+        assert!(!derived_use_bool(&unlicensed));
+        // A multi-instrument output restricted as a single one is.
+        assert_eq!(unlicensed.derived_multi_instrument_free, Some(false));
+        // Never redistributed.
+        assert_eq!(unlicensed.redistribution, Redistribution::NotAllowed as i32);
+        // Never outside the deployment.
+        assert_eq!(
+            unlicensed.outside_computation,
+            OutsideComputation::NotAllowed as i32
+        );
+        // Every listed use prohibited.
+        assert_eq!(
+            unlicensed.prohibited_uses,
+            vec![
+                ProhibitedUse::ModelTraining as i32,
+                ProhibitedUse::ReplicateService as i32,
+                ProhibitedUse::IndexCreation as i32,
+            ]
+        );
+        // A licence a deployment admin set is enforced as set, nothing read
+        // into it.
+        let set = DatasetLicence {
+            dataset: "kraken-1:ticker".into(),
+            kept: true,
+            derived_use_terms: DerivedUse::NotRestricted as i32,
+            redistribution: Redistribution::AllowedWithAttribution as i32,
+            ..Default::default()
+        };
+        assert_eq!(effective_licence("kraken-1:ticker", Some(&set), None), set);
+    }
 
     #[test]
     fn a_futures_series_is_keyed_by_one_ticker_carrying_its_venue() {
@@ -1450,6 +1530,21 @@ mod tests {
                 },
                 "calendar_id",
             ),
+            // Contract v30 (W10.1; rulings 1032, 455).
+            (
+                DatasetDeclaration {
+                    terms_and_pricing: "x".repeat(2001),
+                    ..daily()
+                },
+                "terms_and_pricing is 2001 characters; at most 2000",
+            ),
+            (
+                DatasetDeclaration {
+                    sessions_calendar_id: "FX24X5".into(),
+                    ..daily()
+                },
+                "sessions_calendar_id",
+            ),
         ] {
             let said = refused(wrong, &["data"]).expect(words);
             assert!(said.contains(words), "{words}: {said}");
@@ -1462,6 +1557,19 @@ mod tests {
         )
         .unwrap();
         assert!(twice.contains("twice"), "{twice}");
+        // Contract v30: a vendor's terms in words up to 2,000 characters and
+        // a sessions calendar are admitted.
+        assert_eq!(
+            refused(
+                DatasetDeclaration {
+                    terms_and_pricing: "é".repeat(2000),
+                    sessions_calendar_id: "CAL-FX24X5".into(),
+                    ..daily()
+                },
+                &["data"]
+            ),
+            None
+        );
     }
 
     #[test]

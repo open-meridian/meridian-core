@@ -109,7 +109,10 @@ GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
 #                    (after the compile: above where the compile left the disk)
 GATE_BUDGETS_LOCAL ?= checks=4 images=9  compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
-GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12.5 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+# CI's compile budget is 12.5 (the product owner, 2026-11-10): contract 30
+# adds about 0.1 GB to a compile measured at 12.1 on ubuntu-24.04, past the
+# 12.0 it had.
 # A cold run's compile stages, in place of the row's (the product owner,
 # 2026-11-07): a compile stage gets 9 GB on a warm cache and at most 11 GB
 # compiling every dependency again after a prune (step 3b part 3 measured
@@ -509,12 +512,14 @@ test-store: network tests-image
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; exit 1; }
+	@# The lake's speed check's figures, on every run, passing or not.
+	@grep -h 'SPEED lake' .test-store.log || echo "test-store: the lake's speed check said nothing"
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: serving:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
@@ -523,14 +528,15 @@ test-store: network tests-image
 # The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
 # record and read rates and its latest read as a dataset grows, the plugin
 # catalogue and the store at 2,000 versions and launches, the access
-# records' bytes a person against the broker's 1 MiB, and the engine's
-# options a second on the tree. Run by hand on the machine whose capacity is
+# records' bytes a person against the broker's 1 MiB, the book's proposals
+# at a wealth platform's volume against the sidecar's caps and the broker's
+# pending bound (stage M2), and the engine's options a second on the tree. Run by hand on the machine whose capacity is
 # stated; never in the gate, which runs each one's guard at a size it can
 # afford (test-store, test). Prints the CAPACITY lines INSTALL.md's table is.
 BENCH_LAKE_ROWS ?= 20000,100000,400000
 bench: network
 	@$(COMPOSE) run --rm -T --build -e MERIDIAN_BENCH_LAKE_ROWS=$(BENCH_LAKE_ROWS) tests \
-		run-tests -p meridian-lake --test postgres -p meridian-config --test postgres \
+		run-tests -p meridian-lake --test postgres -p meridian-config --test postgres -p meridian-bor --test postgres \
 		-- --ignored capacity --nocapture >.bench.log 2>&1 \
 		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
 	@$(COMPOSE) run --rm -T tests run-tests -p meridian-config --lib \
@@ -905,9 +911,11 @@ E2E_K3D_ZONES ?=
 E2E_K3D_SHARED = $(if $(or $(filter e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(filter reconfigure,$(PROFILE))),$(E2E_K3D_CLUSTER)-shared)
 E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
 # How much of each container's log .e2e-cluster.log keeps when a run fails,
-# timestamped: enough of a database member's (Patroni says something every
-# two seconds) to reach back past a reconfigure's first upgrade.
-E2E_K3D_LOG_LINES ?= 400
+# timestamped, and e2e/failover/run.py's dump as a class fails: ten minutes
+# and more of every quiet container (a database member under Patroni says
+# something every two seconds), past a reconfigure's first upgrade, and
+# minutes of one answering a flood, a refusal a line (stage M2).
+E2E_K3D_LOG_LINES ?= 5000
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -1131,9 +1139,10 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn .e2e-said-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \
 	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \
@@ -2216,6 +2225,12 @@ chart-check:
 		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
 	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.generate=false >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: a deployment with no key and no way to make one rendered anyway" >&2; exit 1; }; true
+	@# Contract v30 (W12.4): a standing job's lease under a sidecar's 20 s
+	@# renewal, or no standing job at all, refused.
+	@for refused in analytics.standing.leaseSeconds=10 analytics.standing.most=0; do \
+		$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set $$refused >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$refused rendered, and cannot stand" >&2; exit 1; }; \
+	done; true
 	@for missing in deployment.id; do \
 		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
@@ -2659,6 +2674,18 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.maxConcurrentAnswers=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.maxConcurrentAnswers=$$refused rendered; it takes 1 to 8" >&2; exit 1; }; \
 	done
+	@# The write-ahead stream's bounds (contract v30, stage E): set under
+	@# lake: -- where the templates read them -- each reaches the lake in ha,
+	@# 10m and 256MB where unset; a value it does not read renders nothing.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
+	for said in "MAX_AGE:10m:" "MAX_AGE:30s:--set lake.writeAhead.maxAge=30s" "MAX_BYTES:256MB:" "MAX_BYTES:512MB:--set lake.writeAhead.maxBytes=512MB"; do \
+		name="$${said%%:*}"; rest="$${said#*:}"; want="$${rest%%:*}"; flag="$${rest#*:}"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$flag 2>/dev/null \
+			| grep -A1 "name: MERIDIAN_LAKE_WRITE_AHEAD_$$name\$$" | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: lake.writeAhead $${flag:-unset} does not tell the lake MERIDIAN_LAKE_WRITE_AHEAD_$$name=$$want" >&2; exit 1; }; \
+	done; \
+	! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.writeAhead.maxAge=ten >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: lake.writeAhead.maxAge=ten rendered; it takes a whole number of s, m or h" >&2; exit 1; }
 	@# Ruling 972: lake.mallocMmapThreshold reaches the lake as glibc's
 	@# MALLOC_MMAP_THRESHOLD_, 131072 by default, and only a whole number of
 	@# bytes above 0 renders.
@@ -2672,6 +2699,93 @@ chart-check:
 	for refused in 0 -1 1.5 big; do \
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
+	done
+	@# Stage M (W6.40; approved 2026-11-10) and stage D (W6.39; ruled
+	@# 2026-11-11): the conductor runs under its own account, whose Role is
+	@# exactly get and list on pods and on Leases -- nothing written, no other
+	@# resource, no node -- in both profiles.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null)"; \
+		role="$$(echo "$$said" | awk '/^kind: Role$$/{on=1} on&&/^---/{exit} on')"; \
+		echo "$$role" | grep -q 'name: check-meridian-runtime-conductor$$' \
+			|| { echo "chart-check FAILED: the conductor has no Role of its own ($${profile:-tolerant})" >&2; exit 1; }; \
+		[ "$$(echo "$$role" | grep -c 'resources:')" = 2 ] \
+			&& echo "$$role" | grep -A1 'resources: \["pods"\]' | grep -q 'verbs: \["get", "list"\]$$' \
+			&& echo "$$role" | grep -B1 'resources: \["leases"\]' | grep -q 'apiGroups: \["coordination.k8s.io"\]' \
+			&& echo "$$role" | grep -A1 'resources: \["leases"\]' | grep -q 'verbs: \["get", "list"\]$$' \
+			&& [ "$$(echo "$$role" | grep -c 'verbs:')" = 2 ] \
+			|| { echo "chart-check FAILED: the conductor's Role is not exactly get and list on pods and Leases ($${profile:-tolerant})" >&2; exit 1; }; \
+		echo "$$said" | grep -q 'serviceAccountName: check-meridian-runtime-conductor$$' \
+			|| { echo "chart-check FAILED: the conductor does not run under its own account ($${profile:-tolerant})" >&2; exit 1; }; \
+	done
+	@# Stage D (W6.39; approved 2026-11-11): the chart's values the resilience
+	@# profile reads reach the conductor alone, as JSON resolved by the
+	@# profile, and carry no secret, credential or address.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	all="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
+		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor, or not at all" >&2; exit 1; }; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		value="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null \
+			| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')"; \
+		[ -n "$$value" ] || { echo "chart-check FAILED: the conductor is not told the chart's values ($${profile:-tolerant})" >&2; exit 1; }; \
+		! echo "$$value" | grep -qiE 'secret|password|token|://|svc\.cluster' \
+			|| { echo "chart-check FAILED: the resilience values carry a secret, a credential or an address: $$value" >&2; exit 1; }; \
+		want='\\"standby\\":0'; [ -n "$$profile" ] && want='\\"standby\\":1'; \
+		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
+			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
+	done
+	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
+	@# profiles the migration's conductor alone is given the brought
+	@# database's superuser, to make each component's own login there, and
+	@# only where the chart brings one.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
+		all="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile 2>/dev/null)"; \
+		job="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/migrate-job.yaml 2>/dev/null)"; \
+		none="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --set database.brought.enabled=false 2>/dev/null)"; \
+		[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD$$')" = 2 ] \
+			&& [ "$$(echo "$$job" | grep -c 'name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD$$')" = 1 ] \
+			&& [ "$$(echo "$$none" | grep -c 'MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD$$')" = 0 ] \
+			|| { echo "chart-check FAILED: the brought database's superuser reaches something besides first run and the migration's conductor, or not them ($${profile:-tolerant})" >&2; exit 1; }; \
+	done
+	@# Stage M (the resilience spec's section 10a): every component and every
+	@# sidecar is told its container's limit, memory.budgetPercent and
+	@# memory.shedPercent and glibc's settings; a percent out of range, or a
+	@# limit that leaves a component nothing past its hot layer and held
+	@# answers, renders nothing; a plugin's share reaches its sidecar, its own
+	@# limits overriding the chart's, and a share whose answers leave the
+	@# sidecar nothing of its own budget renders nothing (stage M2); and the
+	@# broker's bounds reach it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	shared="$$base --set sidecars[0].instanceId=probe --set sidecars[0].roles[0]=data --set sidecars[0].limits.inFlight=4"; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$shared 2>/dev/null)"; \
+	for container in lake bor instrument street conductor dashboard launcher analytics-coordinator analytics-worker sidecar; do \
+		echo "$$said" | grep -A3 'name: MERIDIAN_MEMORY_LIMIT_BYTES$$' | grep -q "containerName: $$container$$" \
+			|| { echo "chart-check FAILED: the $$container container is not told its memory limit (stage M)" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$said" | grep -A1 'name: MERIDIAN_MEMORY_BUDGET_PERCENT$$' | grep -c 'value: "80"')" -ge 10 ] \
+		|| { echo "chart-check FAILED: memory.budgetPercent does not reach every component as 80" >&2; exit 1; }; \
+	[ "$$(echo "$$said" | grep -A1 'name: MALLOC_ARENA_MAX$$' | grep -c 'value: "2"')" -ge 10 ] \
+		|| { echo "chart-check FAILED: glibc's arenas are not set on every component" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_IN_FLIGHT$$' | grep -q 'value: "4"' \
+		|| { echo "chart-check FAILED: a sidecars[] entry's limits.inFlight does not override sidecar.limits.inFlight" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_REQUESTS_PER_SECOND$$' | grep -q 'value: "400"' \
+		|| { echo "chart-check FAILED: sidecar.limits.requestsPerSecond does not reach a sidecar as 400" >&2; exit 1; }; \
+	echo "$$said" | grep -A1 'name: MERIDIAN_SIDECAR_ANSWER_MIB$$' | grep -q 'value: "32"' \
+		|| { echo "chart-check FAILED: sidecar.limits.answerMiB does not reach a sidecar as 32" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set memory.shedPercent=85 2>/dev/null | grep -A1 'name: MERIDIAN_MEMORY_SHED_PERCENT$$' | grep -q 'value: "85"' \
+		|| { echo "chart-check FAILED: memory.shedPercent=85 does not reach the components" >&2; exit 1; }; \
+	for refused in memory.budgetPercent=5 memory.budgetPercent=96 memory.shedPercent=80 memory.shedPercent=100 sidecar.limits.inFlight=0 resources.limits.memory=128Mi \
+		sidecar.limits.answerMiB=200 sidecars[0].limits.answerMiB=200; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$shared --set $$refused >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: $$refused rendered; it leaves nothing, or is out of range (stage M)" >&2; exit 1; }; \
+	done; \
+	brought="$$($(HELM_TEMPLATE) check deploy/chart $$base --set broker.limits.maxPending=32MB --set broker.jetstream.maxMemory=48MB 2>/dev/null)"; \
+	for pair in max-pending:32MB max-payload:1MB jetstream-memory:48MB; do \
+		echo "$$brought" | grep -A1 -e "- --$${pair%%:*}$$" | grep -q "\"$${pair#*:}\"" \
+			|| { echo "chart-check FAILED: the broker is not given --$${pair%%:*} $${pair#*:} (stage M)" >&2; exit 1; }; \
 	done
 	@# Step 3a: each hot layer's bound reaches its store, in MiB, by default
 	@# and as set.
@@ -2707,14 +2821,18 @@ chart-check:
 	@# Step 3b: a warm standby is a value. With `<component>.standby: 1` a
 	@# component runs two members spread over nodes under the members' lease
 	@# right, a PodDisruptionBudget, a surging rollout and its lease named;
-	@# 2 is refused, and the default renders no lease, no account and no
-	@# budget. Every stateless component tolerates a lost node for 30 s.
+	@# 2 is refused, and the default renders no lease, no members' account
+	@# and no budget -- its one Lease right the conductor's read of them
+	@# (stage D, ruled 2026-11-11). Every stateless component tolerates a
+	@# lost node for 30 s.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "coordination.k8s.io"; do \
+	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "name: check-meridian-runtime-member$$"; do \
 		echo "$$plain" | grep -q "$$absent" \
 			&& { echo "chart-check FAILED: the default profile renders $$absent; standbys are configuration (ruling 1052)" >&2; exit 1; }; \
 	done; \
+	[ "$$(echo "$$plain" | grep -c 'coordination.k8s.io')" = 1 ] \
+		|| { echo "chart-check FAILED: the default profile renders a Lease right beyond the conductor's read of them (stage D); standbys are configuration (ruling 1052)" >&2; exit 1; }; \
 	echo "$$plain" | grep -q "tolerationSeconds: 30" \
 		|| { echo "chart-check FAILED: no component tolerates a lost node for 30 s (question 22)" >&2; exit 1; }; \
 	for store in lake bor instrument street conductor launcher; do \
@@ -2764,7 +2882,7 @@ chart-check:
 			|| { echo "chart-check FAILED: the ha profile gives $$store no standby" >&2; exit 1; }; \
 	done; \
 	for held in "meridian.dev/database-manager: patroni" "meridian.dev/database-role: primary" \
-		"synchronous_mode_strict: true" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
+		"synchronous_mode: quorum" "synchronous_mode_strict: true" "failsafe_mode: true" "checkpoint: fast" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
 		"name: check-meridian-runtime-broker-jetstream-members" "name: check-meridian-runtime-database-members" \
 		"meridian.dev/broker-set: check-meridian-runtime-broker-jetstream"; do \
 		echo "$$ha" | grep -q -- "$$held" \
@@ -2781,17 +2899,50 @@ chart-check:
 		&& { echo "chart-check FAILED: lake.standby=0 under the ha profile still gives the lake a standby" >&2; exit 1; }; \
 	echo "$$over" | grep -q "\-\-route\|meridian.dev/database-manager: patroni" \
 		&& { echo "chart-check FAILED: the ha profile's broker and database counts are not overridable" >&2; exit 1; }; \
-	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1"; do \
+	read="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 --set lake.readers=1 --set bor.readers=1 --set instrument.readers=1 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with a record-read replica" >&2; exit 1; }; \
+	[ "$$(echo "$$read" | grep -A1 "name: MERIDIAN_READ_DATABASE_HOST" | grep -c 'value: "check-meridian-runtime-database-3\.default\.svc\.cluster\.local"')" = 3 ] \
+		|| { echo "chart-check FAILED: the chart does not wire each store's reader to the record-read replica, member 3 (contract v30, stage C2)" >&2; exit 1; }; \
+	echo "$$read" | grep -A16 "name: check-meridian-runtime-database-3$$" | grep -q "port: 5432" \
+		|| { echo "chart-check FAILED: the record-read replica, member 3, has no Service of its own for the readers" >&2; exit 1; }; \
+	echo "$$read" | grep -B5 "name: MERIDIAN_READ_DATABASE_HOST" | grep -q "name: MERIDIAN_LAKE_READ_DATABASE_URL" \
+		|| { echo "chart-check FAILED: the lake's reader is not given the store's own URL beside the replica's host" >&2; exit 1; }; \
+	echo "$$read" | grep -q "name: check-meridian-runtime-database-[012]$$" \
+		&& { echo "chart-check FAILED: a standby is given a Service of its own without internal TLS: the HA standbys serve no reads" >&2; exit 1; }; \
+	own="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set database.brought.readReplicas=1 --set lake.readers=1 --set lake.database.readExistingSecret=lake-read 2>/dev/null)" \
+		|| { echo "chart-check FAILED: a reader with a read Secret of its own did not render" >&2; exit 1; }; \
+	echo "$$own" | grep -q "name: MERIDIAN_READ_DATABASE_HOST" \
+		&& { echo "chart-check FAILED: a reader named a read Secret of its own is still pointed at the brought replica" >&2; exit 1; }; \
+	none="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.generate=false --set key.existingSecret=k --set lake.readers=1 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with a reader" >&2; exit 1; }; \
+	echo "$$none" | grep -q "name: MERIDIAN_READ_DATABASE_HOST\|name: MERIDIAN_LAKE_READ_DATABASE_URL" \
+		&& { echo "chart-check FAILED: with no record-read replica a reader is pointed at one" >&2; exit 1; }; \
+	echo "$$read" | grep -q "read-replica-check-meridian-runtime-database-3: |" \
+		|| { echo "chart-check FAILED: the record-read replica, member 3, has no tags of its own" >&2; exit 1; }; \
+	echo "$$read" | grep -A2 "read-replica-check-meridian-runtime-database-3: |" | grep -q "nosync: true" \
+		|| { echo "chart-check FAILED: the record-read replica is not kept out of the synchronous quorum (nosync)" >&2; exit 1; }; \
+	echo "$$read" | grep -q "read-replica-check-meridian-runtime-database-[012]:" \
+		&& { echo "chart-check FAILED: the primary or a standby is tagged as a record-read replica" >&2; exit 1; }; \
+	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1" "database.brought.readReplicas=2"; do \
 		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
-	done; true
+	done; \
+	short="$$($(HELM_TEMPLATE) check deploy/chart $$base --set leases.renewSeconds=2 --set leases.durationSeconds=5 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: a lease of 5 s renewed every 2 s rendered; a lease lasts at least three renewals (contract v30, stage C)" >&2; exit 1; }; \
+	echo "$$short" | grep -q "leases.durationSeconds is 5 and leases.renewSeconds 2" \
+		|| { echo "chart-check FAILED: a lease shorter than three renewals is refused without naming both values: $$short" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set leases.renewSeconds=2 --set leases.durationSeconds=6 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: the default lease, 6 s renewed every 2 s, did not render" >&2; exit 1; }; \
+	true
 	@# The brought database's max_connections, counted from what the chart
 	@# deploys (ruled 2026-11-08): each store member's pool and what is
-	@# beside it, a rollout's surge, the dashboard's copies, the jobs, the
-	@# superuser's and Patroni's reserve, and a quarter's room -- 82
-	@# tolerant, 213 ha -- given to the server alone and under Patroni and
-	@# to the preflight's memory judge; one set below what the pods hold is
-	@# refused, saying how many they hold.
+	@# beside it, the lake's write-ahead writer's in ha (stage E), a
+	@# rollout's surge, the dashboard's copies, the jobs, the superuser's and
+	@# Patroni's reserve, and a quarter's room -- 82 tolerant, 220 ha --
+	@# given to the server alone and under Patroni and to the preflight's
+	@# memory judge; one set below what the pods hold is refused, saying how
+	@# many they hold. Its memory in ha is the judge's count of it with a
+	@# quarter's room, 1280Mi, given to the members and to the judge.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
@@ -2800,13 +2951,19 @@ chart-check:
 	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "82"' \
 		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 82 connections" >&2; exit 1; }; \
 	patroni="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha 2>/dev/null)"; \
-	echo "$$patroni" | grep -q "^ *max_connections: 213$$" \
-		|| { echo "chart-check FAILED: the ha database is not given max_connections: 213 under Patroni" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q 'max_connections\\":213' \
-		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 213" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *max_connections: 220$$" \
+		|| { echo "chart-check FAILED: the ha database is not given max_connections: 220 under Patroni" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q 'max_connections\\":220' \
+		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 220" >&2; exit 1; }; \
+	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1280Mi"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1280Mi" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *memory: 1280Mi$$" \
+		|| { echo "chart-check FAILED: the ha database is not given the 1280Mi the memory judge counts at 220 connections" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1Gi"' \
+		|| { echo "chart-check FAILED: the tolerant database's memory is not its own 1Gi" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha --set database.brought.maxConnections=100 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: database.brought.maxConnections=100 rendered under ha, below what its pods hold" >&2; exit 1; }; \
-	echo "$$said" | grep -q "hold up to 166 connections" \
+	echo "$$said" | grep -q "hold up to 172 connections" \
 		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
 		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }

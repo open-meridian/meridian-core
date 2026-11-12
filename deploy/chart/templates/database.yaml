@@ -37,6 +37,9 @@
 {{- $held := dict }}
 {{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
 {{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
+{{- /* Its record-read replicas (contract v30, stage C): members past the
+       primary and its standbys, asynchronous, tagged nosync and nofailover. */}}
+{{- $readReplicas := int (include "meridian-runtime.databaseReadReplicas" .) }}
 {{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
 {{/*
   Two ways to run it (step 3b; spec/a-deployment-scales-out-and-fails-over-
@@ -44,22 +47,23 @@
   postgres:16-alpine, restarted on its volume (the tolerant default and the
   desktop). Or under Patroni, from database.brought.patroniImage -- the same
   Postgres with Patroni and pgBackRest -- as a primary and
-  database.brought.standbys standbys, each on its own volume, one of them
-  synchronous and strict, so a primary cut off from its standbys cannot
-  acknowledge a commit alone; Patroni keeps its state in this namespace's
+  database.brought.standbys standbys, each on its own volume, a quorum of
+  either synchronous and strict (ANY 1; contract v30, stage C), so losing one
+  neither stalls nor slows a commit and a primary cut off from both cannot
+  acknowledge one alone; Patroni keeps its state in this namespace's
   ConfigMaps and the members' labels, under a namespaced Role (no CRD, no
   cluster-wide right: decisions/016), and the Service follows the primary's
   label. Once a database has run under Patroni it stays under it, standbys
   or none: its data directory is Patroni's.
 */}}
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
-{{- $patroni := or (gt $standbys 0) $wasPatroni }}
+{{- $patroni := or (gt $standbys 0) (gt $readReplicas 0) $wasPatroni }}
 {{- /* Moving under Patroni from alone, in the first of two upgrades (see
        the StatefulSet's replicas): member 0 runs alone, so nothing waits
        for a synchronous standby it does not have yet -- strict, every
        commit would wait, and the connections waiting filled the server. */}}
 {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
-{{- $converting := and (gt (int $running) 0) (gt $standbys 0) (not $wasPatroni) }}
+{{- $converting := and (gt (int $running) 0) (gt (add $standbys $readReplicas) 0) (not $wasPatroni) }}
 {{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
@@ -161,14 +165,24 @@ spec:
       port: 5432
     - name: patroni
       port: 8008
-{{- if $tls }}
-{{- range $i := until 3 }}
+{{- /* The members named apart: with internal TLS the first three, and
+       always a record-read replica, which a store's readers read the
+       record's past from (contract v30, stage C2). */}}
+{{- $replicasFrom := add 1 $standbys }}
+{{- $members := add $replicasFrom $readReplicas }}
+{{- range $i := until (int (max $members (ternary 3 0 $tls))) }}
+{{- $named := and $tls (lt $i 3) }}
+{{- $replica := and (ge $i $replicasFrom) (lt $i $members) }}
+{{- if or $named $replica }}
 ---
 # Member {{ $i }} by a name of its own (`<name>-{{ $i }}.<namespace>.svc`), which its
 # certificate carries: Patroni's members reach each other's REST API by it
-# over TLS, each verified by that name (ruled 2026-11-08). A Service per
-# member, because a StatefulSet's pods have DNS names only under the
-# Service it was made with, which here is the primary's.
+# over TLS, each verified by that name (ruled 2026-11-08); and a record-read
+# replica's Postgres, which the chart points the stores' readers at
+# (MERIDIAN_READ_DATABASE_HOST; contract v30, stage C2, approved
+# 2026-11-11). A Service per member, because a StatefulSet's pods have DNS
+# names only under the Service it was made with, which here is the
+# primary's.
 apiVersion: v1
 kind: Service
 metadata:
@@ -184,8 +198,14 @@ spec:
     meridian.dev/component: database
     statefulset.kubernetes.io/pod-name: {{ $name }}-{{ $i }}
   ports:
+    {{- if $named }}
     - name: patroni
       port: 8008
+    {{- end }}
+    {{- if $replica }}
+    - name: postgres
+      port: 5432
+    {{- end }}
 {{- end }}
 {{- end }}
 ---
@@ -243,6 +263,14 @@ metadata:
 data:
   database.sh: |
     {{- .Files.Get "files/database.sh" | nindent 4 }}
+  {{- range $i := until $readReplicas }}
+  # A record-read replica (contract v30, stage C): its own Patroni tags,
+  # laid over the static half by database.sh for this member alone.
+  read-replica-{{ $name }}-{{ add 1 $standbys $i }}: |
+    tags:
+      nosync: true
+      nofailover: true
+  {{- end }}
   patroni.yml: |
     scope: {{ $scope }}
     restapi:
@@ -271,6 +299,16 @@ data:
       data_dir: /var/lib/postgresql/data/pgdata
       bin_dir: /usr/local/bin
       pgpass: /tmp/pgpass
+      # A member made, or made again, from its primary by pg_basebackup asks
+      # for an immediate checkpoint, never a spread one: a spread checkpoint
+      # paces its writes over checkpoint_completion_target of
+      # checkpoint_timeout, 270 s of Postgres's 300, and the new member waited
+      # all of it before it streamed (PR CI 42977215067: the third member
+      # started streaming at 07:25:31, four seconds after a checkpoint whose
+      # writes took 269.1 s). Patroni's basebackup options, its
+      # `--checkpoint=fast`.
+      basebackup:
+        - checkpoint: fast
       {{- if or $archive $tls }}
       parameters:
         {{- if $archive }}
@@ -382,7 +420,7 @@ spec:
   # standbys started before member 0 was moved, and the first of them made
   # a new, empty cluster that the Service then followed (step 3b part 3,
   # found by e2e-cluster-reconfigure).
-  replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys }}{{ end }}{{ else }}0{{ end }}
+  replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys $readReplicas }}{{ end }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:
     matchLabels:
@@ -412,7 +450,7 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if gt $standbys 0 }}
+      {{- if gt (add $standbys $readReplicas) 0 }}
       {{- include "meridian-runtime.spread" (dict "top" . "component" "database") | nindent 6 }}
       {{- end }}
       {{- else }}
@@ -553,7 +591,7 @@ spec:
             {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+            {{- include "meridian-runtime.databaseResources" . | nindent 12 }}
           {{- else }}
           {{- if $tls }}
           # Internal TLS (ruling 1084): the chart's certificate copied where
@@ -653,7 +691,7 @@ spec:
             {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
             {{- end }}
           resources:
-            {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+            {{- include "meridian-runtime.databaseResources" . | nindent 12 }}
           {{- end }}
         {{- if $archive }}
         # Beside the server (backup.walArchive): pgBackRest's own server,

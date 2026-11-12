@@ -117,7 +117,7 @@ fn interface(
 /// The registered declaration against the uploaded one, naming the first
 /// field that differs.
 fn declaration(registered: &PluginDeclaration, uploaded: &PluginDeclaration) -> Option<String> {
-    let differs: [(&str, bool); 11] = [
+    let differs: [(&str, bool); 12] = [
         (
             "secret_settings",
             registered.secret_settings != uploaded.secret_settings,
@@ -143,6 +143,11 @@ fn declaration(registered: &PluginDeclaration, uploaded: &PluginDeclaration) -> 
         (
             "affirmation_deadline",
             registered.affirmation_deadline != uploaded.affirmation_deadline,
+        ),
+        // Contract v30 (W8.1): read from the upload, so held to it.
+        (
+            "most_shards",
+            registered.most_shards != uploaded.most_shards,
         ),
     ];
     let (field, _) = differs.iter().find(|(_, differs)| *differs)?;
@@ -227,7 +232,7 @@ mod tests {
     #[test]
     fn the_first_difference_is_named() {
         type Change = fn(&mut RegisterRequest);
-        let cases: [(Change, &str); 9] = [
+        let cases: [(Change, &str); 10] = [
             (
                 |r| r.settings.insert(1, setting("extra")),
                 "registers the setting extra where its version declared the setting region",
@@ -271,6 +276,11 @@ mod tests {
                 |r| r.declaration.as_mut().unwrap().documentation.clear(),
                 "it registers a declaration whose documentation differs",
             ),
+            // Contract v30 (W8.1): most_shards, read from the upload, held.
+            (
+                |r| r.declaration.as_mut().unwrap().most_shards = 4,
+                "it registers a declaration whose most_shards differs",
+            ),
         ];
         for (change, says) in cases {
             let mut request = registered();
@@ -286,154 +296,85 @@ mod tests {
         );
     }
 
-    /// A data plugin's catalogue as the SDK uploads it (JSON, read by core)
-    /// and as it registers it (the wire), with or without the licence's
-    /// attribution terms (contract v27; SDK 0.32.2): the two agree.
+    /// A data plugin built before contract v30 uploads its catalogue with a
+    /// licence_default (JSON, read by core) and registers it on the wire,
+    /// where field 8 is now reserved (ruling 1032): core drops it from both,
+    /// so the two agree and the plugin registers.
     #[test]
-    fn a_catalogue_registers_with_or_without_its_licences_attribution_terms() {
-        use meridian_pb::v1::{
-            Catalogue, CopyrightClass, DatasetDeclaration, DatasetLicence, DerivedUse,
-            ObservationMode, Redistribution,
-        };
-        let terms = serde_json::json!({
-            "redistribution": "allowed_with_attribution",
-            "attribution_required": true,
-            "attribution_text": "Source: central bank statistics",
-            "copyright_class": "public_domain",
-            "no_more_restrictive_terms": true,
-            "not_affiliated_notice": "Not affiliated with the central bank."
-        });
-        for with_terms in [true, false] {
-            let mut licence = serde_json::json!({
-                "kept": true, "retention_days": 0, "derived_use": true,
-                "derived_use_terms": "not_restricted", "display": true,
-                "default_fields": [], "personal_use": false
-            });
-            if with_terms {
-                for (name, value) in terms.as_object().unwrap() {
-                    licence[name] = value.clone();
-                }
-            }
-            let declared: meridian_domain::declaration::Declared =
-                serde_json::from_value(serde_json::json!({
-                    "catalogue": {"datasets": [{
-                        "key": "rates", "vendor": "Central bank", "modes": ["pull"],
-                        "licence_default": licence
-                    }]}
-                }))
-                .unwrap();
-            let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
-            // What DatasetLicence._wire() sends.
-            #[allow(deprecated)]
-            let wire = DatasetLicence {
-                kept: true,
-                derived_use: true,
-                derived_use_terms: DerivedUse::NotRestricted as i32,
-                display: true,
-                redistribution: if with_terms {
-                    Redistribution::AllowedWithAttribution as i32
-                } else {
-                    Redistribution::Unspecified as i32
-                },
-                attribution_required: with_terms,
-                attribution_text: if with_terms {
-                    "Source: central bank statistics".into()
-                } else {
-                    String::new()
-                },
-                copyright_class: if with_terms {
-                    CopyrightClass::PublicDomain as i32
-                } else {
-                    CopyrightClass::Unspecified as i32
-                },
-                no_more_restrictive_terms: with_terms,
-                not_affiliated_notice: if with_terms {
-                    "Not affiliated with the central bank.".into()
-                } else {
-                    String::new()
-                },
-                ..Default::default()
-            };
-            let registered = PluginDeclaration {
-                catalogue: Some(Catalogue {
-                    datasets: vec![DatasetDeclaration {
-                        key: "rates".into(),
-                        vendor: "Central bank".into(),
-                        modes: vec![ObservationMode::Pull as i32],
-                        licence_default: Some(wire),
-                        ..Default::default()
-                    }],
-                }),
-                ..Default::default()
-            };
-            let request = RegisterRequest {
-                schema_version: "v27".into(),
-                declaration: Some(registered),
-                ..Default::default()
-            };
-            assert_eq!(difference(&request, &uploaded), None, "terms: {with_terms}");
-        }
-    }
-
-    /// A licence stating who may take the dataset (contract v28, rulings
-    /// 491 and 597; SDK 0.33.x), as uploaded and as registered: the two
-    /// agree, where the uploaded one once dropped it and the plugin was
-    /// refused as registering a catalogue that differs (plugin-massive).
-    #[test]
-    fn a_catalogue_whose_licence_states_eligibility_registers() {
-        use meridian_pb::v1::{
-            Catalogue, DataEligibility, DataUse, DatasetDeclaration, DatasetLicence, Decimal,
-            DerivedUse, ObservationMode, Redistribution,
-        };
+    fn a_catalogue_from_before_v30_registers_its_licence_default_dropped() {
+        use meridian_pb::v1::{Catalogue, DatasetDeclaration, ObservationMode};
+        use prost::Message;
         let declared: meridian_domain::declaration::Declared =
             serde_json::from_value(serde_json::json!({
                 "catalogue": {"datasets": [{
-                    "key": "stocks", "vendor": "Massive", "modes": ["pull"],
+                    "key": "rates", "vendor": "Central bank", "modes": ["pull"],
                     "licence_default": {
                         "kept": true, "retention_days": 0, "derived_use": true,
                         "derived_use_terms": "not_restricted", "display": true,
-                        "default_fields": [], "personal_use": true,
-                        "redistribution": "not_allowed",
-                        "eligibility": {
-                            "uses": ["personal"], "buyer_revenue_below": "1000000.00",
-                            "buyer_revenue_at_least": null,
-                            "buyer_revenue_currency_code": "USD"
-                        }
+                        "default_fields": [], "personal_use": false,
+                        "redistribution": "allowed_with_attribution"
                     }
                 }]}
             }))
             .unwrap();
         let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
-        // What DatasetLicence._wire() sends, its DataEligibility._wire() in it.
-        #[allow(deprecated)]
-        let wire = DatasetLicence {
-            kept: true,
-            derived_use: true,
-            derived_use_terms: DerivedUse::NotRestricted as i32,
-            display: true,
-            personal_use: true,
-            redistribution: Redistribution::NotAllowed as i32,
-            eligibility: Some(DataEligibility {
-                uses: vec![DataUse::Personal as i32],
-                buyer_revenue_below: Some(Decimal {
-                    high: 0,
-                    low: 100_000_000,
-                    scale: 2,
+        let dataset = DatasetDeclaration {
+            key: "rates".into(),
+            vendor: "Central bank".into(),
+            modes: vec![ObservationMode::Pull as i32],
+            ..Default::default()
+        };
+        // The dataset as a pre-v30 SDK encodes it: field 8, a licence with
+        // kept true, after the fields that remain.
+        let mut bytes = dataset.encode_to_vec();
+        bytes.extend_from_slice(&[0x42, 0x02, 0x08, 0x01]);
+        let decoded = DatasetDeclaration::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded, dataset);
+        let request = RegisterRequest {
+            schema_version: "v29".into(),
+            declaration: Some(PluginDeclaration {
+                catalogue: Some(Catalogue {
+                    datasets: vec![decoded],
                 }),
-                buyer_revenue_at_least: None,
-                buyer_revenue_currency_code: "USD".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
-        let registered = |licence: DatasetLicence| RegisterRequest {
-            schema_version: "v28".into(),
+        assert_eq!(difference(&request, &uploaded), None);
+    }
+
+    /// Contract v30 (W8.1, W10.1): a data plugin built for v30 uploads its
+    /// catalogue's terms and pricing, sessions calendar and gap recovery and
+    /// its most shards (JSON, read by core) and registers the same on the
+    /// wire: the two agree and the plugin registers as its upload says. One
+    /// that registers other terms is named.
+    #[test]
+    fn a_v30_catalogue_registers_as_its_upload_says() {
+        use meridian_pb::v1::{Catalogue, DatasetDeclaration, GapRecovery, ObservationMode};
+        let declared: meridian_domain::declaration::Declared =
+            serde_json::from_value(serde_json::json!({
+                "most_shards": 2,
+                "catalogue": {"datasets": [{
+                    "key": "rates", "vendor": "Central bank", "modes": ["pull"],
+                    "terms_and_pricing": "Free, with attribution.",
+                    "sessions_calendar_id": "CAL-FX24X5",
+                    "gap_recovery": "backfill"
+                }]}
+            }))
+            .unwrap();
+        let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
+        let registered = |terms: &str| RegisterRequest {
+            schema_version: "v30".into(),
             declaration: Some(PluginDeclaration {
+                most_shards: 2,
                 catalogue: Some(Catalogue {
                     datasets: vec![DatasetDeclaration {
-                        key: "stocks".into(),
-                        vendor: "Massive".into(),
+                        key: "rates".into(),
+                        vendor: "Central bank".into(),
                         modes: vec![ObservationMode::Pull as i32],
-                        licence_default: Some(licence),
+                        terms_and_pricing: terms.into(),
+                        sessions_calendar_id: "CAL-FX24X5".into(),
+                        gap_recovery: GapRecovery::Backfill as i32,
                         ..Default::default()
                     }],
                 }),
@@ -441,12 +382,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(difference(&registered(wire.clone()), &uploaded), None);
-        // And an eligibility that is not the uploaded one still differs.
-        let mut other = wire;
-        other.eligibility.as_mut().unwrap().uses = vec![DataUse::Commercial as i32];
         assert_eq!(
-            difference(&registered(other), &uploaded).as_deref(),
+            difference(&registered("Free, with attribution."), &uploaded),
+            None
+        );
+        assert_eq!(
+            difference(&registered("Paid."), &uploaded).as_deref(),
             Some("it registers a declaration whose catalogue differs")
         );
     }

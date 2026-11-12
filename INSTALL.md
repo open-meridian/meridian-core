@@ -78,6 +78,22 @@ GRANT ALL ON DATABASE meridian TO meridian_migrate;
 The wizard tests both and names the statement that fixes what it finds, so you
 do not have to get the grants exactly right here.
 
+Each component then connects as a login of its own, so one component's query
+past its 5 s statement timeout is cancelled and refused on its own, never
+holding the database for the rest. Make them with the serving role's
+password, each a member of the serving role:
+
+```sql
+CREATE ROLE meridian_lake LOGIN PASSWORD 'the-serving-password' IN ROLE meridian_app;
+ALTER ROLE meridian_lake SET statement_timeout = '5s';
+-- and the same for meridian_bor, meridian_instrument, meridian_street,
+-- meridian_conductor and meridian_dashboard
+```
+
+Until a component's login is made it connects as `meridian_app`, and each
+upgrade's preflight names any not made yet with the statement that makes it. A
+database this deployment brings is given them for you.
+
 **How people reach it.** Through the chart's Ingress, by a name, or not from
 outside the cluster at all until you arrange it.
 
@@ -387,26 +403,29 @@ one, along with everything in it. Nothing warns you and nothing backs it up.
 What one deployment holds before something becomes the bottleneck, measured
 by `make bench` on the development machine: an Apple M3 Pro (12 cores), the
 stores in the gate's Linux containers under Rancher Desktop, Postgres 16, the
-store tests' own build, 2026-10-26. These are measurements on one machine,
-not promises; run `make bench` on yours. The gate runs a guard on each at a
+store tests' own build, 2026-10-26; the lake's three rows again on
+2026-11-10, after its record path was batched, two runs on the bench's own
+Postgres beside a running development deployment. These are measurements on
+one machine, not promises; run `make bench` on yours. The gate runs a guard on each at a
 size it can afford, and fails where one falls to a quarter of what is stated
 here.
 
 | What | Measured |
 |---|---|
-| The lake recording a 200-series chain, a quote round at a time | 2,100 to 2,450 rows a second, flat from 20,000 to 400,000 rows |
-| The lake reading every row of it | 102,000 rows a second at 20,000 rows; 79,000 at 100,000; 63,000 at 400,000 |
-| The lake's latest read of it (one row per series) | 222 ms at 20,000 rows; 1.1 s at 100,000; 5.1 s at 400,000 |
+| The lake recording a 200-series chain, a quote round at a time | 12,000 to 15,500 rows a second, flat from 20,000 to 400,000 rows (1,500 to 1,800 on the same runs before the record path was batched) |
+| The lake reading every row of it | 82,000 to 92,000 rows a second at 20,000 rows; 63,000 to 73,000 at 100,000; 62,000 to 72,000 at 400,000 |
+| The lake's latest read of it (one row per series) | 14 ms at 20,000 rows; 19 to 20 ms at 100,000; 35 to 66 ms at 400,000 |
 | The plugin catalogue at 2,000 versions and 2,000 launches | 6 pages, the largest 508 KiB of the 512 KiB budget; all six in 167 ms |
 | The configuration store at the same | 623 versions and 1,650 launches recorded a second; a snapshot in 61 ms |
 | The dashboard's access records, against the broker's 1 MiB | 361 bytes a person; about 2,180 people before the upgrade preflight warns at three quarters |
 | The analytics engine on the tree (`crates/analytics-engine/BENCHMARK.md`) | a 1,920-option chain inverted at bid, mid and ask with greeks in 1.8 s on one worker: about 1,060 options a second |
 
-The latest read grows with the rows a subject's chain keeps: past about
-100,000 rows of one underlying's quotes it takes over a second, which is the
-lake's first bottleneck. The access records are the second: one answer of
-every person, group and permission, so a deployment past about 2,000 people
-is warned at its next upgrade.
+The latest read is answered by an index, one probe a series, so it stays
+within tens of milliseconds as a subject's chain grows to 400,000 rows. A
+lake records a batch in one statement read and one COPY, so its record rate
+no longer falls with the round trips a row once made. The access records are
+the first bottleneck: one answer of every person, group and permission, so a
+deployment past about 2,000 people is warned at its next upgrade.
 
 The lake's memory follows how many readers load a chain at once, not how much
 it keeps: each read's whole answer is built once, and a chain's statistics

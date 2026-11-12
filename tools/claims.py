@@ -64,9 +64,11 @@ def read_claims(paths: list[str]) -> list[dict]:
 
 
 # The lake's rows lost when the database's primary fails over, at most, in
-# seconds of rows, by profile (ruled 2026-11-08): ~5 s in ha. Its local
-# commits are what allow it; the recovery path that closes it is step 3c's.
-LAKE_RPO_BOUND_S = {"ha": 5}
+# seconds of rows, by profile: none in ha since contract v30's stage E. Its
+# commits are local, and its write-ahead stream holds each write until the
+# lake has recorded it again (ruled 2026-11-08, superseding the ~5 s first
+# ruled that day). A row lost in ha is refused whatever its seconds.
+LAKE_RPO_BOUND_S = {"ha": 0}
 
 # What was ruled for a class, written beside its entry: the bound's source,
 # and what the bound leaves to later work.
@@ -77,16 +79,15 @@ RULED = {
     ),
 }
 LAKE_RULED = (
-    "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the "
-    "database's primary fails over (lake_seconds_bound). Recovery lands in "
-    "step 3c; none of it is built yet. In ha, lake writes go through a "
-    "JetStream stream kept on three servers, and a data plugin's write is "
-    "acknowledged once the stream holds it. The lake's writer commits each "
-    "batch with its position in the stream in the same transaction, and after "
-    "a database failover resumes from that position, so no acknowledged row "
-    "is lost. Each dataset declares how it recovers: history fetched again "
-    "through the plugin's backfill, a buffer only, or not fetchable again; a "
-    "gap is marked on the dataset's quality state. Tolerant is unchanged."
+    "Ruled 2026-11-08, built in step 3c's stage E: in ha, lake writes go "
+    "through a JetStream stream kept on three servers, and a data plugin's "
+    "write is answered only once the stream holds it. The lake's writer "
+    "commits each batch with its position in the stream in the same "
+    "transaction, and after a database failover resumes from the position "
+    "the promoted standby holds, so no acknowledged row is lost "
+    "(lake_seconds_bound 0). Each dataset declares how it recovers: history "
+    "fetched again through the plugin's backfill, a buffer only, or not "
+    "fetchable again; a gap is recorded and read. Tolerant is unchanged."
 )
 
 
@@ -188,6 +189,9 @@ def check_ledger(book: dict) -> list[str]:
         if "lake_seconds_bound" in rpo and rpo.get("lake_rpo_s_max", 0) > rpo["lake_seconds_bound"]:
             missed.append(f"{name}: the lake lost {rpo['lake_rpo_s_max']}s of rows, past its bound "
                           f"{rpo['lake_seconds_bound']}s")
+        if entry["profile"] in LAKE_RPO_BOUND_S and LAKE_RPO_BOUND_S[entry["profile"]] == 0 \
+                and rpo.get("lake_rows_lost_max"):
+            missed.append(f"{name}: the lake lost {rpo['lake_rows_lost_max']} acknowledged rows; the bound is none")
     return missed
 
 
@@ -210,6 +214,8 @@ def check_run(book: dict, claims: list[dict], every: bool = False) -> list[str]:
         lake_bound = LAKE_RPO_BOUND_S.get(said["profile"])
         if "lake_rows_lost" in said and lake_bound is not None and float(said.get("lake_rpo_s", 0)) > lake_bound:
             missed.append(f"{name}: the lake lost {said['lake_rpo_s']}s of rows, past its bound {lake_bound}s")
+        elif lake_bound == 0 and said.get("lake_rows_lost"):
+            missed.append(f"{name}: the lake lost {said['lake_rows_lost']} acknowledged rows; the bound is none")
     for entry in book.get("entries", []):
         key = (entry["profile"], entry["class"], entry["component"])
         target = entry.get("command", "").split("E2E_CLUSTER_TARGET=")[-1].split()[0] if entry.get("command") else ""
@@ -280,21 +286,26 @@ def self_test() -> int:
     plug = {"profile": "ha", "failure": "order-plugin", "component": "ems-plugin", "bound_s": 30,
             "detect_bound_s": 10, "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover"}
     made = ledger([dict(plug, recovered_s=5.0, detected_s=1.2, duplicated=0, run="1"),
-                   dict(db, recovered_s=22.0, run="1", lake_rows_lost=3, lake_rpo_s=0.8)])
+                   dict(db, recovered_s=22.0, run="1", lake_rows_lost=0, lake_rpo_s=0)])
     entry = next(e for e in made["entries"] if e["class"] == "order-plugin")
     assert entry["detected_s"] == {"max": 1.2, "bound": 10} and entry["rpo"]["duplicated_max"] == 0, entry
-    assert next(e for e in made["entries"] if e["class"] == "db-primary")["rpo"]["lake_rows_lost_max"] == 3
+    assert next(e for e in made["entries"] if e["class"] == "db-primary")["rpo"]["lake_rows_lost_max"] == 0
     assert check_ledger(made) == []
     assert any("twice" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=1.0, duplicated=1)]))
     assert any("detected" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=11.0)]))
-    # What was ruled written beside the entry; the lake's ~5 s in ha held.
+    # What was ruled written beside the entry; in ha the lake loses no
+    # acknowledged row, one row lost refused as surely as many seconds.
     assert "10 s" in entry["ruled"] and "120 s" in entry["ruled"], entry
     lake_entry = next(e for e in made["entries"] if e["class"] == "db-primary")
-    assert lake_entry["rpo"]["lake_seconds_bound"] == 5 and "3c" in lake_entry["ruled"], lake_entry
+    assert lake_entry["rpo"]["lake_seconds_bound"] == 0 and "stage E" in lake_entry["ruled"], lake_entry
     assert any("lake lost" in m for m in check_run(made, [dict(db, recovered_s=22.0, lake_rows_lost=40,
                                                                 lake_rpo_s=6.2)]))
+    assert any("acknowledged rows" in m for m in check_run(made, [dict(db, recovered_s=22.0, lake_rows_lost=1,
+                                                                       lake_rpo_s=0)]))
     past = ledger([dict(db, recovered_s=22.0, run="1", lake_rows_lost=40, lake_rpo_s=6.2)])
     assert any("lake lost" in m for m in check_ledger(past)), past
+    one = ledger([dict(db, recovered_s=22.0, run="1", lake_rows_lost=1, lake_rpo_s=0)])
+    assert any("acknowledged rows" in m for m in check_ledger(one)), one
     print("claims: self-test OK")
     return 0
 

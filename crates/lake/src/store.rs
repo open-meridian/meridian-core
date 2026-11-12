@@ -28,9 +28,22 @@ pub enum StoreError {
     /// lake over, and this one steps down (step 3a; ruling 1060).
     #[error("{0}")]
     Fenced(#[from] meridian_changes::Fenced),
+
+    /// A write-ahead batch refused because the store's position in the
+    /// stream is not the one the batch follows (the `ha` profile; the
+    /// resilience spec's section 4): the database failed over and lost the
+    /// commits after it, or another writer moved it. The writer reads the
+    /// position again and goes on from there.
+    #[error("{0}")]
+    PositionMoved(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// What a store that keeps no write-ahead position answers: a reader's.
+fn no_write_ahead() -> StoreError {
+    StoreError::Unavailable("this member keeps no write-ahead position: the writer does".into())
+}
 
 /// Which valid time a read asks about (W10.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +87,71 @@ pub struct Query {
     /// them ([`crate::read`]). A store may answer every row still.
     pub latest_only: bool,
 }
+
+/// The lake's place in its write-ahead stream (the `ha` profile; the
+/// resilience spec's section 4): the last of the stream's sequences whose
+/// writes the lake has recorded, and the stream's time for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteAheadPosition {
+    pub sequence: u64,
+    pub at_ns: i64,
+}
+
+/// Writes taken from the write-ahead stream, recorded as one: each part one
+/// request's rows of one dataset that the lake keeps, in the stream's order,
+/// and the position they take the lake to, committed with them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteAheadBatch {
+    /// The stream's name.
+    pub stream: String,
+    /// The position the writer last read or committed: the batch is refused
+    /// [`StoreError::PositionMoved`] where the store holds another.
+    pub after: Option<WriteAheadPosition>,
+    /// The position the batch commits.
+    pub through: WriteAheadPosition,
+    pub parts: Vec<(String, Vec<Observation>)>,
+    /// Sequences the stream dropped before the lake took them, found by
+    /// this batch: kept, so a later write naming one is known to follow a
+    /// gap (W10.14).
+    pub dropped: Vec<Dropped>,
+    /// Each dataset's latest valid time the batch recorded: where a gap of
+    /// it found later begins.
+    pub valid: Vec<(String, i64)>,
+    /// Each gap the batch found, as first recorded (W10.14): its own record,
+    /// in the same transaction, so no gap found is lost with its batch.
+    pub gaps: Vec<meridian_domain::v1::DatasetGap>,
+}
+
+/// A run of the write-ahead stream's sequences it dropped at its bound
+/// before the lake took them (W10.14): the first and last, the stream's
+/// time of the last write the lake had before them and of the first it
+/// took after, and the gap recorded for it the moment it was found, its
+/// datasets not yet known (approved 2026-11-11): each dataset's gap found
+/// from the run names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub first: u64,
+    pub last: u64,
+    pub after_at_ns: i64,
+    pub until_at_ns: i64,
+    /// The unattributed gap's ID; empty for a run found before the lake
+    /// recorded one.
+    pub gap_id: String,
+}
+
+impl Dropped {
+    /// Whether the stream dropped `sequence`.
+    pub fn holds(&self, sequence: u64) -> bool {
+        (self.first..=self.last).contains(&sequence)
+    }
+}
+
+/// A dataset gap's control change's kind (W10.14): each change of its state.
+pub const CONTROL_GAP: &str = "meridian.v1.DatasetGap";
+
+/// A default read's source switched, or switched back (W10.6; the
+/// resilience spec's section 8): its control change's kind.
+pub const CONTROL_SWITCH: &str = "meridian.v1.SourceSwitched";
 
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -431,6 +509,59 @@ pub trait Store: Send + Sync {
         now_ns: i64,
     ) -> Result<Recorded>;
 
+    /// The lake's position in its write-ahead stream `stream`, none before
+    /// its first batch from it (the `ha` profile).
+    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        let _ = stream;
+        Err(no_write_ahead())
+    }
+
+    /// Writes from the write-ahead stream recorded as one (the `ha`
+    /// profile; the resilience spec's section 4): each dataset's parts
+    /// numbered in turn, as one batch of it, decided as [`Store::record`]
+    /// decides a batch, and the stream's position moved to `through` in the
+    /// same transaction, so the rows and the position commit or roll back
+    /// together. Answered with what each part did, in the parts' order.
+    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+        let _ = (batch, now_ns);
+        Err(no_write_ahead())
+    }
+
+    /// What the write-ahead stream dropped that the lake has found, and each
+    /// dataset's latest valid time recorded from it (W10.14): what a writer
+    /// that starts goes on with.
+    fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
+        let _ = stream;
+        Err(no_write_ahead())
+    }
+
+    /// A dataset gap's next state, its own record (W10.14; decisions/031),
+    /// in the `control` partition.
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        let _ = gap;
+        Err(no_write_ahead())
+    }
+
+    /// Every dataset gap's every state, in the order recorded (W10.14).
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        Ok(Vec::new())
+    }
+
+    /// Switches of the default reads' sources, and switches back, each its
+    /// own record (W10.6; the resilience spec's section 8; decisions/031),
+    /// in the `control` partition, in one transaction.
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        let _ = switches;
+        Err(StoreError::Unavailable(
+            "this store keeps no source switches".into(),
+        ))
+    }
+
+    /// Every switch recorded, in the order recorded (W10.6).
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        Ok(Vec::new())
+    }
+
     /// The rows a query names, each row key at its version as of the
     /// query's cut-off, with no choice among them made: which in force is
     /// [`crate::read`]'s.
@@ -607,6 +738,24 @@ pub trait Store: Send + Sync {
         published_as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
 
+    /// [`Store::read_dataset`], each row handed on as it is read, in
+    /// sequence order (stage M; the store memory audit of 2026-11-09, item
+    /// 6): a reader keeps what it answers -- one account's execution costs,
+    /// the scenarios asked -- never the dataset. A store that reads a chunk
+    /// at a time says so by overriding this.
+    fn read_dataset_each(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        for row in self.read_dataset(dataset, data_type, as_of_ns, 0)? {
+            each(row)?;
+        }
+        Ok(())
+    }
+
     /// Every version of every row of one dataset and data type, in sequence
     /// order: how a saved scenario is read at a version not its latest
     /// (contract v28, W10.6, W12.8).
@@ -644,6 +793,14 @@ pub trait Store: Send + Sync {
     /// The `control` partition's epoch now, as the record says (step 3b): a
     /// writer steps down once it moves past its own.
     fn head_epoch(&self) -> Result<u64>;
+
+    /// Follow the database's timeline (contract v30, stage C; the
+    /// resilience spec's section 3): on a new one the epoch raised as a
+    /// takeover raises it and adopted, the takeover recorded with that
+    /// cause. A store with no database never moves.
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        Ok(meridian_changes::timeline::Timeline::Same)
+    }
 
     /// A page of `partition`'s change log after `after` (step 3a): its rows
     /// in sequence, each range it served and did not keep as one change, at

@@ -19,6 +19,9 @@ serde_json.workspace = true
 # Rust, with no other dependency; the frame format is not needed.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 tracing.workspace = true
+# A store's pool's watch on its database's timeline (contract v30, stage C):
+# each connection it opens reads the database's identity.
+r2d2.workspace = true
 # Internal TLS (ruling 1084): the one Postgres connector (`tls`).
 rustls.workspace = true
 tokio-postgres-rustls.workspace = true

@@ -25,7 +25,7 @@
 {{- end }}
 {{- $within := printf "%s.svc.cluster.local" $ns }}
 {{- $servers := dict
-      "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within) (printf "%s-database-0.%s" $full $within) (printf "%s-database-1.%s" $full $within) (printf "%s-database-2.%s" $full $within))
+      "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within) (printf "%s-database-0.%s" $full $within) (printf "%s-database-1.%s" $full $within) (printf "%s-database-2.%s" $full $within) (printf "%s-database-3.%s" $full $within))
       "broker" (list (printf "%s-broker" $full) (printf "%s-broker.%s" $full $ns) (printf "%s-broker.%s.svc" $full $ns) (printf "%s-broker.%s" $full $within) (printf "*.%s-broker-members.%s" $full $within) (printf "*.%s-broker-jetstream-members.%s" $full $within))
       "sidecars" (list (printf "*.%s-sidecars.%s" $full $within) (printf "*.%s-sidecars.%s.svc" $full $ns)) }}
 ---

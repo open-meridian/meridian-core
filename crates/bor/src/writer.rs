@@ -73,7 +73,7 @@ fn cost(book: &Book) -> usize {
 }
 
 #[derive(Default)]
-struct Books {
+pub(crate) struct Books {
     held: BTreeMap<String, (Book, usize, u64)>,
     by_use: BTreeMap<u64, String>,
     bytes: usize,
@@ -81,7 +81,7 @@ struct Books {
 }
 
 impl Books {
-    fn put(&mut self, mut book: Book, bound: usize) {
+    pub(crate) fn put(&mut self, mut book: Book, bound: usize) {
         // A book held answers as the record's does: no entry's body in it.
         book.bodies = Bodies::default();
         let account = book.account_id.clone();
@@ -106,7 +106,7 @@ impl Books {
         }
     }
 
-    fn get(&mut self, account: &str) -> Option<Book> {
+    pub(crate) fn get(&mut self, account: &str) -> Option<Book> {
         let (book, _, used) = self.held.get(account)?;
         let (book, used) = (book.clone(), *used);
         self.by_use.remove(&used);
@@ -118,7 +118,12 @@ impl Books {
         Some(book)
     }
 
-    fn forget(&mut self, account: &str) {
+    /// How many books it holds, and their bytes.
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (self.held.len(), self.bytes)
+    }
+
+    pub(crate) fn forget(&mut self, account: &str) {
         if let Some((_, size, used)) = self.held.remove(account) {
             self.bytes -= size;
             self.by_use.remove(&used);
@@ -202,6 +207,16 @@ impl Store for Writer {
 
     fn head_epoch(&self) -> Result<u64> {
         self.inner.head_epoch()
+    }
+
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let found = self.inner.follow_timeline()?;
+        // The record lost what a book held may hold (contract v30, stage
+        // C): none is kept past it; each is read again from the record.
+        if matches!(found, meridian_changes::timeline::Timeline::Moved(_)) {
+            *self.books() = Books::default();
+        }
+        Ok(found)
     }
 
     fn read_changes(

@@ -33,6 +33,9 @@ pub fn measure(key: &MeasureKey) -> MeasureRef {
         version: key.version as i32,
         breakdowns: key.breakdowns.clone(),
         event_group_id: key.event_group_id.clone(),
+        // Contract v30's refresh (W12.1): a standing job's, read by core's
+        // stage A (step 3c); a one-off job's answer names none.
+        ..Default::default()
     }
 }
 
@@ -152,6 +155,7 @@ pub fn provenance(json: &Value) -> AnswerProvenance {
                 version: integer(&m["version"]) as i32,
                 breakdowns: Vec::new(),
                 event_group_id: String::new(),
+                ..Default::default()
             })
             .collect(),
         event_groups: list(&json["event_groups"])
@@ -290,5 +294,8 @@ pub fn job_answer(job_id: &str, answer: &Answer) -> Result<JobAnswer, String> {
         provenance: Some(provenance(&answer.provenance)),
         // Whole: the coordinator pages it as it is read (ruling 794).
         next_cursor: String::new(),
+        // Contract v30: a standing job's values, filled and paged by core's
+        // stage A (step 3c); a one-off job's answer carries none.
+        values: Vec::new(),
     })
 }

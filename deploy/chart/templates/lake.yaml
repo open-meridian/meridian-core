@@ -30,6 +30,7 @@
   No key and no platform address: licensed data never leaves the deployment
   (spec/the-lake, requirement 14).
 */}}
+{{- define "meridian-runtime.lake.deployment" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -90,17 +91,13 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-analytics
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
-            {{- with .Values.lake.mallocArenaMax }}
-            - name: MALLOC_ARENA_MAX
-              value: {{ . | quote }}
-            {{- end }}
-            # glibc maps every allocation from this size on of its own and
-            # unmaps it when freed (ruling 972).
-            - name: MALLOC_MMAP_THRESHOLD_
-              value: {{ $mmap | int64 | quote }}
+            # Its working memory (stage M), less the hot layer's bounds and
+            # the held answers' 64 MiB; glibc's arenas, and its mmap
+            # threshold (ruling 972), as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "lake" "values" .Values.lake "resources" .Values.resources "heldMiB" (add 64 .Values.lake.hotLayer.latestMiB .Values.lake.hotLayer.listingsMiB) "name" "lake") | nindent 12 }}
             # How many whole answers it builds at once (rulings 957, 958).
             - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
-              value: {{ $answers | int | quote }}
+              value: {{ .Values.lake.maxConcurrentAnswers | int | quote }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -112,6 +109,10 @@ spec:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.lakeKey) }}
             {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+            {{- /* In `ha`, the data plugins' writes taken from the write-ahead
+                   stream (contract v30, stage E). */}}
+            {{- with (include "meridian-runtime.writeAheadEnv" .) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.writeAheadBoundsEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
@@ -125,4 +126,9 @@ spec:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
         {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
         {{- with (include "meridian-runtime.databaseCaVolume" .) }}{{ . | nindent 8 }}{{- end }}
+{{- end -}}
+{{ include "meridian-runtime.lake.deployment" . }}
+{{- /* Its reader members (contract v30, stage B; spec section 5): the same
+       Deployment in a reads-only mode, `lake.readers` of them. */}}
+{{ include "meridian-runtime.readers" (dict "top" $ "component" "lake" "values" .Values.lake "readUrl" "MERIDIAN_LAKE_READ_DATABASE_URL" "rendered" (include "meridian-runtime.lake.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "lake" "values" $.Values.lake) }}

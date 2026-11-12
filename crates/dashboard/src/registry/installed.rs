@@ -28,8 +28,8 @@ use meridian_domain::v1::{
 };
 
 use super::{
-    ask, back, error_line, field, hidden, listings, pull_kind, pull_warning, registry_label,
-    token_ok, update_for, widening, Fields, PLUGINS_PATH, READING,
+    ask, ask_naming, back, error_line, field, hidden, listings, pull_kind, pull_warning,
+    registry_label, token_ok, update_for, widening, Fields, PLUGINS_PATH, READING,
 };
 use crate::html::escape;
 use crate::session::Session;
@@ -621,6 +621,55 @@ fn version_row(
     )
 }
 
+/// What the Launch sheet was given, kept when it is drawn again with a
+/// refusal at its field.
+#[derive(Default)]
+struct Entered {
+    instance_id: Option<String>,
+    note: String,
+    in_flight: String,
+    requests_per_second: String,
+    answer_mib: String,
+    shards: String,
+    standby: bool,
+}
+
+impl Entered {
+    fn from(fields: &Fields) -> Self {
+        Self {
+            instance_id: Some(field(fields, "instance_id").into()),
+            note: field(fields, "note").into(),
+            in_flight: field(fields, "in_flight").into(),
+            requests_per_second: field(fields, "requests_per_second").into(),
+            answer_mib: field(fields, "answer_mib").into(),
+            shards: field(fields, "shards").into(),
+            standby: !field(fields, "standby").is_empty(),
+        }
+    }
+}
+
+/// The most pods of one instance a version allows (contract v30, W8.1): its
+/// declaration's most_shards, 0 and 1 each one pod.
+fn most_shards(version: &PluginVersion) -> u32 {
+    version
+        .metadata
+        .as_ref()
+        .and_then(|m| m.declaration.as_ref())
+        .map_or(0, |d| d.most_shards)
+}
+
+/// A launch's shards as entered (contract v30, W8.3): empty for one pod, or
+/// a whole number. Past the version's most_shards is the conductor's to
+/// refuse, naming shards.
+fn shards_entered(text: &str) -> Result<u32, String> {
+    match text.trim() {
+        "" => Ok(0),
+        text => text
+            .parse::<u32>()
+            .map_err(|_| format!("shards is {text:?}: a whole number of pods, or empty for one")),
+    }
+}
+
 /// `GET /admin/plugins/versions/{name}/launch?version=`: the launch sheet.
 pub(super) async fn launch_sheet(
     State(app): State<Arc<App>>,
@@ -636,55 +685,123 @@ pub(super) async fn launch_sheet(
     let Ok(catalogue) = crate::catalogue::catalogue(&app).await else {
         return back(Err("the catalogue could not be read".into()), "installed");
     };
-    let Some(version) = catalogue.versions.iter().find(|v| {
+    match draw_launch_sheet(
+        &session,
+        &catalogue,
+        &name,
+        &wanted,
+        &Entered::default(),
+        None,
+    ) {
+        Some(page) => page.into_response(),
+        None => back(
+            Err(format!("{name} {wanted} is not installed")),
+            "installed",
+        ),
+    }
+}
+
+/// The Launch sheet for one version, with what was entered and a refusal
+/// shown at the field it names; None where the version is not installed.
+fn draw_launch_sheet(
+    session: &Session,
+    catalogue: &PluginCatalogue,
+    name: &str,
+    wanted: &str,
+    entered: &Entered,
+    refused_shards: Option<&str>,
+) -> Option<Html<String>> {
+    let version = catalogue.versions.iter().find(|v| {
         v.metadata
             .as_ref()
             .is_some_and(|m| m.name == name && m.version == wanted)
-    }) else {
-        return back(
-            Err(format!("{name} {wanted} is not installed")),
-            "installed",
-        );
-    };
+    })?;
     let roles = version
         .metadata
         .as_ref()
         .map(|m| m.roles.clone())
         .unwrap_or_default();
-    let token = crate::admin::token_input(&session);
+    let token = crate::admin::token_input(session);
     let taken: Vec<&str> = catalogue
         .launches
         .iter()
         .map(|l| l.instance_id.as_str())
         .collect();
-    let suggested = (1..)
-        .map(|n| format!("{name}-{n}"))
-        .find(|id| !taken.contains(&id.as_str()))
-        .unwrap_or_default();
+    let suggested = entered.instance_id.clone().unwrap_or_else(|| {
+        (1..)
+            .map(|n| format!("{name}-{n}"))
+            .find(|id| !taken.contains(&id.as_str()))
+            .unwrap_or_default()
+    });
+    // Its pods (contract v30, W8.3): Shards only where the version declares
+    // more than one, at most its most_shards, beside a standby pod for any,
+    // on one line under the Limits; a refusal naming shards under them, in
+    // place of the hint (it says the bound), or alone where the version
+    // offers no Shards (a launch not sent from this sheet).
+    let most = most_shards(version);
+    let refused = refused_shards.map_or(String::new(), |words| {
+        format!(
+            "<p class=\"field-refused\" id=\"shards-refused\" role=\"alert\" data-refused=\"shards\">{}</p>",
+            escape(words)
+        )
+    });
+    let (hint, shards) = if most > 1 {
+        (
+            if refused_shards.is_some() {
+                String::new()
+            } else {
+                format!("<p class=\"hint\">At most {most} shards; empty runs one pod.</p>")
+            },
+            format!(
+                "<label class=\"num\">Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
+                 inputmode=\"numeric\" value=\"{value}\"{invalid}></label>",
+                value = escape(&entered.shards),
+                invalid = if refused_shards.is_some() {
+                    " aria-invalid=\"true\" aria-describedby=\"shards-refused\" autofocus"
+                } else {
+                    ""
+                },
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let page = format!(
         "<section class=\"sheet-dialog\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">Launch {n} {v}</h1>\
          <dl class=\"facts\"><dt>Source</dt><dd>{source}</dd><dt>Roles approved</dt><dd>{r}</dd></dl>\
          <form method=\"post\" action=\"{PLUGINS_PATH}/launch\" class=\"sheet-act\">{token}{hn}{hv}{hr}\
          <label>Instance <input type=\"text\" name=\"instance_id\" required maxlength=\"63\" value=\"{suggested}\"></label>\
-         <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\"></label>\
+         <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\" value=\"{note}\"></label>\
+         <fieldset class=\"checks limits\" data-limits><legend>Limits at its sidecar</legend>\
+         <p class=\"hint\">Empty takes the deployment's.</p>\
+         <label class=\"num\">Requests at once <input type=\"number\" name=\"in_flight\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{in_flight}\"></label>\
+         <label class=\"num\">Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{per_second}\"></label>\
+         <label class=\"num\">Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{answer_mib}\"></label>\
+         </fieldset>\
+         <div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods>{shards}\
+         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label>{refused}{hint}</div>\
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{back}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">Launch</button></div></form></section>",
-        n = escape(&name),
-        v = escape(&wanted),
+        n = escape(name),
+        v = escape(wanted),
         source = registry_label(&version.source_registry),
         r = escape(&roles.join(", ")),
-        hn = hidden("name", &name),
-        hv = hidden("version", &wanted),
+        hn = hidden("name", name),
+        hv = hidden("version", wanted),
         hr = roles.iter().map(|r| hidden("approved_role", r)).collect::<String>(),
         suggested = escape(&suggested),
-        back = escape(&versions_path(&name)),
+        note = escape(&entered.note),
+        in_flight = escape(&entered.in_flight),
+        per_second = escape(&entered.requests_per_second),
+        answer_mib = escape(&entered.answer_mib),
+        standby = if entered.standby { " checked" } else { "" },
+        back = escape(&versions_path(name)),
     );
-    Html(crate::html::page_with(
+    Some(Html(crate::html::page_with(
         "Launch",
         &page,
-        &super::chrome(&session, "Launch"),
-    ))
-    .into_response()
+        &super::chrome(session, "Launch"),
+    )))
 }
 
 fn to_versions(name: &str, done: Result<String, String>) -> Response {
@@ -720,14 +837,32 @@ pub(super) async fn launch(
             Err("this form did not come from your session".into()),
         );
     }
-    let launched: Result<PluginLaunch, String> = ask(
+    // Its own share at its sidecar, where entered (contract v30).
+    let limits = match crate::catalogue::sidecar_limits(
+        field(&fields, "in_flight"),
+        field(&fields, "requests_per_second"),
+        field(&fields, "answer_mib"),
+    ) {
+        Ok(limits) => limits,
+        Err(refused) => return to_versions(&name, Err(refused)),
+    };
+    let version = field(&fields, "version").to_string();
+    // Its shards and standby pod (contract v30, W8.3); a refusal naming
+    // shards, the sheet's or the conductor's, shown at the field.
+    let shards = match shards_entered(field(&fields, "shards")) {
+        Ok(shards) => shards,
+        Err(refused) => {
+            return launch_sheet_refused(&app, &session, &name, &version, &fields, refused).await
+        }
+    };
+    let launched: Result<PluginLaunch, (Vec<String>, String)> = ask_naming(
         &app,
         &session.subject,
         crate::catalogue::LAUNCH_PLUGIN,
         "meridian.v1.LaunchPluginRequest",
         LaunchPluginRequest {
             name: name.clone(),
-            version: field(&fields, "version").into(),
+            version: version.clone(),
             instance_id: field(&fields, "instance_id").into(),
             approved_roles: fields
                 .iter()
@@ -736,14 +871,50 @@ pub(super) async fn launch(
                 .collect(),
             live: false,
             note: field(&fields, "note").into(),
+            limits,
+            shards,
+            standby: !field(&fields, "standby").is_empty(),
         },
         std::time::Duration::from_secs(40),
     )
     .await;
-    to_versions(
-        &name,
-        launched.map(|l| format!("{} runs {} {}.", l.instance_id, l.name, l.version)),
-    )
+    match launched {
+        Err((named, refused)) if named.iter().any(|f| f == "shards") => {
+            launch_sheet_refused(&app, &session, &name, &version, &fields, refused).await
+        }
+        launched => to_versions(
+            &name,
+            launched
+                .map(|l| format!("{} runs {} {}.", l.instance_id, l.name, l.version))
+                .map_err(|(_, refused)| refused),
+        ),
+    }
+}
+
+/// The Launch sheet again, as it was filled, its refusal at Shards.
+async fn launch_sheet_refused(
+    app: &App,
+    session: &Session,
+    name: &str,
+    version: &str,
+    fields: &Fields,
+    refused: String,
+) -> Response {
+    let drawn = match crate::catalogue::catalogue(app).await {
+        Ok(catalogue) => draw_launch_sheet(
+            session,
+            &catalogue,
+            name,
+            version,
+            &Entered::from(fields),
+            Some(&refused),
+        ),
+        Err(_) => None,
+    };
+    match drawn {
+        Some(page) => (axum::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response(),
+        None => to_versions(name, Err(refused)),
+    }
 }
 
 /// `POST /admin/plugins/versions/retire`: RetirePluginVersion (W8.15), its

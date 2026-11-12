@@ -1633,9 +1633,16 @@ fn market_row(price: &v1::Price) -> Option<Value> {
 }
 
 /// Contract v29 (W10.4): a row quoted in yield alone -- a when-issued print
-/// before its auction -- as the engine reads it, with no amount.
+/// before its auction -- as the engine reads it, with no amount; none where
+/// its yield states no day count, kept as quoted and never computed with
+/// (contract v30, ruling 433).
 fn quoted_row(price: &v1::Price) -> Option<Value> {
-    if price.price.is_some() || price.r#yield.is_none() {
+    if price.price.is_some()
+        || !price
+            .r#yield
+            .as_ref()
+            .is_some_and(crate::debt::computed_with)
+    {
         return None;
     }
     let meta = price.meta.as_ref()?;

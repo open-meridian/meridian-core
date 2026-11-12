@@ -8,6 +8,7 @@ description = "Topic routing and in-process transport for the Meridian bus"
 
 [dependencies]
 meridian-clock.workspace = true
+meridian-budget.workspace = true
 async-nats.workspace = true
 futures-util.workspace = true
 meridian-pb.workspace = true

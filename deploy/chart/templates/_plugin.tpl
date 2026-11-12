@@ -8,7 +8,8 @@
   Takes a dict: top (the chart), name (the Deployment's), instance, roles
   (comma-joined), brokerSecret and brokerKey (where the sidecar's broker
   credential is), plugin (image, pullPolicy, args, env, existingSecret,
-  resources, imagePullSecret; absent for a sidecar alone), imageTag,
+  resources, imagePullSecret; absent for a sidecar alone), imageTag, limits
+  (the plugin's own share at its sidecar, overriding sidecar.limits),
   launched, which marks what the launcher made and alone may remove, and
   live: the live shape of a development deployment
   (spec/live-plugin-development), where the plugin runs the files sent to it
@@ -171,6 +172,22 @@ spec:
               value: {{ .roles | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
+            {{- /* In `ha`, a data plugin's lake writes held by the lake's
+                   write-ahead stream before they are recorded (contract v30,
+                   stage E); the sidecar of any other role ignores it. */}}
+            {{- with (include "meridian-runtime.writeAheadEnv" $top) }}{{ . | nindent 12 }}{{- end }}
+            {{- /* Its own budget, and the plugin's share at it (stage M; the
+                   resilience spec's section 10a): past the share only this
+                   plugin is refused. A sidecars[] entry's own `limits`
+                   overrides the chart's sidecar.limits. The plugin's
+                   answers in flight (answerMiB) and its read_after session
+                   (256 KiB, a MiB here) are held apart from the sidecar's
+                   own budget, so a plugin flooding it cannot starve the
+                   sidecar's own work; a share that leaves it nothing is
+                   refused here. */}}
+            {{- $answerMiB := (.limits | default dict).answerMiB | default ($top.Values.sidecar.limits | default dict).answerMiB | default 32 }}
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $top "container" "sidecar" "values" ($top.Values.sidecar | default dict) "resources" $top.Values.resources "heldMiB" (add 1 (int64 $answerMiB)) "name" "sidecar") | nindent 12 }}
+            {{- include "meridian-runtime.sidecarLimitsEnv" (dict "top" $top "limits" .limits) | nindent 12 }}
             {{- if $top.Values.dashboard.enabled }}
             {{/*
               The front door: the dashboard's requests for the plugin's page,

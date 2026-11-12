@@ -1,5 +1,6 @@
 {{- include "meridian-runtime.require" . -}}
 {{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
+{{- $readReplicas := int (include "meridian-runtime.databaseReadReplicas" .) }}
 {{- $scrub := .Values.database.brought.replicaScrub | default dict }}
 {{- if and .Values.database.brought.enabled (gt $standbys 0) $scrub.schedule }}
 {{/*
@@ -68,7 +69,7 @@ spec:
                 - name: MERIDIAN_REPLICAS_SERVICE
                   value: {{ printf "%s-members.%s.svc.cluster.local" $name .Release.Namespace | quote }}
                 - name: MERIDIAN_REPLICAS_MEMBERS
-                  value: {{ add 1 $standbys | quote }}
+                  value: {{ add 1 $standbys $readReplicas | quote }}
                 - name: MERIDIAN_REPLICAS_RECLONE
                   value: {{ ternary "true" "false" (eq (toString $scrub.reclone) "true") | quote }}
                 - name: MERIDIAN_PATRONI_USERNAME

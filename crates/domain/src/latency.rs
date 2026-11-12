@@ -289,7 +289,13 @@ impl Monitor {
             }
             series.judged_to = series.judged_to.max(current);
         }
+        forget_the_silent(&mut held, current);
         out
+    }
+
+    /// How many series it holds.
+    pub fn series(&self) -> usize {
+        self.held.lock().map(|held| held.len()).unwrap_or(0)
     }
 
     /// Every series over the last `window_ns` before `now_ns`, merged: the
@@ -496,9 +502,53 @@ pub fn source_ns(meta: &crate::v1::ObservationMeta) -> i64 {
         .unwrap_or(meta.valid_from_ns)
 }
 
+/// Stage M (the resilience spec's section 10a; the store memory audit of
+/// 2026-11-09, item 10): what the monitor holds is bounded by what it reads.
+/// A series heard nothing from in the hours it keeps, 30 days, is let go --
+/// an instance stopped, a hop retired -- and every other's minutes past 7
+/// days and hours past 30 are let go when it is judged, not only when it is
+/// next heard, so a series gone quiet holds no more than its window.
+fn forget_the_silent(held: &mut BTreeMap<Key, Series>, current_minute: i64) {
+    let oldest_minute = current_minute - MINUTES_KEPT * MINUTE_NS;
+    let oldest_hour = current_minute.div_euclid(HOUR_NS) * HOUR_NS - HOURS_KEPT * HOUR_NS;
+    held.retain(|_, series| series.last_at_ns > oldest_hour);
+    for series in held.values_mut() {
+        series.minutes.retain(|m, _| *m > oldest_minute);
+        series.backlog_minutes.retain(|m, _| *m > oldest_minute);
+        series.hours.retain(|h, _| *h > oldest_hour);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage M: a series gone quiet holds its window and no more, and one
+    /// silent past the 30 days the monitor keeps is let go.
+    #[test]
+    fn a_series_gone_quiet_is_trimmed_to_its_window_and_let_go_after_thirty_days() {
+        let monitor = Monitor::default();
+        let start = 1_792_300_000_000_000_000 / MINUTE_NS * MINUTE_NS;
+        let said = Said {
+            ceiling_ns: 250_000_000,
+            ..Said::default()
+        };
+        for i in 0..30_i64 {
+            minute_of(&monitor, start + i * MINUTE_NS, 2_000, said);
+        }
+        assert_eq!(monitor.series(), 1);
+        // Eight days on: its minutes are past the week it keeps.
+        monitor.judge(start + 8 * 24 * 60 * MINUTE_NS);
+        {
+            let held = monitor.held.lock().unwrap();
+            let series = held.values().next().unwrap();
+            assert!(series.minutes.is_empty() && series.backlog_minutes.is_empty());
+            assert!(!series.hours.is_empty(), "its hours are kept 30 days");
+        }
+        // Thirty-one days on: let go.
+        monitor.judge(start + 31 * 24 * 60 * MINUTE_NS);
+        assert_eq!(monitor.series(), 0);
+    }
 
     #[test]
     fn the_buckets_are_the_sdks() {

@@ -146,7 +146,20 @@ pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
 pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
 pub const LIST_EXECUTION_COSTS: &str = "platform.lake.query.list-execution-costs";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
+/// Contract v30 (W10.14): a deployment admin reads the dataset gaps.
+pub const LIST_DATASET_GAPS: &str = "platform.lake.query.list-dataset-gaps";
+/// Contract v30 (W10.6; the resilience spec's section 8): a deployment admin
+/// reads the switches of the default reads' sources.
+pub const LIST_SOURCE_SWITCHES: &str = "platform.lake.query.list-source-switches";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
+/// A lake read handed on, unchanged, by a reader member to the writer, which
+/// alone serves it, and the writer's reply (contract v30, stage B; topics.md,
+/// "Component topics"; approved 2026-11-10): a read whose answer depends on
+/// the writer's own acts or memory -- one that raises a want, which is the
+/// writer's recorded act, or whose answer says what a source declined or a
+/// dataset's liveness, which only the writer's commands set. The answer
+/// never depends on which member takes the read.
+pub const READ_FROM_WRITER: &str = "platform.lake.internal.read-from-writer";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -338,6 +351,10 @@ struct Wants {
 /// The lake, serving.
 pub struct Lake {
     bus: Arc<Bus>,
+    /// A reader member (contract v30, stage B): it serves reads alone, and
+    /// does none of the writer's acts -- no want asked or kept, nothing heard
+    /// kept, no sweep or retention -- holding what it hears in memory only.
+    reads_only: bool,
     store: Arc<dyn Store>,
     pub(crate) clock: Arc<dyn Clock>,
     config: RwLock<DataConfig>,
@@ -347,8 +364,11 @@ pub struct Lake {
     /// them, since the lake keeps none of it to read again.
     waiting: Mutex<BTreeMap<String, Vec<std::sync::mpsc::Sender<Heard>>>>,
     /// What a source declined, by dataset, subject and the date or range its
-    /// want asked (contract v19): its reason and when.
-    declined: Mutex<read::Declined>,
+    /// want asked (contract v19): its reason and when. Shared, so a read
+    /// takes it without copying it, and replaced whole by a decline, which
+    /// lets go of every one that no longer stands (stage M; the store
+    /// memory audit of 2026-11-09, item 11).
+    declined: Mutex<Arc<read::Declined>>,
     /// Trades recorded since the band last read them.
     trades_recorded: std::sync::atomic::AtomicU64,
     /// Each record the instrument store said it holds, with its asset class
@@ -380,6 +400,38 @@ pub struct Lake {
     /// 3b): what an assessment, an amendment, a priority or an alias
     /// committed after it is published from.
     control_published: Mutex<u64>,
+    /// Each public read's handler by its topic: what a read handed on by a
+    /// reader member ([`READ_FROM_WRITER`]) is answered by on the writer.
+    read_handlers: RwLock<BTreeMap<&'static str, meridian_bus::Handler>>,
+    /// Each gap asked again of its data plugin (W10.14), by its ID: the gap
+    /// as recorded, the wants still open for it, and when it was asked.
+    refetching: Mutex<BTreeMap<String, Refetching>>,
+    /// The sources the default reads pass over now, as the lake last
+    /// recorded their switches (contract v30, W10.6; the resilience spec's
+    /// section 8): rebuilt from the records at start.
+    switches: Mutex<crate::switches::Switches>,
+}
+
+/// A gap asked again of its data plugin (W10.14): recovered once every want
+/// asked for it is answered, unrecovered at a decline or past
+/// [`GAP_REFETCH_NS`].
+struct Refetching {
+    gap: meridian_domain::v1::DatasetGap,
+    wants: BTreeSet<String>,
+    asked_at_ns: i64,
+}
+
+/// How long a gap's want waits for its rows before the gap is marked
+/// unrecovered: ten minutes, a vendor's history read and recorded at least.
+pub const GAP_REFETCH_NS: i64 = 10 * 60 * 1_000_000_000;
+
+/// What a batch did, as its parts are published: what its reply counts,
+/// the datasets it wrote and the subjects it named.
+#[derive(Default)]
+struct Said {
+    reply: RecordObservationsReply,
+    datasets: BTreeSet<String>,
+    subjects: Vec<String>,
 }
 
 /// The lake's change log, read from its store.
@@ -399,43 +451,10 @@ impl meridian_changes::ChangeLog for LakeLog {
 /// The analytics component's instance where nothing names another (W12.2).
 pub const ANALYTICS: &str = "analytics";
 
-/// Ruling 957 (b): glibc's free memory handed back to the system, from the
-/// top of each arena and the free pages within it; what it did said at
-/// debug. Only glibc keeps memory this way, and only glibc is asked.
-#[cfg(target_env = "gnu")]
+/// Ruling 957 (b): glibc's free memory handed back to the system, as every
+/// component's sweep does (stage M; meridian_budget::sweep).
 fn release_to_system() {
-    let told = tracing::enabled!(tracing::Level::DEBUG);
-    let before = told.then(resident_kib).flatten();
-    let started = std::time::Instant::now();
-    // SAFETY: malloc_trim takes no pointer and touches only the allocator's
-    // own state, under the allocator's own locks.
-    let released = unsafe { libc::malloc_trim(0) } == 1;
-    if told {
-        tracing::debug!(
-            released,
-            resident_before_kib = before.unwrap_or(0),
-            resident_after_kib = resident_kib().unwrap_or(0),
-            ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3),
-            "the memory freed returned to the system"
-        );
-    }
-}
-
-#[cfg(not(target_env = "gnu"))]
-fn release_to_system() {}
-
-/// The process's resident memory, in KiB, as /proc says it.
-#[cfg(target_env = "gnu")]
-fn resident_kib() -> Option<u64> {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))?
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .ok()
+    meridian_budget::sweep::release_to_system();
 }
 
 static ANALYTICS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -495,6 +514,213 @@ pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
     superseded
 }
 
+/// A write's rows as the lake records them, by the topic it was asked on
+/// (W10.4): the field its request names them by, each row as a row of its
+/// kind, and the want it answers. Every topic of
+/// [`meridian_bus::write_ahead::TOPICS`], each decoded as the lake's own
+/// handler for it decodes it; any other refused.
+pub fn rows_of(
+    topic: &str,
+    envelope: &Envelope,
+) -> Result<(&'static str, Vec<Observation>, String), String> {
+    use meridian_domain::v1;
+    fn rows<R: Message + Default, T>(
+        envelope: &Envelope,
+        request_type: &str,
+        field: &'static str,
+        take: impl FnOnce(R) -> (Vec<T>, String),
+        each: impl Fn(T) -> Observation,
+    ) -> Result<(&'static str, Vec<Observation>, String), String> {
+        let (rows, want_id) = take(decode(envelope, request_type)?);
+        Ok((field, rows.into_iter().map(each).collect(), want_id))
+    }
+    match topic {
+        RECORD_PRICES => rows(
+            envelope,
+            "meridian.v1.RecordPricesRequest",
+            "prices",
+            |r: RecordPricesRequest| (r.prices, r.want_id),
+            |row| Observation::Price(Box::new(row)),
+        ),
+        RECORD_BARS => rows(
+            envelope,
+            "meridian.v1.RecordBarsRequest",
+            "bars",
+            |r: RecordBarsRequest| (r.bars, r.want_id),
+            |row| Observation::Bar(Box::new(row)),
+        ),
+        RECORD_TRADES => rows(
+            envelope,
+            "meridian.v1.RecordTradesRequest",
+            "trades",
+            |r: RecordTradesRequest| (r.trades, r.want_id),
+            |row| Observation::Trade(Box::new(row)),
+        ),
+        RECORD_QUOTES => rows(
+            envelope,
+            "meridian.v1.RecordQuotesRequest",
+            "quotes",
+            |r: RecordQuotesRequest| (r.quotes, r.want_id),
+            |row| Observation::Quote(Box::new(row)),
+        ),
+        RECORD_OUTCOMES => rows(
+            envelope,
+            "meridian.v1.RecordOutcomesRequest",
+            "outcomes",
+            |r: RecordOutcomesRequest| (r.outcomes, String::new()),
+            |row| Observation::Outcome(Box::new(row)),
+        ),
+        RECORD_RATES => rows(
+            envelope,
+            "meridian.v1.RecordRatesRequest",
+            "rates",
+            |r: RecordRatesRequest| (r.rates, r.want_id),
+            |row| Observation::Rate(Box::new(row)),
+        ),
+        RECORD_STATISTICS => rows(
+            envelope,
+            "meridian.v1.RecordStatisticsRequest",
+            "statistics",
+            |r: RecordStatisticsRequest| (r.statistics, r.want_id),
+            Observation::Statistic,
+        ),
+        RECORD_SERIES => rows(
+            envelope,
+            "meridian.v1.RecordSeriesRequest",
+            "series",
+            |r: RecordSeriesRequest| (r.series, r.want_id),
+            Observation::Series,
+        ),
+        RECORD_DERIVED_SERIES => rows(
+            envelope,
+            "meridian.v1.RecordDerivedSeriesRequest",
+            "values",
+            |r: v1::RecordDerivedSeriesRequest| (r.values, String::new()),
+            |row| Observation::Derived(Box::new(row)),
+        ),
+        RECORD_SCENARIOS => rows(
+            envelope,
+            "meridian.v1.RecordScenariosRequest",
+            "scenarios",
+            |r: v1::RecordScenariosRequest| (r.scenarios, String::new()),
+            Observation::Scenario,
+        ),
+        RECORD_CORPORATE_ACTIONS => rows(
+            envelope,
+            "meridian.v1.RecordCorporateActionsRequest",
+            "actions",
+            |r: RecordCorporateActionsRequest| (r.actions, r.want_id),
+            |row| Observation::CorporateAction(Box::new(row)),
+        ),
+        RECORD_FILINGS => rows(
+            envelope,
+            "meridian.v1.RecordFilingsRequest",
+            "filings",
+            |r: v1::RecordFilingsRequest| (r.filings, r.want_id),
+            Observation::Filing,
+        ),
+        RECORD_REPORTED_FACTS => rows(
+            envelope,
+            "meridian.v1.RecordReportedFactsRequest",
+            "facts",
+            |r: v1::RecordReportedFactsRequest| (r.facts, r.want_id),
+            |row| Observation::ReportedFact(Box::new(row)),
+        ),
+        RECORD_RATING_ACTIONS => rows(
+            envelope,
+            "meridian.v1.RecordRatingActionsRequest",
+            "actions",
+            |r: v1::RecordRatingActionsRequest| (r.actions, r.want_id),
+            Observation::RatingAction,
+        ),
+        RECORD_HOLDINGS_REPORTS => rows(
+            envelope,
+            "meridian.v1.RecordHoldingsReportsRequest",
+            "reports",
+            |r: v1::RecordHoldingsReportsRequest| (r.reports, r.want_id),
+            Observation::HoldingsReport,
+        ),
+        RECORD_HOLDINGS => rows(
+            envelope,
+            "meridian.v1.RecordHoldingsRequest",
+            "holdings",
+            |r: v1::RecordHoldingsRequest| (r.holdings, r.want_id),
+            |row| Observation::Holding(Box::new(row)),
+        ),
+        RECORD_FACTORS => rows(
+            envelope,
+            "meridian.v1.RecordFactorsRequest",
+            "factors",
+            |r: v1::RecordFactorsRequest| (r.factors, r.want_id),
+            |row| Observation::Factor(Box::new(row)),
+        ),
+        other => Err(format!(
+            "{other} is no write the lake takes from its write-ahead stream"
+        )),
+    }
+}
+
+/// A ListDatasetGaps page's rows by default, and at most (W10.14).
+const GAPS_PAGE: usize = 100;
+const GAPS_MOST: usize = 500;
+
+/// Each gap in its latest state, from every state recorded in order.
+fn latest_gaps(
+    every: Vec<meridian_domain::v1::DatasetGap>,
+) -> Vec<meridian_domain::v1::DatasetGap> {
+    let mut latest: BTreeMap<String, meridian_domain::v1::DatasetGap> = BTreeMap::new();
+    for gap in every {
+        latest.insert(gap.gap_id.clone(), gap);
+    }
+    latest.into_values().collect()
+}
+
+/// A gap's ID: `GAP-` and a ULID at the lake's time (W10.14), its
+/// randomness a v4 UUID's.
+fn gap_id(now_ns: i64) -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let ms = (now_ns.max(0) / 1_000_000) as u128;
+    let random = uuid::Uuid::new_v4().as_u128() & ((1u128 << 80) - 1);
+    let value = (ms << 80) | random;
+    let ulid: String = (0..26)
+        .rev()
+        .map(|i| CROCKFORD[((value >> (i * 5)) & 31) as usize] as char)
+        .collect();
+    format!("GAP-{ulid}")
+}
+
+/// The gap recorded the moment the write-ahead stream is found to have
+/// skipped `run` (approved 2026-11-11; the resilience spec's section 4): its
+/// datasets not yet known (`dataset` empty), over the stream's times either
+/// side of the run, unrecovered -- nothing can be asked again of no dataset --
+/// so it is shown at once, and stays shown for a dataset that never writes
+/// again. Each dataset's own gap names it as that dataset's next write
+/// arrives.
+fn unattributed_gap(run: &crate::store::Dropped, now: i64) -> meridian_domain::v1::DatasetGap {
+    use meridian_domain::v1::{GapCause, GapState};
+    let valid_until_ns = if run.until_at_ns > 0 {
+        run.until_at_ns
+    } else {
+        now
+    };
+    let valid_from_ns = if run.after_at_ns > 0 {
+        run.after_at_ns.min(valid_until_ns)
+    } else {
+        valid_until_ns
+    };
+    meridian_domain::v1::DatasetGap {
+        gap_id: run.gap_id.clone(),
+        dataset: String::new(),
+        subjects: Vec::new(),
+        valid_from_ns,
+        valid_until_ns,
+        cause: GapCause::WriteAheadBound as i32,
+        state: GapState::Unrecovered as i32,
+        recorded_at_ns: now,
+        found_in_gap_id: String::new(),
+    }
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -537,13 +763,26 @@ impl Lake {
             .flatten()
             .map(|event| DataConfig::from_event(&event))
             .unwrap_or_default();
+        let reads_only = bus.reads_only();
+        // The switches recorded so far (W10.6): what a writer taking over
+        // holds as passed over, so it records none of them again.
+        let mut switches = crate::switches::Switches::default();
+        if !reads_only {
+            match store.source_switches() {
+                Ok(recorded) => switches.replay(&recorded),
+                Err(failed) => {
+                    tracing::warn!(%failed, "the source switches recorded could not be read; held as none")
+                }
+            }
+        }
         Arc::new(Lake {
             bus,
+            reads_only,
             clock,
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
             waiting: Mutex::new(BTreeMap::new()),
-            declined: Mutex::new(BTreeMap::new()),
+            declined: Mutex::new(Arc::new(BTreeMap::new())),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
             unsettled: Mutex::new(BTreeMap::new()),
@@ -560,7 +799,141 @@ impl Lake {
                     .read_changes(meridian_changes::CONTROL, i64::MAX as u64, 1)
                     .map_or(0, |at| at.head),
             ),
+            read_handlers: RwLock::new(BTreeMap::new()),
+            refetching: Mutex::new(BTreeMap::new()),
+            switches: Mutex::new(switches),
             store,
+        })
+    }
+
+    /// Each dataset's latest sign of life, its liveness over every venue
+    /// (W10.4; ruling 418), by which a default read's stalled source is
+    /// judged (the resilience spec's section 8).
+    fn alive(&self) -> BTreeMap<String, i64> {
+        let mut alive: BTreeMap<String, i64> = BTreeMap::new();
+        for ((dataset, _), liveness) in self.liveness.lock().expect("liveness poisoned").iter() {
+            let at = alive.entry(dataset.clone()).or_insert(liveness.alive_at_ns);
+            *at = (*at).max(liveness.alive_at_ns);
+        }
+        alive
+    }
+
+    /// A default read's switches (W10.6; the resilience spec's section 8):
+    /// each source it passed over that was not already, and each it served
+    /// from again, recorded in the `control` partition and published. The
+    /// writer's alone; a record that did not commit is made again by the
+    /// next such read.
+    fn note_switches(&self, data_type: DataType, switching: &[read::Switching]) {
+        if self.reads_only || switching.is_empty() {
+            return;
+        }
+        let mut held = self.switches.lock().expect("switches poisoned");
+        let made = held.observe(data_type, switching, self.clock.now_ns());
+        if held.over_bound() {
+            tracing::warn!(
+                most = crate::switches::HELD_MOST,
+                "the lake holds as many passed-over sources as it may: a switch is recorded, and its switch back is not"
+            );
+        }
+        if made.is_empty() {
+            return;
+        }
+        match self.store.record_switches(&made) {
+            Ok(()) => {
+                drop(held);
+                for switch in &made {
+                    tracing::warn!(
+                        data_type = switch.data_type,
+                        from = switch.from_dataset,
+                        to = switch.to_dataset,
+                        reason = switch.reason,
+                        subjects = switch.subjects.len(),
+                        "a default read's source switched"
+                    );
+                }
+                self.publish_control();
+            }
+            Err(failed) => {
+                held.forget(&made);
+                tracing::warn!(%failed, "a source switch was not recorded; the next default read records it");
+            }
+        }
+    }
+
+    /// W10.6 (contract v30; the resilience spec's section 8): a deployment
+    /// admin reads the switches of the default reads' sources, and the
+    /// switches back, newest first, by data type and dataset, a page at a
+    /// time. Changes nothing.
+    /// The deployment's source priorities (W10.2): every one, whole, to
+    /// the dashboard; from contract v30 to the eight roles that read the
+    /// lake too (ruling 454; step 3c's question 7), each answered with the
+    /// datasets the asker is entitled to read, one it may not left out of
+    /// each priority's list and a priority with none left not answered.
+    pub(crate) fn list_priorities(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<ListSourcePrioritiesReply, String> {
+        let priorities = self
+            .store
+            .priorities()
+            .map_err(|failed| failed.to_string())?;
+        let reader = reader_of(envelope);
+        if reader == Reader::Core {
+            return Ok(ListSourcePrioritiesReply { priorities });
+        }
+        let config = self.config();
+        Ok(ListSourcePrioritiesReply {
+            priorities: priorities
+                .into_iter()
+                .filter_map(|mut priority| {
+                    priority
+                        .datasets
+                        .retain(|dataset| config.fields_for(dataset, &reader).is_some());
+                    (!priority.datasets.is_empty()).then_some(priority)
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn list_source_switches(
+        &self,
+        request: meridian_domain::v1::ListSourceSwitchesRequest,
+    ) -> Result<meridian_domain::v1::ListSourceSwitchesReply, String> {
+        let mut switches: Vec<meridian_domain::v1::SourceSwitched> = self
+            .store
+            .source_switches()
+            .map_err(|failed| failed.to_string())?
+            .into_iter()
+            .filter(|s| request.data_type.is_empty() || s.data_type == request.data_type)
+            .filter(|s| {
+                request.dataset.is_empty()
+                    || s.from_dataset == request.dataset
+                    || s.to_dataset == request.dataset
+            })
+            .collect();
+        // Newest first: the records are in the order recorded.
+        switches.reverse();
+        let page = match request.page_size {
+            0 => GAPS_PAGE,
+            asked => (asked as usize).min(GAPS_MOST),
+        };
+        let skip: usize = if request.cursor.is_empty() {
+            0
+        } else {
+            request
+                .cursor
+                .parse()
+                .map_err(|_| format!("cursor {:?} is no cursor this read gave", request.cursor))?
+        };
+        let next = skip + page;
+        let next_cursor = if next < switches.len() {
+            next.to_string()
+        } else {
+            String::new()
+        };
+        Ok(meridian_domain::v1::ListSourceSwitchesReply {
+            switches: switches.into_iter().skip(skip).take(page).collect(),
+            next_cursor,
         })
     }
 
@@ -1116,28 +1489,38 @@ impl Lake {
         let config = self.config();
         let mut scenarios = Vec::new();
         for dataset in config.readable(&reader, DataType::Scenario) {
-            let rows = if request.version == 0 {
-                self.store.read_dataset(&dataset, DataType::Scenario, 0, 0)
-            } else {
-                self.store
-                    .read_dataset_versions(&dataset, DataType::Scenario)
-            }
-            .map_err(|failed| failed.to_string())?;
-            // A saved scenario whose effective state is invalid is left out,
+            // Each row as it is read, kept only where the read asks for it
+            // (stage M; the store memory audit of 2026-11-09, item 6). A
+            // saved scenario whose effective state is invalid is left out,
             // as every default read leaves one out (W10.6; ruling 421).
-            for row in rows.into_iter().filter(|row| !crate::store::invalid(row)) {
+            let mut keep = |row: Observation| {
+                if crate::store::invalid(&row) {
+                    return;
+                }
                 let Observation::Scenario(saved) = row else {
-                    continue;
+                    return;
                 };
                 let meta = saved.meta.clone().unwrap_or_default();
                 if !request.row_keys.is_empty() && !request.row_keys.contains(&meta.row_key) {
-                    continue;
+                    return;
                 }
                 if request.version != 0 && meta.version != request.version {
-                    continue;
+                    return;
                 }
                 scenarios.push(saved);
+            };
+            if request.version == 0 {
+                self.store
+                    .read_dataset_each(&dataset, DataType::Scenario, 0, &mut |row| {
+                        keep(row);
+                        Ok(())
+                    })
+            } else {
+                self.store
+                    .read_dataset_versions(&dataset, DataType::Scenario)
+                    .map(|rows| rows.into_iter().for_each(&mut keep))
             }
+            .map_err(|failed| failed.to_string())?;
         }
         Ok(meridian_domain::v1::ListScenariosReply { scenarios })
     }
@@ -1494,6 +1877,24 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
+        let by_dataset = self.prepared(field, rows, envelope)?;
+        let now = self.clock.now_ns();
+        let mut said = Said::default();
+        for (dataset, rows) in by_dataset {
+            let done = self.write_one(&dataset, rows, want_id, now)?;
+            self.published(&dataset, &done, &mut said);
+        }
+        self.answered(said, want_id, envelope, now)
+    }
+
+    /// A batch's bound and every row checked, as [`Lake::checked`] checks
+    /// them, by dataset, each row on a closed day flagged: what is written.
+    fn prepared(
+        &self,
+        field: &str,
+        rows: Vec<Observation>,
+        envelope: &Envelope,
+    ) -> Result<BTreeMap<String, Vec<Observation>>, String> {
         let bound = match field {
             "prices" => bounds::RECORD_PRICES_REQUEST_PRICES_COUNT,
             "trades" => bounds::RECORD_TRADES_REQUEST_TRADES_COUNT,
@@ -1528,71 +1929,101 @@ impl Lake {
                 bound.most
             ));
         }
-        let by_dataset = self.checked(field, rows, envelope)?;
+        let mut by_dataset = self.checked(field, rows, envelope)?;
+        for (dataset, rows) in by_dataset.iter_mut() {
+            self.flag_closed_days(dataset, rows);
+        }
+        Ok(by_dataset)
+    }
+
+    /// One dataset's rows of a batch written: kept, with its change log's
+    /// page published; or, where its licence keeps none of it, served to
+    /// the reads waiting on the want it answers (W10.7; ruling 734).
+    fn write_one(
+        &self,
+        dataset: &str,
+        rows: Vec<Observation>,
+        want_id: &str,
+        now: i64,
+    ) -> Result<crate::store::Recorded, String> {
         let config = self.config();
-        let now = self.clock.now_ns();
-        let mut reply = RecordObservationsReply::default();
-        let mut datasets = BTreeSet::new();
-        let mut subjects = Vec::new();
-        for (dataset, mut rows) in by_dataset {
-            datasets.insert(dataset.clone());
-            self.flag_closed_days(&dataset, &mut rows);
-            let done = if config.licence(&dataset).kept {
-                let done = self.store.record(&dataset, rows, now);
-                if let Ok(done) = &done {
-                    self.publish_changes(&dataset, done, None, now);
-                }
-                done
-            } else {
-                let readers: Vec<String> = self
-                    .wants
-                    .lock()
-                    .expect("wants poisoned")
-                    .open
-                    .get(want_id)
-                    .map(|w| w.asked_by.iter().cloned().collect())
-                    .unwrap_or_else(|| config.entitled(&dataset));
-                let served = self.store.serve_unkept(&dataset, rows, &readers, now);
-                // The reads waiting on the want hear what was served
-                // (W10.7; ruling 734): the lake keeps none of it.
-                if let Ok(done) = &served {
-                    self.publish_changes(&dataset, done, Some(&readers), now);
-                    self.hand_to_waiting(want_id, Heard::Served(done.rows.clone()));
-                }
-                served
-            }
+        if config.licence(dataset).kept {
+            let done = self
+                .store
+                .record(dataset, rows, now)
+                .map_err(|failed| failed.to_string())?;
+            self.publish_changes(dataset, &done, None, now);
+            return Ok(done);
+        }
+        let readers: Vec<String> = self
+            .wants
+            .lock()
+            .expect("wants poisoned")
+            .open
+            .get(want_id)
+            .map(|w| w.asked_by.iter().cloned().collect())
+            .unwrap_or_else(|| config.entitled(dataset));
+        let served = self
+            .store
+            .serve_unkept(dataset, rows, &readers, now)
             .map_err(|failed| failed.to_string())?;
-            reply.recorded += done.recorded;
-            reply.restated += done.restated;
-            reply.unchanged += done.unchanged;
-            // Each real-time row's age at the `lake` hop, on commit (W4.16;
-            // the latency spec's "The hops"; ruling 606): sent to the
-            // monitor with the component's next report.
-            let committed = self.clock.now_ns();
-            let superseded = superseded_in_batch(&done.rows);
-            for (at, row) in done.rows.iter().enumerate() {
-                subjects.extend(row.subjects());
-                if !superseded.contains(&at) {
-                    self.publish(&dataset, row);
-                }
-                if row.data_type().real_time() {
-                    meridian_domain::latency::recorder().record(
-                        &dataset,
-                        meridian_domain::v1::AgeHop::Lake,
-                        committed - meridian_domain::latency::source_ns(row.meta()),
-                    );
-                }
+        // The reads waiting on the want hear what was served (W10.7; ruling
+        // 734): the lake keeps none of it.
+        self.publish_changes(dataset, &served, Some(&readers), now);
+        self.hand_to_waiting(want_id, Heard::Served(served.rows.clone()));
+        Ok(served)
+    }
+
+    /// One dataset's part of a batch, once it committed: each row recorded
+    /// published, and its age at the lake's hop measured; counted in `said`.
+    fn published(&self, dataset: &str, done: &crate::store::Recorded, said: &mut Said) {
+        said.reply.recorded += done.recorded;
+        said.reply.restated += done.restated;
+        said.reply.unchanged += done.unchanged;
+        // Each real-time row's age at the `lake` hop, on commit (W4.16; the
+        // latency spec's "The hops"; ruling 606): sent to the monitor with
+        // the component's next report.
+        let committed = self.clock.now_ns();
+        let superseded = superseded_in_batch(&done.rows);
+        for (at, row) in done.rows.iter().enumerate() {
+            said.subjects.extend(row.subjects());
+            if !superseded.contains(&at) {
+                self.publish(dataset, row);
             }
-            let trades = done
-                .rows
-                .iter()
-                .filter(|row| row.data_type() == DataType::Trade)
-                .count() as u64;
-            if trades > 0 {
-                self.trades_recorded
-                    .fetch_add(trades, std::sync::atomic::Ordering::Relaxed);
+            if row.data_type().real_time() {
+                meridian_domain::latency::recorder().record(
+                    dataset,
+                    meridian_domain::v1::AgeHop::Lake,
+                    committed - meridian_domain::latency::source_ns(row.meta()),
+                );
             }
         }
+        let trades = done
+            .rows
+            .iter()
+            .filter(|row| row.data_type() == DataType::Trade)
+            .count() as u64;
+        if trades > 0 {
+            self.trades_recorded
+                .fetch_add(trades, std::sync::atomic::Ordering::Relaxed);
+        }
+        said.datasets.insert(dataset.to_string());
+    }
+
+    /// A batch answered once every part is published: its watermark, the
+    /// want it answers settled, and the reply.
+    fn answered(
+        &self,
+        said: Said,
+        want_id: &str,
+        envelope: &Envelope,
+        now: i64,
+    ) -> Result<RecordObservationsReply, String> {
+        let Said {
+            mut reply,
+            datasets,
+            subjects,
+        } = said;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         reply.watermark = Some(watermark(&heads, &datasets));
         // What the `lake_record_to_delivery_ms` band reads: from the batch
@@ -1617,6 +2048,484 @@ impl Lake {
             );
         }
         Ok(reply)
+    }
+
+    /// The lake's position in its write-ahead stream `stream` (the `ha`
+    /// profile): where its writer goes on from.
+    pub fn write_ahead_position(
+        &self,
+        stream: &str,
+    ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
+        self.store.write_ahead_position(stream)
+    }
+
+    /// What the lake found its write-ahead stream `stream` dropped, and each
+    /// dataset's latest valid time recorded from it (W10.14).
+    pub fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(Vec<crate::store::Dropped>, BTreeMap<String, i64>), crate::store::StoreError> {
+        self.store.write_ahead_found(stream)
+    }
+
+    /// Writes taken from the write-ahead stream, in its order, recorded as
+    /// one with the stream's position (the `ha` profile; the resilience
+    /// spec's section 4): each write checked as [`Lake::record`] checks it,
+    /// the rows the lake keeps of every write recorded in one transaction
+    /// with `batch`'s position, the runs it found the stream dropped, each
+    /// dataset's latest valid time and each gap found; and only then each
+    /// write's rows published, its want settled and its answer made -- what
+    /// [`Lake::record`] would have answered it, or its refusal. Rows of a
+    /// dataset served, not kept, are served once the batch commits.
+    ///
+    /// A write that follows a run the stream dropped (`after_gap`) is the
+    /// first of its dataset after a gap (W10.14): the gap is recorded from
+    /// the dataset's latest valid time before it to the write's earliest,
+    /// over the write's subjects, and asked again where the dataset declares
+    /// `backfill` or marked unrecovered where it does not.
+    ///
+    /// Refused whole, nothing answered, where the store refuses the batch:
+    /// [`crate::store::StoreError::PositionMoved`] where the position it
+    /// holds is not `batch.after`, so the writer goes back to it.
+    pub fn record_written(
+        &self,
+        writes: Vec<crate::write_ahead::Written>,
+        mut batch: crate::store::WriteAheadBatch,
+        valid_before: &BTreeMap<String, i64>,
+    ) -> Result<crate::write_ahead::Recorded, crate::store::StoreError> {
+        struct Kept {
+            want_id: String,
+            envelope: Envelope,
+            kept: Vec<(String, usize)>,
+            unkept: Vec<(String, Vec<Observation>)>,
+        }
+        let now = self.clock.now_ns();
+        let config = self.config();
+        // Each run the stream skipped that this batch found: a gap recorded
+        // with it, its datasets not yet known (approved 2026-11-11), so the
+        // admin hears of it at once, whether or not a dataset writes again.
+        let unattributed: Vec<meridian_domain::v1::DatasetGap> = batch
+            .dropped
+            .iter()
+            .map(|run| unattributed_gap(run, now))
+            .collect();
+        batch.gaps.extend(unattributed);
+        let mut valid: BTreeMap<String, i64> = BTreeMap::new();
+        let mut written: Vec<Result<Kept, String>> = Vec::with_capacity(writes.len());
+        for write in writes {
+            let prepared =
+                rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
+                    Ok((self.prepared(field, rows, &write.envelope)?, want))
+                });
+            let (by_dataset, want_id) = match prepared {
+                Ok(prepared) => prepared,
+                Err(refused) => {
+                    if write.after_gap.is_some() {
+                        tracing::warn!(
+                            refused,
+                            "a write after a gap in the write-ahead stream was refused: its \
+                             dataset's gap is found by its next write"
+                        );
+                    }
+                    written.push(Err(refused));
+                    continue;
+                }
+            };
+            let mut kept = Kept {
+                want_id,
+                envelope: write.envelope,
+                kept: Vec::new(),
+                unkept: Vec::new(),
+            };
+            for (dataset, rows) in by_dataset {
+                if let Some(dropped) = write.after_gap.as_ref() {
+                    batch.gaps.push(
+                        self.gap_found(
+                            &dataset,
+                            &rows,
+                            valid_before
+                                .get(&dataset)
+                                .copied()
+                                .unwrap_or(dropped.after_at_ns),
+                            dropped.until_at_ns,
+                            &dropped.gap_id,
+                            now,
+                        ),
+                    );
+                }
+                if config.licence(&dataset).kept {
+                    let latest = rows.iter().map(|row| row.meta().valid_from_ns).max();
+                    if let Some(latest) = latest {
+                        let at = valid.entry(dataset.clone()).or_insert(latest);
+                        *at = (*at).max(latest);
+                    }
+                    kept.kept.push((dataset.clone(), batch.parts.len()));
+                    batch.parts.push((dataset, rows));
+                } else {
+                    kept.unkept.push((dataset, rows));
+                }
+            }
+            written.push(Ok(kept));
+        }
+        batch.valid = valid.into_iter().collect();
+        let gaps = batch.gaps.clone();
+        let valid = batch.valid.clone();
+        let mut done: Vec<Option<crate::store::Recorded>> = self
+            .store
+            .record_write_ahead(batch, now)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        let answers = written
+            .into_iter()
+            .map(|write| {
+                let write = write?;
+                let mut said = Said::default();
+                // In the datasets' order, as a batch asked of the lake is
+                // written: what it keeps, then what it serves.
+                for (dataset, part) in &write.kept {
+                    let recorded = done[*part].take().unwrap_or_default();
+                    self.publish_changes(dataset, &recorded, None, now);
+                    self.published(dataset, &recorded, &mut said);
+                }
+                for (dataset, rows) in write.unkept {
+                    let served = self.write_one(&dataset, rows, &write.want_id, now)?;
+                    self.published(&dataset, &served, &mut said);
+                }
+                let reply = self.answered(said, &write.want_id, &write.envelope, now)?;
+                Ok((
+                    "meridian.v1.RecordObservationsReply".to_string(),
+                    reply.encode_to_vec(),
+                ))
+            })
+            .collect();
+        // Each gap found, recorded with the batch: asked again of its data
+        // plugin, or said unrecovered (W10.14).
+        for gap in gaps {
+            self.gap_recorded(gap);
+        }
+        Ok(crate::write_ahead::Recorded { answers, valid })
+    }
+
+    /// A new gap's ID, at the lake's time.
+    pub fn new_gap_id(&self) -> String {
+        gap_id(self.clock.now_ns())
+    }
+
+    /// A gap found in `dataset` before the write whose rows are `rows`
+    /// (W10.14): from `valid_from_ns`, the dataset's latest valid time the
+    /// lake recorded before it, to the write's earliest, over the write's
+    /// subjects; refetching where the dataset declares `backfill`,
+    /// unrecovered where it declares anything else or nothing (the cautious
+    /// reading). `found_in` names the unattributed gap recorded when the
+    /// stream skipped the run it follows (approved 2026-11-11).
+    #[allow(clippy::too_many_arguments)]
+    fn gap_found(
+        &self,
+        dataset: &str,
+        rows: &[Observation],
+        valid_from_ns: i64,
+        until_at_ns: i64,
+        found_in: &str,
+        now: i64,
+    ) -> meridian_domain::v1::DatasetGap {
+        use meridian_domain::v1::{GapCause, GapState};
+        let mut subjects: Vec<String> = rows
+            .iter()
+            .flat_map(|row| row.subjects())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        subjects.truncate(500);
+        let valid_until_ns = rows
+            .iter()
+            .map(|row| row.meta().valid_from_ns)
+            .filter(|at| *at > 0)
+            .min()
+            .unwrap_or(until_at_ns);
+        let backfill = self.config().declaration(dataset).is_some_and(|declared| {
+            declared.gap_recovery == meridian_pb::v1::GapRecovery::Backfill as i32
+        });
+        meridian_domain::v1::DatasetGap {
+            gap_id: gap_id(now),
+            dataset: dataset.to_string(),
+            subjects,
+            valid_from_ns: valid_from_ns.min(valid_until_ns),
+            valid_until_ns,
+            cause: GapCause::WriteAheadBound as i32,
+            state: if backfill {
+                GapState::Refetching
+            } else {
+                GapState::Unrecovered
+            } as i32,
+            recorded_at_ns: now,
+            found_in_gap_id: found_in.to_string(),
+        }
+    }
+
+    /// A gap recorded (W10.14): asked again of its data plugin through the
+    /// want, naming the gap, once for each data type its dataset declares;
+    /// or, unrecovered, said, where its rows are never invented.
+    fn gap_recorded(&self, gap: meridian_domain::v1::DatasetGap) {
+        use meridian_domain::v1::GapState;
+        if gap.dataset.is_empty() {
+            tracing::warn!(
+                gap_id = gap.gap_id,
+                valid_from_ns = gap.valid_from_ns,
+                valid_until_ns = gap.valid_until_ns,
+                "a gap in the write-ahead stream: rows it dropped before the lake committed \
+                 them, their datasets not yet known; recorded and unrecovered, each dataset's \
+                 own gap named as it writes next"
+            );
+            return;
+        }
+        if gap.state != GapState::Refetching as i32 {
+            tracing::warn!(
+                gap_id = gap.gap_id,
+                dataset = gap.dataset,
+                valid_from_ns = gap.valid_from_ns,
+                valid_until_ns = gap.valid_until_ns,
+                "a gap in a dataset: rows the write-ahead stream dropped, which its dataset \
+                 cannot be asked for again; recorded and unrecovered"
+            );
+            return;
+        }
+        let now = self.clock.now_ns();
+        let data_types: Vec<String> = self
+            .config()
+            .declaration(&gap.dataset)
+            .map(|declared| declared.data_types.clone())
+            .unwrap_or_default();
+        let mut wants = BTreeSet::new();
+        for data_type in data_types {
+            let want_id = uuid::Uuid::new_v4().to_string();
+            let event = ObservationsWantedEvent {
+                want_id: want_id.clone(),
+                dataset: gap.dataset.clone(),
+                data_type,
+                subjects: gap
+                    .subjects
+                    .iter()
+                    .map(|subject| SubjectRef {
+                        entity_id: subject.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                valid_from_ns: gap.valid_from_ns,
+                valid_until_ns: gap.valid_until_ns,
+                gap_id: gap.gap_id.clone(),
+                ..Default::default()
+            };
+            self.wants.lock().expect("wants poisoned").open.insert(
+                want_id.clone(),
+                OpenWant {
+                    event: event.clone(),
+                    asked_by: ["lake".to_string()].into(),
+                    asked_at_ns: now,
+                    published_at_ns: now,
+                    cadence_ns: 0,
+                    settled: BTreeSet::new(),
+                    renewed_at_ns: 0,
+                },
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a gap's want was not published");
+            }
+            let change = WantChange {
+                want_id: want_id.clone(),
+                dataset: event.dataset.clone(),
+                kind: WantChangeKind::Asked,
+                subjects: gap.subjects.clone(),
+                reason: 0,
+                by: vec!["lake".into()],
+                at_ns: now,
+                want: Some(event),
+            };
+            if let Err(failed) = self.store.record_want(&change) {
+                tracing::warn!(%failed, "a gap's want was not recorded");
+            }
+            wants.insert(want_id);
+        }
+        if wants.is_empty() {
+            // Nothing its dataset declares to ask for: unrecovered.
+            self.gap_moved(gap, GapState::Unrecovered, now);
+            return;
+        }
+        tracing::info!(
+            gap_id = gap.gap_id,
+            dataset = gap.dataset,
+            wants = wants.len(),
+            "a gap in a dataset asked again of its data plugin"
+        );
+        self.refetching.lock().expect("refetching poisoned").insert(
+            gap.gap_id.clone(),
+            Refetching {
+                gap,
+                wants,
+                asked_at_ns: now,
+            },
+        );
+    }
+
+    /// A gap's next state, its own record (W10.14; decisions/031).
+    fn gap_moved(
+        &self,
+        mut gap: meridian_domain::v1::DatasetGap,
+        state: meridian_domain::v1::GapState,
+        now: i64,
+    ) {
+        gap.state = state as i32;
+        gap.recorded_at_ns = now;
+        match self.store.record_gap(&gap) {
+            Ok(()) => tracing::info!(
+                gap_id = gap.gap_id,
+                dataset = gap.dataset,
+                state = state.as_str_name(),
+                "a dataset's gap moved"
+            ),
+            Err(failed) => {
+                tracing::warn!(%failed, gap_id = gap.gap_id, "a gap's state was not recorded")
+            }
+        }
+    }
+
+    /// A want of a gap settled (W10.14): its gap recovered once every want
+    /// asked for it is answered whole; unrecovered at a decline.
+    fn gap_want_settled(&self, gap_id: &str, want_id: &str, declined: bool, closed: bool) {
+        use meridian_domain::v1::GapState;
+        let now = self.clock.now_ns();
+        let moved = {
+            let mut refetching = self.refetching.lock().expect("refetching poisoned");
+            let Some(held) = refetching.get_mut(gap_id) else {
+                return;
+            };
+            if declined {
+                refetching
+                    .remove(gap_id)
+                    .map(|held| (held, GapState::Unrecovered))
+            } else if closed {
+                held.wants.remove(want_id);
+                if held.wants.is_empty() {
+                    refetching
+                        .remove(gap_id)
+                        .map(|held| (held, GapState::Recovered))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((held, state)) = moved {
+            if state == GapState::Unrecovered {
+                self.forget_wants(&held.wants);
+            }
+            self.gap_moved(held.gap, state, now);
+        }
+    }
+
+    /// Gaps asked again past [`GAP_REFETCH_NS`] with no answer: unrecovered,
+    /// their wants withdrawn (W10.14).
+    fn sweep_gaps(&self, now: i64) {
+        use meridian_domain::v1::GapState;
+        let lapsed: Vec<Refetching> = {
+            let mut refetching = self.refetching.lock().expect("refetching poisoned");
+            let ids: Vec<String> = refetching
+                .iter()
+                .filter(|(_, held)| now - held.asked_at_ns > GAP_REFETCH_NS)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| refetching.remove(id)).collect()
+        };
+        for held in lapsed {
+            self.forget_wants(&held.wants);
+            self.gap_moved(held.gap, GapState::Unrecovered, now);
+        }
+    }
+
+    /// A gap's wants no longer asked: closed, and withdrawn from their data
+    /// plugin.
+    fn forget_wants(&self, ids: &BTreeSet<String>) {
+        let closed: Vec<OpenWant> = {
+            let mut wants = self.wants.lock().expect("wants poisoned");
+            ids.iter().filter_map(|id| wants.open.remove(id)).collect()
+        };
+        for open in closed {
+            let event = WantWithdrawnEvent {
+                want_id: open.event.want_id.clone(),
+                dataset: open.event.dataset.clone(),
+            };
+            if let Err(failed) = self.bus.publish(
+                WANT_WITHDRAWN,
+                "meridian.v1.WantWithdrawnEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a gap's want's withdrawal was not published");
+            }
+        }
+    }
+
+    /// The gaps still refetching when a writer starts (W10.14): their wants
+    /// were the last writer's, held in its memory, so each is asked again.
+    pub fn resume_gaps(&self) -> Result<usize, crate::store::StoreError> {
+        use meridian_domain::v1::GapState;
+        let open: Vec<meridian_domain::v1::DatasetGap> = latest_gaps(self.store.dataset_gaps()?)
+            .into_iter()
+            .filter(|gap| gap.state == GapState::Refetching as i32)
+            .collect();
+        let count = open.len();
+        for gap in open {
+            self.gap_recorded(gap);
+        }
+        Ok(count)
+    }
+
+    /// W10.14 (contract v30): a deployment admin reads the gaps, each in its
+    /// latest state, newest first, by dataset and state, a page at a time.
+    pub(crate) fn list_dataset_gaps(
+        &self,
+        request: meridian_domain::v1::ListDatasetGapsRequest,
+    ) -> Result<meridian_domain::v1::ListDatasetGapsReply, String> {
+        let mut gaps: Vec<meridian_domain::v1::DatasetGap> = latest_gaps(
+            self.store
+                .dataset_gaps()
+                .map_err(|failed| failed.to_string())?,
+        )
+        .into_iter()
+        .filter(|gap| request.dataset.is_empty() || gap.dataset == request.dataset)
+        .filter(|gap| request.state == 0 || gap.state == request.state)
+        .collect();
+        gaps.sort_by(|a, b| (b.recorded_at_ns, &b.gap_id).cmp(&(a.recorded_at_ns, &a.gap_id)));
+        let page = match request.page_size {
+            0 => GAPS_PAGE,
+            asked => (asked as usize).min(GAPS_MOST),
+        };
+        let skip: usize = if request.cursor.is_empty() {
+            0
+        } else {
+            request
+                .cursor
+                .parse()
+                .map_err(|_| format!("cursor {:?} is no cursor this read gave", request.cursor))?
+        };
+        let next = skip + page;
+        let next_cursor = if next < gaps.len() {
+            next.to_string()
+        } else {
+            String::new()
+        };
+        Ok(meridian_domain::v1::ListDatasetGapsReply {
+            gaps: gaps.into_iter().skip(skip).take(page).collect(),
+            next_cursor,
+        })
     }
 
     /// W10.11 (contract v27; ruling 481): execution costs, the analytics
@@ -1769,39 +2678,41 @@ impl Lake {
                 .parse()
                 .map_err(|_| invalid("cursor", "not a cursor this lake wrote"))?
         };
-        let mut costs: Vec<ExecutionCost> = self
-            .store
-            .read_dataset(
+        // Each row as it is read, kept only where it answers the account and
+        // what the read narrows to (stage M; the store memory audit of
+        // 2026-11-09, item 6): never every account's costs held.
+        let mut costs: Vec<ExecutionCost> = Vec::new();
+        self.store
+            .read_dataset_each(
                 lake::EXECUTION_COST_DATASET,
                 DataType::ExecutionCost,
                 request.as_of_ns,
-                0,
+                &mut |row| {
+                    // Left out where invalid, as a default read leaves it (W10.6).
+                    if crate::store::invalid(&row) {
+                        return Ok(());
+                    }
+                    let Observation::ExecutionCost(cost) = row else {
+                        return Ok(());
+                    };
+                    let kept = cost.account_id == request.account_id
+                        && (request.execution_ids.is_empty()
+                            || request.execution_ids.contains(&cost.execution_id))
+                        && (request.order_id.is_empty() || cost.order_id == request.order_id)
+                        && (request.trade_date.is_empty()
+                            || cost
+                                .meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.business_date == request.trade_date))
+                        && (request.benchmarks.is_empty()
+                            || request.benchmarks.contains(&cost.benchmark));
+                    if kept {
+                        costs.push(*cost);
+                    }
+                    Ok(())
+                },
             )
-            .map_err(|failed| failed.to_string())?
-            .into_iter()
-            // Left out where invalid, as a default read leaves it (W10.6).
-            .filter(|row| !crate::store::invalid(row))
-            .filter_map(|row| match row {
-                Observation::ExecutionCost(cost) => Some(*cost),
-                _ => None,
-            })
-            .filter(|cost| cost.account_id == request.account_id)
-            .filter(|cost| {
-                request.execution_ids.is_empty()
-                    || request.execution_ids.contains(&cost.execution_id)
-            })
-            .filter(|cost| request.order_id.is_empty() || cost.order_id == request.order_id)
-            .filter(|cost| {
-                request.trade_date.is_empty()
-                    || cost
-                        .meta
-                        .as_ref()
-                        .is_some_and(|meta| meta.business_date == request.trade_date)
-            })
-            .filter(|cost| {
-                request.benchmarks.is_empty() || request.benchmarks.contains(&cost.benchmark)
-            })
-            .collect();
+            .map_err(|failed| failed.to_string())?;
         costs.sort_by(|a, b| (&a.execution_id, a.benchmark).cmp(&(&b.execution_id, b.benchmark)));
         let next = skip + page;
         let next_cursor = if next < costs.len() {
@@ -2178,6 +3089,7 @@ impl Lake {
             .cloned()
             .collect();
         open.settled.extend(mine.iter().cloned());
+        let kind_was = kind.clone();
         let change = WantChange {
             want_id: want_id.to_string(),
             dataset: open.event.dataset.clone(),
@@ -2189,6 +3101,7 @@ impl Lake {
             want: None,
         };
         let done = !open.event.standing && open.settled.len() >= open.event.subjects.len();
+        let gap_id = open.event.gap_id.clone();
         if done {
             wants.open.remove(want_id);
             wants.by_key.retain(|_, id| id != want_id);
@@ -2196,6 +3109,12 @@ impl Lake {
         drop(wants);
         if let Err(failed) = self.store.record_want(&change) {
             tracing::warn!(%failed, "a want's change was not recorded");
+        }
+        // A gap's want (W10.14): its gap recovered once its wants are
+        // answered whole, unrecovered at a decline.
+        if !gap_id.is_empty() {
+            let declined = matches!(kind_was, WantChangeKind::Declined);
+            self.gap_want_settled(&gap_id, want_id, declined, done);
         }
     }
 
@@ -2210,6 +3129,11 @@ impl Lake {
     /// read may still hear its want served: the want published by this
     /// read, or by another within [`SERVED_WAIT`] (ruling 734).
     fn want(&self, asks: Vec<read::Ask>, reader: &Reader) -> Vec<Waiting> {
+        // A want is the writer's act, asked and kept by it (decisions/031):
+        // a reader answers what the record holds and asks for nothing.
+        if self.reads_only {
+            return Vec::new();
+        }
         let mut waitings = Vec::new();
         let now = self.clock.now_ns();
         let config = self.config();
@@ -2281,6 +3205,9 @@ impl Lake {
                             expiration_to: window_to.clone(),
                             series_keys: ask.series_keys.clone(),
                             all_series: ask.all_series,
+                            // Contract v30's gap_id (W10.14): a gap's want,
+                            // asked by core's stage E (step 3c); none here.
+                            gap_id: String::new(),
                         };
                         wants.open.insert(
                             id.clone(),
@@ -2397,6 +3324,7 @@ impl Lake {
     /// (at least a minute), withdrawn (W10.7).
     pub fn sweep_wants(&self) {
         let now = self.clock.now_ns();
+        self.sweep_gaps(now);
         let mut withdrawn = Vec::new();
         let mut again = Vec::new();
         {
@@ -2720,6 +3648,11 @@ impl Lake {
                 0,
             ),
         };
+        // The lake's own, its caller having named none: a latest read, which
+        // a reader answers from its hot layer (contract v30, stage B).
+        if request.as_of_ns == 0 {
+            crate::reader::cut_off_its_own(as_of);
+        }
         let page = match request.page_size {
             0 => 100,
             n => n.min(500) as usize,
@@ -2757,7 +3690,7 @@ impl Lake {
             .store
             .priorities()
             .map_err(|failed| failed.to_string())?;
-        let declined = self.declined.lock().expect("declined poisoned").clone();
+        let declined = Arc::clone(&self.declined.lock().expect("declined poisoned"));
         let aliases = self.store.aliases().map_err(|failed| failed.to_string())?;
         let mut read = Read {
             reader: reader.clone(),
@@ -2798,12 +3731,18 @@ impl Lake {
             window: request.window,
             fields: request.fields.into_iter().collect(),
         };
+        // Never blind (the resilience spec's section 8): a default read of
+        // the latest now passes over a stalled source by its liveness, which
+        // the writer alone holds.
+        let alive = (!self.reads_only).then(|| self.alive());
         let against = Against {
             config: &config,
             priorities: &priorities,
             declined: &declined,
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
+            liveness: alive.as_ref(),
+            live: request.as_of_ns == 0 && request.cursor.is_empty(),
         };
         // A later page read from the answer its first page made, where it is
         // held, by its rows' places; otherwise the whole read is answered
@@ -2986,6 +3925,26 @@ impl Lake {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answered = read::choose(self.store.as_ref(), read, against)?;
         drop(building);
+        // A reader member's read that would ask a source -- a want, the
+        // writer's recorded act, and where a dataset is served, not kept, the
+        // rows served for it -- or whose answer would say what a source
+        // declined, which the writer alone holds: the writer's to answer
+        // (contract v30, stage B; approved 2026-11-10). A declined subject is
+        // one this member would ask for, holding no decline.
+        if self.reads_only && !answered.asks.is_empty() {
+            return Err(to_the_writer());
+        }
+        // A default read of the latest now whose source is past its stale
+        // ceiling, which only its liveness could say is alive: the writer
+        // holds the liveness, and so answers it (the resilience spec's
+        // section 8, never blind).
+        if self.reads_only && answered.stall_unknown {
+            return Err(to_the_writer());
+        }
+        // Its switches, recorded by the writer (W10.6).
+        let switching = std::mem::take(&mut answered.switching);
+        self.note_switches(read.data_type, &switching);
+        drop(switching);
         // A dataset served, not kept (W10.7; ruling 734): the read that
         // asked hears what is served within its wait; any other is told it
         // is not kept, never asked forever.
@@ -4000,7 +4959,9 @@ impl Lake {
             return Err("as_of_ns is never negative".into());
         }
         let as_of = if request.as_of_ns == 0 {
-            self.clock.now_ns()
+            let now = self.clock.now_ns();
+            crate::reader::cut_off_its_own(now);
+            now
         } else {
             request.as_of_ns
         };
@@ -4042,6 +5003,8 @@ impl Lake {
                 declined: &read::Declined::new(),
                 aliases: &aliases,
                 now_ns: self.clock.now_ns(),
+                liveness: None,
+                live: false,
             },
         )?;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -4063,6 +5026,11 @@ impl Lake {
     }
 
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
+        // Each dataset's liveness, which only the writer's commands set and
+        // only it holds: the writer's to answer (contract v30, stage B).
+        if self.reads_only {
+            return Err(to_the_writer());
+        }
         let reader = reader_of(envelope);
         let config = self.config();
         // The rows carrying a value as reported, and those flagged on a closed
@@ -4519,6 +5487,8 @@ impl Lake {
             declined: &declined,
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
+            liveness: None,
+            live: false,
         };
         let mut asks = Vec::new();
         for (i, want) in request.wants.iter().enumerate() {
@@ -4607,6 +5577,12 @@ impl Lake {
         Ok(RenewWantsReply {})
     }
 
+    /// How many declines it holds (stage M).
+    #[cfg(test)]
+    pub(crate) fn declines_held(&self) -> usize {
+        self.declined.lock().expect("declined poisoned").len()
+    }
+
     pub(crate) fn decline(
         &self,
         request: DeclineWantRequest,
@@ -4651,13 +5627,19 @@ impl Lake {
         {
             // For the date or range the want asked, or the latest, alone
             // (contract v19, approved 2026-10-10).
-            let mut declined = self.declined.lock().expect("declined poisoned");
+            let mut held = self.declined.lock().expect("declined poisoned");
+            let mut declined: read::Declined = held
+                .iter()
+                .filter(|(_, (_, at))| now - at < read::DECLINE_STANDS_NS)
+                .map(|(key, said)| (key.clone(), *said))
+                .collect();
             for subject in &subjects {
                 declined.insert(
                     (dataset.clone(), subject.clone(), asked.clone()),
                     (reason, now),
                 );
             }
+            *held = Arc::new(declined);
         }
         self.settle(
             &request.want_id,
@@ -4676,6 +5658,10 @@ impl Lake {
         *self.config.write().expect("config poisoned") = DataConfig::from_event(event);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A reader holds it; the writer keeps it.
+        if self.reads_only {
+            return;
+        }
         if let Err(failed) = self.store.keep_configuration(event) {
             tracing::warn!(%failed, "the data configuration was not kept");
         }
@@ -5470,19 +6456,29 @@ fn serve_on<Req, Rep, F>(
     F: Fn(&Lake, Req, &Envelope) -> Result<Rep, String> + Send + Sync + 'static,
 {
     let (request_type, reply_type) = types;
+    let registry = Arc::clone(lake);
     let lake = Arc::clone(lake);
     // A read's line (ruling 798): its topic and kind, the rows its whole
     // answer held and the rows its page carried, the bytes answered and its
     // time; never a row, a subject or who asked.
     let read = topic.contains(".query.");
-    bus.serve(topic, move |envelope| {
+    let handler: meridian_bus::Handler = Arc::new(move |envelope: Envelope| {
         let started = std::time::Instant::now();
         if read {
             READ_NOTED.with(|noted| noted.set(None));
             crate::hot::noted::begin();
+            crate::reader::begin();
+            HANDED_ON.with(|handed| handed.set(false));
         }
         let request: Req = decode(&envelope, request_type)?;
         let answered = handle(&lake, request, &envelope);
+        // A reader's read whose answer depends on the writer's own acts or
+        // memory (contract v30, stage B): handed on, unchanged, and answered
+        // with the writer's reply.
+        if read && HANDED_ON.with(|handed| handed.replace(false)) {
+            let _ = crate::hot::noted::take();
+            return lake.hand_to_writer(topic, envelope, started);
+        }
         if read {
             let noted = READ_NOTED.with(std::cell::Cell::take);
             let (kind, whole, page) = noted
@@ -5510,6 +6506,112 @@ fn serve_on<Req, Rep, F>(
         let reply = answered?;
         Ok((reply_type.to_string(), reply.encode_to_vec()))
     });
+    if read {
+        registry
+            .read_handlers
+            .write()
+            .expect("read handlers poisoned")
+            .insert(topic, Arc::clone(&handler));
+    }
+    bus.serve(topic, move |envelope| handler(envelope));
+}
+
+thread_local! {
+    /// Set by a reader member's read whose answer depends on the writer's
+    /// own acts or memory: the read is handed on to the writer.
+    static HANDED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a reader member's read answers where the writer must answer it
+/// ([`READ_FROM_WRITER`]): the read is marked to be handed on, and these
+/// words are never the caller's.
+fn to_the_writer() -> String {
+    HANDED_ON.with(|handed| handed.set(true));
+    "handed on to the lake's writer".to_string()
+}
+
+/// What a read handed to the writer leaves of its caller's deadline for its
+/// answer's way back from the writer through this member.
+const HANDED_BACK: Duration = Duration::from_millis(250);
+
+impl Lake {
+    /// A reader member's read of `topic` handed on, unchanged, to the writer
+    /// on [`READ_FROM_WRITER`], and the writer's reply answered with: its
+    /// rows, or its refusal word for word. A writer that does not answer --
+    /// none serving, mid-failover, or past the caller's deadline -- is
+    /// refused UNAVAILABLE, which the caller may ask again.
+    fn hand_to_writer(
+        &self,
+        topic: &'static str,
+        envelope: Envelope,
+        started: std::time::Instant,
+    ) -> meridian_bus::HandlerReply {
+        let unavailable = |why: String| {
+            refusal_with_status(
+                RefusalStatus::Unavailable,
+                &[],
+                format!("{topic} is the lake writer's to answer, and {why}; ask again"),
+            )
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| unavailable("this member has no runtime to hand it on".into()))?;
+        // What the caller's deadline leaves, less the answer's way back.
+        let timeout = meridian_bus::read_after::deadline().map(|deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(HANDED_BACK)
+        });
+        if timeout.is_some_and(|left| left.is_zero()) {
+            return Err(unavailable(
+                "the caller's deadline left no time to ask it".into(),
+            ));
+        }
+        let answered = handle.block_on(self.bus.hand_on(READ_FROM_WRITER, envelope, timeout));
+        let ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3);
+        match answered {
+            Ok(reply) => {
+                tracing::info!(topic, ms, "a read handed to the writer: answered by it");
+                Ok(reply)
+            }
+            Err(meridian_bus::BusError::HandlerFailed { detail, .. }) => {
+                tracing::info!(topic, ms, "a read handed to the writer: refused by it");
+                Err(detail)
+            }
+            Err(failed) => {
+                tracing::warn!(topic, ms, %failed, "a read handed to the writer: not answered");
+                Err(unavailable(format!("it did not answer ({failed})")))
+            }
+        }
+    }
+
+    /// A read a reader member handed on ([`READ_FROM_WRITER`]): answered by
+    /// the public read's own handler, its topic the one it was asked on,
+    /// held to its `read_after` as every read is. Served by the writer alone.
+    fn answer_handed_on(&self, envelope: Envelope) -> meridian_bus::HandlerReply {
+        let topic = envelope
+            .meta
+            .as_ref()
+            .map(|meta| meta.topic.clone())
+            .unwrap_or_default();
+        let handler = self
+            .read_handlers
+            .read()
+            .expect("read handlers poisoned")
+            .get(topic.as_str())
+            .cloned()
+            .ok_or_else(|| format!("{topic:?} is no lake read: only a lake read is handed on"))?;
+        match envelope
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.read_after.clone())
+        {
+            Some(asked) => self
+                .bus
+                .reads_after()
+                .answer(&topic, &asked, || handler(envelope)),
+            None => handler(envelope),
+        }
+    }
 }
 
 /// Register every handler, and subscribe to every event the lake hears,
@@ -5521,6 +6623,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     // The change log, asked a page at a time by the lake's own members and
     // the analytics component (step 3a; topics.md, "Component topics").
     meridian_changes::serve(&bus, "lake", Arc::new(LakeLog(Arc::clone(&lake.store))));
+    // Its reads held to their `read_after` by every dataset's head in one
+    // look (contract v30, stage B), not one look a dataset.
+    let heads = Arc::clone(&lake.store);
+    bus.reads_after().keep(
+        "lake",
+        Arc::new(meridian_bus::read_after::AllHeads(move || {
+            heads.heads().map_err(|failed| failed.to_string())
+        })),
+    );
     serve_on(
         &bus,
         &lake,
@@ -6191,13 +7302,34 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListSourcePrioritiesRequest",
             "meridian.v1.ListSourcePrioritiesReply",
         ),
-        |lake, _: ListSourcePrioritiesRequest, _| {
-            Ok(ListSourcePrioritiesReply {
-                priorities: lake
-                    .store
-                    .priorities()
-                    .map_err(|failed| failed.to_string())?,
-            })
+        |lake, _: ListSourcePrioritiesRequest, envelope| lake.list_priorities(envelope),
+    );
+    // Contract v30 (W10.6; the resilience spec's section 8): the switches of
+    // the default reads' sources, for a deployment admin.
+    serve_on(
+        &bus,
+        &lake,
+        LIST_SOURCE_SWITCHES,
+        (
+            "meridian.v1.ListSourceSwitchesRequest",
+            "meridian.v1.ListSourceSwitchesReply",
+        ),
+        |lake, request: meridian_domain::v1::ListSourceSwitchesRequest, _| {
+            lake.list_source_switches(request)
+        },
+    );
+    // Contract v30 (W10.14): the gaps the write-ahead stream left, each in
+    // its latest state, for a deployment admin.
+    serve_on(
+        &bus,
+        &lake,
+        LIST_DATASET_GAPS,
+        (
+            "meridian.v1.ListDatasetGapsRequest",
+            "meridian.v1.ListDatasetGapsReply",
+        ),
+        |lake, request: meridian_domain::v1::ListDatasetGapsRequest, _| {
+            lake.list_dataset_gaps(request)
         },
     );
     serve_on(
@@ -6220,6 +7352,16 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         ),
         |lake, request: RenewWantsRequest, envelope| lake.renew_wants(request, envelope),
     );
+
+    // A reader member's reads that depend on this writer's acts or memory,
+    // handed on (contract v30, stage B). A reader serves reads alone, so it
+    // never serves this.
+    {
+        let lake = Arc::clone(&lake);
+        bus.serve(READ_FROM_WRITER, move |envelope| {
+            lake.answer_handed_on(envelope)
+        });
+    }
 
     // Heard, subscribed before this returns.
     let mut configuration = bus.subscribe_every(ENTITLEMENTS_CHANGED);
@@ -6249,7 +7391,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             every.tick().await;
             let lake = Arc::clone(&sweeping);
             let _ = tokio::task::spawn_blocking(move || {
-                lake.sweep_wants();
+                if !lake.reads_only {
+                    lake.sweep_wants();
+                }
                 lake.return_freed();
             })
             .await;
@@ -6266,6 +7410,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     });
     let keeping = Arc::clone(&lake);
     tokio::spawn(async move {
+        if keeping.reads_only {
+            return;
+        }
         let mut every = tokio::time::interval(RETENTION_EVERY);
         loop {
             every.tick().await;
@@ -6293,13 +7440,16 @@ impl Lake {
                     let said = (record.asset_class, record.instrument_type);
                     let stays = record.instrument_id;
                     if !event.replaced_instrument_id.is_empty() && !stays.is_empty() {
-                        if let Err(failed) =
-                            self.store
-                                .keep_alias(&event.replaced_instrument_id, &stays, now)
-                        {
-                            tracing::warn!(%failed, "a replacement was not kept");
+                        // A reader holds what it heard; the writer keeps it.
+                        if !self.reads_only {
+                            if let Err(failed) =
+                                self.store
+                                    .keep_alias(&event.replaced_instrument_id, &stays, now)
+                            {
+                                tracing::warn!(%failed, "a replacement was not kept");
+                            }
+                            self.publish_control();
                         }
-                        self.publish_control();
                         self.unsettled
                             .lock()
                             .expect("unsettled poisoned")
@@ -6308,6 +7458,12 @@ impl Lake {
                     }
                 }
             }
+            // Counted and re-checked by the writer alone (a reader keeps
+            // nothing).
+            "meridian.v1.MissingInstrumentDetectedEvent"
+            | "meridian.v1.MissingVenueDetectedEvent"
+            | "meridian.v1.CalendarAppliedEvent"
+                if self.reads_only => {}
             "meridian.v1.MissingInstrumentDetectedEvent" => {
                 if let Ok(event) = MissingInstrumentDetectedEvent::decode(&envelope.payload[..]) {
                     self.miss(&event.publisher_instance_id, now);

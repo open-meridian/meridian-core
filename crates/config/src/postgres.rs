@@ -47,12 +47,16 @@ pub struct PostgresStore {
     /// The epoch this writer's commits are fenced by (step 3a); none until
     /// it adopts one, as the migration Job never does.
     fence: meridian_changes::Fence,
+    /// Its database's identity as its connections found it (contract v30,
+    /// stage C): a new timeline raises the epoch before a commit there.
+    watch: std::sync::Arc<meridian_changes::timeline::Watch>,
 }
 
 /// The configuration store's change log (step 3a): every table the
 /// conductor writes, captured in its own transaction under one sequence,
 /// but the platform's catalogue, which each pull replaces whole.
 pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    component: "conductor",
     prefix: "config",
     head: "config_change_head",
     partition: "config",
@@ -119,13 +123,18 @@ impl PostgresStore {
             config,
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
+        let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
+            .connection_customizer(Box::new(meridian_changes::timeline::Watching(
+                std::sync::Arc::clone(&watch),
+            )))
             .build(manager)
             .map_err(unavailable)?;
         Ok(Self {
             pool,
             fence: meridian_changes::Fence::new(),
+            watch,
         })
     }
 
@@ -145,6 +154,42 @@ impl PostgresStore {
         let epoch = CHANGES.take_over(&mut *conn, by).map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
+    }
+
+    /// The epoch this writer commits under; 0 before it adopts one.
+    pub fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    /// Follow the database's timeline (contract v30, stage C; the
+    /// resilience spec's section 3): on a new one the epoch is raised, as a
+    /// takeover raises it, and adopted, the takeover recorded with that
+    /// cause. Nothing where this store writes under no epoch.
+    pub fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_on(&mut conn)
+    }
+
+    fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        use meridian_changes::timeline::Timeline;
+        let _alone = self.watch.alone();
+        let mine = self.fence.epoch();
+        if mine == 0 {
+            return Ok(Timeline::Same);
+        }
+        let (found, identity) = CHANGES
+            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .map_err(unavailable)?;
+        if let Timeline::Moved(epoch) = found {
+            self.fence.adopt(epoch);
+            tracing::warn!(
+                epoch,
+                identity,
+                "the database is on a new timeline: the epoch is raised, and followers past it reload"
+            );
+        }
+        self.watch.settled(&identity);
+        Ok(found)
     }
 
     /// The store's epoch now, as its head row says (step 3b): a writer
@@ -176,6 +221,7 @@ impl PostgresStore {
             member,
             started_at_ns,
             finished_at_ns,
+            meridian_changes::integrity::logged_in(&CHANGES),
         )
         .map_err(unavailable)
     }
@@ -210,6 +256,14 @@ impl PostgresStore {
     /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
         let mut conn = self.pool.get().map_err(unavailable)?;
+        // A connection opened on a new database timeline: the epoch raised
+        // before this one commits anything there (contract v30, stage C).
+        if self.watch.moved() {
+            if let Err(failed) = self.follow_on(&mut conn) {
+                self.watch.unsettled();
+                return Err(failed);
+            }
+        }
         CHANGES
             .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
             .map_err(unavailable)?;
@@ -260,6 +314,19 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
+    fn launches(&self) -> Result<Vec<PluginLaunch>> {
+        Ok(self
+            .conn()?
+            .query(
+                &format!("SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch ORDER BY launch_id"),
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(launch_from)
+            .collect())
+    }
+
     fn snapshot(&self) -> Result<Snapshot> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -268,6 +335,9 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        // The whole configuration, at start: without the serving session's
+        // statement_timeout (section 10a).
+        meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
 
         let mut snapshot = Snapshot::default();
         let records = &mut snapshot.records;
@@ -577,9 +647,16 @@ impl Store for PostgresStore {
             });
         }
 
+        // Each instance's latest launch alone, in the order made (stage M;
+        // audit item 8): every launch ever is `launches`.
         for row in tx
             .query(
-                &format!("SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch ORDER BY launch_id"),
+                &format!(
+                    "SELECT {LAUNCH_COLUMNS} FROM config_plugin_launch
+                      WHERE launch_id IN (SELECT max(launch_id) FROM config_plugin_launch
+                                           GROUP BY instance_id)
+                      ORDER BY launch_id"
+                ),
                 &[],
             )
             .map_err(unavailable)?
@@ -1449,8 +1526,9 @@ impl Store for PostgresStore {
                 "INSERT INTO config_plugin_launch
                         (instance_id, name, version, image_digest, roles, launched_by,
                          launched_at_ns, state, live, launched_through_delegation,
-                         launched_client_name, launch_note, prepared_call_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12)
+                         launched_client_name, launch_note, prepared_call_id, sidecar_limits,
+                         shards, standby)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (instance_id) WHERE state = 1 DO NOTHING",
                 &[
                     &launch.instance_id,
@@ -1465,6 +1543,9 @@ impl Store for PostgresStore {
                     &launch.client_name,
                     &note,
                     &launch.prepared_call_id,
+                    &launch.limits.as_ref().map(prost::Message::encode_to_vec),
+                    &i32::try_from(launch.shards).unwrap_or(i32::MAX),
+                    &launch.standby,
                 ],
             )
             .map_err(unavailable)?;
@@ -2924,7 +3005,7 @@ const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
      stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id, \
-     pull_acknowledgement";
+     pull_acknowledgement, sidecar_limits, shards, standby";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
@@ -2996,6 +3077,15 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         // version was pulled (W8.12, contract v25).
         pull_acknowledgement: row.get::<_, Option<Vec<u8>>>(20).and_then(|bytes| {
             <meridian_domain::v1::PullAcknowledgement as prost::Message>::decode(&bytes[..]).ok()
+        }),
+        // Contract v30's shards and standby (W8.3), as the launch asked; the
+        // launcher still runs one pod (3d builds them).
+        shards: u32::try_from(row.get::<_, i32>(22)).unwrap_or_default(),
+        standby: row.get(23),
+        // Its own share at its sidecar, as its launch asked (contract v30;
+        // ruled 2026-11-11).
+        limits: row.get::<_, Option<Vec<u8>>>(21).and_then(|bytes| {
+            <meridian_domain::v1::SidecarLimits as prost::Message>::decode(&bytes[..]).ok()
         }),
     }
 }
@@ -3152,17 +3242,13 @@ fn table_exists(conn: &mut Connection, table: &str) -> Result<bool> {
         .is_some())
 }
 
-fn unavailable(failed: impl std::error::Error) -> StoreError {
-    // With the cause, because this driver's own message for most failures is
-    // "db error" and everything useful is one level down.
-    let mut detail = failed.to_string();
-    let mut cause = failed.source();
-    while let Some(next) = cause {
-        detail.push_str(": ");
-        detail.push_str(&next.to_string());
-        cause = next.source();
-    }
-    StoreError::Unavailable(detail)
+fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
+    // With each cause, because this driver's own message for most failures
+    // is the words "db error" and everything useful is one level down; and
+    // its SQLSTATE, so a query cancelled at the serving session's
+    // statement_timeout is answered with this component's own refusal for
+    // load (the resilience spec's section 10a).
+    StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
 /// The configuration store's change log, read a page at a time (step 3a).

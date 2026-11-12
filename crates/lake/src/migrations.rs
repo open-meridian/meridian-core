@@ -86,6 +86,41 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "row_digest",
         sql: include_str!("../migrations/0012_row_digest.sql"),
     },
+    // The record path batched (ruled 2026-11-10): each subject's last
+    // sequence in a dataset, found by an index.
+    Migration {
+        version: 13,
+        name: "subject_sequence",
+        sql: include_str!("../migrations/0013_subject_sequence.sql"),
+    },
+    // The write-ahead stream's position (the `ha` profile; the resilience
+    // spec's section 4, rulings of 2026-11-08): committed with each batch.
+    Migration {
+        version: 14,
+        name: "write_ahead",
+        sql: include_str!("../migrations/0014_write_ahead.sql"),
+    },
+    // A dataset's gaps (W10.14): what the stream dropped before the lake
+    // took it, each gap's every state, and where a dataset's next begins.
+    Migration {
+        version: 15,
+        name: "dataset_gap",
+        sql: include_str!("../migrations/0015_dataset_gap.sql"),
+    },
+    // A new database timeline raises the epoch (contract v30, stage C): the
+    // identity the writer last saw.
+    Migration {
+        version: 16,
+        name: "database_identity",
+        sql: include_str!("../migrations/0016_database_identity.sql"),
+    },
+    // The unattributed gap (contract v30, stage C2; approved 2026-11-11):
+    // each run the stream skipped keeps the gap recorded for it at once.
+    Migration {
+        version: 17,
+        name: "unattributed_gap",
+        sql: include_str!("../migrations/0017_unattributed_gap.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -384,6 +384,10 @@ fn value_schema() -> Value {
                 "required": ["payout"],
                 "additionalProperties": false,
             },
+            "bond": {
+                "type": "object",
+                "description": "a bond's terms whole, as dashboard__read_instrument answers a record's bond and an offer carries them (contract v30): put in force on a record whose type is bond",
+            },
             "money_market_fund": {
                 "type": "object",
                 "properties": {
@@ -697,11 +701,12 @@ fn value(
     problems: &mut Problems,
 ) -> Option<InstrumentValue> {
     let object = object(said, path, problems)?;
-    const KINDS: [&str; 7] = [
+    const KINDS: [&str; 8] = [
         "asset_class",
         "instrument_type",
         "money_market_fund",
         "binary_event_contract",
+        "bond",
         "currency",
         "description",
         "identifier",
@@ -715,7 +720,7 @@ fn value(
         .filter(|kind| object.contains_key(*kind))
         .collect();
     if given.len() != 1 {
-        problems.add(path, "exactly one of asset_class, instrument_type, money_market_fund, binary_event_contract, currency, description and identifier");
+        problems.add(path, "exactly one of asset_class, instrument_type, money_market_fund, binary_event_contract, bond, currency, description and identifier");
         return None;
     }
     let source = match object.get("source") {
@@ -838,6 +843,19 @@ fn value(
                 category: text(terms, "category", &at, false, problems),
             })
         }
+        // Contract v30 (W3.10; ruling 433): a bond's terms whole, as
+        // dashboard__read_instrument answers them and an offer carries them.
+        "bond" if !held.is_object() => {
+            problems.add(&at, "a bond's terms, as an object");
+            return None;
+        }
+        "bond" => match meridian_domain::debt::bond_from(held, "") {
+            Ok(bond) => instrument_value::Value::Bond(bond),
+            Err(why) => {
+                problems.add(&at, why.trim_start_matches('.').to_string());
+                return None;
+            }
+        },
         "currency" => match held.as_str() {
             Some(code) => instrument_value::Value::Currency(code.trim().to_string()),
             None => {
@@ -1035,6 +1053,10 @@ fn value_json(value: &InstrumentValue) -> Value {
         }
         Some(instrument_value::Value::BinaryEventContract(c)) => {
             json!({"binary_event_contract": contract_json(c)})
+        }
+        // Contract v30 (ruling 433): a bond's terms as a value.
+        Some(instrument_value::Value::Bond(b)) => {
+            json!({"bond": meridian_domain::debt::bond_json(b)})
         }
         None => json!({}),
     };
@@ -1244,6 +1266,7 @@ pub(super) async fn ask<R: Message + Default>(
                     meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
                     meridian_bus::RefusalStatus::NotFound => "not_found",
                     meridian_bus::RefusalStatus::FailedPrecondition => "failed_precondition",
+                    meridian_bus::RefusalStatus::Unavailable => "unavailable",
                 }
                 .into(),
                 words.to_string(),
@@ -2362,6 +2385,7 @@ mod tests {
                     refusal: Some(meridian_pb::v1::Refusal {
                         reason: RefusalReason::RecordChanged as i32,
                         fields: vec!["against_version".into()],
+                        retry_after_seconds: 0,
                     }),
                     detail: "changed".into(),
                     ..Default::default()

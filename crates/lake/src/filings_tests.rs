@@ -20,7 +20,7 @@ use meridian_domain::v1::{
     ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest, Source, SourceTime,
     SourceTimeKind, SubjectRef, SubjectRole, UnitValue, ValueUnit, Watermark,
 };
-use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
 use prost::Message;
 
 use crate::row::Observation;
@@ -131,10 +131,6 @@ fn configuration() -> EntitlementsChangedEvent {
                 vendor: vendor.into(),
                 data_types: data_types.iter().map(|t| t.to_string()).collect(),
                 modes: vec![ObservationMode::Push as i32],
-                licence_default: Some(DatasetLicence {
-                    kept: true,
-                    ..Default::default()
-                }),
                 ..Default::default()
             }),
             ..Default::default()

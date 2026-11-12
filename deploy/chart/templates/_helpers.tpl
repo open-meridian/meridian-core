@@ -96,6 +96,25 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 {{- $n -}}
 {{- end -}}
 
+{{/*
+The brought database's record-read replicas (contract v30, stage C; the
+resilience spec's sections 4, 5 and 11, approved 2026-11-11):
+database.brought.readReplicas, 0 by default, or 1, the shape CI tests
+(e2e-cluster-scaled). Asynchronous members under Patroni tagged nosync and
+nofailover: never in the synchronous quorum, so a long record read neither
+delays a commit nor is cancelled by replay, and never promoted. A store's
+reader is pointed at one by the chart itself (meridian-runtime.readers,
+approved 2026-11-11), or by its <store>.database.readExistingSecret; the
+HA standbys serve no reads. Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseReadReplicas" -}}
+{{- $n := index .Values.database.brought "readReplicas" | default 0 -}}
+{{- if not (has (toString $n) (list "0" "1")) -}}
+{{- fail (printf "database.brought.readReplicas is %v; it takes 0 (the record's reads from the primary) or 1 (an asynchronous replica outside the commit quorum, which a store's reader reads the record's past from by <store>.database.readExistingSecret), the shapes CI tests." $n) -}}
+{{- end -}}
+{{- $n -}}
+{{- end -}}
+
 {{- define "meridian-runtime.brokerReplicas" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" .Values.broker.replicas "tolerant" 1 "ha" 3) -}}
 {{- if not (has (toString $n) (list "1" "3")) -}}
@@ -113,6 +132,74 @@ is refused (requirement 1, ruling 1047). Each takes the chart.
 {{- fail "broker.jetstream.replicas is 3 and broker.replicas is not: a stream kept on three servers needs three. Set broker.replicas: 3, or broker.jetstream.replicas: 0." -}}
 {{- end -}}
 {{- $n -}}
+{{- end -}}
+
+{{/*
+The lake's write-ahead stream (contract v30, stage E; the resilience spec's
+section 4; the rulings of 2026-11-08): where JetStream runs at three -- the
+`ha` profile -- a data plugin's sidecar puts its lake writes in the stream
+first, and the lake's writer records them from it with the stream's
+position. Nothing where it does not. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadEnv" -}}
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD
+  value: jetstream
+{{- end }}
+{{- end -}}
+
+{{/*
+The write-ahead stream's bounds, for the lake (lake.writeAhead.maxAge and
+maxBytes; contract v30, stage E): where JetStream runs, each refused here
+unless it is one the lake reads -- a whole number above 0 of s, m or h; of MB
+or GB. Nothing where JetStream does not run. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadBoundsEnv" -}}
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 }}
+{{- $w := .Values.lake.writeAhead | default dict }}
+{{- $age := toString ($w.maxAge | default "10m") }}
+{{- if not (regexMatch "^[1-9][0-9]*(s|m|h)$" $age) }}
+{{- fail (printf "lake.writeAhead.maxAge is %v; a whole number above 0 of seconds, minutes or hours, as 30s, 10m or 1h: how long the lake's write-ahead stream holds a write the lake has not recorded" $age) }}
+{{- end }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_AGE
+  value: {{ $age | quote }}
+- name: MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES
+  value: {{ printf "%dMB" (int (include "meridian-runtime.writeAheadMiB" .)) | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+lake.writeAhead.maxBytes in MB, refused unless it is a whole number above 0
+of MB or GB. Takes the chart.
+*/}}
+{{- define "meridian-runtime.writeAheadMiB" -}}
+{{- $w := .Values.lake.writeAhead | default dict }}
+{{- $bytes := toString ($w.maxBytes | default "256MB") }}
+{{- if not (regexMatch "^[1-9][0-9]*(MB|GB)$" $bytes) }}
+{{- fail (printf "lake.writeAhead.maxBytes is %v; a whole number above 0 of MB or GB, as 256MB: how much the lake's write-ahead stream holds before it refuses a write" $bytes) }}
+{{- end }}
+{{- $n := int (regexFind "^[0-9]+" $bytes) }}
+{{- if hasSuffix "GB" $bytes }}{{ mul $n 1024 }}{{ else }}{{ $n }}{{ end }}
+{{- end -}}
+
+{{/*
+Each broker server's JetStream file store (max_file_store), where JetStream
+runs: the lake's write-ahead stream at its maxBytes, the analytics units'
+queue's 48 MB, and 64 MB for JetStream's own state -- at least the 256 MB it
+was before the stream. broker.jetstream.size is the volume that holds it.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.jetstreamFileStore" -}}
+{{- $mb := max (add (int (include "meridian-runtime.writeAheadMiB" .)) 48 64) 256 -}}
+{{- $size := toString ((.Values.broker.jetstream | default dict).size | default "1Gi") -}}
+{{- if regexMatch "^[1-9][0-9]*(Mi|Gi)$" $size -}}
+{{- $volume := int (regexFind "^[0-9]+" $size) -}}
+{{- if hasSuffix "Gi" $size }}{{ $volume = mul $volume 1024 }}{{ end -}}
+{{- if gt $mb $volume -}}
+{{- fail (printf "broker.jetstream.size is %s, and JetStream's store needs %dMB of it: lake.writeAhead.maxBytes, the analytics units' 48MB and 64MB of JetStream's own. Grow broker.jetstream.size or lower lake.writeAhead.maxBytes." $size $mb) -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%dMB" $mb -}}
 {{- end -}}
 
 {{/* A stateless set's copies: 1 or 2 by the profile, at least 1. Takes a dict: top, value. */}}
@@ -194,12 +281,31 @@ strategy:
 {{- end -}}
 
 {{/*
+The leases' timing (contract v30, stage C; the resilience spec's section 2,
+approved 2026-11-10): Patroni's rule, `loop_wait + 2 x retry_timeout <=
+ttl`. Each renewal gives up within leases.renewSeconds, so a lease that
+lasts three renewals outlives one slow answer and a retry; one shorter is
+refused, naming both.
+*/}}
+{{- define "meridian-runtime.leaseTiming" -}}
+{{- $renew := int .Values.leases.renewSeconds -}}
+{{- $lasts := int .Values.leases.durationSeconds -}}
+{{- if lt $renew 1 -}}
+{{- fail (printf "leases.renewSeconds is %v; a whole number of seconds above 0: how often a writer renews its lease, each renewal giving up within it" .Values.leases.renewSeconds) -}}
+{{- end -}}
+{{- if lt $lasts (mul 3 $renew) -}}
+{{- fail (printf "leases.durationSeconds is %v and leases.renewSeconds %v: a lease lasts at least three renewals (%d s here), so a writer whose renewal answered slowly once is never taken over while it still renews (Patroni's loop_wait + 2 x retry_timeout <= ttl). Raise leases.durationSeconds, or lower leases.renewSeconds." .Values.leases.durationSeconds .Values.leases.renewSeconds (mul 3 $renew)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 What a member is told of itself (step 3b): its pod's name, its zone where
 the cluster labels it, and with a standby its lease, the lease's timing
 (leases.renewSeconds, leases.durationSeconds) and the lag a standby is ready
 under (`<component>.readyLagMs`). Takes a dict: top, component, values.
 */}}
 {{- define "meridian-runtime.memberEnv" -}}
+{{- include "meridian-runtime.leaseTiming" .top -}}
 - name: MERIDIAN_POD_NAME
   valueFrom:
     fieldRef:
@@ -679,11 +785,14 @@ during a rollout the one more a standby's surge starts -- holds its pool of
 dashboard copy its pool of 4 and 1 beside it; and the jobs that may run at
 once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
 comparison's 1). A store whose database is its own (<store>.database.
-existingSecret) is not counted. Kept in step with the pools the binaries
-open (crates/runtime/src/bin). Takes the chart.
+existingSecret) is not counted. In ha each lake member holds 2 more for the
+write-ahead stream's writer, its batch and its position (contract v30,
+stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
+(crates/runtime/src/bin). Takes the chart.
 */}}
 {{- define "meridian-runtime.databaseConnections" -}}
 {{- $held := 6 -}}
+{{- $writeAhead := gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 -}}
 {{- range $component := list "instrument" "conductor" "street" "bor" "lake" -}}
 {{- $values := index $.Values $component -}}
 {{- if not (dig "database" "existingSecret" "" $values) -}}
@@ -691,7 +800,9 @@ open (crates/runtime/src/bin). Takes the chart.
 {{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
 {{- $members = add1 $members -}}
 {{- end -}}
-{{- $held = add $held (mul $members 10) -}}
+{{- $each := 10 -}}
+{{- if and $writeAhead (eq $component "lake") }}{{ $each = 12 }}{{ end -}}
+{{- $held = add $held (mul $members $each) -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.dashboard.enabled -}}
@@ -721,6 +832,49 @@ found as connections refused while the new pods start. Takes the chart.
 {{- else -}}
 {{- int $set -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+The brought database's memory limit (ruled 2026-11-08): where it runs with
+standbys -- the ha profile -- what the preflight's memory judge counts it
+may use, shared buffers and work memory for every connection it allows
+(crates/runtime/src/preflight.rs, judge_memory), with a quarter's room as
+max_connections keeps, rounded up to 64 MiB; database.brought.resources'
+own where that is more. Postgres's defaults, which this chart leaves as they
+are: shared_buffers 128 MiB, work_mem 4 MiB. Alone, its own limit, as set.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseMemoryLimit" -}}
+{{- $set := toString (dig "limits" "memory" "" (.Values.database.brought.resources | default .Values.resources)) -}}
+{{- /* Every member under Patroni, its record-read replicas' included, is a
+       server of its own held to the same max_connections (a hot standby
+       takes no fewer than its primary), so each is given the same count. */}}
+{{- if gt (add (int (include "meridian-runtime.databaseStandbys" .)) (int (include "meridian-runtime.databaseReadReplicas" .))) 0 -}}
+{{- $judged := add 128 (mul 4 (int (include "meridian-runtime.databaseMaxConnections" .))) -}}
+{{- $roomy := div (add (mul $judged 5) 3) 4 -}}
+{{- $mib := mul (div (add $roomy 63) 64) 64 -}}
+{{- $setMib := 0 -}}
+{{- if regexMatch "^[1-9][0-9]*(Mi|Gi)$" $set -}}
+{{- $setMib = int (regexFind "^[0-9]+" $set) -}}
+{{- if hasSuffix "Gi" $set }}{{ $setMib = mul $setMib 1024 }}{{ end -}}
+{{- end -}}
+{{- if gt $setMib $mib }}{{ $set }}{{ else }}{{ printf "%dMi" $mib }}{{ end -}}
+{{- else -}}
+{{- $set -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The brought database's resources: database.brought.resources (or the
+shared ones), its memory limit as databaseMemoryLimit says. Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseResources" -}}
+{{- $resources := deepCopy (.Values.database.brought.resources | default .Values.resources) -}}
+{{- $limit := include "meridian-runtime.databaseMemoryLimit" . -}}
+{{- if $limit -}}
+{{- $_ := set $resources "limits" (merge (dict "memory" $limit) (omit ($resources.limits | default dict) "memory")) -}}
+{{- end -}}
+{{- toYaml $resources -}}
 {{- end -}}
 
 {{/*
@@ -764,9 +918,20 @@ ttl: 20
 loop_wait: 2
 retry_timeout: 5
 maximum_lag_on_failover: 1048576
-synchronous_mode: {{ gt (int .standbys) 0 }}
+{{- /* The synchronous standbys are a quorum (contract v30, stage C; the
+       resilience spec's section 4, approved 2026-11-10): Patroni's
+       `synchronous_mode: quorum` gives synchronous_standby_names = 'ANY 1
+       (...)' over the two standbys, so either acknowledges and losing one
+       neither stalls nor slows a commit; strict still, so a primary cut off
+       from both acknowledges nothing alone. */}}
+synchronous_mode: {{ if gt (int .standbys) 0 }}quorum{{ else }}false{{ end }}
 synchronous_mode_strict: {{ gt (int .standbys) 0 }}
 synchronous_node_count: 1
+{{- /* The API server lost (contract v30, stage C; the resilience spec's
+       section 2): Patroni's failsafe_mode keeps the primary through its
+       store's outage -- Kubernetes, here -- while it reaches every member
+       by their REST APIs, so the record's writers write on. */}}
+failsafe_mode: true
 postgresql:
   use_pg_rewind: true
   use_slots: true
@@ -1123,4 +1288,181 @@ the name connected to (sslmode verify-full).
       - key: ca.crt
         path: ca.crt
 {{- end }}
+{{- end -}}
+
+{{/*
+A memory quantity in whole MiB, as a container's limit names it (Ki, Mi,
+Gi, Ti, K, M, G, T or plain bytes); -1 where it cannot be read.
+*/}}
+{{- define "meridian-runtime.mib" -}}
+{{- $q := toString . -}}
+{{- $units := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "K" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "" 1.0 -}}
+{{- $digits := regexFind "^[0-9]+(\\.[0-9]+)?" $q -}}
+{{- $unit := trimPrefix $digits $q -}}
+{{- if and $digits (hasKey $units $unit) -}}
+{{- div (int64 (mulf (float64 $digits) (index $units $unit))) 1048576 -}}
+{{- else -}}
+-1
+{{- end -}}
+{{- end -}}
+
+{{/*
+A component's working memory (stage M; the resilience spec's section 10a):
+its container's limit, handed down from the pod's own `limits.memory`, and
+`memory.budgetPercent` and `memory.shedPercent`, with which it reserves each
+request's working memory and cancels its largest above the shed line; and
+glibc's arenas and mmap threshold, carried to every component as the lake
+runs them (`<component>.mallocArenaMax`, 2; `<component>.mallocMmapThreshold`,
+128 KiB). A configuration that leaves a component nothing to answer with --
+its limit's share less its hot layer's and held answers' bounds (`heldMiB`)
+-- is refused here, before it is applied. Takes a dict: top, container,
+values (the component's), resources (the ones its container runs with),
+heldMiB, and name (for the words).
+*/}}
+{{- define "meridian-runtime.memoryEnv" -}}
+{{- $memory := .top.Values.memory | default dict -}}
+{{- $budget := $memory.budgetPercent | default 80 -}}
+{{- $shed := $memory.shedPercent | default 90 -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $budget)) -}}
+{{- fail (printf "memory.budgetPercent is %v; a whole number from 10 to 95" $budget) -}}
+{{- end -}}
+{{- if or (lt (int $budget) 10) (gt (int $budget) 95) -}}
+{{- fail (printf "memory.budgetPercent is %v; a whole number from 10 to 95" $budget) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $shed))) (le (int $shed) (int $budget)) (gt (int $shed) 99) -}}
+{{- fail (printf "memory.shedPercent is %v; above memory.budgetPercent (%v) and at most 99, so a component cancels its largest request before the kernel's OOM killer fires" $shed $budget) -}}
+{{- end -}}
+{{- $limit := dig "limits" "memory" "" (.resources | default dict) -}}
+{{- if $limit -}}
+{{- $mib := int64 (include "meridian-runtime.mib" $limit) -}}
+{{- $held := int64 (.heldMiB | default 0) -}}
+{{- $working := sub (div (mul $mib (int64 $budget)) 100) $held -}}
+{{- if and (ge $mib 0) (lt $working 4) -}}
+{{- fail (printf "%s: a memory limit of %s at memory.budgetPercent %v leaves %d MiB, and its hot layer and held answers take %d MiB: nothing is left to answer with; raise its limit or lower its bounds" .name $limit $budget (div (mul $mib (int64 $budget)) 100) $held) -}}
+{{- end -}}
+{{- end -}}
+{{- $mmap := dig "mallocMmapThreshold" 131072 (.values | default dict) -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (int64 $mmap))) -}}
+{{- fail (printf "%s.mallocMmapThreshold is %v; a whole number of bytes above 0" .name $mmap) -}}
+{{- end }}
+- name: MERIDIAN_MEMORY_LIMIT_BYTES
+  valueFrom:
+    resourceFieldRef:
+      containerName: {{ .container }}
+      resource: limits.memory
+- name: MERIDIAN_MEMORY_BUDGET_PERCENT
+  value: {{ $budget | toString | quote }}
+- name: MERIDIAN_MEMORY_SHED_PERCENT
+  value: {{ $shed | toString | quote }}
+- name: MALLOC_ARENA_MAX
+  value: {{ dig "mallocArenaMax" 2 (.values | default dict) | toString | quote }}
+- name: MALLOC_MMAP_THRESHOLD_
+  value: {{ $mmap | int64 | toString | quote }}
+{{- end -}}
+
+{{/*
+A plugin's share at its sidecar (stage M; section 10a): the chart's
+`sidecar.limits`, each overridable for one plugin by its own `limits`
+(sidecars[] here; a launch's override in step 3d). Takes a dict: top, limits
+(the plugin's own, or none).
+*/}}
+{{- define "meridian-runtime.sidecarLimitsEnv" -}}
+{{- $chart := .top.Values.sidecar.limits | default dict -}}
+{{- $own := .limits | default dict -}}
+{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" }}
+{{- range $said := list (dict "where" "sidecar.limits" "from" $chart) (dict "where" "a plugin's limits" "from" $own) }}
+{{- if hasKey $said.from $name }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $said.from $name))) }}
+{{- fail (printf "%s.%s is %v; a whole number above 0" $said.where $name (index $said.from $name)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $value := ternary (index $own $name) (index $chart $name) (hasKey $own $name) }}
+{{- if $value }}
+- name: {{ $env }}
+  value: {{ $value | toString | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+A store's reader members (contract v30, stage B; spec/a-deployment-scales-
+out-and-fails-over-by-configuration sections 1, 5 and 11): `<store>.readers`
+of them, 0 by default, for the lake, the book and the instrument store. The
+store's own Deployment again, rendered as `rendered`, in a reads-only mode
+(MERIDIAN_MEMBER_MODE=reader): its own name and component label
+(`<store>-reader`), so the writer's selector never counts it, and the same
+instance, so it joins the store's query queue group; ready while its lag
+behind the writer's change log is under `<store>.readyLagMs`. With
+`<store>.database.readExistingSecret` set, the record's past is read from
+that read replica (its URL under the store's database key); unset, with
+the brought database's database.brought.readReplicas above 0, from that
+replica, wired here (contract v30, stage C2, approved 2026-11-11): the
+store's own URL on the replica member's host (MERIDIAN_READ_DATABASE_HOST);
+otherwise from the primary. Takes a dict: top, component, values, readUrl,
+rendered.
+*/}}
+{{- define "meridian-runtime.readers" -}}
+{{- $readers := index .values "readers" | default 0 -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $readers)) -}}
+{{- fail (printf "%s.readers is %v; a whole number of reader members, 0 for none" .component $readers) -}}
+{{- end -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
+{{- $read := dig "database" "readExistingSecret" "" .values -}}
+{{- if and (gt (int $readers) 0) (gt (int $count) 0) }}
+{{- $out := .rendered -}}
+{{- $out = regexReplaceAll "(?m)^  name: (\\S+)$" $out "  name: ${1}-reader" -}}
+{{- $out = regexReplaceAll (printf "(?m)^(\\s+)meridian.dev/component: %s$" .component) $out (printf "${1}meridian.dev/component: %s-reader" .component) -}}
+{{- $out = regexReplaceAll "(?m)^  replicas: .*$" $out (printf "  replicas: %d" (int $readers)) -}}
+{{- $env := "${1}  - name: MERIDIAN_MEMBER_MODE\n${1}    value: reader\n" -}}
+{{- if not (contains "MERIDIAN_READY_LAG_MS" $out) -}}
+{{- $env = printf "%s${1}  - name: MERIDIAN_READY_LAG_MS\n${1}    value: %s\n" $env (index .values "readyLagMs" | default 5000 | toString | quote) -}}
+{{- end -}}
+{{- $key := dig "database" "key" "" .values | default .top.Values.database.key -}}
+{{- if $read -}}
+{{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n" $env .readUrl $read $key -}}
+{{- else if and .top.Values.database.brought.enabled (not (dig "database" "existingSecret" "" .values)) (gt (int (include "meridian-runtime.databaseReadReplicas" .top)) 0) -}}
+{{- /* The brought database's record-read replica, wired by the chart
+       (contract v30, stage C2; approved 2026-11-11): the store's own URL,
+       on the replica's host, so no Secret is edited by hand. */ -}}
+{{- $member := printf "%s-database-%d" (include "meridian-runtime.fullname" .top) (add 1 (int (include "meridian-runtime.databaseStandbys" .top))) -}}
+{{- $host := printf "%s.%s.svc.cluster.local" $member .top.Release.Namespace -}}
+{{- $env = printf "%s${1}  - name: %s\n${1}    valueFrom:\n${1}      secretKeyRef:\n${1}        name: %s\n${1}        key: %s\n${1}  - name: MERIDIAN_READ_DATABASE_HOST\n${1}    value: %s\n" $env .readUrl (include "meridian-runtime.databaseSecret" .top) $key (quote $host) -}}
+{{- end -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+)env:$" $out (printf "${1}env:\n%s" (trimSuffix "\n" $env)) }}
+---
+{{ $out }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The chart's values the resilience profile reads, as the release states them
+(contract v30, stage D; the resilience spec's section 12;
+`MERIDIAN_RESILIENCE_VALUES`, approved 2026-11-11): each count and setting
+of section 11 the profile judges, resolved as the chart resolves it -- by
+the profile where unset -- by its chart path, as JSON on the conductor
+alone. Never a secret, a credential, a Secret's name or an address: counts,
+zones, whether backups are scheduled and archived, the scrub's interval.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.resilienceValues" -}}
+{{- $said := dict -}}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" "launcher" -}}
+{{- $values := index $.Values $component | default dict -}}
+{{- $one := dict "standby" (int (include "meridian-runtime.standbys" (dict "top" $ "component" $component "values" $values))) "readers" (int (index $values "readers" | default 0)) -}}
+{{- if ne $component "launcher" -}}
+{{- $_ := set $one "scrub" (dict "intervalDays" (float64 (dig "scrub" "intervalDays" 7 $values))) -}}
+{{- end -}}
+{{- $_ := set $said $component $one -}}
+{{- end -}}
+{{- $brought := .Values.database.brought.enabled | default false -}}
+{{- $_ := set $said "database" (dict "brought" (dict "enabled" $brought "standbys" (int (include "meridian-runtime.databaseStandbys" .)) "readReplicas" (int (include "meridian-runtime.databaseReadReplicas" .)))) -}}
+{{- $_ := set $said "broker" (dict "replicas" (int (include "meridian-runtime.brokerReplicas" .)) "jetstream" (dict "replicas" (int (include "meridian-runtime.jetstreamReplicas" .)))) -}}
+{{- $_ := set $said "zones" (.Values.zones | default list) -}}
+{{- $b := .Values.backup | default dict -}}
+{{- $_ := set $said "backup" (dict "schedule" ($b.schedule | default "") "walArchive" (dict "enabled" (dig "walArchive" "enabled" false $b))) -}}
+{{- $_ := set $said "analytics" (dict "coordinator" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "coordinator" "replicaCount" nil .Values.analytics) "what" "analytics.coordinator.replicaCount")))) "worker" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "worker" "replicaCount" nil .Values.analytics) "what" "analytics.worker.replicaCount"))))) -}}
+{{- $_ := set $said "dashboard" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount")))) -}}
+{{- $said | toJson -}}
 {{- end -}}

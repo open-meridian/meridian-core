@@ -37,9 +37,12 @@ pub mod pages;
 pub mod postgres;
 pub mod query;
 pub mod read;
+pub mod reader;
 pub mod row;
 pub mod service;
 pub mod store;
+pub mod switches;
+pub mod write_ahead;
 
 mod memory;
 

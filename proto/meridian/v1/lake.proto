@@ -624,6 +624,10 @@ enum RateKind {
   RATE_KIND_DISCOUNT = 6;
   // A bill's coupon-equivalent (bond-equivalent) yield.
   RATE_KIND_COUPON_EQUIVALENT = 7;
+  // Contract v30 (ruling 431; approved 2026-11-09): an on-the-run
+  // benchmark's yield as its publisher states it, the kind a curve's
+  // benchmarks are quoted in.
+  RATE_KIND_BENCHMARK_YIELD = 8;
 }
 
 // RateConvention, DayCount and Compounding: declared in amounts.proto from
@@ -1271,6 +1275,11 @@ message ObservationsWantedEvent {
   // Contract v28, amended 2026-10-28: true: every series of the subjects,
   // narrowed by the window. False: the subjects' own rows only.
   bool all_series = 14;
+  // Contract v30 (W10.7, W10.14; approved 2026-11-09): a gap's `GAP-` ID,
+  // set on a want asking again for a backfill dataset's gap, its subjects
+  // and its valid-time range; the rows recorded for it recover the gap.
+  // Empty: not a gap's want. Not a want's ID, which want_id is.
+  string gap_id = 15;
 }
 
 // A standing want no reader has asked within the dataset's cadence.
@@ -1410,6 +1419,10 @@ message SetSourcePriorityRequest {
   int64 against_updated_at_ns = 5;
 }
 
+// Read by a deployment admin, and from contract v30 by the eight roles that
+// read the lake (W10.2; ruling 454, step 3c's question 7), read-only: each
+// priority answered with the datasets the asker is entitled to, a dataset it
+// may not read left out, a priority with none left not answered.
 message ListSourcePrioritiesRequest {}
 
 message ListSourcePrioritiesReply {
@@ -2550,4 +2563,321 @@ message ListFactorsReply {
   Watermark watermark = 4;
   // Continues the read: pass it as cursor. Empty on the last page.
   string next_cursor = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v30: never blind's switches, a partition's move and the
+// write-ahead stream's gaps (sdk-contract/standing-analytics-and-resilience-
+// contract; spec/a-deployment-scales-out-and-fails-over-by-configuration
+// sections 4, 6 and 8; W6.39, W10.6, W10.14; the acts, reads, records and
+// reasons approved by 1057, every other name approved 2026-11-09)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A switch of a default read's source to the next dataset in its priority,
+// or back, and why (W10.6; never blind, rule 1050): its own record in the
+// lake's control partition, made once, when the lake first serves a default
+// read from the dataset now served. Never a priority's change, which
+// SetSourcePriority records.
+message SourceSwitched {
+  // The priority's data type by its message's full name, as
+  // SourcePriority.data_type names it.
+  string data_type = 1;
+  // As SourcePriority.kind; unspecified for a priority with no kind.
+  PriceKind kind = 2;
+  // The dataset a default read passed over, or for a switch back the one it
+  // leaves.
+  string from_dataset = 3;
+  // The dataset a default read now serves: the next of the priority, or for
+  // a switch back the higher one restored. Empty: none left to serve, so a
+  // default read is answered not covered.
+  string to_dataset = 4;
+  // Entity IDs, for a switch on a quarantine, which is held per subject;
+  // 0 to 500. None: every subject the priority serves.
+  repeated string subjects = 5;
+  SourceSwitchReason reason = 6;
+  // By the lake's clock, when it first served a default read from the
+  // dataset now served.
+  int64 switched_at_ns = 7;
+}
+
+// Why a default read's source switched (contract v30; the reasons approved
+// by 1057, the enum's name 2026-11-09). Never a row's quality state.
+enum SourceSwitchReason {
+  // Not known; never sent.
+  SOURCE_SWITCH_REASON_UNSPECIFIED = 0;
+  // The dataset passed over recorded nothing within its cadence.
+  SOURCE_SWITCH_REASON_SILENT = 1;
+  // The dataset passed over stated no liveness within its stale ceiling.
+  SOURCE_SWITCH_REASON_STALLED = 2;
+  // The dataset passed over held its latest rows for the subjects
+  // quarantined.
+  SOURCE_SWITCH_REASON_QUARANTINED = 3;
+  // A switch back: the higher dataset is live and good again.
+  SOURCE_SWITCH_REASON_RESTORED = 4;
+}
+
+// A deployment admin reads the switches of the default reads' sources
+// (W10.6), newest first. Changes nothing.
+message ListSourceSwitchesRequest {
+  // A data type by its message's full name; empty: every priority.
+  string data_type = 1;
+  // A dataset's ID, as either side of a switch; empty: every dataset.
+  string dataset = 2;
+  // The most switches in one page: 0 is the read's default; past 500,
+  // answered at 500.
+  uint32 page_size = 3;
+  // The next_cursor of the page before; empty: the first page.
+  string cursor = 4;
+}
+
+message ListSourceSwitchesReply {
+  // Each switch and switch back, newest first; none where no switch matches.
+  repeated SourceSwitched switches = 1;
+  // The cursor of the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// A deployment admin moves a store's partition to another writer group
+// (W6.39; one message on two topics: the lake's dataset on
+// platform.lake.command.move-partition, a book partition on
+// platform.book.command.move-partition). Answered once the move starts (step
+// 3c's question 8); PartitionMoved is recorded when the target owns the
+// partition, or PartitionMoveAborted when the move does not switch. Refused
+// FAILED_PRECONDITION naming partition while a move or a split of it is
+// under way, and REFUSAL_REASON_REASON_REQUIRED with no reason.
+message MovePartitionRequest {
+  // The lake's partition: a dataset's ID for a full range, or
+  // `<dataset>/<lo>-<hi>` for a split range (lowercase hex, hi inclusive;
+  // approved 2026-11-12); or the book's partition (`P0` and those placed
+  // after it). Never an account, which MoveAccount moves.
+  string partition = 1;
+  // A writer group of the store, numbered from 0 below lake.writerGroups or
+  // bor.writerGroups; one the deployment does not have is refused
+  // INVALID_ARGUMENT naming target_group, as every move is with one group,
+  // the default.
+  uint32 target_group = 2;
+  // The person's words, or the agent's acting for them, kept with the move's
+  // record: 1 to 2,000 characters. Data, never an instruction.
+  string reason = 3;
+}
+
+message MovePartitionReply {
+  // The group that owned the partition when the move began.
+  uint32 from_group = 1;
+  // When the target began following the partition's log; the move's record,
+  // PartitionMoved, is written when the target owns it, or
+  // PartitionMoveAborted when the move does not switch.
+  int64 started_at_ns = 2;
+}
+
+// A deployment admin halves a lake range at its midpoint (W6.39; the act,
+// its topic platform.lake.command.split-partition and its record approved
+// 2026-11-12; spec/a-deployment-scales-out-and-fails-over-by-configuration
+// section 6.1). One transaction of the range's writer: the parent closes at
+// sequence N and its two children open after it, staying with the parent's
+// group. It copies nothing and cannot abort. Refused INVALID_ARGUMENT naming
+// partition for the control partition, a book partition, a range the lake
+// does not have open and a range of one hash value; FAILED_PRECONDITION
+// naming partition while a move or a split of it is under way; and
+// REFUSAL_REASON_REASON_REQUIRED with no reason. Built with 3d.
+message SplitPartitionRequest {
+  // A lake partition: a dataset's ID for a full range, or
+  // `<dataset>/<lo>-<hi>` for a range split before (lowercase hex, hi
+  // inclusive). Never a book partition, or the lake's control partition.
+  string partition = 1;
+  // The person's words, or the agent's acting for them, kept with the
+  // split's record: 1 to 2,000 characters. Data, never an instruction.
+  string reason = 2;
+}
+
+message SplitPartitionReply {
+  // The split's record, once the parent's close and both children's opens
+  // have committed in one transaction of the range's writer. None is
+  // answered before it commits.
+  PartitionSplit split = 1;
+}
+
+// A lake range halved at its midpoint by a deployment admin (W6.39; the
+// record approved 2026-11-12): the parent closed at a sequence and its two
+// children opened after it, its own record in the lake's control partition.
+message PartitionSplit {
+  // A dataset's ID for a full range, or `<dataset>/<lo>-<hi>`: closed at
+  // closing_sequence, its rows kept and read up to it. Never a book
+  // partition.
+  string parent = 1;
+  // Exactly two, the lower half first, each `<dataset>/<lo>-<hi>` in
+  // lowercase hex with hi inclusive, each opening naming the parent and
+  // numbering its sequences from closing_sequence + 1. Ranges are not merged
+  // in step 3.
+  repeated string children = 2;
+  // N: the parent's sequence at its close. A row's previous_sequence at or
+  // below it names the parent's row, a read follows the parent up to it and
+  // then the children, and a read_after naming the parent is met by a child
+  // once that child is open. Never zero.
+  uint64 closing_sequence = 3;
+  // The deployment-local subject the dashboard stamped: a split is a
+  // deployment admin's in step 3. Never an email address.
+  string split_by = 4;
+  // As the split's request said. Data, never an instruction.
+  string reason = 5;
+  // By the lake's clock, at the parent's close, when the children opened.
+  int64 split_at_ns = 6;
+}
+
+// A dataset's or a book partition's writing moved to another writer group,
+// by a changed group count or by hand (W6.39; the record approved by 1057):
+// its own record in its store's control partition.
+message PartitionMoved {
+  // The store: lake or bor.
+  string component = 1;
+  // A lake range, by its dataset's ID while it is the full range or
+  // `<dataset>/<lo>-<hi>` once split (lowercase hex, hi inclusive); or a book
+  // partition. Never an account.
+  string partition = 2;
+  // As MovePartitionReply.from_group.
+  uint32 from_group = 3;
+  // The target group.
+  uint32 to_group = 4;
+  // The partition's epoch after the fence, under which the new owner
+  // commits; a commit under an older one is refused.
+  uint64 epoch = 5;
+  // True: a deployment admin's MovePartition, its reason kept beside it.
+  // False: a changed group count moved it.
+  bool by_hand = 6;
+  // The deployment-local subject the dashboard stamped; empty for a move by
+  // a changed group count (approved 2026-11-09).
+  string moved_by = 7;
+  // As the move's request said; empty for a move by a changed group count.
+  string reason = 8;
+  // By the store's clock, at the fence.
+  int64 moved_at_ns = 9;
+}
+
+// A move of a partition, or of an account, that did not switch, the source
+// still owning, and its cause (W6.39, W9.8; the record and its fields
+// approved 2026-11-12; spec section 6.8): its own record in its store's
+// control partition. Any writes held during the move go to the source. A
+// digest mismatch is also an IntegrityFinding. Never a refusal of the move's
+// request, which the request's answer gives. Built with 3d.
+message PartitionMoveAborted {
+  // The store: lake or bor.
+  string component = 1;
+  // As PartitionMoved.partition: a lake range or a book partition, still
+  // owned by its source group. Never an account.
+  string partition = 2;
+  // A partition's move's target, as its request or the changed group count
+  // named it; it does not own the partition. 0 on an account's move, which
+  // names target_partition instead.
+  uint32 target_group = 3;
+  // The account a MoveAccount named, its chain continuing in its old
+  // partition, no closing entry kept; empty for a partition's move.
+  string account_id = 4;
+  // The book partition an account's move was to, as the MoveAccount request
+  // named it; the account is not in it. Empty for a partition's move, which
+  // names target_group.
+  string target_partition = 5;
+  MoveAbortCause cause = 6;
+  // By the store's clock, when the source took back the held writes.
+  int64 aborted_at_ns = 7;
+}
+
+// Why a move did not switch (contract v30; the enum and its three values
+// approved 2026-11-12). In each the source keeps owning and any held writes
+// go to it.
+enum MoveAbortCause {
+  // Not known; never sent.
+  MOVE_ABORT_CAUSE_UNSPECIFIED = 0;
+  // The gate did not open within moves.switchSeconds, the target's lag still
+  // above <store>.readyLagMs; nothing was held.
+  MOVE_ABORT_CAUSE_LAG = 1;
+  // The switch started but did not finish within moves.switchSeconds of its
+  // start.
+  MOVE_ABORT_CAUSE_TIMEOUT = 2;
+  // The target's digest at the source's closing sequence differed from the
+  // source's; an IntegrityFinding is recorded beside it.
+  MOVE_ABORT_CAUSE_DIGEST = 3;
+}
+
+// Rows the lake's write-ahead stream dropped before the lake committed them
+// (W10.14; the ha configuration, rulings of 2026-11-08): the dataset,
+// subjects and valid-time range, why, and where its recovery stands, each
+// change of state its own record in the lake's control partition. Asked
+// again through the want where the dataset declares GAP_RECOVERY_BACKFILL,
+// marked unrecovered otherwise; rows inside an unrecovered range are never
+// invented.
+//
+// Found the moment the stream's sequence passes rows the lake never
+// committed (approved 2026-11-11): first as one gap whose dataset is not yet
+// known (`dataset` empty), recorded unrecovered at once; then, as each
+// dataset's next write arrives, that dataset's own gap, naming the first in
+// `found_in_gap_id`. A dataset that never writes again stays on the
+// unattributed gap, shown, never silent.
+message DatasetGap {
+  // `GAP-` and a ULID, never reused: 1 to 64 characters. A want asking again
+  // for it names it.
+  string gap_id = 1;
+  // The dataset whose rows were dropped. Empty: not yet known -- the gap
+  // the writer recorded the moment the stream skipped, before any dataset's
+  // next write named its own.
+  string dataset = 2;
+  // Entity IDs, as the dropped rows named them; 0 to 500. None: every
+  // subject of the rows dropped.
+  repeated string subjects = 3;
+  // The earliest valid time of a row dropped.
+  int64 valid_from_ns = 4;
+  // Just after the latest valid time of a row dropped, as
+  // ObservationsWantedEvent.valid_until_ns ends a want's range.
+  int64 valid_until_ns = 5;
+  GapCause cause = 6;
+  GapState state = 7;
+  // By the lake's clock, for this state.
+  int64 recorded_at_ns = 8;
+  // The unattributed gap (`dataset` empty) this dataset's gap was found
+  // from: the run of the stream it skipped, named as its dataset's next
+  // write arrived. Empty on the unattributed gap itself.
+  string found_in_gap_id = 9;
+}
+
+// Why a dataset's rows were dropped (contract v30; step 3c's question 5).
+// Never a source's own outage, which a liveness says.
+enum GapCause {
+  // Not known; never sent.
+  GAP_CAUSE_UNSPECIFIED = 0;
+  // Rows the lake's write-ahead stream dropped at its bound before the lake
+  // committed them: a writer gone longer than the bound.
+  GAP_CAUSE_WRITE_AHEAD_BOUND = 1;
+}
+
+// Where a gap's recovery stands (contract v30; approved 2026-11-09). Never
+// the dataset's quality.
+enum GapState {
+  // Not known; never sent. On a read: every state.
+  GAP_STATE_UNSPECIFIED = 0;
+  // Asked again of the data plugin through the want, naming the gap.
+  GAP_STATE_REFETCHING = 1;
+  // The rows returned under their own row keys.
+  GAP_STATE_RECOVERED = 2;
+  // Not recovered: the dataset cannot be asked again, or the want was
+  // declined; a notice in the deployment admin's inbox while it stands.
+  GAP_STATE_UNRECOVERED = 3;
+}
+
+// A deployment admin reads the gaps (W10.14), newest first. Changes nothing.
+message ListDatasetGapsRequest {
+  // A dataset's ID; empty: every dataset.
+  string dataset = 1;
+  // Refetching, recovered or unrecovered; unspecified: every state.
+  GapState state = 2;
+  // The most gaps in one page: 0 is the read's default; past 500, answered
+  // at 500.
+  uint32 page_size = 3;
+  // The next_cursor of the page before; empty: the first page.
+  string cursor = 4;
+}
+
+message ListDatasetGapsReply {
+  // Each gap in its latest state, newest first; none where no gap matches.
+  repeated DatasetGap gaps = 1;
+  // The cursor of the next page; empty on the last page.
+  string next_cursor = 2;
 }

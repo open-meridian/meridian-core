@@ -62,6 +62,9 @@ spec:
               value: {{ .Values.deployment.id | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Its working memory (stage M; the resilience spec's section 10a),
+            # and glibc's arenas and mmap threshold, as every component's.
+            {{- include "meridian-runtime.memoryEnv" (dict "top" $ "container" "street" "values" .Values.street "resources" .Values.resources "heldMiB" 0 "name" "street") | nindent 12 }}
             - name: MERIDIAN_STREET_DATABASE_URL
               valueFrom:
                 secretKeyRef:

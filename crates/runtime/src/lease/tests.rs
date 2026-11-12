@@ -193,6 +193,82 @@ fn the_renew_deadline_falls_before_the_lease_ends() {
     let mut bad = settings("x");
     bad.duration = Duration::from_secs(2);
     assert!(bad.check().unwrap_err().contains("leases.renewSeconds"));
+    // A lease lasts at least three renewals (contract v30, stage C).
+    let mut short = settings("x");
+    short.duration = Duration::from_secs(5);
+    assert!(short
+        .check()
+        .unwrap_err()
+        .contains("at least three times leases.renewSeconds"));
+    short.duration = Duration::from_secs(6);
+    assert!(short.check().is_ok());
+}
+
+/// A standby that could not read the lease while the API server did not
+/// answer counts none of that time toward its expiry (contract v30, stage
+/// C): answered again, it watches a whole lease duration before it takes
+/// it, and the holder, renewing, keeps it.
+#[test]
+fn a_standby_never_counts_a_stretch_it_could_not_watch_as_the_holders_silence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Flaky {
+        inner: Memory,
+        down: Arc<AtomicBool>,
+    }
+    impl Leases for Flaky {
+        async fn get(&self, name: &str) -> Result<Option<Record>, String> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err("the API server did not answer".into());
+            }
+            self.inner.get(name).await
+        }
+        async fn create(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+            self.inner.create(name, record).await
+        }
+        async fn update(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+            self.inner.update(name, record).await
+        }
+    }
+    run(async {
+        let api = Memory::default();
+        let down = Arc::new(AtomicBool::new(false));
+        let mut writer = Elector::new(api.clone(), settings("writer"));
+        let mut standby = Elector::new(
+            Flaky {
+                inner: api.clone(),
+                down: down.clone(),
+            },
+            settings("standby"),
+        );
+        let t0 = Instant::now();
+        assert_eq!(writer.look(t0, 0).await.unwrap(), Standing::Held);
+        assert!(matches!(
+            standby.look(t0, 0).await.unwrap(),
+            Standing::HeldBy(_)
+        ));
+        // The API server lost to the standby for 30 s.
+        down.store(true, Ordering::SeqCst);
+        assert!(standby.look(t0 + Duration::from_secs(15), 0).await.is_err());
+        down.store(false, Ordering::SeqCst);
+        // Answered again: the record unchanged since the standby last saw it,
+        // and still the writer's for a whole lease from now.
+        let back = t0 + Duration::from_secs(30);
+        assert!(
+            matches!(standby.look(back, 0).await.unwrap(), Standing::HeldBy(_)),
+            "never taken on time it did not watch"
+        );
+        assert_eq!(
+            writer.look(back + Duration::from_secs(1), 0).await.unwrap(),
+            Standing::Held
+        );
+        assert!(matches!(
+            standby
+                .look(back + Duration::from_secs(5), 0)
+                .await
+                .unwrap(),
+            Standing::HeldBy(_)
+        ));
+    });
 }
 
 #[test]

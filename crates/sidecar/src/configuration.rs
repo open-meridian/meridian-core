@@ -57,6 +57,12 @@ pub struct Configuration {
 // would buy nothing.
 #[allow(clippy::result_large_err)]
 impl Configuration {
+    /// The bus it reads by: its session sees what is delivered (contract
+    /// v30, stage B).
+    pub(crate) fn bus(&self) -> &Arc<Bus> {
+        &self.bus
+    }
+
     pub(crate) fn new(bus: Arc<Bus>, instance: String) -> Configuration {
         Configuration {
             clock: bus.clock(),

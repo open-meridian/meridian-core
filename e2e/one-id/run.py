@@ -319,7 +319,11 @@ def run():
             + "; INSERT INTO instrument_identifier (instrument_id, scheme, value, source, "
             "valid_from_ns) VALUES "
             + ", ".join(f"('{lcl}', 'iso4217', '{code}', '', 0)" for lcl, code, _ in KEPT_BEFORE_V24)
-            + ";")
+            # As a deployment holding records kept before v24 stands: its
+            # migration not done. This one's finished at its install with
+            # none to send, and a migration once done reads no record again
+            # (stage M; the store memory audit's item 3).
+            + "; DELETE FROM instrument_state WHERE key = 'migration_v24_done_at_ns';")
     compose("exec", "-T", "postgres", "psql", "-U", "meridian", "-d", "meridian",
             "-v", "ON_ERROR_STOP=1", "-c", seed)
     gbp1, gbp2, chf = (lcl for lcl, _, _ in KEPT_BEFORE_V24)

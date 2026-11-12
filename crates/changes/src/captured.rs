@@ -30,6 +30,9 @@ pub const FENCED_STATE: &str = "MF001";
 /// What a store captures, and where.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
+    /// The component whose store this is, as its records name it: the
+    /// conductor's for the configuration store.
+    pub component: &'static str,
     /// Names the change table (`{prefix}_change`), the trigger function and
     /// the connection's epoch setting.
     pub prefix: &'static str,
@@ -46,6 +49,11 @@ pub struct Spec {
 }
 
 impl Spec {
+    /// Every partition the log keeps: the store's own, and `control`.
+    pub fn partitions(&self) -> [&'static str; 2] {
+        [self.partition, CONTROL]
+    }
+
     fn change_table(&self) -> String {
         format!("{}_change", self.prefix)
     }
@@ -156,6 +164,10 @@ impl Spec {
                 ADD COLUMN IF NOT EXISTS tx        xid8,
                 ADD COLUMN IF NOT EXISTS ordinal   integer NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS claimed   boolean NOT NULL DEFAULT false;
+            -- The database's identity the writer last saw, on the control
+            -- row (contract v30, stage C): a new timeline raises the epoch.
+            ALTER TABLE {head}
+                ADD COLUMN IF NOT EXISTS database_identity text NOT NULL DEFAULT '';
             INSERT INTO {head} (partition, sequence) VALUES ('{partition}', 0), ('{CONTROL}', 0)
                 ON CONFLICT (partition) DO NOTHING;
             -- What the store held before its log began is not in it: a
@@ -394,6 +406,42 @@ impl Spec {
     ) -> Result<u64, postgres::Error> {
         let mut tx = client.transaction()?;
         crate::end_deposed_writers(&mut tx, &[self.head])?;
+        let epoch = self.raise(&mut tx, by)?;
+        tx.commit()?;
+        Ok(epoch)
+    }
+
+    /// Follow the database's timeline for the writer at epoch `mine`
+    /// (contract v30, stage C; [`crate::timeline`]): on a new one, the epoch
+    /// raised as a takeover raises it, the takeover recorded with
+    /// [`crate::timeline::DATABASE_TIMELINE`] by `member`, in one
+    /// transaction. Answers what was found, and the identity now.
+    pub fn follow_timeline(
+        &self,
+        client: &mut impl GenericClient,
+        mine: u64,
+        member: &str,
+    ) -> Result<(crate::timeline::Timeline, String), postgres::Error> {
+        let mut tx = client.transaction()?;
+        let by = crate::TookOver {
+            member: member.to_string(),
+            previous: String::new(),
+            why: crate::timeline::DATABASE_TIMELINE.to_string(),
+            at_ns: crate::now_ns(),
+        };
+        let found =
+            crate::timeline::follow(&mut tx, self.head, CONTROL, mine, |tx| self.raise(tx, &by))?;
+        tx.commit()?;
+        Ok(found)
+    }
+
+    /// Raise the epoch of the partition and its control partition, and
+    /// record who raised it and why, in `tx`: answer the epoch.
+    fn raise(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        by: &crate::TookOver,
+    ) -> Result<u64, postgres::Error> {
         let epoch: i64 = tx
             .query_one(
                 &format!(
@@ -422,8 +470,53 @@ impl Spec {
                 &by.at_ns,
             ],
         )?;
-        tx.commit()?;
+        // And in the control partition, in the same transaction (contract
+        // v30, stage D): the record the conductor reads.
+        self.log_control(
+            tx,
+            &crate::records::Record::TookOver(crate::records::took_over(
+                self.component,
+                by,
+                partitions,
+                epoch as u64,
+            )),
+            by.at_ns,
+        )?;
         Ok(epoch as u64)
+    }
+
+    /// Append one of the store's own records to its `control` partition in
+    /// `tx` (contract v30, stage D; [`crate::records`]): the next sequence
+    /// from the control head row, under that row's lock and its epoch now,
+    /// its digest beside it as every captured change's. Nothing here applies
+    /// it: a follower's captured apply passes over a kind that is no table's.
+    pub fn log_control(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        record: &crate::records::Record,
+        at_ns: i64,
+    ) -> Result<(), postgres::Error> {
+        let kind = match record {
+            crate::records::Record::TookOver(_) => crate::records::TOOK_OVER,
+            crate::records::Record::Finding(_) => crate::records::FINDING,
+        };
+        let body = crate::records::to_json(record).to_string();
+        tx.execute(
+            &format!(
+                "WITH next AS (
+                    UPDATE {head} SET sequence = sequence + 1
+                     WHERE partition = '{CONTROL}' RETURNING sequence, epoch)
+                 INSERT INTO {change} (partition, sequence, ordinal, epoch, committed_at_ns, kind,
+                                       body, digest)
+                 SELECT '{CONTROL}', next.sequence, 0, next.epoch, $1, $2, $3::text::jsonb,
+                        sha256(convert_to($3::text::jsonb::text, 'UTF8'))
+                   FROM next",
+                head = self.head,
+                change = self.change_table()
+            ),
+            &[&at_ns, &kind, &body],
+        )?;
+        Ok(())
     }
 
     /// The partition's epoch now, as its head row says: what a writer
@@ -440,6 +533,18 @@ impl Spec {
 
     /// A page of the partition's changes after `after`: each transaction's
     /// rows one change, never split across pages.
+    ///
+    /// Read by the log's key alone (`enable_seqscan` off for its
+    /// transaction): every question asked of a log is a range of one
+    /// partition's sequences, and a log small enough that Postgres would
+    /// scan it whole once analysed (a few pages) otherwise reads every page
+    /// to answer one -- so a page damaged anywhere in it failed every read,
+    /// the `control` partition's too, which holds no rows here and is what a
+    /// member's probe and followers ask (the tolerant bit-rot class: failover-
+    /// repeat 42977259116, the configuration store's log, its first page
+    /// flipped, refused the probe's read of `control` with "invalid page in
+    /// block 0" until the class gave up). A damaged page still fails the
+    /// reads that reach its rows, and the scrub records it.
     pub fn read(
         &self,
         client: &mut impl GenericClient,
@@ -450,6 +555,22 @@ impl Spec {
         if partition != self.partition && partition != CONTROL {
             return Err(ReadError::UnknownPartition(partition.to_string()));
         }
+        let unavailable = |failed: postgres::Error| ReadError::Unavailable(failed.to_string());
+        let mut tx = client.transaction().map_err(unavailable)?;
+        tx.batch_execute("SET LOCAL enable_seqscan = off")
+            .map_err(unavailable)?;
+        let page = self.read_by_key(&mut tx, partition, after, most_bytes)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(page)
+    }
+
+    fn read_by_key(
+        &self,
+        client: &mut impl GenericClient,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
         let unavailable = |failed: postgres::Error| ReadError::Unavailable(failed.to_string());
         let head_row = client
             .query_opt(

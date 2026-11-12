@@ -73,6 +73,10 @@ pub fn routes() -> Router<Arc<App>> {
         // ReadBookHealthFromTerminal (contract v25; ruling 155): what
         // `meridian status` reads of the book.
         .route("/terminal/book-health", get(book_health))
+        // ReadResilienceProfile (contract v30, W6.39): what `meridian status
+        // --profile` prints, as the Resilience page's Profile tab and
+        // `dashboard__read_resilience_profile` read it.
+        .route("/terminal/resilience-profile", get(resilience_profile))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
         // Contract v26 (the v26 plan's question 237): the registry's acts
@@ -803,6 +807,28 @@ async fn book_health(State(app): State<Arc<App>>, headers: HeaderMap) -> Respons
     json(StatusCode::OK, serde_json::json!({ "accounts": accounts }))
 }
 
+/// `GET /terminal/resilience-profile`: the resilience profile, a deployment
+/// admin's read, answered as `dashboard__read_resilience_profile` answers it.
+async fn resilience_profile(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let admin = match admin(&app, &headers).await {
+        Ok(admin) => admin,
+        Err(refusal) => return *refusal,
+    };
+    let reply: Result<meridian_domain::v1::ReadResilienceProfileReply, String> = ask(
+        &app,
+        &admin,
+        crate::admin::resilience::READ_RESILIENCE_PROFILE,
+        "meridian.v1.ReadResilienceProfileRequest",
+        meridian_domain::v1::ReadResilienceProfileRequest {},
+        Duration::from_secs(10),
+    )
+    .await;
+    match reply {
+        Ok(reply) => json(StatusCode::OK, crate::mcp::resilience::profile_json(&reply)),
+        Err(failed) => refused(StatusCode::BAD_GATEWAY, failed),
+    }
+}
+
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let person: Result<Admin, ()> = match admin(&app, &headers).await {
         Ok(admin) => Ok(admin),
@@ -877,6 +903,16 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 "pull_kept": pulled.as_ref().map(|_| {
                     running.is_some_and(|v| crate::registry::pull_warning(launch, v, &listings).is_none())
                 }),
+                // As its launch asked (contract v30, W8.3), read back by
+                // `meridian plugin list`: its own share at its sidecar, null
+                // for the deployment's, and its shards and standby pod.
+                "limits": launch.limits.as_ref().map(|l| serde_json::json!({
+                    "in_flight": l.in_flight,
+                    "requests_per_second": l.requests_per_second,
+                    "answer_mib": l.answer_mib,
+                })),
+                "shards": launch.shards,
+                "standby": launch.standby,
             })
         })
         .collect();
@@ -884,6 +920,48 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         StatusCode::OK,
         serde_json::json!({ "versions": versions, "launches": launches }),
     )
+}
+
+/// A launch's own share at its sidecar (contract v30, W8.3; the
+/// resilience spec's section 10a; ruled 2026-11-11), from what was entered:
+/// each a whole number above 0, or empty for the chart's sidecar.limits.
+/// None where every one is empty. Refused naming the first that is not.
+pub(crate) fn sidecar_limits(
+    in_flight: &str,
+    requests_per_second: &str,
+    answer_mib: &str,
+) -> Result<Option<meridian_domain::v1::SidecarLimits>, String> {
+    let said = |value: &str, name: &str| -> Result<u32, String> {
+        match value.trim() {
+            "" => Ok(0),
+            text => text
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("limits.{name} is {text:?}: a whole number above 0, or empty for the deployment's")),
+        }
+    };
+    let limits = meridian_domain::v1::SidecarLimits {
+        in_flight: said(in_flight, "in_flight")?,
+        requests_per_second: said(requests_per_second, "requests_per_second")?,
+        answer_mib: said(answer_mib, "answer_mib")?,
+        // The lake write share (approved 2026-11-12) is 3d's: the sheet
+        // asks none, so the chart's.
+        write_mib_per_second: 0,
+    };
+    Ok((limits != meridian_domain::v1::SidecarLimits::default()).then_some(limits))
+}
+
+/// A launch's limits as the terminal sends them (contract v30): each
+/// optional, 0 or absent for the chart's.
+#[derive(serde::Deserialize, Default)]
+struct LaunchLimits {
+    #[serde(default)]
+    in_flight: u32,
+    #[serde(default)]
+    requests_per_second: u32,
+    #[serde(default)]
+    answer_mib: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -900,6 +978,16 @@ struct Launch {
     /// Why, kept with the launch (contract v17); the CLI sends none yet.
     #[serde(default)]
     note: String,
+    /// Its own share at its sidecar (contract v30); none for the chart's.
+    #[serde(default)]
+    limits: Option<LaunchLimits>,
+    /// Its shards and standby pod (contract v30, W8.3; `meridian plugin
+    /// launch --shards`, `--standby`, approved by 1057 and 1060): kept on
+    /// the launch, the launcher still running one pod (3d builds them).
+    #[serde(default)]
+    shards: u32,
+    #[serde(default)]
+    standby: bool,
 }
 
 async fn launch(
@@ -918,6 +1006,21 @@ async fn launch(
         approved_roles: asked.approved_roles,
         live: asked.live,
         note: asked.note,
+        // Its own share at its sidecar (contract v30; ruled 2026-11-11).
+        limits: asked
+            .limits
+            .map(|l| meridian_domain::v1::SidecarLimits {
+                in_flight: l.in_flight,
+                requests_per_second: l.requests_per_second,
+                answer_mib: l.answer_mib,
+                // The lake write share (approved 2026-11-12) is 3d's.
+                write_mib_per_second: 0,
+            })
+            .filter(|l| *l != meridian_domain::v1::SidecarLimits::default()),
+        // Contract v30's shards and standby (W8.3), kept on the launch;
+        // the pods are 3d's.
+        shards: asked.shards,
+        standby: asked.standby,
     };
     // Longer than the conductor gives the launcher, so its answer arrives.
     let launched: Result<PluginLaunch, String> = ask(
@@ -996,6 +1099,7 @@ fn registry_refused(reason: &str) -> Response {
                 meridian_bus::RefusalStatus::NotFound => StatusCode::NOT_FOUND,
                 // Contract v29 (616): as the deployment stands, nothing moved.
                 meridian_bus::RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
+                meridian_bus::RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             },
             serde_json::json!({"error": words, "fields": fields}),
         ),

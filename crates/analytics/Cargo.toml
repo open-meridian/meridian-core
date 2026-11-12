@@ -9,6 +9,7 @@ description = "The analytics component: the coordinator and the worker pool, ans
 [dependencies]
 meridian-analytics-engine = { path = "../analytics-engine" }
 meridian-bus = { path = "../bus" }
+meridian-budget.workspace = true
 meridian-clock.workspace = true
 meridian-domain.workspace = true
 meridian-pb.workspace = true

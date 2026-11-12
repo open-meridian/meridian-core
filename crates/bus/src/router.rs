@@ -27,7 +27,7 @@ pub use crate::backend::HandlerReply;
 /// What a sidecar stamps on a question it asks for its plugin, and a core
 /// component never does (decisions/014): the person it is asked for, and the
 /// plugin's read scope.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stamp {
     /// The person a command is sent for; empty when the plugin acts as itself.
     pub acting_for_subject: String,
@@ -97,6 +97,147 @@ pub struct Stamp {
     /// store reads it only from the analytics component; empty everywhere
     /// else.
     pub on_behalf_of_instance_id: String,
+
+    /// The watermark a read must not be answered behind (contract v30, W4.4):
+    /// stamped by the sidecar's session on its plugin's reads (see
+    /// [`crate::read_after`]), never by a plugin. `None` reads from the
+    /// nearest member, eventually consistent.
+    pub read_after: Option<meridian_pb::v1::Watermark>,
+}
+
+/// Who a request is asked by, for its component's fair shares (the
+/// resilience spec's section 10a): its calling instance -- a plugin's, by
+/// its sidecar -- and, where the call names one, the delegation or else the
+/// person it is asked for, and the client instance the analytics component
+/// reads for. A browser's calls are keyed by the person; a delegation's by
+/// the delegation.
+pub fn caller_of(meta: Option<&MessageMeta>) -> String {
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let mut caller = meta.publisher_instance_id.clone();
+    let narrower = [
+        ("d", &meta.acting_through_delegation),
+        ("p", &meta.acting_for_subject),
+        ("i", &meta.on_behalf_of_instance_id),
+    ]
+    .into_iter()
+    .find(|(_, said)| !said.is_empty());
+    if let Some((kind, said)) = narrower {
+        caller.push('|');
+        caller.push_str(kind);
+        caller.push(':');
+        caller.push_str(said);
+    }
+    caller
+}
+
+/// Requests dropped because their caller's deadline passed while they
+/// waited for their turn, since the process started: counted apart from
+/// the refusals for load (the research batch's item 5).
+static EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`EXPIRED`]'s count.
+pub fn expired_requests() -> u64 {
+    EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A request dropped, its caller gone: counted and said, and answered to
+/// nobody waiting.
+fn expired(topic: &str, caller: &str) -> String {
+    EXPIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        topic,
+        caller,
+        "a request dropped: its caller's deadline passed while it waited for its turn"
+    );
+    crate::backend::refusal_with_status(
+        crate::backend::RefusalStatus::Unavailable,
+        &[],
+        format!("{topic} was dropped: its caller's deadline passed while it waited for its turn"),
+    )
+}
+
+/// Admit a request on `topic` at this process's gate and budget, and run
+/// `handler` on the blocking pool within its reservation; refused for load,
+/// with its retry-after, where it waited its while (section 10a).
+pub(crate) async fn admitted(
+    topic: &str,
+    envelope: Envelope,
+    handler: Handler,
+    deadline: Option<std::time::Instant>,
+) -> std::result::Result<HandlerReply, tokio::task::JoinError> {
+    let class = meridian_budget::Class::of_topic(topic);
+    let caller = caller_of(envelope.meta.as_ref());
+    let bytes = envelope.payload.len() as u64;
+    let what = format!(
+        "{topic} for {}",
+        if caller.is_empty() { "itself" } else { &caller }
+    );
+    let admit = meridian_budget::process().admit(class, &caller, bytes, &what);
+    // A request whose caller has stopped waiting is dropped, never run
+    // (the research batch's item 5, approved 2026-11-10): while it waits
+    // for its turn, or as its turn comes.
+    let admitted = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline.into(), admit).await {
+            Ok(admitted) => admitted,
+            Err(_) => return Ok(Err(expired(topic, &caller))),
+        },
+        None => admit.await,
+    };
+    match admitted {
+        Ok(_) if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) => {
+            Ok(Err(expired(topic, &caller)))
+        }
+        Err(over) => {
+            tracing::info!(
+                topic,
+                caller,
+                retry_after_seconds = over.retry_after_seconds,
+                "{}",
+                over.words
+            );
+            Ok(Err(crate::backend::overloaded(&over)))
+        }
+        Ok(admitted) => {
+            let answered = tokio::task::spawn_blocking(move || {
+                admitted
+                    .within(|| crate::read_after::within_deadline(deadline, || handler(envelope)))
+            })
+            .await;
+            Ok(cancelled_for_load(topic, answered?))
+        }
+    }
+}
+
+/// What a store's error carries in its words when the database cancelled
+/// its query at the serving session's `statement_timeout` (SQLSTATE 57014;
+/// meridian_changes::serving).
+pub const CANCELLED_QUERY: &str = "[sqlstate 57014]";
+
+/// How long a request whose query was cancelled is told to wait.
+const CANCELLED_RETRY_AFTER_SECONDS: u32 = 5;
+
+/// An answer whose query the database cancelled at its statement_timeout:
+/// this component's own refusal for load, with a retry-after (the
+/// resilience spec's section 10a), never the database's failure.
+pub(crate) fn cancelled_for_load(topic: &str, answered: HandlerReply) -> HandlerReply {
+    match answered {
+        Err(said) if said.contains(CANCELLED_QUERY) => {
+            tracing::info!(
+                topic,
+                "a query past its statement_timeout was cancelled: {said}"
+            );
+            meridian_budget::count_refusal();
+            Err(crate::backend::overloaded(&meridian_budget::Overloaded {
+                retry_after_seconds: CANCELLED_RETRY_AFTER_SECONDS,
+                words: format!(
+                    "overloaded: {topic}'s query ran past its statement_timeout and was cancelled"
+                ),
+            }))
+        }
+        answered => answered,
+    }
 }
 
 /// The bus.
@@ -120,7 +261,19 @@ pub struct Bus {
     /// (ruling 798): a sidecar's front door names the calls its plugin made
     /// while a page was being answered.
     observer: RwLock<Option<CallObserver>>,
+
+    /// `read_after` (contract v30, stage B): the positions of the stores this
+    /// process serves the reads of, and a sidecar's session.
+    reads: Arc<crate::read_after::Reads>,
+
+    /// A reader member's serve mode (contract v30, stage B; the resilience
+    /// spec's section 1): the topics it serves, every other declined. Unset,
+    /// as every writer and every other component, everything is served.
+    serves_only: RwLock<Option<Serves>>,
 }
+
+/// Which topics a reader member serves.
+type Serves = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What [`Bus::observe_calls`] is told of each call: its topic, when it was
 /// asked and how long its answer took. Never its payload.
@@ -202,11 +355,26 @@ impl Bus {
             default_timeout: Duration::from_secs(5),
             clock,
             observer: RwLock::new(None),
+            reads: Arc::default(),
+            serves_only: RwLock::new(None),
         }
     }
 
+    /// Route the topics `rules` match to the backends they name, beside the
+    /// rules already given: each transport adds its own routes -- the lake's
+    /// write-ahead stream's in `ha`, a second data-plane transport's later --
+    /// and none takes another's away. The first rule matching a topic wins.
     pub fn with_rules(mut self, rules: Vec<RouteRule>) -> Self {
-        self.rules = rules;
+        self.rules.extend(rules);
+        self
+    }
+
+    /// A second backend, by name, for the rules that name it: a transport
+    /// beside the default one, as the lake's write-ahead stream is in `ha`
+    /// ([`crate::write_ahead`]). Everything above the backends -- stamping,
+    /// `read_after`, the gate -- is the bus's, whichever carries a message.
+    pub fn with_backend(mut self, name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
+        self.backends.insert(name.into(), backend);
         self
     }
 
@@ -290,6 +458,14 @@ impl Bus {
     /// `work`, so two subscriptions of one process to one topic for
     /// different work each hear it. At most once.
     pub fn subscribe_shared(&self, pattern: &str, work: &str) -> Subscription {
+        // A reader member does none of its component's shared work: each
+        // message would otherwise reach it rather than the writer, which
+        // does that work (contract v30, stage B). Its subscription ends at
+        // once.
+        if self.serves_only.read().expect("serves poisoned").is_some() {
+            let (_, rx) = tokio::sync::mpsc::channel(1);
+            return Subscription::new(rx, pattern, Default::default());
+        }
         let group = format!("{}.{work}", self.instance_id);
         self.backend_for(pattern).subscribe_shared(pattern, &group)
     }
@@ -303,7 +479,10 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
-        let handler: Handler = Arc::new(handler);
+        if self.declines(topic) {
+            return;
+        }
+        let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -317,6 +496,55 @@ impl Bus {
             .serve(topic, &self.instance_id, handler);
     }
 
+    /// This process's part in `read_after` (contract v30, stage B): a store's
+    /// member keeps its position here, a sidecar its session.
+    pub fn reads_after(&self) -> &Arc<crate::read_after::Reads> {
+        &self.reads
+    }
+
+    /// Serve only the topics `serves` says, from now on: a store's reader
+    /// member, the same image in a reads-only mode the chart sets (contract
+    /// v30, stage B; the resilience spec's section 1). Every other topic its
+    /// component would serve is left to the writer -- a member not in a
+    /// topic's queue group is never asked it -- and its shared work too.
+    pub fn serve_only(&self, serves: impl Fn(&str) -> bool + Send + Sync + 'static) {
+        *self.serves_only.write().expect("serves poisoned") = Some(Arc::new(serves));
+    }
+
+    /// Whether this process is a reader member, serving reads alone.
+    pub fn reads_only(&self) -> bool {
+        self.serves_only.read().expect("serves poisoned").is_some()
+    }
+
+    fn declines(&self, topic: &str) -> bool {
+        let serves = self.serves_only.read().expect("serves poisoned");
+        match serves.as_ref() {
+            Some(serves) if !serves(topic) => {
+                tracing::debug!(topic, "a reader: left to the writer");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A store's read held to its `read_after` (W4.4): never answered from
+    /// behind the watermark it names, whichever member answers it. Every
+    /// other topic's handler as it was.
+    fn held_to_read_after(&self, topic: &str, handler: Handler) -> Handler {
+        if !crate::read_after::is_read(topic) {
+            return handler;
+        }
+        let reads = Arc::clone(&self.reads);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            crate::read_after::begin_read();
+            match envelope.meta.as_ref().and_then(|m| m.read_after.clone()) {
+                Some(asked) => reads.answer(&topic, &asked, || handler(envelope)),
+                None => handler(envelope),
+            }
+        })
+    }
+
     /// Register a handler, and signal once each answer has been delivered.
     ///
     /// For the one component that replies and then stops: first run applies a
@@ -328,7 +556,10 @@ impl Bus {
     where
         F: Fn(Envelope) -> HandlerReply + Send + Sync + 'static,
     {
-        let handler: Handler = Arc::new(handler);
+        if self.declines(topic) {
+            return;
+        }
+        let handler = self.held_to_read_after(topic, Arc::new(handler));
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -406,9 +637,31 @@ impl Bus {
         stamp: &Stamp,
     ) -> crate::Result<(String, Vec<u8>)> {
         let started = std::time::Instant::now();
+        // A sidecar's session (contract v30, stage B): each read of a store
+        // names the highest it has seen of that store for its instance, and
+        // each answer is seen.
+        let session = self.reads.session();
+        let stamped;
+        let mut stamp = stamp;
+        if let Some(session) = &session {
+            if stamp.read_after.is_none() && crate::read_after::is_read(topic) {
+                if let Some(seen) = crate::read_after::domain_of(topic)
+                    .and_then(|domain| session.read_after(domain))
+                {
+                    stamped = Stamp {
+                        read_after: Some(seen),
+                        ..stamp.clone()
+                    };
+                    stamp = &stamped;
+                }
+            }
+        }
         let answered = self
             .asked(topic, payload_type, payload, correlation_id, timeout, stamp)
             .await;
+        if let (Some(session), Ok((reply_type, reply))) = (&session, &answered) {
+            session.answered(topic, reply_type, reply);
+        }
         let took = started.elapsed();
         let _ = TIMED.try_with(|calls| {
             calls.lock().expect("timed calls poisoned").push(TimedCall {
@@ -421,6 +674,28 @@ impl Bus {
             observer(topic, started, took);
         }
         answered
+    }
+
+    /// Hand `envelope` on, unchanged, to whoever serves `topic` in another
+    /// process, and answer with their answer: one member of a component
+    /// handing a request to the member that must answer it (topics.md,
+    /// "Component topics": a lake reader's read that depends on the writer's
+    /// own acts, contract v30 stage B). Nothing is stamped: who asked, their
+    /// scope and their `read_after` stay the original caller's, and its
+    /// topic the public one it was asked on. Never answered in this process,
+    /// which is the one handing it on.
+    pub async fn hand_on(
+        &self,
+        topic: &str,
+        envelope: Envelope,
+        timeout: Option<Duration>,
+    ) -> crate::Result<(String, Vec<u8>)> {
+        let timeout = timeout.unwrap_or(self.default_timeout);
+        let answered = self
+            .backend_for(topic)
+            .request(topic, envelope, timeout)
+            .await?;
+        Ok((answered.payload_type, answered.payload))
     }
 
     /// Tell `observer` of every call this bus asks from now on (ruling 798).
@@ -468,10 +743,24 @@ impl Bus {
         // The handler runs off the async runtime. A handler that blocks is a
         // handler that would otherwise stall unrelated tasks on the same
         // worker, and the timeout below would not fire because the timer could
-        // not be polled.
+        // not be polled. A process asking itself is not admitted at its own
+        // gate: its callers are other processes, which the broker's path
+        // admits (section 10a), and a question it asks itself while
+        // answering one would otherwise wait on its own turn.
+        // Its deadline known to it, so a read held to its read_after waits no
+        // longer than its caller does (ruled 2026-11-10).
+        let deadline = std::time::Instant::now() + timeout;
+        let asked_topic = topic_owned.clone();
         let joined = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || handler(envelope)),
+            tokio::task::spawn_blocking(move || {
+                // A query cancelled at its statement_timeout is this
+                // process's own refusal for load, as on the broker's path.
+                cancelled_for_load(
+                    &asked_topic,
+                    crate::read_after::within_deadline(Some(deadline), || handler(envelope)),
+                )
+            }),
         )
         .await;
 
@@ -536,12 +825,113 @@ impl Bus {
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),
             account_scope_applies: stamp.account_scope.is_some(),
+            // Contract v30's read_after (W4.4): a sidecar's session stamps
+            // its plugin's reads (stage B); unset reads from the nearest member.
+            read_after: stamp.read_after.clone(),
         }
     }
 }
 
 #[cfg(test)]
+mod expired_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The research batch's item 5 (approved 2026-11-10): a request whose
+    /// caller's deadline has passed by its turn is dropped, never run, and
+    /// counted apart from the refusals for load.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_whose_caller_stopped_waiting_is_dropped_and_never_run() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let running = Arc::clone(&ran);
+        let handler: Handler = Arc::new(move |_| {
+            running.store(true, Ordering::SeqCst);
+            Ok((String::new(), Vec::new()))
+        });
+        let before = expired_requests();
+        let refused_before = meridian_budget::process().accounting().refused;
+        let gone = std::time::Instant::now() - Duration::from_millis(1);
+        let answered = admitted(
+            "platform.lake.command.record-prices",
+            Envelope::default(),
+            handler,
+            Some(gone),
+        )
+        .await
+        .unwrap();
+        assert!(answered.unwrap_err().contains("dropped"));
+        assert!(!ran.load(Ordering::SeqCst), "never run");
+        assert_eq!(expired_requests(), before + 1);
+        assert_eq!(
+            meridian_budget::process().accounting().refused,
+            refused_before
+        );
+    }
+}
+
+#[cfg(test)]
+mod reads_only_tests {
+    use super::*;
+    use crate::MemoryBackend;
+    use meridian_clock::ManualClock;
+
+    #[tokio::test]
+    async fn a_reader_serves_only_its_reads_and_does_no_shared_work() {
+        let bus = Bus::single(
+            "lake-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(ManualClock::at(1_790_553_600_000_000_000)),
+        );
+        bus.serve_only(crate::read_after::is_read);
+        assert!(bus.reads_only());
+        bus.serve("platform.lake.query.list-quotes", |_| {
+            Ok(("t".into(), Vec::new()))
+        });
+        bus.serve("platform.lake.command.record-prices", |_| {
+            Ok(("t".into(), Vec::new()))
+        });
+        assert!(bus
+            .call(
+                "platform.lake.query.list-quotes",
+                "t",
+                Vec::new(),
+                None,
+                None
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            bus.call(
+                "platform.lake.command.record-prices",
+                "t",
+                Vec::new(),
+                None,
+                None
+            )
+            .await,
+            Err(BusError::NoHandler(_))
+        ));
+        let mut shared = bus.subscribe_shared("platform.reference.event.*", "work");
+        assert!(shared.recv().await.is_none(), "ended at once");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_query_cancelled_at_its_statement_timeout_is_refused_for_load_by_its_component() {
+        let said = "the lake's store is unavailable: db error: ERROR: canceling statement due to statement timeout [sqlstate 57014]";
+        let refused =
+            super::cancelled_for_load("platform.lake.query.list-prices", Err(said.into()))
+                .unwrap_err();
+        assert_eq!(crate::backend::refusal_retry_after(&refused), Some(5));
+        assert!(refused.contains("statement_timeout"), "{refused}");
+        // Any other failure is answered as it was.
+        let other = super::cancelled_for_load("t", Err("db error [sqlstate 23505]".into()));
+        assert_eq!(other.unwrap_err(), "db error [sqlstate 23505]");
+        assert!(super::cancelled_for_load("t", Ok(("k".into(), vec![1]))).is_ok());
+    }
     use super::*;
     use crate::MemoryBackend;
     use meridian_clock::ManualClock;
@@ -826,6 +1216,66 @@ mod tests {
         assert!(matches!(err, BusError::HandlerFailed { .. }), "got {err:?}");
     }
 
+    /// Two transports beside the default, each with its own routes, as a
+    /// second data-plane transport would stand beside the write-ahead
+    /// stream (contract v30, stage E): a topic goes to the backend its rule
+    /// names, whichever was given first, and the rest to the default.
+    #[tokio::test]
+    async fn each_transport_adds_its_routes_and_none_takes_anothers_away() {
+        let default_backend = Arc::new(MemoryBackend::new());
+        let writes = Arc::new(MemoryBackend::new());
+        let hot = Arc::new(MemoryBackend::new());
+        let bus = Bus::single(
+            "core-1",
+            default_backend.clone(),
+            Arc::new(ManualClock::at(NOW)),
+        )
+        .with_backend("writes", writes.clone())
+        .with_rules(vec![RouteRule {
+            pattern: "platform.lake.command.record-trades".into(),
+            backend: "writes".into(),
+        }])
+        .with_backend("hot", hot.clone())
+        .with_rules(vec![RouteRule {
+            pattern: "platform.lake.*.event.trades-recorded".into(),
+            backend: "hot".into(),
+        }]);
+        let mut on_writes = writes.subscribe("platform.lake.command.record-trades");
+        let mut on_hot = hot.subscribe("platform.lake.*.event.trades-recorded");
+        let mut on_default = default_backend.subscribe("platform.**");
+        bus.publish(
+            "platform.lake.command.record-trades",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        bus.publish(
+            "platform.lake.v:live.event.trades-recorded",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        bus.publish(
+            "platform.lake.v:live.event.prices-recorded",
+            "t",
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(on_writes.recv().await.is_some());
+        assert!(on_hot.recv().await.is_some());
+        let heard = on_default.recv().await.unwrap();
+        assert_eq!(
+            heard.envelope.meta.unwrap().topic,
+            "platform.lake.v:live.event.prices-recorded"
+        );
+    }
+
     #[tokio::test]
     async fn routing_sends_a_topic_to_its_named_backend() {
         let default_backend = Arc::new(MemoryBackend::new());
@@ -847,6 +1297,8 @@ mod tests {
             default_timeout: Duration::from_secs(5),
             clock: Arc::new(ManualClock::at(NOW)),
             observer: RwLock::new(None),
+            reads: Arc::default(),
+            serves_only: RwLock::new(None),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

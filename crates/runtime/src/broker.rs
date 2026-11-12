@@ -34,6 +34,11 @@ const RUNTIME_COMPONENTS: [&str; 4] = ["street", "bor", "lake", "conductor"];
 /// to the datasets it is entitled to alone (contract v18, W10.1).
 const DATASET: &str = "{dataset}";
 
+/// A data plugin's lake writes in `ha`, by the lake's write-ahead stream
+/// (contract v30, stage E; [`meridian_bus::write_ahead`]): the stream's
+/// subjects of its own instance's datasets, `{instance}.{key}` after this.
+const WRITE_AHEAD: &str = "platform.lake.internal.write-ahead";
+
 /// Components holding a credential of their own rather than the runtime's.
 ///
 /// First run holds the only right in a deployment to change the cluster, and
@@ -70,12 +75,33 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// JetStream's API and its acknowledgements, to the analytics component's
 /// credential alone, so its coordinators make and fill the queue and its
 /// workers take and acknowledge from it. No other credential holds either.
-const COMPONENT_TOPICS: [(&str, &str); 13] = [
+///
+/// From contract v30 (W12.4; the step 3 plan's question 13), the analytics
+/// coordinators' own: each says it is live on `members` and hears the
+/// others there, and is handed a standing job's question by another on
+/// `standing.{member}`, its pod's name (approved 2026-11-10); and the lake's
+/// `read-from-writer`, on which a lake reader hands its writer a read that
+/// depends on the writer's own acts (stage B, approved 2026-11-10).
+///
+/// From contract v30's stage E, in `ha`, the lake's write-ahead stream
+/// (the resilience spec's section 4): JetStream's API for that stream alone,
+/// to the lake's credential, so its writer makes the stream and reads it.
+/// No other stream is reached by it, and the analytics component's stays
+/// its own. A data plugin's credential publishes to the stream's subjects of
+/// its own instance alone ([`WRITE_AHEAD`]).
+const COMPONENT_TOPICS: [(&str, &str); 20] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
+    ("analytics", "platform.analytics.internal.members"),
+    ("analytics", "platform.analytics.internal.standing.*"),
     ("analytics", "$JS.API.>"),
     ("analytics", "$JS.ACK.>"),
     ("lake", "platform.lake.internal.read-changes"),
     ("lake", "platform.lake.internal.changes.*"),
+    ("lake", "platform.lake.internal.read-from-writer"),
+    ("lake", "$JS.API.STREAM.*.LAKE_WRITE_AHEAD"),
+    ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD"),
+    ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>"),
+    ("lake", "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*"),
     ("bor", "platform.book.internal.read-changes"),
     ("bor", "platform.book.internal.changes.*"),
     ("instrument", "platform.reference.internal.read-changes"),
@@ -277,6 +303,17 @@ pub fn permissions_entitled(
     let mut subscribe = BTreeSet::new();
     for topic in granted.publish.iter().chain(&sidecar.publish) {
         publish.insert(subject(&scoped(topic, instance_id, roles)));
+    }
+    // A data plugin's rows go by the lake's write-ahead stream in `ha`: on
+    // its own instance's subjects alone, so it writes no other's datasets.
+    if roles.iter().any(|role| role == "data") && dataset_reads(instance_id) {
+        publish.insert(format!("{WRITE_AHEAD}.{instance_id}.*"));
+        // And the last write of each of its own datasets read back from the
+        // stream, by subject, as a restarted sidecar goes on with its chain
+        // (contract v30, stage C): its own instance's subjects alone.
+        publish.insert(format!(
+            "$JS.API.DIRECT.GET.LAKE_WRITE_AHEAD.{WRITE_AHEAD}.{instance_id}.*"
+        ));
     }
     for topic in granted.subscribe.iter().chain(&sidecar.subscribe) {
         if topic.contains(DATASET) {

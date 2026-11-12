@@ -143,11 +143,9 @@ spec:
             # applied, which the memory is judged by.
             - name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS
               value: {{ include "meridian-runtime.databaseMaxConnections" . | quote }}
-            {{- with .Values.database.brought.resources.limits }}
-            {{- with .memory }}
+            {{- with (include "meridian-runtime.databaseMemoryLimit" .) }}
             - name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY
               value: {{ . | quote }}
-            {{- end }}
             {{- end }}
             {{- end }}
             {{- if $backups }}

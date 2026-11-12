@@ -343,7 +343,7 @@ fn pruned(rows: Vec<Observation>) -> Vec<Observation> {
 /// Whether a read is one memory may answer: the latest in force at the
 /// latest valid time, as recorded by now or by a cut-off at or after every
 /// row each key held reflects (checked key by key).
-fn answers_latest(query: &Query) -> bool {
+pub(crate) fn answers_latest(query: &Query) -> bool {
     query.latest_only
         && matches!(query.when, When::Latest { at_ns: 0 })
         && query.published_as_of_ns == 0
@@ -603,6 +603,61 @@ impl HotStore {
         layer.counts = Counts::default();
     }
 
+    /// A reader member's following (contract v30, stage B): changes the
+    /// writer committed to `partition`, applied to what is held as the
+    /// writer's own commit applies them -- a dataset's rows added, anything
+    /// else that could change what its keys answer evicting the dataset --
+    /// and a closed day's amendment or an assessment, which can change any
+    /// dataset's rows, evicting everything held.
+    pub fn follow(&self, partition: &str, changes: &[meridian_changes::Change]) {
+        if partition == meridian_changes::CONTROL {
+            let amended = changes.iter().any(|change| {
+                change.kind == crate::store::CONTROL_CLOSED_DAY
+                    || change.kind == crate::store::CONTROL_ASSESSMENT
+            });
+            if amended {
+                self.evict_all();
+            }
+            return;
+        }
+        let mut rows = Vec::with_capacity(changes.len());
+        for change in changes {
+            // Rows served and not kept were never the record's, nor held.
+            if change.kind == "served" {
+                continue;
+            }
+            match DataType::named(&change.kind)
+                .and_then(|data_type| Observation::decode(data_type, &change.body).ok())
+            {
+                Some(row) => rows.push(row),
+                None => {
+                    self.evict_dataset(partition);
+                    return;
+                }
+            }
+        }
+        self.committed(partition, &rows);
+    }
+
+    /// Everything held of a dataset dropped: a reader's partition whose
+    /// changes it did not follow.
+    pub fn forget_dataset(&self, dataset: &str) {
+        self.evict_dataset(dataset);
+    }
+
+    fn evict_all(&self) {
+        let mut layer = self.layer();
+        layer.latest.retain(|_| false);
+        layer.listings.retain(|_| false);
+        for loading in layer.loading_latest.values_mut() {
+            loading.spoiled = true;
+        }
+        for loading in layer.loading_listings.values_mut() {
+            loading.spoiled = true;
+        }
+        layer.counts = Counts::default();
+    }
+
     /// The latest now, from memory where every key asked is held.
     fn latest_from_memory(&self, query: &Query) -> Option<Vec<Observation>> {
         let code = query.data_type.code();
@@ -675,6 +730,62 @@ impl Store for HotStore {
         let done = self.inner.record(dataset, rows, now_ns)?;
         self.committed(dataset, &done.rows);
         Ok(done)
+    }
+
+    fn write_ahead_position(
+        &self,
+        stream: &str,
+    ) -> Result<Option<crate::store::WriteAheadPosition>> {
+        self.inner.write_ahead_position(stream)
+    }
+
+    fn record_write_ahead(
+        &self,
+        batch: crate::store::WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Recorded>> {
+        let datasets: Vec<String> = batch.parts.iter().map(|(d, _)| d.clone()).collect();
+        let done = self.inner.record_write_ahead(batch, now_ns)?;
+        for (dataset, part) in datasets.iter().zip(&done) {
+            self.committed(dataset, &part.rows);
+        }
+        Ok(done)
+    }
+
+    fn write_ahead_found(
+        &self,
+        stream: &str,
+    ) -> Result<(
+        Vec<crate::store::Dropped>,
+        std::collections::BTreeMap<String, i64>,
+    )> {
+        self.inner.write_ahead_found(stream)
+    }
+
+    fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {
+        self.inner.record_gap(gap)
+    }
+
+    fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
+        self.inner.dataset_gaps()
+    }
+
+    fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
+        let found = self.inner.follow_timeline()?;
+        // The record lost what this layer may hold (contract v30, stage C):
+        // nothing held is kept past it; each key is loaded again.
+        if matches!(found, meridian_changes::timeline::Timeline::Moved(_)) {
+            self.evict_all();
+        }
+        Ok(found)
+    }
+
+    fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
+        self.inner.record_switches(switches)
+    }
+
+    fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        self.inner.source_switches()
     }
 
     fn serve_unkept(
@@ -903,6 +1014,17 @@ impl Store for HotStore {
     ) -> Result<Vec<Observation>> {
         self.inner
             .read_dataset(dataset, data_type, as_of_ns, published_as_of_ns)
+    }
+
+    fn read_dataset_each(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        self.inner
+            .read_dataset_each(dataset, data_type, as_of_ns, each)
     }
 
     fn read_dataset_versions(

@@ -227,6 +227,22 @@ pub fn instructions_of(book: &Book, read: &InstructionsRead) -> Vec<(String, Tra
         .collect()
 }
 
+/// The key a keyed page's cursor names, the last it answered; empty for
+/// the first page. Read in the database (stage M; the store memory audit of
+/// 2026-11-09, item 7), so a page reads its rows alone.
+pub fn keyed_after(cursor: &str) -> Result<String> {
+    if cursor.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(parts(cursor, 1)?.remove(0))
+}
+
+/// How many rows a keyed page reads: its limit and one more, which says
+/// whether another page follows.
+pub fn keyed_rows(limit: usize) -> i64 {
+    limit.saturating_add(1).min(i64::MAX as usize) as i64
+}
+
 /// A page of instructions, keyed by their standing key.
 pub fn keyed_page<T>(
     mut records: Vec<(String, T)>,

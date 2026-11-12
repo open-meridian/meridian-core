@@ -18,7 +18,7 @@ use meridian_domain::v1::{
     StatisticsRecordedEvent, SubjectRef, TemplateFieldValue, Trade, TradeAttributes, UnitValue,
     ValueUnit,
 };
-use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
 use prost::Message;
 
 use crate::row::{DataType, Observation};
@@ -123,10 +123,6 @@ fn configuration() -> EntitlementsChangedEvent {
                 "meridian.v1.SavedScenario".into(),
             ],
             modes: vec![ObservationMode::Push as i32],
-            licence_default: Some(DatasetLicence {
-                kept: true,
-                ..Default::default()
-            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -148,10 +144,6 @@ fn configuration() -> EntitlementsChangedEvent {
                         "meridian.v1.Statistic".into(),
                     ],
                     modes: vec![ObservationMode::Stream as i32],
-                    licence_default: Some(DatasetLicence {
-                        kept: true,
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

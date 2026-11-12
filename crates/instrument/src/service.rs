@@ -201,6 +201,22 @@ pub fn serve_all_within(
             let started = std::time::Instant::now();
             let request: ResolveIdentifierRequest =
                 decode(&envelope, "meridian.v1.ResolveIdentifierRequest")?;
+            // Contract v30 (W3.1; ruling 1035): an event contract's terms as
+            // stated, held to the record's rules but for a payout, which a
+            // statement may leave unstated.
+            if let Some((field, words)) = request
+                .stated_binary_event_contract
+                .as_ref()
+                .map(meridian_domain::instrument_type::stated_contract_refused)
+                .and_then(|wrong| wrong.into_iter().next())
+            {
+                let named = format!("stated_binary_event_contract.{field}");
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    std::slice::from_ref(&named),
+                    format!("{named}: {words}"),
+                ));
+            }
             let instance = envelope
                 .meta
                 .as_ref()
@@ -681,19 +697,17 @@ fn serve_one_id(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, wr
                             )
                         }
                     })?;
-                let mut live = Vec::new();
-                for record in store.all().map_err(|failed| failed.to_string())? {
-                    if store
-                        .replacement_of(&record.instrument_id)
-                        .map_err(|failed| failed.to_string())?
-                        .is_none()
-                    {
-                        live.push(record);
-                    }
-                }
-                let counts = crate::reask::migration_counts(store.as_ref(), &live)
-                    .map_err(|failed| failed.to_string())?
-                    .unwrap_or_default();
+                // Counted a record at a time (stage M; audit item 3).
+                let mut tallies = crate::reask::Tallies::new(store.as_ref());
+                store
+                    .each(&mut |record| {
+                        if store.replacement_of(&record.instrument_id)?.is_none() {
+                            tallies.add(store.as_ref(), &record)?;
+                        }
+                        Ok(true)
+                    })
+                    .map_err(|failed| failed.to_string())?;
+                let counts = tallies.migration().unwrap_or_default();
                 (made, counts)
             };
             for applied in &made.applied {

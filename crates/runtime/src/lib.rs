@@ -18,6 +18,7 @@ pub mod member;
 pub mod preflight;
 pub mod probe;
 pub mod replicas;
+pub mod resilience;
 pub mod scrub;
 
 use std::collections::BTreeMap;
@@ -292,6 +293,29 @@ fn as_released(
     }
 }
 
+/// A migration is applied on a primary, never a server in recovery: waited
+/// for where the server reached is one (contract v30, stage D).
+///
+/// An upgrade moving the brought database under Patroni back to ha hands its
+/// leadership to another member while member 0 restarts as a replica, and
+/// the database's Service can still name member 0 for a moment: PR CI
+/// 43058388339's e2e-cluster-reconfigure, the second move to ha, reached it
+/// with the release's own connection count and failed "cannot execute
+/// CREATE TABLE in a read-only transaction" (the Service named member 1,
+/// the primary, a few seconds later). Stage C2's intermittent of the same
+/// step, its pods' logs gone, is this one's likeliest cause.
+fn a_primary(in_recovery: bool) -> Result<(), Wait> {
+    if in_recovery {
+        Err(Wait::NotYet(
+            "the server reached is in recovery, a standby, not the primary a migration is \
+             applied on"
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// [`database_answers`], and on the database the chart brings, the server
 /// this release starts ([`as_released`]): one connection, made and closed.
 fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<(), Wait> {
@@ -313,6 +337,11 @@ fn database_as_released(url: &str, brought: Option<&(String, u32)>) -> Result<()
     let mut client = config
         .connect(tls)
         .map_err(|failed| Wait::NotYet(failed.to_string()))?;
+    let in_recovery: bool = client
+        .query_one("select pg_is_in_recovery()", &[])
+        .map_err(|failed| Wait::NotYet(failed.to_string()))?
+        .get(0);
+    a_primary(in_recovery)?;
     if as_released(&hosts, brought, None).is_ok() {
         return Ok(());
     }
@@ -569,6 +598,55 @@ pub fn mark_ready(serving: bool) {
 /// exit: in an upgrade the broker restarts beside everything that connects to
 /// it, and a component that exited on it was restarted once per release.
 pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
+    // Every component's working memory is budgeted before it answers
+    // anything (stage M; the resilience spec's section 10a): one installed
+    // by its binary with its hot layer's and held answers' bounds, or else
+    // installed here with none held. A process with no limit known runs
+    // unbounded, as before.
+    if meridian_budget::installed().is_none() {
+        let component = instance_id.split('-').next().unwrap_or(instance_id);
+        install_budget(component, 0)?;
+    }
+    bus_from_env_budgeted(instance_id, false).await
+}
+
+/// [`bus_from_env`], for a data plugin's sidecar in `ha` (the resilience
+/// spec's section 4): its lake writes routed to the lake's write-ahead
+/// stream, everything else to the broker as before. Where the chart does not
+/// say the deployment writes ahead (`MERIDIAN_LAKE_WRITE_AHEAD`), or there
+/// is no broker, the same bus as [`bus_from_env`].
+pub async fn bus_from_env_writing_ahead(instance_id: &str) -> Result<Arc<Bus>, String> {
+    if meridian_budget::installed().is_none() {
+        let component = instance_id.split('-').next().unwrap_or(instance_id);
+        install_budget(component, 0)?;
+    }
+    let on = var("MERIDIAN_LAKE_WRITE_AHEAD").as_deref() == Some("jetstream");
+    bus_from_env_budgeted(instance_id, on).await
+}
+
+/// This serving component's own database login and its sessions' bounds
+/// (the resilience spec's section 10a): `meridian_<component>` in the
+/// serving role's place, `statement_timeout` 5 s, and `work_mem` from its
+/// working budget (meridian_changes::serving). Called by a serving binary
+/// before it connects, never by its migration or its scrub.
+pub fn serve_database_as(component: &str) {
+    let working = meridian_budget::Settings::from_env()
+        .ok()
+        .and_then(|settings| settings.working_bytes(0).ok().flatten());
+    meridian_changes::serving::serve_as(component, working);
+}
+
+/// This component's budget, installed from the chart's memory settings, less
+/// `held` bytes of hot layer and held answers (section 10a); refused, and the
+/// component stopped, where they leave nothing to answer with -- as the
+/// chart refuses such a configuration before it is applied.
+pub fn install_budget(component: &str, held: u64) -> Result<(), String> {
+    // Its start counted beside its ready file, for its report's restarts.
+    member::count_this_start(clock().now_ns());
+    meridian_budget::install(component, held, meridian_budget::permits_from_env()).map(|_| ())
+}
+
+async fn bus_from_env_budgeted(instance_id: &str, write_ahead: bool) -> Result<Arc<Bus>, String> {
     let backend: Arc<dyn Backend> = match var("MERIDIAN_BROKER_URL") {
         Some(url) => {
             let mut waiting = Waiting::new("the broker");
@@ -595,7 +673,24 @@ pub async fn bus_from_env(instance_id: &str) -> Result<Arc<Bus>, String> {
         }
     };
 
-    Ok(Arc::new(Bus::single(instance_id, backend, clock())))
+    let bus = Bus::single(instance_id, Arc::clone(&backend), clock());
+    let Some(url) = var("MERIDIAN_BROKER_URL").filter(|_| write_ahead) else {
+        return Ok(Arc::new(bus));
+    };
+    let mut waiting = Waiting::new("the lake's write-ahead stream");
+    let stream = loop {
+        match meridian_bus::write_ahead::WriteAhead::connect(&url, Arc::clone(&backend)).await {
+            Ok(stream) => break stream,
+            Err(failed) => waiting.not_yet(&format!("it could not be reached: {failed}")),
+        }
+        tokio::time::sleep(WAIT_AGAIN_AFTER).await;
+    };
+    waiting.over();
+    tracing::info!("the plugin's lake writes go by the lake's write-ahead stream");
+    Ok(Arc::new(
+        bus.with_backend(meridian_bus::write_ahead::BACKEND, Arc::new(stream))
+            .with_rules(meridian_bus::write_ahead::routes()),
+    ))
 }
 
 /// The platform client, for a component that talks to the platform.
@@ -730,6 +825,151 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
     });
 
     heard
+}
+
+/// The conductor's read of every member's health (W6.40; contract v30).
+pub const READ_COMPONENT_HEALTH_TOPIC: &str = "platform.deployment.query.read-component-health";
+
+/// Every member's latest report, whole, by component and member (W6.40;
+/// stage M): what the conductor answers `ReadComponentHealth` with. A
+/// member not heard for ten of its report intervals is let go, so a member
+/// gone holds nothing.
+pub fn members_heard(bus: &Bus) -> MembersHeard {
+    use prost::Message as _;
+    let heard: MembersHeard = Arc::new(Mutex::new(BTreeMap::new()));
+    let collecting = Arc::clone(&heard);
+    let mut inward = bus.subscribe_every(COMPONENT_REPORT_TOPIC);
+    let clock = bus.clock();
+    tokio::spawn(async move {
+        let stale_ns = 10 * REPORT_INWARD_EVERY.as_nanos() as i64;
+        while let Some(delivery) = inward.recv().await {
+            let Ok(report) =
+                meridian_domain::v1::ComponentReport::decode(&delivery.envelope.payload[..])
+            else {
+                continue;
+            };
+            let now = clock.now_ns();
+            let key = format!("{}/{}", report.component, report.member);
+            let mut held = collecting.lock().expect("member reports poisoned");
+            held.insert(key, (report, now));
+            held.retain(|_, (_, heard_at)| *heard_at >= now - stale_ns);
+        }
+    });
+    heard
+}
+
+/// Every member's latest report, and when it was heard.
+pub type MembersHeard = Arc<Mutex<BTreeMap<String, (meridian_domain::v1::ComponentReport, i64)>>>;
+
+/// What the cluster says of each pod's restarts: by pod name, its
+/// containers' restarts together and the last one's reason (OOMKilled,
+/// Error, Completed).
+pub type PodRestarts = Arc<Mutex<BTreeMap<String, (u32, String)>>>;
+
+/// Each pod's restarts and the last one's reason, from a pod list.
+pub fn restarts_of(pods: &serde_json::Value) -> BTreeMap<String, (u32, String)> {
+    let mut said = BTreeMap::new();
+    for pod in pods["items"].as_array().into_iter().flatten() {
+        let Some(name) = pod["metadata"]["name"].as_str() else {
+            continue;
+        };
+        let mut restarts = 0u32;
+        let mut last: Option<(String, String)> = None;
+        for container in pod["status"]["containerStatuses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            restarts += container["restartCount"].as_u64().unwrap_or(0) as u32;
+            let ended = &container["lastState"]["terminated"];
+            if let (Some(reason), Some(at)) =
+                (ended["reason"].as_str(), ended["finishedAt"].as_str())
+            {
+                // RFC 3339 in UTC sorts as text.
+                if last.as_ref().is_none_or(|(_, before)| at > before.as_str()) {
+                    last = Some((reason.to_string(), at.to_string()));
+                }
+            }
+        }
+        said.insert(
+            name.to_string(),
+            (restarts, last.map(|(reason, _)| reason).unwrap_or_default()),
+        );
+    }
+    said
+}
+
+/// The cluster's word on each member's restarts, read every minute by the
+/// conductor where its Role lets it (W6.40; read-only `get` and `list` on
+/// pods, approved 2026-11-10). Where it may not, nothing is filled and
+/// `meridian status` and `doctor` read the reasons themselves.
+pub async fn pod_restarts_forever(api: meridian_first_run::cluster::ApiServer, held: PodRestarts) {
+    loop {
+        match api.pods().await {
+            Ok(pods) => {
+                if let Ok(mut held) = held.lock() {
+                    *held = restarts_of(&pods);
+                }
+            }
+            Err(failed) => {
+                tracing::debug!("the pods were not read for their restarts: {}", failed.0)
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// A member's report with what the cluster says of its restarts: the more
+/// of the two counts, and the last one's reason.
+pub fn with_restarts(
+    mut report: meridian_domain::v1::ComponentReport,
+    pods: &BTreeMap<String, (u32, String)>,
+) -> meridian_domain::v1::ComponentReport {
+    if let Some((restarts, reason)) = pods.get(&report.member) {
+        report.restarts = report.restarts.max(*restarts);
+        if !reason.is_empty() {
+            report.last_restart_reason = reason.clone();
+        }
+    }
+    report
+}
+
+/// Answer `ReadComponentHealth` (W6.40): every member heard, and this
+/// conductor's own member's report beside them.
+pub fn serve_component_health(
+    bus: &Bus,
+    heard: MembersHeard,
+    pods: PodRestarts,
+    own: impl Fn() -> meridian_domain::v1::ComponentReport + Send + Sync + 'static,
+) {
+    use prost::Message as _;
+    let clock = bus.clock();
+    bus.serve(READ_COMPONENT_HEALTH_TOPIC, move |_| {
+        let mut members = vec![own()];
+        members.extend(
+            heard
+                .lock()
+                .map_err(|_| "the member reports' lock".to_string())?
+                .values()
+                .map(|(report, _)| report.clone()),
+        );
+        let pods = pods
+            .lock()
+            .map_err(|_| "the pods' restarts' lock".to_string())?
+            .clone();
+        let members = members
+            .into_iter()
+            .map(|report| with_restarts(report, &pods))
+            .collect();
+        Ok((
+            "meridian.v1.ReadComponentHealthReply".into(),
+            meridian_domain::v1::ReadComponentHealthReply {
+                members,
+                read_at_ns: clock.now_ns(),
+            }
+            .encode_to_vec(),
+        ))
+    });
 }
 
 /// Tell the platform what this component is running, now and every interval.
@@ -1048,6 +1288,84 @@ pub fn var(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Where the chart names the brought database's record-read replica a
+/// store's readers read the record's past from (contract v30, stage C2; the
+/// resilience spec's section 5, approved 2026-11-11): its host, the store's
+/// own URL otherwise, so no Secret is edited by hand.
+pub const READ_DATABASE_HOST: &str = "MERIDIAN_READ_DATABASE_HOST";
+
+/// A store reader's read replica's URL: the variable `name` where set, on
+/// the host [`READ_DATABASE_HOST`] names where the chart set one -- the
+/// brought database's record-read replica, reached with the store's own
+/// credentials, database and settings.
+pub fn read_database_url(name: &str) -> Option<String> {
+    let url = var(name)?;
+    Some(match var(READ_DATABASE_HOST) {
+        Some(host) => with_host(&url, &host),
+        None => url,
+    })
+}
+
+/// A reader member's record-read replica, where `name` names one: its store
+/// made and verified before the component's runtime starts, and held by the
+/// caller (contract v30, stage D; stage C2's leftover).
+///
+/// A reader's replica was made inside the runtime, so its last reference --
+/// the reader's service, its handlers' captures -- went with the runtime's
+/// tasks, and its blocking Postgres client closed its connections on the
+/// runtime's worker, which panics ([`on_runtime`]'s rule). Made here and
+/// held by the caller as the primary is, the runtime is gone before its
+/// last reference, and its connections close off any worker.
+pub fn read_replica<S>(
+    what: &str,
+    name: &str,
+    connect: impl Fn(&str) -> Result<S, String>,
+    verify: impl Fn(&S) -> Result<(), Wait>,
+) -> Result<Option<S>, String> {
+    match read_database_url(name) {
+        None => Ok(None),
+        Some(url) => wait_for_store(what, &url, connect, verify).map(Some),
+    }
+}
+
+/// `url` with its host `host`, its credentials, port, database and settings
+/// as they were: a URL (`postgres://user:pass@host:port/db?...`) or libpq's
+/// `key=value` form.
+pub fn with_host(url: &str, host: &str) -> String {
+    if let Some(scheme) = url.find("://") {
+        let start = scheme + 3;
+        let rest = &url[start..];
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let authority = &rest[..end];
+        let (user, at) = match authority.rfind('@') {
+            Some(i) => (&authority[..=i], &authority[i + 1..]),
+            None => ("", authority),
+        };
+        let port = if at.starts_with('[') {
+            at.find("]:").map_or("", |i| &at[i + 1..])
+        } else {
+            at.rfind(':').map_or("", |i| &at[i..])
+        };
+        return format!("{}{user}{host}{port}{}", &url[..start], &rest[end..]);
+    }
+    let mut named = false;
+    let mut parts: Vec<String> = url
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with("host=") {
+                named = true;
+                format!("host={host}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect();
+    if !named {
+        parts.push(format!("host={host}"));
+    }
+    parts.join(" ")
+}
+
 pub fn required(name: &str) -> Result<String, String> {
     var(name).ok_or_else(|| format!("{name} is not set"))
 }
@@ -1075,6 +1393,79 @@ pub fn required(name: &str) -> Result<String, String> {
 ///
 /// Idempotent, and a no-op when both roles are the same, which is what an
 /// administrator who supplied one connection has.
+/// Each component's own login on the database this chart brings (the
+/// resilience spec's section 10a), made or kept by its superuser, with the
+/// serving role's password -- where the chart gives the brought database's
+/// superuser (`MERIDIAN_FIRST_RUN_BROUGHT_*`, as first run reads them) and
+/// the serving URL is the brought database's. Nothing on a database
+/// somebody else runs: its administrator makes them, as the upgrade's
+/// preflight says.
+pub fn component_logins_on_brought(serving_url: &str) -> Result<(), String> {
+    let (Some(host), Some(superuser), Some(password), Some(serving_password)) = (
+        var("MERIDIAN_FIRST_RUN_BROUGHT_HOST"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD"),
+        var("MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD"),
+    ) else {
+        return Ok(());
+    };
+    let serving: postgres::Config = serving_url
+        .parse()
+        .map_err(|failed| format!("the serving database URL is unreadable: {failed}"))?;
+    let brought = serving.get_hosts().iter().any(|named| match named {
+        postgres::config::Host::Tcp(name) => name == &host || host.starts_with(&format!("{name}.")),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    });
+    let (Some(role), Some(database)) = (serving.get_user(), serving.get_dbname()) else {
+        return Ok(());
+    };
+    if !brought {
+        return Ok(());
+    }
+    let named = |name: &str| -> Result<String, String> {
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            Ok(format!("\"{name}\""))
+        } else {
+            Err(format!("{name} is not a name this can grant to"))
+        }
+    };
+    let mut config = serving.clone();
+    config
+        .user(&superuser)
+        .password(password.as_bytes())
+        .connect_timeout(Duration::from_secs(5));
+    let (config, tls) =
+        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(serving_url))
+            .map_err(|failed| format!("the database's TLS: {failed}"))?;
+    let (role, database) = (named(role)?, named(database)?);
+    std::thread::scope(|threads| {
+        threads
+            .spawn(|| {
+                let mut client = config.connect(tls).map_err(|failed| {
+                    format!(
+                        "the brought database could not be reached as its superuser: {}",
+                        meridian_changes::serving::described(&failed)
+                    )
+                })?;
+                meridian_changes::serving::ensure_logins(
+                    &mut client,
+                    &role,
+                    &serving_password,
+                    &database,
+                )
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the components' logins could not be made".into()))
+    })?;
+    tracing::info!("each component's own database login is made or kept on the brought database");
+    Ok(())
+}
+
 pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), String> {
     let serving: postgres::Config = serving_url
         .parse()
@@ -1149,6 +1540,39 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// A migration waits for a primary: a server in recovery is waited past,
+    /// never migrated (PR CI 43058388339, e2e-cluster-reconfigure).
+    #[test]
+    fn a_migration_waits_past_a_server_in_recovery() {
+        assert!(
+            matches!(super::a_primary(true), Err(super::Wait::NotYet(why)) if why.contains("in recovery"))
+        );
+        assert!(super::a_primary(false).is_ok());
+    }
+
+    /// The brought database's record-read replica reached with the store's
+    /// own URL, its host the chart's (contract v30, stage C2).
+    #[test]
+    fn a_readers_replica_url_is_the_stores_own_on_the_replicas_host() {
+        let replica = "om-database-3.om.svc.cluster.local";
+        assert_eq!(
+            super::with_host("postgres://meridian:p%40ss@om-database:5432/meridian?sslmode=verify-full", replica),
+            "postgres://meridian:p%40ss@om-database-3.om.svc.cluster.local:5432/meridian?sslmode=verify-full"
+        );
+        assert_eq!(
+            super::with_host("postgresql://u@om-database/m", replica),
+            "postgresql://u@om-database-3.om.svc.cluster.local/m"
+        );
+        assert_eq!(
+            super::with_host("postgres://u:p@[fd00::1]:5432/m", replica),
+            "postgres://u:p@om-database-3.om.svc.cluster.local:5432/m"
+        );
+        assert_eq!(
+            super::with_host("host=om-database port=5432 dbname=m user=u", replica),
+            "host=om-database-3.om.svc.cluster.local port=5432 dbname=m user=u"
+        );
+    }
+
     use std::cell::Cell;
     use std::time::Duration;
 
@@ -1213,6 +1637,86 @@ mod tests {
             !cancelled.load(Ordering::SeqCst),
             "the loop ran on into the runtime's shutdown: its blocking work was cancelled under it"
         );
+    }
+
+    /// A store whose connections close as the blocking Postgres client's
+    /// do: by running a runtime of its own, which panics on a thread already
+    /// driving one.
+    struct ClosesLikePostgres(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ClosesLikePostgres {
+        fn drop(&mut self) {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime of its own")
+                .block_on(async {});
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A reader shuts down cleanly (contract v30, stage D; stage C2's
+    /// leftover): its replica made before the runtime and held by the
+    /// caller, as [`super::read_replica`] is in the lake's, the book's and
+    /// the instrument store's readers, while its service and a background
+    /// task hold it too. The serving ends, the runtime stops, and the
+    /// replica's connections close after, off any worker.
+    #[test]
+    fn a_reader_holding_its_replica_shuts_down_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let replica = Some(Arc::new(ClosesLikePostgres(Arc::clone(&closed))));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::served_on(runtime, async {
+                // The reader's service and its handlers' captures.
+                let service = replica.clone();
+                let held = replica.clone();
+                super::background(async move {
+                    let _held = held;
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+                drop(service);
+                Ok(())
+            })
+        }));
+        assert_eq!(
+            served.ok(),
+            Some(Ok(())),
+            "the reader panicked as it shut down"
+        );
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "the replica closed inside the runtime"
+        );
+        drop(replica);
+        assert!(closed.load(Ordering::SeqCst), "the replica never closed");
+    }
+
+    /// What the test above keeps from happening: a replica made inside the
+    /// runtime, its last reference dropped there, panics as it closes.
+    #[test]
+    fn a_replica_closed_on_the_runtimes_worker_panics() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let closing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let replica = ClosesLikePostgres(Arc::new(AtomicBool::new(false)));
+                drop(replica);
+            })
+        }));
+        assert!(closing.is_err(), "a close on the worker did not panic");
     }
 
     /// The migration reaches the server its release starts, on the database

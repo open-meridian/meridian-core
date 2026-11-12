@@ -18,7 +18,7 @@ use meridian_domain::v1::{
     Trade, TradeAttributes, TradeCharacteristic, TradesRecordedEvent, UnansweredReason, UnitValue,
     ValueUnit, YieldKind,
 };
-use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+use meridian_pb::v1::{DatasetDeclaration, Decimal, ObservationMode};
 use prost::Message;
 
 use crate::row::{DataType, Observation};
@@ -121,10 +121,6 @@ pub(crate) fn dataset(
                 data_types: types.iter().map(|t| t.to_string()).collect(),
                 modes: modes.iter().map(|m| *m as i32).collect(),
                 day_time_zone: "Etc/UTC".into(),
-                licence_default: Some(DatasetLicence {
-                    kept: true,
-                    ..Default::default()
-                }),
                 ..Default::default()
             }),
             ..Default::default()

@@ -44,6 +44,10 @@ struct Layer {
     by_use: BTreeMap<u64, (bool, String)>,
     bytes: usize,
     tick: u64,
+    /// Moved by each eviction: a record read from the record while one was
+    /// evicted is answered and not held, as it may be older than the write
+    /// that evicted it.
+    evicted: u64,
 }
 
 impl Layer {
@@ -102,13 +106,26 @@ impl HotStore {
     }
 
     fn clear(&self) {
-        *self.layer() = Layer::default();
+        let mut layer = self.layer();
+        let evicted = layer.evicted + 1;
+        *layer = Layer {
+            evicted,
+            ..Layer::default()
+        };
     }
 
     fn evict(&self, id: &str) {
         let mut layer = self.layer();
         layer.forget(true, id);
         layer.forget(false, id);
+        layer.evicted += 1;
+    }
+
+    /// A reader member's following (contract v30, stage B): any change the
+    /// writer committed empties the layer, as any write but a record's own
+    /// does on the writer; a record read again is held again.
+    pub fn follow(&self) {
+        self.clear();
     }
 }
 
@@ -126,6 +143,7 @@ impl Store for HotStore {
                 return Ok(held);
             }
         }
+        let before = self.layer().evicted;
         let read = self.inner.by_id(instrument_id)?;
         let size = read
             .as_ref()
@@ -133,6 +151,9 @@ impl Store for HotStore {
             + instrument_id.len()
             + 160;
         let mut layer = self.layer();
+        if layer.evicted != before {
+            return Ok(read);
+        }
         layer.forget(true, instrument_id);
         let tick = layer.touch(true, instrument_id);
         layer.bytes += size;
@@ -156,8 +177,12 @@ impl Store for HotStore {
                 return Ok(held);
             }
         }
+        let before = self.layer().evicted;
         let read = self.inner.replacement_of(instrument_id)?;
         let mut layer = self.layer();
+        if layer.evicted != before {
+            return Ok(read);
+        }
         layer.forget(false, instrument_id);
         let tick = layer.touch(false, instrument_id);
         layer.bytes += instrument_id.len() + 96;
@@ -211,6 +236,10 @@ impl Store for HotStore {
 
     fn all(&self) -> Result<Vec<Instrument>> {
         self.inner.all()
+    }
+
+    fn each(&self, every: &mut dyn FnMut(Instrument) -> Result<bool>) -> Result<()> {
+        self.inner.each(every)
     }
 
     fn count(&self) -> Result<usize> {
@@ -426,6 +455,89 @@ mod tests {
             .mint(record(&id, &format!("S{n}"), 1), &key, entry(&id, 1))
             .unwrap();
         id
+    }
+
+    /// Contract v30, stage B: a reader's layer is emptied by each change it
+    /// follows, so a record the writer wrote is read again, and a reader
+    /// writes nothing.
+    #[test]
+    fn a_readers_layer_follows_the_writers_changes_and_it_writes_nothing() {
+        let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let id = minted(primary.as_ref(), 1);
+        let hot = Arc::new(HotStore::new(Arc::clone(&primary), DEFAULT_BYTES));
+        let reader = crate::reader::ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        assert_eq!(hot.held().0, 1);
+        // The writer writes; held until followed.
+        primary
+            .write(record(&id, "S1", 2), 1, entry(&id, 2))
+            .unwrap();
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        hot.follow();
+        assert_eq!(hot.held().0, 0);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 2);
+        assert!(reader
+            .write(record(&id, "S1", 3), 2, entry(&id, 3))
+            .is_err());
+        assert!(reader.set_state("k", "v").is_err());
+        assert_eq!(primary.by_id(&id).unwrap().unwrap().version, 2);
+    }
+
+    /// Contract v30, stage B (the resilience spec's section 5, approved
+    /// 2026-11-10): a reader answers at the position it was answered at --
+    /// its own applied position from its hot layer, the primary's past its
+    /// wait. The instrument store's replies carry no store position of their
+    /// own (no reference reply has a watermark; a list's `sequence` is the
+    /// last item it read), so what a reply says is the record it answers.
+    #[test]
+    fn an_instrument_readers_answer_is_at_its_own_position_or_the_primarys_past_its_wait() {
+        use meridian_bus::read_after::{Position, Reads};
+        use meridian_pb::v1::{PartitionSequence, Watermark};
+        struct At(u64);
+        impl Position for At {
+            fn heads(
+                &self,
+                _: &[String],
+            ) -> std::result::Result<std::collections::HashMap<String, u64>, String> {
+                Ok([("instruments".to_string(), self.0)].into())
+            }
+        }
+        let primary: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let id = minted(primary.as_ref(), 1);
+        let hot = Arc::new(HotStore::new(Arc::clone(&primary), DEFAULT_BYTES));
+        let reader = crate::reader::ReaderStore::new(Arc::clone(&hot), Arc::clone(&primary), None);
+        assert_eq!(reader.by_id(&id).unwrap().unwrap().version, 1);
+        // The writer writes at 2; the reader has applied to 1.
+        primary
+            .write(record(&id, "S1", 2), 1, entry(&id, 2))
+            .unwrap();
+        let reads = Reads::default();
+        reads.keep("reference", Arc::new(At(1)));
+        reads.keep_primary("reference", Arc::new(At(2)));
+        reads.set_bound(std::time::Duration::from_millis(20));
+        let at = |sequence| Watermark {
+            partitions: vec![PartitionSequence {
+                partition: "instruments".into(),
+                sequence,
+            }],
+        };
+        let version = |asked: u64| {
+            reads
+                .answer(
+                    "platform.reference.query.resolve-instrument",
+                    &at(asked),
+                    || reader.by_id(&id).map_err(|failed| failed.to_string()),
+                )
+                .unwrap()
+                .unwrap()
+                .version
+        };
+        assert_eq!(version(1), 1, "at its own position: its hot layer's");
+        assert_eq!(
+            version(2),
+            2,
+            "past its wait: the primary's, never its own behind it"
+        );
     }
 
     /// Step 3a: the same answer as the record, before and after each write,

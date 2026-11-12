@@ -48,6 +48,10 @@ pub struct Notice {
 pub trait NoticeStore: Send + Sync {
     fn notify(&self, notices: &[Notice]) -> Result<(), String>;
     fn notices(&self, subject: &str, limit: usize) -> Result<Vec<Notice>, String>;
+    /// What every notice of `kind` was about, to anyone: what a judge reads
+    /// at its start so a notice filed once is never filed again after a
+    /// restart (`gap_found`, once per gap; contract v30, stage D).
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String>;
 }
 
 #[derive(Default)]
@@ -57,10 +61,16 @@ pub struct InMemory {
 
 impl NoticeStore for InMemory {
     fn notify(&self, notices: &[Notice]) -> Result<(), String> {
-        self.held
+        let mut held = self
+            .held
             .lock()
-            .map_err(|_| "the notices' lock".to_string())?
-            .extend_from_slice(notices);
+            .map_err(|_| "the notices' lock".to_string())?;
+        // Kept once by its ID, as the dashboard's table keeps it.
+        for notice in notices {
+            if !held.iter().any(|n| n.notice_id == notice.notice_id) {
+                held.push(notice.clone());
+            }
+        }
         Ok(())
     }
 
@@ -76,6 +86,17 @@ impl NoticeStore for InMemory {
         found.sort_by(|a, b| b.notice_id.cmp(&a.notice_id));
         found.truncate(limit);
         Ok(found)
+    }
+
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .held
+            .lock()
+            .map_err(|_| "the notices' lock".to_string())?
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.about.clone())
+            .collect())
     }
 }
 
@@ -97,7 +118,8 @@ impl NoticeStore for InPostgres {
             tx.execute(
                 "INSERT INTO dashboard_notice (notice_id, subject, ticket_id, kind,
                      author_provenance, plugin_instance_id, about, changed_ns, read)
-                 VALUES ($1, $2, NULL, $3, 'rules', $4, $5, $6, false)",
+                 VALUES ($1, $2, NULL, $3, 'rules', $4, $5, $6, false)
+                 ON CONFLICT (notice_id) DO NOTHING",
                 &[
                     &notice.notice_id,
                     &notice.subject,
@@ -135,6 +157,19 @@ impl NoticeStore for InPostgres {
             })
             .collect())
     }
+
+    fn abouts(&self, kind: &str) -> Result<Vec<String>, String> {
+        let mut conn = self.database.conn()?;
+        Ok(conn
+            .query(
+                "SELECT DISTINCT about FROM dashboard_notice WHERE kind = $1",
+                &[&kind],
+            )
+            .map_err(said)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
 }
 
 static STORE: OnceLock<Arc<dyn NoticeStore>> = OnceLock::new();
@@ -146,6 +181,20 @@ pub fn keep_in(store: Arc<dyn NoticeStore>) {
 
 fn store() -> Arc<dyn NoticeStore> {
     Arc::clone(STORE.get_or_init(|| Arc::new(InMemory::default())))
+}
+
+/// Keep notices made elsewhere on this path: a component's or a plugin's
+/// health (W6.40; stage M), read beside the latency judge's.
+pub fn keep(notices: &[Notice]) -> Result<(), String> {
+    store().notify(notices)
+}
+
+/// What every notice of `kind` was about: see [`NoticeStore::abouts`].
+pub async fn abouts(kind: &str) -> Result<Vec<String>, String> {
+    let kind = kind.to_string();
+    tokio::task::spawn_blocking(move || store().abouts(&kind))
+        .await
+        .map_err(|failed| failed.to_string())?
 }
 
 /// A person's latest latency notices, newest first.
@@ -309,10 +358,17 @@ pub fn rows(notices: &[Notice]) -> String {
         .map(|notice| {
             // One word a badge, so it fits a phone; the series, and backlog
             // or p99, in the line beside it.
-            let (badge, tone) = if notice.kind.ends_with("breached") {
-                ("Breached", " warn")
-            } else {
-                ("Recovered", "")
+            let (badge, tone) = match notice.kind.as_str() {
+                kind if kind.ends_with("breached") => ("Breached", " warn"),
+                // A component's or a plugin's health (W6.40; stage M).
+                kind if kind.ends_with("-restarted") => ("Restarted", " warn"),
+                kind if kind.ends_with("-over-budget") => ("Over budget", " warn"),
+                kind if kind.ends_with("-shedding") => ("Shedding", " warn"),
+                kind if kind.ends_with("-restarting-repeatedly") => ("Restarting", " warn"),
+                kind if kind.ends_with("-memory-climbing") => ("Climbing", " warn"),
+                // A gap in a dataset (W10.14; contract v30, stage D).
+                "gap_found" => ("Gap found", " warn"),
+                _ => ("Recovered", ""),
             };
             format!(
                 "<tr data-kind=\"{kind}\" data-plugin=\"{instance}\"><td><span class=\"badge{tone}\" title=\"{kind}\">{badge}</span></td>\

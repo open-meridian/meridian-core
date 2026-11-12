@@ -40,6 +40,19 @@ fn main() {
     }
 }
 
+/// A book reader's following: each entry's account's book forgotten.
+struct BookFollows(Arc<meridian_bor::reader::ReaderStore>);
+
+impl meridian_runtime::member::Apply for BookFollows {
+    fn apply(&self, _: &str, changes: &[meridian_changes::Change]) {
+        self.0.follow(changes);
+    }
+
+    fn reset(&self, _: &str) {
+        self.0.forget_all();
+    }
+}
+
 fn run() -> Result<(), String> {
     // Every path this member needs, probed from inside its pod: what
     // `meridian status` and `doctor` read (step 3b).
@@ -125,6 +138,8 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its own database login and its sessions' bounds (section 10a).
+    meridian_runtime::serve_database_as("bor");
     let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
         "the book's database",
         &url,
@@ -144,6 +159,27 @@ fn run() -> Result<(), String> {
     // adopted before the first command (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
     let member = meridian_runtime::member::Member::from_env("bor", Some("book"))?;
+    // A reader's record-read replica, made before the runtime and held here,
+    // as the primary is, so its blocking client closes its connections after
+    // the runtime has stopped, never on its worker (contract v30, stage D;
+    // a reader made it inside the runtime from stage C2, connecting in
+    // block_in_place after PR CI 43014977978's "Cannot start a runtime from
+    // within a runtime").
+    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
+        meridian_runtime::read_replica(
+            "the book's read replica",
+            "MERIDIAN_BOR_READ_DATABASE_URL",
+            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
+            |store| {
+                store
+                    .verify()
+                    .map_err(|failed| Wait::NotYet(failed.to_string()))
+            },
+        )?
+        .map(Arc::new)
+    } else {
+        None
+    };
 
     let books_bound =
         meridian_bor::writer::books_bytes_from_mib(var("MERIDIAN_BOR_HOT_BOOKS_MIB").as_deref())?;
@@ -155,7 +191,52 @@ fn run() -> Result<(), String> {
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "bor-1".into());
 
     on_runtime(async {
+        // Its working budget (stage M), less the hot layer's bound.
+        meridian_runtime::install_budget("bor", books_bound as u64)?;
         let bus = bus_from_env(&instance_id).await?;
+        // A reader member (contract v30, stage B): the book's reads alone,
+        // its books kept by the writer's change log, never acting.
+        if member.is_reader() {
+            bus.serve_only(meridian_bus::read_after::is_read);
+            // Made before the runtime and held outside it (stage D): its
+            // connections close after the runtime has stopped.
+            let replica = replica
+                .clone()
+                .map(|replica| replica as Arc<dyn meridian_bor::Store>);
+            let start =
+                tokio::task::block_in_place(|| meridian_bor::Store::heads(postgres.as_ref()))
+                    .map_err(|failed| format!("the book's heads could not be read: {failed}"))?;
+            let followed = meridian_runtime::member::Followed::from_heads(start);
+            // Its replies' watermarks: what it has applied, for a read from
+            // the books it holds (spec section 5).
+            let applied = Arc::clone(&followed);
+            let reading = Arc::new(meridian_bor::reader::ReaderStore::new(
+                postgres.clone(),
+                replica,
+                books_bound,
+                Arc::new(move || applied.heads().into_iter().collect()),
+            ));
+            meridian_bor::service::serve(bus.clone(), reading.clone(), clock());
+            let primary = postgres.clone();
+            member.read(
+                &bus,
+                followed,
+                Arc::new(BookFollows(reading)),
+                Arc::new(meridian_bus::read_after::AllHeads(move || {
+                    meridian_bor::Store::heads(primary.as_ref())
+                        .map_err(|failed| failed.to_string())
+                })),
+            )?;
+            let reporting = bus.clone();
+            let schema = meridian_bor::migrations::latest();
+            meridian_runtime::background(async move {
+                report_inward_forever(reporting, "bor", schema).await
+            });
+            tracing::info!(instance_id, "the book is serving reads, as a reader");
+            shutdown().await;
+            tracing::info!("stopping");
+            return Ok(());
+        }
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
@@ -174,9 +255,14 @@ fn run() -> Result<(), String> {
         })?;
         tracing::info!(epoch, "the book writes under its epoch");
         let watched = postgres.clone();
-        holding.keep(epoch, move || {
-            meridian_bor::Store::head_epoch(watched.as_ref()).map_err(|failed| failed.to_string())
-        });
+        let writing = postgres.clone();
+        holding.keep(
+            move || meridian_bor::Store::epoch(writing.as_ref()),
+            move || {
+                meridian_bor::Store::head_epoch(watched.as_ref())
+                    .map_err(|failed| failed.to_string())
+            },
+        );
         // The scrub, under the lease (step 3b, integrity at rest).
         let scrubbing = url.clone();
         meridian_runtime::scrub::forever("book", move || {
@@ -203,6 +289,14 @@ fn run() -> Result<(), String> {
             bus.clone(),
             books_bound,
         ));
+        // A new database timeline raises the epoch (contract v30, stage C):
+        // the books held let go of what the record may have lost.
+        let following = Arc::clone(&store);
+        holding.follow_timeline(&bus, "book", move || {
+            following
+                .follow_timeline()
+                .map_err(|failed| failed.to_string())
+        });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // The start's snapshots (v26; W9.10): every account whose journal

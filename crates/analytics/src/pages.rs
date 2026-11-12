@@ -6,8 +6,8 @@
 //! broker's 1 MiB: its read failed. Now a page ends at [`PAGE_BUDGET`],
 //! whatever the request asks, and says where the next one starts.
 //!
-//! The order is the figures, then what was not evaluated, each in the
-//! answer's own order; every page carries the job's ID and its whole
+//! The order is the figures, then from contract v30 a standing job's values,
+//! then what was not evaluated, each in the answer's own order; every page carries the job's ID and its whole
 //! provenance, so a page is checked against the answer's hash as the answer
 //! is. A cursor names the job, the answer's hash and how many entries the
 //! pages before held: an answer is never changed once kept, so a cursor
@@ -125,7 +125,9 @@ pub(crate) fn page(
         ));
     }
     let figures = answer.figures.len();
-    let entries = figures + answer.not_evaluated.len();
+    // Contract v30 (W12.4): a standing job's values, after its figures.
+    let values = figures + answer.values.len();
+    let entries = values + answer.not_evaluated.len();
     let start = read_cursor(&request.cursor, answer, entries)?;
 
     // 0 is as many as the budget takes; past 500, answered at 500.
@@ -146,8 +148,10 @@ pub(crate) fn page(
     while at < entries && at - start < most {
         let more = if at < figures {
             added(answer.figures[at].encoded_len())
+        } else if at < values {
+            added(answer.values[at - figures].encoded_len())
         } else {
-            added(answer.not_evaluated[at - figures].encoded_len())
+            added(answer.not_evaluated[at - values].encoded_len())
         };
         if at > start && used + more > room {
             break;
@@ -155,9 +159,11 @@ pub(crate) fn page(
         used += more;
         if at < figures {
             page.figures.push(answer.figures[at].clone());
+        } else if at < values {
+            page.values.push(answer.values[at - figures].clone());
         } else {
             page.not_evaluated
-                .push(answer.not_evaluated[at - figures].clone());
+                .push(answer.not_evaluated[at - values].clone());
         }
         at += 1;
     }
