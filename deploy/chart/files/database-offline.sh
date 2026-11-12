@@ -135,6 +135,8 @@ def say(text):
 
 
 def fail(text):
+    # Every refusal here comes before the restore: the volume is untouched.
+    say("nothing was restored: the database's volume is as it was")
     print(f"database-offline: FAILED: {text}", file=sys.stderr, flush=True)
     sys.exit(1)
 

@@ -907,6 +907,7 @@ def restored_to_a_time(s, before):
             f"a time past the archive, {past}, refused as outside it, naming its first and last times ({named})")
     s.check(named is not None and named[0] < t0 and to < named[1] < past,
             "its first time before the earliest time restored to, its last after the latest")
+    s.check("the database's volume is as it was" in log, "refused before the volume was touched")
     ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME="2000-01-01 00:00:00+00")
     s.check(not ok and "is before its oldest base backup ended" in log and holds(log) == named,
             "a time before the oldest base backup refused the same, naming the same first and last times")
