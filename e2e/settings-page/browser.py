@@ -1307,6 +1307,9 @@ def the_registry_pages(browser, prefix):
                     limits = page.locator("[data-limits] input[type=number]")
                     check(limits.count() == 3 and all(limits.nth(i).is_visible() for i in range(3)),
                           f"launch-sheet at {size}, {scheme} offers its three limits")
+                    # Kept for a person's look (M2's follow-up): CI keeps
+                    # them as the run's launch-sheet artifact.
+                    page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-{size}-{scheme}.png"))
                 if name.endswith("-sheet") and name not in ("keep-or-stop-sheet", "launch-sheet"):
                     line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
                     check(line.count() == 1 and line.is_visible(),
