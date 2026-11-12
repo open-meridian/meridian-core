@@ -302,3 +302,61 @@ async fn a_read_as_of_a_time_or_naming_its_sources_switches_nothing() {
     assert_eq!(past.rows[0].dataset(), COINBASE);
     assert!(switches(&h).is_empty());
 }
+
+/// Contract v30 (W10.2; ruling 454; step 3c's question 7): a plugin of a
+/// role that reads the lake reads the source priorities too, each answered
+/// with the datasets it is entitled to read -- one it may not left out, a
+/// priority with none left not answered -- and the dashboard every one,
+/// whole (the suite case `reads-the-source-priorities`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_reads_the_priorities_its_entitlements_allow() {
+    let h = harness();
+    prioritised(&h);
+    tokio::task::block_in_place(|| {
+        h.lake.set_priority(
+            SetSourcePriorityRequest {
+                data_type: "meridian.v1.Bar".into(),
+                kind: PriceKind::Unspecified as i32,
+                datasets: vec![KRAKEN.into()],
+                note: "Kraken alone.".into(),
+                against_updated_at_ns: 0,
+            },
+            &envelope("dashboard-1", false, "local|ada"),
+        )
+    })
+    .unwrap();
+    // reporting-1 is entitled to both; then to coinbase's alone.
+    let read = |instance: &str, plugin: bool| {
+        tokio::task::block_in_place(|| {
+            h.lake
+                .list_priorities(&envelope(instance, plugin, ""))
+                .unwrap()
+                .priorities
+                .into_iter()
+                .map(|p| (p.data_type, p.datasets))
+                .collect::<Vec<_>>()
+        })
+    };
+    let both = read("reporting-1", true);
+    assert_eq!(both.len(), 2, "{both:?}");
+    let mut config = configuration(true, &[]);
+    for entitlement in &mut config.entitlements {
+        if entitlement.dataset == KRAKEN {
+            entitlement.allowed = false;
+        }
+    }
+    h.lake.configured(&config);
+    assert_eq!(
+        read("reporting-1", true),
+        vec![("meridian.v1.Price".to_string(), vec![COINBASE.to_string()])],
+        "kraken left out of the closes' priority, and the bars' -- kraken alone -- not answered"
+    );
+    // A plugin entitled to nothing reads none.
+    assert!(read("signal-9", true).is_empty());
+    // The dashboard, every one whole.
+    let whole = read("dashboard-1", false);
+    assert_eq!(whole.len(), 2);
+    assert!(whole
+        .iter()
+        .any(|(_, datasets)| datasets == &vec![COINBASE.to_string(), KRAKEN.to_string()]));
+}

@@ -324,6 +324,34 @@ platform.config.query.plugin-configuration\tquery\tsidecar\tconductor
     }
 
     #[test]
+    fn the_eight_roles_that_read_the_lake_read_the_source_priorities_and_data_does_not() {
+        // Contract v30 (W10.2; ruling 454; step 3c's question 7): reporting,
+        // portfolio, compliance, signal, ems, oms, operations and
+        // servicing ask ListSourcePriorities, not data; setting one stays
+        // the dashboard's.
+        let topic = "platform.lake.query.list-source-priorities";
+        for role in [
+            "reporting",
+            "portfolio",
+            "compliance",
+            "signal",
+            "ems",
+            "oms",
+            "operations",
+            "servicing",
+        ] {
+            let grants = Contract::embedded().grants_for(&roles(&[role])).unwrap();
+            assert!(grants.may_publish(topic), "{role}");
+            assert!(
+                !grants.may_publish("platform.lake.command.set-source-priority"),
+                "{role}"
+            );
+        }
+        let data = Contract::embedded().grants_for(&roles(&["data"])).unwrap();
+        assert!(!data.may_publish(topic));
+    }
+
+    #[test]
     fn the_compiled_in_contract_admits_a_re_resolution_from_custody_heard_by_operations() {
         // Contract v15 (W2.15, W2.16): custody re-resolves a recorded
         // activity, the street keeps it, and operations hears it; a plugin

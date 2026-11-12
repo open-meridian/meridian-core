@@ -864,6 +864,37 @@ impl Lake {
     /// admin reads the switches of the default reads' sources, and the
     /// switches back, newest first, by data type and dataset, a page at a
     /// time. Changes nothing.
+    /// The deployment's source priorities (W10.2): every one, whole, to
+    /// the dashboard; from contract v30 to the eight roles that read the
+    /// lake too (ruling 454; step 3c's question 7), each answered with the
+    /// datasets the asker is entitled to read, one it may not left out of
+    /// each priority's list and a priority with none left not answered.
+    pub(crate) fn list_priorities(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<ListSourcePrioritiesReply, String> {
+        let priorities = self
+            .store
+            .priorities()
+            .map_err(|failed| failed.to_string())?;
+        let reader = reader_of(envelope);
+        if reader == Reader::Core {
+            return Ok(ListSourcePrioritiesReply { priorities });
+        }
+        let config = self.config();
+        Ok(ListSourcePrioritiesReply {
+            priorities: priorities
+                .into_iter()
+                .filter_map(|mut priority| {
+                    priority
+                        .datasets
+                        .retain(|dataset| config.fields_for(dataset, &reader).is_some());
+                    (!priority.datasets.is_empty()).then_some(priority)
+                })
+                .collect(),
+        })
+    }
+
     pub(crate) fn list_source_switches(
         &self,
         request: meridian_domain::v1::ListSourceSwitchesRequest,
@@ -7271,14 +7302,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListSourcePrioritiesRequest",
             "meridian.v1.ListSourcePrioritiesReply",
         ),
-        |lake, _: ListSourcePrioritiesRequest, _| {
-            Ok(ListSourcePrioritiesReply {
-                priorities: lake
-                    .store
-                    .priorities()
-                    .map_err(|failed| failed.to_string())?,
-            })
-        },
+        |lake, _: ListSourcePrioritiesRequest, envelope| lake.list_priorities(envelope),
     );
     // Contract v30 (W10.6; the resilience spec's section 8): the switches of
     // the default reads' sources, for a deployment admin.
