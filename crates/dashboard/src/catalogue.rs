@@ -877,6 +877,16 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 "pull_kept": pulled.as_ref().map(|_| {
                     running.is_some_and(|v| crate::registry::pull_warning(launch, v, &listings).is_none())
                 }),
+                // As its launch asked (contract v30, W8.3), read back by
+                // `meridian plugin list`: its own share at its sidecar, null
+                // for the deployment's, and its shards and standby pod.
+                "limits": launch.limits.as_ref().map(|l| serde_json::json!({
+                    "in_flight": l.in_flight,
+                    "requests_per_second": l.requests_per_second,
+                    "answer_mib": l.answer_mib,
+                })),
+                "shards": launch.shards,
+                "standby": launch.standby,
             })
         })
         .collect();

@@ -136,6 +136,13 @@ fn conductor(bus: &Bus) {
                     name: "snaptrade".into(),
                     version: "0.1.0".into(),
                     state: PluginLaunchState::Launched as i32,
+                    limits: Some(meridian_domain::v1::SidecarLimits {
+                        in_flight: 4,
+                        answer_mib: 64,
+                        ..Default::default()
+                    }),
+                    shards: 2,
+                    standby: true,
                     ..Default::default()
                 }],
             }
@@ -762,6 +769,14 @@ async fn the_catalogue_launching_and_stopping() {
         "pulled: a breach of the Platform Terms"
     );
     assert_eq!(listed["launches"][0]["pull_kept"], false);
+    // Contract v30 (W8.3): what the launch asked, read back by `meridian
+    // plugin list`.
+    assert_eq!(
+        listed["launches"][0]["limits"],
+        serde_json::json!({"in_flight": 4, "requests_per_second": 0, "answer_mib": 64})
+    );
+    assert_eq!(listed["launches"][0]["shards"], 2);
+    assert_eq!(listed["launches"][0]["standby"], true);
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
