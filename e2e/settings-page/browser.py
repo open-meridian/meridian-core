@@ -1307,6 +1307,11 @@ def the_registry_pages(browser, prefix):
                     limits = page.locator("[data-limits] input[type=number]")
                     check(limits.count() == 3 and all(limits.nth(i).is_visible() for i in range(3)),
                           f"launch-sheet at {size}, {scheme} offers its three limits")
+                    # Each shown whole: the fieldset scrolls nothing away
+                    # (the checks list's 14rem cap clipped the third).
+                    clipped = page.evaluate("""() => { const f = document.querySelector('[data-limits]');
+                        return f.scrollHeight - f.clientHeight; }""")
+                    check(clipped <= 1, f"launch-sheet at {size}, {scheme} shows its limits whole: {clipped}px hidden")
                     # Kept for a person's look (M2's follow-up): CI keeps
                     # them as the run's launch-sheet artifact.
                     page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-{size}-{scheme}.png"))
