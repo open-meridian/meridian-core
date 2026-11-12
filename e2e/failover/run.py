@@ -171,6 +171,11 @@ DRIVER_ROLES = {"data": ["data", "reporting"], "oms": ["oms"], "desk": ["oms", "
                 # The standing-coordinator class's subject (contract v30): a
                 # standing job held by its view.
                 "standing": ["reporting"]}
+# The flood instance's own sidecar.limits.inFlight: its pressure readers'
+# count in driver.py (FLOOD_PRESSURE), each reaching the lake at once, as
+# under the chart's 32 the class was built against; its noisy readers (160)
+# stay past it.
+FLOOD_IN_FLIGHT = 32
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
 DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
@@ -889,6 +894,13 @@ def driver_values():
         }})
         if role in ("oms", "desk"):
             sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
+        if role == "flood":
+            # Its own share at its sidecar, as a launch may set it (contract
+            # v30, ruled 2026-11-11): FLOOD_PRESSURE readers at once reach
+            # the lake past its budget, as memory-pressure asks, now that
+            # the chart's default is 16; noisy-plugin's FLOOD_NOISY are still
+            # past it. The chart's bounds and the lake's are unchanged.
+            sidecars[-1]["limits"] = {"inFlight": FLOOD_IN_FLIGHT}
     path = os.path.join(tempfile.mkdtemp(prefix="failover-driver-"), "driver.json")
     with open(path, "w", encoding="utf-8") as kept:
         json.dump({"sidecars": sidecars}, kept)
@@ -3457,8 +3469,15 @@ def trust_targets(s, failure, began_ms):
     render, a browser's clock, deliveries a page hears between reads."""
     if not DRIVEN:
         return
-    ended_ms = int(time.time() * 1000)
+    # The page reads about once a second: a class shorter than that (the
+    # street's network-policy, healed in under one) is judged once the page
+    # has read in it, waited for at most 5 s.
     reads = page_reads(began_ms)
+    waited = time.time()
+    while not reads and time.time() - waited < 5:
+        time.sleep(0.5)
+        reads = page_reads(began_ms)
+    ended_ms = int(time.time() * 1000)
     if not reads:
         s.check(False, f"{failure}: trust targets: the page read nothing in the class")
         return
