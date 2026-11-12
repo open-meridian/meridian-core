@@ -1318,6 +1318,21 @@ def the_registry_pages(browser, prefix):
                         const [a, b] = [...f.children].map(c => c.getBoundingClientRect());
                         return b.top < a.bottom ? b.left - a.right : b.top - a.bottom; }""")
                     check(apart >= 6, f"launch-sheet at {size}, {scheme} keeps Cancel and Launch apart: {apart}px")
+                    # Contract v30 (W8.3): its Pods beside the Limits -- Shards,
+                    # at most 0.13.0's four, and a standby pod -- shown whole.
+                    shards = page.locator("[data-pods] input[name=shards]")
+                    standby = page.locator("[data-pods] input[name=standby][type=checkbox]")
+                    check(shards.count() == 1 and shards.is_visible() and shards.get_attribute("max") == "4"
+                          and standby.count() == 1 and standby.is_visible(),
+                          f"launch-sheet at {size}, {scheme} offers Shards, at most 4, and a standby pod")
+                    clipped = page.evaluate("""() => { const f = document.querySelector('[data-pods]');
+                        return f.scrollHeight - f.clientHeight; }""")
+                    check(clipped <= 1, f"launch-sheet at {size}, {scheme} shows its pods whole: {clipped}px hidden")
+                    # Past four the browser holds it at the field, unsent.
+                    shards.fill("9")
+                    check(page.evaluate("() => document.querySelector('[data-pods] input[name=shards]').validity.rangeOverflow"),
+                          f"launch-sheet at {size}, {scheme} holds 9 shards at the field")
+                    shards.fill("")
                     # Kept for a person's look (M2's follow-up): CI keeps
                     # them as the run's launch-sheet artifact.
                     page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-{size}-{scheme}.png"))
@@ -1359,6 +1374,27 @@ def the_registry_pages(browser, prefix):
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            # Contract v30 (W8.3): shards past most_shards sent all the same
+            # (the field's bound lifted) come back refused by the conductor,
+            # naming shards, at the field, the sheet as it was filled, and on
+            # one screen still.
+            page.goto(f"{BASE}/admin/plugins/versions/snaptrade/launch?version=0.13.0")
+            settled(page)
+            page.evaluate("() => document.querySelector('[data-pods] input[name=shards]').removeAttribute('max')")
+            page.fill("[data-pods] input[name=shards]", "9")
+            page.fill("input[name=note]", "Nine pods")
+            page.click(".sheet-foot button[type=submit]")
+            settled(page)
+            refusal = page.locator("[data-pods] [data-refused=shards]")
+            check(refusal.count() == 1 and refusal.is_visible() and "at most 4" in refusal.text_content(),
+                  f"launch-sheet at {size}, {scheme} shows 9 shards refused at the field")
+            check(page.locator("[data-pods] input[name=shards][aria-invalid=true]").input_value() == "9"
+                  and page.locator("input[name=note]").input_value() == "Nine pods",
+                  f"launch-sheet at {size}, {scheme} keeps what was entered beside the refusal")
+            m = page.evaluate(MEASURE)
+            measured(page, f"launch-sheet refused at {size}, {scheme}", f"v25-{prefix}-registry-launch-refused-{size}-{scheme}.png")
+            check(m["tall"] <= 0, f"launch-sheet refused at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-launch-sheet-refused-{size}-{scheme}.png"))
             check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
             ctx.close()
 

@@ -2125,14 +2125,19 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     // Contract v25: the catalogue holding SnapTrade's version, launched as
     // INSTANCE, and its documentation as a vendor writes it (the SnapTrade
     // draft's shape: headings, lists, a table, outside links), for the
-    // Documentation tab, the versions list and a version's page.
+    // Documentation tab, the versions list and a version's page. Its newest
+    // allows four pods of one instance, for the Launch sheet's Shards
+    // (contract v30, W8.3).
     bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
         let version = |v: &str| meridian_domain::v1::PluginVersion {
             metadata: Some(meridian_domain::v1::PluginMetadata {
                 name: "snaptrade".into(),
                 version: v.into(),
                 roles: vec!["custody".into()],
-                declaration: Some(documented_declaration()),
+                declaration: Some(meridian_pb::v1::PluginDeclaration {
+                    most_shards: if v == "0.13.0" { 4 } else { 0 },
+                    ..documented_declaration()
+                }),
                 ..Default::default()
             }),
             uploaded_by: ADMIN.into(),
@@ -2178,6 +2183,36 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                         ..Default::default()
                     },
                 ],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v30 (W8.3): a launch from the Launch sheet, refused past
+    // 0.13.0's four pods naming shards, as the conductor refuses it.
+    bus.serve(crate::catalogue::LAUNCH_PLUGIN, |envelope| {
+        let asked = meridian_domain::v1::LaunchPluginRequest::decode(&envelope.payload[..])
+            .map_err(|failed| failed.to_string())?;
+        if asked.shards > 4 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["shards".to_string()],
+                format!(
+                    "shards is {}, and {} {} allows at most 4 pod(s) of one instance (its most_shards)",
+                    asked.shards, asked.name, asked.version
+                ),
+            ));
+        }
+        Ok((
+            "meridian.v1.PluginLaunch".into(),
+            meridian_domain::v1::PluginLaunch {
+                instance_id: asked.instance_id,
+                name: asked.name,
+                version: asked.version,
+                roles: asked.approved_roles,
+                shards: asked.shards,
+                standby: asked.standby,
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
