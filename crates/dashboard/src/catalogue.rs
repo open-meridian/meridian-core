@@ -73,6 +73,10 @@ pub fn routes() -> Router<Arc<App>> {
         // ReadBookHealthFromTerminal (contract v25; ruling 155): what
         // `meridian status` reads of the book.
         .route("/terminal/book-health", get(book_health))
+        // ReadResilienceProfile (contract v30, W6.39): what `meridian status
+        // --profile` prints, as the Resilience page's Profile tab and
+        // `dashboard__read_resilience_profile` read it.
+        .route("/terminal/resilience-profile", get(resilience_profile))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
         // Contract v26 (the v26 plan's question 237): the registry's acts
@@ -801,6 +805,28 @@ async fn book_health(State(app): State<Arc<App>>, headers: HeaderMap) -> Respons
         cursor = page.next_cursor;
     }
     json(StatusCode::OK, serde_json::json!({ "accounts": accounts }))
+}
+
+/// `GET /terminal/resilience-profile`: the resilience profile, a deployment
+/// admin's read, answered as `dashboard__read_resilience_profile` answers it.
+async fn resilience_profile(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let admin = match admin(&app, &headers).await {
+        Ok(admin) => admin,
+        Err(refusal) => return *refusal,
+    };
+    let reply: Result<meridian_domain::v1::ReadResilienceProfileReply, String> = ask(
+        &app,
+        &admin,
+        crate::admin::resilience::READ_RESILIENCE_PROFILE,
+        "meridian.v1.ReadResilienceProfileRequest",
+        meridian_domain::v1::ReadResilienceProfileRequest {},
+        Duration::from_secs(10),
+    )
+    .await;
+    match reply {
+        Ok(reply) => json(StatusCode::OK, crate::mcp::resilience::profile_json(&reply)),
+        Err(failed) => refused(StatusCode::BAD_GATEWAY, failed),
+    }
 }
 
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {

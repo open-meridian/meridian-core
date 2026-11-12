@@ -496,6 +496,45 @@ async fn the_books_health_is_read_from_a_deployment_admins_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_resilience_profile_is_read_from_a_deployment_admins_terminal() {
+    // ReadResilienceProfile (contract v30, W6.39): what `meridian status
+    // --profile` prints, a deployment admin's alone, as the MCP tool answers.
+    let h = harness().await;
+    h.app.bus.serve(
+        crate::admin::resilience::READ_RESILIENCE_PROFILE,
+        |envelope| {
+            stamped(&envelope)?;
+            Ok((
+                "meridian.v1.ReadResilienceProfileReply".into(),
+                meridian_domain::v1::ReadResilienceProfileReply {
+                    level: meridian_domain::v1::ServiceLevel::SingleNode as i32,
+                    failures: vec![meridian_domain::v1::ResilienceLine {
+                        subject: "a pod".into(),
+                        state: meridian_domain::v1::ResilienceState::MetByRestart as i32,
+                        reason: "one book writer, no standby".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
+    assert_eq!(
+        send(&h, "GET", "/terminal/resilience-profile", Some(&h.bob), "")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, body) = send(&h, "GET", "/terminal/resilience-profile", Some(&h.ada), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["level"], "single_node", "{body}");
+    assert_eq!(read["failures"][0]["state"], "met_by_restart", "{body}");
+    assert_eq!(read["failures"][0]["reason"], "one book writer, no standby");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_push_is_passed_through_step_by_step_and_its_location_kept_here() {
     let h = harness().await;
     let base = "/terminal/registry/v2/plugins/snaptrade";

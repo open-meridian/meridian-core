@@ -227,6 +227,8 @@ pub const PARITY: &[(&str, &str)] = &[
     ("tab partitions", "read_resilience"),
     ("tab history", "read_resilience"),
     (page::PATH, "read_resilience_profile read_resilience"),
+    // What `meridian status --profile` reads (contract v30).
+    ("/terminal/resilience-profile", "read_resilience_profile"),
 ];
 
 #[cfg(test)]
