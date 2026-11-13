@@ -732,7 +732,12 @@ impl NatsBackend {
                             .await
                             .ok()
                             .flatten();
-                        if let Some((internal, group)) = owner {
+                        // A wait spent while it was decided: dropped here,
+                        // below, as any request whose caller stopped waiting
+                        // -- never passed on to be run late.
+                        let spent = deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                        if let Some((internal, group)) = owner.filter(|_| !spent) {
                             let mut headers = async_nats::HeaderMap::new();
                             headers.insert(
                                 crate::owners::WRITER_GROUP_HEADER,
@@ -743,6 +748,7 @@ impl NatsBackend {
                                     .saturating_duration_since(std::time::Instant::now())
                                     .as_millis()
                                     .max(1);
+                                // What is left of it, the owner's to keep.
                                 headers.insert(TIMEOUT_HEADER, left.to_string().as_str());
                             }
                             match client
