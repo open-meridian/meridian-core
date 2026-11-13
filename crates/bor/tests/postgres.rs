@@ -2595,6 +2595,9 @@ async fn capacity_book_partitions() {
     // first act: every bench account of every shape, no owner label, so each
     // is placed by its ID. One stand-in for the whole run.
     let known: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    // `make bench-book`'s: every run's figures, written as JSON where
+    // MERIDIAN_BENCH_JSON names a file.
+    let mut figures: Vec<serde_json::Value> = Vec::new();
     let conductor = Arc::new(Bus::single(
         format!("conductor-bench-{}", unique("C")),
         Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap()),
@@ -2685,15 +2688,17 @@ async fn capacity_book_partitions() {
             let (count_before, total_before, _) = meridian_bus::owners::handed_on();
             let next = Arc::new(AtomicU64::new(0));
             let retried = Arc::new(AtomicU64::new(0));
+            let timeouts = Arc::new(AtomicU64::new(0));
             let started = std::time::Instant::now();
             let mut workers = Vec::new();
             for _ in 0..in_flight {
-                let (client, accounts, next, run, retried) = (
+                let (client, accounts, next, run, retried, timeouts) = (
                     Arc::clone(&client),
                     accounts.clone(),
                     Arc::clone(&next),
                     run.clone(),
                     Arc::clone(&retried),
+                    Arc::clone(&timeouts),
                 );
                 workers.push(tokio::spawn(async move {
                     let mut took = Vec::new();
@@ -2723,6 +2728,11 @@ async fn capacity_book_partitions() {
                                 .await
                             {
                                 Ok(_) => break,
+                                Err(refused) if refused.contains("timed out after") => {
+                                    // Its caller stopped waiting: counted, and
+                                    // asked again at once.
+                                    timeouts.fetch_add(1, Ordering::Relaxed);
+                                }
                                 Err(refused) => {
                                     let detail = refused
                                         .find('[')
@@ -2757,6 +2767,21 @@ async fn capacity_book_partitions() {
             } else {
                 0.0
             };
+            figures.push(serde_json::json!({
+                "run": label,
+                "groups": groups,
+                "partitions": partitions,
+                "proposals": count,
+                "in_flight": in_flight,
+                "rate_per_s": count as f64 / elapsed.as_secs_f64(),
+                "p50_ms": at(0.50).as_secs_f64() * 1e3,
+                "p99_ms": at(0.99).as_secs_f64() * 1e3,
+                "max_ms": took.last().unwrap().as_secs_f64() * 1e3,
+                "timeouts": timeouts.load(Ordering::Relaxed),
+                "asked_again": retried.load(Ordering::Relaxed),
+                "handed": handed,
+                "handed_mean_ms": mean_ms,
+            }));
             println!(
                 "CAPACITY book partitions groups={groups} partitions={partitions} run={label} \
                  proposals={count} in_flight={in_flight} rate_per_s={:.0} p50_ms={:.2} \
@@ -2790,6 +2815,32 @@ async fn capacity_book_partitions() {
         );
         drop(buses);
         blocking(move || drop(held));
+    }
+    if let Ok(path) = std::env::var("MERIDIAN_BENCH_JSON") {
+        // The 1-, 5- and 15-minute loads, as /proc/loadavg says them.
+        let averages = |said: &str| -> Option<[f64; 3]> {
+            let mut each = said.split_whitespace().map(|n| n.parse::<f64>().ok());
+            Some([each.next()??, each.next()??, each.next()??])
+        };
+        let load = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|said| averages(&said));
+        let before = std::env::var("MERIDIAN_BENCH_LOAD_BEFORE").unwrap_or_default();
+        let written = serde_json::json!({
+            "bench": "book",
+            "commit": std::env::var("MERIDIAN_BENCH_COMMIT").unwrap_or_default(),
+            "host": {
+                "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                "load_before": averages(&before).map_or_else(
+                    || serde_json::Value::from(before.clone()),
+                    |loads| serde_json::json!(loads),
+                ),
+                "load_after": load,
+            },
+            "runs": figures,
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&written).unwrap())
+            .unwrap_or_else(|failed| panic!("{path} could not be written: {failed}"));
     }
 }
 

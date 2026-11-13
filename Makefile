@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: bench-book ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -26,6 +26,7 @@ help:
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
 	@echo "  make bench          measure the stated capacity INSTALL.md gives (by hand)"
+	@echo "  make bench-book     the book's bench for one shape, headless: BENCH_DATABASE_URL, BENCH_OUT (JSON)"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
@@ -551,6 +552,44 @@ bench: network
 		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
 	@grep -E '^CAPACITY |inversions' .bench.log
 	@$(COMPOSE) --profile tests down --remove-orphans >/dev/null 2>&1 || true
+
+# The book's bench for one shape, headless (step 3d, checkpoint 2; the PO's
+# ruling of 2026-11-13: decision-grade figures from a dedicated cloud VM):
+# BENCH_PROPOSALS proposals (100,000) at BENCH_IN_FLIGHT at once (64), over
+# BENCH_GROUPS writer groups and BENCH_PARTITIONS partitions, against the
+# Postgres BENCH_DATABASE_URL names and the broker BENCH_BROKER_URL names,
+# then a light run asked one at a time. Built and run with cargo at the
+# workspace's rust-version (1.90 or newer), optimised, so a plain Linux VM
+# runs it: no container. It writes JSON to BENCH_OUT -- each run's rate, p50,
+# p99 and most, timeouts and retries, the shape, the commit, the host's CPU
+# count and its load -- and the run's own output beside it, BENCH_OUT.log.
+# It prints only `done <path>`: core is public, and so are its CI logs, so
+# no figure is ever printed. Never wired into CI (stage T's write-scale is
+# separate).
+BENCH_GROUPS ?= 1
+BENCH_PARTITIONS ?= 1
+BENCH_IN_FLIGHT ?= 64
+BENCH_PROPOSALS ?= 100000
+BENCH_LIGHT ?= 2000
+BENCH_BROKER_URL ?= nats://127.0.0.1:4222
+bench-book:
+	@test -n "$(BENCH_DATABASE_URL)" \
+		|| { echo "bench-book: set BENCH_DATABASE_URL=<a Postgres the bench may make schemas in>" >&2; exit 1; }
+	@test -n "$(BENCH_OUT)" || { echo "bench-book: set BENCH_OUT=<path for the JSON>" >&2; exit 1; }
+	@MERIDIAN_TEST_DATABASE_URL="$(BENCH_DATABASE_URL)" \
+	MERIDIAN_BENCH_BROKER_URL="$(BENCH_BROKER_URL)" \
+	MERIDIAN_BENCH_SHAPES="$(BENCH_GROUPS)x$(BENCH_PARTITIONS)" \
+	MERIDIAN_BENCH_IN_FLIGHT="$(BENCH_IN_FLIGHT)" \
+	MERIDIAN_BENCH_PROPOSALS="$(BENCH_PROPOSALS)" \
+	MERIDIAN_BENCH_LIGHT="$(BENCH_LIGHT)" \
+	MERIDIAN_BENCH_JSON="$(abspath $(BENCH_OUT))" \
+	MERIDIAN_BENCH_COMMIT="$$(git rev-parse HEAD 2>/dev/null)" \
+	MERIDIAN_BENCH_LOAD_BEFORE="$$(cat /proc/loadavg 2>/dev/null || uptime)" \
+		cargo test --release --locked -p meridian-bor --test postgres \
+			-- --ignored --exact capacity_book_partitions --nocapture \
+		>"$(abspath $(BENCH_OUT)).log" 2>&1 \
+		|| { echo "bench-book FAILED; its output is in $(abspath $(BENCH_OUT)).log" >&2; exit 1; }
+	@echo "done $(abspath $(BENCH_OUT))"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
