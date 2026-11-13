@@ -442,16 +442,27 @@ impl Backend for NatsBackend {
 
     /// Offer a local handler's answer to writer group `group` alone.
     fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
-        self.offer(topic, queue, handler, None, Some(group));
+        self.offer(topic, queue, handler, None, Some(group), None);
     }
     /// Offer a local handler's answer to callers in other processes.
     fn serve(&self, topic: &str, group: &str, handler: Handler) {
-        self.offer(topic, group, handler, None, None);
+        self.offer(topic, group, handler, None, None, None);
+    }
+
+    /// The same, each request another writer group owns passed to it first.
+    fn serve_routed(
+        &self,
+        topic: &str,
+        group: &str,
+        handler: Handler,
+        route: crate::backend::PreRoute,
+    ) {
+        self.offer(topic, group, handler, None, None, Some(route));
     }
 
     /// The same, signalling once each answer is on the wire.
     fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
-        self.offer(topic, group, handler, Some(delivered), None);
+        self.offer(topic, group, handler, Some(delivered), None, None);
     }
 
     /// One of a queue group at the broker (contract v25): each message to one
@@ -639,6 +650,7 @@ impl NatsBackend {
         handler: Handler,
         delivered: Option<Arc<Notify>>,
         writer_group: Option<u32>,
+        route: Option<crate::backend::PreRoute>,
     ) {
         let client = self.client.clone();
         let subject = topic.to_string();
@@ -684,6 +696,7 @@ impl NatsBackend {
                     .and_then(|said| said.to_string().parse::<u64>().ok())
                     .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
 
+                let passed = message.payload.clone();
                 let asked = match Envelope::decode(message.payload) {
                     Ok(envelope) => envelope,
                     Err(failed) => {
@@ -696,6 +709,7 @@ impl NatsBackend {
                 let client = client.clone();
                 let topic = subject.clone();
                 let delivered = delivered.clone();
+                let route = route.clone();
 
                 // Each request on its own task, so one slow handler does not
                 // hold up the next, and on a blocking pool, because a handler
@@ -705,6 +719,53 @@ impl NatsBackend {
                 // HANDLERS_AT_ONCE answering at once -- and its working memory
                 // reserved; or refused for load with a retry-after.
                 tokio::spawn(async move {
+                    // Another writer group's write, as the request says (step
+                    // 3d; section 6.7): passed to its owner as it came, its
+                    // caller's reply address kept and what is left of its
+                    // wait, so the owner answers the caller; nothing held or
+                    // waited on here. Decided off the runtime: the owner's
+                    // record may be read.
+                    if let Some(route) = route {
+                        let started = std::time::Instant::now();
+                        let looked = asked.clone();
+                        let owner = tokio::task::spawn_blocking(move || route(&looked))
+                            .await
+                            .ok()
+                            .flatten();
+                        if let Some((internal, group)) = owner {
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers.insert(
+                                crate::owners::WRITER_GROUP_HEADER,
+                                group.to_string().as_str(),
+                            );
+                            if let Some(deadline) = deadline {
+                                let left = deadline
+                                    .saturating_duration_since(std::time::Instant::now())
+                                    .as_millis()
+                                    .max(1);
+                                headers.insert(TIMEOUT_HEADER, left.to_string().as_str());
+                            }
+                            match client
+                                .publish_with_reply_and_headers(
+                                    internal,
+                                    reply_to.clone(),
+                                    headers,
+                                    passed,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    crate::owners::note_passed(started.elapsed());
+                                    return;
+                                }
+                                Err(failed) => {
+                                    // Answered here instead: its handler
+                                    // hands it on as before.
+                                    tracing::warn!(topic, %failed, "a write could not be passed to its owner");
+                                }
+                            }
+                        }
+                    }
                     let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
 
                     let (payload_type, payload, refusal) = match answered {

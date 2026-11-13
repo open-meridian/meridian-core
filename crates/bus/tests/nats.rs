@@ -1305,3 +1305,58 @@ async fn a_client_that_stops_reading_is_cut_off_alone_and_every_other_keeps_its_
         "the stalled client was sent everything: {left} bytes"
     );
 }
+
+/// Step 3d (section 6.7): a write the request says another writer group
+/// owns is passed to that group's member before it is admitted here, the
+/// caller's reply address kept: the owner answers the caller itself, this
+/// member's handler never runs, and it waits on nothing.
+#[tokio::test]
+async fn a_write_another_group_owns_is_passed_to_it_and_answered_by_it() {
+    let instance = format!("store-{}", mark("pass"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    let ran = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let mut members = Vec::new();
+    for group in 0..2u32 {
+        let member = bus(&instance).await;
+        member.hand_writes_on(&internal, group, {
+            let write = write.clone();
+            move |topic| topic == write
+        });
+        // Every write is group 1's, as its request says.
+        member.route_writes_by(|_, _| Some(1));
+        let counted = std::sync::Arc::clone(&ran);
+        member.serve(&write, move |envelope| {
+            counted[group as usize].fetch_add(1, Ordering::SeqCst);
+            Ok((
+                "meridian.test.Answer".to_string(),
+                [format!("group {group}: ").into_bytes(), envelope.payload].concat(),
+            ))
+        });
+        members.push(member);
+    }
+    settle().await;
+    let asking = bus("asking").await;
+    let (before, _, _) = meridian_bus::owners::handed_on();
+    for n in 0..20u32 {
+        let (_, payload) = asking
+            .call(
+                &write,
+                "meridian.test.Question",
+                n.to_string().into_bytes(),
+                None,
+                None,
+            )
+            .await
+            .expect("answered");
+        assert_eq!(payload, format!("group 1: {n}").into_bytes());
+    }
+    assert_eq!(
+        ran[0].load(Ordering::SeqCst),
+        0,
+        "group 0's handler never ran"
+    );
+    assert_eq!(ran[1].load(Ordering::SeqCst), 20);
+    let (after, _, _) = meridian_bus::owners::handed_on();
+    assert!(after > before, "the writes group 0 received were passed on");
+}

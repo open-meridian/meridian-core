@@ -434,6 +434,12 @@ pub type HandlerReply = std::result::Result<(String, Vec<u8>), String>;
 /// A registered answer to one topic.
 pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync>;
 
+/// Where a request is to be handed before it is admitted here (step 3d;
+/// section 6.7): the internal topic and the writer group that owns the
+/// write, where it is another group's; none where it is this member's to
+/// answer, or the request says nothing of its owner.
+pub type PreRoute = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
+
 /// A future a backend returns, boxed so the trait stays object-safe.
 ///
 /// Only the call path pays for this. `publish` and `subscribe` stay
@@ -515,6 +521,17 @@ pub trait Backend: Send + Sync {
     /// it as one `group` (the component's name), so each request is answered
     /// once, not once per copy with all but the first answer thrown away.
     fn serve(&self, _topic: &str, _group: &str, _handler: Handler) {}
+
+    /// [`Backend::serve`], each request first offered to `route`: one it
+    /// names another writer group's is passed to that group on the internal
+    /// topic as it came, its caller's reply address kept, so the owner
+    /// answers the caller itself -- never admitted here, never waited on
+    /// here (step 3d). Defaulted to serving alone: an in-process backend's
+    /// router hands it on in its handler.
+    fn serve_routed(&self, topic: &str, group: &str, handler: Handler, route: PreRoute) {
+        let _ = route;
+        self.serve(topic, group, handler);
+    }
 
     /// The same, and signal once an answer has actually reached the broker.
     ///

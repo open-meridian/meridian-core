@@ -71,6 +71,13 @@ static HANDED_COUNT: AtomicU64 = AtomicU64::new(0);
 static HANDED_NS: AtomicU64 = AtomicU64::new(0);
 static HANDED_MOST_NS: AtomicU64 = AtomicU64::new(0);
 
+/// One write passed to its owner before it was admitted, the owner
+/// answering its caller (step 3d): counted with the writes handed on, in
+/// the time the pass took here.
+pub(crate) fn note_passed(took: Duration) {
+    note_handed(took);
+}
+
 /// One write handed on and answered, in `took`.
 pub(crate) fn note_handed(took: Duration) {
     let ns = took.as_nanos() as u64;

@@ -529,8 +529,21 @@ impl Bus {
         // offer it, every copy of this component one group (contract v25),
         // so a request is answered once. The in-process backend does nothing
         // here, because the map above is already the answer.
+        // A write another writer group owns, as the request says, passed to
+        // its owner before it is admitted here (step 3d): never a slot of
+        // this member's held while the owner answers, nor admitted twice.
+        let routing = Arc::clone(&self.routing);
+        let asked = topic.to_string();
+        let route: crate::backend::PreRoute = Arc::new(move |envelope: &Envelope| {
+            let route = routing.read().expect("routing poisoned").clone()?;
+            if !(route.writes)(&asked) {
+                return None;
+            }
+            let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
+            (group != route.group).then(|| (route.internal.clone(), group))
+        });
         self.backend_for(topic)
-            .serve(topic, &self.instance_id, handler);
+            .serve_routed(topic, &self.instance_id, handler, route);
     }
 
     /// This process's part in `read_after` (contract v30, stage B): a store's
