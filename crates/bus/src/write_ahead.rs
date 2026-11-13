@@ -53,7 +53,11 @@ pub fn subject(instance: &str, key: &str) -> String {
 /// The dataset a write's subject names (`<instance>:<key>`, as
 /// [`subject_of`] spelled it); none for a subject of no dataset's.
 pub fn dataset_of_subject(subject: &str) -> Option<String> {
-    let rest = subject.strip_prefix("platform.lake.internal.write-ahead.")?;
+    // The prefix as [`subject`] spells it, so the topic is named once.
+    let prefix = self::subject("", "");
+    let rest = subject
+        .strip_prefix(prefix.trim_end_matches('.'))?
+        .strip_prefix('.')?;
     let (instance, key) = rest.split_once('.')?;
     (!instance.is_empty() && !key.is_empty() && !key.contains('.'))
         .then(|| format!("{instance}:{key}"))
