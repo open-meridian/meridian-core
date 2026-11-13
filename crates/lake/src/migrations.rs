@@ -128,6 +128,32 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "writer_group",
         sql: include_str!("../migrations/0018_writer_group.sql"),
     },
+    // Hash ranges (step 3d; section 6.1, approved 2026-11-12): each range's
+    // own head row, and each row's range and anchor.
+    Migration {
+        version: 19,
+        name: "ranges",
+        sql: include_str!("../migrations/0019_ranges.sql"),
+    },
+    // lake_row partitioned online (step 3d; section 6.2): the rows kept so
+    // far said to name no range, checked without holding reads back, then
+    // the table kept so far made the new table's default partition, and
+    // `lake_latest` (approved 2026-11-12).
+    Migration {
+        version: 20,
+        name: "partitioned_prepare",
+        sql: include_str!("../migrations/0020_partitioned_prepare.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "partitioned_validate",
+        sql: include_str!("../migrations/0021_partitioned_validate.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "partitioned",
+        sql: include_str!("../migrations/0022_partitioned.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -684,12 +684,49 @@ pub fn quarantine_refused(sources: &SourceChoice) -> Result<(), String> {
     Ok(())
 }
 
+/// The datasets places name, each by a number for the process's life: as
+/// few as the catalogue's datasets.
+static DATASET_IDS: std::sync::LazyLock<std::sync::RwLock<DatasetIds>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each dataset a place names, by its number, and each number by dataset.
+type DatasetIds = (Vec<Arc<str>>, std::collections::HashMap<Arc<str>, u32>);
+
+/// The number a place names `dataset` by.
+pub fn dataset_id(dataset: &Arc<str>) -> u32 {
+    if let Some(id) = DATASET_IDS
+        .read()
+        .expect("dataset ids poisoned")
+        .1
+        .get(dataset)
+    {
+        return *id;
+    }
+    let mut ids = DATASET_IDS.write().expect("dataset ids poisoned");
+    if let Some(id) = ids.1.get(dataset) {
+        return *id;
+    }
+    let id = ids.0.len() as u32;
+    ids.0.push(Arc::clone(dataset));
+    ids.1.insert(Arc::clone(dataset), id);
+    id
+}
+
+/// The dataset a place's number names.
+pub fn dataset_named(id: u32) -> Arc<str> {
+    DATASET_IDS.read().expect("dataset ids poisoned").0[id as usize].clone()
+}
+
 /// Where a row of an answer is, and so how the page carrying it reads it.
 #[derive(Debug, Clone)]
 pub enum Place {
-    /// A row the lake keeps, by its dataset and sequence: read again from
-    /// the record with the page that carries it ([`Store::rows_at`]).
-    Kept(Arc<str>, u64),
+    /// A row the lake keeps, by its dataset ([`dataset_id`]), its row key's
+    /// hash ([`crate::range::key_hash`]; two ranges split from one number
+    /// on from the same sequence) and its sequence: read again from the
+    /// record with the page that carries it ([`Store::rows_at`]). Sixteen
+    /// bytes, so an answer held by its places holds a row in no more than
+    /// it did.
+    Kept(u32, u32, u64),
     /// A row held as it was read and stripped: one served and not kept
     /// (W10.7; ruling 734), which nothing could read again; or, while its
     /// answer holds no more than [`HELD_INLINE_MOST`], one the lake keeps.
@@ -720,6 +757,7 @@ pub struct Candidate {
     series: Arc<str>,
     valid_from_ns: i64,
     sequence: u64,
+    key_hash: u32,
     recorded_at_ns: i64,
     /// The fields stripped from it as its reader may read them.
     stripped: Box<[&'static str]>,
@@ -989,6 +1027,7 @@ impl<'a, 'b> Gather<'a, 'b> {
         let meta = row.meta();
         let (valid_from_ns, sequence, recorded_at_ns) =
             (meta.valid_from_ns, meta.sequence, meta.recorded_at_ns);
+        let key_hash = crate::range::key_hash(&meta.row_key);
         let kind = row.kind();
         let allowed = self
             .against
@@ -1004,7 +1043,7 @@ impl<'a, 'b> Gather<'a, 'b> {
             self.held_bytes += cost;
             Place::Held(Box::new(row))
         } else {
-            Place::Kept(Arc::clone(&dataset), sequence)
+            Place::Kept(dataset_id(&dataset), key_hash, sequence)
         };
         Candidate {
             place,
@@ -1016,6 +1055,7 @@ impl<'a, 'b> Gather<'a, 'b> {
             series,
             valid_from_ns,
             sequence,
+            key_hash,
             recorded_at_ns,
             stripped,
         }
@@ -1027,7 +1067,11 @@ impl<'a, 'b> Gather<'a, 'b> {
         self.placing = true;
         let mut placed = |candidate: &mut Candidate| {
             if candidate.kept && matches!(candidate.place, Place::Held(_)) {
-                candidate.place = Place::Kept(Arc::clone(&candidate.dataset), candidate.sequence);
+                candidate.place = Place::Kept(
+                    dataset_id(&candidate.dataset),
+                    candidate.key_hash,
+                    candidate.sequence,
+                );
             }
         };
         self.rows.iter_mut().for_each(&mut placed);
@@ -1096,10 +1140,12 @@ pub fn rows_of(
     against: &Against<'_>,
     places: &[Place],
 ) -> Result<Option<Vec<Observation>>, String> {
-    let kept: Vec<(String, u64)> = places
+    let kept: Vec<(String, u64, u32)> = places
         .iter()
         .filter_map(|place| match place {
-            Place::Kept(dataset, sequence) => Some((dataset.to_string(), *sequence)),
+            Place::Kept(dataset, key_hash, sequence) => {
+                Some((dataset_named(*dataset).to_string(), *sequence, *key_hash))
+            }
             Place::Held(_) => None,
         })
         .collect();

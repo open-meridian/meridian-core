@@ -206,6 +206,13 @@ fn a_priority_carries_the_stale_guard_and_what_is_served_wants_and_misses_are_ke
 
 /// A trade, as the 1b records it (contract v19): keyed by its valid time,
 /// with no business date.
+/// A row restated: its value changed, its valid time and first subject kept
+/// (the lake's rule 5).
+fn restate(mut row: Observation) -> Observation {
+    row.meta_mut().valid_until_ns += 1;
+    row
+}
+
 fn trade(dataset: &str, row_key: &str, subject: &str, valid_from_ns: i64) -> Observation {
     Observation::Trade(Box::new(meridian_domain::v1::Trade {
         meta: Some(ObservationMeta {
@@ -309,7 +316,7 @@ fn a_catch_up_from_an_old_watermark_holds_a_chunk_never_the_dataset() {
     }
     // Ten row keys restated: each answered once, at its later version.
     let restated: Vec<Observation> = (0..10)
-        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .map(|n| restate(trade(&dataset, &format!("t{n}"), &subject, 1_000 + n)))
         .collect();
     store.record(&dataset, restated, 5_000).unwrap();
     let query = Query {
@@ -395,6 +402,7 @@ fn a_read_loads_the_closed_day_rechecks_of_its_rows_alone() {
     let recheck = |sequence: u64| ClosedDayAmendment {
         dataset: dataset.clone(),
         sequence,
+        row_key: String::new(),
         closed_day: Some(DateCheck {
             date: "2026-10-13".into(),
             reason: DateCheckReason::Holiday as i32,
@@ -465,7 +473,7 @@ fn a_whole_datasets_read_hands_on_a_chunk_at_a_time() {
         store.record(&dataset, rows, 1_000 + batch as i64).unwrap();
     }
     let restated: Vec<Observation> = (0..10)
-        .map(|n| trade(&dataset, &format!("t{n}"), &subject, 9_000))
+        .map(|n| restate(trade(&dataset, &format!("t{n}"), &subject, 1_000 + n)))
         .collect();
     store.record(&dataset, restated, 5_000).unwrap();
     let mut whole_bytes = 0usize;
@@ -519,7 +527,9 @@ fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation 
                 dataset: dataset.into(),
                 ..Default::default()
             }),
-            valid_from_ns: 100 + stage as i64,
+            // Every stage under the first determination's valid time (the
+            // lake's rule 5, ruled 2026-11-12).
+            valid_from_ns: 100,
             ..Default::default()
         }),
         determination: 1,
@@ -630,6 +640,7 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
         .amend_closed_day(&[ClosedDayAmendment {
             dataset: dataset.clone(),
             sequence: tuesday,
+            row_key: String::new(),
             closed_day: Some(DateCheck {
                 date: "2026-10-13".into(),
                 reason: DateCheckReason::Holiday as i32,
@@ -683,6 +694,7 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
         .amend_closed_day(&[ClosedDayAmendment {
             dataset: dataset.clone(),
             sequence: done.rows[0].meta().sequence,
+            row_key: String::new(),
             closed_day: None,
             why: "calendar CAL-USSS version 3 applied".into(),
             at_ns: 3_000,
@@ -826,6 +838,7 @@ fn the_rows_as_reported_and_on_a_closed_day_are_counted_in_force() {
     let recheck = |row: &Observation| ClosedDayAmendment {
         dataset: dataset.clone(),
         sequence: row.meta().sequence,
+        row_key: String::new(),
         closed_day: Some(DateCheck {
             date: row.meta().business_date.clone(),
             reason: DateCheckReason::Holiday as i32,
@@ -1425,6 +1438,10 @@ fn a_latest_read_by_the_index_keeps_a_later_subjects_rows_and_a_moved_row_key() 
         chain_trade(&dataset, "n", &subject, "B", 25),
     ];
     assert_eq!(store.record(&dataset, rows, 1_000).unwrap().recorded, 5);
+    // Its first subject replaced by the other record (W10.8): the key keeps
+    // its range, followed by alias, and is no first-subject change (the
+    // lake's rule 5, ruled 2026-11-12).
+    store.keep_alias(&subject, &other, 1_050).unwrap();
     let moved = store
         .record(
             &dataset,
@@ -1484,14 +1501,11 @@ fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row()
     ];
     let done = store.record(&dataset, rows, 1_000).unwrap();
     assert_eq!(done.recorded, 8);
-    // `r` restated to an earlier time: its version in force is no latest.
-    let restated = store
-        .record(
-            &dataset,
-            vec![chain_trade(&dataset, "r", &subject, "A", 5)],
-            1_100,
-        )
-        .unwrap();
+    // `r` restated invalid, its valid time kept (the lake's rule 5): series
+    // A's latest is it, and its latest valid the one before both invalid.
+    let mut r_invalid = chain_trade(&dataset, "r", &subject, "A", 40);
+    r_invalid.meta_mut().quality = QualityState::Invalid as i32;
+    let restated = store.record(&dataset, vec![r_invalid], 1_100).unwrap();
     assert_eq!(restated.restated, 1);
     let b2 = done
         .rows
@@ -1524,7 +1538,7 @@ fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row()
     let chosen = store.read(&latest_query(&dataset, &subject, true)).unwrap();
     assert_eq!(
         keys_of(&chosen),
-        vec!["a2", "a3", "b1", "b2", "t2"],
+        vec!["a2", "b1", "b2", "r", "t2"],
         "per series the latest, and the latest not invalid"
     );
     let state = |key: &str| {
@@ -1536,7 +1550,7 @@ fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row()
             .quality
     };
     assert_eq!(state("b2"), QualityState::Invalid as i32, "as assessed");
-    assert_eq!(state("a3"), QualityState::Invalid as i32, "as recorded");
+    assert_eq!(state("r"), QualityState::Invalid as i32, "as restated");
     // As of before the restatement and the assessment: r at its first
     // version is series A's latest and valid, and b2 stood.
     let mut before = latest_query(&dataset, &subject, true);
@@ -3960,6 +3974,7 @@ fn the_control_partition_logs_what_is_not_a_row_and_is_fenced() {
         .amend_closed_day(&[ClosedDayAmendment {
             dataset: "d-1".into(),
             sequence: 1,
+            row_key: String::new(),
             closed_day: None,
             why: "calendar 2 applied".into(),
             at_ns: 2,
@@ -4914,7 +4929,10 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
             },
             5_000,
         )
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
     assert_eq!(
         done.iter()
             .map(|part| (part.recorded, part.restated, part.unchanged, part.head))
@@ -4959,7 +4977,10 @@ fn writes_from_the_stream_commit_with_its_position_or_not_at_all() {
             },
             7_000,
         )
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
     assert_eq!(
         (again[0].recorded, again[0].restated, again[0].unchanged),
         (0, 0, 1)
@@ -5277,4 +5298,433 @@ fn writer_groups_commit_their_own_datasets_under_their_own_epochs() {
             .unwrap(),
         0
     );
+}
+
+/// Subjects whose hash falls in the lower and the upper half of the space.
+fn halves_of(tag: &str) -> (String, String) {
+    let mut low = None;
+    let mut high = None;
+    for n in 0.. {
+        let subject = unique(&format!("{tag}-{n}"));
+        if meridian_lake::range::hash(&subject) < 0x8000 {
+            low.get_or_insert(subject);
+        } else {
+            high.get_or_insert(subject);
+        }
+        if low.is_some() && high.is_some() {
+            break;
+        }
+    }
+    (low.unwrap(), high.unwrap())
+}
+
+/// Step 3d (section 6.1): a split is a continuation. The parent closes at
+/// its head N with its rows kept; each child opens naming it and numbers
+/// from N + 1; a subject's chain runs on across it, each row in the child
+/// holding its first subject's hash; a key restated after it keeps its
+/// version and goes to its child; a read after a watermark naming the
+/// parent reads on into both children; and the split is recorded in the
+/// control partition.
+#[test]
+fn a_split_closes_the_range_and_its_children_number_on_from_its_close() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let (low, high) = halves_of("LCL-SPLIT");
+    let first = store
+        .record(
+            &dataset,
+            vec![
+                trade(&dataset, "l1", &low, 10),
+                trade(&dataset, "h1", &high, 11),
+                trade(&dataset, "l2", &low, 12),
+            ],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(first.head, 3);
+    assert!(
+        first.partitions.is_empty(),
+        "one full range: no range named"
+    );
+
+    let split = store
+        .split_partition(&dataset, "admin-1", "a busy dataset", 1_500)
+        .unwrap();
+    let lower = format!("{dataset}/0000-7fff");
+    let upper = format!("{dataset}/8000-ffff");
+    assert_eq!(split.parent, dataset);
+    assert_eq!(split.children, vec![lower.clone(), upper.clone()]);
+    assert_eq!(split.closing_sequence, 3);
+    assert_eq!(split.split_by, "admin-1");
+    assert_eq!(
+        store
+            .splits()
+            .unwrap()
+            .into_iter()
+            .filter(|kept| kept.parent == dataset)
+            .collect::<Vec<_>>(),
+        vec![split.clone()]
+    );
+    let heads = store.heads().unwrap();
+    assert_eq!(
+        (heads[&dataset], heads[&lower], heads[&upper]),
+        (3, 3, 3),
+        "the parent closed at N, each child opened at it"
+    );
+
+    // Rows after it: each in the child holding its subject's hash, each
+    // child numbering from N + 1, each subject's chain unbroken.
+    let after = store
+        .record(
+            &dataset,
+            vec![
+                trade(&dataset, "l3", &low, 13),
+                trade(&dataset, "h2", &high, 14),
+                // A key from before the split, restated: its next version,
+                // in the child of its anchor.
+                restate(trade(&dataset, "l1", &low, 10)),
+            ],
+            2_000,
+        )
+        .unwrap();
+    assert_eq!((after.recorded, after.restated), (2, 1));
+    let placed: Vec<(String, u64, u64, u64)> = after
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| {
+            (
+                after.partition_of(&dataset, at).to_string(),
+                row.meta().sequence,
+                row.meta().previous_sequence,
+                row.meta().version,
+            )
+        })
+        .collect();
+    assert!(placed.contains(&(lower.clone(), 4, 3, 1)), "{placed:?}");
+    assert!(placed.contains(&(lower.clone(), 5, 4, 2)), "{placed:?}");
+    assert!(placed.contains(&(upper.clone(), 4, 2, 1)), "{placed:?}");
+    let heads = store.heads().unwrap();
+    assert_eq!((heads[&dataset], heads[&lower], heads[&upper]), (3, 5, 4));
+
+    // Each range's log is its own.
+    let lower_log = store.read_changes(&lower, 3, 1 << 20).unwrap();
+    assert_eq!(
+        lower_log
+            .changes
+            .iter()
+            .map(|c| (c.partition.clone(), c.sequence))
+            .collect::<Vec<_>>(),
+        vec![(lower.clone(), 4), (lower.clone(), 5)]
+    );
+    assert_eq!(store.read_changes(&dataset, 0, 1 << 20).unwrap().head, 3);
+
+    // A catch-up after a watermark naming the parent reads on into both
+    // children; one naming a child reads after its own sequence there.
+    let catch_up = |watermark: std::collections::BTreeMap<String, u64>| {
+        let mut keys: Vec<String> = store
+            .read(&Query {
+                datasets: vec![dataset.clone()],
+                subjects: vec![low.clone(), high.clone()],
+                data_type: DataType::Trade,
+                kinds: vec![],
+                interval_ns: 0,
+                when: When::After(watermark),
+                as_of_ns: 0,
+                published_as_of_ns: 0,
+                latest_only: false,
+            })
+            .unwrap()
+            .iter()
+            .map(|r| format!("{}@{}", r.meta().row_key, r.meta().version))
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        catch_up([(dataset.clone(), 2)].into()),
+        vec!["h2@1", "l1@2", "l2@1", "l3@1"]
+    );
+    assert_eq!(
+        catch_up([(dataset.clone(), 3), (lower.clone(), 4), (upper.clone(), 3)].into()),
+        vec!["h2@1", "l1@2"]
+    );
+    // A read of the dataset reads every range.
+    let latest = store
+        .read(&Query {
+            datasets: vec![dataset.clone()],
+            subjects: vec![low.clone(), high.clone()],
+            data_type: DataType::Trade,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Latest { at_ns: 0 },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+        .unwrap();
+    assert_eq!(latest.len(), 5, "every key at its version in force");
+
+    // A child halves in turn; the parent, closed, does not.
+    let quarter = store
+        .split_partition(&upper, "admin-1", "busier still", 2_500)
+        .unwrap();
+    assert_eq!(
+        quarter.children,
+        vec![
+            format!("{dataset}/8000-bfff"),
+            format!("{dataset}/c000-ffff")
+        ]
+    );
+    assert_eq!(quarter.closing_sequence, 4);
+    let refused = |partition: &str| match store.split_partition(partition, "admin-1", "why", 3_000)
+    {
+        Err(meridian_lake::StoreError::Invalid { field, words }) => {
+            assert_eq!(field, "partition");
+            words
+        }
+        other => panic!("{partition}: {other:?}"),
+    };
+    assert!(refused(&dataset).contains("not a range this lake has open"));
+    assert!(refused(&upper).contains("not a range this lake has open"));
+    assert!(refused("control").contains("control partition"));
+    assert!(refused("P0").contains("book partition"));
+    assert!(refused(&unique("none:none")).contains("not a range this lake has open"));
+    assert!(refused(&format!("{dataset}/0005-0005")).contains("one hash value"));
+}
+
+/// The lake's rule 5 (step 3d; ruled 2026-11-12): a row key fixes its valid
+/// time and its first subject. A restatement changing either is refused
+/// naming the field, and nothing of its batch is kept; one naming the record
+/// that replaced its first subject is no change, and keeps the key's range.
+#[test]
+fn a_restatement_keeps_its_keys_valid_time_and_first_subject() {
+    let store = store();
+    let dataset = unique("coinbase-1:live");
+    let subject = unique("LCL-BTC");
+    let stays = unique("INS-BTC");
+    store
+        .record(&dataset, vec![trade(&dataset, "k", &subject, 10)], 1_000)
+        .unwrap();
+    let field = |refused: meridian_lake::StoreError| match refused {
+        meridian_lake::StoreError::KeyFixed { field, row_key, .. } => (field, row_key),
+        other => panic!("{other:?}"),
+    };
+    let moved = store
+        .record(
+            &dataset,
+            vec![
+                trade(&dataset, "fresh", &subject, 30),
+                trade(&dataset, "k", &subject, 20),
+            ],
+            1_100,
+        )
+        .unwrap_err();
+    assert_eq!(field(moved), ("meta.valid_from_ns", "k".to_string()));
+    let other = store
+        .record(&dataset, vec![trade(&dataset, "k", &stays, 10)], 1_200)
+        .unwrap_err();
+    assert_eq!(
+        field(other),
+        ("meta.subjects[0].entity_id", "k".to_string())
+    );
+    assert_eq!(
+        store.heads().unwrap()[&dataset],
+        1,
+        "nothing of either kept"
+    );
+    // Replaced by the record that stays: followed by alias, restated.
+    store.keep_alias(&subject, &stays, 1_300).unwrap();
+    let restated = store
+        .record(
+            &dataset,
+            vec![restate(trade(&dataset, "k", &stays, 10))],
+            1_400,
+        )
+        .unwrap();
+    assert_eq!(restated.restated, 1);
+}
+
+/// Step 3d (section 6.2; section 15's online conversions): `lake_row`
+/// partitioned on upgrade, online and under write load. The rows kept
+/// before it stand as the new table's default partition and are copied
+/// behind a page at a time while a writer records; every read of them
+/// answers the same before, between every page, and after; nothing the
+/// writer recorded meanwhile is missed; and once the default is empty it is
+/// let go and `lake_latest` holds every key.
+#[test]
+fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("lake_convert_{}_{seq}", SystemClock.now_ns());
+    let base = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("the test database");
+    postgres::Client::connect(&base, postgres::NoTls)
+        .expect("could not reach the test database")
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .expect("could not create a schema");
+    let url = format!("{base}?options=-c%20search_path%3D{name}");
+    let migrated = PostgresStore::connect(&url, 4).unwrap();
+    migrated.migrate(&SystemClock).unwrap();
+    let dataset = unique("coinbase-1:live");
+    let kept = unique("LCL-KEPT");
+    let live = unique("LCL-LIVE");
+    // Six months of a subject's rows, some restated, as the release before
+    // kept them.
+    const MONTH_NS: i64 = 31 * 86_400_000_000_000;
+    let start = 1_780_000_000_000_000_000_i64;
+    for batch in 0..12 {
+        let rows: Vec<Observation> = (0..500)
+            .map(|n| {
+                let at = start + (batch / 2) * MONTH_NS + n;
+                trade(&dataset, &format!("k{batch}-{n}"), &kept, at)
+            })
+            .collect();
+        migrated.record(&dataset, rows, 1_000 + batch).unwrap();
+    }
+    let restated: Vec<Observation> = (0..50)
+        .map(|n| {
+            restate(trade(
+                &dataset,
+                &format!("k3-{n}"),
+                &kept,
+                start + MONTH_NS + n,
+            ))
+        })
+        .collect();
+    migrated.record(&dataset, restated, 2_000).unwrap();
+    let mut sql = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    sql.batch_execute(
+        "CREATE TABLE lake_row_legacy (LIKE lake_row INCLUDING DEFAULTS);
+         WITH moved AS (DELETE FROM lake_row RETURNING *)
+         INSERT INTO lake_row_legacy SELECT * FROM moved;
+         UPDATE lake_row_legacy SET partition = NULL, anchor = NULL;
+         ALTER TABLE lake_row_legacy
+           ADD CONSTRAINT lake_row_unpartitioned CHECK (partition IS NULL);
+         ALTER TABLE lake_row ATTACH PARTITION lake_row_legacy DEFAULT;
+         DELETE FROM lake_latest;
+         UPDATE lake_conversion SET latest_all = false;",
+    )
+    .unwrap();
+    drop(migrated);
+    let store = Arc::new(PostgresStore::connect(&url, 4).unwrap());
+    let legacy_rows = |sql: &mut postgres::Client| -> i64 {
+        let there: bool = sql
+            .query_one("SELECT to_regclass('lake_row_legacy') IS NOT NULL", &[])
+            .unwrap()
+            .get(0);
+        if !there {
+            return -1;
+        }
+        sql.query_one("SELECT count(*) FROM lake_row_legacy", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(
+        legacy_rows(&mut sql),
+        6_050,
+        "every row kept so far in the default"
+    );
+
+    let answers = |store: &PostgresStore| {
+        let latest = keys_of(&store.read(&latest_query(&dataset, &kept, true)).unwrap());
+        let every = store
+            .read(&Query {
+                when: When::After([(dataset.clone(), 0)].into()),
+                ..latest_query(&dataset, &kept, false)
+            })
+            .unwrap()
+            .iter()
+            .map(|r| (r.meta().sequence, r.meta().version))
+            .collect::<Vec<_>>();
+        let in_force = store
+            .read(&latest_query(&dataset, &kept, false))
+            .unwrap()
+            .len();
+        (latest, every, in_force)
+    };
+    let before = answers(&store);
+    assert_eq!(before.2, 6_000, "each key at its version in force");
+    assert_eq!(before.1.iter().filter(|(_, v)| *v == 2).count(), 50);
+
+    // A writer records throughout, another subject, a row at a time.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (store, stop, dataset, live) = (
+            Arc::clone(&store),
+            Arc::clone(&stop),
+            dataset.clone(),
+            live.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut written = 0;
+            while !stop.load(Ordering::Relaxed) {
+                store
+                    .record(
+                        &dataset,
+                        vec![trade(
+                            &dataset,
+                            &format!("w{written}"),
+                            &live,
+                            start + written,
+                        )],
+                        3_000 + written,
+                    )
+                    .unwrap();
+                written += 1;
+            }
+            written
+        })
+    };
+    let mut pages = 0;
+    loop {
+        let moved = store.convert_page().unwrap();
+        if moved == 0 {
+            break;
+        }
+        pages += 1;
+        assert_eq!(
+            answers(&store),
+            before,
+            "the same answer between pages ({pages})"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    let written = writer.join().unwrap();
+    assert!(pages >= 2, "copied a page at a time: {pages}");
+    assert_eq!(legacy_rows(&mut sql), -1, "the default let go once empty");
+    let after = PostgresStore::connect(&url, 4).unwrap();
+    assert_eq!(answers(&after), before, "the same answer after");
+    let live_rows = after
+        .read(&Query {
+            when: When::After([(dataset.clone(), 0)].into()),
+            ..latest_query(&dataset, &live, false)
+        })
+        .unwrap();
+    assert_eq!(
+        live_rows.len() as i64,
+        written,
+        "nothing written meanwhile missed"
+    );
+    let latest_all: bool = sql
+        .query_one("SELECT latest_all FROM lake_conversion", &[])
+        .unwrap()
+        .get(0);
+    assert!(latest_all, "lake_latest holds every key");
+    let keys: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM lake_latest WHERE dataset = $1",
+            &[&dataset],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(keys, 6_000 + written);
+    // Each of the six months in its own table.
+    let months: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+              WHERE i.inhparent = $1::text::regclass",
+            &[&meridian_lake::postgres::range_table_of(&dataset)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(months, 6);
 }

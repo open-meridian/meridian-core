@@ -1123,8 +1123,8 @@ fn at_of(item: &ResilienceHistoryItem) -> i64 {
         Some(Item::SourceSwitched(r)) => r.switched_at_ns,
         Some(Item::AccountMoved(r)) => r.moved_at_ns,
         Some(Item::IntegrityFinding(r)) => r.found_at_ns,
-        // Contract v30's 3d records (approved 2026-11-12): none is recorded
-        // until 3d builds the split and the move.
+        // Contract v30's 3d records (approved 2026-11-12): the split from
+        // step 3d's stage H; the move that did not switch from stage M.
         Some(Item::PartitionSplit(r)) => r.split_at_ns,
         Some(Item::PartitionMoveAborted(r)) => r.aborted_at_ns,
         None => 0,
@@ -1149,6 +1149,16 @@ impl History {
                 if let Ok(switch) = SourceSwitched::decode(change.body.as_slice()) {
                     items.push(ResilienceHistoryItem {
                         item: Some(Item::SourceSwitched(switch)),
+                    });
+                }
+            }
+            // A lake range's split (step 3d; section 6.1).
+            "meridian.v1.PartitionSplit" => {
+                if let Ok(split) =
+                    meridian_domain::v1::PartitionSplit::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionSplit(split)),
                     });
                 }
             }
@@ -1366,7 +1376,13 @@ impl Answering {
                 .as_ref()
                 .map_or(1, |values| values.writer_groups(component));
             for partition in partitions {
-                let group = meridian_changes::groups::owner(&partition, groups);
+                // A lake range is its dataset's group's (step 3d).
+                let owned_by = if component == "lake" {
+                    meridian_lake::range::dataset_of(&partition)
+                } else {
+                    partition.as_str()
+                };
+                let group = meridian_changes::groups::owner(owned_by, groups);
                 let named = if group == 0 {
                     named.clone()
                 } else {

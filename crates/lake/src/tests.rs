@@ -1884,23 +1884,23 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
     let mut heard = h
         .bus
         .subscribe_every("platform.lake.kalshi-1:outcomes.event.outcomes-recorded");
-    // Determined; then disputed and restated as version 2; then final.
+    // Determined; then disputed and restated as version 2; then final. Each
+    // keeps the first determination's valid time (the lake's rule 5, ruled
+    // 2026-11-12): later results are new versions of the same key.
     let first = record_outcomes(&h, vec![outcome(NOW, S::Determined, D::Pays, "1.00")]).unwrap();
     assert_eq!(first.recorded, 1);
     let seen = first.watermark.unwrap();
     let before_dispute = h.clock.now_ns();
     h.clock.advance(1_000);
-    let disputed =
-        record_outcomes(&h, vec![outcome(NOW + 10, S::Disputed, D::Pays, "1.00")]).unwrap();
+    let disputed = record_outcomes(&h, vec![outcome(NOW, S::Disputed, D::Pays, "1.00")]).unwrap();
     assert_eq!(
         disputed.restated, 1,
         "one row key per contract: a new version"
     );
     h.clock.advance(1_000);
-    record_outcomes(&h, vec![outcome(NOW + 20, S::Final, D::PaysPart, "0.50")]).unwrap();
+    record_outcomes(&h, vec![outcome(NOW, S::Final, D::PaysPart, "0.50")]).unwrap();
     // The same again changes nothing.
-    let again =
-        record_outcomes(&h, vec![outcome(NOW + 20, S::Final, D::PaysPart, "0.50")]).unwrap();
+    let again = record_outcomes(&h, vec![outcome(NOW, S::Final, D::PaysPart, "0.50")]).unwrap();
     assert_eq!(again.unchanged, 1);
     // Every version delivered, in order, never conflated.
     for (stage, version) in [(S::Determined, 1), (S::Disputed, 2), (S::Final, 3)] {
@@ -2956,4 +2956,26 @@ fn futures_lite_recv(heard: &mut meridian_bus::Subscription) -> ObservationsWant
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(heard.recv()))
             .unwrap();
     ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap()
+}
+
+/// Step 3d (section 6.1): a `read_after` naming a range split is met by its
+/// children once this member holds them, at any sequence -- a delivery of a
+/// child's row names its dataset and a sequence past the parent's close --
+/// and a range not split is held to its own head.
+#[test]
+fn a_read_after_naming_a_split_range_is_met_by_its_children() {
+    let heads: std::collections::BTreeMap<String, u64> = [
+        ("d".to_string(), 7),
+        ("d/0000-7fff".to_string(), 9),
+        ("d/8000-ffff".to_string(), 7),
+        ("d/8000-bfff".to_string(), 8),
+        ("e".to_string(), 3),
+    ]
+    .into();
+    let met = service::met_by_children(heads);
+    assert_eq!(met["d"], u64::MAX);
+    assert_eq!(met["d/8000-ffff"], u64::MAX, "split again");
+    assert_eq!(met["d/0000-7fff"], 9);
+    assert_eq!(met["d/8000-bfff"], 8);
+    assert_eq!(met["e"], 3, "never split");
 }

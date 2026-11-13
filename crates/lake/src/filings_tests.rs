@@ -249,12 +249,18 @@ fn filing(number: &str, form: &str, kind: FilingKind, items: &[&str], filed: &st
 const EPS_KEY: &str = "320193:us-gaap:EarningsPerShareBasic:USD/shares:2026-06-28:2026-09-27";
 
 fn eps(amount: &str, filed_by: &str, published: i64) -> ReportedFact {
+    eps_valid_from(amount, filed_by, published, published)
+}
+
+/// A fact valid from `valid`, as a later filing restating it keeps its
+/// first valid time (the lake's rule 5), its own published time beside it.
+fn eps_valid_from(amount: &str, filed_by: &str, valid: i64, published: i64) -> ReportedFact {
     ReportedFact {
         meta: meta(
             EPS_KEY,
             FACTS,
             vec![subject(APPLE, SubjectRole::Filer)],
-            published,
+            valid,
             published,
         ),
         concept: "us-gaap:EarningsPerShareBasic".into(),
@@ -470,12 +476,19 @@ async fn a_fact_restated_and_confirmed_reads_as_first_published_and_as_latest() 
         .unwrap(),
         (1, 0, 0)
     );
-    // A later filing repeating it: a confirmation, not a restatement.
+    // A later filing repeating it: a confirmation, not a restatement, under
+    // the key's first valid time and its own published time (the lake's
+    // rule 5, ruled 2026-11-12).
     assert_eq!(
         record(
             &h,
             "facts",
-            fact(eps("1.850", "0000320193-26-000120", confirmed))
+            fact(eps_valid_from(
+                "1.850",
+                "0000320193-26-000120",
+                first,
+                confirmed
+            ))
         )
         .unwrap(),
         (0, 0, 1)
@@ -485,17 +498,40 @@ async fn a_fact_restated_and_confirmed_reads_as_first_published_and_as_latest() 
         record(
             &h,
             "facts",
-            fact(eps("1.850", "0000320193-26-000120", confirmed))
+            fact(eps_valid_from(
+                "1.850",
+                "0000320193-26-000120",
+                first,
+                confirmed
+            ))
         )
         .unwrap(),
         (0, 0, 1)
     );
-    // A later filing's different value: restated.
+    // A later filing's different value under a valid time of its own:
+    // refused, naming the field (the lake's rule 5, ruled 2026-11-12).
+    let refused = record(
+        &h,
+        "facts",
+        fact(eps("1.86", "0000320193-27-000011", restated)),
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("fields=facts[0].meta.valid_from_ns"),
+        "{refused}"
+    );
+    // Its value restated under the key's first valid time, published later:
+    // restated.
     assert_eq!(
         record(
             &h,
             "facts",
-            fact(eps("1.86", "0000320193-27-000011", restated))
+            fact(eps_valid_from(
+                "1.86",
+                "0000320193-27-000011",
+                first,
+                restated
+            ))
         )
         .unwrap(),
         (0, 1, 0)

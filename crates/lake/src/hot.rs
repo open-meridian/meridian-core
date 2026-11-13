@@ -637,6 +637,8 @@ impl HotStore {
             }
             return;
         }
+        // A range's rows are its dataset's (step 3d).
+        let partition = crate::range::dataset_of(partition);
         let mut rows = Vec::with_capacity(changes.len());
         for change in changes {
             // Rows served and not kept were never the record's, nor held.
@@ -659,7 +661,7 @@ impl HotStore {
     /// Everything held of a dataset dropped: a reader's partition whose
     /// changes it did not follow.
     pub fn forget_dataset(&self, dataset: &str) {
-        self.evict_dataset(dataset);
+        self.evict_dataset(crate::range::dataset_of(dataset));
     }
 
     fn evict_all(&self) {
@@ -774,11 +776,13 @@ impl Store for HotStore {
         &self,
         batch: crate::store::WriteAheadBatch,
         now_ns: i64,
-    ) -> Result<Vec<Recorded>> {
+    ) -> Result<Vec<Result<Recorded>>> {
         let datasets: Vec<String> = batch.parts.iter().map(|(d, _)| d.clone()).collect();
         let done = self.inner.record_write_ahead(batch, now_ns)?;
         for (dataset, part) in datasets.iter().zip(&done) {
-            self.committed(dataset, &part.rows);
+            if let Ok(part) = part {
+                self.committed(dataset, &part.rows);
+            }
         }
         Ok(done)
     }
@@ -807,6 +811,22 @@ impl Store for HotStore {
 
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
         self.inner.dataset_gaps()
+    }
+
+    fn split_partition(
+        &self,
+        partition: &str,
+        split_by: &str,
+        reason: &str,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::PartitionSplit> {
+        // Nothing a split changes is what a key answers: its rows stay.
+        self.inner
+            .split_partition(partition, split_by, reason, now_ns)
+    }
+
+    fn splits(&self) -> Result<Vec<meridian_domain::v1::PartitionSplit>> {
+        self.inner.splits()
     }
 
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
@@ -871,7 +891,7 @@ impl Store for HotStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         self.inner.rows_at(data_type, places, as_of_ns)

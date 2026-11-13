@@ -224,7 +224,7 @@ impl Store for ReaderStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         if latest_cut(as_of_ns) {

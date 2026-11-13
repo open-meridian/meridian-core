@@ -32,10 +32,12 @@
 
 pub mod config;
 pub mod hot;
+pub(crate) mod leaves;
 pub mod migrations;
 pub mod pages;
 pub mod postgres;
 pub mod query;
+pub mod range;
 pub mod read;
 pub mod reader;
 pub mod row;

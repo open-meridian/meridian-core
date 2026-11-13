@@ -168,12 +168,18 @@ pub const INTERNAL_RECORD: &str = "platform.lake.internal.record";
 /// to the writer group owning each dataset: every `record-` command but a
 /// dataset's liveness and an assessment, which are group 0's own.
 pub fn is_record_write(topic: &str) -> bool {
-    topic
+    (topic
         .strip_prefix("platform.lake.")
         .is_some_and(|rest| rest.starts_with("command.record-"))
         && topic != RECORD_LIVENESS
-        && topic != RECORD_QUALITY_ASSESSMENTS
+        && topic != RECORD_QUALITY_ASSESSMENTS)
+        // A range's split is its writer's one transaction (step 3d).
+        || topic == SPLIT_PARTITION
 }
+
+/// A deployment admin halves a lake range (step 3d; section 6.1, approved
+/// 2026-11-12): answered by the range's writer once the split commits.
+pub const SPLIT_PARTITION: &str = "platform.lake.command.split-partition";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -428,7 +434,7 @@ pub struct Lake {
     /// section 6.5): the batches waiting for its transaction in flight.
     lanes: meridian_changes::group_commit::Lanes<
         (Vec<Observation>, i64),
-        Result<crate::store::Recorded, String>,
+        Result<crate::store::Recorded, crate::store::StoreError>,
     >,
     /// Its writer group and the lake's count (step 3d; section 6.1): the
     /// datasets it writes, and those it hands to their owners.
@@ -524,6 +530,67 @@ pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
 /// as before; only its publication is left out, since every reader's sidecar
 /// would drop it for the later one anyway. A row every version of which is
 /// delivered -- a trade, an outcome, a filing -- is never superseded.
+/// A member's heads as `read_after` holds a read to them (step 3d; section
+/// 6.1): a range split, whose children this member holds, meets any
+/// sequence named of it -- "a `read_after` naming the parent is met by a
+/// child once that child is open" -- since a delivery of a child's row names
+/// its dataset and a sequence past the parent's close.
+pub(crate) fn met_by_children(mut heads: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    let mut parents: BTreeSet<String> = BTreeSet::new();
+    for child in heads.keys() {
+        let (dataset, lo, hi) = crate::range::parse(child);
+        if (lo, hi) == (0, crate::range::TOP) {
+            continue;
+        }
+        // Its dataset's full range, and every wider range of it held.
+        parents.insert(dataset.to_string());
+        for wider in heads.keys() {
+            let (of, from, to) = crate::range::parse(wider);
+            if of == dataset && from <= lo && hi <= to && (from, to) != (lo, hi) {
+                parents.insert(wider.clone());
+            }
+        }
+    }
+    for parent in parents {
+        heads.insert(parent, u64::MAX);
+    }
+    heads
+}
+
+/// Each row's data type and row key, in the request's order: where a
+/// refusal naming one row finds its place (`<field>[i]`).
+fn row_keys(rows: &[Observation]) -> Vec<(i16, String)> {
+    rows.iter()
+        .map(|row| (row.data_type().code(), row.meta().row_key.clone()))
+        .collect()
+}
+
+/// A store's refusal of a write as its plugin hears it: a restatement the
+/// lake's rule 5 refuses is INVALID_ARGUMENT naming the field at the first
+/// row of the write under that key (`series[3].meta.valid_from_ns`); every
+/// other failure as the store said it.
+fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, String)]) -> String {
+    match failed {
+        crate::store::StoreError::KeyFixed {
+            data_type,
+            row_key,
+            field: path,
+            words,
+        } => {
+            let at = keys
+                .iter()
+                .position(|(code, key)| *code == data_type.code() && *key == row_key)
+                .unwrap_or(0);
+            refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &[format!("{field}[{at}].{path}")],
+                words,
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
     let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut superseded = BTreeSet::new();
@@ -760,15 +827,31 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
 }
 
 fn watermark(heads: &BTreeMap<String, u64>, datasets: &BTreeSet<String>) -> Watermark {
-    Watermark {
-        partitions: datasets
-            .iter()
-            .map(|d| PartitionSequence {
-                partition: d.clone(),
-                sequence: heads.get(d).copied().unwrap_or(0),
-            })
-            .collect(),
+    // Each dataset's own partition, and every range split from it (step 3d;
+    // section 6.1), each at its head: a reader's catch-up reads each range
+    // after its own sequence.
+    let mut partitions: Vec<PartitionSequence> = Vec::new();
+    for dataset in datasets {
+        partitions.push(PartitionSequence {
+            partition: dataset.clone(),
+            sequence: heads.get(dataset).copied().unwrap_or(0),
+        });
+        let ranges = heads
+            .range::<str, _>((
+                std::ops::Bound::Excluded(format!("{dataset}/").as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(partition, _)| partition.starts_with(&format!("{dataset}/")));
+        for (partition, sequence) in ranges {
+            if crate::range::is_of(partition, dataset) {
+                partitions.push(PartitionSequence {
+                    partition: partition.clone(),
+                    sequence: *sequence,
+                });
+            }
+        }
     }
+    Watermark { partitions }
 }
 
 fn subject_ref(subject: &str) -> Option<SubjectRef> {
@@ -831,8 +914,13 @@ impl Lake {
         })
     }
 
+    /// Its writer group and the lake's count (step 3d).
+    pub fn groups(&self) -> meridian_changes::groups::Groups {
+        self.groups
+    }
+
     /// The same lake, writing for writer group `groups` (step 3d).
-    fn grouped(
+    pub(crate) fn grouped(
         bus: Arc<Bus>,
         store: Arc<dyn Store>,
         clock: Arc<dyn Clock>,
@@ -1951,6 +2039,7 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
+        let keys = row_keys(&rows);
         let by_dataset = self.prepared(field, rows, envelope)?;
         let now = self.clock.now_ns();
         let mut said = Said::default();
@@ -1963,7 +2052,9 @@ impl Lake {
             by_dataset
         };
         for (dataset, rows) in by_dataset {
-            let done = self.write_one(&dataset, rows, want_id, now)?;
+            let done = self
+                .write_one(&dataset, rows, want_id, now)
+                .map_err(|failed| refusal_of(failed, field, &keys))?;
             self.published(&dataset, &done, &mut said);
         }
         self.answered(said, want_id, envelope, now)
@@ -2105,7 +2196,7 @@ impl Lake {
         rows: Vec<Observation>,
         want_id: &str,
         now: i64,
-    ) -> Result<crate::store::Recorded, String> {
+    ) -> Result<crate::store::Recorded, crate::store::StoreError> {
         let config = self.config();
         if config.licence(dataset).kept {
             return self.recorded_together(dataset, rows, now);
@@ -2118,10 +2209,7 @@ impl Lake {
             .get(want_id)
             .map(|w| w.asked_by.iter().cloned().collect())
             .unwrap_or_else(|| config.entitled(dataset));
-        let served = self
-            .store
-            .serve_unkept(dataset, rows, &readers, now)
-            .map_err(|failed| failed.to_string())?;
+        let served = self.store.serve_unkept(dataset, rows, &readers, now)?;
         // The reads waiting on the want hear what was served (W10.7; ruling
         // 734): the lake keeps none of it.
         self.publish_changes(dataset, &served, Some(&readers), now);
@@ -2140,7 +2228,7 @@ impl Lake {
         dataset: &str,
         rows: Vec<Observation>,
         now: i64,
-    ) -> Result<crate::store::Recorded, String> {
+    ) -> Result<crate::store::Recorded, crate::store::StoreError> {
         let bytes: usize = rows.iter().map(Observation::encoded_len).sum();
         self.lanes.lane(dataset).commit(
             (rows, now),
@@ -2153,16 +2241,16 @@ impl Lake {
                     .record_parts(dataset, parts, now)
                     .into_iter()
                     .map(|done| {
-                        let done = done.map_err(|failed| failed.to_string())?;
+                        let done = done?;
                         self.publish_changes(dataset, &done, None, now);
                         Ok(done)
                     })
                     .collect()
             },
             || {
-                Err(format!(
+                Err(crate::store::StoreError::Unavailable(format!(
                     "the batch of {dataset} this write waited in stopped before it committed"
-                ))
+                )))
             },
         )
     }
@@ -2291,6 +2379,8 @@ impl Lake {
             envelope: Envelope,
             kept: Vec<(String, usize)>,
             unkept: Vec<(String, Vec<Observation>)>,
+            field: &'static str,
+            keys: Vec<(i16, String)>,
         }
         let now = self.clock.now_ns();
         let config = self.config();
@@ -2308,9 +2398,15 @@ impl Lake {
         for write in writes {
             let prepared =
                 rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
-                    Ok((self.prepared(field, rows, &write.envelope)?, want))
+                    let keys = row_keys(&rows);
+                    Ok((
+                        self.prepared(field, rows, &write.envelope)?,
+                        want,
+                        field,
+                        keys,
+                    ))
                 });
-            let (by_dataset, want_id) = match prepared {
+            let (by_dataset, want_id, field, keys) = match prepared {
                 Ok(prepared) => prepared,
                 Err(refused) => {
                     if write.after_gap.is_some() {
@@ -2329,6 +2425,8 @@ impl Lake {
                 envelope: write.envelope,
                 kept: Vec::new(),
                 unkept: Vec::new(),
+                field,
+                keys,
             };
             for (dataset, rows) in by_dataset {
                 if let Some(dropped) = write.after_gap.as_ref() {
@@ -2363,7 +2461,7 @@ impl Lake {
         batch.valid = valid.into_iter().collect();
         let gaps = batch.gaps.clone();
         let valid = batch.valid.clone();
-        let mut done: Vec<Option<crate::store::Recorded>> = self
+        let mut done: Vec<Option<Result<crate::store::Recorded, crate::store::StoreError>>> = self
             .store
             .record_write_ahead(batch, now)?
             .into_iter()
@@ -2376,13 +2474,27 @@ impl Lake {
                 let mut said = Said::default();
                 // In the datasets' order, as a batch asked of the lake is
                 // written: what it keeps, then what it serves.
+                // A part the store refused alone (the lake's rule 5) is the
+                // write's answer; its other parts committed with the batch.
+                let mut refused = None;
                 for (dataset, part) in &write.kept {
-                    let recorded = done[*part].take().unwrap_or_default();
-                    self.publish_changes(dataset, &recorded, None, now);
-                    self.published(dataset, &recorded, &mut said);
+                    match done[*part].take().unwrap_or_else(|| Ok(Default::default())) {
+                        Ok(recorded) => {
+                            self.publish_changes(dataset, &recorded, None, now);
+                            self.published(dataset, &recorded, &mut said);
+                        }
+                        Err(failed) => {
+                            refused.get_or_insert(refusal_of(failed, write.field, &write.keys));
+                        }
+                    }
+                }
+                if let Some(refused) = refused {
+                    return Err(refused);
                 }
                 for (dataset, rows) in write.unkept {
-                    let served = self.write_one(&dataset, rows, &write.want_id, now)?;
+                    let served = self
+                        .write_one(&dataset, rows, &write.want_id, now)
+                        .map_err(|failed| refusal_of(failed, write.field, &write.keys))?;
                     self.published(&dataset, &served, &mut said);
                 }
                 let reply = self.answered(said, &write.want_id, &write.envelope, now)?;
@@ -3077,6 +3189,7 @@ impl Lake {
                         || crate::store::ClosedDayAmendment {
                             dataset: dataset.to_string(),
                             sequence: row.meta().sequence,
+                            row_key: row.meta().row_key.clone(),
                             closed_day: now_flag,
                             why: format!(
                                 "calendar {} version {} applied",
@@ -3235,30 +3348,34 @@ impl Lake {
         }
         let epoch = self.store.epoch();
         let origin = meridian_changes::origin();
-        // The partition's head before this batch: what its page follows.
-        let after = done
-            .rows
-            .first()
-            .map_or(done.head, |row| row.meta().sequence)
-            .saturating_sub(1);
-        let changes: Vec<meridian_changes::Change> = match served_to {
-            None => done
-                .rows
+        // A page a range (step 3d; section 6.1): each follows its own
+        // partition's head before the batch.
+        let mut at = 0;
+        while at < done.rows.len() {
+            let partition = done.partition_of(dataset, at);
+            let run = done.rows[at..]
                 .iter()
-                .map(|row| crate::store::row_change(dataset, row, epoch, origin))
-                .collect(),
-            Some(readers) => {
-                let first = done
-                    .rows
-                    .first()
-                    .map_or(done.head, |row| row.meta().sequence);
-                let served = crate::memory::served_of(
-                    dataset, &done.rows, first, done.head, readers, now_ns,
-                );
-                vec![crate::store::served_change(&served, epoch, origin)]
-            }
-        };
-        meridian_changes::publish(&self.bus, "lake", after, &changes);
+                .enumerate()
+                .take_while(|(i, _)| done.partition_of(dataset, at + i) == partition)
+                .count();
+            let rows = &done.rows[at..at + run];
+            at += run;
+            let first = rows[0].meta().sequence;
+            let after = first.saturating_sub(1);
+            let changes: Vec<meridian_changes::Change> = match served_to {
+                None => rows
+                    .iter()
+                    .map(|row| crate::store::row_change(partition, row, epoch, origin))
+                    .collect(),
+                Some(readers) => {
+                    let last = rows.last().map_or(first, |row| row.meta().sequence);
+                    let served =
+                        crate::memory::served_of(partition, rows, first, last, readers, now_ns);
+                    vec![crate::store::served_change(&served, epoch, origin)]
+                }
+            };
+            meridian_changes::publish(&self.bus, "lake", after, &changes);
+        }
     }
 
     /// A want's subjects answered or declined, recorded; a want every
@@ -4014,7 +4131,9 @@ impl Lake {
         if let When::After(watermark) = &read.when {
             let readable = config.readable(&reader, read.data_type);
             let heads = self.store.heads().map_err(|failed| failed.to_string())?;
-            for (dataset, sequence) in watermark {
+            for (partition, sequence) in watermark {
+                // A range's dataset's (step 3d).
+                let dataset = &crate::range::dataset_of(partition).to_string();
                 let reason = if !readable.contains(dataset) {
                     Some(
                         if config.datasets.contains_key(dataset)
@@ -4028,10 +4147,10 @@ impl Lake {
                 } else if !config.licence(dataset).kept {
                     Some(UnansweredReason::NotKept)
                 } else {
-                    let head = heads.get(dataset).copied().unwrap_or(0);
+                    let head = heads.get(partition).copied().unwrap_or(0);
                     let lowest = self
                         .store
-                        .lowest_kept(dataset)
+                        .lowest_kept(partition)
                         .map_err(|failed| failed.to_string())?;
                     let removed = match lowest {
                         Some(lowest) => lowest > sequence + 1,
@@ -5217,6 +5336,61 @@ impl Lake {
                 .collect(),
             watermark: Some(watermark(&heads, &readable)),
         })
+    }
+
+    /// `SplitPartition` (step 3d; section 6.1): a deployment admin's, its
+    /// reason kept with its record. The range's writer halves it in one
+    /// transaction; a range of another group's is handed to that group's
+    /// writer by the store's refusal. Refused INVALID_ARGUMENT naming
+    /// `partition` for the control partition, a book partition, a range
+    /// not open and one hash value; REASON_REQUIRED naming `reason` with
+    /// none. The page, the tool and the CLI that ask it are stage M's.
+    pub(crate) fn split_partition(
+        &self,
+        request: meridian_domain::v1::SplitPartitionRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::SplitPartitionReply, String> {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        if meta.acting_for_subject.is_empty() {
+            return Err(
+                "a split is a deployment admin's to make, and this is sent for nobody".into(),
+            );
+        }
+        let reason = request.reason.trim();
+        if reason.is_empty() {
+            return Err(meridian_bus::refusal_naming(
+                meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                &["reason".to_string()],
+                "reason: a split says why",
+            ));
+        }
+        if request.reason.chars().count() > 2_000 {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["reason".to_string()],
+                "reason: at most 2,000 characters",
+            ));
+        }
+        let split = self
+            .store
+            .split_partition(
+                &request.partition,
+                &meta.acting_for_subject,
+                &request.reason,
+                self.clock.now_ns(),
+            )
+            .map_err(|failed| match failed {
+                crate::store::StoreError::Invalid { field, words } => {
+                    refusal_with_status(RefusalStatus::InvalidArgument, &[field.to_string()], words)
+                }
+                other => other.to_string(),
+            })?;
+        tracing::info!(
+            parent = split.parent,
+            closing_sequence = split.closing_sequence,
+            "a range was split: its children number on from its close"
+        );
+        Ok(meridian_domain::v1::SplitPartitionReply { split: Some(split) })
     }
 
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
@@ -6844,7 +7018,10 @@ pub fn serve_grouped(
     bus.reads_after().keep(
         "lake",
         Arc::new(meridian_bus::read_after::AllHeads(move || {
-            heads.heads().map_err(|failed| failed.to_string())
+            heads
+                .heads()
+                .map(met_by_children)
+                .map_err(|failed| failed.to_string())
         })),
     );
     serve_on(
@@ -7498,6 +7675,18 @@ pub fn serve_grouped(
             "meridian.v1.ListDatasetsReply",
         ),
         |lake, _: ListDatasetsRequest, envelope| lake.list_datasets(envelope),
+    );
+    serve_on(
+        &bus,
+        &lake,
+        SPLIT_PARTITION,
+        (
+            "meridian.v1.SplitPartitionRequest",
+            "meridian.v1.SplitPartitionReply",
+        ),
+        |lake, request: meridian_domain::v1::SplitPartitionRequest, envelope| {
+            lake.split_partition(request, envelope)
+        },
     );
     serve_on(
         &bus,

@@ -41,7 +41,33 @@ pub enum StoreError {
     /// resilience spec's section 6.7): handed to that group's writer.
     #[error("dataset {partition} is writer group {group}'s to write; this member's group does not own it")]
     NotOwned { partition: String, group: u32 },
+
+    /// A restatement that changes its row key's valid time or first subject
+    /// (step 3d; the-lake rule 5, ruled 2026-11-12): refused
+    /// INVALID_ARGUMENT naming the field, `field` its path within the row
+    /// (`meta.valid_from_ns`, `meta.subjects[0].entity_id`). The plugin
+    /// cancels the old key and records a new one.
+    #[error("{words}")]
+    KeyFixed {
+        data_type: DataType,
+        row_key: String,
+        field: &'static str,
+        words: String,
+    },
+
+    /// A partition act refused, naming the field (step 3d; section 6.1):
+    /// `SplitPartition`'s INVALID_ARGUMENT naming `partition`.
+    #[error("{words}")]
+    Invalid { field: &'static str, words: String },
 }
+
+/// The field a restated row's valid time is refused by (the-lake rule 5),
+/// within the row: kept exact, since SDK 0.36.3's `SeriesTimes` reads a
+/// series re-send refused naming `series[i].meta.valid_from_ns` as recorded.
+pub const VALID_TIME_FIELD: &str = "meta.valid_from_ns";
+
+/// The field a restated row's first subject is refused by, within the row.
+pub const FIRST_SUBJECT_FIELD: &str = "meta.subjects[0].entity_id";
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -163,6 +189,10 @@ pub const CONTROL_SWITCH: &str = "meridian.v1.SourceSwitched";
 /// only when its group changes. None recorded means group 0.
 pub const CONTROL_OWNER: &str = "meridian.v1.PartitionOwner";
 
+/// A range's split (step 3d; section 6.1, approved 2026-11-12): its
+/// `PartitionSplit`, in the `control` partition.
+pub const CONTROL_SPLIT: &str = "meridian.v1.PartitionSplit";
+
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Recorded {
@@ -175,6 +205,32 @@ pub struct Recorded {
     pub unchanged: u32,
     /// The partition's head once the batch committed.
     pub head: u64,
+    /// Each row's partition, in step with `rows` (step 3d; section 6.1):
+    /// empty where every row is in the dataset's own full range.
+    pub partitions: Vec<String>,
+}
+
+impl Recorded {
+    /// The partition `rows[at]` was recorded in.
+    pub fn partition_of<'a>(&'a self, dataset: &'a str, at: usize) -> &'a str {
+        self.partitions.get(at).map_or(dataset, String::as_str)
+    }
+
+    /// Another range's part of the same batch added to this one: its rows
+    /// after these, its counts added.
+    pub fn joined(&mut self, dataset: &str, more: Recorded, partition: &str) {
+        if !self.partitions.is_empty() || partition != dataset {
+            // Rows before these, unnamed, are in the dataset's own range.
+            self.partitions.resize(self.rows.len(), dataset.to_string());
+            self.partitions
+                .extend(std::iter::repeat_n(partition.to_string(), more.rows.len()));
+        }
+        self.rows.extend(more.rows);
+        self.recorded += more.recorded;
+        self.restated += more.restated;
+        self.unchanged += more.unchanged;
+        self.head = self.head.max(more.head);
+    }
 }
 
 /// A change to a want, its own record (decisions/031).
@@ -257,6 +313,10 @@ pub struct Removal {
 pub struct ClosedDayAmendment {
     pub dataset: String,
     pub sequence: u64,
+    /// The row's key (step 3d): two ranges split from one number on from
+    /// the same sequence. Empty on a re-check kept before 3d, of the one
+    /// row its dataset held at that sequence.
+    pub row_key: String,
     /// The flag as re-checked; None where the day is no longer closed.
     pub closed_day: Option<DateCheck>,
     /// Why: the calendar version applied.
@@ -276,12 +336,16 @@ pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], a
     if amendments.is_empty() {
         return;
     }
-    let mut latest: BTreeMap<(&str, u64), &ClosedDayAmendment> = BTreeMap::new();
+    let mut latest: BTreeMap<(&str, u64, &str), &ClosedDayAmendment> = BTreeMap::new();
     for amendment in amendments {
         if as_of_ns != 0 && amendment.at_ns > as_of_ns {
             continue;
         }
-        let key = (amendment.dataset.as_str(), amendment.sequence);
+        let key = (
+            amendment.dataset.as_str(),
+            amendment.sequence,
+            amendment.row_key.as_str(),
+        );
         match latest.get(&key) {
             Some(held) if held.at_ns > amendment.at_ns => {}
             _ => {
@@ -290,8 +354,14 @@ pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], a
         }
     }
     for row in rows.iter_mut() {
-        let key = (row.dataset().to_string(), row.meta().sequence);
-        if let Some(amendment) = latest.get(&(key.0.as_str(), key.1)) {
+        let (dataset, sequence) = (row.dataset().to_string(), row.meta().sequence);
+        let row_key = row.meta().row_key.clone();
+        // The row's own re-check; one kept before 3d names no row key.
+        let found = [row_key.as_str(), ""]
+            .into_iter()
+            .filter_map(|key| latest.get(&(dataset.as_str(), sequence, key)))
+            .max_by_key(|amendment| amendment.at_ns);
+        if let Some(amendment) = found {
             row.meta_mut().closed_day = amendment.closed_day.clone();
         }
     }
@@ -348,6 +418,7 @@ pub fn amendment_body(amendment: &ClosedDayAmendment) -> Vec<u8> {
     serde_json::json!({
         "dataset": amendment.dataset,
         "sequence": amendment.sequence,
+        "row_key": amendment.row_key,
         "closed_day": amendment.closed_day.as_ref().map(|check| {
             base64::engine::general_purpose::STANDARD.encode(check.encode_to_vec())
         }),
@@ -446,18 +517,25 @@ pub fn as_assessed(rows: &mut [Observation], assessments: &[Assessment], as_of_n
     if assessments.is_empty() {
         return;
     }
-    let mut of: BTreeMap<(&str, u64), Vec<&Assessment>> = BTreeMap::new();
+    // By the row's dataset, sequence and key: two ranges split from one
+    // number on from the same sequence (step 3d).
+    let mut of: BTreeMap<(&str, u64, &str), Vec<&Assessment>> = BTreeMap::new();
     for assessment in assessments {
         if as_of_ns != 0 && assessment.at_ns > as_of_ns {
             continue;
         }
-        of.entry((assessment.dataset.as_str(), assessment.sequence))
-            .or_default()
-            .push(assessment);
+        of.entry((
+            assessment.dataset.as_str(),
+            assessment.sequence,
+            assessment.row_key.as_str(),
+        ))
+        .or_default()
+        .push(assessment);
     }
     for row in rows.iter_mut() {
         let dataset = row.dataset().to_string();
-        let Some(found) = of.get(&(dataset.as_str(), row.meta().sequence)) else {
+        let row_key = row.meta().row_key.clone();
+        let Some(found) = of.get(&(dataset.as_str(), row.meta().sequence, row_key.as_str())) else {
             continue;
         };
         let meta = row.meta_mut();
@@ -550,7 +628,14 @@ pub trait Store: Send + Sync {
     /// decides a batch, and the stream's position moved to `through` in the
     /// same transaction, so the rows and the position commit or roll back
     /// together. Answered with what each part did, in the parts' order.
-    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+    /// Each part's answer in the batch's order: a part refused alone (the
+    /// lake's rule 5) is its own refusal, the batch and its position
+    /// committed without it.
+    fn record_write_ahead(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         let _ = (batch, now_ns);
         Err(no_write_ahead())
     }
@@ -604,6 +689,33 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Halve the open range `partition` at its midpoint (step 3d;
+    /// `SplitPartition`, section 6.1): in one transaction of its writer, the
+    /// parent closed at its head N and both children opened after it,
+    /// numbering from N + 1 and staying with the parent's group, and the
+    /// split's `PartitionSplit` recorded in the `control` partition. Copies
+    /// nothing. Refused [`StoreError::Invalid`] naming `partition` for the
+    /// control partition, a book partition, a range not open and a range of
+    /// one hash value.
+    fn split_partition(
+        &self,
+        partition: &str,
+        split_by: &str,
+        reason: &str,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::PartitionSplit> {
+        let _ = (split_by, reason, now_ns);
+        Err(StoreError::Invalid {
+            field: "partition",
+            words: format!("{partition} is not a range this lake has open"),
+        })
+    }
+
+    /// Every split recorded, in the order recorded (section 6.1).
+    fn splits(&self) -> Result<Vec<meridian_domain::v1::PartitionSplit>> {
+        Ok(Vec::new())
+    }
+
     /// The rows a query names, each row key at its version as of the
     /// query's cut-off, with no choice among them made: which in force is
     /// [`crate::read`]'s.
@@ -632,10 +744,13 @@ pub trait Store: Send + Sync {
     /// answer's later page reads, its rows held by their places alone
     /// (found on dev 2026-11-09: a chain's statistics, 49,412 rows, held
     /// whole or answered again whole at each page).
+    /// The rows at `places`, each named by its dataset, sequence and its row
+    /// key's hash ([`crate::range::key_hash`]; step 3d: two ranges split
+    /// from one number on from the same sequence).
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
 
