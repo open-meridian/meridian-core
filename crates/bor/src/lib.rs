@@ -48,6 +48,7 @@ pub mod book;
 pub mod booking;
 pub mod booking_service;
 pub mod cash;
+pub mod control;
 pub mod dates;
 pub mod deadline;
 pub mod decide;

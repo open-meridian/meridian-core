@@ -229,6 +229,10 @@ impl Store for Writer {
         self.inner.writer_group_of(account_id)
     }
 
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        self.inner.control_records_owed()
+    }
+
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         self.inner.journal(account_id)
     }

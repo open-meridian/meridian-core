@@ -80,7 +80,7 @@ and source shown). It changes nothing: a change it names is made by meridian upg
 zone, lag behind its writer in ms, partitions and restarts), each partition of the lake and the \
 book with its writer and epoch, and a page of the history, newest first: each takeover of a \
 writer, integrity finding and switch of a default read's source (cursor: next_cursor from the \
-page before). The book's own takeovers and integrity findings are not in it yet. Answers \
+page before), the book's own among them. Answers \
 `unchanged`.",
         true,
         history_schema,
@@ -209,7 +209,6 @@ pub fn resilience_json(r: &ReadResilienceReply) -> Value {
             json!({"at_ns": stamp_said(at), "kind": word(kind), "words": words})
         }).collect::<Vec<_>>(),
         "next_cursor": r.next_cursor,
-        "not_listed": page::BOOK_NOT_LISTED,
     })
 }
 
@@ -396,6 +395,9 @@ mod tests {
             "two nodes or more"
         );
         let read = resilience_json(&ReadResilienceReply::default());
-        assert_eq!(read["not_listed"], page::BOOK_NOT_LISTED);
+        assert!(
+            read.get("not_listed").is_none(),
+            "the book's records are in it"
+        );
     }
 }

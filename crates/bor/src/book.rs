@@ -688,6 +688,11 @@ impl Book {
         for _ in &touched.settings {
             take(self, Chain::Setting);
         }
+        // A `~control` record (step 3d; section 6.3, option (c)): one record,
+        // numbered as a setting is.
+        if body.record.is_some() {
+            take(self, Chain::Setting);
+        }
         let Some(first) = first else {
             return Err(StoreError::Invalid(
                 "an entry that changes no record changes nothing; nothing was journalled".into(),

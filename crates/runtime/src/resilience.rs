@@ -1095,6 +1095,12 @@ pub const SOURCES: &[Source] = &[
         domain: "config",
         component: "conductor",
     },
+    // The book's control journal (step 3d; section 6.3, option (c)): its
+    // takeovers and findings as `~control` entries.
+    Source {
+        domain: "book",
+        component: "bor",
+    },
 ];
 
 /// The history the conductor holds: the newest items of every source, each
@@ -1135,6 +1141,27 @@ impl History {
     /// What one control change adds: its records as items, and a lake
     /// source priority in force.
     fn take(held: &mut Held, change: &meridian_changes::Change) {
+        // A book change is a `~control` entry: the record it carries, as a
+        // control change of every other store carries one.
+        let carried;
+        let change = if change.partition == meridian_changes::CONTROL
+            && change.kind.starts_with("meridian.v1.")
+            && change.body.first() == Some(&b'{')
+        {
+            match meridian_bor::control::record_of_change(change) {
+                Some((kind, body)) => {
+                    carried = meridian_changes::Change {
+                        kind,
+                        body,
+                        ..change.clone()
+                    };
+                    &carried
+                }
+                None => change,
+            }
+        } else {
+            change
+        };
         let mut items: Vec<ResilienceHistoryItem> = records::of_change(change)
             .into_iter()
             .map(|record| ResilienceHistoryItem {

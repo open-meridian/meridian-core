@@ -53,12 +53,6 @@ pub const TABS: [(&str, &str); 4] = [
     ("history", "History"),
 ];
 
-/// What the history does not list yet, said where it is read (the product
-/// owner's ruling of 2026-11-11, option c): the book's own records join its
-/// control journal in step 3d.
-pub const BOOK_NOT_LISTED: &str =
-    "The book's own takeovers and integrity findings are not listed here yet.";
-
 async fn read<R: Message + Default>(
     bus: &meridian_bus::Bus,
     subject: &str,
@@ -529,9 +523,13 @@ fn history_tab(history: &[ResilienceHistoryItem], next_cursor: &str, cursor: &st
     } else {
         format!(" <a href=\"{PATH}#history\" data-newest>Newest</a>")
     };
-    let foot = format!(
-        "<p class=\"hint one-line\" data-book-not-listed>{BOOK_NOT_LISTED}{newest}{older}</p>"
-    );
+    // The book's takeovers and findings are listed with every store's from
+    // step 3d (section 6.3, option (c)): its control journal holds them.
+    let foot = if newest.is_empty() && older.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"hint one-line\">{newest}{older}</p>")
+    };
     if history.is_empty() {
         return format!(
             "<p class=\"empty\" data-history=\"0\">No takeover, finding or source switch recorded.</p>{foot}"
@@ -716,7 +714,10 @@ mod tests {
         assert!(body.contains("street: om-street-1 took over from om-street-0, epoch 4"));
         assert!(body.contains("Quote: kraken-1:ticker to coinbase-1:ticker, stalled"));
         assert!(body.contains("?cursor=50#history"));
-        assert!(body.contains(BOOK_NOT_LISTED));
+        assert!(
+            !body.contains("not listed here yet"),
+            "the book's records are listed from step 3d"
+        );
         assert_eq!(body.matches("<om-pager").count(), 4);
         assert!(!body.to_lowercase().contains("move partition"));
         assert!(!body.to_lowercase().contains("move account"));

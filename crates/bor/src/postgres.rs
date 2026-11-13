@@ -1846,6 +1846,133 @@ impl Store for PostgresStore {
         self.groups.owns(&self.placed(account_id))
     }
 
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        use meridian_changes::records;
+        let mut conn = self.conn()?;
+        let journalled: std::collections::BTreeSet<String> = conn
+            .query(
+                "SELECT idempotency_key FROM book_entry
+                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:%'",
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let mut owed = Vec::new();
+        // Each takeover, by its epoch, as it was kept in its own fencing.
+        for row in conn
+            .query(
+                "SELECT epoch, member, partitions, why, at_ns FROM book_writer_took_over
+                  ORDER BY epoch",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let epoch: i64 = row.get(0);
+            let key = format!("control-record:took-over:{epoch}");
+            if journalled.contains(&key) {
+                continue;
+            }
+            let by = meridian_changes::TookOver {
+                member: row.get(1),
+                previous: String::new(),
+                why: row.get(3),
+                at_ns: row.get(4),
+            };
+            let record = records::took_over("bor", &by, row.get(2), epoch as u64);
+            owed.push(crate::control::Owed {
+                key,
+                kind: records::TOOK_OVER,
+                body: record.encode_to_vec(),
+                reason: format!("the book's writer took over: {}", by.why),
+            });
+        }
+        // Each finding, by its row, as the scrub kept it.
+        for row in conn
+            .query(
+                "SELECT id, partition, sequence, committed_at_ns, what, found_at_ns
+                   FROM book_integrity_finding ORDER BY id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let id: i64 = row.get(0);
+            let key = format!("control-record:finding:{id}");
+            if journalled.contains(&key) {
+                continue;
+            }
+            let found = meridian_changes::integrity::Finding {
+                partition: row.get(1),
+                sequence: row.get::<_, i64>(2) as u64,
+                committed_at_ns: row.get(3),
+                what: row.get(4),
+            };
+            let record = records::finding(
+                "bor",
+                meridian_domain::v1::IntegrityCheck::JournalChain,
+                &found,
+                row.get(5),
+            );
+            owed.push(crate::control::Owed {
+                key,
+                kind: records::FINDING,
+                body: record.encode_to_vec(),
+                reason: format!("an integrity finding: {}", found.what),
+            });
+        }
+        // Each partition's writer group, where its last assignment named
+        // another (none: group 0).
+        let mut assigned: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for row in conn
+            .query(
+                "SELECT idempotency_key FROM book_entry
+                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:owner:%'
+                  ORDER BY first_sequence",
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+        {
+            let key: String = row.get(0);
+            let mut said = key
+                .trim_start_matches("control-record:owner:")
+                .rsplitn(3, ':');
+            let (_, group, partition) = (said.next(), said.next(), said.next());
+            if let (Some(group), Some(partition)) = (group.and_then(|g| g.parse().ok()), partition)
+            {
+                assigned.insert(partition.to_string(), group);
+            }
+        }
+        for row in conn
+            .query(
+                "SELECT partition, epoch FROM book_partition_head ORDER BY partition",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let (partition, epoch): (String, i64) = (row.get(0), row.get(1));
+            let group = self.groups.owner(&partition);
+            if assigned.get(&partition).copied().unwrap_or(0) == group {
+                continue;
+            }
+            let record = meridian_domain::v1::PartitionOwner {
+                component: "bor".into(),
+                partition: partition.clone(),
+                group,
+                writer: String::new(),
+                epoch: (epoch as u64).max(1),
+            };
+            owed.push(crate::control::Owed {
+                key: format!("control-record:owner:{partition}:{group}:{epoch}"),
+                kind: crate::control::OWNER,
+                body: record.encode_to_vec(),
+                reason: format!("partition {partition} assigned to writer group {group}"),
+            });
+        }
+        Ok(owed)
+    }
+
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {
         self.groups
             .several()

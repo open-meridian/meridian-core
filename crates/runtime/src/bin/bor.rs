@@ -390,6 +390,33 @@ fn run() -> Result<(), String> {
             meridian_bor::order_service::EXPIRE_EVERY,
         ));
 
+        // The control journal (step 3d; section 6.3, option (c)): the
+        // book's takeovers, findings and assignments journalled on
+        // `~control` by the control partition's group, the ones kept before
+        // 3d backfilled first, then each new one within a minute.
+        if groups.holds_control() {
+            let journaling = bus.clone();
+            let held = Arc::clone(&store);
+            meridian_runtime::background(async move {
+                loop {
+                    let (bus, store) = (journaling.clone(), Arc::clone(&held));
+                    match tokio::task::spawn_blocking(move || {
+                        meridian_bor::control::journal_owed(&bus, store.as_ref())
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(journalled)) => tracing::info!(
+                            journalled,
+                            "the book's takeovers, findings and assignments journalled on its control"
+                        ),
+                        Ok(Err(why)) => tracing::warn!(why, "the book's control journal was not brought up to date"),
+                        Err(failed) => tracing::warn!(%failed, "the book's control journal failed"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
+        }
         // Booking (W11.30, contract v24): the child entries every booking
         // owes the other accounts it allocates to, swept for on start and
         // every quarter hour; and, once at the upgrade, the escape hatch for

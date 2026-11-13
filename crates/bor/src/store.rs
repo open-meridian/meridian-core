@@ -535,6 +535,14 @@ pub trait Store: Send + Sync {
         None
     }
 
+    /// The records the `~control` journal owes (step 3d; section 6.3,
+    /// option (c)): each takeover and finding kept beside the journal and
+    /// not yet in it, and each partition whose writer group is not the one
+    /// its last assignment named. A store keeping none owes none.
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        Ok(Vec::new())
+    }
+
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;
 

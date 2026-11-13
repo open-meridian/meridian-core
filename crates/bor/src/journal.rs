@@ -97,6 +97,11 @@ pub struct Body {
     /// Contract v28 (W9.16 to W9.18): each lifecycle event as it stands
     /// after the entry, whole.
     pub lifecycle_events: Vec<meridian_domain::v1::LifecycleEvent>,
+    /// A `~control` entry's record (step 3d; section 6.3, option (c)): its
+    /// kind -- `meridian.v1.WriterTookOver`, `meridian.v1.IntegrityFinding`,
+    /// `meridian.v1.PartitionOwner` -- and its protobuf, in the shape the
+    /// book's `AccountMoved` is kept in. None on every other entry.
+    pub record: Option<(String, Vec<u8>)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -139,6 +144,9 @@ struct Kept {
     states_waits: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lifecycle_events: Vec<String>,
+    /// A `~control` entry's record, its kind and its protobuf (step 3d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record: Option<(String, String)>,
 }
 
 fn encoded<M: Message>(message: &M) -> String {
@@ -189,6 +197,10 @@ impl Body {
             trade: self.trade,
             states_waits: self.states_waits,
             lifecycle_events: self.lifecycle_events.iter().map(encoded).collect(),
+            record: self
+                .record
+                .as_ref()
+                .map(|(kind, body)| (kind.clone(), STANDARD.encode(body))),
         };
         serde_json::to_vec(&kept).expect("an entry's body is plain data")
     }
@@ -221,6 +233,17 @@ impl Body {
             trade: kept.trade,
             states_waits: kept.states_waits,
             lifecycle_events: all(&kept.lifecycle_events)?,
+            record: kept
+                .record
+                .map(|(kind, body)| {
+                    STANDARD
+                        .decode(body)
+                        .map(|bytes| (kind, bytes))
+                        .map_err(|failed| {
+                            StoreError::Unavailable(format!("an entry did not read: {failed}"))
+                        })
+                })
+                .transpose()?,
         })
     }
 

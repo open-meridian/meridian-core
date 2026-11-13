@@ -2552,3 +2552,70 @@ async fn capacity_book_hand_off() {
         blocking(move || drop(held));
     }
 }
+
+/// Step 3d (section 6.3, option (c)): the book's takeovers and findings
+/// become `~control` entries carrying their records, the ones kept before
+/// backfilled, each record its own time and each entry the backfill's; a
+/// second pass journals nothing again; and the control partition's change
+/// log carries each record as the conductor's history reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn takeovers_and_findings_are_journalled_on_control_once_each() {
+    let (url, store) = blocking(isolated);
+    let bus = Arc::new(Bus::single(
+        "operations-test-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    blocking(|| {
+        store
+            .take_over(&meridian_changes::TookOver {
+                member: "om-bor-1".into(),
+                previous: "om-bor-0".into(),
+                why: meridian_changes::LEASE_LAPSED.into(),
+                at_ns: 7,
+            })
+            .unwrap();
+        let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        raw.execute(
+            "INSERT INTO book_integrity_finding
+                    (partition, sequence, committed_at_ns, what, member, origin, found_at_ns)
+             VALUES ('P0', 3, 11, 'an entry does not match its digest', 'om-bor-1', '', 13)",
+            &[],
+        )
+        .unwrap();
+    });
+    let journalled = blocking(|| meridian_bor::control::journal_owed(&bus, store.as_ref()));
+    let again = blocking(|| meridian_bor::control::journal_owed(&bus, store.as_ref()));
+    let changes = blocking(|| followed(&store, "control", 1 << 20));
+    blocking(move || drop(store));
+    assert_eq!(journalled, Ok(2), "the takeover and the finding");
+    assert_eq!(again, Ok(0), "never twice");
+    let records: Vec<(String, Vec<u8>, i64)> = changes
+        .iter()
+        .filter_map(|change| {
+            meridian_bor::control::record_of_change(change)
+                .map(|(kind, body)| (kind, body, change.committed_at_ns))
+        })
+        .collect();
+    assert_eq!(records.len(), 2);
+    let took = WriterTookOver::decode(&records[0].1[..]).unwrap();
+    assert_eq!(records[0].0, "meridian.v1.WriterTookOver");
+    assert_eq!(
+        (took.member.as_str(), took.took_over_at_ns),
+        ("om-bor-1", 7)
+    );
+    assert!(
+        records[0].2 > 7,
+        "the entry committed at the backfill's own time"
+    );
+    let found = IntegrityFinding::decode(&records[1].1[..]).unwrap();
+    assert_eq!(records[1].0, "meridian.v1.IntegrityFinding");
+    assert_eq!(
+        (
+            found.partition.as_str(),
+            found.first_bad_sequence,
+            found.found_at_ns
+        ),
+        ("P0", 3, 13)
+    );
+}
