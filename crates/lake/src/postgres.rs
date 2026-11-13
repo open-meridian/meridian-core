@@ -1115,35 +1115,43 @@ later AS (
     SELECT * FROM named_later WHERE dataset = ANY($1) AND data_type = $3
 ),
 chosen AS (
-    SELECT c.partition, c.sequence, c.row_key, c.valid_from_ns
+    SELECT k.dataset, c.partition, c.sequence, c.row_key, c.valid_from_ns
       FROM keys k
      CROSS JOIN LATERAL ({latest} UNION ALL {latest_valid}) AS c
      WHERE (cardinality($4::smallint[]) = 0 OR k.kind = ANY($4))
        AND ($5::bigint = 0 OR k.interval_ns = $5)
   UNION ALL
-    SELECT {place_r}
+    SELECT r.dataset, {place_r}
       FROM lake_row r
      WHERE r.dataset = ANY($1) AND r.latest_key IS NULL AND r.subjects && $2::text[]
        AND {narrowed_r} AND {in_force}
   UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
-            partition, sequence, row_key, valid_from_ns
+            dataset, partition, sequence, row_key, valid_from_ns
        FROM later
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
   UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
-            partition, sequence, row_key, valid_from_ns
+            dataset, partition, sequence, row_key, valid_from_ns
        FROM later
       WHERE NOT invalid
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
 )
-SELECT r.body FROM lake_row r
-  JOIN (SELECT DISTINCT partition, sequence, row_key, valid_from_ns FROM chosen) c
-    ON coalesce(r.partition, r.dataset) = c.partition AND r.sequence = c.sequence
-   AND r.row_key = c.row_key AND r.valid_from_ns = c.valid_from_ns
- WHERE r.dataset = ANY($1) AND {PRUNED_R}
+-- Each chosen row fetched by its own index probe, its dataset and sequence,
+-- in its own month: driven by the few rows chosen, never by the range's
+-- every row (step 3d: a new month's table has no statistics yet, and a
+-- join the planner chose by them read the range whole, a row at a time,
+-- against every row chosen).
+SELECT r.body FROM (SELECT DISTINCT dataset, partition, sequence, row_key, valid_from_ns
+                      FROM chosen) c
+ CROSS JOIN LATERAL (
+    SELECT f.dataset, f.sequence, f.body FROM lake_row f
+     WHERE f.dataset = c.dataset AND f.sequence = c.sequence
+       AND f.row_key = c.row_key AND f.valid_from_ns = c.valid_from_ns
+       AND coalesce(f.partition, f.dataset) = c.partition
+       AND (f.partition = ANY($11) OR f.partition IS NULL)) r
  ORDER BY r.dataset, r.sequence",
         first = next_key("d.dataset", "s.subject", "r.latest_key IS NOT NULL"),
         next = next_key(
