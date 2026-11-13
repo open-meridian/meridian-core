@@ -33,8 +33,8 @@ mod router;
 
 pub use backend::{
     overloaded, read_refusal, read_refusal_status, refusal, refusal_fields, refusal_naming,
-    refusal_retry_after, refusal_retrying, refusal_with_status, Answer, Backend, BusError,
-    Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Subscription,
+    refusal_retry_after, refusal_retrying, refusal_status_retrying, refusal_with_status, Answer,
+    Backend, BusError, Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Subscription,
 };
 pub use memory::MemoryBackend;
 pub use nats::{NatsBackend, INTERNAL_TLS_CA};

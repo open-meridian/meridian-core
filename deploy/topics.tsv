@@ -135,7 +135,7 @@ platform.config.event.plugin-configuration-changed	event	conductor	sidecar
 platform.config.event.unlinked-external-accounts	event	sidecar	dashboard
 platform.config.event.venue-catalogue	event	connectivity	conductor,ems,oms
 platform.config.query.access-records	query	dashboard	conductor
-platform.config.query.accounts	query	custody	conductor
+platform.config.query.accounts	query	custody,bor	conductor
 platform.config.query.check-first-run-answer	query	dashboard	first-run
 platform.config.query.enrolment	query	dashboard	conductor
 platform.config.query.filed-tickets	query	sidecar	dashboard

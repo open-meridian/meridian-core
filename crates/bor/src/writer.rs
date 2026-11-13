@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use meridian_bus::Bus;
+use prost::Message as _;
 
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break};
 
@@ -156,7 +157,54 @@ pub struct Writer {
     batched: bool,
 }
 
+/// An account's placement key: its owner label when one is set, else its
+/// ID (step 3d; section 6.3).
+pub fn placement_key_of(account_id: &str, owner: &str) -> String {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        account_id.to_string()
+    } else {
+        owner.to_string()
+    }
+}
+
 impl Writer {
+    /// The key `account_id` is placed by (step 3d; section 6.3, the source
+    /// ruled 2026-11-13): its owner label as the conductor holds it, else
+    /// its ID where none is set. Refused UNAVAILABLE, with a retry-after,
+    /// where the conductor does not answer or holds no such account yet:
+    /// never placed by its ID instead.
+    fn placement_key(&self, account_id: &str) -> Result<String> {
+        let not_placed = |why: String| {
+            crate::store::StoreError::NotPlaced(format!(
+                "account {account_id} cannot be placed now: {why}; ask again"
+            ))
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| not_placed("no runtime to ask the conductor on".into()))?;
+        let asked = handle.block_on(self.bus.call(
+            crate::store::READ_ACCOUNTS,
+            "meridian.v1.AccountsRequest",
+            meridian_domain::v1::AccountsRequest {}.encode_to_vec(),
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        ));
+        let (_, body) = asked
+            .map_err(|failed| not_placed(format!("the conductor did not answer ({failed})")))?;
+        let accounts =
+            meridian_domain::v1::Accounts::decode(body.as_slice()).map_err(|failed| {
+                not_placed(format!("the conductor's answer did not read ({failed})"))
+            })?;
+        // Not in the answer yet: refused, never placed by its ID instead,
+        // since its placement is fixed at its creation.
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.account_id == account_id)
+            .ok_or_else(|| not_placed("the conductor holds no such account yet".into()))?;
+        Ok(placement_key_of(account_id, &account.owner))
+    }
+
     pub fn new(inner: Arc<dyn Store>, bus: Arc<Bus>) -> Self {
         Self::bounded(inner, bus, DEFAULT_BOOKS_BYTES)
     }
@@ -204,6 +252,12 @@ impl Store for Writer {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        // Placed first where it never was (step 3d; section 6.3): by its
+        // owner label, read from the conductor once, at its creation.
+        if self.inner.placement_needed(account_id)? {
+            let key = self.placement_key(account_id)?;
+            self.inner.place_first(account_id, &key)?;
+        }
         let acted = self
             .inner
             .act(account_id, message_id, idempotency_key, request, decide)?;
@@ -231,6 +285,22 @@ impl Store for Writer {
 
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
         self.inner.control_records_owed()
+    }
+
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        self.inner.placement_needed(account_id)
+    }
+
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        self.inner.place_first(account_id, key)
+    }
+
+    fn partition_count(&self) -> u32 {
+        self.inner.partition_count()
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        self.inner.partition_of(account_id)
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {

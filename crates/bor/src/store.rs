@@ -108,6 +108,12 @@ pub enum StoreError {
     /// resilience spec's section 6.7): handed to that group's writer.
     #[error("partition {partition} is writer group {group}'s to write; this member's group does not own it")]
     NotOwned { partition: String, group: u32 },
+
+    /// An account's first act, refused because its owner label could not
+    /// be read to place it (step 3d; section 6.3, ruled 2026-11-13): never
+    /// placed by its ID instead. UNAVAILABLE, with a retry-after.
+    #[error("{0}")]
+    NotPlaced(String),
 }
 
 /// How many times a decision may ask for bodies before it is a fault: each
@@ -204,6 +210,11 @@ impl StoreError {
                 words,
             ),
             StoreError::Recorded(said) => said.clone(),
+            StoreError::NotPlaced(words) => meridian_bus::refusal_status_retrying(
+                meridian_bus::RefusalStatus::Unavailable,
+                PLACEMENT_RETRY_SECONDS,
+                words,
+            ),
             other => other.to_string(),
         }
     }
@@ -231,6 +242,48 @@ pub const NO_ACCOUNT: &str = "~unplaced";
 /// Whether a key the store holds a book under is an account's.
 pub fn is_account(key: &str) -> bool {
     !key.starts_with('~')
+}
+
+/// How long an account's first act waits before asking again when its
+/// owner label could not be read (step 3d).
+pub const PLACEMENT_RETRY_SECONDS: u32 = 5;
+
+/// The conductor's accounts read the book asks at an account's first
+/// placement (matrix row ReadAccountsForPlacement, ruled 2026-11-13).
+pub const READ_ACCOUNTS: &str = "platform.config.query.accounts";
+
+/// The book's count of partitions in the environment (step 3d; section
+/// 6.3; `bor.partitions`, the variable ruled 2026-11-13): `P0` to `P<n-1>`.
+pub const PARTITIONS_VAR: &str = "MERIDIAN_BOR_PARTITIONS";
+
+/// The most partitions a book takes, as the most writer groups.
+pub const PARTITIONS_MOST: u32 = meridian_changes::groups::MOST;
+
+/// The count of partitions the chart said; 1 where it said nothing.
+pub fn partitions_from(said: Option<&str>) -> std::result::Result<u32, String> {
+    match said.map(str::trim).filter(|said| !said.is_empty()) {
+        None => Ok(1),
+        Some(text) => text
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=PARTITIONS_MOST).contains(n))
+            .ok_or_else(|| {
+                format!("{PARTITIONS_VAR} is {text:?}; a whole number of partitions from 1 to {PARTITIONS_MOST}")
+            }),
+    }
+}
+
+/// A partition's name: `P<n>`.
+pub fn partition_named(n: u32) -> String {
+    format!("P{n}")
+}
+
+/// The partition a new account is placed in (step 3d; section 6.3): by
+/// rendezvous hashing of its placement key -- its owner label when set,
+/// else its ID -- over `P0` to `P<count-1>`, so a fund's or a household's
+/// accounts land together, and raising the count moves none placed before.
+pub fn placement_of(key: &str, count: u32) -> String {
+    partition_named(meridian_changes::groups::owner(key, count.max(1)))
 }
 
 /// The partition a book key starts in.
@@ -541,6 +594,34 @@ pub trait Store: Send + Sync {
     /// its last assignment named. A store keeping none owes none.
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
         Ok(Vec::new())
+    }
+
+    /// Whether `account_id` is to be placed before its first act (step 3d;
+    /// section 6.3): an account the store has not placed, where it has more
+    /// than one partition. Never the book's own keys.
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        let _ = account_id;
+        Ok(false)
+    }
+
+    /// Place `account_id` by `key` -- its owner label, else its ID -- where
+    /// nothing placed it yet, and answer its partition; an account placed
+    /// already keeps its own, whatever the key.
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        let _ = (account_id, key);
+        Ok(FIRST_PARTITION.to_string())
+    }
+
+    /// How many partitions the book places accounts over (step 3d;
+    /// `bor.partitions`): 1, the default, and a booking is as it always was.
+    fn partition_count(&self) -> u32 {
+        1
+    }
+
+    /// The partition `account_id` is in, where it is placed.
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        let _ = account_id;
+        None
     }
 
     /// An account's journal, in order.

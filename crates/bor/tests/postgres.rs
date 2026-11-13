@@ -85,6 +85,11 @@ fn wired_with(store: Arc<PostgresStore>) -> (Arc<Bus>, Arc<PostgresStore>) {
         Arc::new(meridian_clock::SystemClock),
     ));
     serve(bus.clone(), store.clone(), bus.clock());
+    resolving_equities(&bus);
+    (bus, store)
+}
+
+fn resolving_equities(bus: &Bus) {
     // An instrument store whose every record names an equity in US dollars:
     // from contract v10 the book requires each instrument's asset class and
     // currency, and refuses a command it cannot check.
@@ -105,7 +110,6 @@ fn wired_with(store: Arc<PostgresStore>) -> (Arc<Bus>, Arc<PostgresStore>) {
             .encode_to_vec(),
         ))
     });
-    (bus, store)
 }
 
 fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
@@ -2618,4 +2622,201 @@ async fn takeovers_and_findings_are_journalled_on_control_once_each() {
         ),
         ("P0", 3, 13)
     );
+}
+
+/// Step 3d (section 6.3; the source ruled 2026-11-13): with several
+/// partitions, a new account is placed at its first act by rendezvous
+/// hashing of its owner label as the conductor holds it, else its ID; the
+/// key is kept with the placement, so editing the label moves nothing and
+/// the book never asks again. An account the conductor does not hold yet,
+/// or a conductor that does not answer, refuses the act UNAVAILABLE with a
+/// retry-after: never placed by its ID instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_account_is_placed_by_its_owner_label_and_kept_there() {
+    use meridian_bor::store::{placement_of, PARTITIONS_VAR};
+    assert_eq!(PARTITIONS_VAR, "MERIDIAN_BOR_PARTITIONS");
+    assert_eq!(meridian_bor::store::partitions_from(None), Ok(1));
+    assert_eq!(meridian_bor::store::partitions_from(Some("4")), Ok(4));
+    for bad in ["0", "65", "two"] {
+        assert!(
+            meridian_bor::store::partitions_from(Some(bad)).is_err(),
+            "{bad}"
+        );
+    }
+    let (url, made) = blocking(isolated);
+    blocking(move || drop(made));
+    let store = blocking(|| {
+        let store = PostgresStore::connect(&url, 4).unwrap().with_partitions(4);
+        assert_eq!(store.make_partitions(4).unwrap(), 3, "P1 to P3");
+        assert_eq!(store.make_partitions(4).unwrap(), 0, "never twice");
+        Arc::new(store)
+    });
+    let bus = Arc::new(Bus::single(
+        "bor-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let (fund_a, fund_b, plain, unknown) =
+        (unique("ACC"), unique("ACC"), unique("ACC"), unique("ACC"));
+    let owners: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(vec![
+            (fund_a.clone(), "Fund I".into()),
+            (fund_b.clone(), " Fund I ".into()),
+            (plain.clone(), String::new()),
+        ]));
+    let asked = Arc::new(AtomicU64::new(0));
+    let (holding, counting) = (owners.clone(), asked.clone());
+    bus.serve("platform.config.query.accounts", move |envelope| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        let meta = envelope.meta.clone().unwrap_or_default();
+        assert_eq!(
+            meta.publisher_instance_id, "bor-1",
+            "the book asks as itself"
+        );
+        assert!(meta.acting_for_subject.is_empty() && !meta.account_scope_applies);
+        Ok((
+            "meridian.v1.Accounts".into(),
+            Accounts {
+                accounts: holding
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, owner)| AccountRecord {
+                        account_id: id.clone(),
+                        owner: owner.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let writer: Arc<dyn Store> = Arc::new(meridian_bor::writer::Writer::new(
+        store.clone() as Arc<dyn Store>,
+        bus.clone(),
+    ));
+    serve(bus.clone(), writer, bus.clock());
+    resolving_equities(&bus);
+    for account in [&fund_a, &fund_b, &plain] {
+        open(&bus, account, "INS-AAPL").await;
+    }
+    let placed = |account: &str| -> (String, String) {
+        let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let row = raw
+            .query_one(
+                "SELECT partition, placement_key FROM book_account WHERE account_id = $1",
+                &[&account],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    let fund = blocking(|| placed(&fund_a));
+    assert_eq!(fund, (placement_of("Fund I", 4), "Fund I".to_string()));
+    assert_eq!(
+        blocking(|| placed(&fund_b)),
+        fund,
+        "a fund's accounts land together"
+    );
+    assert_eq!(
+        blocking(|| placed(&plain)),
+        (placement_of(&plain, 4), plain.clone()),
+        "no label: by its ID"
+    );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "asked once each, at its first act"
+    );
+
+    // Editing the label moves nothing, and the book never asks again.
+    owners.lock().unwrap()[0].1 = "Fund II".into();
+    send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&fund_a, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .ok();
+    assert_eq!(blocking(|| placed(&fund_a)), fund);
+    assert_eq!(asked.load(Ordering::SeqCst), 3);
+
+    // Not in the conductor's answer yet: refused UNAVAILABLE, retry-after.
+    let refused = send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&unknown, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("unavailable"), "{refused}");
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&refused[refused.find("[refusal-status").unwrap()..]),
+        Some(5),
+        "{refused}"
+    );
+    let none: Option<String> = blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&unknown],
+            )
+            .unwrap()
+            .map(|row| row.get(0))
+    });
+    assert_eq!(none, None, "never placed by its ID instead");
+    blocking(move || drop(store));
+}
+
+/// The conductor silent: an account's first act refused UNAVAILABLE with a
+/// retry-after, and nothing placed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_act_waits_for_the_conductor_and_never_places_by_id() {
+    let (url, made) = blocking(isolated);
+    blocking(move || drop(made));
+    let store = blocking(|| {
+        let store = PostgresStore::connect(&url, 4).unwrap().with_partitions(2);
+        store.make_partitions(2).unwrap();
+        Arc::new(store)
+    });
+    let bus = Arc::new(Bus::single(
+        "bor-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let writer: Arc<dyn Store> = Arc::new(meridian_bor::writer::Writer::new(
+        store.clone() as Arc<dyn Store>,
+        bus.clone(),
+    ));
+    serve(bus.clone(), writer, bus.clock());
+    resolving_equities(&bus);
+    let account = unique("ACC");
+    let refused = send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&account, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("unavailable"), "{refused}");
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&refused[refused.find("[refusal-status").unwrap()..]),
+        Some(5),
+        "{refused}"
+    );
+    let placed: i64 = blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM book_account WHERE account_id NOT LIKE '~%'",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    });
+    assert_eq!(placed, 0);
+    blocking(move || drop(store));
 }

@@ -182,6 +182,9 @@ spec:
             capabilities:
               drop: [ALL]
           env:
+            # The partitions whose head rows it makes (step 3d).
+            - name: MERIDIAN_BOR_PARTITIONS
+              value: {{ include "meridian-runtime.borPartitions" $ | quote }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:

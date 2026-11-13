@@ -2780,6 +2780,22 @@ chart-check:
 		|| { echo "chart-check FAILED: the lake's writer group 1 in ha does not take a Lease of its own, check-meridian-runtime-lake-group-1" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=0 >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: bor.writerGroups=0 rendered; a store has one writer group at least" >&2; exit 1; }; true
+	@# Step 3d, stage B (section 6.3; MERIDIAN_BOR_PARTITIONS ruled
+	@# 2026-11-13): bor.partitions, 1 by default, told to every bor member
+	@# and the migrate Job, which makes the partitions' head rows; 0 and 65
+	@# refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	[ "$$(echo "$$one" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "1"')" -ge 2 ] \
+		|| { echo "chart-check FAILED: the book and its migrate Job are not told bor.partitions, 1 by default (MERIDIAN_BOR_PARTITIONS)" >&2; exit 1; }; \
+	four="$$($(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=4 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render bor.partitions=4" >&2; exit 1; }; \
+	[ "$$(echo "$$four" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "4"')" -ge 3 ] \
+		|| { echo "chart-check FAILED: bor.partitions=4 is not told to each writer group's member and the migrate Job" >&2; exit 1; }; \
+	for bad in 0 65; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=$$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: bor.partitions=$$bad rendered; 1 to 64" >&2; exit 1; }; \
+	done; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and

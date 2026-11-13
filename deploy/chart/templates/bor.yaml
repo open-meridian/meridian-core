@@ -77,6 +77,9 @@ spec:
             - name: MERIDIAN_BOR_SNAPSHOT_INTERVAL
               value: {{ . | quote }}
             {{- end }}
+            # Its partitions, where a new account is placed (step 3d).
+            - name: MERIDIAN_BOR_PARTITIONS
+              value: {{ include "meridian-runtime.borPartitions" $ | quote }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:

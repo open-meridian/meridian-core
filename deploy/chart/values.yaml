@@ -405,6 +405,12 @@ bor:
   # book's start for every account past it with none current. The default is
   # from core's replay benchmark; 10 to 100000.
   snapshotInterval: 1000
+  # The book's partitions (step 3d; the resilience spec's section 6.3): P0
+  # to P<n-1>, 1 to 64. A new account is placed by rendezvous hashing of its
+  # owner label, else its ID, at its creation and for good; raising the
+  # count places new accounts only. The upgrade preflight refuses lowering
+  # it while a partition past the new count holds accounts.
+  partitions: 1
   # The hot layer (step 3a): each account's book at its head, answered from
   # the book's memory, bounded in MiB, the least recently read evicted
   # first, within its 512 MiB.

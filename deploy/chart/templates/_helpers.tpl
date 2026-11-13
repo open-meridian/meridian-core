@@ -256,6 +256,25 @@ lake's write-ahead stream on (ha), each group's writer reads the stream
 with its own position and commits its own datasets' writes (stage H). Zero
 is refused, and more than 64. Takes a dict: top, component, values.
 */}}
+{{/*
+The book's partitions (step 3d; the resilience spec's section 6.3;
+`bor.partitions`, MERIDIAN_BOR_PARTITIONS ruled 2026-11-13): 1, the default,
+P0 alone; 1 to 64.
+*/}}
+{{- define "meridian-runtime.borPartitions" -}}
+{{- $partitions := .Values.bor.partitions -}}
+{{- if kindIs "invalid" $partitions -}}
+{{- $partitions = 1 -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $partitions)) -}}
+{{- fail (printf "bor.partitions is %v; a whole number of partitions from 1 (P0 alone, the default)" $partitions) -}}
+{{- end -}}
+{{- if gt (int $partitions) 64 -}}
+{{- fail (printf "bor.partitions is %v; at most 64" $partitions) -}}
+{{- end -}}
+{{- int $partitions -}}
+{{- end -}}
+
 {{- define "meridian-runtime.writerGroups" -}}
 {{- $groups := 1 -}}
 {{- if hasKey .values "writerGroups" -}}{{- $groups = index .values "writerGroups" -}}{{- end -}}

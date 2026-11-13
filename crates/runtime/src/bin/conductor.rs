@@ -236,6 +236,11 @@ fn run() -> Result<(), String> {
         meridian_runtime::member::Member::from_env("conductor", logged.as_ref().map(|_| "config"))?;
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
+    // The book beside it, whose read of the accounts as itself is answered
+    // in full, to place a new account (ReadAccountsForPlacement, step 3d).
+    if let Some(book) = meridian_config::service::book_beside(&instance_id) {
+        meridian_config::service::reads_for_book(&book);
+    }
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
     let platform = platform_from_env(key)?;
 

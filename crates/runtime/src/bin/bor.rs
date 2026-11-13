@@ -69,6 +69,10 @@ fn run() -> Result<(), String> {
     // (contract v25, W9.10): the chart's `bor.snapshotInterval`.
     let interval =
         meridian_bor::snapshot::interval_from(var("MERIDIAN_BOR_SNAPSHOT_INTERVAL").as_deref())?;
+    // Its partitions (step 3d; section 6.3; `bor.partitions`): where a new
+    // account is placed, and the head rows `migrate` makes.
+    let partitions =
+        meridian_bor::store::partitions_from(var(meridian_bor::store::PARTITIONS_VAR).as_deref())?;
 
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
@@ -79,6 +83,7 @@ fn run() -> Result<(), String> {
                 |store| {
                     store
                         .migrate(&*clock())
+                        .and_then(|()| store.make_partitions(partitions).map(|_| ()))
                         .map_err(|failed| failed.to_string())
                 },
             )
@@ -148,7 +153,12 @@ fn run() -> Result<(), String> {
         &url,
         |url| {
             PostgresStore::connect(url, 8)
-                .map(|store| store.with_snapshot_interval(interval).with_groups(groups))
+                .map(|store| {
+                    store
+                        .with_snapshot_interval(interval)
+                        .with_groups(groups)
+                        .with_partitions(partitions)
+                })
                 .map_err(|failed| failed.to_string())
         },
         |store| {

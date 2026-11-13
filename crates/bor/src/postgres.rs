@@ -121,6 +121,9 @@ pub struct PostgresStore {
     groups: meridian_changes::groups::Groups,
     /// One adoption at once where it may raise the epoch (several groups).
     adopting: Mutex<()>,
+    /// Its count of partitions (step 3d; `bor.partitions`): where a new
+    /// account is placed.
+    partitions: u32,
 }
 
 impl PostgresStore {
@@ -148,7 +151,36 @@ impl PostgresStore {
             committed: Mutex::default(),
             groups: meridian_changes::groups::Groups::one(),
             adopting: Mutex::new(()),
+            partitions: 1,
         })
+    }
+
+    /// The same store, placing new accounts over `count` partitions (step
+    /// 3d; section 6.3).
+    pub fn with_partitions(mut self, count: u32) -> Self {
+        self.partitions = count.max(1);
+        self
+    }
+
+    /// Each of `P0` to `P<count-1>`'s head row made where it is not, at the
+    /// control partition's epoch, as `migrate` makes them for
+    /// `bor.partitions` (step 3d; section 6.3). Lowering the count removes
+    /// none: the CLI's upgrade preflight refuses it.
+    pub fn make_partitions(&self, count: u32) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let names: Vec<String> = (0..count.max(1))
+            .map(crate::store::partition_named)
+            .collect();
+        let made = conn
+            .execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch)
+                 SELECT p, 0, (SELECT epoch FROM book_partition_head WHERE partition = 'control')
+                   FROM unnest($1::text[]) AS p
+                 ON CONFLICT (partition) DO NOTHING",
+                &[&names],
+            )
+            .map_err(unavailable)?;
+        Ok(made as usize)
     }
 
     /// The same store, writing for writer group `groups` (step 3d; section
@@ -1799,6 +1831,14 @@ impl Store for PostgresStore {
             idempotency_key: idempotency_key.to_string(),
             request: request.to_vec(),
         };
+        // An account never placed, with several partitions: placed by its
+        // owner label first, never by its ID instead (step 3d; ruled
+        // 2026-11-13). The book's writer places it before its act.
+        if self.placement_needed(account_id)? {
+            return Err(StoreError::NotPlaced(format!(
+                "account {account_id} is not placed in a partition yet: its owner label was not read"
+            )));
+        }
         // The partition the account was last found in: a guess its batch
         // checks under the partition's lock (step 3d; section 6.3), and an
         // account found elsewhere there is acted on in its partition.
@@ -1971,6 +2011,83 @@ impl Store for PostgresStore {
             });
         }
         Ok(owed)
+    }
+
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        if self.partitions < 2
+            || !crate::store::is_account(account_id)
+            || self
+                .placed
+                .lock()
+                .expect("placements poisoned")
+                .contains_key(account_id)
+        {
+            return Ok(false);
+        }
+        let found: Option<String> = self
+            .conn()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        match found {
+            Some(partition) => {
+                self.place(account_id, &partition);
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+
+    fn partition_count(&self) -> u32 {
+        self.partitions
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        if let Some(partition) = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+        {
+            return Some(partition.clone());
+        }
+        let found: Option<String> = self
+            .conn()
+            .ok()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .ok()?
+            .map(|row| row.get(0));
+        if let Some(partition) = &found {
+            self.place(account_id, partition);
+        }
+        found
+    }
+
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        let partition = crate::store::placement_of(key, self.partitions);
+        let mut conn = self.conn()?;
+        // Fixed at its creation: an account placed already keeps its own.
+        conn.execute(
+            "INSERT INTO book_account (account_id, partition, placement_key) VALUES ($1, $2, $3)
+             ON CONFLICT (account_id) DO NOTHING",
+            &[&account_id, &partition, &key],
+        )
+        .map_err(unavailable)?;
+        let placed: String = conn
+            .query_one(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        self.place(account_id, &placed);
+        Ok(placed)
     }
 
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {

@@ -72,6 +72,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "database_identity",
         sql: include_str!("../migrations/0010_database_identity.sql"),
     },
+    // An account's placement key (step 3d; section 6.3): what it was placed
+    // in its partition by, kept at its creation.
+    Migration {
+        version: 11,
+        name: "placement",
+        sql: include_str!("../migrations/0011_placement.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\
