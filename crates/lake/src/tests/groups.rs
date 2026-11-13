@@ -278,3 +278,64 @@ async fn a_write_answering_a_want_is_group_zeros_to_answer() {
     // Whole to group 0, which hands group 1 its part.
     assert_eq!(*g.broker.handed.lock().unwrap(), vec![0, 1]);
 }
+
+/// The ownership pre-check (step 3d, decided 2026-11-13): a write's group
+/// read from its request before any row is checked -- one wholly another
+/// group's datasets', that group; a want's answer, group 0; a write
+/// spanning groups, none, which its handler splits.
+#[test]
+fn a_writes_owner_is_read_from_its_request_first() {
+    let groups = Groups::new(0, 2).unwrap();
+    let datasets: Vec<String> = (0..40).map(|n| format!("coin-{n}:daily")).collect();
+    let of = |group: u32| {
+        datasets
+            .iter()
+            .find(|d| owner(d, 2) == group)
+            .unwrap()
+            .clone()
+    };
+    let (zero, one) = (of(0), of(1));
+    let asked = |datasets: &[&str], want: &str| {
+        let prices = datasets
+            .iter()
+            .map(|dataset| price(dataset, "BTC:07", "1"))
+            .collect();
+        Envelope {
+            meta: None,
+            payload_type: "meridian.v1.RecordPricesRequest".into(),
+            payload: RecordPricesRequest {
+                prices,
+                want_id: want.into(),
+            }
+            .encode_to_vec(),
+        }
+    };
+    let owner_of =
+        |envelope: &Envelope| service::owner_of_write(groups, service::RECORD_PRICES, envelope);
+    assert_eq!(owner_of(&asked(&[&one, &one], "")), Some(1));
+    assert_eq!(owner_of(&asked(&[&zero], "")), Some(0));
+    assert_eq!(
+        owner_of(&asked(&[&zero, &one], "")),
+        None,
+        "spanning groups: split"
+    );
+    assert_eq!(
+        owner_of(&asked(&[&one], "WANT-1")),
+        Some(0),
+        "a want's answer"
+    );
+    let split = Envelope {
+        meta: None,
+        payload_type: "meridian.v1.SplitPartitionRequest".into(),
+        payload: meridian_domain::v1::SplitPartitionRequest {
+            partition: format!("{one}/0000-7fff"),
+            reason: "why".into(),
+        }
+        .encode_to_vec(),
+    };
+    assert_eq!(
+        service::owner_of_write(groups, service::SPLIT_PARTITION, &split),
+        Some(1),
+        "a range is its dataset's group's"
+    );
+}

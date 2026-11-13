@@ -284,11 +284,19 @@ struct Routing {
     internal: String,
     /// Which of its topics are writes.
     writes: Serves,
+    /// The group a write is its owner's by, read from the request before
+    /// its handler runs any of its work: none where the request does not say
+    /// cheaply, and its handler finds out (step 3d; the ownership pre-check
+    /// decided 2026-11-13).
+    owner_of: Option<OwnerOf>,
     /// This member's writer group.
     group: u32,
     backend: Arc<dyn Backend>,
     timeout: Duration,
 }
+
+/// What a write's owning group is, read from its request (step 3d).
+pub type OwnerOf = Arc<dyn Fn(&str, &Envelope) -> Option<u32> + Send + Sync>;
 
 /// What a write handed to its owner leaves of its caller's deadline for its
 /// answer's way back through this member.
@@ -547,9 +555,16 @@ impl Bus {
         writes: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) {
         let writes: Serves = Arc::new(writes);
+        let owner_of = self
+            .routing
+            .read()
+            .expect("routing poisoned")
+            .as_ref()
+            .and_then(|routing| routing.owner_of.clone());
         *self.routing.write().expect("routing poisoned") = Some(Routing {
             internal: internal.to_string(),
             writes: Arc::clone(&writes),
+            owner_of,
             group,
             backend: Arc::clone(self.backend_for(internal)),
             timeout: self.default_timeout,
@@ -598,6 +613,22 @@ impl Bus {
         }
     }
 
+    /// Decide a write's owning group from its request before its handler
+    /// runs (step 3d; section 6.7; the ownership pre-check decided
+    /// 2026-11-13): `owner_of` answers the group where the request says it
+    /// cheaply -- the book's account's placement, the lake's datasets' -- and
+    /// a write of another group's is handed to it at once, its handler
+    /// never run here. Where it answers none, the handler finds out as
+    /// before. Set after [`Bus::hand_writes_on`].
+    pub fn route_writes_by(
+        &self,
+        owner_of: impl Fn(&str, &Envelope) -> Option<u32> + Send + Sync + 'static,
+    ) {
+        if let Some(routing) = self.routing.write().expect("routing poisoned").as_mut() {
+            routing.owner_of = Some(Arc::new(owner_of));
+        }
+    }
+
     /// A write's handler, handed to its owner where its store says so.
     fn routed(&self, topic: &str, handler: Handler) -> Handler {
         let routing = Arc::clone(&self.routing);
@@ -612,6 +643,17 @@ impl Bus {
                 return handler(envelope);
             };
             let handed = crate::owners::take_arriving();
+            // The owner decided from the request first: another group's
+            // write handed on before any of its handler's work.
+            if !handed {
+                if let Some(owner_of) = route.owner_of.as_ref() {
+                    if let Some(group) = owner_of(&topic, &envelope) {
+                        if group != route.group {
+                            return hand(&route, group, &topic, envelope);
+                        }
+                    }
+                }
+            }
             crate::owners::begin(handed);
             let kept = envelope.clone();
             let answered = handler(envelope);

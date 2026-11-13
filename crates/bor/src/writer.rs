@@ -225,6 +225,10 @@ impl Store for Writer {
         self.inner.writes(account_id)
     }
 
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        self.inner.writer_group_of(account_id)
+    }
+
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         self.inner.journal(account_id)
     }

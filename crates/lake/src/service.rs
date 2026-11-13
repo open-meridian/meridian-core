@@ -177,6 +177,31 @@ pub fn is_record_write(topic: &str) -> bool {
         || topic == SPLIT_PARTITION
 }
 
+/// The writer group a lake write is its owner's by, read from its request
+/// before its handler checks any row (step 3d; the ownership pre-check
+/// decided 2026-11-13): a write answering a want is group 0's, which holds
+/// the wants; one whose rows are every one of one other group's datasets is
+/// that group's; a split is its range's dataset's group's. None where the
+/// write spans groups or is this group's own, which its handler takes.
+pub fn owner_of_write(
+    groups: meridian_changes::groups::Groups,
+    topic: &str,
+    envelope: &Envelope,
+) -> Option<u32> {
+    if topic == SPLIT_PARTITION {
+        let request =
+            meridian_domain::v1::SplitPartitionRequest::decode(envelope.payload.as_slice()).ok()?;
+        return Some(groups.owner(crate::range::dataset_of(&request.partition)));
+    }
+    let (_, rows, want_id) = rows_of(topic, envelope).ok()?;
+    if !want_id.is_empty() {
+        return Some(0);
+    }
+    let mut owners = rows.iter().map(|row| groups.owner(row.dataset()));
+    let first = owners.next()?;
+    owners.all(|group| group == first).then_some(first)
+}
+
 /// A deployment admin halves a lake range (step 3d; section 6.1, approved
 /// 2026-11-12): answered by the range's writer once the split commits.
 pub const SPLIT_PARTITION: &str = "platform.lake.command.split-partition";

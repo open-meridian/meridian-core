@@ -54,6 +54,44 @@ use crate::store::{
 pub use meridian_clock::Clock;
 
 pub const RECORD_OPENING_BALANCE: &str = "platform.book.command.record-opening-balance";
+
+/// A request whose first field is the account it acts in: what the
+/// ownership pre-check reads, and nothing more of it.
+#[derive(Clone, PartialEq, prost::Message)]
+struct AccountFirst {
+    #[prost(string, tag = "1")]
+    account_id: String,
+}
+
+/// The commands whose request names its account as its first field, read
+/// by [`account_of_write`].
+const ACCOUNT_FIRST: &[&str] = &[
+    crate::order_service::PROPOSE_ORDER,
+    crate::order_service::RECORD_ORDER,
+    "platform.book.command.set-account-attribute",
+    "platform.book.command.record-account-figures",
+    RECORD_OPENING_BALANCE,
+    "platform.book.command.record-break",
+    "platform.book.command.record-encumbrances",
+    "platform.book.command.raise-alert",
+    "platform.book.command.record-locate",
+    "platform.book.command.handle-break",
+    "platform.book.command.close-breaks-as-cleared",
+];
+
+/// The account a command acts in, read from its request's first field
+/// alone, where its request names it there (step 3d; the ownership
+/// pre-check decided 2026-11-13): what decides its writer group before its
+/// handler runs. None for any other command, whose handler finds out.
+pub fn account_of_write(topic: &str, payload: &[u8]) -> Option<String> {
+    if !ACCOUNT_FIRST.contains(&topic) {
+        return None;
+    }
+    AccountFirst::decode(payload)
+        .ok()
+        .map(|first| first.account_id)
+        .filter(|account| !account.is_empty())
+}
 pub const RECORD_BREAK: &str = "platform.book.command.record-break";
 pub const RECORD_ACCOUNT_FIGURES: &str = "platform.book.command.record-account-figures";
 pub const RECORD_ENCUMBRANCES: &str = "platform.book.command.record-encumbrances";
@@ -1562,3 +1600,39 @@ async fn move_accounts(
 /// An account found holding a replaced record that no longer does, by the time
 /// its lock is held: nothing to move, and nothing wrong.
 const NOTHING_HELD: &str = "the account holds nothing under the replaced record";
+
+#[cfg(test)]
+mod pre_check {
+    use super::*;
+
+    /// The ownership pre-check (step 3d, decided 2026-11-13): a command
+    /// naming its account first is read for it alone; any other is left to
+    /// its handler.
+    #[test]
+    fn a_commands_account_is_read_from_its_first_field_alone() {
+        let proposal = meridian_domain::v1::ProposeOrderRequest {
+            account_id: "ACC-1".into(),
+            instrument_id: "INS-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_of_write(
+                crate::order_service::PROPOSE_ORDER,
+                &proposal.encode_to_vec()
+            ),
+            Some("ACC-1".into())
+        );
+        assert_eq!(
+            account_of_write(
+                "platform.book.command.book-order",
+                &proposal.encode_to_vec()
+            ),
+            None,
+            "a command naming its account by a record is its handler's to place"
+        );
+        assert_eq!(
+            account_of_write(crate::order_service::PROPOSE_ORDER, &[]),
+            None
+        );
+    }
+}

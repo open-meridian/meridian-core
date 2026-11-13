@@ -276,6 +276,15 @@ fn run() -> Result<(), String> {
                 groups.mine(),
                 meridian_bor::writer::is_command,
             );
+            // Its owner decided from the request first (the ownership
+            // pre-check decided 2026-11-13): a command naming its account
+            // handed to that account's group before any of its handler's
+            // work, by the placement this member last found it in.
+            let placing = postgres.clone();
+            bus.route_writes_by(move |topic, envelope| {
+                let account = meridian_bor::service::account_of_write(topic, &envelope.payload)?;
+                meridian_bor::Store::writer_group_of(placing.as_ref(), &account)
+            });
             tracing::info!(
                 group = groups.mine(),
                 groups = groups.count(),

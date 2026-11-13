@@ -526,6 +526,15 @@ pub trait Store: Send + Sync {
         true
     }
 
+    /// The writer group `account_id`'s commands are its owner's by, decided
+    /// from its placement as this store last found it, never read from the
+    /// record (step 3d; the ownership pre-check decided 2026-11-13): none
+    /// with one writer group, where nothing is handed on.
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        let _ = account_id;
+        None
+    }
+
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;
 

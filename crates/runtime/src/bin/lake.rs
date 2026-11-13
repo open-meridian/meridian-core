@@ -295,6 +295,12 @@ fn run() -> Result<(), String> {
                 groups.mine(),
                 meridian_lake::service::is_record_write,
             );
+            // Its owner decided from the request first (the ownership
+            // pre-check decided 2026-11-13): a write wholly another group's
+            // handed to it before any of its rows is checked.
+            bus.route_writes_by(move |topic, envelope| {
+                meridian_lake::service::owner_of_write(groups, topic, envelope)
+            });
             if !groups.holds_control() {
                 let changes = meridian_changes::read_changes_topic("lake");
                 bus.serve_only(move |topic| {

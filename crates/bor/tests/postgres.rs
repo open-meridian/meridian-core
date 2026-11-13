@@ -2448,6 +2448,14 @@ async fn capacity_book_hand_off() {
             ));
             if groups > 1 {
                 bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+                // The owner decided from the request first, as the book's
+                // binary routes (the ownership pre-check, 2026-11-13).
+                let placing = Arc::clone(&store);
+                bus.route_writes_by(move |topic, envelope| {
+                    let account =
+                        meridian_bor::service::account_of_write(topic, &envelope.payload)?;
+                    placing.writer_group_of(&account)
+                });
             }
             let writer: Arc<dyn Store> = Arc::new(Writer::new(
                 Arc::clone(&store) as Arc<dyn Store>,

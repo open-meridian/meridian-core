@@ -1846,6 +1846,12 @@ impl Store for PostgresStore {
         self.groups.owns(&self.placed(account_id))
     }
 
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        self.groups
+            .several()
+            .then(|| self.groups.owner(&self.placed(account_id)))
+    }
+
     fn on_commit(&self, observer: Committed) -> bool {
         *self.committed.lock().expect("observer poisoned") = Some(observer);
         true
