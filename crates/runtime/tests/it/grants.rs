@@ -152,3 +152,107 @@ fn a_role_name_that_is_not_one_is_refused() {
 
     assert!(refusal.contains("is not a role name"), "{refusal}");
 }
+
+/// Step 3d (section 6.2): the lake, migrated by one role and serving as
+/// another that may not create in the schema, still makes each range's and
+/// month's table as its writer first needs them -- through the functions
+/// migration 23 made, run as `lake_row`'s owner -- and records there, a
+/// split's children's too.
+#[test]
+fn the_lake_serving_role_makes_its_partitions_through_the_owners_functions() {
+    use meridian_domain::v1::{Money, ObservationMeta, Source, SubjectRef, Trade};
+    use meridian_lake::row::Observation;
+    use meridian_lake::store::Store as _;
+    let trade = |row_key: &str, subject: &str, valid_from_ns: i64| {
+        Observation::Trade(Box::new(Trade {
+            meta: Some(ObservationMeta {
+                row_key: row_key.into(),
+                subjects: vec![SubjectRef {
+                    entity_id: subject.into(),
+                    ..Default::default()
+                }],
+                source: Some(Source {
+                    instance: "coinbase-1".into(),
+                    dataset: "live".into(),
+                    ..Default::default()
+                }),
+                valid_from_ns,
+                ..Default::default()
+            }),
+            price: Some(Money {
+                amount: Some(meridian_pb::v1::Decimal {
+                    high: 0,
+                    low: 62_000,
+                    scale: 0,
+                }),
+                currency_code: "USD".into(),
+                instrument_id: "LCL-USD".into(),
+            }),
+            quantity: Some(meridian_pb::v1::Decimal {
+                high: 0,
+                low: 5,
+                scale: 1,
+            }),
+            ..Default::default()
+        }))
+    };
+    let (schema, serving, migrating) = two_roles("lake");
+    let migrator = meridian_lake::PostgresStore::connect(&migrating, 2).expect("connects");
+    migrator
+        .migrate(&meridian_clock::SystemClock)
+        .expect("the migrating role migrates");
+    drop(migrator);
+    meridian_runtime::grant_serving(&migrating, &serving).expect("grants");
+
+    // The serving role may not create a table of its own.
+    let mut server = postgres::Client::connect(&serving, postgres::NoTls).expect("connects");
+    assert!(
+        server
+            .batch_execute(&format!("create table {schema}.mine (id text)"))
+            .is_err(),
+        "the serving role creates nothing itself"
+    );
+    let leaves = |server: &mut postgres::Client| -> i64 {
+        server
+            .query_one(
+                "SELECT count(*) FROM pg_class WHERE relname LIKE 'lake\\_row\\_%' \
+                 AND relkind IN ('r', 'p') AND relnamespace = current_schema()::regnamespace",
+                &[],
+            )
+            .expect("reads")
+            .get(0)
+    };
+    let before = leaves(&mut server);
+
+    let lake = meridian_lake::PostgresStore::connect(&serving, 2).expect("connects");
+    let dataset = "coinbase-1:live";
+    let month = 1_790_380_800_000_000_000;
+    let next_month = month + 31 * 86_400 * 1_000_000_000;
+    let recorded = lake
+        .record(dataset, vec![trade("T-1", "INS-BTC", month)], month)
+        .expect("the serving role records into a range and a month it makes");
+    assert_eq!(recorded.recorded, 1);
+    lake.record(
+        dataset,
+        vec![trade("T-2", "INS-BTC", next_month)],
+        next_month,
+    )
+    .expect("and into the next month's");
+    let after = leaves(&mut server);
+    assert_eq!(after - before, 3, "the range's table and two months'");
+
+    // A split's children's tables, made the same way.
+    lake.split_partition(
+        dataset,
+        "local|grants",
+        "a split as the serving role",
+        month,
+    )
+    .expect("the serving role splits");
+    lake.record(dataset, vec![trade("T-3", "INS-BTC", month)], month)
+        .expect("and records in a child");
+    assert!(
+        leaves(&mut server) >= after + 3,
+        "two children's tables and a month"
+    );
+}

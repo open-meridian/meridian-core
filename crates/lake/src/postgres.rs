@@ -1825,10 +1825,10 @@ impl PostgresStore {
             // Empty: the default let go, under a short wait for its lock, and
             // tried again later where a read holds it.
             let mut tx = conn.transaction().map_err(unavailable)?;
+            // Let go by lake_row's owner (migration 23).
             tx.batch_execute(
                 "SET LOCAL lock_timeout = '2s';
-                 ALTER TABLE lake_row DETACH PARTITION lake_row_legacy;
-                 DROP TABLE lake_row_legacy;
+                 SELECT lake_drop_legacy();
                  UPDATE lake_conversion SET latest_all = true;",
             )
             .map_err(unavailable)?;

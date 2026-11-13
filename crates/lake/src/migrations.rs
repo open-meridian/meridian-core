@@ -154,6 +154,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "partitioned",
         sql: include_str!("../migrations/0022_partitioned.sql"),
     },
+    // lake_row's partitions made by lake_row's owner (step 3d): the lake
+    // serves under a login that may not create in the schema.
+    Migration {
+        version: 23,
+        name: "leaves",
+        sql: include_str!("../migrations/0023_leaves.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

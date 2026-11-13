@@ -7,7 +7,9 @@
 //! first needs them: made empty, given their indexes while empty, then
 //! attached, so nothing is ever read to attach it and no index is built over
 //! rows. Their names are a digest of the range's ID, which a table name
-//! could not always carry (63 bytes; any character).
+//! could not always carry (63 bytes; any character). The writer asks; the
+//! functions migration 23 made, run as `lake_row`'s owner, make them, so
+//! the lake's own login needs no right to create in the schema.
 
 use std::collections::BTreeSet;
 
@@ -121,33 +123,6 @@ pub fn month_table(partition: &str, month: Month) -> String {
     format!("{}_{}", range_table(partition), month.tag())
 }
 
-/// The indexes each month's table is made with, `{t}` its name: the ones
-/// the table kept before 3d has, over its own rows.
-const INDEXES: &[&str] = &[
-    "CREATE UNIQUE INDEX {t}_seq ON {t} (dataset, sequence)",
-    "CREATE UNIQUE INDEX {t}_version ON {t} (dataset, data_type, row_key, version)",
-    "CREATE INDEX {t}_subjects ON {t} USING gin (subjects)",
-    "CREATE INDEX {t}_latest ON {t} (dataset, data_type, subject, kind, venue_id, interval_ns, \
-     latest_key, valid_from_ns DESC, sequence DESC)",
-    "CREATE INDEX {t}_later ON {t} USING gin ((subjects[2:]))",
-    "CREATE INDEX {t}_unkeyed ON {t} (dataset, sequence) WHERE latest_key IS NULL",
-    "CREATE INDEX {t}_unconverted ON {t} (dataset) WHERE unconverted",
-    "CREATE INDEX {t}_closed ON {t} (dataset, sequence) WHERE closed_reason <> 0",
-    "CREATE INDEX {t}_listing ON {t} (subject, dataset, row_key, version DESC) \
-     INCLUDE (expires, listed_type, latest_key, recorded_at_ns, valid_from_ns, quality, sequence) \
-     WHERE data_type = 9",
-    "CREATE INDEX {t}_unlisted ON {t} (dataset, sequence) WHERE data_type = 9 AND listed_type IS NULL",
-    "CREATE INDEX {t}_unpublished ON {t} (dataset, sequence) \
-     WHERE data_type = 6 AND published_at_ns IS NULL",
-    "CREATE INDEX {t}_quality ON {t} (dataset, sequence) WHERE quality IN (2, 3)",
-    "CREATE INDEX {t}_subject_sequence ON {t} (dataset, data_type, (subject || ''), sequence)",
-];
-
-/// A text as an SQL literal: doubled quotes, so any partition ID is one.
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
-}
-
 /// Whether `table` exists in the session's schema.
 fn exists(client: &mut impl GenericClient, table: &str) -> Result<bool, postgres::Error> {
     Ok(client
@@ -179,17 +154,12 @@ pub fn ensure_ranges(
     client.execute("SELECT pg_advisory_xact_lock($1)", &[&LEAVES_LOCK])?;
     let mut made = 0;
     for partition in missing {
-        let range = range_table(partition);
-        if exists(client, &range)? {
-            continue;
-        }
-        client.batch_execute(&format!(
-            "CREATE TABLE {range} (LIKE lake_row INCLUDING DEFAULTS)
-                 PARTITION BY RANGE (valid_from_ns);
-             ALTER TABLE lake_row ATTACH PARTITION {range} FOR VALUES IN ({});",
-            literal(partition)
-        ))?;
-        made += 1;
+        // Made by lake_row's owner (migration 23): the lake's own login may
+        // not create in the schema. False where another made it first.
+        let fresh: bool = client
+            .query_one("SELECT lake_make_range($1)", &[partition])?
+            .get(0);
+        made += usize::from(fresh);
     }
     Ok(made)
 }
@@ -236,18 +206,16 @@ pub fn ensure_months(
         if exists(client, &leaf)? {
             continue;
         }
-        let range = range_table(partition);
-        let mut sql = format!("CREATE TABLE {leaf} (LIKE lake_row INCLUDING DEFAULTS);\n");
-        for index in INDEXES {
-            sql.push_str(&index.replace("{t}", &leaf));
-            sql.push_str(";\n");
-        }
+        // Made by lake_row's owner (migration 23), with the indexes the
+        // table kept before 3d has, while it is empty, then attached.
         let (from, to) = month.bounds();
-        sql.push_str(&format!(
-            "ALTER TABLE {range} ATTACH PARTITION {leaf} FOR VALUES FROM ({from}) TO ({to});"
-        ));
-        client.batch_execute(&sql)?;
-        made += 1;
+        let fresh: bool = client
+            .query_one(
+                "SELECT lake_make_month($1, $2, $3, $4)",
+                &[partition, &month.tag(), &from, &to],
+            )?
+            .get(0);
+        made += usize::from(fresh);
     }
     Ok(made)
 }
@@ -287,6 +255,5 @@ mod tests {
         assert_ne!(name, range_table("truefx:live/8000-ffff"));
         let leaf = month_table("truefx:live", Month::of(0));
         assert!(leaf.ends_with("_197001") && leaf.len() < 63, "{leaf}");
-        assert_eq!(literal("a'b"), "'a''b'");
     }
 }

@@ -1515,6 +1515,9 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
         format!("grant usage on schema {schema} to {role}"),
         format!("grant select, insert, update, delete on all tables in schema {schema} to {role}"),
         format!("grant usage, select on all sequences in schema {schema} to {role}"),
+        // What the stores' own functions do in the owner's stead (the lake's
+        // partitions, step 3d): run by the serving role, never written.
+        format!("grant execute on all functions in schema {schema} to {role}"),
         format!(
             "alter default privileges in schema {schema} \
              grant select, insert, update, delete on tables to {role}"
