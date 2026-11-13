@@ -45,6 +45,7 @@ impl Month {
         Month { year, month }
     }
 
+    #[cfg(test)]
     fn next(self) -> Month {
         if self.month == 12 {
             Month {
@@ -59,11 +60,14 @@ impl Month {
         }
     }
 
+    #[cfg(test)]
     fn start_ns(self) -> i128 {
         i128::from(days_from_civil(self.year, self.month, 1)) * NS_PER_DAY
     }
 
-    /// Its bounds as a RANGE partition's: `FROM (...) TO (...)`.
+    /// Its bounds as a RANGE partition's: `FROM (...) TO (...)`, as
+    /// migration 23's lake_make_month computes them.
+    #[cfg(test)]
     fn bounds(self) -> (String, String) {
         let edge = |ns: i128| {
             if ns <= i128::from(i64::MIN) {
@@ -75,6 +79,11 @@ impl Month {
             }
         };
         (edge(self.start_ns()), edge(self.next().start_ns()))
+    }
+
+    /// Its `YYYY-MM`, as migration 23's lake_make_month takes it.
+    pub fn label(self) -> String {
+        format!("{:04}-{:02}", self.year, self.month)
     }
 
     fn tag(self) -> String {
@@ -100,6 +109,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+#[cfg(test)]
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -208,11 +218,11 @@ pub fn ensure_months(
         }
         // Made by lake_row's owner (migration 23), with the indexes the
         // table kept before 3d has, while it is empty, then attached.
-        let (from, to) = month.bounds();
+        // Its bounds computed there from the month, never passed.
         let fresh: bool = client
             .query_one(
-                "SELECT lake_make_month($1, $2, $3, $4)",
-                &[partition, &month.tag(), &from, &to],
+                "SELECT lake_make_month($1, $2)",
+                &[partition, &month.label()],
             )?
             .get(0);
         made += usize::from(fresh);
