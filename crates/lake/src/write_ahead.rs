@@ -453,60 +453,54 @@ pub async fn write_forever(
         "the lake takes its writes from the write-ahead stream"
     );
     loop {
-        let consumer = match context.get_stream(STREAM).await {
-            Ok(mut stream) => {
-                // A stream made again -- its volume lost, or JetStream off and
-                // on again -- numbers from its own first: the position was
-                // taken in another, and what that one held past it is gone.
-                if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
-                    let state = &info.state;
-                    if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
-                        tracing::error!(
-                            position = at.sequence,
-                            last = state.last_sequence,
-                            "the lake's write-ahead stream is not the one its position was taken \
-                             in: going on from its first write; what the stream held past the \
-                             position before it was made again is not recorded"
-                        );
-                        writer.begin_at(state.first_sequence.max(1));
-                    }
-                }
-                let from = writer.next();
-                stream
-                    .create_consumer(consumer::pull::OrderedConfig {
-                        deliver_policy: consumer::DeliverPolicy::ByStartSequence {
-                            start_sequence: from,
-                        },
-                        ..Default::default()
-                    })
-                    .await
-            }
+        let mut stream = match context.get_stream(STREAM).await {
+            Ok(stream) => stream,
             Err(failed) => {
                 tracing::warn!(%failed, "the write-ahead stream could not be read");
                 tokio::time::sleep(AGAIN_AFTER).await;
                 continue;
             }
         };
-        let mut messages = match consumer {
-            Ok(consumer) => match consumer.messages().await {
-                Ok(messages) => messages,
-                Err(failed) => {
-                    tracing::warn!(%failed, "the write-ahead stream could not be followed");
-                    tokio::time::sleep(AGAIN_AFTER).await;
-                    continue;
-                }
-            },
+        // A stream made again -- its volume lost, or JetStream off and on
+        // again -- numbers from its own first: the position was taken in
+        // another, and what that one held past it is gone.
+        if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
+            let state = &info.state;
+            if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
+                tracing::error!(
+                    position = at.sequence,
+                    last = state.last_sequence,
+                    "the lake's write-ahead stream is not the one its position was taken \
+                     in: going on from its first write; what the stream held past the \
+                     position before it was made again is not recorded"
+                );
+                writer.begin_at(state.first_sequence.max(1));
+            }
+        }
+        let mut messages = match follow(&mut stream, writer.next()).await {
+            Ok((messages, _)) => messages,
             Err(failed) => {
                 tracing::warn!(%failed, "the write-ahead stream's reader could not be made");
                 tokio::time::sleep(AGAIN_AFTER).await;
                 continue;
             }
         };
+        let mut stall = Stall::new(STALL_AFTER);
         loop {
-            let batch = match gather(&mut messages).await {
-                Ok(batch) => batch,
-                Err(failed) => {
+            let batch = match read(&mut messages, &mut stall, writer.next(), &mut stream).await {
+                Read::Batch(batch) => batch,
+                Read::Stopped(failed) => {
                     tracing::warn!(%failed, "the write-ahead stream stopped; following it again");
+                    break;
+                }
+                Read::Stalled { last } => {
+                    tracing::warn!(
+                        next = writer.next(),
+                        last,
+                        quiet_s = STALL_AFTER.as_secs(),
+                        "the write-ahead stream holds writes past the lake's position and its \
+                         reader delivered none: the reader is made again from the position"
+                    );
                     break;
                 }
             };
@@ -562,9 +556,202 @@ pub async fn write_forever(
     }
 }
 
+/// How often the writer, delivered nothing, asks the stream's leader how far
+/// the stream has reached.
+pub const STALL_LOOK_EVERY: Duration = Duration::from_secs(5);
+
+/// How long the stream may hold writes past the writer's position, its
+/// reader delivering none, before the reader is made again from the
+/// position: a reader is never left silent (PR #113's failover-repeat
+/// 43340543897, ha run 2: the reader placed on a replica 400 writes behind
+/// delivered nothing for five minutes).
+pub const STALL_AFTER: Duration = Duration::from_secs(15);
+
+/// How many times the reader is made again to be placed on the stream's
+/// leader before it is followed where it was placed, the stall check its
+/// safety: NATS places an ephemeral consumer on any of the stream's peers
+/// (a cluster of three placed one off the leader two times in three), so
+/// 24 tries miss it about once in 17,000.
+pub const PLACEMENT_TRIES: usize = 24;
+
+/// The stream's reader, stopped or not: told each delivery, and each look
+/// at how far the stream has reached.
+#[derive(Debug)]
+pub struct Stall {
+    after: Duration,
+    /// Since when the stream has held writes past the position with none
+    /// delivered.
+    since: Option<tokio::time::Instant>,
+}
+
+impl Stall {
+    pub fn new(after: Duration) -> Self {
+        Self { after, since: None }
+    }
+
+    /// A batch delivered: the reader reads.
+    pub fn delivered(&mut self) {
+        self.since = None;
+    }
+
+    /// The stream's last sequence `last`, as its leader says at `now`, and
+    /// the writer's next `next`: whether its reader has delivered none of
+    /// the writes past the position for [`Stall`]'s bound.
+    pub fn looked(&mut self, now: tokio::time::Instant, last: u64, next: u64) -> bool {
+        if last < next {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= self.after
+    }
+}
+
+/// Where the stream's last sequence is asked: its leader, which answers a
+/// stream's info.
+pub trait Leader {
+    fn last(&mut self) -> impl std::future::Future<Output = Result<u64, String>> + Send;
+}
+
+impl Leader for stream::Stream {
+    async fn last(&mut self) -> Result<u64, String> {
+        self.info()
+            .await
+            .map(|info| info.state.last_sequence)
+            .map_err(|failed| failed.to_string())
+    }
+}
+
+/// What the reader gave.
+#[derive(Debug)]
+pub enum Read {
+    Batch(Vec<Taken>),
+    /// It ended, or failed.
+    Stopped(String),
+    /// The stream holds writes past the position, and it delivered none of
+    /// them for [`STALL_AFTER`]: `last` is the stream's last sequence.
+    Stalled {
+        last: u64,
+    },
+}
+
+/// The next batch the reader `messages` delivers; or, delivered none for
+/// [`STALL_LOOK_EVERY`], the stream's `leader` asked how far it has reached,
+/// and a reader that has delivered none of the writes past `next` for
+/// `stall`'s bound said to have stalled -- placed on a replica left behind,
+/// or lost -- never a quiet stream.
+pub async fn read<S, E, L>(messages: &mut S, stall: &mut Stall, next: u64, leader: &mut L) -> Read
+where
+    S: futures_util::Stream<Item = Result<jetstream::Message, E>> + Unpin,
+    E: std::fmt::Display,
+    L: Leader,
+{
+    loop {
+        match tokio::time::timeout(STALL_LOOK_EVERY, gather(messages)).await {
+            Ok(Ok(batch)) => {
+                stall.delivered();
+                return Read::Batch(batch);
+            }
+            Ok(Err(failed)) => return Read::Stopped(failed),
+            Err(_) => match leader.last().await {
+                Ok(last) if stall.looked(tokio::time::Instant::now(), last, next) => {
+                    return Read::Stalled { last };
+                }
+                Ok(_) => {}
+                Err(failed) => {
+                    tracing::debug!(%failed, "the write-ahead stream's leader did not say how far it is");
+                }
+            },
+        }
+    }
+}
+
+/// Whether a reader placed on `placed` reads from the stream's leader
+/// `leader`; with no cluster (one server), there is no other.
+pub fn on_leader(leader: Option<&str>, placed: Option<&str>) -> bool {
+    match (leader, placed) {
+        (Some(leader), Some(placed)) => leader == placed,
+        _ => true,
+    }
+}
+
+/// The stream's reader from `from` (NATS's consumers read from the copy of
+/// the stream on the server their leader is on, and an ephemeral one is R1,
+/// placed on one of the stream's peers): a pull consumer as an ordered one
+/// is -- ephemeral, in memory, no acknowledgements, gone 30 s after it is
+/// let go -- made again until it is placed on the stream's leader, which
+/// holds every write the stream has acknowledged. A follower left behind
+/// would hold back what it has not caught up. After [`PLACEMENT_TRIES`] it
+/// is followed where it is, the stall check its safety.
+async fn follow(
+    stream: &mut stream::Stream,
+    from: u64,
+) -> Result<(consumer::pull::Stream, bool), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let leader = stream
+            .info()
+            .await
+            .map_err(|failed| failed.to_string())?
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.leader.clone());
+        let mut made = stream
+            .create_consumer(consumer::pull::Config {
+                deliver_policy: consumer::DeliverPolicy::ByStartSequence {
+                    start_sequence: from,
+                },
+                ack_policy: consumer::AckPolicy::None,
+                inactive_threshold: Duration::from_secs(30),
+                num_replicas: 1,
+                memory_storage: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|failed| failed.to_string())?;
+        let info = made.info().await.map_err(|failed| failed.to_string())?;
+        let placed = info
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.leader.clone());
+        let on = on_leader(leader.as_deref(), placed.as_deref());
+        if on || tries >= PLACEMENT_TRIES {
+            if !on {
+                tracing::warn!(
+                    tries,
+                    ?leader,
+                    ?placed,
+                    "the write-ahead stream's reader was not placed on its leader: followed \
+                     where it is, the stall check its safety"
+                );
+            }
+            return made
+                .messages()
+                .await
+                .map(|messages| (messages, on))
+                .map_err(|failed| failed.to_string());
+        }
+        let name = info.name.clone();
+        if let Err(failed) = stream.delete_consumer(&name).await {
+            tracing::debug!(%failed, "a reader placed off the leader was not let go: it lapses");
+        }
+        tracing::info!(
+            tries,
+            ?leader,
+            ?placed,
+            "the write-ahead stream's reader was placed off its leader: made again"
+        );
+    }
+}
+
 /// The writes the stream has sent, up to [`MOST_WRITES`]: waits for the
 /// first, then takes what has come with it.
-async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, String> {
+async fn gather<S, E>(messages: &mut S) -> Result<Vec<Taken>, String>
+where
+    S: futures_util::Stream<Item = Result<jetstream::Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
     use futures_util::StreamExt as _;
     let mut batch = Vec::new();
     let first = messages
@@ -596,6 +783,153 @@ async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stream's leader, stood in: how far it says the stream reached.
+    struct Says(u64);
+
+    impl Leader for Says {
+        async fn last(&mut self) -> Result<u64, String> {
+            Ok(self.0)
+        }
+    }
+
+    type Delivered = futures_util::stream::Pending<Result<jetstream::Message, String>>;
+
+    #[test]
+    fn a_reader_is_on_the_leader_only_where_it_was_placed_there() {
+        assert!(on_leader(Some("js-0"), Some("js-0")));
+        assert!(
+            !on_leader(Some("js-0"), Some("js-2")),
+            "a follower, maybe left behind"
+        );
+        assert!(on_leader(None, None), "one server: no other");
+    }
+
+    #[test]
+    fn a_stall_is_writes_past_the_position_with_none_delivered_for_its_bound() {
+        let at = tokio::time::Instant::now();
+        let mut stall = Stall::new(Duration::from_secs(15));
+        // A quiet stream: nothing past the position, never a stall.
+        assert!(!stall.looked(at, 4, 5));
+        assert!(!stall.looked(at + Duration::from_secs(60), 4, 5));
+        // Writes past it, none delivered: a stall once the bound has passed.
+        assert!(!stall.looked(at + Duration::from_secs(61), 9, 5));
+        assert!(!stall.looked(at + Duration::from_secs(70), 9, 5));
+        assert!(stall.looked(at + Duration::from_secs(76), 9, 5));
+        // A delivery starts it again.
+        stall.delivered();
+        assert!(!stall.looked(at + Duration::from_secs(80), 12, 10));
+    }
+
+    /// A reader that stops delivering -- placed on a replica left behind,
+    /// as failover-repeat 43340543897 found -- is said to have stalled once
+    /// the leader says writes are past the position, within its bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_delivering_nothing_past_the_position_is_said_to_have_stalled() {
+        let mut stopped: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let began = tokio::time::Instant::now();
+        match read(&mut stopped, &mut stall, 593, &mut Says(609)).await {
+            Read::Stalled { last } => assert_eq!(last, 609),
+            other => panic!("not said to have stalled: {other:?}"),
+        }
+        let took = began.elapsed();
+        assert!(
+            took >= STALL_AFTER && took <= STALL_AFTER + STALL_LOOK_EVERY * 2,
+            "{took:?}"
+        );
+        // A quiet stream -- nothing past the position -- is never a stall.
+        let mut quiet: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let waited = tokio::time::timeout(
+            STALL_AFTER * 10,
+            read(&mut quiet, &mut stall, 610, &mut Says(609)),
+        )
+        .await;
+        assert!(waited.is_err(), "a quiet stream's reader kept reading");
+    }
+
+    /// The reader against a real JetStream (by hand: a broker with
+    /// JetStream at MERIDIAN_TEST_JETSTREAM_URL): made from a position, it
+    /// delivers the writes after it in the stream's order.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+    async fn the_reader_delivers_a_real_stream_from_its_position_in_order() {
+        let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+        let client = async_nats::connect(&url).await.unwrap();
+        let context = jetstream::new(client);
+        let name = format!("FOLLOW_TEST_{}", std::process::id());
+        let mut stream = context
+            .create_stream(stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("follow-test.{}.>", std::process::id())],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for n in 1..=5 {
+            context
+                .publish(
+                    format!("follow-test.{}.{n}", std::process::id()),
+                    vec![n as u8].into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let (mut messages, on) = follow(&mut stream, 2).await.unwrap();
+        assert!(on, "one server: its leader");
+        let mut seen = Vec::new();
+        while seen.len() < 4 {
+            let message = futures_util::StreamExt::next(&mut messages)
+                .await
+                .unwrap()
+                .unwrap();
+            seen.push(message.info().unwrap().stream_sequence);
+        }
+        assert_eq!(seen, vec![2, 3, 4, 5]);
+        let mut stall = Stall::new(STALL_AFTER);
+        assert!(!stall.looked(tokio::time::Instant::now(), stream.last().await.unwrap(), 6));
+        context.delete_stream(&name).await.unwrap();
+    }
+
+    /// The reader on a stream of three replicas (by hand: a JetStream
+    /// cluster of three at MERIDIAN_TEST_JETSTREAM_CLUSTER_URL): placed on
+    /// the stream's leader each time it is made, never on a follower that
+    /// may be left behind.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a JetStream cluster of three: MERIDIAN_TEST_JETSTREAM_CLUSTER_URL"]
+    async fn the_reader_is_placed_on_the_streams_leader() {
+        let url = std::env::var("MERIDIAN_TEST_JETSTREAM_CLUSTER_URL").unwrap();
+        let client = async_nats::connect(&url).await.unwrap();
+        let context = jetstream::new(client);
+        let name = format!("PLACED_TEST_{}", std::process::id());
+        let mut stream = context
+            .create_stream(stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("placed-test.{}.>", std::process::id())],
+                num_replicas: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            let (_, on) = follow(&mut stream, 1).await.unwrap();
+            assert!(on, "placed off the stream's leader");
+        }
+        context.delete_stream(&name).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_ended_is_said_to_have_stopped() {
+        let mut ended = futures_util::stream::empty::<Result<jetstream::Message, String>>();
+        let mut stall = Stall::new(STALL_AFTER);
+        assert!(matches!(
+            read(&mut ended, &mut stall, 1, &mut Says(0)).await,
+            Read::Stopped(_)
+        ));
+    }
 
     #[test]
     fn the_stream_refuses_a_write_when_full_never_dropping_its_oldest() {
