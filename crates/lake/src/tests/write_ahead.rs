@@ -26,6 +26,7 @@ fn written(sequence: u64, instance: &str, prices: Vec<Price>) -> Taken {
         reply_to: Some(format!("_INBOX.test.{sequence}")),
         after: None,
         envelope,
+        dataset: String::new(),
     }
 }
 
@@ -458,4 +459,77 @@ async fn a_gap_is_recorded_the_moment_the_stream_skips_and_each_dataset_names_it
         .filter(|g| g.dataset.is_empty())
         .collect::<Vec<_>>();
     assert_eq!(still, vec![unattributed]);
+}
+
+/// Step 3d (section 6.1): one reader of the stream per writer group, each
+/// with its own position. Every group reads the whole stream; each commits
+/// its own datasets' writes and answers them, and moves its position past
+/// the rest, which their owners answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_its_own_position() {
+    use meridian_changes::groups::{owner, Groups};
+    let h = harness();
+    let dataset = "coinbase-1:daily";
+    let owning = owner(dataset, 2);
+    let lake_of = |group: u32| {
+        let lake = service::Lake::grouped(
+            h.bus.clone(),
+            h.store.clone(),
+            h.clock.clone(),
+            Groups::new(group, 2).unwrap(),
+        );
+        lake.configured(&configuration(true, &[]));
+        lake
+    };
+    let write = |sequence: u64| {
+        let mut taken = written(
+            sequence,
+            "coinbase-1",
+            vec![close(
+                "coinbase-1",
+                &format!("BTC:{sequence}"),
+                BTC,
+                "2026-10-07",
+                "62000",
+            )],
+        );
+        taken.dataset = dataset.to_string();
+        taken
+    };
+    let batch = vec![write(1), write(2)];
+    let other = lake_of(1 - owning);
+    let mut skipping = tokio::task::block_in_place(|| Writer::start(other, STREAM)).unwrap();
+    let skipped = tokio::task::block_in_place(|| skipping.take(batch.clone())).unwrap();
+    assert!(
+        skipped.is_empty(),
+        "another group's writes are its owner's to answer"
+    );
+    let key = |group: u32| crate::write_ahead::position_key(STREAM, Groups::new(group, 2).unwrap());
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(1 - owning))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(2),
+        "its own position moved past them"
+    );
+    assert_eq!(
+        h.store.heads().unwrap().get(dataset),
+        None,
+        "nothing of them kept"
+    );
+    let mut taking =
+        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    let answers = tokio::task::block_in_place(|| taking.take(batch)).unwrap();
+    assert_eq!(answers.len(), 2);
+    assert_eq!(reply(&answers[1].1).recorded, 1);
+    assert_eq!(h.store.heads().unwrap()[dataset], 2);
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(owning))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(2)
+    );
+    assert_eq!(key(0), STREAM, "group 0 keeps the position every lake kept");
 }

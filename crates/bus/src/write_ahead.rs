@@ -50,6 +50,15 @@ pub fn subject(instance: &str, key: &str) -> String {
     format!("platform.lake.internal.write-ahead.{instance}.{key}")
 }
 
+/// The dataset a write's subject names (`<instance>:<key>`, as
+/// [`subject_of`] spelled it); none for a subject of no dataset's.
+pub fn dataset_of_subject(subject: &str) -> Option<String> {
+    let rest = subject.strip_prefix("platform.lake.internal.write-ahead.")?;
+    let (instance, key) = rest.split_once('.')?;
+    (!instance.is_empty() && !key.is_empty() && !key.contains('.'))
+        .then(|| format!("{instance}:{key}"))
+}
+
 /// Every subject of one instance's datasets: what its plugin's credential
 /// publishes on, and reads its last writes back from.
 pub fn instance_subjects(instance: &str) -> String {

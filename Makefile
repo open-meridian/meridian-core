@@ -2742,8 +2742,8 @@ chart-check:
 	@# writer Deployment of its own, <release>-<store>-group-<g>, its group
 	@# and the count in its environment, its own Lease, and with a standby
 	@# its standby and PodDisruptionBudget; the resilience values carry the
-	@# count; the lake's above 1 with the write-ahead stream refused until
-	@# stage H, and 0 refused.
+	@# count; the lake's above 1 with the write-ahead stream on rendered
+	@# from stage H, each group's writer with its own Lease; and 0 refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
 	echo "$$one" | grep -q "MERIDIAN_WRITER_GROUP\|-group-[0-9]" \
@@ -2774,10 +2774,10 @@ chart-check:
 		|| { echo "chart-check FAILED: bor.standby does not count per writer group: group 1 runs no standby beside its writer" >&2; exit 1; }; \
 	echo "$$ha" | grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | grep -q '\\"writerGroups\\":2' \
 		|| { echo "chart-check FAILED: the resilience values do not carry bor.writerGroups" >&2; exit 1; }; \
-	refused="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set lake.writerGroups=2 2>&1 >/dev/null)" \
-		&& { echo "chart-check FAILED: lake.writerGroups=2 rendered with the write-ahead stream on, before a group's own consumer of it (stage H)" >&2; exit 1; }; \
-	echo "$$refused" | grep -q "lake.writerGroups is 2 with the lake's write-ahead stream on" \
-		|| { echo "chart-check FAILED: lake.writerGroups=2 in ha is refused without naming it: $$refused" >&2; exit 1; }; \
+	lake_ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set lake.writerGroups=2 2>&1)" \
+		|| { echo "chart-check FAILED: lake.writerGroups=2 did not render with the write-ahead stream on (stage H: each group reads the stream itself): $$lake_ha" >&2; exit 1; }; \
+	echo "$$lake_ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-lake-group-1"' \
+		|| { echo "chart-check FAILED: the lake's writer group 1 in ha does not take a Lease of its own, check-meridian-runtime-lake-group-1" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=0 >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: bor.writerGroups=0 rendered; a store has one writer group at least" >&2; exit 1; }; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both

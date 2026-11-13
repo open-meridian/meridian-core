@@ -114,15 +114,9 @@ fn run() -> Result<(), String> {
     let ready = Ready::from_env();
     // Its writer group and the lake's count (step 3d; section 6.1): the
     // datasets it writes, and those it hands to their owners.
+    // In ha each group's writer reads the write-ahead stream with its own
+    // position, and commits its own datasets' writes (stage H).
     let groups = meridian_changes::groups::Groups::from_env()?;
-    if groups.several() && write_ahead_on() {
-        return Err(format!(
-            "lake.writerGroups is {} with the write-ahead stream on (ha): a writer group's \
-             own consumer of the stream comes with the lake's hash ranges (step 3d, stage H); \
-             until then the lake writes as one group in ha",
-            groups.count()
-        ));
-    }
     // Its pool of 8, and in ha 2 more for the write-ahead stream's writer --
     // its batch's transaction and its position -- so its commits never wait
     // behind the lake's reads (the chart's databaseConnections counts them).
@@ -335,6 +329,15 @@ fn run() -> Result<(), String> {
                 )
             });
         }
+        // `lake_row` partitioned online (step 3d; section 6.2): the rows
+        // kept before it copied behind into their ranges' months, a page at
+        // a time, by the control partition's group's writer, under its lease;
+        // nothing once none is left. The rows move inside Postgres: the
+        // lake holds a page's row places, never its rows.
+        if groups.holds_control() {
+            let converting = url.clone();
+            std::thread::spawn(move || convert_forever(&converting));
+        }
         // Every handler and subscription in place before this returns.
         let lake =
             meridian_lake::service::serve_grouped(bus.clone(), Arc::clone(&store), clock(), groups);
@@ -383,6 +386,46 @@ fn run() -> Result<(), String> {
         holding.release().await;
         Ok(())
     })
+}
+
+/// Copy the rows kept before the lake's ranges into their months until none
+/// is left (step 3d; section 6.2): a page, then a pause, so the writer's own
+/// work goes first; a page that fails tried again shortly.
+fn convert_forever(url: &str) {
+    let store = loop {
+        match PostgresStore::connect(url, 1) {
+            Ok(store) => break store,
+            Err(failed) => {
+                tracing::warn!(%failed, "the lake's rows could not be converted yet");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    };
+    let mut moved: u64 = 0;
+    loop {
+        match store.convert_page() {
+            Ok(0) => {
+                if moved > 0 {
+                    tracing::info!(
+                        moved,
+                        "the lake's rows kept before its ranges are converted"
+                    );
+                }
+                return;
+            }
+            Ok(rows) => {
+                moved += rows;
+                if moved % 100_000 < rows {
+                    tracing::info!(moved, "the lake's rows kept before its ranges, converting");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(failed) => {
+                tracing::warn!(%failed, "a page of the lake's rows was not converted; again shortly");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
 }
 
 /// Whether this deployment's data plugins write ahead to the stream: the

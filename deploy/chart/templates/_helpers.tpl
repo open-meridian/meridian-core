@@ -251,10 +251,10 @@ datasets, the book's partitions, `control` always group 0's -- and every
 group past the first is a writer Deployment of its own,
 `<release>-<store>-group-<g>` (approved 2026-11-12), with its own Lease and
 standby (`<store>.standby` counts per group); every member serves the
-store's public writes and hands each to the group owning it. The lake's
-above 1 with the write-ahead stream on (ha) is refused until a group's own
-consumer of the stream comes, with the lake's hash ranges (stage H). Zero is
-refused, and more than 64. Takes a dict: top, component, values.
+store's public writes and hands each to the group owning it. With the
+lake's write-ahead stream on (ha), each group's writer reads the stream
+with its own position and commits its own datasets' writes (stage H). Zero
+is refused, and more than 64. Takes a dict: top, component, values.
 */}}
 {{- define "meridian-runtime.writerGroups" -}}
 {{- $groups := 1 -}}
@@ -264,9 +264,6 @@ refused, and more than 64. Takes a dict: top, component, values.
 {{- end -}}
 {{- if gt (int $groups) 64 -}}
 {{- fail (printf "%s.writerGroups is %v; at most 64" .component $groups) -}}
-{{- end -}}
-{{- if and (eq .component "lake") (gt (int $groups) 1) (gt (int (include "meridian-runtime.jetstreamReplicas" .top)) 0) -}}
-{{- fail (printf "lake.writerGroups is %v with the lake's write-ahead stream on (broker.jetstream.replicas above 0, as resilience.profile ha sets it): a writer group's own consumer of the stream comes with the lake's hash ranges (step 3d, stage H). Until then the lake writes as one group with the stream on; set lake.writerGroups: 1, or broker.jetstream.replicas: 0." $groups) -}}
 {{- end -}}
 {{- int $groups -}}
 {{- end -}}

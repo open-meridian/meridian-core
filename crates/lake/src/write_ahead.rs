@@ -69,6 +69,29 @@ pub struct Taken {
     pub after: Option<u64>,
     /// The request as its sidecar stamped it.
     pub envelope: Envelope,
+    /// The dataset its subject names; empty where it names none.
+    pub dataset: String,
+}
+
+/// Where a writer group keeps its position in the stream (step 3d; section
+/// 6.1): group 0 under the stream's own name, as every lake before groups
+/// kept it; each group past the first under `<stream>.group-<g>`, as its
+/// queue group is named.
+pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> String {
+    match groups.mine() {
+        0 => stream.to_string(),
+        group => format!("{stream}.group-{group}"),
+    }
+}
+
+/// Whether a write taken from the stream is this writer group's to commit:
+/// its dataset's owner is the group; one naming no dataset is group 0's.
+fn ours(groups: meridian_changes::groups::Groups, write: &Taken) -> bool {
+    if write.dataset.is_empty() {
+        groups.holds_control()
+    } else {
+        groups.owns(&write.dataset)
+    }
 }
 
 /// What a batch did: each write's answer, to where it is sent.
@@ -109,11 +132,13 @@ impl Writer {
     /// The writer of `lake`, at the position its store holds in `stream`,
     /// with what it found the stream dropped.
     pub fn start(lake: Arc<Lake>, stream: &str) -> Result<Writer, StoreError> {
-        let position = lake.write_ahead_position(stream)?;
-        let (dropped, valid) = lake.write_ahead_found(stream)?;
+        // Each writer group's own position (step 3d; section 6.1).
+        let stream = position_key(stream, lake.groups());
+        let position = lake.write_ahead_position(&stream)?;
+        let (dropped, valid) = lake.write_ahead_found(&stream)?;
         Ok(Writer {
             lake,
-            stream: stream.to_string(),
+            stream,
             position,
             from: None,
             dropped,
@@ -191,6 +216,15 @@ impl Writer {
                  datasets named as each writes next"
             );
         }
+        // Every group reads the whole stream, so each dataset's chain and
+        // every run it dropped are seen whole; each commits its own
+        // datasets' writes alone, and moves its own position past the rest
+        // (step 3d; section 6.1). The rest are their owners' to answer.
+        let groups = self.lake.groups();
+        let taken: Vec<Taken> = taken
+            .into_iter()
+            .filter(|write| ours(groups, write))
+            .collect();
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
         for write in taken {
@@ -273,6 +307,8 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         reply_to: header(REPLY_HEADER).filter(|to| !to.is_empty()),
         after: header(AFTER_HEADER).and_then(|said| said.parse().ok()),
         envelope: Envelope::decode(message.payload.clone()).unwrap_or_default(),
+        dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)
+            .unwrap_or_default(),
     })
 }
 
@@ -441,7 +477,13 @@ pub async fn write_forever(
     };
     // The gaps the last writer was asking for again, asked again by this
     // one (W10.14): their wants were in its memory.
-    match tokio::task::block_in_place(|| lake.resume_gaps()) {
+    // Group 0's, which holds the lake's wants (step 3d).
+    let resumed = if lake.groups().holds_control() {
+        tokio::task::block_in_place(|| lake.resume_gaps())
+    } else {
+        Ok(0)
+    };
+    match resumed {
         Ok(0) => {}
         Ok(asked) => tracing::info!(asked, "gaps still refetching asked again"),
         Err(failed) => tracing::warn!(%failed, "the gaps still refetching could not be read"),
