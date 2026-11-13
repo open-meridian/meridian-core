@@ -2591,6 +2591,31 @@ async fn capacity_book_partitions() {
         })
         .collect();
     meridian_domain::money::learn("USD", "INS-CASH-USD");
+    // The conductor's accounts read, as the book asks it at an account's
+    // first act: every bench account of every shape, no owner label, so each
+    // is placed by its ID. One stand-in for the whole run.
+    let known: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let conductor = Arc::new(Bus::single(
+        format!("conductor-bench-{}", unique("C")),
+        Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let listing = Arc::clone(&known);
+    conductor.serve("platform.config.query.accounts", move |_| {
+        let accounts = listing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|account| AccountRecord {
+                account_id: account.clone(),
+                ..Default::default()
+            })
+            .collect();
+        Ok((
+            "meridian.v1.Accounts".into(),
+            Accounts { accounts }.encode_to_vec(),
+        ))
+    });
     for (groups, partitions) in shapes {
         let (url, migrated) = blocking(isolated);
         blocking(|| migrated.make_partitions(partitions).unwrap());
@@ -2637,21 +2662,7 @@ async fn capacity_book_partitions() {
             Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap()),
             Arc::new(meridian_clock::SystemClock),
         ));
-        // The conductor's accounts read, as the book asks it at an account's
-        // first act: every bench account, no owner label, placed by its ID.
-        let listed = Accounts {
-            accounts: accounts
-                .iter()
-                .map(|account| AccountRecord {
-                    account_id: account.clone(),
-                    ..Default::default()
-                })
-                .collect(),
-        }
-        .encode_to_vec();
-        client.serve("platform.config.query.accounts", move |_| {
-            Ok(("meridian.v1.Accounts".into(), listed.clone()))
-        });
+        known.lock().unwrap().extend(accounts.iter().cloned());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         for account in &accounts {
             send_order(
@@ -2673,14 +2684,16 @@ async fn capacity_book_partitions() {
         for (label, count, in_flight) in [("load", proposals, at_once), ("light", light, 1)] {
             let (count_before, total_before, _) = meridian_bus::owners::handed_on();
             let next = Arc::new(AtomicU64::new(0));
+            let retried = Arc::new(AtomicU64::new(0));
             let started = std::time::Instant::now();
             let mut workers = Vec::new();
             for _ in 0..in_flight {
-                let (client, accounts, next, run) = (
+                let (client, accounts, next, run, retried) = (
                     Arc::clone(&client),
                     accounts.clone(),
                     Arc::clone(&next),
                     run.clone(),
+                    Arc::clone(&retried),
                 );
                 workers.push(tokio::spawn(async move {
                     let mut took = Vec::new();
@@ -2701,10 +2714,31 @@ async fn capacity_book_partitions() {
                             idempotency_key: format!("{run}-{label}-{n}"),
                             ..Default::default()
                         };
+                        // Asked again after a refusal's retry-after, as a
+                        // plugin's SDK does; its latency counts from the
+                        // first ask.
                         let began = std::time::Instant::now();
-                        send_order(&client, PROPOSE_ORDER, &proposal, Some(PERSON), None)
-                            .await
-                            .unwrap_or_else(|refused| panic!("proposal {n} refused: {refused}"));
+                        loop {
+                            match send_order(&client, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                                .await
+                            {
+                                Ok(_) => break,
+                                Err(refused) => {
+                                    let detail = refused
+                                        .find('[')
+                                        .map_or(refused.as_str(), |at| &refused[at..]);
+                                    let Some(wait) = meridian_bus::refusal_retry_after(detail)
+                                    else {
+                                        panic!("proposal {n} refused: {refused}")
+                                    };
+                                    retried.fetch_add(1, Ordering::Relaxed);
+                                    tokio::time::sleep(std::time::Duration::from_secs(u64::from(
+                                        wait,
+                                    )))
+                                    .await;
+                                }
+                            }
+                        }
                         took.push(began.elapsed());
                     }
                 }));
@@ -2727,13 +2761,14 @@ async fn capacity_book_partitions() {
                 "CAPACITY book partitions groups={groups} partitions={partitions} run={label} \
                  proposals={count} in_flight={in_flight} rate_per_s={:.0} p50_ms={:.2} \
                  p90_ms={:.2} p99_ms={:.2} most_ms={:.2} handed={handed} \
-                 handed_mean_ms={mean_ms:.2} handed_most_ms={:.2}",
+                 handed_mean_ms={mean_ms:.2} handed_most_ms={:.2} asked_again={}",
                 count as f64 / elapsed.as_secs_f64(),
                 at(0.50).as_secs_f64() * 1e3,
                 at(0.90).as_secs_f64() * 1e3,
                 at(0.99).as_secs_f64() * 1e3,
                 took.last().unwrap().as_secs_f64() * 1e3,
                 most.as_secs_f64() * 1e3,
+                retried.load(Ordering::Relaxed),
             );
         }
         // Where the accounts landed, a count a partition.
@@ -3020,4 +3055,43 @@ async fn a_first_act_waits_for_the_conductor_and_never_places_by_id() {
     });
     assert_eq!(placed, 0);
     blocking(move || drop(store));
+}
+
+/// Step 3d (the ownership pre-check, with several partitions): a member
+/// routes a write by where the record holds its account, learnt where this
+/// member has not seen it -- never the partition an account starts in -- and
+/// an account not placed yet to no group, so the member it reaches places it
+/// and hands it on where it landed.
+#[test]
+fn the_pre_check_routes_by_the_record_and_leaves_an_unplaced_account_unrouted() {
+    use meridian_changes::groups::Groups;
+    let (url, migrated) = isolated();
+    migrated.make_partitions(4).unwrap();
+    drop(migrated);
+    let placing = PostgresStore::connect(&url, 2).unwrap().with_partitions(4);
+    // An account whose ID lands it in a partition group 1 owns.
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| format!("ACC-ROUTE-{n}"))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    let landed = placing.place_first(&account, &account).unwrap();
+    assert_eq!(groups.owner(&landed), 1);
+    drop(placing);
+    // Another member of group 0, its cache cold.
+    let member = PostgresStore::connect(&url, 2)
+        .unwrap()
+        .with_groups(groups)
+        .with_partitions(4);
+    assert_eq!(member.writer_group_of(&account), Some(1), "by the record");
+    assert_eq!(
+        member.writer_group_of("ACC-NEVER-PLACED"),
+        None,
+        "no group's yet"
+    );
+    assert_eq!(
+        member.writer_group_of(meridian_bor::store::CONTROL_ACCOUNT),
+        Some(0),
+        "the book's own keys where they start"
+    );
 }

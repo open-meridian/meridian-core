@@ -2091,9 +2091,46 @@ impl Store for PostgresStore {
     }
 
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {
-        self.groups
-            .several()
-            .then(|| self.groups.owner(&self.placed(account_id)))
+        if !self.groups.several() {
+            return None;
+        }
+        // Where this member has seen it, else where the record holds it,
+        // learnt (step 3d): a guess from the partition an account starts in
+        // routes it wrong once the book has several partitions. An account
+        // not placed yet is no group's to route to: the member it reaches
+        // places it, and hands it on where it landed.
+        let cached = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+            .cloned();
+        let partition = match cached {
+            Some(partition) => partition,
+            None if !crate::store::is_account(account_id) => {
+                first_partition_of(account_id).to_string()
+            }
+            None => {
+                let found: Option<String> = self
+                    .conn()
+                    .ok()?
+                    .query_opt(
+                        "SELECT partition FROM book_account WHERE account_id = $1",
+                        &[&account_id],
+                    )
+                    .ok()?
+                    .map(|row| row.get(0));
+                match found {
+                    Some(partition) => {
+                        self.place(account_id, &partition);
+                        partition
+                    }
+                    None if self.partitions > 1 => return None,
+                    None => first_partition_of(account_id).to_string(),
+                }
+            }
+        };
+        Some(self.groups.owner(&partition))
     }
 
     fn on_commit(&self, observer: Committed) -> bool {
