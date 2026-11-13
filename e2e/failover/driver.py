@@ -714,6 +714,9 @@ async def flood_seed(plugin, dataset):
                 break
             except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
                 say(f"driver: flood: seeding batch {batch} again ({words(failed)})")
+                # Told to stop: stops, seeded or not.
+                if stopped():
+                    return
                 await asyncio.sleep(1.0)
     kept("/tmp/seeded", "SEEDED")
     say(f"driver: flood: {FLOOD_ROWS} rows recorded in {dataset}")
