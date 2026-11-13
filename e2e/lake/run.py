@@ -113,6 +113,19 @@ harness's admin, Ben, who holds read on `book`.
    by its index kept, a new version; a row with no index refused naming its
    path, a kind the schema does not define naming its value.
 
+20. Step 3d (section 6.1): a split under load. `coin` records BTC and USDC
+   trades on `coin:live` throughout; `desk`, following BTC, has heard some
+   when the deployment admin halves `coin:live` through
+   `dashboard__split_partition` with a note -- the act answering its
+   PartitionSplit: the parent closed at N, its two children numbering from
+   N + 1 -- and `coin` records on, refused nothing. Every row `desk` heard of
+   BTC follows its previous one (each row's previous sequence the last
+   one's), across the split; a catch-up after the watermark `desk` held
+   before the split, naming `coin:live`, reads on into the children,
+   answered with no refusal: BTC's and USDC's rows after it, each subject's
+   chain unbroken, none at or before it. The Resilience history lists the
+   split.
+
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
 
@@ -838,6 +851,10 @@ def run():
     must(live_sequences == list(range(1, len(live_sequences) + 1)) and len(live_sequences) > 8,
          f"step 10, live's trades and quotes numbered from its head with no holes: {live_sequences}")
 
+    # 20. A split under load (step 3d; section 6.1), last: coin:live's rows
+    # are numbered per range after it.
+    split_under_load(btc, usdc)
+
     took = int(time.time() - started)
     print(f"{NAME} OK in {took}s: on the plugin harness, a data plugin's three datasets listed by the "
           "deployment admin's tool, licensed at the Data sources page and through the tool with a "
@@ -872,6 +889,50 @@ def run():
           "kept, a row with no index and an undefined kind refused naming each; and "
           "`store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
+
+
+def chained(rows, what):
+    """Each row's previous sequence the sequence of the row before it, in
+    the order of their sequences: a subject's chain unbroken."""
+    rows = sorted(rows, key=lambda row: row["sequence"])
+    for before, row in zip(rows, rows[1:]):
+        must(row["previous_sequence"] == before["sequence"],
+             f"{what}: {row['row_key']} at {row['sequence']} follows {row['previous_sequence']}, "
+             f"not {before['row_key']} at {before['sequence']}: {rows}")
+
+
+def split_under_load(btc, usdc):
+    must(page("coin", "admin", "/split-run?start=1").get("started"), "step 20, coin did not start")
+    heard_before = lambda: [t for t in page("desk", "read", "/heard")["trades"]
+                            if t["row_key"].startswith("SPLIT-btc-")]
+    before = until(60, lambda: (lambda h: h if len(h) >= 5 else None)(heard_before()),
+                   "step 20, desk heard none of coin's trades before the split")
+    held = max(t["sequence"] for t in before)
+    split = call("dashboard__split_partition",
+                 {"partition": "coin:live", "note": "The live trades outgrew one writer."},
+                 "made")["data"]["split"]
+    must(split["parent"] == "coin:live"
+         and split["children"] == ["coin:live/0000-7fff", "coin:live/8000-ffff"]
+         and split["closing_sequence"] >= held,
+         f"step 20, the split's record: the parent, its two children, its close: {split}")
+    closed = split["closing_sequence"]
+    after = until(60, lambda: (lambda h: h if sum(t["sequence"] > closed for t in h) >= 5 else None)(
+        heard_before()), "step 20, desk heard none of coin's trades after the split")
+    stopped = page("coin", "admin", "/split-run?stop=1")
+    must(not stopped["failed"] and stopped["recorded"] > 0,
+         f"step 20, coin recorded on through the split, refused nothing: {stopped}")
+    chained(after, "step 20, BTC's chain as desk heard it, across the split")
+    for name, subject in (("btc", btc), ("usdc", usdc)):
+        caught = page("desk", "read", f"/catch-up?subject={subject}&after={held}")
+        must(not caught["unanswered"], f"step 20, the catch-up after {held} answered whole: {caught}")
+        rows = [t for t in caught["trades"] if t["row_key"].startswith(f"SPLIT-{name}-")]
+        must(rows and all(t["sequence"] > held or t["dataset"] != "coin:live" for t in rows)
+             and any(t["sequence"] > closed for t in rows),
+             f"step 20, {name}'s rows after the watermark held before the split, on past it: {rows}")
+        chained(rows, f"step 20, {name}'s chain caught up across the split")
+    history = call("dashboard__read_resilience", {}, "unchanged")["data"]["history"]
+    must(any(item["kind"] == "partition_split" for item in history),
+         f"step 20, the split in the Resilience history: {history}")
 
 
 def main():

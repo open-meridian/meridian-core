@@ -8,10 +8,14 @@
 //!   changes, never blind per live data type.
 //! - `read_resilience` over ReadResilience: the members, the partitions and
 //!   a page of the history.
+//! - `split_partition` over SplitPartition (step 3d; section 6.1,
+//!   `dashboard__split_partition` approved 2026-11-12): a lake range halved
+//!   by a deployment admin, a note saying why kept as the split's reason,
+//!   answered with its `PartitionSplit`. The Partitions tab's Split dialog,
+//!   which will send the same act, is stage M's.
 //!
-//! The moves of a partition and an account are step 3d's and have no tool
-//! yet. Neither tool reads a secret or changes who holds access; neither
-//! changes anything.
+//! The moves of a partition and an account are step 3d's stage M's and have
+//! no tool yet. No tool reads a secret or changes who holds access.
 
 use std::time::Duration;
 
@@ -22,23 +26,31 @@ use super::{Area, Caller, Spec};
 use crate::admin::resilience as page;
 use crate::web::App;
 use meridian_domain::v1::{
-    ComponentReport, PartitionOwner, ReadResilienceProfileReply, ReadResilienceProfileRequest,
-    ReadResilienceReply, ReadResilienceRequest, ResilienceChange, ResilienceLine,
+    ComponentReport, PartitionOwner, PartitionSplit, ReadResilienceProfileReply,
+    ReadResilienceProfileRequest, ReadResilienceReply, ReadResilienceRequest, ResilienceChange,
+    ResilienceLine, SplitPartitionReply, SplitPartitionRequest,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// How long a split's one transaction is waited for.
+const CHANGING: Duration = Duration::from_secs(20);
+
+/// The act a split sends (step 3d; section 6.1): the range's writer's.
+pub const SPLIT_PARTITION: &str = "platform.lake.command.split-partition";
 
 const fn spec(
     name: &'static str,
     title: &'static str,
     description: &'static str,
+    reads: bool,
     input_schema: fn() -> Value,
 ) -> Spec {
     Spec {
         name,
         title,
         description,
-        reads: true,
+        reads,
         open_world: false,
         input_schema,
         area: Area::Resilience,
@@ -58,6 +70,7 @@ its value, nodes or zones to add, a standby) and its cost; a class or tier is me
 tests that configuration; and never blind per live data type (a second source, standby pods, age \
 and source shown). It changes nothing: a change it names is made by meridian upgrade-deployment \
 --set, or at Plugins and Data sources. Answers `unchanged`.",
+        true,
         nothing_schema,
     ),
     spec(
@@ -69,9 +82,48 @@ book with its writer and epoch, and a page of the history, newest first: each ta
 writer, integrity finding and switch of a default read's source (cursor: next_cursor from the \
 page before). The book's own takeovers and integrity findings are not in it yet. Answers \
 `unchanged`.",
+        true,
         history_schema,
     ),
+    spec(
+        "split_partition",
+        "Split a lake range",
+        "halve one of the lake's ranges at its midpoint (a dataset's ID for its full range, or \
+<dataset>/<lo>-<hi> for one split before, lowercase hex, hi inclusive), with a note saying why, \
+kept as the split's reason. One transaction of the range's writer: the range closes at its \
+sequence N with its rows kept, and its two halves open after it, numbering from N + 1 and \
+staying with its writer group. Nothing is copied and it cannot abort; writes to the range wait \
+for that one commit. Refused naming partition for the control partition, a book partition, a \
+range the lake has not open and a range of one hash value. Answers the split as recorded: the \
+parent, its children, N, who split it, why and when.",
+        false,
+        split_schema,
+    ),
 ];
+
+fn split_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "partition": {"type": "string", "minLength": 1, "description": "the range: a dataset's ID, or <dataset>/<lo>-<hi>"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept with the split's record as its reason"},
+        },
+        "required": ["partition", "note"],
+        "additionalProperties": false,
+    })
+}
+
+/// A split as the tool answers it.
+pub fn split_json(split: &PartitionSplit) -> Value {
+    json!({
+        "parent": split.parent,
+        "children": split.children,
+        "closing_sequence": split.closing_sequence,
+        "split_by": split.split_by,
+        "reason": split.reason,
+        "split_at_ns": stamp_said(split.split_at_ns),
+    })
+}
 
 fn nothing_schema() -> Value {
     json!({"type": "object", "properties": {}, "additionalProperties": false})
@@ -214,6 +266,39 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
                 Err(failed) => bus_refused(failed, ""),
             }
         }
+        "split_partition" => {
+            only(top, &["partition", "note"], "", &mut problems);
+            let request = SplitPartitionRequest {
+                partition: text(top, "partition", "", true, &mut problems),
+                reason: text(top, "note", "", true, &mut problems),
+            };
+            if request.reason.chars().count() > 2_000 {
+                problems.add("note", "at most 2,000 characters");
+            }
+            if !problems.is_empty() {
+                return problems.refusal();
+            }
+            let reply: Result<SplitPartitionReply, _> = ask(
+                app,
+                caller,
+                SPLIT_PARTITION,
+                "meridian.v1.SplitPartitionRequest",
+                request,
+                CHANGING,
+            )
+            .await;
+            match reply {
+                Ok(SplitPartitionReply { split: Some(split) }) => {
+                    json!({"outcome": "made", "data": {"split": split_json(&split)}})
+                }
+                Ok(_) => super::refused(
+                    "unavailable",
+                    "the lake answered no split: read the Resilience history before asking again",
+                    Vec::new(),
+                ),
+                Err(failed) => bus_refused(failed, ""),
+            }
+        }
         other => super::refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -224,7 +309,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
 pub const PARITY: &[(&str, &str)] = &[
     ("tab profile", "read_resilience_profile"),
     ("tab members", "read_resilience"),
-    ("tab partitions", "read_resilience"),
+    // The Partitions tab, where stage M's Split dialog sends the same act.
+    ("tab partitions", "read_resilience split_partition"),
     ("tab history", "read_resilience"),
     (page::PATH, "read_resilience_profile read_resilience"),
     // What `meridian status --profile` reads (contract v30).
@@ -267,8 +353,14 @@ mod tests {
             assert!(PARITY
                 .iter()
                 .any(|(_, by)| by.split(' ').any(|w| w == spec.name)));
-            assert!(spec.reads && spec.area == Area::Resilience, "{}", spec.name);
-            assert!(spec.name.starts_with("read_"));
+            assert_eq!(spec.area, Area::Resilience, "{}", spec.name);
+            // Each a read but the split, the one change (step 3d).
+            assert_eq!(spec.reads, spec.name.starts_with("read_"), "{}", spec.name);
+            assert!(
+                spec.reads || spec.name == "split_partition",
+                "{}",
+                spec.name
+            );
         }
         let open = |deployment_admin| {
             Area::Resilience.open_to(&meridian_access::Access {
