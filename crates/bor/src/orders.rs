@@ -337,6 +337,10 @@ pub enum Act {
     /// Its executions moved by a fact after the hand-off or closing (row b9):
     /// the state kept, heard so `operations` corrects it.
     BookingMoved { booking_id: String, reason: String },
+    /// Posted (step 3d; section 6.3, `booking-posted` ruled 2026-11-13):
+    /// every child its pending marker awaits, in another partition, is
+    /// journalled. The state kept.
+    BookingPosted { booking_id: String },
     /// An allocation of another account's booking received here, a child
     /// entry naming the booking (W11.30): its lines where `lines` says, and
     /// the block's member order in this account it fills, where one.
@@ -538,6 +542,18 @@ pub struct BookingHeld {
     /// The entry it was booked or last replaced in, whose sequence a later
     /// fact is compared with.
     pub booked_at: u64,
+    /// Step 3d (section 6.3): where the current version's clearing lines
+    /// are -- the entry, the first, how many -- which a cancel or a replace
+    /// reverses; none with one partition.
+    pub clearing: (String, usize, usize),
+    /// The children in other accounts the current version awaits (its
+    /// pending marker): the account, the allocation, the partition.
+    pub pending: Vec<(String, String, String)>,
+    /// Every child awaited is journalled (`booking-posted`), or none was.
+    pub posted: bool,
+    /// When the current version was committed: a pending one past its bound
+    /// raises the held-booking alert.
+    pub pending_since_ns: i64,
 }
 
 /// An allocation of another account's booking this account received, a
@@ -550,6 +566,8 @@ pub struct ReceivedHeld {
     pub member_order_id: String,
     pub lines: (String, usize, usize),
     pub withdrawn: bool,
+    /// Step 3d: where its clearing lines are, which a withdrawal reverses.
+    pub clearing: (String, usize, usize),
 }
 
 /// The order path's records in one account's book.
@@ -813,9 +831,8 @@ impl Ledger {
                 | Act::BookingClosed { booking_id }
                 | Act::BookingCancelled { booking_id, .. }
                 | Act::BookingReplaced { booking_id, .. }
-                | Act::BookingMoved { booking_id, .. } => {
-                    push_once(&mut touched.bookings, booking_id)
-                }
+                | Act::BookingMoved { booking_id, .. }
+                | Act::BookingPosted { booking_id } => push_once(&mut touched.bookings, booking_id),
                 // A child entry: the block's member order it fills.
                 Act::AllocationReceived {
                     member_order_id, ..
@@ -1267,6 +1284,10 @@ impl Ledger {
                         version: 1,
                         held_alert: String::new(),
                         booked_at: 0,
+                        clearing: Default::default(),
+                        pending: Vec::new(),
+                        posted: true,
+                        pending_since_ns: 0,
                     },
                 );
             }
@@ -1309,6 +1330,11 @@ impl Ledger {
                 }
             }
             Act::BookingMoved { .. } => {}
+            Act::BookingPosted { booking_id } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    held.posted = true;
+                }
+            }
             Act::AllocationReceived {
                 booking_id,
                 from_account,
@@ -1326,6 +1352,7 @@ impl Ledger {
                         member_order_id: member_order_id.clone(),
                         lines: (entry_id.to_string(), lines.0, lines.1),
                         withdrawn: false,
+                        clearing: Default::default(),
                     },
                 );
             }

@@ -64,6 +64,65 @@ pub const CLOSED: &str = "booking-closed";
 pub const CANCELLED: &str = "booking-cancelled";
 pub const CORRECTED: &str = "booking-corrected";
 pub const ALLOCATION_MOVED: &str = "allocation-moved";
+/// Step 3d (section 6.3; ruled 2026-11-13, W9.8's list): a booking whose
+/// children in other partitions are each journalled, posted.
+pub const POSTED: &str = "booking-posted";
+
+/// How long a booking may await its children in other partitions before the
+/// held-booking alert is raised (step 3d; ruled 2026-11-13, a constant).
+pub const PENDING_BOUND_NS: i64 = 5 * 60 * 1_000_000_000;
+
+/// The clearing lines against `lines` (step 3d; section 6.3): each negated,
+/// no lot named, so the entry and its partition's clearing account
+/// together move nothing.
+pub fn clearing_of(lines: &[MovementLine]) -> Vec<MovementLine> {
+    lines
+        .iter()
+        .map(|line| MovementLine {
+            instrument_id: line.instrument_id.clone(),
+            side: line.side,
+            bucket: line.bucket,
+            value_date: line.value_date.clone(),
+            quantity: line.quantity.as_ref().map(|quantity| {
+                Exact::from_wire(quantity)
+                    .map(|value| value.negated().to_wire())
+                    .unwrap_or(*quantity)
+            }),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// An entry's clearing lines in `range`, negated: what a cancel, a replace
+/// or a withdrawal reverses.
+fn clearing_reversed(book: &Book, range: &(String, usize, usize)) -> Result<Vec<MovementLine>> {
+    let (entry_id, start, count) = range;
+    if *count == 0 {
+        return Ok(Vec::new());
+    }
+    let body = book.body(entry_id)?;
+    Ok(clearing_of(
+        body.clearing.get(*start..start + count).unwrap_or_default(),
+    ))
+}
+
+/// A booking's pending marker (step 3d): each allocation to another account,
+/// with the partition it was in, where the book has more than one.
+fn pending_of(ctx: &Context, booking: &Booking) -> Vec<(String, String, String)> {
+    let Some(partitions) = ctx.clearing.as_ref() else {
+        return Vec::new();
+    };
+    allocations_elsewhere(booking)
+        .into_iter()
+        .map(|allocation| {
+            let partition = partitions
+                .get(&allocation.account_id)
+                .cloned()
+                .unwrap_or_default();
+            (allocation.account_id, allocation.allocation_id, partition)
+        })
+        .collect()
+}
 
 /// A block's member, read from its own account before the lock (W11.1).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -840,8 +899,11 @@ fn booking_lines(
     execution_ids: &[String],
     allocations: &[Allocation],
     earlier: &[MovementLine],
-) -> Result<Vec<MovementLine>> {
+) -> Result<(Vec<MovementLine>, Vec<MovementLine>)> {
     let mut lines: Vec<MovementLine> = Vec::new();
+    // The lines moving value to other accounts (step 3d): what the
+    // partition's clearing account takes against, with several partitions.
+    let mut outward: Vec<MovementLine> = Vec::new();
     let mut seen: Vec<MovementLine> = earlier.to_vec();
     let fills = fill_lots(book, execution_ids)?;
     let method = method_of(book);
@@ -955,13 +1017,18 @@ fn booking_lines(
                 seen.extend(moved.iter().cloned());
                 made.extend(moved);
             }
+            let mut out = made.clone();
+            if executed.settlement_date_unknown {
+                crate::order_decide::undated_pending(&mut out);
+            }
+            outward.extend(out);
         }
         lines.extend(made);
     }
     if executed.settlement_date_unknown {
         crate::order_decide::undated_pending(&mut lines);
     }
-    Ok(lines)
+    Ok((lines, outward))
 }
 
 /// The lines of an allocation received from another account's booking, in
@@ -1401,7 +1468,7 @@ pub fn book_order(
         allocations,
         ..Default::default()
     };
-    let lines = booking_lines(
+    let (lines, outward) = booking_lines(
         book,
         ctx,
         &executed,
@@ -1418,6 +1485,12 @@ pub fn book_order(
     let mut plan = Plan::new(BOOKED, ctx.actor(), acts);
     plan.lines = lines;
     plan.effective_date = executed.trade_date.clone();
+    // Step 3d (section 6.3): with several partitions, journalled pending,
+    // naming each child, its outward legs against the clearing account.
+    if ctx.clearing.is_some() {
+        plan.clearing = clearing_of(&outward);
+        plan.pending = pending_of(ctx, &booking);
+    }
     let made = finish(book, head, ctx, plan)?;
     if !request.hand_off {
         return Ok(made);
@@ -1434,6 +1507,8 @@ pub fn book_order(
         booking_id: booking_id.clone(),
     });
     plan.lines = made.entry.body.lines.clone();
+    plan.clearing = made.entry.body.clearing.clone();
+    plan.pending = made.entry.body.pending.clone();
     plan.effective_date = executed.trade_date.clone();
     finish(book, head, ctx, plan)
 }
@@ -1606,6 +1681,7 @@ pub fn correct_booking(
                 book,
                 negated(book, &entry_id, start, count)?,
             )?;
+            plan.clearing = clearing_reversed(book, &held.clearing)?;
             finish(book, head, ctx, plan)
         }
         Ok(BookingCorrectionKind::Replace) => {
@@ -1645,7 +1721,7 @@ pub fn correct_booking(
                 book,
                 negated(book, &entry_id, start, count)?,
             )?;
-            let lines = booking_lines(
+            let (lines, outward) = booking_lines(
                 book,
                 ctx,
                 &executed,
@@ -1675,6 +1751,13 @@ pub fn correct_booking(
             all.extend(lines);
             plan.lines = all;
             plan.effective_date = effective;
+            // Step 3d: the version before's clearing reversed, then the new
+            // version's, pending on its own children.
+            plan.clearing = clearing_reversed(book, &held.clearing)?;
+            if ctx.clearing.is_some() {
+                plan.clearing.extend(clearing_of(&outward));
+                plan.pending = pending_of(ctx, &replaced);
+            }
             finish(book, head, ctx, plan)
         }
         _ => Err(malformed(
@@ -1716,6 +1799,9 @@ pub struct ChildMove {
     pub factor_month_awaited: String,
     /// Contract v29 (W11.11): the fills' settlement date not yet known.
     pub settlement_date_unknown: bool,
+    /// Step 3d (section 6.3): the booking's pending marker names it, so its
+    /// child entry balances against its partition's clearing account.
+    pub cleared: bool,
 }
 
 /// Each allocation of a booking to another account, as its child entry
@@ -1734,6 +1820,10 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
         .unwrap_or_default();
     let mut out = Vec::new();
     for allocation in allocations_elsewhere(&held.booking) {
+        let cleared = held
+            .pending
+            .iter()
+            .any(|(_, allocation_id, _)| *allocation_id == allocation.allocation_id);
         // A net's members are of both sides: the member filled is the one
         // in the allocation's account on the booking's side.
         let member_order_id = members
@@ -1760,6 +1850,7 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
                 .unwrap_or_default(),
             factor_month_awaited: executed.factor_month_awaited.clone(),
             settlement_date_unknown: executed.settlement_date_unknown,
+            cleared,
         });
     }
     Ok(out)
@@ -1811,6 +1902,9 @@ pub fn receive_allocation(
         "allocation {} of booking {} in account {}",
         moved.allocation.allocation_id, moved.booking_id, moved.from_account
     ));
+    if moved.cleared {
+        plan.clearing = clearing_of(&lines);
+    }
     plan.lines = lines;
     plan.effective_date = moved.trade_date.clone();
     finish(book, head, ctx, plan).map(Some)
@@ -1847,6 +1941,74 @@ pub fn withdraw_allocation(
     ));
     plan.lines =
         crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count)?)?;
+    plan.clearing = clearing_reversed(book, &received.clearing)?;
+    finish(book, head, ctx, plan).map(Some)
+}
+
+/// A booking posted (step 3d; section 6.3): the book's own act in its
+/// account once every child its pending marker awaits is journalled. `None`
+/// where there is nothing to post: posted already, awaiting nothing, or
+/// cancelled.
+pub fn post_booking(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    booking_id: &str,
+) -> Result<Option<Made>> {
+    let Some(held) = book.ledger.bookings.get(booking_id) else {
+        return Ok(None);
+    };
+    if held.posted || held.pending.is_empty() || held.state == BookingState::Cancelled {
+        return Ok(None);
+    }
+    let plan = Plan::new(
+        POSTED,
+        ctx.actor(),
+        vec![Act::BookingPosted {
+            booking_id: booking_id.to_string(),
+        }],
+    )
+    .reason(&format!(
+        "booking {booking_id}'s {} allocations in other partitions are each journalled",
+        held.pending.len()
+    ));
+    finish(book, head, ctx, plan).map(Some)
+}
+
+/// The held-booking alert on a booking awaiting its children past its bound
+/// (step 3d; section 6.3, ruled 2026-11-13): held, its alert raised; nothing
+/// voided. `None` where it is not pending past the bound, or its alert
+/// stands.
+pub fn hold_pending(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    booking_id: &str,
+) -> Result<Option<Made>> {
+    let Some(held) = book.ledger.bookings.get(booking_id) else {
+        return Ok(None);
+    };
+    if held.posted
+        || held.pending.is_empty()
+        || held.state == BookingState::Cancelled
+        || !held.held_alert.is_empty()
+        || ctx.committed_at_ns - held.pending_since_ns < PENDING_BOUND_NS
+    {
+        return Ok(None);
+    }
+    let reason = format!(
+        "its allocations in other partitions are not all journalled {} minutes after it was booked",
+        PENDING_BOUND_NS / 60_000_000_000
+    );
+    let booking = book.ledger.booking_record(booking_id)?;
+    let acts = vec![
+        Act::BookingHeld {
+            booking_id: booking_id.to_string(),
+            reason: reason.clone(),
+        },
+        held_alert(ctx, book, &booking, &reason),
+    ];
+    let plan = Plan::new(HELD, ctx.actor(), acts).reason(&reason);
     finish(book, head, ctx, plan).map(Some)
 }
 

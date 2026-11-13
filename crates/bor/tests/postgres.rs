@@ -2557,6 +2557,207 @@ async fn capacity_book_hand_off() {
     }
 }
 
+/// The book across writer groups and partitions (step 3d, stage B; the
+/// brief's benches, figures private): `MERIDIAN_BENCH_PROPOSALS`
+/// proposals (100,000) at `MERIDIAN_BENCH_IN_FLIGHT` at once (64), through
+/// a real broker, at one group over one partition, two over two and two
+/// over four; then the light-load check, `MERIDIAN_BENCH_LIGHT` (2,000)
+/// asked one at a time, at each. The book's members serve its commands in
+/// one queue group as a deployment runs them, each handing what is not its
+/// group's to its owner; each account placed at its first act by its ID,
+/// the conductor's accounts read answered by a stand-in. It prints each
+/// run's rate and latency (p50, p90, p99, the most), and the hand-offs'
+/// count, mean and most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_book_partitions() {
+    use meridian_bor::order_service::*;
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    let broker = std::env::var("MERIDIAN_BENCH_BROKER_URL")
+        .expect("MERIDIAN_BENCH_BROKER_URL names the broker the bench asks through");
+    let from_env =
+        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let proposals: usize = from_env("MERIDIAN_BENCH_PROPOSALS", "100000")
+        .parse()
+        .unwrap();
+    let at_once: usize = from_env("MERIDIAN_BENCH_IN_FLIGHT", "64").parse().unwrap();
+    let light: usize = from_env("MERIDIAN_BENCH_LIGHT", "2000").parse().unwrap();
+    let shapes: Vec<(u32, u32)> = from_env("MERIDIAN_BENCH_SHAPES", "1x1,2x2,2x4")
+        .split(',')
+        .map(|shape| {
+            let (g, p) = shape.trim().split_once('x').unwrap();
+            (g.parse().unwrap(), p.parse().unwrap())
+        })
+        .collect();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    for (groups, partitions) in shapes {
+        let (url, migrated) = blocking(isolated);
+        blocking(|| migrated.make_partitions(partitions).unwrap());
+        let run = unique("PARTS");
+        let instance = format!("bor-bench-{run}");
+        let accounts: Vec<String> = (0..1000).map(|n| format!("ACC-{run}-{n}")).collect();
+        let mut held = vec![migrated];
+        let mut buses = Vec::new();
+        for group in 0..groups {
+            let store = blocking(|| {
+                Arc::new(
+                    PostgresStore::connect(&url, 8)
+                        .unwrap()
+                        .with_groups(Groups::new(group, groups).unwrap())
+                        .with_partitions(partitions),
+                )
+            });
+            let backend = Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap());
+            let bus = Arc::new(Bus::single(
+                instance.clone(),
+                backend,
+                Arc::new(meridian_clock::SystemClock),
+            ));
+            if groups > 1 {
+                bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+                let placing = Arc::clone(&store);
+                bus.route_writes_by(move |topic, envelope| {
+                    let account =
+                        meridian_bor::service::account_of_write(topic, &envelope.payload)?;
+                    placing.writer_group_of(&account)
+                });
+            }
+            let writer: Arc<dyn Store> = Arc::new(Writer::new(
+                Arc::clone(&store) as Arc<dyn Store>,
+                Arc::clone(&bus),
+            ));
+            meridian_bor::service::serve(bus.clone(), writer, bus.clock());
+            resolving_equities(&bus);
+            held.push(store);
+            buses.push(bus);
+        }
+        let client = Arc::new(Bus::single(
+            format!("operations-bench-{run}"),
+            Arc::new(meridian_bus::NatsBackend::connect(&broker).await.unwrap()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        // The conductor's accounts read, as the book asks it at an account's
+        // first act: every bench account, no owner label, placed by its ID.
+        let listed = Accounts {
+            accounts: accounts
+                .iter()
+                .map(|account| AccountRecord {
+                    account_id: account.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+        .encode_to_vec();
+        client.serve("platform.config.query.accounts", move |_| {
+            Ok(("meridian.v1.Accounts".into(), listed.clone()))
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for account in &accounts {
+            send_order(
+                &client,
+                SET_ACCOUNT_ATTRIBUTE,
+                &SetAccountAttributeRequest {
+                    account_id: account.clone(),
+                    attribute: Some(
+                        set_account_attribute_request::Attribute::WaitsForCompliance(false),
+                    ),
+                    reason: "the bench proposes without a compliance plugin".into(),
+                },
+                Some(PERSON),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for (label, count, in_flight) in [("load", proposals, at_once), ("light", light, 1)] {
+            let (count_before, total_before, _) = meridian_bus::owners::handed_on();
+            let next = Arc::new(AtomicU64::new(0));
+            let started = std::time::Instant::now();
+            let mut workers = Vec::new();
+            for _ in 0..in_flight {
+                let (client, accounts, next, run) = (
+                    Arc::clone(&client),
+                    accounts.clone(),
+                    Arc::clone(&next),
+                    run.clone(),
+                );
+                workers.push(tokio::spawn(async move {
+                    let mut took = Vec::new();
+                    loop {
+                        let n = next.fetch_add(1, Ordering::Relaxed) as usize;
+                        if n >= count {
+                            return took;
+                        }
+                        let proposal = ProposeOrderRequest {
+                            account_id: accounts[n % accounts.len()].clone(),
+                            instrument_id: "INS-AAPL".into(),
+                            sleeve: "core".into(),
+                            side: Side::Buy as i32,
+                            quantity: d("10"),
+                            order_type: OrderType::Limit as i32,
+                            limit_price: usd("227.50"),
+                            time_in_force: TimeInForce::Day as i32,
+                            idempotency_key: format!("{run}-{label}-{n}"),
+                            ..Default::default()
+                        };
+                        let began = std::time::Instant::now();
+                        send_order(&client, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                            .await
+                            .unwrap_or_else(|refused| panic!("proposal {n} refused: {refused}"));
+                        took.push(began.elapsed());
+                    }
+                }));
+            }
+            let mut took = Vec::new();
+            for worker in workers {
+                took.extend(worker.await.unwrap());
+            }
+            let elapsed = started.elapsed();
+            took.sort();
+            let at = |q: f64| took[((took.len() as f64 * q) as usize).min(took.len() - 1)];
+            let (count_after, total_after, most) = meridian_bus::owners::handed_on();
+            let handed = count_after - count_before;
+            let mean_ms = if handed > 0 {
+                (total_after - total_before).as_secs_f64() * 1e3 / handed as f64
+            } else {
+                0.0
+            };
+            println!(
+                "CAPACITY book partitions groups={groups} partitions={partitions} run={label} \
+                 proposals={count} in_flight={in_flight} rate_per_s={:.0} p50_ms={:.2} \
+                 p90_ms={:.2} p99_ms={:.2} most_ms={:.2} handed={handed} \
+                 handed_mean_ms={mean_ms:.2} handed_most_ms={:.2}",
+                count as f64 / elapsed.as_secs_f64(),
+                at(0.50).as_secs_f64() * 1e3,
+                at(0.90).as_secs_f64() * 1e3,
+                at(0.99).as_secs_f64() * 1e3,
+                took.last().unwrap().as_secs_f64() * 1e3,
+                most.as_secs_f64() * 1e3,
+            );
+        }
+        // Where the accounts landed, a count a partition.
+        let spread: Vec<(String, i64)> = blocking(|| {
+            postgres::Client::connect(&url, postgres::NoTls)
+                .unwrap()
+                .query(
+                    "SELECT partition, count(*) FROM book_account WHERE account_id NOT LIKE '~%' \
+                     GROUP BY partition ORDER BY partition",
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect()
+        });
+        println!(
+            "CAPACITY book partitions groups={groups} partitions={partitions} spread={spread:?}"
+        );
+        drop(buses);
+        blocking(move || drop(held));
+    }
+}
+
 /// Step 3d (section 6.3, option (c)): the book's takeovers and findings
 /// become `~control` entries carrying their records, the ones kept before
 /// backfilled, each record its own time and each entry the backfill's; a

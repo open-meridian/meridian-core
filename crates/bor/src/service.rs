@@ -315,6 +315,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         factor_taken: None,
         factor_row: Default::default(),
         factors_unavailable: false,
+        clearing: None,
     }
 }
 

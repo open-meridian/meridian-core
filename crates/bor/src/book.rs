@@ -1111,11 +1111,41 @@ impl Book {
                 crate::orders::Act::BookingOpened { booking, .. } => {
                     if let Some(held) = self.ledger.bookings.get_mut(&booking.booking_id) {
                         held.booked_at = entry.first_sequence;
+                        // Step 3d (section 6.3): its clearing lines, and the
+                        // children it awaits in other partitions.
+                        held.clearing = (entry.entry_id.clone(), 0, entry.body.clearing.len());
+                        held.pending = entry.body.pending.clone();
+                        held.posted = entry.body.pending.is_empty();
+                        held.pending_since_ns = entry.cause.committed_at_ns;
                     }
                 }
                 crate::orders::Act::BookingReplaced { booking_id, .. } => {
                     if let Some(held) = self.ledger.bookings.get_mut(booking_id) {
                         held.booked_at = entry.first_sequence;
+                        // The version before's clearing lines reversed
+                        // first, then the new version's.
+                        let reversed = held.clearing.2.min(entry.body.clearing.len());
+                        held.clearing = (
+                            entry.entry_id.clone(),
+                            reversed,
+                            entry.body.clearing.len() - reversed,
+                        );
+                        held.pending = entry.body.pending.clone();
+                        held.posted = entry.body.pending.is_empty();
+                        held.pending_since_ns = entry.cause.committed_at_ns;
+                    }
+                }
+                crate::orders::Act::AllocationReceived {
+                    booking_id,
+                    allocation,
+                    ..
+                } => {
+                    if let Some(held) = self
+                        .ledger
+                        .received
+                        .get_mut(&(booking_id.clone(), allocation.allocation_id.clone()))
+                    {
+                        held.clearing = (entry.entry_id.clone(), 0, entry.body.clearing.len());
                     }
                 }
                 // Whose own order it is, and when it opened: the instance

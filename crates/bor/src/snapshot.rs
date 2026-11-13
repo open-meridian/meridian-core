@@ -281,6 +281,20 @@ struct BookingShape {
     version: u32,
     held_alert: String,
     booked_at: u64,
+    /// Step 3d (section 6.3): absent from a snapshot made before.
+    #[serde(default)]
+    clearing: (String, usize, usize),
+    #[serde(default)]
+    pending: Vec<(String, String, String)>,
+    #[serde(default = "posted_before")]
+    posted: bool,
+    #[serde(default)]
+    pending_since_ns: i64,
+}
+
+/// A booking in a snapshot made before step 3d awaited nothing.
+fn posted_before() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,6 +305,9 @@ struct ReceivedShape {
     member_order_id: String,
     lines: (String, usize, usize),
     withdrawn: bool,
+    /// Step 3d: absent from a snapshot made before.
+    #[serde(default)]
+    clearing: (String, usize, usize),
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────────
@@ -579,6 +596,10 @@ fn booking_shape(held: &BookingHeld) -> BookingShape {
         version,
         held_alert,
         booked_at,
+        clearing,
+        pending,
+        posted,
+        pending_since_ns,
     } = held;
     BookingShape {
         booking: pb(booking),
@@ -588,6 +609,10 @@ fn booking_shape(held: &BookingHeld) -> BookingShape {
         version: *version,
         held_alert: held_alert.clone(),
         booked_at: *booked_at,
+        clearing: clearing.clone(),
+        pending: pending.clone(),
+        posted: *posted,
+        pending_since_ns: *pending_since_ns,
     }
 }
 
@@ -599,6 +624,7 @@ fn received_shape(held: &ReceivedHeld) -> ReceivedShape {
         member_order_id,
         lines,
         withdrawn,
+        clearing,
     } = held;
     ReceivedShape {
         booking_id: booking_id.clone(),
@@ -607,6 +633,7 @@ fn received_shape(held: &ReceivedHeld) -> ReceivedShape {
         member_order_id: member_order_id.clone(),
         lines: lines.clone(),
         withdrawn: *withdrawn,
+        clearing: clearing.clone(),
     }
 }
 
@@ -822,6 +849,10 @@ fn booking_from(shape: BookingShape) -> Result<BookingHeld> {
         version: shape.version,
         held_alert: shape.held_alert,
         booked_at: shape.booked_at,
+        clearing: shape.clearing,
+        pending: shape.pending,
+        posted: shape.posted,
+        pending_since_ns: shape.pending_since_ns,
     })
 }
 
@@ -833,6 +864,7 @@ fn received_from(shape: ReceivedShape) -> Result<ReceivedHeld> {
         member_order_id: shape.member_order_id,
         lines: shape.lines,
         withdrawn: shape.withdrawn,
+        clearing: shape.clearing,
     })
 }
 

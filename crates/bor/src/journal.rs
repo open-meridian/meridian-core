@@ -102,6 +102,21 @@ pub struct Body {
     /// `meridian.v1.PartitionOwner` -- and its protobuf, in the shape the
     /// book's `AccountMoved` is kept in. None on every other entry.
     pub record: Option<(String, Vec<u8>)>,
+    /// The lines the entry's partition's own clearing account,
+    /// `~clearing/<partition>`, takes against this entry's (step 3d; section
+    /// 6.3, ruled 2026-11-13): with more than one partition, a booking's leg
+    /// moving value to or from another account balances in its own entry, so
+    /// every partition balances at every sequence. Signed as the account's
+    /// lines are, no lot named. Empty with one partition, and on every entry
+    /// not a booking's leg.
+    pub clearing: Vec<MovementLine>,
+    /// A booking's pending marker (step 3d; section 6.3): on its
+    /// `booking-booked` (or a replace's) entry, each child it awaits in
+    /// another account -- the account, the allocation and the partition the
+    /// account was in when booked, empty where it was not placed yet. The
+    /// booking posts (`booking-posted`) once each is journalled. Empty with
+    /// one partition.
+    pub pending: Vec<(String, String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -147,6 +162,12 @@ struct Kept {
     /// A `~control` entry's record, its kind and its protobuf (step 3d).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record: Option<(String, String)>,
+    /// A booking leg's clearing lines and a booking's pending children
+    /// (step 3d).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clearing: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<(String, String, String)>,
 }
 
 fn encoded<M: Message>(message: &M) -> String {
@@ -201,6 +222,8 @@ impl Body {
                 .record
                 .as_ref()
                 .map(|(kind, body)| (kind.clone(), STANDARD.encode(body))),
+            clearing: self.clearing.iter().map(encoded).collect(),
+            pending: self.pending.clone(),
         };
         serde_json::to_vec(&kept).expect("an entry's body is plain data")
     }
@@ -244,6 +267,8 @@ impl Body {
                         })
                 })
                 .transpose()?,
+            clearing: all(&kept.clearing)?,
+            pending: kept.pending,
         })
     }
 

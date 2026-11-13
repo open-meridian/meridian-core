@@ -272,8 +272,103 @@ pub fn local_record_orders_setting(bus: &Bus, store: &dyn Store) -> LocalRecordO
 
 const NOTHING_OWED: &str = "the child entry was made already";
 
+/// With more than one partition, the partition each account a booking
+/// allocates to is in, read before the lock (step 3d; section 6.3); `None`
+/// with one, and the booking is as it always was.
+pub fn clearing_partitions(
+    store: &dyn Store,
+    accounts: impl IntoIterator<Item = String>,
+) -> Option<BTreeMap<String, String>> {
+    if store.partition_count() < 2 {
+        return None;
+    }
+    Some(
+        accounts
+            .into_iter()
+            .map(|account| {
+                let partition = store.partition_of(&account).unwrap_or_default();
+                (account, partition)
+            })
+            .collect(),
+    )
+}
+
+/// The idempotency key of a booking's post (step 3d; ruled 2026-11-13):
+/// `booking-post:<booking_id>`, a replaced version's with its number.
+pub fn post_key(booking_id: &str, version: u32) -> String {
+    if version <= 1 {
+        format!("booking-post:{booking_id}")
+    } else {
+        format!("booking-post:{booking_id}/{version}")
+    }
+}
+
+/// A booking posted in `account`, the book's own act, where its pending
+/// marker's children are each journalled. Says whether it posted now.
+pub fn post_owed(
+    bus: &Bus,
+    store: &dyn Store,
+    account: &str,
+    booking_id: &str,
+    version: u32,
+) -> usize {
+    let ctx = own_context(bus);
+    let key = post_key(booking_id, version);
+    let acted =
+        store.act(
+            account,
+            "",
+            &key,
+            key.as_bytes(),
+            &mut |book, head| match booking::post_booking(book, head, &ctx, booking_id)? {
+                Some(made) => Ok(crate::service::decided(made, Vec::new())),
+                None => Err(StoreError::Invalid(NOTHING_OWED.into())),
+            },
+        );
+    said(bus, acted, None, None)
+}
+
+/// A booking awaiting its children past its bound held in `account`, its
+/// alert raised (step 3d; ruled 2026-11-13). Says whether it held it now.
+pub fn hold_owed(
+    bus: &Bus,
+    store: &dyn Store,
+    account: &str,
+    booking_id: &str,
+    version: u32,
+) -> usize {
+    let ctx = own_context(bus);
+    let key = format!("booking-pending-held:{booking_id}/{version}");
+    let acted =
+        store.act(
+            account,
+            "",
+            &key,
+            key.as_bytes(),
+            &mut |book, head| match booking::hold_pending(book, head, &ctx, booking_id)? {
+                Some(made) => Ok(crate::service::decided(made, Vec::new())),
+                None => Err(StoreError::Invalid(NOTHING_OWED.into())),
+            },
+        );
+    said(bus, acted, None, None)
+}
+
+/// The book's own acts' context: its instance, now.
+fn own_context(bus: &Bus) -> Context {
+    let now = bus.clock().now_ns();
+    Context {
+        instance_id: bus.instance_id().to_string(),
+        event_time_ns: now,
+        received_at_ns: now,
+        committed_at_ns: now,
+        ..Default::default()
+    }
+}
+
 /// The child entries a booking owes, each in its account's own partition,
 /// idempotent by its key: what a booking's commit and the sweep both make.
+/// Then each booking whose children all landed is posted (step 3d). Says how
+/// many entries it made.
 pub fn make_children(
     bus: &Bus,
     store: &dyn Store,
@@ -282,6 +377,20 @@ pub fn make_children(
     correlation: Option<&str>,
     causation: Option<&str>,
 ) -> usize {
+    make_children_landed(bus, store, moves, withdrawals, correlation, causation).0
+}
+
+/// [`make_children`], with the (booking, allocation) of each child that is
+/// journalled, now or before.
+pub fn make_children_landed(
+    bus: &Bus,
+    store: &dyn Store,
+    moves: &[ChildMove],
+    withdrawals: &[(String, String, String)],
+    correlation: Option<&str>,
+    causation: Option<&str>,
+) -> (usize, BTreeSet<(String, String)>) {
+    let mut landed = BTreeSet::new();
     let mut made = 0;
     let now = bus.clock().now_ns();
     let ctx = Context {
@@ -316,9 +425,47 @@ pub fn make_children(
                 None => Err(StoreError::Invalid(NOTHING_OWED.into())),
             },
         );
+        let journalled = match &acted {
+            Ok(_) => true,
+            Err(StoreError::Invalid(said)) => said == NOTHING_OWED,
+            Err(_) => false,
+        };
+        if journalled {
+            landed.insert((
+                moved.booking_id.clone(),
+                moved.allocation.allocation_id.clone(),
+            ));
+        }
         made += said(bus, acted, correlation, causation);
     }
-    made
+    // Step 3d (section 6.3): each cleared booking whose every child here
+    // landed posts; one whose did not waits for the sweep.
+    let mut bookings: BTreeMap<(String, String), bool> = BTreeMap::new();
+    for moved in moves.iter().filter(|moved| moved.cleared) {
+        let all = bookings
+            .entry((moved.from_account.clone(), moved.booking_id.clone()))
+            .or_insert(true);
+        *all &= landed.contains(&(
+            moved.booking_id.clone(),
+            moved.allocation.allocation_id.clone(),
+        ));
+    }
+    for ((account, booking_id), all) in bookings {
+        if all {
+            let version = store
+                .book(&account)
+                .ok()
+                .and_then(|book| {
+                    book.ledger
+                        .bookings
+                        .get(&booking_id)
+                        .map(|held| held.version)
+                })
+                .unwrap_or(1);
+            made += post_owed(bus, store, &account, &booking_id, version);
+        }
+    }
+    (made, landed)
 }
 
 fn said(
@@ -399,11 +546,27 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
     let mut carried_by: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut receiving: Vec<(String, String, String, String)> = Vec::new();
     let mut nets: Vec<(String, String, Vec<String>)> = Vec::new();
+    // Step 3d (section 6.3): each booking awaiting its children in other
+    // partitions -- its account, ID, version, the allocations it awaits and
+    // since when -- resumed from the legs that survive.
+    let mut awaiting: Vec<(String, String, u32, Vec<String>, i64)> = Vec::new();
     for account in &accounts {
         let book = store.book(account).map_err(|failed| failed.to_string())?;
         for (id, held) in &book.ledger.bookings {
             if held.state == meridian_domain::v1::BookingState::Cancelled {
                 continue;
+            }
+            if !held.posted && !held.pending.is_empty() {
+                awaiting.push((
+                    account.clone(),
+                    id.clone(),
+                    held.version,
+                    held.pending
+                        .iter()
+                        .map(|(_, allocation_id, _)| allocation_id.clone())
+                        .collect(),
+                    held.pending_since_ns,
+                ));
             }
             for allocation in &held.booking.allocations {
                 carried_by.insert((
@@ -462,9 +625,29 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
         })
         .map(|(account, booking_id, allocation_id, _)| (account, booking_id, allocation_id))
         .collect();
-    let mut made = make_children(bus, store, &moves, &withdrawals, None, None);
+    let (mut made, landed) = make_children_landed(bus, store, &moves, &withdrawals, None, None);
     for (account, net, members) in &nets {
         made += link_net_members(bus, store, account, net, members);
+    }
+    // Each booking awaiting its children: posted where every one is
+    // journalled, a crash between its last child and its post put right;
+    // held, its alert raised, where one is not past the bound. Nothing is
+    // voided.
+    let received: BTreeSet<(String, String)> = received_by
+        .iter()
+        .map(|(_, booking_id, allocation_id)| (booking_id.clone(), allocation_id.clone()))
+        .chain(landed)
+        .collect();
+    let now = bus.clock().now_ns();
+    for (account, booking_id, version, allocations, since) in awaiting {
+        let complete = allocations
+            .iter()
+            .all(|allocation_id| received.contains(&(booking_id.clone(), allocation_id.clone())));
+        let posted = complete && post_owed(bus, store, &account, &booking_id, version) > 0;
+        made += usize::from(posted);
+        if !posted && now - since >= booking::PENDING_BOUND_NS {
+            made += hold_owed(bus, store, &account, &booking_id, version);
+        }
     }
     Ok(made)
 }
@@ -680,6 +863,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let account = owner(store.as_ref(), Record::Order, &request.order_id, "order_id")?;
             ctx.account_marks =
                 account_marks(store.as_ref(), allocation_accounts(&request.allocations));
+            ctx.clearing =
+                clearing_partitions(store.as_ref(), allocation_accounts(&request.allocations));
             let members = block_members(store.as_ref(), &account, &request.order_id);
             ctx.members = member_views(store.as_ref(), &members);
             order_records(&bus2, store.as_ref(), &account, &request.order_id, &mut ctx);
@@ -779,6 +964,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             )?;
             ctx.account_marks =
                 account_marks(store.as_ref(), allocation_accounts(&request.allocations));
+            ctx.clearing =
+                clearing_partitions(store.as_ref(), allocation_accounts(&request.allocations));
             // A block's members, read from their own accounts, as its booking
             // read them: a replace allocates to the same instructed accounts.
             let order_id = booking_order(store.as_ref(), &account, &request.booking_id);

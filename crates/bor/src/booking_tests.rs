@@ -1431,3 +1431,317 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
         );
     }
 }
+
+// ── Step 3d: bookings across partitions through `~clearing` ─────────────────
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The booking legs' lines and clearing lines netted per instrument, each
+/// partition's at every sequence, which every one must hold at zero; and
+/// every clearing line's across the deployment.
+fn legs_balance(w: &Wired) -> BTreeMap<String, Exact> {
+    use crate::booking::{ALLOCATION_MOVED, BOOKED, CANCELLED, CORRECTED, HELD, POSTED};
+    let legs = [BOOKED, CORRECTED, CANCELLED, ALLOCATION_MOVED, POSTED, HELD];
+    let mut by_partition: BTreeMap<String, Vec<crate::journal::Entry>> = BTreeMap::new();
+    for account in w.store.accounts().unwrap() {
+        for entry in w.store.journal(&account).unwrap() {
+            by_partition
+                .entry(entry.partition.clone())
+                .or_default()
+                .push(entry);
+        }
+    }
+    let add = |sums: &mut BTreeMap<String, Exact>, line: &MovementLine| {
+        let held = sums.entry(line.instrument_id.clone()).or_default();
+        *held = crate::numbers::add(
+            "sum",
+            *held,
+            Exact::from_wire(line.quantity.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+    };
+    let mut cleared = BTreeMap::new();
+    for (partition, mut entries) in by_partition {
+        entries.sort_by_key(|entry| entry.first_sequence);
+        let mut sums: BTreeMap<String, Exact> = BTreeMap::new();
+        for entry in entries
+            .iter()
+            .filter(|entry| legs.contains(&entry.meta.kind.as_str()))
+        {
+            for line in entry.body.lines.iter().chain(&entry.body.clearing) {
+                add(&mut sums, line);
+            }
+            for line in &entry.body.clearing {
+                add(&mut cleared, line);
+            }
+            for (instrument, sum) in &sums {
+                assert!(
+                    sum.is_zero(),
+                    "partition {partition} does not balance in {instrument} at sequence {} ({}): {sum}",
+                    entry.last_sequence,
+                    entry.meta.kind
+                );
+            }
+        }
+    }
+    cleared
+}
+
+/// Step 3d (section 6.3; section 15's property test; the names and the bound
+/// ruled 2026-11-13): bookings allocating at random across three partitions,
+/// the writer stopped at random between their legs -- before a child, before
+/// a post -- and resumed by the sweep, as a writer that takes over resumes
+/// each pending booking from the legs that survive. Every partition balances
+/// at every sequence through its `~clearing/<partition>` account; a booking
+/// pending past its bound is held, its alert raised, nothing voided; the
+/// clearing accounts net to zero once every booking is complete; and every
+/// account's book replays identically, from a snapshot at any entry too.
+#[tokio::test(flavor = "multi_thread")]
+async fn bookings_across_partitions_balance_at_every_sequence_and_clearing_nets_to_zero() {
+    use rand::{Rng, SeedableRng};
+    let seed: u64 = std::env::var("MERIDIAN_PROPERTY_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+        .unwrap_or(0x3d_c1ea);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let w = wired_with(MemoryStore::new().with_partitions(3));
+    let others: Vec<String> = (2..=7).map(|n| format!("ACC-{n}")).collect();
+    account(&w, ACC).await;
+    for other in &others {
+        account(&w, other).await;
+    }
+    let partitions: BTreeSet<String> = std::iter::once(ACC.to_string())
+        .chain(others.iter().cloned())
+        .map(|account| w.store.partition_of(&account).unwrap())
+        .collect();
+    assert!(
+        partitions.len() > 1,
+        "seed {seed}: the accounts span partitions"
+    );
+
+    let mut bookings = Vec::new();
+    let mut held_any = false;
+    for round in 0..16 {
+        let (order, executions) = filled_in(&w, ACC, "10", &["10"]).await;
+        // An allocation to the order's account and up to three others, the
+        // ten shares split at random.
+        let mut chosen: Vec<String> = Vec::new();
+        for _ in 0..rng.gen_range(1..=3) {
+            let pick = others[rng.gen_range(0..others.len())].clone();
+            if !chosen.contains(&pick) {
+                chosen.push(pick);
+            }
+        }
+        let mut left = 10u32;
+        let mut split = Vec::new();
+        for (index, account) in chosen.iter().enumerate() {
+            let most = left - (chosen.len() - index) as u32;
+            let take = rng.gen_range(1..=most.max(1)).min(most);
+            split.push((account.clone(), take));
+            left -= take;
+        }
+        split.push((ACC.to_string(), left));
+        let mut instruction = AllocationInstruction::default();
+        for (held, quantity) in &split {
+            instruction.lines.push(AllocationLine {
+                account_id: held.clone(),
+                quantity: d(&quantity.to_string()),
+                ..Default::default()
+            });
+        }
+        order_command(
+            &w,
+            SET_ALLOCATION_INSTRUCTION,
+            "meridian.v1.SetAllocationInstructionRequest",
+            &SetAllocationInstructionRequest {
+                order_id: order.order_id.clone(),
+                allocation_instruction: Some(instruction),
+                reason: "the client's split".into(),
+            },
+            &anywhere(PM),
+        )
+        .await
+        .unwrap();
+        let allocations: Vec<Allocation> = split
+            .iter()
+            .filter(|(_, quantity)| *quantity > 0)
+            .map(|(held, quantity)| {
+                let cents = u64::from(*quantity) * 22_741;
+                let gross = format!("{}.{:02}", cents / 100, cents % 100);
+                allocation(held, &quantity.to_string(), &gross)
+            })
+            .collect();
+
+        // The writer stops at random: before each child, before the post.
+        let stopped: BTreeSet<String> = chosen
+            .iter()
+            .filter(|_| rng.gen_bool(0.5))
+            .cloned()
+            .collect();
+        let stop_post = rng.gen_bool(0.3);
+        w.store.crash_when(Some(Box::new(move |account, key| {
+            (key.starts_with("allocation-in:") && stopped.contains(account))
+                || (stop_post && key.starts_with("booking-post:"))
+        })));
+        let booking = book(&w, &order.order_id, &executions, allocations, false)
+            .await
+            .unwrap();
+        legs_balance(&w);
+        let parent = w.store.journal(ACC).unwrap();
+        let booked = parent
+            .iter()
+            .rev()
+            .find(|entry| entry.meta.kind == crate::booking::BOOKED)
+            .unwrap();
+        assert_eq!(
+            booked.body.pending.len(),
+            chosen.len(),
+            "round {round}: pending, naming each child"
+        );
+        for (account, _, partition) in &booked.body.pending {
+            assert_eq!(Some(partition), w.store.partition_of(account).as_ref());
+        }
+
+        // Sometimes the writer stays away past the bound: the sweep holds
+        // the booking and raises its alert, voiding nothing.
+        let held_now = w
+            .store
+            .book(ACC)
+            .unwrap()
+            .ledger
+            .bookings
+            .get(&booking.booking_id)
+            .is_some_and(|held| !held.posted);
+        if held_now && rng.gen_bool(0.5) {
+            w.clock.advance(crate::booking::PENDING_BOUND_NS + 1);
+            sweep_children(&w.bus, w.store.as_ref()).unwrap();
+            let alerts = alerts_in(&w, ACC);
+            assert!(
+                alerts
+                    .iter()
+                    .any(|alert| alert.kind == AlertKind::BookingHeld as i32
+                        && alert
+                            .subject
+                            .as_ref()
+                            .is_some_and(|subject| subject.booking_id == booking.booking_id)),
+                "round {round}: pending past its bound, held"
+            );
+            held_any = true;
+            legs_balance(&w);
+        }
+
+        // A writer takes over: resumed from the legs that survive.
+        w.store.crash_when(None);
+        sweep_children(&w.bus, w.store.as_ref()).unwrap();
+        let held = w.store.book(ACC).unwrap().ledger.bookings[&booking.booking_id].clone();
+        assert!(
+            held.posted,
+            "round {round}: posted once every child is journalled"
+        );
+        assert_eq!(
+            w.store
+                .journal(ACC)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.meta.kind == crate::booking::POSTED
+                    && entry.body.acts.iter().any(|act| matches!(act,
+                        crate::orders::Act::BookingPosted { booking_id } if *booking_id == booking.booking_id)))
+                .count(),
+            usize::from(!chosen.is_empty()),
+            "round {round}: posted once"
+        );
+        legs_balance(&w);
+        bookings.push(booking);
+    }
+    assert!(
+        held_any,
+        "seed {seed}: some booking was held past its bound"
+    );
+
+    // Some cancelled: their children withdrawn, the clearing reversed.
+    for booking in bookings.iter().filter(|_| rng.gen_bool(0.3)) {
+        correct(
+            &w,
+            &CorrectBookingRequest {
+                booking_id: booking.booking_id.clone(),
+                kind: BookingCorrectionKind::Cancel as i32,
+                reason: "booked in error".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sweep_children(&w.bus, w.store.as_ref()).unwrap();
+        legs_balance(&w);
+    }
+
+    // Complete: the clearing accounts net to zero across the deployment.
+    for (instrument, net) in legs_balance(&w) {
+        assert!(
+            net.is_zero(),
+            "seed {seed}: ~clearing nets {net} in {instrument}"
+        );
+    }
+    // Replay identical, from a snapshot at any entry too.
+    for account in w.store.accounts().unwrap() {
+        let journal = w.store.journal(&account).unwrap();
+        let partition = journal[0].partition.clone();
+        let replayed = crate::Book::replay(&account, &partition, &journal).unwrap();
+        let mut held = w.store.book(&account).unwrap();
+        held.release_bodies();
+        let mut again = replayed.clone();
+        again.release_bodies();
+        assert_eq!(again, held, "{account}: replay identical");
+        crate::snapshot::tests::holds_at_every_split(&account, &partition, &journal);
+    }
+}
+
+/// With one partition, the default, a booking is as it always was: no
+/// clearing line, no pending marker, no post.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_one_partition_a_booking_is_unchanged() {
+    let w = wired();
+    account(&w, ACC).await;
+    account(&w, OTHER).await;
+    let (order, executions) = filled_in(&w, ACC, "10", &["10"]).await;
+    let mut instruction = AllocationInstruction::default();
+    for (held, quantity) in [(ACC, "6"), (OTHER, "4")] {
+        instruction.lines.push(AllocationLine {
+            account_id: held.into(),
+            quantity: d(quantity),
+            ..Default::default()
+        });
+    }
+    order_command(
+        &w,
+        SET_ALLOCATION_INSTRUCTION,
+        "meridian.v1.SetAllocationInstructionRequest",
+        &SetAllocationInstructionRequest {
+            order_id: order.order_id.clone(),
+            allocation_instruction: Some(instruction),
+            reason: "the client's split".into(),
+        },
+        &anywhere(PM),
+    )
+    .await
+    .unwrap();
+    book(
+        &w,
+        &order.order_id,
+        &executions,
+        vec![
+            allocation(ACC, "6", "1364.46"),
+            allocation(OTHER, "4", "909.64"),
+        ],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&aapl_in(&w, OTHER).unwrap().trade_date_quantity), "4");
+    for account in [ACC, OTHER] {
+        for entry in w.store.journal(account).unwrap() {
+            assert!(entry.body.clearing.is_empty() && entry.body.pending.is_empty());
+            assert_ne!(entry.meta.kind, crate::booking::POSTED);
+        }
+    }
+}
