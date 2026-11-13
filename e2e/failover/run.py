@@ -3637,7 +3637,7 @@ def verdict(s):
 
 # The internal topics a write is handed to its owning group on (the
 # resilience spec's section 6.7).
-HANDED_ON = ("platform.lake.internal.record", "platform.book.internal.command")
+WRITES_HANDED_ON = ("platform.lake.internal.record", "platform.book.internal.command")
 
 
 def handed_on_counts():
@@ -3652,7 +3652,7 @@ def handed_on_counts():
             continue
         for connection in json.loads(text).get("connections", []):
             for sub in connection.get("subscriptions_list_detail", []) or []:
-                if sub.get("subject") in HANDED_ON:
+                if sub.get("subject") in WRITES_HANDED_ON:
                     key = (sub["subject"], sub.get("qgroup", ""))
                     counts[key] = counts.get(key, 0) + int(sub.get("msgs", 0))
     return counts
@@ -3718,7 +3718,7 @@ def writer_groups(s):
             f"writer groups: the driver's orders committed in P0 by the book's group 1 since ({acted} entries)")
     # Handed on: each internal topic's messages to its group-1 queue group.
     counts = handed_on_counts()
-    for topic in HANDED_ON:
+    for topic in WRITES_HANDED_ON:
         to_one = sum(n for (subject, group), n in counts.items() if subject == topic and group.endswith(".group-1"))
         s.check(to_one > 0, f"writer groups: writes handed to group 1 on {topic} ({to_one} as the broker counts)")
     s.note(f"writer groups: the hand-offs by topic and queue group: {counts}")
@@ -3794,16 +3794,20 @@ def main():
     if DRIVEN:
         try:
             driver_rpo_held(s, "the whole run", lake_may_lose=PROFILE == "ha")
+        except SystemExit as stopped:
+            s.check(False, f"the write driver's record could not be read: {stopped}")
+        # Two writer groups (step 3d, stage G), last of the tolerant run's
+        # with every class run, the driver still writing: its stores' groups
+        # then stay as this leaves them.
+        if PROFILE == "tolerant" and not asked:
+            try:
+                writer_groups(s)
+            except SystemExit as stopped:
+                s.check(False, f"writer groups: {stopped}")
+        try:
             driver_history(s)
         except SystemExit as stopped:
             s.check(False, f"the write driver's record could not be read: {stopped}")
-    # Two writer groups (step 3d, stage G), last of the tolerant run's, with
-    # every class run: its stores' groups then stay as this leaves them.
-    if PROFILE == "tolerant" and DRIVEN and not asked:
-        try:
-            writer_groups(s)
-        except SystemExit as stopped:
-            s.check(False, f"writer groups: {stopped}")
     if PROFILE == "reconfigure":
         # Last: a restore to a time takes back what the driver wrote after
         # it, which every reading above holds kept.
