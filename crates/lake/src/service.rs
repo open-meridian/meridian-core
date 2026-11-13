@@ -168,7 +168,9 @@ pub const INTERNAL_RECORD: &str = "platform.lake.internal.record";
 /// to the writer group owning each dataset: every `record-` command but a
 /// dataset's liveness and an assessment, which are group 0's own.
 pub fn is_record_write(topic: &str) -> bool {
-    topic.starts_with("platform.lake.command.record-")
+    topic
+        .strip_prefix("platform.lake.")
+        .is_some_and(|rest| rest.starts_with("command.record-"))
         && topic != RECORD_LIVENESS
         && topic != RECORD_QUALITY_ASSESSMENTS
 }

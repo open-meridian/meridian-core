@@ -41,7 +41,9 @@ pub const INTERNAL_COMMAND: &str = "platform.book.internal.command";
 /// Whether `topic` is one of the book's commands, which a member hands to
 /// the writer group owning its account's partition.
 pub fn is_command(topic: &str) -> bool {
-    topic.starts_with("platform.book.command.")
+    topic
+        .strip_prefix("platform.book.")
+        .is_some_and(|rest| rest.starts_with("command."))
 }
 
 /// The default bound: 128 MiB of books, within the book's 512 MiB.
