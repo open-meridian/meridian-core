@@ -929,7 +929,10 @@ def split_under_load(btc, usdc):
         must(rows and all(t["sequence"] > held or t["dataset"] != "coin:live" for t in rows)
              and any(t["sequence"] > closed for t in rows),
              f"step 20, {name}'s rows after the watermark held before the split, on past it: {rows}")
-        chained(rows, f"step 20, {name}'s chain caught up across the split")
+        # Every one of the subject's rows on `live` chains, the split's and
+        # any an earlier step's stream still writes beside them.
+        chained([t for t in caught["trades"] if t["dataset"] == "coin:live"],
+                f"step 20, {name}'s chain caught up across the split")
     history = call("dashboard__read_resilience", {}, "unchanged")["data"]["history"]
     must(any(item["kind"] == "partition_split" for item in history),
          f"step 20, the split in the Resilience history: {history}")
