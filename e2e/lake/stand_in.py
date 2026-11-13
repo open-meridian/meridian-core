@@ -633,16 +633,21 @@ class Dgm(data.Role):
                 source_times=[SourceTime(kind="published", at_ns=published)],
                 raw=self.plugin.raw_record(f"edgar/{row_key}"))
 
+        # A row key fixes its valid time (the-lake rule 5, enforced from step
+        # 3d): each row's is a constant of the row, so asking again restates
+        # nothing it may not, and a restatement changes what was published.
+        filed_at = int(datetime(2026, 10, 30, tzinfo=timezone.utc).timestamp()) * 10**9
+        period_end = int(datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()) * 10**9
         eight_k = "0000320193-26-000105"
         filed = await self.record_filings(filings=[meridian.Filing(
-            meta=meta(eight_k, [(apple, "filer")], first, first),
+            meta=meta(eight_k, [(apple, "filer")], filed_at, first),
             filing=ops.FilingRef(accession_number=eight_k, form="8-K"),
             kind="current_report", items=["2.02", "9.01"], filed_date="2026-10-30")])
         eps_key = "320193:us-gaap:EarningsPerShareBasic:USD/shares:2026-06-28:2026-09-27"
 
         def eps(amount, accession, published):
             return meridian.ReportedFact(
-                meta=meta(eps_key, [(apple, "filer")], published, published),
+                meta=meta(eps_key, [(apple, "filer")], period_end, published),
                 concept="us-gaap:EarningsPerShareBasic", amount=Money(Decimal(amount), "USD"),
                 period_start="2026-06-28", period_end="2026-09-27",
                 filing=ops.FilingRef(accession_number=accession, form="10-K"))
