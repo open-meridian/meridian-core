@@ -317,10 +317,15 @@ async def serve_want(plugin, heard):
 async def drive_data(plugin, gen):
     stub = plugin._operations()
     dataset = f"{plugin.identity.instance_id}:{DATASET_KEY}"
+    # A row key fixes its valid time (the lake's rule 5, enforced from step
+    # 3d): a pod rescheduled starts its generations again from 1 with an
+    # empty /tmp, so each start's keys carry when it started, never another
+    # start's key at a later time.
+    started = time.time_ns() // 1_000_000
     n = 0
     while not stopped():
         n += 1
-        key = f"drive-{gen}-{n}"
+        key = f"drive-{gen}-{started}-{n}"
         now = time.time_ns()
         price = ops.Price(
             meta=ops.ObservationMeta(
@@ -685,7 +690,9 @@ async def flood_seed(plugin, dataset):
     if os.path.exists("/tmp/seeded"):
         return
     stub = plugin._operations()
-    began = time.time_ns() - FLOOD_ROWS * 1_000_000
+    # Each row's valid time a constant of its key (the lake's rule 5): a pod
+    # rescheduled seeds again, its /tmp gone, and restates nothing.
+    began = 1_793_491_200_000_000_000  # 2026-11-01T00:00:00Z
     for batch in range(FLOOD_ROWS // 500):
         prices = []
         for n in range(500):
