@@ -323,6 +323,11 @@ impl Store for Spread {
         self.owed_everywhere()
     }
 
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        // In this member's own database, where its group writes.
+        self.own().owe_control(record, kept_at_ns)
+    }
+
     fn placement_needed(&self, account_id: &str) -> Result<bool> {
         if self.partition_of(account_id).is_some() {
             return Ok(false);

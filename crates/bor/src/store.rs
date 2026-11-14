@@ -685,6 +685,18 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// A record owed to `~control` kept where this member writes, by its
+    /// key, for the control partition's group to journal (step 3d;
+    /// `book_control_owed`, approved 2026-11-14): this member does not write
+    /// `~control`. Idempotent by the key. A store of one writer group, which
+    /// journals each itself, keeps none.
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        let _ = (record, kept_at_ns);
+        Err(StoreError::Unavailable(
+            "this store keeps no record owed to the control journal".into(),
+        ))
+    }
+
     /// Whether `account_id` is to be placed before its first act (step 3d;
     /// section 6.3): an account the store has not placed, where it has more
     /// than one partition. Never the book's own keys.

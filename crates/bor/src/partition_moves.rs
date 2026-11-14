@@ -355,9 +355,24 @@ pub fn journal(bus: &meridian_bus::Bus, store: &dyn Store, ended: &Ended) {
             }
         }
     }
+    let at_ns = match ended {
+        Ended::Moved(moved) => moved.moved_at_ns,
+        Ended::Aborted(aborted, _) => aborted.aborted_at_ns,
+    };
     for record in &owed {
-        if let Err(failed) = crate::control::journal_one(bus, store, record) {
-            tracing::warn!(key = record.key, %failed, "a move's record was not journalled on control");
+        match crate::control::journal_one(bus, store, record) {
+            Ok(_) => {}
+            // A member of a group past the first (an account's move aborted
+            // there): kept where it writes, for the control partition's
+            // group to journal (step 3d; `book_control_owed`).
+            Err(StoreError::NotOwned { .. }) => {
+                if let Err(failed) = store.owe_control(record, at_ns) {
+                    tracing::warn!(key = record.key, %failed, "a move's record was not kept for control");
+                }
+            }
+            Err(failed) => {
+                tracing::warn!(key = record.key, %failed, "a move's record was not journalled on control")
+            }
         }
     }
 }

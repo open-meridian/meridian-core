@@ -4373,6 +4373,145 @@ async fn an_account_move_aborts_for_lag_timeout_and_digest_and_stays() {
     blocking(move || drop((one, one_store, _one, _one_store, migrated)));
 }
 
+/// An account's move aborted on a member of writer group 1 (step 3d;
+/// `book_control_owed`, approved 2026-11-14): that member does not write
+/// `~control`, so it keeps PartitionMoveAborted -- and a digest's finding
+/// -- in its own database, answering its own refusal; group 0's sweep
+/// journals each on `~control` once, under its own key, and a sweep run
+/// again -- a restarted group 0 -- journals nothing twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_account_move_aborted_in_group_one_is_journalled_on_control_once() {
+    use meridian_bor::decide::Context;
+    use meridian_bor::moves::move_account_with;
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::Settings;
+    use meridian_domain::v1::MoveAccountRequest;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], _mover) = blocking(|| two_members(&url));
+    let ones: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| meridian_changes::groups::owner(p, 2) == 1)
+        .collect();
+    let (from, target) = (ones[0].clone(), ones[1].clone());
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-OWED-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == from)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    let dir = std::env::temp_dir().join(unique("owed"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lag, digest) = (dir.join("lag"), dir.join("digest"));
+    std::fs::write(&lag, "60000").unwrap();
+    std::fs::write(&digest, "").unwrap();
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: target.clone(),
+        reason: "an abort in group 1".into(),
+    };
+    let attempt = |n: i64, lag_file, digest_file| {
+        let ctx = Context {
+            acting_for: PERSON.into(),
+            received_at_ns: 5_000 + n,
+            ..Default::default()
+        };
+        let settings = Settings {
+            switch: std::time::Duration::from_secs(1),
+            lag_file,
+            digest_file,
+            ..Default::default()
+        };
+        move_account_with(&one, one_store.as_ref(), &ctx, &request, &settings)
+            .unwrap_err()
+            .on_the_bus()
+    };
+    // Its own refusals, answered by group 1's member.
+    let lagged = blocking(|| attempt(1, Some(lag.clone()), None));
+    assert!(
+        lagged.contains(&format!(
+            "refusal-reason {}",
+            meridian_pb::v1::RefusalReason::Overloaded as i32
+        )),
+        "{lagged}"
+    );
+    let differs = blocking(|| attempt(2, None, Some(digest.clone())));
+    assert!(differs.contains("account_id"), "{differs}");
+    let keys = [
+        format!("control-record:partition-move-aborted:{from}:5001"),
+        format!("control-record:partition-move-aborted:{from}:5002"),
+        format!("control-record:finding:move:{from}:5002"),
+    ];
+    let journalled = |store: &PostgresStore| -> Vec<String> {
+        let mut said: Vec<String> = store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.idempotency_key)
+            .filter(|k| keys.contains(k))
+            .collect();
+        said.sort();
+        said
+    };
+    let mut once = keys.to_vec();
+    once.sort();
+    blocking(|| {
+        // Not on control yet: kept beside group 1's journal, owed.
+        assert!(journalled(&zero_store).is_empty());
+        let kept: i64 = postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM book_control_owed WHERE key = ANY($1)",
+                &[&keys.to_vec()],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(kept, 3);
+        // Group 0's sweep journals each once.
+        assert!(meridian_bor::control::journal_owed(&zero, zero_store.as_ref()).unwrap() >= 3);
+        assert_eq!(journalled(&zero_store), once);
+        // Its sweep again, and a restarted group 0's: nothing twice.
+        assert_eq!(
+            meridian_bor::control::journal_owed(&zero, zero_store.as_ref()).unwrap(),
+            0
+        );
+        let restarted = Arc::new(
+            PostgresStore::connect(&url, 2)
+                .unwrap()
+                .with_groups(Groups::new(0, 2).unwrap())
+                .with_partitions(8),
+        );
+        meridian_bor::control::journal_owed(&zero, restarted.as_ref()).unwrap();
+        assert_eq!(journalled(&zero_store), once);
+        // Each record as it was kept: the abort names the account, its
+        // target and its cause.
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        let aborted = control
+            .iter()
+            .find(|e| e.idempotency_key == keys[1])
+            .and_then(|e| e.body.record.clone())
+            .unwrap();
+        let aborted = PartitionMoveAborted::decode(&aborted.1[..]).unwrap();
+        assert_eq!(
+            (
+                aborted.account_id.as_str(),
+                aborted.target_partition.as_str(),
+                aborted.cause,
+                aborted.aborted_at_ns
+            ),
+            (
+                account.as_str(),
+                target.as_str(),
+                MoveAbortCause::Digest as i32,
+                5002
+            )
+        );
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+    blocking(move || drop((zero, zero_store, one, one_store, migrated)));
+}
+
 /// A partition moved back to a writer group that owned nothing meanwhile
 /// (step 3d; `book_writer_group`, approved 2026-11-14): every partition of
 /// group 1 moved to group 0, then P4 moved back. It carries group 1's own

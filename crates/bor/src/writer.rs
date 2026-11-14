@@ -309,6 +309,10 @@ impl Store for Writer {
         self.inner.control_records_owed()
     }
 
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        self.inner.owe_control(record, kept_at_ns)
+    }
+
     fn placement_needed(&self, account_id: &str) -> Result<bool> {
         self.inner.placement_needed(account_id)
     }

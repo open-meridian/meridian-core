@@ -2083,6 +2083,23 @@ impl Store for PostgresStore {
         self.groups.owns(&self.placed(account_id))
     }
 
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO book_control_owed (key, kind, body, reason, kept_at_ns)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key) DO NOTHING",
+                &[
+                    &record.key,
+                    &record.kind,
+                    &record.body,
+                    &record.reason,
+                    &kept_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
         let journalled = self.journalled_keys()?;
         let mut owed: Vec<crate::control::Owed> = self
@@ -4426,6 +4443,30 @@ impl PostgresStore {
                     "account {} moved from {} to {}: {}",
                     moved.account_id, moved.from_partition, moved.to_partition, moved.reason
                 ),
+            });
+        }
+        // Each record a member of a group past the first kept for it (step
+        // 3d; `book_control_owed`), by its own key, in the order kept.
+        for row in conn
+            .query(
+                "SELECT key, kind, body, reason FROM book_control_owed ORDER BY kept_at_ns, key",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let kind: String = row.get(1);
+            let Some(kind) = crate::control::owed_kind(&kind) else {
+                tracing::warn!(
+                    kind,
+                    "a record owed to control is of no kind the book journals"
+                );
+                continue;
+            };
+            owed.push(crate::control::Owed {
+                key: row.get(0),
+                kind,
+                body: row.get(2),
+                reason: row.get(3),
             });
         }
         // Each finding, by its row, as the scrub kept it.

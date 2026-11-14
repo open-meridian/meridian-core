@@ -34,6 +34,19 @@ pub struct Owed {
 /// A partition's assignment's kind: the lake's control kind, the same record.
 pub const OWNER: &str = "meridian.v1.PartitionOwner";
 
+/// A kind a member past the first group may owe `~control`
+/// (`book_control_owed`), as the static name the journal keeps: an
+/// account's move aborted there and its digest's finding. None for any
+/// other.
+pub fn owed_kind(kind: &str) -> Option<&'static str> {
+    [
+        crate::partition_moves::ABORTED,
+        meridian_changes::records::FINDING,
+    ]
+    .into_iter()
+    .find(|known| *known == kind)
+}
+
 /// What the journal says when the entry is there already.
 const JOURNALLED: &str = "the record is journalled already";
 

@@ -93,6 +93,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "writer_group_epoch",
         sql: include_str!("../migrations/0013_writer_group_epoch.sql"),
     },
+    // The records owed to `~control` by a member that does not write it
+    // (step 3d; `book_control_owed` approved 2026-11-14).
+    Migration {
+        version: 14,
+        name: "control_owed",
+        sql: include_str!("../migrations/0014_control_owed.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\
