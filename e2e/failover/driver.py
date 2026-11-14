@@ -136,9 +136,23 @@ def took(kind, began):
 
 def refused(kind, ident, failed):
     """A write refused, or answered by nothing, kept in /tmp/refused as
-    `REFUSED <kind> <id> <unix ms>`: what the rebalance class holds to none
-    inside a move's hold."""
-    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(time.time() * 1000)} {words(failed)[:200]}")
+    `REFUSED <kind> <id> <unix ms> <its words>`: what the rebalance class
+    holds to none inside a move's hold."""
+    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(time.time() * 1000)} {refusal_words(failed)}")
+
+
+def refusal_words(failed):
+    """A refusal's whole words on one line, for the run's log and artifact
+    (CI 43626539705: five refused prices whose cause no log named): its
+    status, its detail in full, and each trailing metadata entry the
+    sidecar sent with it (the refusal's reason among them)."""
+    if not isinstance(failed, grpc.aio.AioRpcError):
+        return f"{type(failed).__name__}: {failed}".replace("\n", " ")
+    said = [f"status={failed.code().name}", f"detail={failed.details()}"]
+    for key, value in failed.trailing_metadata() or ():
+        if not key.endswith("-bin"):
+            said.append(f"{key}={value}")
+    return " ".join(said).replace("\r", " ").replace("\n", " ")
 
 
 def decimal(text):

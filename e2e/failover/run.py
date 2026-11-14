@@ -3819,8 +3819,18 @@ def window_held(s, what, began_ms, ended_ms):
     s.check(bool(took) and p99 <= HOLD_SECONDS * 1000,
             f"rebalance: {what}: the driver's p99 write time while it moved within moves.holdSeconds "
             f"({p99} ms of {len(took)} writes, the longest {took[-1] if took else None} ms)")
+    # Each refusal's whole words, in the job's log and the run's artifact
+    # (.e2e-refused.log): the next red names its cause (CI 43626539705).
+    if refused:
+        with open(".e2e-refused.log", "a") as kept:
+            kept.write(f"== {what}\n")
+            for p in refused:
+                kept.write(" ".join(p) + "\n")
+        for p in refused:
+            print(f"      refused: {' '.join(p)}", flush=True)
     s.check(not refused, f"rebalance: {what}: no write refused while it moved ({len(refused)}: "
-                         f"{[' '.join(p[:3]) for p in refused[:3]]})")
+                         f"{[' '.join(p[:3]) for p in refused[:3]]}; each in full above and in "
+                         f".e2e-refused.log)")
     if p99 is not None:
         claim(s, "rebalance", what, p99 / 1000, HOLD_SECONDS,
               {"move_s": round((ended_ms - began_ms) / 1000, 2), "writes": len(took)})
