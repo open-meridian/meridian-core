@@ -3882,7 +3882,10 @@ def varint_field(record, number):
         elif wire == 5:
             at += 4
         elif wire == 2:
-            at += varint()
+            # The length read first: `at += varint()` would add it to
+            # `at` as it was before the length's own bytes were read.
+            length = varint()
+            at += length
         else:
             return None
     return None
@@ -3952,6 +3955,13 @@ def lake_owner(partition):
     said = psql(f"select coalesce(writer_group, -1) from lake_partition where dataset = '{partition}'")
     named = int(said) if said.lstrip("-").isdigit() else -1
     return named if named >= 0 else rendezvous(partition.split("/")[0])
+
+
+def book_partitions():
+    """The book's partitions after the class's upgrade, each whether or not
+    it has been written yet: a partition's head is made by its first write,
+    and in ha the heads named P0 alone (CI 43621875619)."""
+    return [f"P{i}" for i in range(BOOK_PARTITIONS)]
 
 
 def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
@@ -4050,11 +4060,14 @@ def an_abort(s, dash, store, name, target, cause):
     s.check(writing, f"rebalance: {store} {name}: the driver writes on after the abort")
 
 
+BOOK_PARTITIONS = 4
+
+
 def rebalance(s):
     """The rebalance class (step 3d; section 15), after writer_groups."""
     print("R: rebalance: a range, a partition and an account moved under load", flush=True)
     began = time.time()
-    upgraded = upgrade("bor.partitions=4")
+    upgraded = upgrade(f"bor.partitions={BOOK_PARTITIONS}")
     s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
     for deployment in (f"{FULL}-bor", f"{FULL}-bor-group-1"):
         run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
@@ -4089,8 +4102,7 @@ def moves(s, dash):
         return
     accounts = [a for a in DRIVER_ACCOUNTS if psql(
         f"select partition from book_account where account_id = '{a}'") == "P0"]
-    owners = {p: str(book_owner(p)) for p in psql(
-        "select partition from book_partition_head where partition <> 'control'").split()}
+    owners = {p: str(book_owner(p)) for p in book_partitions()}
     # Within one database: the driver's half and the book's P0 to the other
     # group; an account to a partition of the group P0 left.
     half_from = lake_owner(loaded)
@@ -4134,8 +4146,7 @@ def moves(s, dash):
     window_held(s, "the count's moves home", since_ms, int(time.time() * 1000))
     if not (ready and writing):
         return
-    owners = {p: str(book_owner(p)) for p in psql(
-        "select partition from book_partition_head where partition <> 'control'").split()}
+    owners = {p: str(book_owner(p)) for p in book_partitions()}
     zeros = sorted(p for p, g in owners.items() if int(g) == 0)
     ones = sorted(p for p, g in owners.items() if int(g) == 1)
     # An account of group 0's database to group 1's.
