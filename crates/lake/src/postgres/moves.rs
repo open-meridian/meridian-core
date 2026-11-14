@@ -370,6 +370,60 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
+    /// `dataset`'s open ranges in this database, its own range among them:
+    /// each with its head and the group its row names (step 3d).
+    pub fn open_heads(&self, dataset: &str) -> Result<Vec<(String, u64, Option<u32>)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, head, writer_group FROM lake_partition
+                  WHERE (dataset = $1 OR starts_with(dataset, $1 || '/')) AND closed_at IS NULL",
+                &[&dataset],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1).max(0) as u64,
+                    row.get::<_, Option<i32>>(2).map(|group| group as u32),
+                )
+            })
+            .filter(|(partition, _, _)| crate::range::is_of(partition, dataset))
+            .collect())
+    }
+}
+
+impl PostgresStore {
+    /// Each range's last move logged in this database's control that was by
+    /// hand (step 3d; section 6.8): the group the admin moved it to. A range
+    /// whose last move was by a changed count is not named.
+    pub fn moved_by_hand(&self) -> Result<BTreeMap<String, u32>> {
+        let mut out = BTreeMap::new();
+        for row in self
+            .conn()?
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = 'meridian.v1.PartitionMoved'
+                  ORDER BY sequence",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let body: Vec<u8> = row.get(0);
+            let Ok(moved) = meridian_domain::v1::PartitionMoved::decode(&body[..]) else {
+                continue;
+            };
+            if moved.by_hand {
+                out.insert(moved.partition, moved.to_group);
+            } else {
+                out.remove(&moved.partition);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl PostgresStore {
     /// A move's records appended to the lake's `control` partition, in one
     /// transaction (step 3d; section 6.8): `PartitionMoved` or
     /// `PartitionMoveAborted`, and a digest mismatch's `IntegrityFinding`

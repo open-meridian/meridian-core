@@ -1762,6 +1762,18 @@ impl PostgresStore {
                 }));
             }
         }
+        // A partition this group's database has not begun while another
+        // database holds it ahead, named this group's: the database count
+        // was raised, and the partition is not moved here yet (step 3d;
+        // section 6.8). Held until it is, never begun twice. An interim
+        // guard: it goes with the routing of each partition's writes to the
+        // database its head is in (handover-m4).
+        if held.get::<_, i64>(0) == 0 && self.ahead_elsewhere(partition)? {
+            return Err(Unbatched::Whole(StoreError::Held(format!(
+                "partition {partition} is moving to writer group {}'s database: ask again in a moment",
+                self.groups.mine()
+            ))));
+        }
         self.fence
             .admits(held.get::<_, i64>(1) as u64)
             .map_err(|fenced| Unbatched::Whole(fenced.into()))?;
@@ -4363,6 +4375,67 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
+    /// Whether another of the book's databases holds `partition` begun,
+    /// named this member's group's (or its own by rendezvous): its records
+    /// are there until a move brings them here (step 3d; section 6.8). Only
+    /// asked of a partition this database has not begun.
+    fn ahead_elsewhere(&self, partition: &str) -> std::result::Result<bool, Unbatched> {
+        let Some(linked) = self.databases.get() else {
+            return Ok(false);
+        };
+        let mine = self.groups.mine();
+        for store in linked.iter().filter_map(std::sync::Weak::upgrade) {
+            if std::ptr::eq(store.as_ref(), self) {
+                continue;
+            }
+            let tip = store
+                .tip(partition)
+                .map_err(Unbatched::Whole)?
+                .filter(|tip| tip.head > 0);
+            if let Some(tip) = tip {
+                let named = tip.writer_group.unwrap_or_else(|| {
+                    meridian_changes::groups::owner(partition, self.groups.count())
+                });
+                if named == mine {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Each partition's last move journalled on this store's `~control`
+    /// that was by hand (step 3d; section 6.8): the group the admin moved it
+    /// to. A partition whose last move was by a changed count is not named.
+    pub fn moved_by_hand(&self) -> Result<std::collections::BTreeMap<String, u32>> {
+        let mut out = std::collections::BTreeMap::new();
+        for row in self
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry
+                      WHERE account_id = $1 AND idempotency_key LIKE 'control-record:partition-moved:%'
+                      ORDER BY first_sequence"
+                ),
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+        {
+            let Some((_, body)) = entry_of(&row)?.body.record else {
+                continue;
+            };
+            let Ok(moved) = meridian_domain::v1::PartitionMoved::decode(&body[..]) else {
+                continue;
+            };
+            if moved.by_hand {
+                out.insert(moved.partition, moved.to_group);
+            } else {
+                out.remove(&moved.partition);
+            }
+        }
+        Ok(out)
+    }
+
     /// The keys of the records this store's `~control` has journalled.
     fn journalled_keys(&self) -> Result<std::collections::BTreeSet<String>> {
         Ok(self

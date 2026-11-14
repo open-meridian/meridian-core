@@ -104,6 +104,26 @@ impl Mover {
 
     /// The group that owns `partition` now, as its database's row names
     /// it, and where it stands there; none where no database holds it.
+    /// A range whose owner's database holds none of it, held in another's
+    /// named its owner's (a database count raised; step 3d, section 6.8):
+    /// its owner and that database.
+    fn misplaced(&self, partition: &str) -> Result<Option<(u32, usize)>> {
+        let dataset = crate::range::dataset_of(partition);
+        for (d, store) in self.stores.iter().enumerate() {
+            let Some(tip) = store.range_tip(partition)? else {
+                continue;
+            };
+            let owner = tip
+                .writer_group
+                .filter(|group| *group < self.groups.count())
+                .unwrap_or_else(|| meridian_changes::groups::owner(dataset, self.groups.count()));
+            if !Arc::ptr_eq(store, self.database_of(owner)) && !tip.closed {
+                return Ok(Some((owner, d)));
+            }
+        }
+        Ok(None)
+    }
+
     fn owner_now(&self, partition: &str) -> Result<Option<(u32, crate::postgres::RangeTip)>> {
         let dataset = crate::range::dataset_of(partition);
         let guess = self.groups.owner_by(partition, dataset);
@@ -205,8 +225,22 @@ impl Mover {
     /// The move, start to end, after [`Mover::check`] and [`Mover::begin`]:
     /// how it ended, its record made, not yet logged.
     pub fn run(&self, partition: &str, target: u32, asked: &Asked) -> Result<Ended> {
+        self.run_from(partition, target, asked, None)
+    }
+
+    /// [`Self::run`], from `away` -- the group and database whose rows hold
+    /// the range where its owner's database holds none of it (a database
+    /// count raised: a move to the owner's own database, its group
+    /// unchanged).
+    fn run_from(
+        &self,
+        partition: &str,
+        target: u32,
+        asked: &Asked,
+        away: Option<(u32, usize)>,
+    ) -> Result<Ended> {
         let _alone = self.one.lock().expect("moves poisoned");
-        let ended = self.run_alone(partition, target, asked);
+        let ended = self.run_alone(partition, target, asked, away);
         self.under_way
             .lock()
             .expect("moves poisoned")
@@ -214,11 +248,23 @@ impl Mover {
         ended
     }
 
-    fn run_alone(&self, partition: &str, target: u32, asked: &Asked) -> Result<Ended> {
-        let (from, _) = self
-            .owner_now(partition)?
-            .ok_or_else(|| StoreError::Unavailable(format!("the lake has no range {partition}")))?;
-        let (source, to) = (self.database_of(from), self.database_of(target));
+    fn run_alone(
+        &self,
+        partition: &str,
+        target: u32,
+        asked: &Asked,
+        away: Option<(u32, usize)>,
+    ) -> Result<Ended> {
+        let (from, source) = match away {
+            Some((group, d)) => (group, &self.stores[d]),
+            None => {
+                let (from, _) = self.owner_now(partition)?.ok_or_else(|| {
+                    StoreError::Unavailable(format!("the lake has no range {partition}"))
+                })?;
+                (from, self.database_of(from))
+            }
+        };
+        let to = self.database_of(target);
         let aborted = |cause: MoveAbortCause, finding: Option<IntegrityFinding>| {
             Ended::Aborted(
                 PartitionMoveAborted {
@@ -344,6 +390,15 @@ impl Mover {
     pub fn rebalance(&self) -> Vec<Ended> {
         let mut ended = Vec::new();
         let mut seen = BTreeSet::new();
+        // Where a deployment admin moved a range by hand, it stays (section
+        // 6.8): only a count lowered past its group moves it again.
+        let by_hand = match self.stores[0].moved_by_hand() {
+            Ok(by_hand) => by_hand,
+            Err(failed) => {
+                tracing::warn!(%failed, "the moves by hand were not read: no range moved by the count");
+                return ended;
+            }
+        };
         for store in &self.stores {
             let ranges = match store.ranges() {
                 Ok(ranges) => ranges,
@@ -362,13 +417,42 @@ impl Mover {
                 );
                 let now = match self.owner_now(&partition) {
                     Ok(Some((now, _))) => now,
-                    Ok(None) => continue,
+                    // Its owner's database holds none of it: a database
+                    // count raised, so it is moved there, its group kept.
+                    Ok(None) => {
+                        let away = match self.misplaced(&partition) {
+                            Ok(Some(away)) => away,
+                            Ok(None) => continue,
+                            Err(failed) => {
+                                tracing::warn!(partition, %failed, "a range's databases were not read");
+                                continue;
+                            }
+                        };
+                        if !self.begin(&partition) {
+                            continue;
+                        }
+                        match self.run_from(&partition, away.0, &Asked::default(), Some(away)) {
+                            Ok(done) => {
+                                self.log(&done);
+                                ended.push(done);
+                            }
+                            Err(failed) => tracing::warn!(
+                                partition,
+                                %failed,
+                                "a range's move to its owner's database stopped: it stays where it is"
+                            ),
+                        }
+                        continue;
+                    }
                     Err(failed) => {
                         tracing::warn!(partition, %failed, "a range's owner was not read");
                         continue;
                     }
                 };
-                if now == wanted || !self.begin(&partition) {
+                let placed = by_hand
+                    .get(&partition)
+                    .is_some_and(|group| *group == now && *group < self.groups.count());
+                if now == wanted || placed || !self.begin(&partition) {
                     continue;
                 }
                 match self.run(&partition, wanted, &Asked::default()) {

@@ -96,6 +96,29 @@ impl Mover {
             [meridian_changes::databases::of_group(group, self.stores.len() as u32) as usize]
     }
 
+    /// The database other than its owner's that holds `partition` begun,
+    /// further on than its owner's does, named its owner's: the database
+    /// count was raised since it was written (step 3d; section 6.8).
+    fn misplaced(&self, partition: &str, owner: u32) -> Result<Option<usize>> {
+        let home = meridian_changes::databases::of_group(owner, self.stores.len() as u32) as usize;
+        let here = self.stores[home].tip(partition)?.map_or(0, |tip| tip.head);
+        for (d, store) in self.stores.iter().enumerate() {
+            if d == home {
+                continue;
+            }
+            let Some(tip) = store.tip(partition)? else {
+                continue;
+            };
+            let named = tip
+                .writer_group
+                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()));
+            if named == owner && tip.head > here {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
+    }
+
     /// The group that owns `partition` now, as its source database's head
     /// names it.
     fn owner_now(&self, partition: &str) -> Result<u32> {
@@ -168,8 +191,21 @@ impl Mover {
     /// The move, start to end, after [`Mover::check`] and [`Mover::begin`]:
     /// how it ended, its record made, not yet journalled.
     pub fn run(&self, partition: &str, target: u32, asked: &Asked) -> Result<Ended> {
+        self.run_from(partition, target, asked, None)
+    }
+
+    /// [`Self::run`], from database `from_database` where its records are
+    /// there rather than in its owner's (a database count raised: a move to
+    /// the owner's own database, its group unchanged).
+    fn run_from(
+        &self,
+        partition: &str,
+        target: u32,
+        asked: &Asked,
+        from_database: Option<usize>,
+    ) -> Result<Ended> {
         let _alone = self.one.lock().expect("moves poisoned");
-        let ended = self.run_alone(partition, target, asked);
+        let ended = self.run_alone(partition, target, asked, from_database);
         self.under_way
             .lock()
             .expect("moves poisoned")
@@ -177,9 +213,16 @@ impl Mover {
         ended
     }
 
-    fn run_alone(&self, partition: &str, target: u32, asked: &Asked) -> Result<Ended> {
+    fn run_alone(
+        &self,
+        partition: &str,
+        target: u32,
+        asked: &Asked,
+        from_database: Option<usize>,
+    ) -> Result<Ended> {
         let from = self.owner_now(partition)?;
-        let (source, to) = (self.database_of(from), self.database_of(target));
+        let source = from_database.map_or_else(|| self.database_of(from), |d| &self.stores[d]);
+        let to = self.database_of(target);
         let across = !Arc::ptr_eq(source, to);
         let aborted = |cause: MoveAbortCause, finding: Option<IntegrityFinding>| {
             Ended::Aborted(
@@ -456,6 +499,15 @@ pub fn serve(bus: &Arc<meridian_bus::Bus>, store: &Arc<dyn Store>, mover: &Arc<M
 pub fn rebalance(bus: &meridian_bus::Bus, store: &dyn Store, mover: &Mover) -> Vec<Ended> {
     let count = mover.stores[0].partition_count().max(1);
     let mut ended = Vec::new();
+    // Where a deployment admin moved a partition by hand, it stays (section
+    // 6.8): only a count lowered past its group moves it again.
+    let by_hand = match mover.stores[0].moved_by_hand() {
+        Ok(by_hand) => by_hand,
+        Err(failed) => {
+            tracing::warn!(%failed, "the moves by hand were not read: no partition moved by the count");
+            return ended;
+        }
+    };
     for n in 0..count {
         let partition = crate::store::partition_named(n);
         let wanted = meridian_changes::groups::owner(&partition, mover.groups.count());
@@ -466,10 +518,27 @@ pub fn rebalance(bus: &meridian_bus::Bus, store: &dyn Store, mover: &Mover) -> V
                 continue;
             }
         };
-        if now == wanted || !mover.begin(&partition) {
+        let placed = by_hand
+            .get(&partition)
+            .is_some_and(|group| *group == now && *group < mover.groups.count());
+        // Its owner kept, its records in another database than its owner's
+        // (a raised database count): moved there, its group unchanged.
+        let away = if now == wanted || placed {
+            match mover.misplaced(&partition, now) {
+                Ok(away) => away,
+                Err(failed) => {
+                    tracing::warn!(partition, %failed, "a partition's databases were not read");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if ((now == wanted || placed) && away.is_none()) || !mover.begin(&partition) {
             continue;
         }
-        match mover.run(&partition, wanted, &Asked::default()) {
+        let target = if away.is_some() { now } else { wanted };
+        match mover.run_from(&partition, target, &Asked::default(), away) {
             Ok(done) => {
                 journal(bus, store, &done);
                 ended.push(done);

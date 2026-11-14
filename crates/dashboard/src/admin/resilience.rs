@@ -221,10 +221,19 @@ pub fn history_words(item: &ResilienceHistoryItem) -> (i64, &'static str, String
         Some(Item::PartitionMoved(r)) => (
             r.moved_at_ns,
             "partition moved",
-            format!(
-                "{} {}: group {} to {}, epoch {}",
-                r.component, r.partition, r.from_group, r.to_group, r.epoch
-            ),
+            // Its group kept, its database's count raised: moved between
+            // databases (step 3d; section 6.8).
+            if r.from_group == r.to_group {
+                format!(
+                    "{} {}: moved to writer group {}'s database, epoch {}",
+                    r.component, r.partition, r.to_group, r.epoch
+                )
+            } else {
+                format!(
+                    "{} {}: group {} to {}, epoch {}",
+                    r.component, r.partition, r.from_group, r.to_group, r.epoch
+                )
+            },
         ),
         // Contract v30's 3d records (approved 2026-11-12), shown once 3d
         // records them: a lake range's split, and a move that did not switch.
@@ -755,6 +764,30 @@ pub fn page(
 mod tests {
     use super::*;
     use meridian_domain::v1::{ResilienceChange, SourceSwitched, WriterTookOver};
+
+    /// A move by a raised database count keeps its group: read as a move to
+    /// that group's database, never "group 1 to 1" (step 3d).
+    #[test]
+    fn a_move_between_databases_reads_as_one() {
+        let moved = |from_group, to_group| ResilienceHistoryItem {
+            item: Some(Item::PartitionMoved(meridian_domain::v1::PartitionMoved {
+                component: "bor".into(),
+                partition: "P3".into(),
+                from_group,
+                to_group,
+                epoch: 7,
+                ..Default::default()
+            })),
+        };
+        assert_eq!(
+            history_words(&moved(1, 1)).2,
+            "bor P3: moved to writer group 1's database, epoch 7"
+        );
+        assert_eq!(
+            history_words(&moved(0, 1)).2,
+            "bor P3: group 0 to 1, epoch 7"
+        );
+    }
 
     fn reply() -> ReadResilienceReply {
         ReadResilienceReply {

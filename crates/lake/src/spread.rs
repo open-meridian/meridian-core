@@ -44,6 +44,10 @@ use crate::store::{
 pub struct Spread {
     stores: Vec<Arc<PostgresStore>>,
     groups: Groups,
+    /// The datasets this member's database was found to hold whole, as far
+    /// as its group writes them: none of their open ranges named its group
+    /// further on in another database (see [`Spread::not_moved_here`]).
+    settled: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// What [`Spread::reconcile`] found missing and copied, per database.
@@ -68,7 +72,11 @@ impl Spread {
     /// `groups`.
     pub fn new(stores: Vec<Arc<PostgresStore>>, groups: Groups) -> Self {
         assert!(!stores.is_empty(), "a lake has a database");
-        Self { stores, groups }
+        Self {
+            stores,
+            groups,
+            settled: Default::default(),
+        }
     }
 
     /// How many databases.
@@ -87,6 +95,54 @@ impl Spread {
             self.groups.mine(),
             self.count(),
         ))
+    }
+
+    /// A write of `dataset` held where another database holds one of its
+    /// ranges further on than this member's own, named this member's group:
+    /// the database count was raised and the range is not moved here yet
+    /// (step 3d; section 6.8), so it is never begun twice. Held at most the
+    /// hold by the lake, then OVERLOADED; asked once a dataset after it
+    /// answers clear. An interim guard: it goes with the routing of each
+    /// range's writes to the database its head is in (handover-m4).
+    fn not_moved_here(&self, dataset: &str) -> Result<()> {
+        if self.stores.len() < 2
+            || self
+                .settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(dataset)
+        {
+            return Ok(());
+        }
+        let own = self.own();
+        let mine = self.groups.mine();
+        let here: BTreeMap<String, u64> = own
+            .open_heads(dataset)?
+            .into_iter()
+            .map(|(partition, head, _)| (partition, head))
+            .collect();
+        for store in &self.stores {
+            if Arc::ptr_eq(store, own) {
+                continue;
+            }
+            for (partition, head, named) in store.open_heads(dataset)? {
+                let group = named
+                    .filter(|group| *group < self.groups.count())
+                    .unwrap_or_else(|| {
+                        meridian_changes::groups::owner(dataset, self.groups.count())
+                    });
+                if group == mine && head > 0 && here.get(&partition).copied().unwrap_or(0) < head {
+                    return Err(StoreError::Held(format!(
+                        "range {partition} is moving to writer group {mine}'s database: ask again in a moment"
+                    )));
+                }
+            }
+        }
+        self.settled
+            .lock()
+            .expect("settled poisoned")
+            .insert(dataset.to_string());
+        Ok(())
     }
 
     /// Database 0's store: the store's home.
@@ -308,6 +364,7 @@ impl Spread {
 
 impl Store for Spread {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        self.not_moved_here(dataset)?;
         self.own().record(dataset, rows, now_ns)
     }
 
@@ -317,6 +374,13 @@ impl Store for Spread {
         parts: Vec<Vec<Observation>>,
         now_ns: i64,
     ) -> Vec<Result<Recorded>> {
+        if let Err(held) = self.not_moved_here(dataset) {
+            let words = held.to_string();
+            return parts
+                .iter()
+                .map(|_| Err(StoreError::Held(words.clone())))
+                .collect();
+        }
         self.own().record_parts(dataset, parts, now_ns)
     }
 
@@ -327,6 +391,7 @@ impl Store for Spread {
         readers: &[String],
         now_ns: i64,
     ) -> Result<Recorded> {
+        self.not_moved_here(dataset)?;
         self.own().serve_unkept(dataset, rows, readers, now_ns)
     }
 
@@ -344,6 +409,9 @@ impl Store for Spread {
         batch: WriteAheadBatch,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
+        for (dataset, _) in &batch.parts {
+            self.not_moved_here(dataset)?;
+        }
         self.own().record_write_ahead(batch, now_ns)
     }
 

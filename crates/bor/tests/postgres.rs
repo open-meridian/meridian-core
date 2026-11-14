@@ -4236,6 +4236,98 @@ async fn a_changed_count_of_writer_groups_moves_each_partition_once() {
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// A partition a deployment admin moved by hand stays where she put it
+/// (step 3d; section 6.8, ruled 2026-11-14): the sweep, every minute, moves
+/// only by a changed count. With the count raised after her move, the
+/// other partitions converge on their owners at the new count and hers
+/// stays; the sweep then moves nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_partition_moved_by_hand_stays_through_the_sweep_and_a_raised_count() {
+    use meridian_bor::partition_moves::{journal, rebalance, Asked, Ended, Mover, Settings};
+    use meridian_changes::groups::{owner, Groups};
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    // Hers: a partition of group 1's, which a count of three keeps away
+    // from group 0, moved to group 0 by hand.
+    let mine = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .find(|p| owner(p, 2) == 1 && owner(p, 3) != 0)
+        .expect("a partition of group 1's at two and three");
+    let ended = blocking(|| {
+        mover.begin(&mine);
+        mover.run(
+            &mine,
+            0,
+            &Asked {
+                by_hand: true,
+                moved_by: PERSON.into(),
+                reason: "group 1 is busy".into(),
+            },
+        )
+    })
+    .unwrap();
+    assert!(matches!(&ended, Ended::Moved(m) if m.by_hand), "{ended:?}");
+    blocking(|| journal(&zero, zero_store.as_ref(), &ended));
+    // The sweep: nothing moved, hers still group 0's.
+    blocking(|| {
+        assert!(rebalance(&zero, zero_store.as_ref(), &mover).is_empty());
+        assert_eq!(
+            zero_store.tip(&mine).unwrap().unwrap().writer_group,
+            Some(0)
+        );
+    });
+    // The count raised to three: the others converge, hers stays.
+    let three = blocking(|| {
+        Arc::new(
+            PostgresStore::connect(&url, 4)
+                .unwrap()
+                .with_groups(Groups::new(0, 3).unwrap())
+                .with_partitions(8),
+        )
+    });
+    let mover_three = Mover::new(
+        vec![Arc::clone(&three)],
+        three.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(2),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let wanted: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| *p != mine && owner(p, 3) != owner(p, 2))
+        .collect();
+    let moved: Vec<String> = blocking(|| rebalance(&zero, three.as_ref(), &mover_three))
+        .into_iter()
+        .map(|e| match e {
+            Ended::Moved(m) => {
+                assert!(!m.by_hand);
+                assert_eq!(m.to_group, owner(&m.partition, 3));
+                m.partition
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(moved, wanted);
+    blocking(|| {
+        assert_eq!(three.tip(&mine).unwrap().unwrap().writer_group, Some(0));
+        assert!(rebalance(&zero, three.as_ref(), &mover_three).is_empty());
+    });
+    blocking(move || {
+        drop((
+            zero,
+            one,
+            zero_store,
+            one_store,
+            three,
+            mover,
+            mover_three,
+            migrated,
+        ))
+    });
+}
+
 /// Every cause an account's move aborts for (step 3d; section 6.8; ruled
 /// 2026-11-14), each before its close: the injected lag, a close its
 /// partition holds past moves.switchSeconds, and the injected digest

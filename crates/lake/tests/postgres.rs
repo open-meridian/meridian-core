@@ -6814,6 +6814,44 @@ fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept
     }
 }
 
+/// A range a deployment admin moved by hand stays where she put it (step
+/// 3d; section 6.8, ruled 2026-11-14): the sweep, every minute, moves a
+/// range only by a changed count, so it never takes hers back to its
+/// dataset's group.
+#[test]
+fn a_range_moved_by_hand_stays_through_the_sweep() {
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let (_url, zero, one, dataset, lower, _upper, _low, _high) =
+        two_groups_and_a_split("lake-by-hand");
+    assert_eq!(meridian_changes::groups::owner(&dataset, 2), 0);
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings::default(),
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover
+        .run(
+            &lower,
+            1,
+            &Asked {
+                by_hand: true,
+                moved_by: "https://directory.example.org|8812".into(),
+                reason: "group 0 is busy".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(&ended, Ended::Moved(m) if m.by_hand), "{ended:?}");
+    mover.log(&ended);
+    assert!(mover.rebalance().is_empty(), "the sweep leaves hers");
+    one.read_owners().unwrap();
+    assert_eq!(
+        zero.range_tip(&lower).unwrap().unwrap().writer_group,
+        Some(1)
+    );
+}
+
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
 /// group answering it waits until the other group's consumer has committed
 /// its part -- its position in the stream past the write -- and answers
