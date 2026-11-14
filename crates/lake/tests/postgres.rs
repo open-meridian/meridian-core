@@ -7063,3 +7063,157 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
     // Their connections closed off the runtime's threads.
     tokio::task::block_in_place(move || drop((lake, zero, one)));
 }
+
+/// The lake's database count raised under load (step 3d; sections 6.4 and
+/// 6.8, ruled 2026-11-14: each range is written and read where its head
+/// is). Two writer groups wrote one database; with a second, writer group
+/// 1's home is the new one, but its datasets' heads are in the first: their
+/// writes go on there, never held past a switch or refused, until the
+/// sweep moves each home -- once, from group 1 to group 1, by_hand false --
+/// after which they are written at home. A second sweep moves nothing, and
+/// every key written is read back through either member.
+#[test]
+fn a_raised_lake_database_count_writes_where_each_head_is_and_moves_each_range_home_once() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Ended, Mover, Settings};
+    let urls = two_databases();
+    let datasets: Vec<String> = (0..)
+        .map(|n| unique(&format!("coinbase-1:raise{n}")))
+        .filter(|dataset| meridian_changes::groups::owner(dataset, 2) == 1)
+        .take(2)
+        .collect();
+    let subject = unique("LCL-RAISE");
+    // One database: group 1 writes its datasets there.
+    {
+        let member = |group: u32| {
+            let store = PostgresStore::connect(&urls[0], 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap());
+            store.adopt().unwrap();
+            store
+        };
+        let (zero, one) = (member(0), member(1));
+        zero.pin_owners().unwrap();
+        for dataset in &datasets {
+            one.record(dataset, vec![trade(dataset, "before", &subject, 10)], 1_000)
+                .unwrap();
+        }
+    }
+    // Two databases: group 1's home is the second.
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let zero = Arc::new(meridian_lake::spread::Spread::new(
+        zeros.clone(),
+        zeros[0].groups(),
+    ));
+    let one = Arc::new(meridian_lake::spread::Spread::new(
+        ones.clone(),
+        ones[0].groups(),
+    ));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    let fresh = |d: usize, range: &str| {
+        PostgresStore::connect(&urls[d], 1)
+            .unwrap()
+            .range_tip(range)
+            .unwrap()
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load: Vec<_> = datasets
+        .iter()
+        .map(|dataset| {
+            writing_range(
+                one.clone() as Arc<dyn Store>,
+                zero.clone() as Arc<dyn Store>,
+                dataset.clone(),
+                subject.clone(),
+                "w",
+                stop.clone(),
+            )
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Written on where the heads are: the new database not begun.
+    for dataset in &datasets {
+        assert!(fresh(0, dataset).unwrap().head > 1, "{dataset}");
+        assert_eq!(fresh(1, dataset), None, "{dataset}");
+    }
+    let mover = Mover::new(
+        zeros.clone(),
+        zeros[0].groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    let ended = mover.rebalance();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let mut written = 0;
+    for task in load {
+        let (count, refused, _) = task.join().unwrap();
+        assert!(refused.is_empty(), "refused: {refused:?}");
+        written += count;
+    }
+    assert!(written > 20, "{written} written across the raise");
+    let mut moved: Vec<String> = ended
+        .iter()
+        .map(|e| match e {
+            Ended::Moved(m) => {
+                assert!(!m.by_hand && m.moved_by.is_empty(), "{m:?}");
+                assert_eq!((m.from_group, m.to_group), (1, 1));
+                m.partition.clone()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    moved.sort();
+    let mut wanted = datasets.clone();
+    wanted.sort();
+    assert_eq!(moved, wanted, "each of group 1's datasets moved home once");
+    assert!(mover.rebalance().is_empty(), "a second sweep moves nothing");
+    for dataset in &datasets {
+        let (away, home) = (fresh(0, dataset).unwrap(), fresh(1, dataset).unwrap());
+        assert!(home.head > away.head, "{dataset}: written on at home");
+        // Every key written, read back through either member.
+        for member in [&zero, &one] {
+            let read = member
+                .read(&Query {
+                    datasets: vec![dataset.clone()],
+                    data_type: DataType::Trade,
+                    subjects: vec![subject.clone()],
+                    kinds: vec![],
+                    interval_ns: 0,
+                    when: When::Latest { at_ns: 0 },
+                    as_of_ns: 0,
+                    published_as_of_ns: 0,
+                    latest_only: false,
+                })
+                .unwrap();
+            assert_eq!(
+                read.len() as u64,
+                home.head,
+                "{dataset}: {} read",
+                read.len()
+            );
+        }
+    }
+}

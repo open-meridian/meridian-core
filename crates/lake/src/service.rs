@@ -221,7 +221,26 @@ pub fn owners_of_rows(
     if let Some(group) = whole_owner(groups, dataset) {
         return vec![group; rows.len()];
     }
+    ranges_of_rows(groups, store, dataset, rows)
+        .iter()
+        .map(|range| groups.owner_by(range, dataset))
+        .collect()
+}
+
+/// The open range each of `rows` of `dataset` goes to, as this member last
+/// read its ranges (step 3d; ruling 2 of 2026-11-14): its key's anchor's --
+/// its subject's hash, or, for a subject an alias stays as, the anchor its
+/// key was first recorded under -- the dataset itself where it has none.
+pub fn ranges_of_rows(
+    groups: meridian_changes::groups::Groups,
+    store: &dyn Store,
+    dataset: &str,
+    rows: &[Observation],
+) -> Vec<String> {
     let open = crate::range::leaves(&groups.ranges_of(dataset));
+    if open.is_empty() {
+        return vec![dataset.to_string(); rows.len()];
+    }
     let stays: BTreeSet<String> = store
         .aliases()
         .map(|aliases| aliases.into_values().collect())
@@ -247,7 +266,7 @@ pub fn owners_of_rows(
                 .unwrap_or_else(|| crate::range::hash(row.subject()));
             open.iter()
                 .find(|(range, _)| range.holds(anchor))
-                .map_or_else(|| groups.owner(dataset), |(_, group)| *group)
+                .map_or_else(|| dataset.to_string(), |(range, _)| range.partition.clone())
         })
         .collect()
 }

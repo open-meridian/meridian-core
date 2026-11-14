@@ -117,7 +117,13 @@ impl Mover {
                 .writer_group
                 .filter(|group| *group < self.groups.count())
                 .unwrap_or_else(|| meridian_changes::groups::owner(dataset, self.groups.count()));
-            if !Arc::ptr_eq(store, self.database_of(owner)) && !tip.closed {
+            // Further on than at its owner's home: once moved home, the
+            // home holds it level, and it is not moved again.
+            let home = self.database_of(owner);
+            if !Arc::ptr_eq(store, home)
+                && !tip.closed
+                && home.range_tip(partition)?.map_or(0, |at| at.head) < tip.head
+            {
                 return Ok(Some((owner, d)));
             }
         }

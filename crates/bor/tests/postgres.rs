@@ -4724,3 +4724,197 @@ async fn a_deployment_installed_at_two_writer_groups_moves_nothing() {
     });
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
+
+/// The book's database count raised under load (step 3d; section 6.4 and
+/// 6.8, ruled 2026-11-14: each partition is written where its head is).
+/// Two writer groups wrote one database; with a second database, writer
+/// group 1's home is the new one, but its partitions' heads are in the
+/// first: its writes go on there, never held or refused, until the sweep
+/// moves each home -- once, from group 1 to group 1, by_hand false -- after
+/// which they are written at home alone. Nothing is refused throughout
+/// (each switch's hold delays, never refuses); each partition's chain is
+/// whole at home from 1, nothing committed in the first database after its
+/// close; a second sweep moves nothing; and a read naming a watermark taken
+/// before the moves is answered after them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_raised_database_count_writes_where_each_head_is_and_moves_each_partition_home_once() {
+    use meridian_bor::partition_moves::{rebalance, Ended, Mover, Settings};
+    use meridian_bor::spread::Spread;
+    use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_pb::v1::{PartitionSequence, Watermark};
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(8).unwrap();
+                apart(&url);
+                url
+            })
+            .collect()
+    });
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    // A member of `group` over the first `databases` databases.
+    let member = |group: u32, databases: usize| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores: Vec<Arc<PostgresStore>> = urls[..databases]
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 6)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        let spread = Arc::new(Spread::new(stores, groups));
+        let bus = Arc::new(Bus::single(
+            "bor-raised-databases-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        serve(bus.clone(), spread.clone(), bus.clock());
+        resolving_equities(&bus);
+        (bus, spread)
+    };
+    // Group 1's partitions P4 and another, and one of group 0's: none a
+    // takeover test's lock names.
+    let ones: Vec<String> = ["P4", "P5", "P6", "P7"]
+        .into_iter()
+        .filter(|p| owner(p, 2) == 1)
+        .take(2)
+        .map(String::from)
+        .collect();
+    assert_eq!(ones.len(), 2, "two of group 1's partitions");
+    let accounts_in = |partition: &str, n: usize| -> Vec<String> {
+        (0..)
+            .map(|k| unique(&format!("ACC-RAISE-{k}")))
+            .filter(|a| meridian_bor::store::placement_of(a, 8) == partition)
+            .take(n)
+            .collect()
+    };
+    let accounts: Vec<String> = ones.iter().flat_map(|p| accounts_in(p, 2)).collect();
+    // One database: both groups write it.
+    {
+        let ((bus_zero, zero), (bus_one, one)) = blocking(|| (member(0, 1), member(1, 1)));
+        for account in &accounts {
+            blocking(|| one.place_first(account, account)).unwrap();
+            open(&bus_one, account, "INS-AAPL").await;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load = writing(bus_zero.clone(), accounts.clone(), stop.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop.store(true, Ordering::SeqCst);
+        let (_, refused) = load.await.unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        blocking(move || drop((zero, one, bus_zero, bus_one)));
+    }
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    let heads_before: Vec<u64> = blocking(|| {
+        ones.iter()
+            .map(|p| fresh(0).tip(p).unwrap().unwrap().head)
+            .collect()
+    });
+    assert!(heads_before.iter().all(|h| *h > 0), "{heads_before:?}");
+    // The count raised to two databases: group 1's home is the second.
+    let ((bus_zero, zero), (bus_one, one)) = blocking(|| (member(0, 2), member(1, 2)));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = [
+        writing(bus_one.clone(), accounts.clone(), stop.clone()),
+        writing(bus_zero.clone(), accounts.clone(), stop.clone()),
+    ];
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // Written on where the heads are, the new database not begun.
+    blocking(|| {
+        for (p, before) in ones.iter().zip(&heads_before) {
+            assert!(fresh(0).tip(p).unwrap().unwrap().head > *before, "{p}");
+            assert_eq!(fresh(1).tip(p).unwrap().unwrap().head, 0, "{p}");
+        }
+    });
+    let watermark = blocking(|| Watermark {
+        partitions: ones
+            .iter()
+            .map(|p| PartitionSequence {
+                partition: p.clone(),
+                sequence: fresh(0).tip(p).unwrap().unwrap().head,
+            })
+            .collect(),
+    });
+    // Group 0's sweep, under the load.
+    let mover = Mover::new(
+        vec![zero.database(0).clone(), zero.database(1).clone()],
+        zero.database(0).groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let ended = blocking(|| rebalance(&bus_zero, zero.as_ref(), &mover));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    stop.store(true, Ordering::SeqCst);
+    let mut written = 0;
+    for task in load {
+        let (count, refused) = task.await.unwrap();
+        assert!(refused.is_empty(), "refused: {refused:?}");
+        written += count;
+    }
+    assert!(written > 20, "{written} written across the raise");
+    let moved: Vec<(String, u64)> = ended
+        .iter()
+        .map(|e| match e {
+            Ended::Moved(m) => {
+                assert!(!m.by_hand && m.moved_by.is_empty(), "{m:?}");
+                assert_eq!((m.from_group, m.to_group), (1, 1));
+                (m.partition.clone(), m.epoch)
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        moved.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        ones,
+        "each of group 1's partitions moved home once"
+    );
+    blocking(|| {
+        assert!(
+            rebalance(&bus_zero, zero.as_ref(), &mover).is_empty(),
+            "a second sweep moves nothing"
+        );
+        for p in &ones {
+            let (away, home) = (
+                fresh(0).tip(p).unwrap().unwrap(),
+                fresh(1).tip(p).unwrap().unwrap(),
+            );
+            assert!(home.head > away.head, "{p}: written on at home");
+            // Nothing committed away after its close; whole at home from 1.
+            let left = numbered(&urls[0], p);
+            assert_eq!(left.last().unwrap().1 as u64, away.head, "{p}");
+            let rows = numbered(&urls[1], p);
+            assert_eq!(rows[0].0, 1, "{p}");
+            assert_eq!(rows.last().unwrap().1 as u64, home.head, "{p}");
+        }
+        for d in 0..2 {
+            let scrubbed = fresh(d).scrub().unwrap();
+            assert!(scrubbed.findings.is_empty(), "{d}: {:?}", scrubbed.findings);
+        }
+        for account in &accounts {
+            let journal = zero.journal(account).unwrap();
+            assert_eq!(one.journal(account).unwrap(), journal);
+        }
+        meridian_bus::read_after::begin_read();
+        bus_zero
+            .reads_after()
+            .answer(LIST_POSITIONS, &watermark, || {
+                zero.journal(&accounts[0]).map_err(|f| f.to_string())
+            })
+            .unwrap();
+    });
+    blocking(move || drop((zero, one, bus_zero, bus_one, mover)));
+}

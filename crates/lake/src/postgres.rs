@@ -119,6 +119,15 @@ pub struct PostgresStore {
     /// database, so a range moved out of it is read where it went.
     database: u32,
     databases: u32,
+    /// Every database's store, this one's among them, where the lake has
+    /// several (step 3d; ruled 2026-11-14): where a range's head is.
+    linked: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
+    /// Ranges of a group writing another database found held there at or
+    /// past this one's head: written and read there, never here again.
+    away_settled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Ranges at their group's home here found held no further on in any
+    /// other database: written here, never asked again.
+    home_settled: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The range and month tables of `lake_row` this store has seen made
     /// (step 3d; section 6.2): never looked for again. Let go whenever a
     /// batch fails, so one a restore took away is made again.
@@ -253,11 +262,11 @@ fn open_ranges_taken(
     dataset: &str,
 ) -> Result<(
     Vec<crate::range::Open>,
-    BTreeMap<String, (Option<u32>, bool)>,
+    BTreeMap<String, (Option<u32>, bool, u64)>,
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL
+            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head
                FROM lake_partition p
                LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
                                    WHERE q.dataset = p.dataset
@@ -279,6 +288,7 @@ fn open_ranges_taken(
             (
                 row.get::<_, Option<i32>>(3).map(|group| group as u32),
                 row.get::<_, bool>(4),
+                row.get::<_, i64>(5).max(0) as u64,
             ),
         );
         open.push(crate::range::Open {
@@ -371,6 +381,9 @@ impl PostgresStore {
             leads_database: false,
             database: 0,
             databases: 1,
+            linked: std::sync::OnceLock::new(),
+            away_settled: std::sync::Mutex::default(),
+            home_settled: std::sync::Mutex::default(),
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -1830,7 +1843,7 @@ impl PostgresStore {
     fn refuse_not_ours(
         &self,
         dataset: &str,
-        states: &BTreeMap<String, (Option<u32>, bool)>,
+        states: &BTreeMap<String, (Option<u32>, bool, u64)>,
         by_range: &mut BTreeMap<String, Vec<(usize, Vec<Observation>)>>,
         answered: &mut [Result<Recorded>],
     ) {
@@ -1838,23 +1851,27 @@ impl PostgresStore {
         let mut refused: BTreeMap<usize, StoreError> = BTreeMap::new();
         for (partition, parts) in by_range.iter() {
             let failed = match states.get(partition) {
-                Some((_, false)) => Some(StoreError::Held(format!(
+                Some((_, false, _)) => Some(StoreError::Held(format!(
                     "range {partition} is switching to another writer group: ask again in a moment"
                 ))),
-                Some((named, true)) => {
+                Some((named, true, here)) => {
                     self.groups.assign(partition, *named);
                     let group = self.groups.owner_by(partition, dataset);
-                    (group != mine).then(|| StoreError::NotOwned {
-                        partition: partition.clone(),
-                        group,
+                    (group != mine || self.headed_elsewhere(partition, *here)).then(|| {
+                        StoreError::NotOwned {
+                            partition: partition.clone(),
+                            group,
+                        }
                     })
                 }
                 // A range not begun yet: its dataset's first write.
                 None => {
                     let group = self.groups.owner_by(partition, dataset);
-                    (group != mine).then(|| StoreError::NotOwned {
-                        partition: partition.clone(),
-                        group,
+                    (group != mine || self.headed_elsewhere(partition, 0)).then(|| {
+                        StoreError::NotOwned {
+                            partition: partition.clone(),
+                            group,
+                        }
                     })
                 }
             };
@@ -4917,6 +4934,156 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
     StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
+/// Where a range's head is, over the lake's several databases (step 3d;
+/// ruled 2026-11-14: each range is written and read where its head is).
+impl PostgresStore {
+    /// Every database's store, this one's among them.
+    pub fn link_databases(&self, stores: &[std::sync::Arc<PostgresStore>]) {
+        let _ = self
+            .linked
+            .set(stores.iter().map(std::sync::Arc::downgrade).collect());
+    }
+
+    /// The store of writer group `group`'s home database, where several.
+    fn home_of(&self, group: u32) -> Option<std::sync::Arc<PostgresStore>> {
+        let linked = self.linked.get().filter(|linked| linked.len() > 1)?;
+        linked
+            .get(meridian_changes::databases::of_group(group, linked.len() as u32) as usize)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Whether `partition`'s group's home database, not this one, holds it
+    /// at or past this one's head, named that group: moved home, or never
+    /// here. Once so, always so -- only a move home settles it.
+    fn headed_home(&self, partition: &str, group: u32) -> bool {
+        let Some(home) = self.home_of(group) else {
+            return true;
+        };
+        if std::ptr::eq(home.as_ref(), self) {
+            return false;
+        }
+        if self
+            .away_settled
+            .lock()
+            .expect("settled poisoned")
+            .contains(partition)
+        {
+            return true;
+        }
+        let here = match self.range_tip(partition) {
+            Ok(tip) => tip.map_or(0, |tip| tip.head),
+            Err(_) => return true,
+        };
+        let count = self.groups.count();
+        let dataset = crate::range::dataset_of(partition);
+        let there = match home.range_tip(partition) {
+            Ok(tip) => tip.filter(|tip| {
+                tip.writer_group
+                    .filter(|named| *named < count)
+                    .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                    == group
+            }),
+            Err(_) => return true,
+        };
+        let held = there.is_some_and(|tip| tip.head >= here) || here == 0;
+        if held && here > 0 {
+            self.away_settled
+                .lock()
+                .expect("settled poisoned")
+                .insert(partition.to_string());
+        }
+        held
+    }
+
+    /// Whether `partition`, this member's group's, standing at `here` in
+    /// this database, is to be written in another (the same-group fence):
+    /// away from home, its home holds it at or past `here`; at home,
+    /// another database holds it further on -- the database count was
+    /// raised and it is not moved home yet.
+    fn headed_elsewhere(&self, partition: &str, here: u64) -> bool {
+        let mine = self.groups.mine();
+        let Some(home) = self.home_of(mine) else {
+            return false;
+        };
+        if !std::ptr::eq(home.as_ref(), self) {
+            let count = self.groups.count();
+            let dataset = crate::range::dataset_of(partition);
+            return home.range_tip(partition).ok().flatten().is_some_and(|tip| {
+                !tip.closed
+                    && tip
+                        .writer_group
+                        .filter(|named| *named < count)
+                        .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                        == mine
+                    && tip.head >= here
+            });
+        }
+        if self
+            .home_settled
+            .lock()
+            .expect("settled poisoned")
+            .contains(partition)
+        {
+            return false;
+        }
+        let count = self.groups.count();
+        let dataset = crate::range::dataset_of(partition);
+        let linked = self.linked.get().map(Vec::as_slice).unwrap_or_default();
+        for other in linked.iter().filter_map(std::sync::Weak::upgrade) {
+            if std::ptr::eq(other.as_ref(), self) {
+                continue;
+            }
+            let ahead = other
+                .range_tip(partition)
+                .ok()
+                .flatten()
+                .is_some_and(|tip| {
+                    !tip.closed
+                        && tip
+                            .writer_group
+                            .filter(|named| *named < count)
+                            .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                            == mine
+                        && tip.head > here
+                });
+            if ahead {
+                return true;
+            }
+        }
+        self.home_settled
+            .lock()
+            .expect("settled poisoned")
+            .insert(partition.to_string());
+        false
+    }
+
+    /// The open ranges this database holds named writer group `group` (or
+    /// its dataset's rendezvous owner), with their heads.
+    pub fn open_ranges_of(&self, group: u32) -> Result<Vec<(String, u64)>> {
+        let count = self.groups.count();
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, head, writer_group FROM lake_partition WHERE closed_at IS NULL",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .filter(|row| {
+                let partition: String = row.get(0);
+                row.get::<_, Option<i32>>(2)
+                    .map(|named| named as u32)
+                    .filter(|named| *named < count)
+                    .unwrap_or_else(|| {
+                        meridian_changes::groups::owner(crate::range::dataset_of(&partition), count)
+                    })
+                    == group
+            })
+            .map(|row| (row.get(0), row.get::<_, i64>(1).max(0) as u64))
+            .collect())
+    }
+}
+
 /// A database past the first (step 3d; the resilience spec's section 6.4):
 /// what database 0 decided, copied into the database holding the rows it is
 /// about, and what this database's own control journal recorded, relayed
@@ -4984,8 +5151,11 @@ impl PostgresStore {
     /// Whether a read here answers `partition`, its row naming `named`:
     /// where its group writes this database.
     fn serves(&self, partition: &str, named: Option<i32>) -> bool {
-        meridian_changes::databases::of_group(self.group_named(partition, named), self.databases)
-            == self.database
+        let group = self.group_named(partition, named);
+        meridian_changes::databases::of_group(group, self.databases) == self.database
+            // Held here, its group's home not at or past it yet: its head
+            // is here (step 3d; ruled 2026-11-14).
+            || !self.headed_home(partition, group)
     }
 
     /// Whether a read here answers each partition, of every dataset (step

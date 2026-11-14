@@ -370,31 +370,6 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
-    /// `dataset`'s open ranges in this database, its own range among them:
-    /// each with its head and the group its row names (step 3d).
-    pub fn open_heads(&self, dataset: &str) -> Result<Vec<(String, u64, Option<u32>)>> {
-        Ok(self
-            .conn()?
-            .query(
-                "SELECT dataset, head, writer_group FROM lake_partition
-                  WHERE (dataset = $1 OR starts_with(dataset, $1 || '/')) AND closed_at IS NULL",
-                &[&dataset],
-            )
-            .map_err(unavailable)?
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<_, String>(0),
-                    row.get::<_, i64>(1).max(0) as u64,
-                    row.get::<_, Option<i32>>(2).map(|group| group as u32),
-                )
-            })
-            .filter(|(partition, _, _)| crate::range::is_of(partition, dataset))
-            .collect())
-    }
-}
-
-impl PostgresStore {
     /// Each range's last move logged in this database's control that was by
     /// hand (step 3d; section 6.8): the group the admin moved it to. A range
     /// whose last move was by a changed count is not named.

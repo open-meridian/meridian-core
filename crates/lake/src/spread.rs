@@ -44,10 +44,29 @@ use crate::store::{
 pub struct Spread {
     stores: Vec<Arc<PostgresStore>>,
     groups: Groups,
-    /// The datasets this member's database was found to hold whole, as far
-    /// as its group writes them: none of their open ranges named its group
-    /// further on in another database (see [`Spread::not_moved_here`]).
-    settled: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Each range found at its owner's home database, by owner: written and
+    /// read there from then on, as only a move takes it away -- to another
+    /// group, so another owner (step 3d; ruled 2026-11-14).
+    settled: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
+}
+
+/// How many times a write's rows are routed again to the database their
+/// range's head is in: once moved home, it is there.
+const ROUTED_AGAIN: usize = 3;
+
+/// `more`, another database's part of the same write, added to `into`.
+fn merged(dataset: &str, into: &mut Recorded, more: Recorded) {
+    if !into.partitions.is_empty() || !more.partitions.is_empty() {
+        into.partitions.resize(into.rows.len(), dataset.to_string());
+        let mut named = more.partitions;
+        named.resize(more.rows.len(), dataset.to_string());
+        into.partitions.extend(named);
+    }
+    into.rows.extend(more.rows);
+    into.recorded += more.recorded;
+    into.restated += more.restated;
+    into.unchanged += more.unchanged;
+    into.head = into.head.max(more.head);
 }
 
 /// What [`Spread::reconcile`] found missing and copied, per database.
@@ -72,6 +91,9 @@ impl Spread {
     /// `groups`.
     pub fn new(stores: Vec<Arc<PostgresStore>>, groups: Groups) -> Self {
         assert!(!stores.is_empty(), "a lake has a database");
+        for store in &stores {
+            store.link_databases(&stores);
+        }
         Self {
             stores,
             groups,
@@ -97,52 +119,136 @@ impl Spread {
         ))
     }
 
-    /// A write of `dataset` held where another database holds one of its
-    /// ranges further on than this member's own, named this member's group:
-    /// the database count was raised and the range is not moved here yet
-    /// (step 3d; section 6.8), so it is never begun twice. Held at most the
-    /// hold by the lake, then OVERLOADED; asked once a dataset after it
-    /// answers clear. An interim guard: it goes with the routing of each
-    /// range's writes to the database its head is in (handover-m4).
-    fn not_moved_here(&self, dataset: &str) -> Result<()> {
-        if self.stores.len() < 2
-            || self
-                .settled
-                .lock()
-                .expect("settled poisoned")
-                .contains(dataset)
-        {
-            return Ok(());
-        }
+    /// The databases past this member's own where its group holds a range
+    /// further on than at home: the database count was raised and they are
+    /// not moved home yet (step 3d; ruled 2026-11-14). Its group's epoch is
+    /// adopted, or taken over, in each, as at home.
+    fn ahead_away(&self) -> Result<Vec<&Arc<PostgresStore>>> {
         let own = self.own();
-        let mine = self.groups.mine();
-        let here: BTreeMap<String, u64> = own
-            .open_heads(dataset)?
-            .into_iter()
-            .map(|(partition, head, _)| (partition, head))
-            .collect();
+        let mut away = Vec::new();
         for store in &self.stores {
             if Arc::ptr_eq(store, own) {
                 continue;
             }
-            for (partition, head, named) in store.open_heads(dataset)? {
-                let group = named
-                    .filter(|group| *group < self.groups.count())
-                    .unwrap_or_else(|| {
-                        meridian_changes::groups::owner(dataset, self.groups.count())
-                    });
-                if group == mine && head > 0 && here.get(&partition).copied().unwrap_or(0) < head {
-                    return Err(StoreError::Held(format!(
-                        "range {partition} is moving to writer group {mine}'s database: ask again in a moment"
-                    )));
+            let mut ahead = false;
+            for (range, head) in store.open_ranges_of(self.groups.mine())? {
+                let home = own.range_tip(&range)?.map_or(0, |tip| tip.head);
+                if head > home {
+                    ahead = true;
+                    break;
                 }
             }
+            if ahead {
+                away.push(store);
+            }
         }
+        Ok(away)
+    }
+
+    /// `partition` routed again by its head from now on: a write found it
+    /// moved home.
+    fn route_again(&self, partition: &str) {
         self.settled
             .lock()
             .expect("settled poisoned")
-            .insert(dataset.to_string());
-        Ok(())
+            .retain(|(held, _)| held != partition);
+    }
+
+    /// The database each of `rows` of `dataset` is written in: its range's
+    /// head's, for a range this member's group writes; this member's own
+    /// for another group's, which its store hands on. One for every row
+    /// where the dataset's ranges are in one database.
+    fn write_dbs(&self, dataset: &str, rows: &[Observation]) -> Vec<u32> {
+        let mine = self.groups.mine();
+        let own = meridian_changes::databases::of_group(mine, self.count());
+        let leaves = crate::range::leaves(&self.groups.ranges_of(dataset));
+        let ranges: Vec<String> = if leaves.is_empty() {
+            vec![dataset.to_string()]
+        } else {
+            leaves
+                .into_iter()
+                .map(|(range, _)| range.partition)
+                .collect()
+        };
+        let dbs: BTreeMap<String, u32> = ranges
+            .into_iter()
+            .map(|range| {
+                let d = if self.groups.owner_by(&range, dataset) == mine {
+                    self.of(&range)
+                } else {
+                    own
+                };
+                (range, d)
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<u32> = dbs.values().copied().collect();
+        if distinct.len() <= 1 {
+            return vec![distinct.first().copied().unwrap_or(own); rows.len()];
+        }
+        crate::service::ranges_of_rows(self.groups, self, dataset, rows)
+            .into_iter()
+            .map(|range| dbs.get(&range).copied().unwrap_or(own))
+            .collect()
+    }
+
+    /// `parts` of `dataset` written where each row's range's head is, by
+    /// `write` on each database's store: each part's answer, its rows'
+    /// parts in several databases merged. A part found moved home is
+    /// routed again (the same-group fence), never refused for it.
+    fn routed(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        write: impl Fn(&PostgresStore, Vec<Vec<Observation>>) -> Vec<Result<Recorded>>,
+    ) -> Vec<Result<Recorded>> {
+        let mine = self.groups.mine();
+        let mut answers: Vec<Option<Result<Recorded>>> = (0..parts.len()).map(|_| None).collect();
+        let mut pending: Vec<(usize, Vec<Observation>)> = parts.into_iter().enumerate().collect();
+        for round in 0..=ROUTED_AGAIN {
+            if pending.is_empty() {
+                break;
+            }
+            let mut by_db: BTreeMap<u32, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
+            for (at, rows) in pending.drain(..) {
+                let dbs = self.write_dbs(dataset, &rows);
+                let mut split: BTreeMap<u32, Vec<Observation>> = BTreeMap::new();
+                for (row, d) in rows.into_iter().zip(dbs) {
+                    split.entry(d).or_default().push(row);
+                }
+                for (d, rows) in split {
+                    by_db.entry(d).or_default().push((at, rows));
+                }
+            }
+            for (d, subs) in by_db {
+                let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = subs.into_iter().unzip();
+                let kept = rows.clone();
+                let done = write(self.database(d), rows);
+                for ((at, result), rows) in places.into_iter().zip(done).zip(kept) {
+                    match result {
+                        Err(StoreError::NotOwned { partition, group })
+                            if group == mine && round < ROUTED_AGAIN =>
+                        {
+                            self.route_again(&partition);
+                            pending.push((at, rows));
+                        }
+                        Ok(recorded) => match &mut answers[at] {
+                            Some(Ok(into)) => merged(dataset, into, recorded),
+                            Some(Err(_)) => {}
+                            none => *none = Some(Ok(recorded)),
+                        },
+                        Err(failed) => {
+                            if !matches!(answers[at], Some(Err(_))) {
+                                answers[at] = Some(Err(failed));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        answers
+            .into_iter()
+            .map(|answer| answer.unwrap_or_else(|| Ok(Recorded::default())))
+            .collect()
     }
 
     /// Database 0's store: the store's home.
@@ -150,25 +256,66 @@ impl Spread {
         &self.stores[0]
     }
 
-    /// The database holding `partition` (a dataset or one of its ranges;
-    /// `control` is database 0's).
+    /// The database holding `partition`'s head (a dataset or one of its
+    /// ranges; `control` is database 0's; step 3d, ruled 2026-11-14): among
+    /// the databases whose open row of it names its owner, the one furthest
+    /// on, its owner's home where two stand level -- a move home switched
+    /// -- or none has begun it. Once there, it is there until its owner
+    /// changes.
     pub fn of(&self, partition: &str) -> u32 {
         if partition == meridian_changes::CONTROL {
             return 0;
         }
-        meridian_changes::databases::of_group(
-            self.groups
-                .owner_by(partition, crate::range::dataset_of(partition)),
-            self.count(),
-        )
+        let dataset = crate::range::dataset_of(partition);
+        let owner = self.groups.owner_by(partition, dataset);
+        let home = meridian_changes::databases::of_group(owner, self.count());
+        let key = (partition.to_string(), owner);
+        if self.stores.len() == 1
+            || self
+                .settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(&key)
+        {
+            return home;
+        }
+        let count = self.groups.count();
+        let mut best = (0u64, home);
+        for (d, store) in self.stores.iter().enumerate() {
+            let Ok(Some(tip)) = store.range_tip(partition) else {
+                continue;
+            };
+            let named = tip
+                .writer_group
+                .filter(|group| *group < count)
+                .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count));
+            if named == owner && !tip.closed && tip.head > best.0 {
+                best = (tip.head, d as u32);
+            }
+        }
+        if best.1 != home
+            && self
+                .database(home)
+                .range_tip(partition)
+                .ok()
+                .flatten()
+                .map(|tip| tip.head)
+                == Some(best.0)
+        {
+            best.1 = home;
+        }
+        if best.1 == home {
+            self.settled.lock().expect("settled poisoned").insert(key);
+        }
+        best.1
     }
 
     /// Every database a read of `dataset` asks (step 3d): its own, and each
     /// its ranges' groups write, as this member last read them.
     fn databases_of(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
         let mut out = std::collections::BTreeSet::from([self.of(dataset)]);
-        for (_, group) in self.groups.ranges_of(dataset) {
-            out.insert(meridian_changes::databases::of_group(group, self.count()));
+        for (range, _) in self.groups.ranges_of(dataset) {
+            out.insert(self.of(&range));
         }
         out
     }
@@ -364,8 +511,12 @@ impl Spread {
 
 impl Store for Spread {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
-        self.not_moved_here(dataset)?;
-        self.own().record(dataset, rows, now_ns)
+        // Where each range's head is (step 3d; ruled 2026-11-14).
+        self.routed(dataset, vec![rows], |store, mut parts| {
+            vec![store.record(dataset, parts.pop().unwrap_or_default(), now_ns)]
+        })
+        .pop()
+        .unwrap_or_else(|| Ok(Recorded::default()))
     }
 
     fn record_parts(
@@ -374,14 +525,9 @@ impl Store for Spread {
         parts: Vec<Vec<Observation>>,
         now_ns: i64,
     ) -> Vec<Result<Recorded>> {
-        if let Err(held) = self.not_moved_here(dataset) {
-            let words = held.to_string();
-            return parts
-                .iter()
-                .map(|_| Err(StoreError::Held(words.clone())))
-                .collect();
-        }
-        self.own().record_parts(dataset, parts, now_ns)
+        self.routed(dataset, parts, |store, parts| {
+            store.record_parts(dataset, parts, now_ns)
+        })
     }
 
     fn serve_unkept(
@@ -391,8 +537,11 @@ impl Store for Spread {
         readers: &[String],
         now_ns: i64,
     ) -> Result<Recorded> {
-        self.not_moved_here(dataset)?;
-        self.own().serve_unkept(dataset, rows, readers, now_ns)
+        self.routed(dataset, vec![rows], |store, mut parts| {
+            vec![store.serve_unkept(dataset, parts.pop().unwrap_or_default(), readers, now_ns)]
+        })
+        .pop()
+        .unwrap_or_else(|| Ok(Recorded::default()))
     }
 
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
@@ -406,13 +555,52 @@ impl Store for Spread {
 
     fn record_write_ahead(
         &self,
-        batch: WriteAheadBatch,
+        mut batch: WriteAheadBatch,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
-        for (dataset, _) in &batch.parts {
-            self.not_moved_here(dataset)?;
+        // Each part where its ranges' heads are (step 3d; ruled
+        // 2026-11-14): those wholly this member's own database's with the
+        // stream's position, in one transaction; the rest first, each in
+        // its own database -- a batch refused after them is taken again,
+        // and each row is recorded once.
+        let own = meridian_changes::databases::of_group(self.groups.mine(), self.count());
+        let mut answers: Vec<Option<Result<Recorded>>> =
+            (0..batch.parts.len()).map(|_| None).collect();
+        let mut places = Vec::new();
+        let mut here = Vec::new();
+        for (at, (dataset, rows)) in std::mem::take(&mut batch.parts).into_iter().enumerate() {
+            if self.write_dbs(&dataset, &rows).iter().all(|d| *d == own) {
+                places.push(at);
+                here.push((dataset, rows));
+            } else {
+                answers[at] = self
+                    .routed(&dataset, vec![rows], |store, parts| {
+                        store.record_parts(&dataset, parts, now_ns)
+                    })
+                    .pop();
+            }
         }
-        self.own().record_write_ahead(batch, now_ns)
+        let again = here.clone();
+        batch.parts = here;
+        let done = self.own().record_write_ahead(batch, now_ns)?;
+        for ((at, result), (dataset, rows)) in places.into_iter().zip(done).zip(again) {
+            answers[at] = Some(match result {
+                // Moved home since it was routed: routed again.
+                Err(StoreError::NotOwned { partition, group }) if group == self.groups.mine() => {
+                    self.route_again(&partition);
+                    self.routed(&dataset, vec![rows], |store, parts| {
+                        store.record_parts(&dataset, parts, now_ns)
+                    })
+                    .pop()
+                    .unwrap_or_else(|| Ok(Recorded::default()))
+                }
+                other => other,
+            });
+        }
+        Ok(answers
+            .into_iter()
+            .map(|answer| answer.unwrap_or_else(|| Ok(Recorded::default())))
+            .collect())
     }
 
     fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
@@ -811,7 +999,12 @@ impl Store for Spread {
     }
 
     fn adopt(&self) -> Result<u64> {
-        self.own().adopt()
+        let epoch = self.own().adopt()?;
+        // Where its ranges' heads are ahead of home (step 3d).
+        for store in self.ahead_away()? {
+            store.adopt()?;
+        }
+        Ok(epoch)
     }
 
     fn epoch(&self) -> u64 {
@@ -819,7 +1012,13 @@ impl Store for Spread {
     }
 
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
-        self.own().take_over(by)
+        let epoch = self.own().take_over(by)?;
+        // Its group's writer before fenced where its ranges' heads are
+        // ahead of home too (step 3d).
+        for store in self.ahead_away()? {
+            store.take_over(by)?;
+        }
+        Ok(epoch)
     }
 
     fn head_epoch(&self) -> Result<u64> {

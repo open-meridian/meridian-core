@@ -129,6 +129,10 @@ pub struct PostgresStore {
     /// several (step 3d; section 6.4): where an account placed in another
     /// database is found.
     databases: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
+    /// The partitions this store, its group's home database, found no other
+    /// database holding further on under its group (step 3d; ruled
+    /// 2026-11-14): written here from then on, never asked again.
+    home_settled: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl PostgresStore {
@@ -158,6 +162,7 @@ impl PostgresStore {
             adopting: Mutex::new(()),
             partitions: 1,
             databases: std::sync::OnceLock::new(),
+            home_settled: Mutex::default(),
         })
     }
 
@@ -1762,17 +1767,17 @@ impl PostgresStore {
                 }));
             }
         }
-        // A partition this group's database has not begun while another
-        // database holds it ahead, named this group's: the database count
-        // was raised, and the partition is not moved here yet (step 3d;
-        // section 6.8). Held until it is, never begun twice. An interim
-        // guard: it goes with the routing of each partition's writes to the
-        // database its head is in (handover-m4).
-        if held.get::<_, i64>(0) == 0 && self.ahead_elsewhere(partition)? {
-            return Err(Unbatched::Whole(StoreError::Held(format!(
-                "partition {partition} is moving to writer group {}'s database: ask again in a moment",
-                self.groups.mine()
-            ))));
+        // Written where its head is (step 3d; ruled 2026-11-14): another
+        // of the book's databases holding it further on under this group --
+        // the database count was raised and it is not moved home yet, or a
+        // move home has just switched it -- and the batch is this group's
+        // to write there: NotOwned naming this group, which its book routes
+        // again by head, never begun or committed twice.
+        if self.headed_elsewhere(partition, held.get::<_, i64>(0).max(0) as u64)? {
+            return Err(Unbatched::Whole(StoreError::NotOwned {
+                partition: partition.to_string(),
+                group: self.groups.mine(),
+            }));
         }
         self.fence
             .admits(held.get::<_, i64>(1) as u64)
@@ -2060,7 +2065,9 @@ impl PostgresStore {
                         Ok(_) => self.place(account_id, &partition),
                         // Moved to another group under its lock (step 3d):
                         // handed to it.
-                        Err(StoreError::NotOwned { group, .. }) => {
+                        // Its own group's, in another of its databases
+                        // (step 3d): routed again by its book, never handed.
+                        Err(StoreError::NotOwned { group, .. }) if *group != self.groups.mine() => {
                             meridian_bus::owners::hand_to_named(*group);
                         }
                         Err(_) => {}
@@ -4375,33 +4382,65 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
-    /// Whether another of the book's databases holds `partition` begun,
-    /// named this member's group's (or its own by rendezvous): its records
-    /// are there until a move brings them here (step 3d; section 6.8). Only
-    /// asked of a partition this database has not begun.
-    fn ahead_elsewhere(&self, partition: &str) -> std::result::Result<bool, Unbatched> {
+    /// Whether `partition`, this group's, is to be written in another of
+    /// the book's databases than this one, whose head stands at `here`
+    /// (step 3d; ruled 2026-11-14: each partition is written where its head
+    /// is). In the group's home database: another holds it further on under
+    /// this group -- not moved home yet -- asked until none does, then never
+    /// again. In any other: the home database's head is at or past this
+    /// one's -- moved home, its switch having raised the home head to the
+    /// close before the source let go -- so a write routed here before the
+    /// move goes home, never committed in both (the same-group fence).
+    fn headed_elsewhere(&self, partition: &str, here: u64) -> std::result::Result<bool, Unbatched> {
         let Some(linked) = self.databases.get() else {
             return Ok(false);
         };
-        let mine = self.groups.mine();
-        for store in linked.iter().filter_map(std::sync::Weak::upgrade) {
-            if std::ptr::eq(store.as_ref(), self) {
-                continue;
+        if linked.len() < 2 {
+            return Ok(false);
+        }
+        let stores: Vec<Arc<PostgresStore>> =
+            linked.iter().filter_map(std::sync::Weak::upgrade).collect();
+        let (mine, count) = (self.groups.mine(), linked.len() as u32);
+        let names_mine = |tip: &Tip| {
+            tip.writer_group
+                .filter(|group| *group < self.groups.count())
+                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()))
+                == mine
+        };
+        let Some(home) = stores.get(meridian_changes::databases::of_group(mine, count) as usize)
+        else {
+            return Ok(false);
+        };
+        if std::ptr::eq(home.as_ref(), self) {
+            if self
+                .home_settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(partition)
+            {
+                return Ok(false);
             }
-            let tip = store
-                .tip(partition)
-                .map_err(Unbatched::Whole)?
-                .filter(|tip| tip.head > 0);
-            if let Some(tip) = tip {
-                let named = tip.writer_group.unwrap_or_else(|| {
-                    meridian_changes::groups::owner(partition, self.groups.count())
-                });
-                if named == mine {
+            for other in stores
+                .iter()
+                .filter(|other| !std::ptr::eq(other.as_ref(), self))
+            {
+                let tip = other.tip(partition).map_err(Unbatched::Whole)?;
+                if tip.is_some_and(|tip| tip.head > here && names_mine(&tip)) {
                     return Ok(true);
                 }
             }
+            self.home_settled
+                .lock()
+                .expect("settled poisoned")
+                .insert(partition.to_string());
+            return Ok(false);
         }
-        Ok(false)
+        let home_head = home
+            .tip(partition)
+            .map_err(Unbatched::Whole)?
+            .filter(names_mine)
+            .map(|tip| tip.head);
+        Ok(home_head.is_some_and(|head| head >= here))
     }
 
     /// Each partition's last move journalled on this store's `~control`

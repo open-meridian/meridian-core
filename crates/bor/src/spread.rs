@@ -37,7 +37,15 @@ use crate::store::{
 pub struct Spread {
     stores: Vec<Arc<PostgresStore>>,
     groups: Groups,
+    /// Each partition found at its owner's home database, by owner: read
+    /// there from then on, as only a move takes it away -- to another
+    /// group, so another owner (step 3d; ruled 2026-11-14).
+    settled: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
 }
+
+/// How many times an act is routed again to the database its partition's
+/// head is in: once moved home, it is there.
+const ROUTED_AGAIN: usize = 3;
 
 /// A page some read answers, filled from one database after another.
 trait Filled: Default {
@@ -112,7 +120,11 @@ impl Spread {
         for store in &stores {
             store.link_databases(&stores);
         }
-        Self { stores, groups }
+        Self {
+            stores,
+            groups,
+            settled: Default::default(),
+        }
     }
 
     /// How many databases.
@@ -137,22 +149,21 @@ impl Spread {
         &self.stores[0]
     }
 
-    /// The account copied into this member's own database from any other
-    /// whose row names a partition placed here: its move closed there,
-    /// toward this database (step 3d; section 6.4). Nothing where it is
-    /// here already, or closed toward nowhere here.
-    fn bring_in(&self, account_id: &str) -> Result<()> {
-        let own = self.own();
-        let here = meridian_changes::databases::of_group(self.groups.mine(), self.count());
+    /// The account copied into database `here`, where its act goes, from
+    /// any other whose row names a partition written there: its move closed
+    /// there, toward this database (step 3d; section 6.4). Nothing where it
+    /// is here already, or closed toward nowhere here.
+    fn bring_in(&self, account_id: &str, here: u32) -> Result<()> {
+        let into = self.database(here);
         for (d, store) in self.stores.iter().enumerate() {
-            if Arc::ptr_eq(store, own) {
+            if Arc::ptr_eq(store, into) {
                 continue;
             }
             let Some(partition) = store.account_row(account_id)? else {
                 continue;
             };
             if self.of(&partition) == here {
-                let added = own.copy_account_from(store, account_id)?;
+                let added = into.copy_account_from(store, account_id)?;
                 tracing::info!(
                     account_id,
                     from = d,
@@ -164,12 +175,100 @@ impl Spread {
         Ok(())
     }
 
-    /// The database holding `partition` (`control` is database 0's).
+    /// The databases past this member's own where its group holds a
+    /// partition further on than at home: the database count was raised and
+    /// they are not moved home yet (step 3d; ruled 2026-11-14). Its group's
+    /// epoch is adopted, or taken over, in each, as at home, so a writer of
+    /// its group before is fenced there too.
+    fn ahead_away(&self) -> Result<Vec<&Arc<PostgresStore>>> {
+        let own = self.own();
+        let mut away = Vec::new();
+        for store in &self.stores {
+            if Arc::ptr_eq(store, own) {
+                continue;
+            }
+            let ahead = (0..self.partition_count())
+                .map(crate::store::partition_named)
+                .filter(|partition| self.groups.owns(partition))
+                .try_fold(false, |ahead, partition| -> Result<bool> {
+                    if ahead {
+                        return Ok(true);
+                    }
+                    let there = store.tip(&partition)?;
+                    let named_mine = there.as_ref().is_some_and(|tip| {
+                        tip.writer_group
+                            .is_none_or(|group| group == self.groups.mine())
+                    });
+                    let head_there = there.map_or(0, |tip| tip.head);
+                    let head_home = own.tip(&partition)?.map_or(0, |tip| tip.head);
+                    Ok(named_mine && head_there > head_home)
+                })?;
+            if ahead {
+                away.push(store);
+            }
+        }
+        Ok(away)
+    }
+
+    /// The database holding `partition`'s head (`control` is database
+    /// 0's; step 3d, ruled 2026-11-14): among the databases whose head of it
+    /// names its owner, the one furthest on, its owner's home where two
+    /// stand level -- a move home switched -- or none has begun it. Once
+    /// there, it is read there until its owner changes.
     pub fn of(&self, partition: &str) -> u32 {
         if partition == crate::store::CONTROL_PARTITION {
             return 0;
         }
-        meridian_changes::databases::of_group(self.groups.owner(partition), self.count())
+        let owner = self.groups.owner(partition);
+        let home = meridian_changes::databases::of_group(owner, self.count());
+        let key = (partition.to_string(), owner);
+        if self.stores.len() == 1
+            || self
+                .settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(&key)
+        {
+            return home;
+        }
+        let mut best = (0u64, home);
+        for (d, store) in self.stores.iter().enumerate() {
+            let Ok(Some(tip)) = store.tip(partition) else {
+                continue;
+            };
+            let named = tip
+                .writer_group
+                .filter(|group| *group < self.groups.count())
+                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()));
+            if named == owner && tip.head > best.0 {
+                best = (tip.head, d as u32);
+            }
+        }
+        // Level with the furthest: home.
+        if best.1 != home
+            && self
+                .database(home)
+                .tip(partition)
+                .ok()
+                .flatten()
+                .map(|tip| tip.head)
+                == Some(best.0)
+        {
+            best.1 = home;
+        }
+        if best.1 == home {
+            self.settled.lock().expect("settled poisoned").insert(key);
+        }
+        best.1
+    }
+
+    /// `partition` routed again by its head from now on: a write found it
+    /// moved home.
+    fn route_again(&self, partition: &str) {
+        self.settled
+            .lock()
+            .expect("settled poisoned")
+            .retain(|(held, _)| held != partition);
     }
 
     /// The store holding `account_id`'s partition: where it is placed, else
@@ -237,19 +336,43 @@ impl Store for Spread {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
-        // Where it is placed, wherever that is: the own store then hands an
+        // Where it is placed, wherever that is: the store then hands an
         // account of another group's on, never placing it again here.
-        if let Some(partition) = self.partition_of(account_id) {
-            self.own().learn_placement(account_id, &partition);
+        let placed = self.partition_of(account_id);
+        for _ in 0..ROUTED_AGAIN {
+            // Its partition's head's database (step 3d; ruled 2026-11-14):
+            // where its group writes it until it moves home.
+            let partition = placed
+                .clone()
+                .unwrap_or_else(|| crate::store::first_partition_of(account_id).to_string());
+            let d = if self.groups.owns(&partition) {
+                self.of(&partition)
+            } else {
+                meridian_changes::databases::of_group(self.groups.mine(), self.count())
+            };
+            let store = self.database(d);
+            if let Some(partition) = &placed {
+                store.learn_placement(account_id, partition);
+            }
+            // A move's open in this database, the account closed in another:
+            // everything that one holds of it copied here first (step 3d;
+            // section 6.4, "a move between databases copies the data").
+            if crate::moves::is_open_key(idempotency_key) {
+                self.bring_in(account_id, d)?;
+            }
+            match store.act(account_id, message_id, idempotency_key, request, decide) {
+                // Its own group's partition headed elsewhere: moved home, or
+                // not yet -- routed again.
+                Err(StoreError::NotOwned { partition, group }) if group == self.groups.mine() => {
+                    self.route_again(&partition);
+                }
+                other => return other,
+            }
         }
-        // A move's open in this database, the account closed in another:
-        // everything that one holds of it copied here first (step 3d;
-        // section 6.4, "a move between databases copies the data").
-        if crate::moves::is_open_key(idempotency_key) {
-            self.bring_in(account_id)?;
-        }
-        self.own()
-            .act(account_id, message_id, idempotency_key, request, decide)
+        Err(StoreError::Held(format!(
+            "account {account_id}'s partition is switching between writer group {}'s databases: ask again in a moment",
+            self.groups.mine()
+        )))
     }
 
     fn group_of_partition(&self, partition: &str) -> u32 {
@@ -301,7 +424,13 @@ impl Store for Spread {
     }
 
     fn on_commit(&self, observer: Committed) -> bool {
-        self.own().on_commit(observer)
+        // Every database's commits: its group writes a partition where its
+        // head is (step 3d).
+        let observer: Arc<Committed> = Arc::new(observer);
+        self.stores.iter().all(|store| {
+            let observer = Arc::clone(&observer);
+            store.on_commit(Box::new(move |epoch, decided| observer(epoch, decided)))
+        })
     }
 
     fn writes(&self, account_id: &str) -> bool {
@@ -379,7 +508,12 @@ impl Store for Spread {
     }
 
     fn adopt(&self) -> Result<u64> {
-        self.own().adopt()
+        let epoch = self.own().adopt()?;
+        // Where its partitions' heads are ahead of home (step 3d).
+        for store in self.ahead_away()? {
+            store.adopt()?;
+        }
+        Ok(epoch)
     }
 
     fn epoch(&self) -> u64 {
@@ -387,7 +521,13 @@ impl Store for Spread {
     }
 
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
-        self.own().take_over(by)
+        let epoch = self.own().take_over(by)?;
+        // Its group's writer before fenced where its partitions' heads are
+        // ahead of home too (step 3d).
+        for store in self.ahead_away()? {
+            store.take_over(by)?;
+        }
+        Ok(epoch)
     }
 
     fn head_epoch(&self) -> Result<u64> {
