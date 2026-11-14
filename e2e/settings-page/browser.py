@@ -2095,9 +2095,13 @@ def the_resilience_page(browser, prefix):
                 ("split-partition", "#partitions tr[data-partition='kraken-1:daily'] button[data-dialog-open=split-partition]"),
                 ("move-account", "#partitions button[data-dialog-open=move-account]"),
             ]:
-                # Each from the tab's first page: the pager turns forward only.
-                page.goto(f"{RESILIENCE}#partitions")
-                settled(page)
+                # Each from the tab's first page: on_its_page turns forward
+                # only, and a hash alone reloads nothing.
+                page.evaluate("""() => {
+                  const pager = document.querySelector('#partitions om-pager');
+                  for (let i = 0; pager && i < 50; i++) pager.turn(-1);
+                }""")
+                page.wait_for_timeout(100)
                 row = opener.rsplit(" button", 1)[0]
                 if "tr[" in row:
                     on_its_page(page, row)
