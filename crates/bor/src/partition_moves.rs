@@ -158,10 +158,17 @@ pub struct Mover {
     under_way: Mutex<BTreeSet<String>>,
     /// One move at a time (section 6.8).
     one: Mutex<()>,
+    /// The deployment's clock, its records' times.
+    clock: Arc<dyn meridian_clock::Clock>,
 }
 
 impl Mover {
-    pub fn new(stores: Vec<Arc<PostgresStore>>, groups: Groups, settings: Settings) -> Self {
+    pub fn new(
+        stores: Vec<Arc<PostgresStore>>,
+        groups: Groups,
+        settings: Settings,
+        clock: Arc<dyn meridian_clock::Clock>,
+    ) -> Self {
         assert!(!stores.is_empty(), "a book has a database");
         Self {
             stores,
@@ -169,6 +176,7 @@ impl Mover {
             settings,
             under_way: Mutex::default(),
             one: Mutex::new(()),
+            clock,
         }
     }
 
@@ -271,7 +279,7 @@ impl Mover {
                     account_id: String::new(),
                     target_partition: String::new(),
                     cause: cause as i32,
-                    aborted_at_ns: now_ns(),
+                    aborted_at_ns: self.clock.now_ns(),
                 },
                 finding,
             )
@@ -352,7 +360,7 @@ impl Mover {
                     by_hand: asked.by_hand,
                     moved_by: asked.moved_by.clone(),
                     reason: asked.reason.clone(),
-                    moved_at_ns: now_ns(),
+                    moved_at_ns: self.clock.now_ns(),
                 }))
             }
             Switched::TimedOut => Ok(aborted(MoveAbortCause::Timeout, None)),
@@ -377,23 +385,12 @@ impl Mover {
                     "bor",
                     meridian_domain::v1::IntegrityCheck::MemberDigest,
                     &found,
-                    now_ns(),
+                    self.clock.now_ns(),
                 );
                 finding.check = meridian_domain::v1::IntegrityCheck::MemberDigest as i32;
                 Ok(aborted(MoveAbortCause::Digest, Some(finding)))
             }
         }
-    }
-}
-
-/// The deployment's time; the system's where no clock is set (a tool's, a
-/// test's).
-fn now_ns() -> i64 {
-    match meridian_changes::now_ns() {
-        0 => std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos() as i64),
-        now => now,
     }
 }
 

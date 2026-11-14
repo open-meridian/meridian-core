@@ -3529,6 +3529,7 @@ fn two_members(url: &str) -> TwoMembers {
             switch: std::time::Duration::from_secs(2),
             ..Default::default()
         },
+        Arc::new(meridian_clock::SystemClock),
     );
     (broker, [zero, one], mover)
 }
@@ -3735,7 +3736,12 @@ async fn a_book_partition_move_aborts_for_lag_timeout_and_digest_and_the_source_
     std::fs::create_dir_all(&files).unwrap();
     let (lag_file, digest_file) = (files.join("lag"), files.join("digest"));
     let mover = |settings: Settings| {
-        Mover::new(vec![Arc::clone(&zero_store)], zero_store.groups(), settings)
+        Mover::new(
+            vec![Arc::clone(&zero_store)],
+            zero_store.groups(),
+            settings,
+            Arc::new(meridian_clock::SystemClock),
+        )
     };
     let short = Settings {
         switch: std::time::Duration::from_secs(1),
@@ -3922,6 +3928,7 @@ async fn a_book_partition_moved_between_databases_under_load_is_copied_and_switc
             switch: std::time::Duration::from_secs(10),
             ..Default::default()
         },
+        Arc::new(meridian_clock::SystemClock),
     );
     let ended = blocking(|| {
         mover.begin(&partition);

@@ -412,6 +412,7 @@ fn run() -> Result<(), String> {
                 every_database.clone(),
                 groups,
                 meridian_bor::partition_moves::Settings::from_env(),
+                clock(),
             ));
             meridian_bor::partition_moves::serve(&bus, &store, &mover);
             // A changed count of writer groups (section 6.8, Triggers): each
