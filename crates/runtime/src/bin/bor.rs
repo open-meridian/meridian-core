@@ -291,8 +291,10 @@ fn run() -> Result<(), String> {
                         tracing::info!(pinned, "each partition named its writer group");
                     }
                 }
-                store.read_owners().map_err(|failed| failed.to_string())?;
             }
+            // By the furthest head over every database (CI 43626539705).
+            PostgresStore::read_owners_from(&every_database)
+                .map_err(|failed| failed.to_string())?;
             Ok(())
         })?;
         let epoch = tokio::task::block_in_place(|| {
@@ -347,10 +349,8 @@ fn run() -> Result<(), String> {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let stores = reading.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        for store in &stores {
-                            if let Err(failed) = store.read_owners() {
-                                tracing::debug!(%failed, "the writer groups were not read again");
-                            }
+                        if let Err(failed) = PostgresStore::read_owners_from(&stores) {
+                            tracing::debug!(%failed, "the writer groups were not read again");
                         }
                     })
                     .await;

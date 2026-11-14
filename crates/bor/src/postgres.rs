@@ -1819,15 +1819,37 @@ impl PostgresStore {
                 group: self.groups.mine(),
             }));
         }
+        let mut epoch = held.get::<_, i64>(1) as u64;
+        // A head never written, made at the control partition's epoch for
+        // a partition another group owns (make_partitions, a raised
+        // `bor.partitions`): taken at its owner's epoch by its first batch,
+        // where this writer holds its group's epoch now (step 3d; CI
+        // 43626539705, an account's move into P1 refused "fenced ... this
+        // writer's 2, the partition's 1"). No entry is under it to protect,
+        // and a deposed writer of the group, its epoch not the group's, is
+        // still fenced.
+        let mine = self.fence.epoch();
+        if held.get::<_, i64>(0) == 0
+            && epoch != mine
+            && self.groups.several()
+            && self.groups.owns(partition)
+            && own_epoch(&mut tx, self.groups.mine()).map_err(Unbatched::Whole)? == Some(mine)
+        {
+            tx.execute(
+                "UPDATE book_partition_head SET epoch = $2 WHERE partition = $1",
+                &[&partition, &(mine as i64)],
+            )
+            .map_err(whole)?;
+            epoch = mine;
+        }
         self.fence
-            .admits(held.get::<_, i64>(1) as u64)
+            .admits(epoch)
             .map_err(|fenced| Unbatched::Whole(fenced.into()))?;
         // The epoch the entries are committed under: the head row's, which
         // the fence has just admitted as the writer's own -- never one read
         // before the connection was taken, which a connection opened on a
         // new database timeline raises (contract v30, stage C; failover-
         // repeat 43015006850, torn-write).
-        let epoch = held.get::<_, i64>(1) as u64;
         let mut head = held.get::<_, i64>(0).max(0) as u64;
         // The partition's last digest, its chain's end (step 3b).
         let mut last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
@@ -4052,15 +4074,40 @@ impl PostgresStore {
         if !self.groups.several() {
             return Ok(());
         }
-        if let Some(row) = self
-            .conn()?
-            .query_opt(
-                "SELECT writer_group FROM book_partition_head WHERE partition = $1",
-                &[&partition],
-            )
-            .map_err(unavailable)?
-        {
-            let named = row.get::<_, Option<i32>>(0).map(|group| group as u32);
+        // Where the book has several databases, the head furthest on names
+        // it, as [`Self::read_owners_from`] reads every partition: a raised
+        // count's new database holds an empty head of each (CI 43626539705).
+        let linked: Vec<Arc<PostgresStore>> = self
+            .databases
+            .get()
+            .map(|stores| stores.iter().filter_map(std::sync::Weak::upgrade).collect())
+            .unwrap_or_default();
+        let mut furthest: Option<(i64, Option<u32>)> = None;
+        let mut read = |store: &PostgresStore| -> Result<()> {
+            if let Some(row) = store
+                .conn()?
+                .query_opt(
+                    "SELECT writer_group, sequence FROM book_partition_head WHERE partition = $1",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+            {
+                let named = row.get::<_, Option<i32>>(0).map(|group| group as u32);
+                let sequence: i64 = row.get(1);
+                if furthest.is_none_or(|(held, _)| held < sequence) {
+                    furthest = Some((sequence, named));
+                }
+            }
+            Ok(())
+        };
+        if linked.len() > 1 {
+            for store in &linked {
+                read(store)?;
+            }
+        } else {
+            read(self)?;
+        }
+        if let Some((_, named)) = furthest {
             self.groups.assign(partition, named);
         }
         Ok(())
@@ -4087,6 +4134,50 @@ impl PostgresStore {
                 .assign(row.get::<_, &str>(0), Some(group as u32));
         }
         Ok(rows.len())
+    }
+
+    /// Each partition's writer group as its furthest head names it, over
+    /// every database of the book, read into each store's view (step 3d;
+    /// CI 43626539705). A database brought by a raised `bor.databases`
+    /// holds a head of every partition at 0, named by its rendezvous owner
+    /// when pinned; read one database after another, the last named won,
+    /// and a partition moved by hand in the first read as its rendezvous
+    /// owner's again: that group wrote it from an empty head (P0 to group
+    /// 1, "writer group 1 owns P0 already", and P0's entries numbered
+    /// twice). The head furthest on is where the partition is written; on
+    /// a tie, the first database's. Says how many were named.
+    pub fn read_owners_from(stores: &[Arc<PostgresStore>]) -> Result<usize> {
+        if !stores.first().is_some_and(|store| store.groups.several()) {
+            return Ok(0);
+        }
+        let mut furthest: std::collections::BTreeMap<String, (i64, u32)> =
+            std::collections::BTreeMap::new();
+        for store in stores {
+            for row in store
+                .conn()?
+                .query(
+                    "SELECT partition, writer_group, sequence FROM book_partition_head
+                      WHERE writer_group IS NOT NULL",
+                    &[],
+                )
+                .map_err(unavailable)?
+            {
+                let (partition, group, sequence): (String, i32, i64) =
+                    (row.get(0), row.get(1), row.get(2));
+                match furthest.get(&partition) {
+                    Some((held, _)) if *held >= sequence => {}
+                    _ => {
+                        furthest.insert(partition, (sequence, group as u32));
+                    }
+                }
+            }
+        }
+        for store in stores {
+            for (partition, (_, group)) in &furthest {
+                store.groups.assign(partition, Some(*group));
+            }
+        }
+        Ok(furthest.len())
     }
 
     /// Each partition whose `writer_group` is NULL given its rendezvous

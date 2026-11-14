@@ -4752,6 +4752,118 @@ async fn a_partition_moved_away_while_its_group_looks_at_the_timeline_steps_no_m
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// A partition never written, its head made at the control partition's
+/// epoch as a raised `bor.partitions` makes it, is written by its owner
+/// group past the first at that group's epoch, never fenced (step 3d; CI
+/// 43626539705: an account's move into P1 refused "fenced ... this writer's
+/// 2, the partition's 1"). The test harness's `apart` hid it: it gives
+/// every head its owner's epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_made_at_controls_epoch_is_written_by_its_owner_unfenced() {
+    use meridian_changes::groups::owner;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], _mover) = blocking(|| two_members(&url));
+    let ones: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| owner(p, 2) == 1)
+        .collect();
+    let (written, partition) = (ones[0].clone(), ones[1].clone());
+    // Group 1's member writes first, so it holds its epoch before the
+    // partition's head is made, as a raised count makes it on a deployment
+    // already running.
+    let first = (0..)
+        .map(|n| unique(&format!("ACC-PFIRST-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == written)
+        .unwrap();
+    blocking(|| one_store.place_first(&first, &first)).unwrap();
+    open(&one, &first, "INS-AAPL").await;
+    // As make_partitions made it: never written, at control's epoch.
+    blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET epoch = 10, writer_group = NULL
+                  WHERE partition = $1 AND sequence = 0",
+                &[&partition],
+            )
+            .unwrap()
+    });
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-PMADE-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == partition)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    send(
+        &one,
+        RECORD_OPENING_BALANCE,
+        &opening(&account, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .expect("written by its owner, never fenced");
+    // Group 1's own epoch, as its row holds it once its member adopted.
+    let held: i64 = blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT epoch FROM book_writer_group WHERE writer_group = 1",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    });
+    blocking(|| {
+        let tip = zero_store.tip(&partition).unwrap().unwrap();
+        let now = Store::epoch(one_store.as_ref());
+        eprintln!("pmade: held {held}, now {now}, the head's {}", tip.epoch);
+        assert_eq!(tip.epoch, now, "at its owner's epoch");
+        assert_eq!(now, held as u64, "group 1's own epoch: no takeover");
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
+/// A book whose `bor.databases` was raised reads each partition's writer
+/// group from its furthest head (step 3d; CI 43626539705): the new
+/// database's empty head of P0, pinned to its rendezvous owner, never names
+/// it over the head where P0 was moved by hand and is written. Before, read
+/// one database after another, the last won: group 1 took P0 as its own
+/// and numbered its entries again from 0.
+#[test]
+fn a_raised_database_count_reads_each_partitions_owner_from_its_furthest_head() {
+    use meridian_changes::groups::{owner, Groups};
+    assert_eq!(owner("P0", 2), 1, "P0's rendezvous owner is group 1");
+    let (first, _) = isolated();
+    let (second, _) = isolated();
+    let groups = Groups::new(1, 2).unwrap();
+    let store = |url: &str| Arc::new(PostgresStore::connect(url, 2).unwrap().with_groups(groups));
+    let stores = vec![store(&first), store(&second)];
+    let set = |url: &str, sql: &str| {
+        postgres::Client::connect(url, postgres::NoTls)
+            .unwrap()
+            .batch_execute(sql)
+            .unwrap()
+    };
+    // Moved by hand to group 0 and written there; the new database's head
+    // of it empty, pinned to group 1.
+    set(
+        &first,
+        "UPDATE book_partition_head SET sequence = 5, writer_group = 0 WHERE partition = 'P0'",
+    );
+    set(
+        &second,
+        "UPDATE book_partition_head SET writer_group = 1 WHERE partition = 'P0'",
+    );
+    PostgresStore::read_owners_from(&stores).unwrap();
+    assert_eq!(groups.owner("P0"), 0, "by the head furthest on");
+    // One partition read again, from either database: the same.
+    groups.assign("P0", None);
+    for store in &stores {
+        store.link_databases(&stores);
+    }
+    stores[1].read_owner("P0").unwrap();
+    assert_eq!(groups.owner("P0"), 0, "read again where its head is");
+}
+
 /// A deployment installed at two writer groups starts each partition with
 /// its rendezvous owner, pinned at the control partition's group's start:
 /// no partition moves and no PartitionMoved is recorded, as no owner
