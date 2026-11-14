@@ -232,8 +232,9 @@ impl StoreError {
                 &[field.to_string()],
                 words,
             ),
-            StoreError::Held(words) => meridian_bus::refusal_status_retrying(
-                meridian_bus::RefusalStatus::Unavailable,
+            // Held past the hold (section 6.8): OVERLOADED, its retry-after.
+            StoreError::Held(words) => meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
                 crate::moves::HELD_RETRY_SECONDS,
                 words,
             ),

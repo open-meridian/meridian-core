@@ -28,9 +28,47 @@ use crate::decide::{Context, Draft, Made};
 use crate::journal::{Body, ACCOUNT_MOVED};
 use crate::store::{Result, StoreError};
 
-/// How long an act on an account waits, at most, while its move is between
-/// its close and its open: the retry-after it is answered with.
+/// The retry-after an act held past the hold is answered with.
 pub const HELD_RETRY_SECONDS: u32 = 1;
+
+/// The hold's default, `moves.holdSeconds` (section 6.8).
+pub const HOLD_SECONDS: u64 = 5;
+
+/// The variable the chart sets from `moves.holdSeconds` (approved
+/// 2026-11-14).
+pub const HOLD_SECONDS_VAR: &str = "MERIDIAN_MOVES_HOLD_SECONDS";
+
+/// How long an act on an account between its move's close and its open
+/// waits for the open (section 6.8, the hold): `moves.holdSeconds` as the
+/// chart sets it, else its default.
+pub fn hold() -> std::time::Duration {
+    static HOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::time::Duration::from_secs(
+            std::env::var(HOLD_SECONDS_VAR)
+                .ok()
+                .and_then(|said| said.trim().parse().ok())
+                .unwrap_or(HOLD_SECONDS),
+        )
+    })
+}
+
+/// An act tried again while its account is held, for at most `limit`
+/// (section 6.8, the hold): its writes wait for the move's open, never
+/// refused inside the hold; past it, refused OVERLOADED with a retry-after.
+pub fn holding<T>(limit: std::time::Duration, mut act: impl FnMut() -> Result<T>) -> Result<T> {
+    let until = std::time::Instant::now() + limit;
+    let mut wait = std::time::Duration::from_millis(5);
+    loop {
+        match act() {
+            Err(StoreError::Held(_)) if std::time::Instant::now() + wait < until => {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// The close's idempotency key: one close for each move of the account to
 /// that partition from where it is.
@@ -345,5 +383,52 @@ pub fn record(
     };
     if let Err(failed) = crate::control::journal_one(bus, store, &owed) {
         tracing::debug!(%failed, "the account's move is journalled in control by its writer");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// An act held while its account moves is tried again until the open,
+    /// never refused inside the hold; past it, refused OVERLOADED with a
+    /// retry-after (section 6.8).
+    #[test]
+    fn a_held_act_waits_for_the_open_and_past_the_hold_is_overloaded() {
+        let mut tries = 0;
+        let acted = holding(Duration::from_secs(5), || {
+            tries += 1;
+            if tries < 3 {
+                Err(StoreError::Held("moving".into()))
+            } else {
+                Ok(tries)
+            }
+        });
+        assert_eq!(acted.unwrap(), 3);
+        let started = std::time::Instant::now();
+        let held = holding(Duration::from_millis(60), || -> Result<()> {
+            Err(StoreError::Held("account ACC-1 is moving to P1".into()))
+        })
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let said = held.on_the_bus();
+        assert_eq!(
+            meridian_bus::refusal_retry_after(&said),
+            Some(HELD_RETRY_SECONDS),
+            "{said}"
+        );
+        assert!(
+            said.contains(&(meridian_pb::v1::RefusalReason::Overloaded as i32).to_string()),
+            "{said}"
+        );
+        // Anything else is answered at once.
+        let mut once = 0;
+        let refused = holding(Duration::from_secs(5), || -> Result<()> {
+            once += 1;
+            Err(StoreError::Invalid("no".into()))
+        });
+        assert!(refused.is_err() && once == 1);
+        assert_eq!(hold(), Duration::from_secs(HOLD_SECONDS));
     }
 }

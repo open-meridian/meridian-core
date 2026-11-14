@@ -1923,8 +1923,9 @@ impl PostgresStore {
     }
 }
 
-impl Store for PostgresStore {
-    fn act(
+impl PostgresStore {
+    /// One try of [`Store::act`].
+    fn act_once(
         &self,
         account_id: &str,
         message_id: &str,
@@ -1999,6 +2000,23 @@ impl Store for PostgresStore {
         Err(StoreError::Unavailable(format!(
             "account {account_id} was found in another partition {MOVES_FOLLOWED} times while it was acted on"
         )))
+    }
+}
+
+impl Store for PostgresStore {
+    fn act(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // Held while its move is between its close and its open (step 3d;
+        // section 6.8): tried again for at most the hold.
+        crate::moves::holding(crate::moves::hold(), || {
+            self.act_once(account_id, message_id, idempotency_key, request, decide)
+        })
     }
 
     fn writes(&self, account_id: &str) -> bool {

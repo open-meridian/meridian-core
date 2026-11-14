@@ -145,19 +145,9 @@ impl MemoryStore {
     }
 }
 
-impl Store for MemoryStore {
-    fn partition_count(&self) -> u32 {
-        self.partitions
-    }
-
-    fn partition_of(&self, account_id: &str) -> Option<String> {
-        let state = self.state();
-        let book = state.books.get(account_id)?;
-        // Between a move's close and its open: its new partition's (step 3d).
-        Some(moving_to(book).unwrap_or_else(|| book.partition.clone()))
-    }
-
-    fn act(
+impl MemoryStore {
+    /// One try of [`Store::act`].
+    fn act_once(
         &self,
         account_id: &str,
         message_id: &str,
@@ -268,6 +258,34 @@ impl Store for MemoryStore {
         kept.release_bodies();
         state.books.insert(account_id.to_string(), kept);
         Ok(Acted::Committed(Box::new(decided)))
+    }
+}
+
+impl Store for MemoryStore {
+    fn partition_count(&self) -> u32 {
+        self.partitions
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        let state = self.state();
+        let book = state.books.get(account_id)?;
+        // Between a move's close and its open: its new partition's (step 3d).
+        Some(moving_to(book).unwrap_or_else(|| book.partition.clone()))
+    }
+
+    fn act(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // Held while its move is between its close and its open (step 3d;
+        // section 6.8): tried again for at most the hold.
+        crate::moves::holding(crate::moves::hold(), || {
+            self.act_once(account_id, message_id, idempotency_key, request, decide)
+        })
     }
 
     fn book(&self, account_id: &str) -> Result<Book> {

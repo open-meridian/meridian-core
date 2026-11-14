@@ -2904,6 +2904,15 @@ chart-check:
 		&& { echo "chart-check FAILED: bor.databases=2 rendered on a database somebody else runs with no group Secret named" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.databases=0 >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: bor.databases=0 rendered; one database at least" >&2; exit 1; }; true
+	@# Step 3d, stage M (section 6.8; MERIDIAN_MOVES_HOLD_SECONDS approved
+	@# 2026-11-14): the book's members told moves.holdSeconds, the hold an
+	@# act waits while its account moves.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for hold in 5 8; do \
+		set="$$( [ $$hold = 5 ] || echo --set moves.holdSeconds=$$hold )"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_HOLD_SECONDS$$" | grep -q "value: \"$$hold\"" \
+			|| { echo "chart-check FAILED: the book's members are not told moves.holdSeconds, $$hold, as MERIDIAN_MOVES_HOLD_SECONDS (step 3d)" >&2; exit 1; }; \
+	done
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and
