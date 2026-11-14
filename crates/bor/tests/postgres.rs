@@ -3454,9 +3454,12 @@ fn apart(url: &str) {
     for n in 0..8 {
         let partition = meridian_bor::store::partition_named(n);
         let epoch = 10 + 10 * meridian_changes::groups::owner(&partition, 2) as i64;
+        // Pinned to a group already: that group's epoch.
         admin
             .execute(
-                "UPDATE book_partition_head SET epoch = $2 WHERE partition = $1",
+                "UPDATE book_partition_head
+                    SET epoch = coalesce(10 + 10 * writer_group::bigint, $2)
+                  WHERE partition = $1",
                 &[&partition, &epoch],
             )
             .unwrap();
@@ -3546,7 +3549,9 @@ fn writing(
             let request = SetAccountAttributeRequest {
                 account_id: account.clone(),
                 attribute: Some(
-                    set_account_attribute_request::Attribute::WaitsForCompliance(n.is_multiple_of(2)),
+                    set_account_attribute_request::Attribute::WaitsForCompliance(
+                        n.is_multiple_of(2),
+                    ),
                 ),
                 reason: format!("write {n}"),
             };
@@ -4012,4 +4017,71 @@ async fn a_book_partition_moved_between_databases_under_load_is_copied_and_switc
             .unwrap();
     });
     blocking(move || drop((zero, one, bus_zero, bus_one, mover)));
+}
+
+/// A changed count of writer groups moves each partition its rendezvous
+/// owner at the new count is another group's, once, by_hand false (section
+/// 6.8, Triggers): the heads pinned at one group keep every partition with
+/// group 0 until the move, and a second pass moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_changed_count_of_writer_groups_moves_each_partition_once() {
+    use meridian_bor::partition_moves::{rebalance, Ended};
+    use meridian_changes::groups::{owner, Groups};
+    let (url, migrated) = blocking(isolated);
+    // Started at one group: every head pinned to group 0.
+    blocking(|| {
+        let one = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(0, 1).unwrap())
+            .with_partitions(8);
+        one.make_partitions(8).unwrap();
+        assert_eq!(one.pin_owners().unwrap(), 8);
+    });
+    // Raised to two: nothing has jumped.
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    blocking(|| {
+        for n in 0..8 {
+            let p = meridian_bor::store::partition_named(n);
+            assert_eq!(
+                zero_store.tip(&p).unwrap().unwrap().writer_group,
+                Some(0),
+                "{p}"
+            );
+        }
+    });
+    let ended = blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    let wanted: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| owner(p, 2) == 1)
+        .collect();
+    let moved: Vec<String> = ended
+        .iter()
+        .map(|e| match e {
+            Ended::Moved(m) => {
+                assert!(!m.by_hand && m.moved_by.is_empty() && m.reason.is_empty());
+                assert_eq!((m.from_group, m.to_group), (0, 1));
+                m.partition.clone()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(moved, wanted);
+    blocking(|| {
+        assert!(rebalance(&zero, zero_store.as_ref(), &mover).is_empty());
+        for p in &wanted {
+            assert_eq!(zero_store.tip(p).unwrap().unwrap().writer_group, Some(1));
+        }
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        let records = control
+            .iter()
+            .filter(|e| {
+                e.idempotency_key
+                    .starts_with("control-record:partition-moved:")
+            })
+            .count();
+        assert_eq!(records, wanted.len());
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }

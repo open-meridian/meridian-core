@@ -528,3 +528,39 @@ pub fn serve(bus: &Arc<meridian_bus::Bus>, store: &Arc<dyn Store>, mover: &Arc<M
         ))
     });
 }
+
+/// The moves a changed count of writer groups calls for (section 6.8,
+/// Triggers; question 10): each partition whose head names another group
+/// than its rendezvous owner at the count now, moved to it one at a time,
+/// warm-up first, by_hand false; each record journalled. A partition a move
+/// is under way of is left to it. Says what each move ended as.
+pub fn rebalance(bus: &meridian_bus::Bus, store: &dyn Store, mover: &Mover) -> Vec<Ended> {
+    let count = mover.stores[0].partition_count().max(1);
+    let mut ended = Vec::new();
+    for n in 0..count {
+        let partition = crate::store::partition_named(n);
+        let wanted = meridian_changes::groups::owner(&partition, mover.groups.count());
+        let now = match mover.owner_now(&partition) {
+            Ok(now) => now,
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a partition's owner was not read");
+                continue;
+            }
+        };
+        if now == wanted || !mover.begin(&partition) {
+            continue;
+        }
+        match mover.run(&partition, wanted, &Asked::default()) {
+            Ok(done) => {
+                journal(bus, store, &done);
+                ended.push(done);
+            }
+            Err(failed) => tracing::warn!(
+                partition,
+                %failed,
+                "a partition's move by the changed count stopped: the source still owns it"
+            ),
+        }
+    }
+    ended
+}

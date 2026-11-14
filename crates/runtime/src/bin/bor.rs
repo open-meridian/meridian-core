@@ -414,6 +414,32 @@ fn run() -> Result<(), String> {
                 meridian_bor::partition_moves::Settings::from_env(),
             ));
             meridian_bor::partition_moves::serve(&bus, &store, &mover);
+            // A changed count of writer groups (section 6.8, Triggers): each
+            // partition its head names for another group than its owner at
+            // the count now moved to it, one at a time, at start and each
+            // minute after.
+            if groups.several() {
+                let (bus, store, mover) = (bus.clone(), Arc::clone(&store), Arc::clone(&mover));
+                meridian_runtime::background(async move {
+                    loop {
+                        let (bus, store, mover) =
+                            (bus.clone(), Arc::clone(&store), Arc::clone(&mover));
+                        let moved = tokio::task::spawn_blocking(move || {
+                            meridian_bor::partition_moves::rebalance(&bus, store.as_ref(), &mover)
+                                .len()
+                        })
+                        .await
+                        .unwrap_or(0);
+                        if moved > 0 {
+                            tracing::info!(
+                                moved,
+                                "partitions moved by the changed count of writer groups"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
         }
         // The start's snapshots (v26; W9.10): every account whose journal
         // since its latest snapshot of this format reaches the interval --
