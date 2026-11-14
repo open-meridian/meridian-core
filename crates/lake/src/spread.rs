@@ -145,6 +145,19 @@ impl Spread {
         Ok(away)
     }
 
+    /// The furthest position kept under `key` in any database.
+    fn furthest_position(&self, key: &str) -> Result<Option<WriteAheadPosition>> {
+        let mut furthest: Option<WriteAheadPosition> = None;
+        for store in &self.stores {
+            if let Some(at) = store.write_ahead_position(key)? {
+                if furthest.is_none_or(|held| at.sequence > held.sequence) {
+                    furthest = Some(at);
+                }
+            }
+        }
+        Ok(furthest)
+    }
+
     /// `partition` routed again by its head from now on: a write found it
     /// moved home.
     fn route_again(&self, partition: &str) {
@@ -545,12 +558,33 @@ impl Store for Spread {
     }
 
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        if let Some(at) = self.own().write_ahead_position(stream)? {
+            return Ok(Some(at));
+        }
+        // None at home: its group committed in another database before the
+        // count was raised (step 3d; "lake loss is re-sent, never silent").
+        // That position is carried home with nothing else, so the writer
+        // goes on from it and a run the stream dropped past it is a gap --
+        // never mistaken for a group's first start.
+        let Some(at) = self.furthest_position(stream)? else {
+            return Ok(None);
+        };
+        self.own().record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.to_string(),
+                after: None,
+                through: at,
+                ..Default::default()
+            },
+            meridian_changes::now_ns(),
+        )?;
         self.own().write_ahead_position(stream)
     }
 
-    fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
-        self.database(meridian_changes::databases::of_group(group, self.count()))
-            .write_ahead_position(key)
+    fn group_position(&self, key: &str, _group: u32) -> Result<Option<WriteAheadPosition>> {
+        // Wherever the group keeps it: home, or where it was before the
+        // count was raised (step 3d).
+        self.furthest_position(key)
     }
 
     fn record_write_ahead(
@@ -604,7 +638,26 @@ impl Store for Spread {
     }
 
     fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
-        self.own().write_ahead_found(stream)
+        // Every database's: a group's runs and valid times found before the
+        // count was raised are still its own (step 3d).
+        let (mut dropped, mut valid) = self.own().write_ahead_found(stream)?;
+        for store in &self.stores {
+            if Arc::ptr_eq(store, self.own()) {
+                continue;
+            }
+            let (more, times) = store.write_ahead_found(stream)?;
+            for run in more {
+                if !dropped.iter().any(|held| held.first == run.first) {
+                    dropped.push(run);
+                }
+            }
+            for (dataset, at) in times {
+                let held = valid.entry(dataset).or_insert(at);
+                *held = (*held).max(at);
+            }
+        }
+        dropped.sort_by_key(|run| run.first);
+        Ok((dropped, valid))
     }
 
     fn record_gap(&self, gap: &meridian_domain::v1::DatasetGap) -> Result<()> {

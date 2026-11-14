@@ -245,12 +245,16 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
-        // A writer group past the first with no position of its own -- its
-        // first start, after `writerGroups` was raised (step 3d; section
-        // 6.1; CI 43615034712) -- takes from the first write the stream
-        // still holds: the writes before it were group 0's to take, and
-        // were taken, so none is counted dropped. Its datasets' writes in
-        // the stream are taken again, and each row is recorded once.
+        // A writer group past the first that has never committed -- no
+        // position of its own in any of the lake's databases (a position is
+        // committed with its batch's rows), so its first start after
+        // `writerGroups` was raised (step 3d; section 6.1; CI 43615034712)
+        // -- takes from the first write the stream still holds: the writes
+        // before it were group 0's to take, and were taken, so none is
+        // counted dropped. Its datasets' writes in the stream are taken
+        // again, and each row is recorded once. A group that has committed
+        // goes on from its position, and a run the stream dropped past it
+        // is a gap, as for group 0.
         let fresh = self.position.is_none() && self.from.is_none() && self.lake.groups().mine() > 0;
         let mut expected = if fresh {
             taken[0].sequence

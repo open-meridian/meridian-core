@@ -594,6 +594,24 @@ async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_stream
         gaps(&h, "", GapState::Unspecified).is_empty(),
         "no gap recorded"
     );
+    // Committed since: the stream aging past its position later is a gap
+    // it marks, as group 0 would ("lake loss is re-sent, never silent").
+    let mut again = tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    tokio::task::block_in_place(|| again.take(vec![write(2_500)])).unwrap();
+    let (dropped, _) = h.store.write_ahead_found(&key(owning)).unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(1_811, 2_499)],
+        "a group that has committed marks the run past its position"
+    );
+    assert_eq!(
+        gaps(&h, "", GapState::Unspecified).len(),
+        1,
+        "its gap recorded"
+    );
     // Group 0, with no position, never took 1 to 1,809: those it finds.
     let mut zero = tokio::task::block_in_place(|| Writer::start(lake_of(0), STREAM)).unwrap();
     tokio::task::block_in_place(|| zero.take(vec![write(1_811)])).unwrap();

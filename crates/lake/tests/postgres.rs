@@ -7217,3 +7217,76 @@ fn a_raised_lake_database_count_writes_where_each_head_is_and_moves_each_range_h
         }
     }
 }
+
+/// A writer group's place in the write-ahead stream, committed in the
+/// first database before the lake's database count was raised (step 3d;
+/// "lake loss is re-sent, never silent"): its member over two databases
+/// reads it from where it was, carries it to its group's home, and so goes
+/// on from it -- a run the stream dropped past it is a gap, never taken for
+/// a group's first start -- with the runs it found there.
+#[test]
+fn a_groups_stream_position_is_carried_home_when_the_database_count_is_raised() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::store::{Dropped, WriteAheadBatch, WriteAheadPosition};
+    let urls = two_databases();
+    let key = unique("LAKE_WRITE_AHEAD.group-1");
+    let run = Dropped {
+        first: 3,
+        last: 4,
+        after_at_ns: 2,
+        until_at_ns: 5,
+        gap_id: unique("GAP-CARRIED"),
+    };
+    {
+        let one = PostgresStore::connect(&urls[0], 2)
+            .unwrap()
+            .with_groups(Groups::new(1, 2).unwrap());
+        one.adopt().unwrap();
+        one.record_write_ahead(
+            WriteAheadBatch {
+                stream: key.clone(),
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 7,
+                    at_ns: 70,
+                },
+                dropped: vec![run.clone()],
+                ..Default::default()
+            },
+            1_000,
+        )
+        .unwrap();
+    }
+    let groups = Groups::new(1, 2).unwrap();
+    let stores: Vec<Arc<PostgresStore>> = urls
+        .iter()
+        .enumerate()
+        .map(|(d, url)| {
+            Arc::new(
+                PostgresStore::connect(url, 2)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_databases(2)
+                    .in_database(d as u32),
+            )
+        })
+        .collect();
+    let one = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    one.adopt().unwrap();
+    assert_eq!(stores[1].write_ahead_position(&key).unwrap(), None);
+    let at = one
+        .write_ahead_position(&key)
+        .unwrap()
+        .map(|at| at.sequence);
+    assert_eq!(at, Some(7), "read from where it was");
+    assert_eq!(
+        stores[1]
+            .write_ahead_position(&key)
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(7),
+        "carried home"
+    );
+    let (found, _) = one.write_ahead_found(&key).unwrap();
+    assert_eq!(found, vec![run]);
+}
