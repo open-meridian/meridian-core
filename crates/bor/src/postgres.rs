@@ -51,42 +51,79 @@ thread_local! {
     /// The heads its snapshots read, the lowest of each where it took more
     /// than one.
     static SNAPSHOT_HEADS: std::cell::RefCell<Option<Mark>> = const { std::cell::RefCell::new(None) };
-    /// The partitions this database writes, where a read of every account
-    /// fans out over several databases ([`answering_for`]).
-    static WRITTEN_HERE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    /// This database's share of a read of every account that fans out over
+    /// several databases ([`answering_for`]).
+    static WRITTEN_HERE: std::cell::RefCell<Option<Share>> = const { std::cell::RefCell::new(None) };
 }
 
-/// `read` on this thread answering only the accounts placed in
-/// `partitions` -- those this database writes -- in a read of every account
-/// over several databases (step 3d; the review's C5): each partition's
-/// accounts from the database writing it, so none is read twice, a move's
-/// copy in another database included, even for the moment of a switch.
-pub fn answering_for<T>(partitions: &[String], read: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Vec<String>>);
+/// A database's share of a read of every account over several databases
+/// (step 3d; the review's C5): the accounts placed in the partitions it
+/// writes, but those it is told to leave to another, and the accounts it
+/// is told to answer for besides -- an account between its move's close and
+/// its open, whose close here names a target that holds nothing of it yet,
+/// read here at its source and left out at its target (m9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Share {
+    /// The partitions this database writes.
+    pub partitions: Vec<String>,
+    /// Accounts answered here besides: closed here toward a database that
+    /// has not opened them.
+    pub also: Vec<String>,
+    /// Accounts placed in a partition written here left out: another
+    /// database answers for them.
+    pub not: Vec<String>,
+}
+
+/// `read` on this thread answering only the accounts of `share` -- those
+/// placed in the partitions this database writes -- in a read of every
+/// account over several databases (step 3d; the review's C5): each
+/// partition's accounts from the database writing it, so none is read
+/// twice, a move's copy in another database included, even for the moment
+/// of a switch; and an account between its close and its open from its
+/// source, so none is missed (m9).
+pub fn answering_for<T>(share: &Share, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Share>);
     impl Drop for Restore {
         fn drop(&mut self) {
             let before = self.0.take();
             WRITTEN_HERE.with(|written| *written.borrow_mut() = before);
         }
     }
-    let _restore = Restore(WRITTEN_HERE.with(|written| written.replace(Some(partitions.to_vec()))));
+    let _restore = Restore(WRITTEN_HERE.with(|written| written.replace(Some(share.clone()))));
     read()
 }
 
-/// A read's condition on `column`, an account: placed in a partition this
-/// database writes, under [`answering_for`]; nothing otherwise. In the
-/// read's own statement, so its rows and their placements are one snapshot.
+/// `values` as a SQL text array's literal.
+fn text_array(values: &[String]) -> String {
+    format!(
+        "ARRAY[{}]::text[]",
+        values
+            .iter()
+            .map(|value| format!("'{}'", value.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// A read's condition on `column`, an account: in this database's share,
+/// under [`answering_for`]; nothing otherwise. In the read's own statement,
+/// so its rows and their placements are one snapshot.
 fn written_here(column: &str) -> String {
     WRITTEN_HERE.with(|written| match &*written.borrow() {
         None => String::new(),
-        Some(partitions) => format!(
-            "AND {column} IN (SELECT account_id FROM book_account WHERE partition = ANY(ARRAY[{}]::text[]))",
-            partitions
-                .iter()
-                .map(|partition| format!("'{}'", partition.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        Some(share) => {
+            let mut placed = format!(
+                "{column} IN (SELECT account_id FROM book_account WHERE partition = ANY({}))",
+                text_array(&share.partitions)
+            );
+            if !share.not.is_empty() {
+                placed = format!("({placed} AND {column} <> ALL({}))", text_array(&share.not));
+            }
+            if !share.also.is_empty() {
+                placed = format!("({placed} OR {column} = ANY({}))", text_array(&share.also));
+            }
+            format!("AND {placed}")
+        }
     })
 }
 
@@ -3663,12 +3700,24 @@ fn anchor_of(
 /// Whether `groups`' group owns the head `row` (its partition, then its
 /// `writer_group`): the group the row names, else the rendezvous owner
 /// (step 3d; ruled 2026-11-14). Read from the row, never the member's view,
-/// so an epoch is raised only on what the group owns now.
+/// so an epoch is raised only on what the group owns now -- and never
+/// written into that view: a database the partition is not written in
+/// holds a head of it at 0 named by its rendezvous owner (a raised
+/// `bor.databases`), which is not its owner (PR CI 43648472142, tolerant:
+/// group 1 took group 0's P0 for its own and read an account's journal
+/// where none is). The view is each partition's furthest head's, as
+/// `read_owners_from` and a batch under its head's lock read it.
 fn owned_in_row(groups: Groups, row: &Row) -> bool {
     let partition: String = row.get(0);
-    let named = row.get::<_, Option<i32>>(1).map(|group| group as u32);
-    groups.assign(&partition, named);
-    groups.owns(&partition)
+    if partition == CONTROL_PARTITION {
+        return groups.holds_control();
+    }
+    let owner = row
+        .get::<_, Option<i32>>(1)
+        .map(|group| group as u32)
+        .filter(|group| *group < groups.count())
+        .unwrap_or_else(|| meridian_changes::groups::owner(&partition, groups.count()));
+    owner == groups.mine()
 }
 
 /// The epochs of the partitions `groups`' group owns, sorted, and the set of
@@ -4531,6 +4580,37 @@ impl PostgresStore {
             )
             .map_err(unavailable)?
             .map(|row| row.get(0)))
+    }
+
+    /// The accounts this database places in a partition not among
+    /// `partitions`, each with that partition: moved toward another
+    /// database and not yet let go here (step 3d; m9).
+    pub fn accounts_placed_outside(&self, partitions: &[String]) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id, partition FROM book_account
+                  WHERE NOT (partition = ANY($1)) ORDER BY account_id",
+                &[&partitions],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Those of `accounts` this database holds a row of.
+    pub fn accounts_held(&self, accounts: &[String]) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id FROM book_account WHERE account_id = ANY($1)",
+                &[&accounts],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
     }
 
     /// `account_id`'s entries of `partitions` alone, by sequence, each

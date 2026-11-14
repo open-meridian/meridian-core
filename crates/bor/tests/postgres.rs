@@ -6075,3 +6075,180 @@ async fn review_a2_a_group_writing_away_follows_that_databases_timeline() {
     });
     blocking(move || drop(one));
 }
+
+/// m9: a group's look at its own database's heads -- its epoch adopted, its
+/// timeline followed -- never names a partition's owner from a head that
+/// database does not write (PR CI 43648472142, tolerant: "the book holds no
+/// account ACC-DRIVE-01"). A partition moved by hand to group 0 before the
+/// count of databases was raised is written in database 0; database 1, which
+/// group 1 writes, holds its head at 0, named its rendezvous owner, group 1.
+/// Group 1's member read that head as the owner's and took the partition for
+/// its own: it read the account's journal from database 1, where none is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m9_a_groups_own_heads_never_name_an_owner_its_database_does_not_write() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(8).unwrap();
+                apart(&url);
+                url
+            })
+            .collect()
+    });
+    let partition = partition_of(1, 0);
+    assert_eq!(meridian_changes::groups::owner(&partition, 2), 1);
+    // Moved by hand to group 0 at one database and written on there.
+    blocking(|| {
+        postgres::Client::connect(&urls[0], postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET sequence = 5, writer_group = 0 WHERE partition = $1",
+                &[&partition],
+            )
+            .unwrap();
+    });
+    let groups = Groups::new(1, 2).unwrap();
+    let one = blocking(|| {
+        let stores: Vec<Arc<PostgresStore>> = urls
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 4)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        PostgresStore::read_owners_from(&stores).unwrap();
+        meridian_bor::spread::Spread::new(stores, groups)
+    });
+    blocking(|| {
+        assert_eq!(groups.owner(&partition), 0, "named by its furthest head");
+        assert_eq!(one.of(&partition), 0, "written in database 0");
+        Store::adopt(&one).unwrap();
+        assert_eq!(groups.owner(&partition), 0, "after the epoch is adopted");
+        Store::follow_timeline(&one).unwrap();
+        Store::head_epoch(&one).unwrap();
+        assert_eq!(
+            groups.owner(&partition),
+            0,
+            "after the timeline is looked at"
+        );
+        assert_eq!(one.of(&partition), 0, "still written in database 0");
+    });
+    blocking(move || drop(one));
+}
+
+/// m9 (part 8's residue): an account moved across databases is in every
+/// read of all accounts between its close and its open -- read at its
+/// source, whose close names a target that holds nothing of it yet -- and
+/// once: never at its source and its target both, its open done and its
+/// source's copy not yet let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m9_an_account_between_its_close_and_its_open_is_in_a_read_of_every_account_once() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-GAP-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (bus("gap-0", zero.clone()), bus("gap-1", one.clone()));
+    open(&bus_one, &account, &unique("INS-GAP")).await;
+    let everyone = PositionsRead {
+        scope: Scope::Everything,
+        account_id: String::new(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 500,
+        cursor: String::new(),
+    };
+    let times = |member: &meridian_bor::spread::Spread| {
+        member
+            .positions(&everyone)
+            .unwrap()
+            .records
+            .iter()
+            .filter(|p| p.account_id == account)
+            .count()
+    };
+    blocking(|| assert_eq!((times(&zero), times(&one)), (1, 1), "before its move"));
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1; its open, group 0's, never asked.
+    let handed = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    assert!(handed.is_err(), "the open is the new partition's group's");
+    blocking(|| {
+        assert_eq!(
+            (times(&zero), times(&one)),
+            (1, 1),
+            "between its close and its open"
+        )
+    });
+    // The control group's sweep opens it, in group 0's database; the
+    // source's copy is let go after.
+    let opened = blocking(|| {
+        meridian_bor::moves::finish_opens(
+            &bus_zero,
+            zero.as_ref(),
+            &[zero.database(0).clone(), zero.database(1).clone()],
+            &meridian_changes::moves::Settings::default(),
+            meridian_clock::Clock::now_ns(&meridian_clock::SystemClock) + 1_000_000_000,
+        )
+    });
+    assert_eq!(opened, 1);
+    blocking(|| assert_eq!((times(&zero), times(&one)), (1, 1), "after its open"));
+    drop((bus_zero, bus_one));
+}

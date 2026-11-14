@@ -292,16 +292,62 @@ impl Spread {
         written
     }
 
-    /// `read` of each database in turn, each answering only the accounts
-    /// placed in the partitions it writes (the review's C5): an account a
-    /// move copied into another database -- warming, switching, or let go
-    /// and not yet forgotten -- is read once, from the database writing it.
-    fn each_written<T>(&self, mut read: impl FnMut(&PostgresStore) -> Result<T>) -> Result<Vec<T>> {
+    /// Each database's share of a read of every account: the accounts of
+    /// the partitions it writes (the review's C5), and an account between
+    /// its move's close and its open -- its source's row naming a partition
+    /// another database writes, which holds no row of it yet -- answered at
+    /// its source and left out at its target (m9): never missed while its
+    /// target holds nothing of it, and never read twice, an open made
+    /// between this look and the target's read included.
+    fn shares(&self) -> Result<Vec<crate::postgres::Share>> {
         let written = self.written();
+        let mut shares: Vec<crate::postgres::Share> = written
+            .iter()
+            .map(|partitions| crate::postgres::Share {
+                partitions: partitions.clone(),
+                ..Default::default()
+            })
+            .collect();
+        if self.stores.len() == 1 {
+            return Ok(shares);
+        }
+        for (d, store) in self.stores.iter().enumerate() {
+            // By the database that writes each named partition.
+            let mut toward: Vec<Vec<String>> = vec![Vec::new(); self.stores.len()];
+            for (account, partition) in store.accounts_placed_outside(&written[d])? {
+                if let Some(e) = written.iter().position(|held| held.contains(&partition)) {
+                    if e != d {
+                        toward[e].push(account);
+                    }
+                }
+            }
+            for (e, accounts) in toward.into_iter().enumerate() {
+                if accounts.is_empty() {
+                    continue;
+                }
+                let opened = self.stores[e].accounts_held(&accounts)?;
+                for account in accounts {
+                    if !opened.contains(&account) {
+                        shares[e].not.push(account.clone());
+                        shares[d].also.push(account);
+                    }
+                }
+            }
+        }
+        Ok(shares)
+    }
+
+    /// `read` of each database in turn, each answering only its share of
+    /// the accounts ([`Self::shares`]; the review's C5): an account a move
+    /// copied into another database -- warming, switching, or let go and not
+    /// yet forgotten -- is read once, from the database writing it; one
+    /// between its close and its open, once, from its source.
+    fn each_written<T>(&self, mut read: impl FnMut(&PostgresStore) -> Result<T>) -> Result<Vec<T>> {
+        let shares = self.shares()?;
         self.stores
             .iter()
-            .zip(&written)
-            .map(|(store, partitions)| crate::postgres::answering_for(partitions, || read(store)))
+            .zip(&shares)
+            .map(|(store, share)| crate::postgres::answering_for(share, || read(store)))
             .collect()
     }
 
@@ -342,15 +388,15 @@ impl Spread {
             return read(self.holding(account_id), cursor, limit);
         }
         let (mut d, mut inner) = split_cursor(cursor)?;
-        // Each database answering the accounts of the partitions it writes
-        // (the review's C5): never one read twice.
-        let written = self.written();
+        // Each database answering its share of the accounts (the review's
+        // C5; m9): never one read twice, nor one between its close and its
+        // open missed.
+        let shares = self.shares()?;
         let mut page = P::default();
         while d < self.stores.len() {
             let room = limit.saturating_sub(page.len()).max(1);
-            let part = crate::postgres::answering_for(&written[d], || {
-                read(&self.stores[d], &inner, room)
-            })?;
+            let part =
+                crate::postgres::answering_for(&shares[d], || read(&self.stores[d], &inner, room))?;
             let next = part.cursor().to_string();
             page.take(part);
             if !next.is_empty() {
