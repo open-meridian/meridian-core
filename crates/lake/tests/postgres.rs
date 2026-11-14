@@ -6814,6 +6814,50 @@ fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept
     }
 }
 
+/// A range split by a writer group past the first (step 3d; section 6.1;
+/// CI 43615034712): its PartitionSplit is logged in the lake's control,
+/// which group 0 writes, under the splitting group's own epoch -- never
+/// refused as though group 1's writer had been fenced by group 0's.
+#[test]
+fn a_range_of_group_ones_is_split_by_its_own_writer() {
+    use meridian_changes::groups::Groups;
+    let (url, migrated) = isolated("lake-split-one");
+    drop(migrated);
+    let member = |group: u32| {
+        Arc::new(
+            PostgresStore::connect(&url, 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap()),
+        )
+    };
+    let (zero, one) = (member(0), member(1));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:g1s{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 1)
+        .unwrap();
+    let (low, high) = halves_of("lake-split-one");
+    one.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    let split = one
+        .split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    assert_eq!(split.children.len(), 2);
+    assert!(zero
+        .splits()
+        .unwrap()
+        .iter()
+        .any(|kept| kept.parent == dataset));
+}
+
 /// A range a deployment admin moved by hand stays where she put it (step
 /// 3d; section 6.8, ruled 2026-11-14): the sweep, every minute, moves a
 /// range only by a changed count, so it never takes hers back to its

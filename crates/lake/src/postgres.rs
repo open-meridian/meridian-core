@@ -559,7 +559,23 @@ impl PostgresStore {
             )
             .map_err(unavailable)?;
         let epoch: i64 = row.get(1);
-        self.fence.admits(epoch as u64)?;
+        // The writer's own epoch checked: the control partition's for the
+        // group that writes it, else its writer group's own (step 3d; a
+        // range split by a group past the first, CI 43615034712), so a
+        // group that does not write `control` is fenced by its own epoch,
+        // never by another group's.
+        if self.groups.mine() == 0 || self.leads_database {
+            self.fence.admits(epoch as u64)?;
+        } else {
+            let own: i64 = tx
+                .query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
+                    &[&(self.groups.mine() as i32)],
+                )
+                .map_err(unavailable)?
+                .map_or(0, |row| row.get(0));
+            self.fence.admits(own as u64)?;
+        }
         let mut sequence: i64 = row.get(0);
         for (kind, body, at_ns) in entries {
             sequence += 1;
