@@ -2913,6 +2913,23 @@ chart-check:
 		$(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_HOLD_SECONDS$$" | grep -q "value: \"$$hold\"" \
 			|| { echo "chart-check FAILED: the book's members are not told moves.holdSeconds, $$hold, as MERIDIAN_MOVES_HOLD_SECONDS (step 3d)" >&2; exit 1; }; \
 	done
+	@# MERIDIAN_MOVES_SWITCH_SECONDS (approved 2026-11-14): the lake's and the
+	@# book's members each told moves.switchSeconds and moves.holdSeconds,
+	@# and a switch shorter than its hold, or of no seconds, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for switch in 30 45; do \
+		set="$$( [ $$switch = 30 ] || echo --set moves.switchSeconds=$$switch )"; \
+		told=$$($(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_SWITCH_SECONDS$$" | grep -c "value: \"$$switch\""); \
+		[ "$$told" = 2 ] \
+			|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.switchSeconds, $$switch, as MERIDIAN_MOVES_SWITCH_SECONDS (told $$told) (step 3d)" >&2; exit 1; }; \
+	done; \
+	told=$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -c "name: MERIDIAN_MOVES_HOLD_SECONDS$$"); \
+	[ "$$told" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.holdSeconds (told $$told) (step 3d)" >&2; exit 1; }; \
+	for bad in moves.switchSeconds=0 moves.switchSeconds=4 moves.holdSeconds=0; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set $$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$bad rendered; a switch is at least as long as its hold, each of a second at least" >&2; exit 1; }; \
+	done; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and

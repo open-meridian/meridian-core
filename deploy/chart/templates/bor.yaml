@@ -80,9 +80,8 @@ spec:
             # Its partitions, where a new account is placed (step 3d).
             - name: MERIDIAN_BOR_PARTITIONS
               value: {{ include "meridian-runtime.borPartitions" $ | quote }}
-            # The hold while an account moves (step 3d; section 6.8).
-            - name: MERIDIAN_MOVES_HOLD_SECONDS
-              value: {{ .Values.moves.holdSeconds | int | quote }}
+            # A move's hold and its switch's bound (step 3d; section 6.8).
+            {{- include "meridian-runtime.movesEnv" $ | nindent 12 }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:

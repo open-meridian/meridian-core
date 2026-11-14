@@ -192,6 +192,7 @@ fn run() -> Result<(), String> {
     }
     // Its own database's store, and the book over every database.
     let postgres: Arc<PostgresStore> = Arc::clone(&stores[own]);
+    let every_database: Vec<Arc<PostgresStore>> = stores.clone();
     let record: Arc<dyn meridian_bor::Store> = if databases.several() {
         tracing::info!(
             databases = databases.count(),
@@ -275,6 +276,25 @@ fn run() -> Result<(), String> {
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
         let holding = member.wait_to_write(&bus).await?;
+        // Each partition's writer group as its head names it (step 3d;
+        // ruled 2026-11-14): the control partition's group names every
+        // one not named yet, by the count now, so a later change of the
+        // count moves nothing until a move moves it; every member reads
+        // them at start and every few seconds, and again on each write
+        // handed back to it.
+        // Read before the epoch is adopted, which goes by them.
+        tokio::task::block_in_place(|| -> Result<(), String> {
+            for store in &every_database {
+                if groups.holds_control() {
+                    let pinned = store.pin_owners().map_err(|failed| failed.to_string())?;
+                    if pinned > 0 {
+                        tracing::info!(pinned, "each partition named its writer group");
+                    }
+                }
+                store.read_owners().map_err(|failed| failed.to_string())?;
+            }
+            Ok(())
+        })?;
         let epoch = tokio::task::block_in_place(|| {
             holding.epoch(
                 || {
@@ -313,8 +333,28 @@ fn run() -> Result<(), String> {
             // work, by the placement this member last found it in.
             let placing = record.clone();
             bus.route_writes_by(move |topic, envelope| {
+                // A partition's move is the control partition's group's
+                // to run (step 3d; section 6.8).
+                if topic == meridian_bor::partition_moves::MOVE_PARTITION {
+                    return Some(0);
+                }
                 let account = meridian_bor::service::account_of_write(topic, &envelope.payload)?;
                 meridian_bor::Store::writer_group_of(placing.as_ref(), &account)
+            });
+            let reading = every_database.clone();
+            meridian_runtime::background(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let stores = reading.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for store in &stores {
+                            if let Err(failed) = store.read_owners() {
+                                tracing::debug!(%failed, "the writer groups were not read again");
+                            }
+                        }
+                    })
+                    .await;
+                }
             });
             tracing::info!(
                 group = groups.mine(),
@@ -365,6 +405,16 @@ fn run() -> Result<(), String> {
         });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // A partition's move (step 3d; section 6.8): the control partition's
+        // group runs each, one at a time, over every database.
+        if groups.holds_control() {
+            let mover = Arc::new(meridian_bor::partition_moves::Mover::new(
+                every_database.clone(),
+                groups,
+                meridian_bor::partition_moves::Settings::from_env(),
+            ));
+            meridian_bor::partition_moves::serve(&bus, &store, &mover);
+        }
         // The start's snapshots (v26; W9.10): every account whose journal
         // since its latest snapshot of this format reaches the interval --
         // a quiet one, or one upgraded from an older format -- kept now, off

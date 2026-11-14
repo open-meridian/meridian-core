@@ -670,9 +670,10 @@ impl Bus {
             crate::owners::begin(handed);
             let kept = envelope.clone();
             let answered = handler(envelope);
+            let named = crate::owners::take_named();
             match crate::owners::take_hand_to() {
                 None => answered,
-                Some(_) if handed => Err(crate::refusal_with_status(
+                Some(_) if handed && !named => Err(crate::refusal_with_status(
                     crate::RefusalStatus::Unavailable,
                     &[],
                     crate::owners::NOT_THIS_GROUPS,

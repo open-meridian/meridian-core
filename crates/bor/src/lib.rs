@@ -65,6 +65,7 @@ pub mod order_decide;
 pub mod order_reads;
 pub mod order_service;
 pub mod orders;
+pub mod partition_moves;
 pub mod postgres;
 pub mod reader;
 pub mod reads;

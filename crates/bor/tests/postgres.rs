@@ -3444,3 +3444,572 @@ async fn an_account_moved_between_databases_is_copied_and_replays_the_same() {
 fn read_position(position: &BookPosition) -> String {
     read(&position.trade_date_quantity)
 }
+
+/// Each writer group's partitions in the database at `url` at an epoch of
+/// its own, as a deployment's are once each writer has started: neither
+/// takes the other's over -- a takeover ends the sessions holding its
+/// partitions' locks, by key, in every schema of the test database.
+fn apart(url: &str) {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    for n in 0..8 {
+        let partition = meridian_bor::store::partition_named(n);
+        let epoch = 10 + 10 * meridian_changes::groups::owner(&partition, 2) as i64;
+        admin
+            .execute(
+                "UPDATE book_partition_head SET epoch = $2 WHERE partition = $1",
+                &[&partition, &epoch],
+            )
+            .unwrap();
+    }
+    admin
+        .execute(
+            "UPDATE book_partition_head SET epoch = 10 WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+}
+
+/// Two members of two writer groups over one database, each serving the
+/// book and handing the other's commands on (step 3d), and its admin
+/// connection.
+type TwoMembers = (
+    Arc<GroupsBroker>,
+    [(Arc<Bus>, Arc<PostgresStore>); 2],
+    meridian_bor::partition_moves::Mover,
+);
+
+fn two_members(url: &str) -> TwoMembers {
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let member = |group: u32| {
+        let store = Arc::new(
+            PostgresStore::connect(url, 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap())
+                .with_partitions(8),
+        );
+        store.make_partitions(8).unwrap();
+        store.pin_owners().unwrap();
+        let bus = Arc::new(Bus::single(
+            "bor-moves-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        let writer: Arc<dyn Store> = Arc::new(Writer::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&bus),
+        ));
+        serve(bus.clone(), writer, bus.clock());
+        resolving_equities(&bus);
+        (bus, store)
+    };
+    // Each group's partitions at an epoch of its own, as a deployment's
+    // are once each writer has started: neither takes the other's over --
+    // a takeover ends the sessions holding its partitions' locks, by key,
+    // in every schema of the test database.
+    PostgresStore::connect(url, 1)
+        .unwrap()
+        .make_partitions(8)
+        .unwrap();
+    apart(url);
+    let (zero, one) = (member(0), member(1));
+    let mover = meridian_bor::partition_moves::Mover::new(
+        vec![Arc::clone(&zero.1)],
+        zero.1.groups(),
+        meridian_bor::partition_moves::Settings {
+            switch: std::time::Duration::from_secs(2),
+            ..Default::default()
+        },
+    );
+    (broker, [zero, one], mover)
+}
+
+/// Writes to `accounts` through `bus` until `stop`: each answered, never
+/// refused (section 15: nothing refused inside the hold). Says how many.
+fn writing(
+    bus: Arc<Bus>,
+    accounts: Vec<String>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<(u64, Vec<String>)> {
+    tokio::spawn(async move {
+        let (mut written, mut refused) = (0, Vec::new());
+        let mut n = 0u64;
+        while !stop.load(Ordering::SeqCst) {
+            n += 1;
+            let account = &accounts[(n as usize) % accounts.len()];
+            let request = SetAccountAttributeRequest {
+                account_id: account.clone(),
+                attribute: Some(
+                    set_account_attribute_request::Attribute::WaitsForCompliance(n.is_multiple_of(2)),
+                ),
+                reason: format!("write {n}"),
+            };
+            match send(&bus, SET_ACCOUNT_ATTRIBUTE, &request, Some(PERSON)).await {
+                Ok(_) => written += 1,
+                Err(failed) => refused.push(failed),
+            }
+        }
+        (written, refused)
+    })
+}
+
+/// `partition`'s entries in this database, each numbered on from the one
+/// before, never a hole: (first, last, epoch) each.
+fn numbered(url: &str, partition: &str) -> Vec<(i64, i64, i64)> {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let rows: Vec<(i64, i64, i64)> = admin
+        .query(
+            "SELECT first_sequence, last_sequence, epoch FROM book_entry
+              WHERE partition = $1 ORDER BY first_sequence",
+            &[&partition],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    for pair in rows.windows(2) {
+        assert_eq!(pair[1].0, pair[0].1 + 1, "{partition}: a hole at {pair:?}");
+    }
+    rows
+}
+
+/// A book partition moved to another writer group under write load, within
+/// one database (step 3d; section 6.8; fixtures/book/move-book-partition.
+/// yaml): the switch holds the source's next batch, the held writes drain to
+/// the target, none refused; the partition's chain runs on unbroken across
+/// the switch, the target's epoch from it on; the source's writer is never
+/// fenced; a read naming a watermark taken before the switch is answered
+/// after it; and the move's record is journalled on `~control`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_book_partition_moved_under_load_keeps_its_chain_and_its_read_after() {
+    use meridian_bor::partition_moves::{journal, Asked, Ended};
+    use meridian_pb::v1::{PartitionSequence, Watermark};
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    // P4 is group 1's at two groups -- a partition no takeover test's
+    // lock names -- and accounts placed there.
+    assert_eq!(meridian_changes::groups::owner("P4", 2), 1);
+    let accounts: Vec<String> = (0..)
+        .map(|n| unique(&format!("ACC-PMOVE-{n}")))
+        .filter(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .take(4)
+        .collect();
+    for account in &accounts {
+        blocking(|| one_store.place_first(account, account)).unwrap();
+        open(&one, account, "INS-AAPL").await;
+    }
+    let before = blocking(|| Store::heads(one_store.as_ref())).unwrap()["P4"];
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = [
+        writing(one.clone(), accounts.clone(), stop.clone()),
+        writing(zero.clone(), accounts.clone(), stop.clone()),
+    ];
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let request = MovePartitionRequest {
+        partition: "P4".into(),
+        target_group: 0,
+        reason: "spread the book's partitions over both writer groups".into(),
+    };
+    let ended = blocking(|| {
+        assert_eq!(mover.check(&request).unwrap(), 1);
+        assert!(mover.begin("P4"));
+        // Asked again while under way: refused, naming the partition.
+        let again = mover.check(&request).unwrap_err();
+        assert!(again.on_the_bus().contains("partition"), "{again}");
+        mover.run(
+            "P4",
+            0,
+            &Asked {
+                by_hand: true,
+                moved_by: PERSON.into(),
+                reason: request.reason.clone(),
+            },
+        )
+    })
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let mut written = 0;
+    for task in load {
+        let (count, refused) = task.await.unwrap();
+        assert!(refused.is_empty(), "refused inside the hold: {refused:?}");
+        written += count;
+    }
+    assert!(written > 10, "{written} written under the move");
+    let Ended::Moved(moved) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!((moved.from_group, moved.to_group), (1, 0));
+    assert!(moved.by_hand && moved.epoch > 0);
+    blocking(|| {
+        let tip = zero_store.tip("P4").unwrap().unwrap();
+        assert_eq!(tip.writer_group, Some(0));
+        assert_eq!(tip.epoch, moved.epoch);
+        // Unbroken: no hole, the old epoch up to the switch, the new after.
+        let rows = numbered(&url, "P4");
+        let switched = rows
+            .iter()
+            .position(|(_, _, epoch)| *epoch as u64 == moved.epoch)
+            .expect("written by the target after the switch");
+        assert!(rows[switched..]
+            .iter()
+            .all(|(_, _, epoch)| *epoch as u64 == moved.epoch));
+        assert!(switched > 0, "written by the source before it");
+        assert!(zero_store.scrub().unwrap().findings.is_empty());
+        // The source hands on, never fenced: its epoch as it was.
+        assert_eq!(
+            Store::writer_group_of(one_store.as_ref(), &accounts[0]),
+            Some(0)
+        );
+        // A read naming the head before the switch, answered after it.
+        let watermark = Watermark {
+            partitions: vec![PartitionSequence {
+                partition: "P4".into(),
+                sequence: before,
+            }],
+        };
+        meridian_bus::read_after::begin_read();
+        let read = zero
+            .reads_after()
+            .answer(LIST_POSITIONS, &watermark, || {
+                Store::journal(zero_store.as_ref(), &accounts[0]).map_err(|f| f.to_string())
+            })
+            .unwrap();
+        assert!(read.len() > 1);
+        // Its record in ~control, once.
+        journal(&zero, zero_store.as_ref(), &ended);
+        journal(&zero, zero_store.as_ref(), &ended);
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        let records: Vec<_> = control
+            .iter()
+            .filter(|e| {
+                e.idempotency_key
+                    .starts_with("control-record:partition-moved:P4:")
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        // Moved back is a move like any other; to its owner, refused.
+        let refused = mover
+            .check(&MovePartitionRequest {
+                target_group: 0,
+                ..request.clone()
+            })
+            .unwrap_err();
+        assert!(refused.on_the_bus().contains("target_group"), "{refused}");
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
+/// Every cause a partition's move aborts for (section 6.8; MoveAbortCause):
+/// the injected lag (MERIDIAN_MOVE_LAG_FILE) before anything is held, a
+/// switch that cannot finish within moves.switchSeconds (the source's
+/// batch in flight never ends), and the injected digest mismatch
+/// (MERIDIAN_MOVE_DIGEST_FILE), with an IntegrityFinding. Each leaves the
+/// source owning at its epoch, with no gap, and its record on ~control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_book_partition_move_aborts_for_lag_timeout_and_digest_and_the_source_owns() {
+    use meridian_bor::partition_moves::{journal, Asked, Ended, Mover, Settings};
+    use meridian_domain::v1::MoveAbortCause;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], _) = blocking(|| two_members(&url));
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-ABORT-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    let files = std::env::temp_dir().join(unique("bor-move-abort"));
+    std::fs::create_dir_all(&files).unwrap();
+    let (lag_file, digest_file) = (files.join("lag"), files.join("digest"));
+    let mover = |settings: Settings| {
+        Mover::new(vec![Arc::clone(&zero_store)], zero_store.groups(), settings)
+    };
+    let short = Settings {
+        switch: std::time::Duration::from_secs(1),
+        lag_file: Some(lag_file.clone()),
+        digest_file: Some(digest_file.clone()),
+        ..Default::default()
+    };
+    let asked = Asked {
+        by_hand: true,
+        moved_by: PERSON.into(),
+        reason: "a test of each abort".into(),
+    };
+    let epoch_before = blocking(|| zero_store.tip("P4").unwrap().unwrap().epoch);
+    let mut causes = Vec::new();
+    // Lag: the target never within readyLagMs.
+    std::fs::write(&lag_file, "60000").unwrap();
+    causes.push(blocking(|| mover(short.clone()).run("P4", 0, &asked)).unwrap());
+    std::fs::remove_file(&lag_file).unwrap();
+    // Timeout: the source's batch in flight holds the lock past the bound.
+    let in_flight = std::thread::spawn({
+        let url = url.clone();
+        move || {
+            let mut batch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let key = meridian_bor::postgres::partition_lock_key("P4");
+            batch
+                .execute("SELECT pg_advisory_lock($1)", &[&key])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            batch
+                .execute("SELECT pg_advisory_unlock($1)", &[&key])
+                .unwrap();
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    causes.push(blocking(|| mover(short.clone()).run("P4", 0, &asked)).unwrap());
+    in_flight.join().unwrap();
+    // Digest: the target's digest at N differs.
+    std::fs::write(&digest_file, "").unwrap();
+    causes.push(blocking(|| mover(short.clone()).run("P4", 0, &asked)).unwrap());
+    std::fs::remove_file(&digest_file).unwrap();
+    let said: Vec<i32> = causes
+        .iter()
+        .map(|ended| match ended {
+            Ended::Aborted(aborted, _) => aborted.cause,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            MoveAbortCause::Lag as i32,
+            MoveAbortCause::Timeout as i32,
+            MoveAbortCause::Digest as i32
+        ]
+    );
+    let Ended::Aborted(_, Some(finding)) = &causes[2] else {
+        panic!("a digest abort carries its finding");
+    };
+    assert_eq!(
+        finding.check,
+        meridian_domain::v1::IntegrityCheck::MemberDigest as i32
+    );
+    // The source owns at its epoch, and writes on with no gap.
+    blocking(|| {
+        let tip = zero_store.tip("P4").unwrap().unwrap();
+        assert_eq!(tip.writer_group, Some(1));
+        assert_eq!(tip.epoch, epoch_before);
+    });
+    send(&one, RECORD_BREAK, &a_break(&account), Some(PERSON))
+        .await
+        .unwrap();
+    blocking(|| {
+        let rows = numbered(&url, "P4");
+        assert!(rows.len() >= 2);
+        for ended in &causes {
+            journal(&zero, zero_store.as_ref(), ended);
+        }
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        let keys: Vec<&str> = control.iter().map(|e| e.idempotency_key.as_str()).collect();
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.starts_with("control-record:partition-move-aborted:P4:"))
+                .count(),
+            3,
+            "{keys:?}"
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.starts_with("control-record:finding:move:P4:"))
+                .count(),
+            1
+        );
+    });
+    let _ = std::fs::remove_dir_all(&files);
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
+/// A book partition moved to a writer group in another database under write
+/// load (step 3d; sections 6.4 and 6.8): the target's database copies the
+/// partition -- its entries and every account it places -- then its change
+/// log until within readyLagMs; the switch brings it to the source's close
+/// under the lock; the held writes drain to it, none refused. The chain is
+/// whole in the new database and scrubs clean in both; each account
+/// replays the same through either member, its positions read once, from
+/// its new database; a read naming a watermark taken before is answered
+/// after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_book_partition_moved_between_databases_under_load_is_copied_and_switched() {
+    use meridian_bor::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_bor::spread::Spread;
+    use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    use meridian_pb::v1::{PartitionSequence, Watermark};
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(8).unwrap();
+                apart(&url);
+                url
+            })
+            .collect()
+    });
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let member = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores: Vec<Arc<PostgresStore>> = urls
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 6)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        let spread = Arc::new(Spread::new(stores, groups));
+        let bus = Arc::new(Bus::single(
+            "bor-cross-moves-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        serve(bus.clone(), spread.clone(), bus.clock());
+        resolving_equities(&bus);
+        (bus, spread)
+    };
+    let ((bus_zero, zero), (bus_one, one)) = blocking(|| (member(0), member(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    // A partition of group 1's, in database 1, and accounts placed in it.
+    // P4: a partition no takeover test's lock names.
+    let partition = "P4".to_string();
+    assert_eq!(groups.owner(&partition), 1);
+    let accounts: Vec<String> = (0..)
+        .map(|n| unique(&format!("ACC-PXDB-{n}")))
+        .filter(|a| meridian_bor::store::placement_of(a, 8) == partition)
+        .take(3)
+        .collect();
+    for account in &accounts {
+        blocking(|| one.place_first(account, account)).unwrap();
+        open(&bus_one, account, "INS-AAPL").await;
+    }
+    let before = blocking(|| one.database(1).tip(&partition))
+        .unwrap()
+        .unwrap()
+        .head;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = [
+        writing(bus_one.clone(), accounts.clone(), stop.clone()),
+        writing(bus_zero.clone(), accounts.clone(), stop.clone()),
+    ];
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mover = Mover::new(
+        vec![zero.database(0).clone(), zero.database(1).clone()],
+        zero.database(0).groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+    );
+    let ended = blocking(|| {
+        mover.begin(&partition);
+        mover.run(
+            &partition,
+            0,
+            &Asked {
+                by_hand: true,
+                moved_by: PERSON.into(),
+                reason: "group 1's database is busy".into(),
+            },
+        )
+    })
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let mut written = 0;
+    for task in load {
+        let (count, refused) = task.await.unwrap();
+        assert!(refused.is_empty(), "refused inside the hold: {refused:?}");
+        written += count;
+    }
+    assert!(written > 10, "{written} written under the move");
+    let Ended::Moved(moved) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!((moved.from_group, moved.to_group), (1, 0));
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    blocking(|| {
+        let (new, old) = (
+            fresh(0).tip(&partition).unwrap().unwrap(),
+            fresh(1).tip(&partition).unwrap().unwrap(),
+        );
+        assert_eq!((new.writer_group, old.writer_group), (Some(0), Some(0)));
+        assert!(new.head > old.head, "written on in its new database");
+        // Whole in the new database: no hole from 1, the old epoch up to
+        // the close, the new after; each database scrubs clean.
+        let rows = numbered(&urls[0], &partition);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows.last().unwrap().1 as u64, new.head);
+        let at = rows
+            .iter()
+            .position(|(first, _, _)| *first as u64 > old.head)
+            .expect("written after the switch");
+        assert!(rows[at..].iter().all(|(_, _, e)| *e as u64 == moved.epoch));
+        for d in 0..2 {
+            let scrubbed = fresh(d).scrub().unwrap();
+            assert!(scrubbed.findings.is_empty(), "{d}: {:?}", scrubbed.findings);
+        }
+        for account in &accounts {
+            // Read through either member, the same; replayed the same.
+            let journal = zero.journal(account).unwrap();
+            assert_eq!(one.journal(account).unwrap(), journal);
+            let mut replayed = meridian_bor::Book::replay(account, &partition, &journal).unwrap();
+            let mut held = zero.book(account).unwrap();
+            replayed.release_bodies();
+            held.release_bodies();
+            assert_eq!(replayed, held);
+            // Placed in the new database alone, its positions read once.
+            assert_eq!(fresh(1).account_row(account).unwrap(), None);
+            assert_eq!(
+                fresh(0).account_row(account).unwrap(),
+                Some(partition.clone())
+            );
+            let read = PositionsRead {
+                scope: Scope::Everything,
+                account_id: String::new(),
+                since: None,
+                business_date: String::new(),
+                at: None,
+                limit: 500,
+                cursor: String::new(),
+            };
+            let everyone = zero.positions(&read).unwrap().records;
+            assert_eq!(
+                everyone.iter().filter(|p| p.account_id == *account).count(),
+                1
+            );
+        }
+        // A read naming the head before the move, answered after it.
+        let watermark = Watermark {
+            partitions: vec![PartitionSequence {
+                partition: partition.clone(),
+                sequence: before,
+            }],
+        };
+        meridian_bus::read_after::begin_read();
+        bus_zero
+            .reads_after()
+            .answer(LIST_POSITIONS, &watermark, || {
+                zero.journal(&accounts[0]).map_err(|f| f.to_string())
+            })
+            .unwrap();
+    });
+    blocking(move || drop((zero, one, bus_zero, bus_one, mover)));
+}

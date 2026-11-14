@@ -11,7 +11,8 @@
 //! A store's code says a request is another group's with [`hand_to`]; the
 //! bus then hands the request on, unchanged, and answers with the owner's
 //! reply. A request handed here is answered here or refused: never handed
-//! on again ([`handed`]).
+//! on again ([`handed`]) on a guess, only to the group the record names now
+//! ([`hand_to_named`]), as after a move.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,7 @@ thread_local! {
     static HAND_TO: Cell<Option<u32>> = const { Cell::new(None) };
     static HANDED: Cell<bool> = const { Cell::new(false) };
     static ARRIVING: Cell<bool> = const { Cell::new(false) };
+    static NAMED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The next write this thread answers was handed here.
@@ -43,6 +45,21 @@ pub fn hand_to(group: u32) {
     HAND_TO.with(|to| to.set(Some(group)));
 }
 
+/// The request this thread answers is writer group `group`'s as the store's
+/// record names it now, read under the partition's lock or from its head
+/// just now (step 3d; ruled 2026-11-14): a partition moved since the member
+/// that handed it here looked. Handed on once more even where it was handed
+/// here, as the record, never a stale route, says so.
+pub fn hand_to_named(group: u32) {
+    HAND_TO.with(|to| to.set(Some(group)));
+    NAMED.with(|named| named.set(true));
+}
+
+/// Whether the group said is the one the record names now, cleared.
+pub(crate) fn take_named() -> bool {
+    NAMED.with(Cell::take)
+}
+
 /// Whether the request this thread answers was handed here by another
 /// member: answered here, or refused, never handed on again.
 pub fn handed() -> bool {
@@ -57,6 +74,7 @@ pub(crate) fn take_hand_to() -> Option<u32> {
 /// A request begins on this thread: handed here or not, said to no group.
 pub(crate) fn begin(handed: bool) {
     HAND_TO.with(|to| to.set(None));
+    NAMED.with(|named| named.set(false));
     HANDED.with(|was| was.set(handed));
 }
 

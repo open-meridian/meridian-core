@@ -68,6 +68,7 @@ if any check failed.
 """
 
 import os
+import time
 import re
 import sys
 from urllib.parse import urlencode
@@ -2145,6 +2146,28 @@ def the_resilience_page(browser, prefix):
     settled(page)
     check(page.url.endswith("/admin/resilience#partitions"),
           f"Move account posted returns to the Partitions tab: {page.url}")
+    # Move, posted (step 3d; section 6.8): the book serves the act, so the
+    # dialog is answered -- the move begun, back on the Partitions tab, or
+    # the book's own refusal naming the partition's group -- never left to
+    # time out.
+    page.goto(f"{RESILIENCE}#partitions")
+    settled(page)
+    page.evaluate("""() => {
+      const pager = document.querySelector('#partitions om-pager');
+      for (let i = 0; pager && i < 50; i++) pager.turn(-1);
+    }""")
+    on_its_page(page, "#partitions tr[data-partition='P1']")
+    page.click("#partitions tr[data-partition='P1'] button[data-dialog-open=move-partition]")
+    page.fill("#move-partition input[name=target_group]", "0")
+    page.fill("#move-partition input[name=note]", "spread the book's partitions over both writer groups")
+    started = time.monotonic()
+    page.click("#move-partition button.primary")
+    settled(page)
+    took = time.monotonic() - started
+    said = page.inner_text("body")
+    answered = page.url.endswith("/admin/resilience#partitions") or "owns P1 already" in said
+    check(answered, f"Move posted is answered by the book: {page.url} {said[:300]!r}")
+    check(took < 10, f"Move posted is answered at once, not left to time out: {took:.1f}s")
     ctx.close()
 
 

@@ -272,6 +272,28 @@ The book's partitions (step 3d; the resilience spec's section 6.3;
 `bor.partitions`, MERIDIAN_BOR_PARTITIONS ruled 2026-11-13): 1, the default,
 P0 alone; 1 to 64.
 */}}
+{{- /* A move's bounds (step 3d; section 6.8; MERIDIAN_MOVES_HOLD_SECONDS and
+MERIDIAN_MOVES_SWITCH_SECONDS approved 2026-11-14): the lake's and the
+book's members each told both. A switch shorter than its hold could never
+drain the writes it held, so it is refused. */ -}}
+{{- define "meridian-runtime.movesEnv" -}}
+{{- $hold := .Values.moves.holdSeconds -}}
+{{- $switch := .Values.moves.switchSeconds -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $hold)) -}}
+{{- fail (printf "moves.holdSeconds is %v; a whole number of seconds from 1 (5, the default)" $hold) -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $switch)) -}}
+{{- fail (printf "moves.switchSeconds is %v; a whole number of seconds from 1 (30, the default)" $switch) -}}
+{{- end -}}
+{{- if lt (int $switch) (int $hold) -}}
+{{- fail (printf "moves.switchSeconds is %v and moves.holdSeconds %v; a switch is at least as long as its hold" $switch $hold) -}}
+{{- end }}
+- name: MERIDIAN_MOVES_HOLD_SECONDS
+  value: {{ int $hold | quote }}
+- name: MERIDIAN_MOVES_SWITCH_SECONDS
+  value: {{ int $switch | quote }}
+{{- end -}}
+
 {{- define "meridian-runtime.borPartitions" -}}
 {{- $partitions := .Values.bor.partitions -}}
 {{- if kindIs "invalid" $partitions -}}

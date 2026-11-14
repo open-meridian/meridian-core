@@ -98,6 +98,8 @@ spec:
             # How many whole answers it builds at once (rulings 957, 958).
             - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
               value: {{ .Values.lake.maxConcurrentAnswers | int | quote }}
+            # A move's hold and its switch's bound (step 3d; section 6.8).
+            {{- include "meridian-runtime.movesEnv" $ | nindent 12 }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
