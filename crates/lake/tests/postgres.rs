@@ -6919,6 +6919,39 @@ fn a_range_moved_by_hand_stays_through_the_sweep() {
     );
 }
 
+/// A writer group past the first leading its own database, taken over in
+/// ha, follows that database's timeline under its own epoch: never found
+/// another writer's on the control head its takeover does not raise (step
+/// 3d; CI 43631481777, ha at two databases: group 1's members stepped down
+/// in turn, "the store's epoch is 1, another writer's").
+#[test]
+fn a_group_leading_its_own_database_follows_its_timeline_under_its_own_epoch() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::timeline::Timeline;
+    let (url, migrated) = isolated("lake-leads");
+    drop(migrated);
+    let leader = PostgresStore::connect(&url, 2)
+        .unwrap()
+        .with_groups(Groups::new(1, 2).unwrap())
+        .with_databases(2);
+    let epoch = leader
+        .take_over(&meridian_changes::TookOver {
+            member: "lake-group-1-b".into(),
+            previous: "lake-group-1-a".into(),
+            why: "the writer's lease lapsed".into(),
+            at_ns: 1,
+        })
+        .unwrap();
+    assert!(epoch > 1, "{epoch}");
+    for _ in 0..2 {
+        let found = leader.follow_timeline().unwrap();
+        assert!(
+            !matches!(found, Timeline::NotMine(_)),
+            "the leader is not deposed by its database's control head: {found:?}"
+        );
+    }
+}
+
 /// A lake range moved between writer groups in ha, under load (step 3d;
 /// spec 6.1 and 6.8; ruled 2026-11-14 after CI 43621875619): two groups'
 /// writers take one stream at their own paces, the target ahead of the

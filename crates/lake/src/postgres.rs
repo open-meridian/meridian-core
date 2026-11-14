@@ -506,6 +506,22 @@ impl PostgresStore {
             return Ok(Timeline::Same);
         }
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // A group past the first leading its database writes that
+        // database's control partition under its own epoch, which its
+        // takeover raises in lake_writer_group, never in this database's
+        // control head (step 3d; CI 43631481777, ha at two databases: group
+        // 1's members stepped down in turn, "the store's epoch is 1, another
+        // writer's"). Its control head is brought up to the leader's epoch
+        // here, never down: a deposed leader's epoch is below it, and it is
+        // still found another's.
+        if self.leads_database && !self.groups.holds_control() {
+            tx.execute(
+                "UPDATE lake_change_head SET epoch = $1
+                  WHERE partition = 'control' AND epoch < $1",
+                &[&(mine as i64)],
+            )
+            .map_err(unavailable)?;
+        }
         let (found, identity) = meridian_changes::timeline::follow(
             &mut tx,
             "lake_change_head",
