@@ -3632,8 +3632,9 @@ def page_entitled(s):
 # deployment admin does it: signed in at the dashboard, a lake range, a book
 # partition and an account moved by the dashboard's own tools
 # (`dashboard__move_partition`, `dashboard__move_account`) and its Move
-# dialog, within one database and then across two (`lake.databases` and
-# `bor.databases` set to 2 by an upgrade). Each move holds the writes to what
+# dialog, within one database (across two, `lake.databases` and
+# `bor.databases` set to 2 by an upgrade, waits on routing by head: see
+# moves()). Each move holds the writes to what
 # it moves for at most moves.holdSeconds: the driver's p99 write time while
 # it ran within it, and none of its writes refused; it switches only with the
 # digests equal (its PartitionMoved, no PartitionMoveAborted); and what was
@@ -4104,53 +4105,16 @@ def moves(s, dash):
     others = sorted(p for p, g in owners.items() if p != "P0" and int(g) == p0_from) or \
         sorted(p for p in owners if p != "P0")
     a_move(s, dash, "book", "account", accounts[0], others[0], (0, 0))
-    # Across two databases: each store's second database brought by an
-    # upgrade, group 1 writing to it; its partitions moved there by the
-    # count's change; then the driver's half, P0 and an account moved from
-    # group 0's database to group 1's.
-    upgraded = upgrade("lake.databases=2", "bor.databases=2")
-    s.check(upgraded.returncode == 0, "rebalance: the lake and the book at two databases")
-    if upgraded.returncode != 0:
-        return
-    for component in ("lake", "bor"):
-        rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
-                     f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
-        s.check(rolled.returncode == 0, f"rebalance: {component}'s database 1 brought and ready")
-    ready = happens(all_ready, 600, every=5)
-    s.check(ready, "rebalance: every component ready at two databases")
-    since_ms = int(time.time() * 1000)
-    writing = happens(lambda: all(sum(1 for at in driver_acked().get(kind, {}).values() if at > since_ms) >= 10
-                                  for kind in ("price", "order")), 300, every=3)
-    s.check(writing, "rebalance: the driver's prices and orders acknowledged again at two databases")
-    in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
-                                      pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
-    s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
-    if not (ready and writing):
-        return
-    owners = {p: str(book_owner(p)) for p in psql(
-        "select partition from book_partition_head where partition <> 'control'").split()}
-    zeros = sorted(p for p, g in owners.items() if int(g) == 0)
-    ones = sorted(p for p, g in owners.items() if int(g) == 1)
-    # An account of group 0's database to group 1's.
-    held = [a for a in accounts[1:] if psql(f"select partition from book_account where account_id = '{a}'") in zeros]
-    if held and ones:
-        a_move(s, dash, "book", "account", held[0], ones[0], (0, 1))
-    else:
-        s.check(False, f"rebalance: an account in group 0's database to move ({held}, {ones})")
-    if lake_owner(loaded) == 0:
-        a_move(s, dash, "lake", "range", loaded, 1, (0, 1))
-    else:
-        s.check(False, f"rebalance: the driver's half in group 0's database to move ({lake_owner(loaded)})")
-    moved_p0 = "P0" in zeros and a_move(s, dash, "book", "partition", "P0", 1, (0, 1))
-    if "P0" not in zeros:
-        s.check(False, f"rebalance: P0 in group 0's database to move ({owners})")
-    # The aborts, from group 1's database back towards group 0's: the
+    # Across two databases (lake.databases and bor.databases raised to 2 by
+    # an upgrade, then a range, P0 and an account moved from group 0's
+    # database to group 1's): waits on each partition's writes routed to
+    # the database its head is in (handover-m4); checkpoint 3 is not done
+    # until it is back here and green.
+    # The aborts, back towards each one's group before the moves above: the
     # lake's range by an injected digest mismatch, the book's P0 by an
     # injected lag (the gate held shut for moves.switchSeconds).
-    if lake_owner(loaded) == 1:
-        an_abort(s, dash, "lake", loaded, 0, "digest")
-    if moved_p0:
-        an_abort(s, dash, "bor", "P0", 0, "lag")
+    an_abort(s, dash, "lake", loaded, half_from, "digest")
+    an_abort(s, dash, "bor", "P0", p0_from, "lag")
 
 
 FAILURES = {
