@@ -492,8 +492,17 @@ pub fn move_account_with(
     // The open, in the new partition: handed to its writer where another
     // group writes it.
     let key = open_key(account, &closed.from_partition, closed.closing_sequence);
+    // The open is its own entry, not the request's: the close carries the
+    // request's message ID, and the book holds a message once (its unique
+    // book_entry_message). Within one database the open under the same ID
+    // was refused "duplicate key ... book_entry_message" (CI 43621875619
+    // and 43631481777). The open is kept once by its own key.
+    let opening = Context {
+        message_id: String::new(),
+        ..ctx.clone()
+    };
     let acted = store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
-        open(book, head, ctx, &closed).map(|made| crate::service::decided(made, Vec::new()))
+        open(book, head, &opening, &closed).map(|made| crate::service::decided(made, Vec::new()))
     })?;
     let opened = match acted {
         crate::store::Acted::Committed(decided) => {

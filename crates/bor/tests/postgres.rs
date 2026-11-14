@@ -4752,6 +4752,66 @@ async fn a_partition_moved_away_while_its_group_looks_at_the_timeline_steps_no_m
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// An account moved within one database by a request carrying its message
+/// ID, as every request through the bus does: its close keeps the ID and
+/// its open, its own entry, none, so the book's one-message index never
+/// refuses the open (step 3d; CI 43621875619 and 43631481777: "duplicate
+/// key value violates unique constraint book_entry_message").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_moved_within_one_database_by_a_request_with_its_message_id_opens() {
+    use meridian_bor::decide::Context;
+    use meridian_bor::moves::move_account_with;
+    use meridian_changes::moves::Settings;
+    use meridian_domain::v1::MoveAccountRequest;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], _mover) = blocking(|| two_members(&url));
+    let ones: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| meridian_changes::groups::owner(p, 2) == 1)
+        .collect();
+    let (from, target) = (ones[0].clone(), ones[1].clone());
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-MSGID-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == from)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: target.clone(),
+        reason: "moved with its message id".into(),
+    };
+    let ctx = Context {
+        acting_for: PERSON.into(),
+        received_at_ns: 5_000,
+        message_id: unique("msg-move"),
+        ..Default::default()
+    };
+    let moved = blocking(|| {
+        move_account_with(
+            &one,
+            one_store.as_ref(),
+            &ctx,
+            &request,
+            &Settings::default(),
+        )
+    })
+    .expect("closed and opened within one database");
+    assert_eq!(moved.to_partition, target);
+    assert!(moved.opening_sequence > 0, "{moved:?}");
+    let ids: Vec<String> = blocking(|| one_store.journal(&account).unwrap())
+        .into_iter()
+        .filter(|entry| meridian_bor::journal::moved_of(entry).is_some())
+        .map(|entry| entry.message_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![ctx.message_id.clone(), String::new()],
+        "the close's, then none"
+    );
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
 /// A partition never written, its head made at the control partition's
 /// epoch as a raised `bor.partitions` makes it, is written by its owner
 /// group past the first at that group's epoch, never fenced (step 3d; CI

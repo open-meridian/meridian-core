@@ -340,10 +340,11 @@ async fn a_refusal_of_several_lines_crosses_on_one() {
     );
     match refused {
         BusError::HandlerFailed { detail, .. } => {
-            // Every word, in full: each line break a space, nothing cut.
+            // Every word, in full: each line break a space, nothing cut
+            // (the header's trailing space trimmed by the broker).
             assert!(
                 detail.contains(
-                    "db error: ERROR: duplicate key value DETAIL: Key (message_id) already exists. "
+                    "db error: ERROR: duplicate key value DETAIL: Key (message_id) already exists."
                 ),
                 "{detail:?}"
             );
