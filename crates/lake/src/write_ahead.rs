@@ -323,9 +323,13 @@ impl Writer {
             let answering = answers(groups, &write);
             // An answer of a write whose dataset's ranges span groups waits
             // until each other group's part has committed (spec 6.7).
+            // A split dataset's answer waits even where every range was this
+            // group's at the take: one may move before the answer (C4).
             if answering && write.reply_to.is_some() && !write.dataset.is_empty() {
                 let others = other_groups(groups, &write.dataset);
-                if !others.is_empty() {
+                if !others.is_empty()
+                    || crate::range::leaves(&groups.ranges_of(&write.dataset)).len() > 1
+                {
                     self.waits.push(Wait {
                         at: sent_to.len(),
                         sequence: write.sequence,
@@ -439,20 +443,34 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
             continue;
         };
         let mut groups = wait.groups.clone();
+        // The dataset's ranges' owners now: read at once, again now and then
+        // while the answer waits, and once more after every group waited on
+        // has passed the write. A range moved to another group since the
+        // write was taken is waited on there too (the review's C4): an old
+        // owner skips the rows only once the move names the new one, so a
+        // read after its position passed the write names the new owner.
+        let more = |groups: &mut Vec<u32>| -> bool {
+            if wait.dataset.is_empty() {
+                return false;
+            }
+            if tokio::task::block_in_place(|| lake.read_owners_again()).is_err() {
+                return true;
+            }
+            let mut grew = false;
+            for group in other_groups(lake.groups(), &wait.dataset) {
+                if !groups.contains(&group) {
+                    groups.push(group);
+                    grew = true;
+                }
+            }
+            grew
+        };
+        more(&mut groups);
         let mut looked = tokio::time::Instant::now();
         let reached = loop {
-            // The dataset's ranges' owners now, read again now and then: a
-            // range moved to another group since the write was taken is
-            // waited on there too (the review's C4).
-            if !wait.dataset.is_empty() && looked.elapsed() >= Duration::from_millis(100) {
+            if looked.elapsed() >= Duration::from_millis(100) {
                 looked = tokio::time::Instant::now();
-                if tokio::task::block_in_place(|| lake.read_owners_again()).is_ok() {
-                    for group in other_groups(lake.groups(), &wait.dataset) {
-                        if !groups.contains(&group) {
-                            groups.push(group);
-                        }
-                    }
-                }
+                more(&mut groups);
             }
             let all = tokio::task::block_in_place(|| {
                 groups.iter().all(|group| {
@@ -462,7 +480,7 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                         .is_some_and(|at| at.sequence >= wait.sequence)
                 })
             });
-            if all {
+            if all && !more(&mut groups) {
                 break true;
             }
             if tokio::time::Instant::now() >= until {

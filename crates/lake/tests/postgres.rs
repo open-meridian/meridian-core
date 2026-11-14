@@ -8096,4 +8096,6 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
         answered[0].1.is_err(),
         "answered before group 1, which owns a range of it now, committed its part"
     );
+    // Their connections closed off the runtime's threads.
+    tokio::task::block_in_place(move || drop((lake, zero, one)));
 }
