@@ -4239,8 +4239,17 @@ def writer_groups(s):
     s.check(acted.isdigit() and int(acted) > 0,
             f"writer groups: the driver's orders committed in P0 by the book's group 1 since ({acted} entries)")
     # Handed on: each internal topic's messages to its group-1 queue group.
+    # In `ha` a data plugin's lake writes reach every group by the lake's
+    # write-ahead stream, never by a hand-off (section 6.1): there, group
+    # 1's own place in the stream, moved since, says it took them.
     counts = handed_on_counts()
     for topic in WRITES_HANDED_ON:
+        if topic == "platform.lake.internal.record" and PROFILE == "ha":
+            taken = psql("select count(*) from lake_write_ahead where stream = 'LAKE_WRITE_AHEAD.group-1' "
+                         f"and committed_at_ns >= {since_ns}").strip()
+            s.check(taken == "1", "writer groups: the lake's group 1 took its writes from the write-ahead stream, "
+                    f"its own place in it moved since ({taken or 'none'})")
+            continue
         to_one = sum(n for (subject, group), n in counts.items() if subject == topic and group.endswith(".group-1"))
         s.check(to_one > 0, f"writer groups: writes handed to group 1 on {topic} ({to_one} as the broker counts)")
     s.note(f"writer groups: the hand-offs by topic and queue group: {counts}")

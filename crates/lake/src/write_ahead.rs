@@ -245,7 +245,18 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
-        let mut expected = self.next();
+        // A writer group past the first with no position of its own -- its
+        // first start, after `writerGroups` was raised (step 3d; section
+        // 6.1; CI 43615034712) -- takes from the first write the stream
+        // still holds: the writes before it were group 0's to take, and
+        // were taken, so none is counted dropped. Its datasets' writes in
+        // the stream are taken again, and each row is recorded once.
+        let fresh = self.position.is_none() && self.from.is_none() && self.lake.groups().mine() > 0;
+        let mut expected = if fresh {
+            taken[0].sequence
+        } else {
+            self.next()
+        };
         let mut before_at = self.position.map_or(0, |at| at.at_ns);
         let mut dropped = Vec::new();
         for write in &taken {
