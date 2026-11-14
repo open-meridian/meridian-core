@@ -8027,3 +8027,73 @@ fn review_m1_a_group_leading_its_database_logs_control_right_after_its_takeover(
         .split_partition(&dataset, "admin-1", "two halves", 1_100)
         .unwrap();
 }
+
+/// C4: an answer of a write split across groups waits on the groups that
+/// own its dataset's ranges as they are while it waits, never only those
+/// its taker saw: a range moved to group 1 since the write was taken (its
+/// taker saw no other group) holds the answer until group 1 commits -- here
+/// it never does, so the answer is refused for load, never answered OK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
+    use meridian_domain::v1::{RecordObservationsReply, Watermark};
+    use meridian_lake::partition_moves::{Asked, Mover, Settings};
+    use meridian_lake::write_ahead::{settled, Wait};
+    use prost::Message;
+    let (_url, zero, one, dataset, lower, _upper, _low, _high) =
+        tokio::task::block_in_place(|| two_groups_and_a_split("lake-c4"));
+    tokio::task::block_in_place(|| {
+        let mover = Mover::new(
+            vec![zero.clone()],
+            zero.groups(),
+            Settings::default(),
+            Arc::new(SystemClock),
+        );
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+        one.read_owners().unwrap();
+    });
+    let bus = Arc::new(meridian_bus::Bus::single(
+        "lake-c4",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(SystemClock),
+    ));
+    let lake = meridian_lake::service::serve_grouped(
+        bus,
+        zero.clone() as Arc<dyn Store>,
+        Arc::new(SystemClock),
+        zero.groups(),
+    );
+    let answer = vec![(
+        Some("_INBOX.c4".to_string()),
+        Ok((
+            "meridian.v1.RecordObservationsReply".to_string(),
+            RecordObservationsReply {
+                recorded: 1,
+                watermark: Some(Watermark {
+                    partitions: vec![meridian_pb::v1::PartitionSequence {
+                        partition: dataset.clone(),
+                        sequence: 0,
+                    }],
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )),
+    )];
+    let answered = settled(
+        &lake,
+        "lake-c4-stream",
+        answer,
+        vec![Wait {
+            at: 0,
+            sequence: 7,
+            groups: Vec::new(),
+            dataset: dataset.clone(),
+        }],
+    )
+    .await;
+    assert!(
+        answered[0].1.is_err(),
+        "answered before group 1, which owns a range of it now, committed its part"
+    );
+}
