@@ -2969,12 +2969,19 @@ impl Store for PostgresStore {
             &places.iter().map(|(d, _, _)| d.clone()).collect::<Vec<_>>(),
         )?;
         let code = data_type.code();
+        // Each place by the month's unique (dataset, sequence) index alone:
+        // its data type named so no index leads with it. A month not yet
+        // analysed otherwise took the subject index, whose sequence follows
+        // the subject, and scanned the dataset's every row of the type for
+        // each place -- a page's 500 places in seconds, its burst past the
+        // pool's wait (CI run 43560029609; base fd50b1b0 the same, half its
+        // runs).
         let found = tx
             .query(
                 "SELECT r.body, p.n
                    FROM unnest($1::text[], $2::bigint[]) WITH ORDINALITY AS p(dataset, sequence, n)
                    JOIN lake_row r ON r.dataset = p.dataset AND r.sequence = p.sequence
-                  WHERE r.data_type = $3
+                  WHERE r.data_type + 0::smallint = $3
                   ORDER BY p.n",
                 &[&datasets, &sequences, &code],
             )
