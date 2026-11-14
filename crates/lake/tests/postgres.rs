@@ -6641,3 +6641,171 @@ fn a_lake_range_moved_between_databases_is_copied_and_its_chain_reads_whole() {
     // The moved range's head is the target's: past the source's close.
     assert!(one.heads().unwrap()[&lower] > zeros[0].heads().unwrap()[&lower]);
 }
+
+/// A write split across two writer groups, in ha (step 3d; spec 6.7): the
+/// group answering it waits until the other group's consumer has committed
+/// its part -- its position in the stream past the write -- and answers
+/// with a watermark naming each part's range at its head, so a read after
+/// that watermark finds both parts at once. Never within the hold, it is
+/// refused OVERLOADED with a retry-after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_split_across_groups_is_answered_once_every_part_has_committed() {
+    use meridian_domain::v1::{RecordObservationsReply, Watermark};
+    use meridian_lake::partition_moves::{Asked, Mover, Settings};
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::{settled, Wait};
+    use prost::Message;
+    let (_url, zero, one, dataset, lower, upper, low, high) =
+        tokio::task::block_in_place(|| two_groups_and_a_split("lake-wait"));
+    tokio::task::block_in_place(|| {
+        let mover = Mover::new(
+            vec![zero.clone()],
+            zero.groups(),
+            Settings::default(),
+            Arc::new(SystemClock),
+        );
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+        one.read_owners().unwrap();
+    });
+    let bus = Arc::new(meridian_bus::Bus::single(
+        "lake-1",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(SystemClock),
+    ));
+    let lake = meridian_lake::service::serve_grouped(
+        bus,
+        zero.clone() as Arc<dyn Store>,
+        Arc::new(SystemClock),
+        zero.groups(),
+    );
+    let stream = "lake-test-stream";
+    // Group 0's part committed with its position, and its answer made.
+    let part = |store: &PostgresStore, key: &str, row: Observation, sequence: u64| {
+        store
+            .record_write_ahead(
+                WriteAheadBatch {
+                    stream: key.to_string(),
+                    after: None,
+                    through: WriteAheadPosition { sequence, at_ns: 1 },
+                    parts: vec![(dataset.clone(), vec![row])],
+                    ..Default::default()
+                },
+                5_000,
+            )
+            .unwrap()
+    };
+    tokio::task::block_in_place(|| part(&zero, stream, trade(&dataset, "w-high", &high, 70), 7));
+    let answer = || {
+        vec![(
+            Some("_INBOX.w".to_string()),
+            Ok((
+                "meridian.v1.RecordObservationsReply".to_string(),
+                RecordObservationsReply {
+                    recorded: 1,
+                    watermark: Some(Watermark {
+                        partitions: vec![meridian_pb::v1::PartitionSequence {
+                            partition: dataset.clone(),
+                            sequence: 0,
+                        }],
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )),
+        )]
+    };
+    let wait = || Wait {
+        at: 0,
+        sequence: 7,
+        groups: vec![1],
+    };
+    // Group 1's part commits a moment later: the answer waits for it.
+    let committing = {
+        let (one, dataset, low) = (one.clone(), dataset.clone(), low.clone());
+        let key = format!("{stream}.group-1");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::task::block_in_place(|| {
+                one.record_write_ahead(
+                    WriteAheadBatch {
+                        stream: key,
+                        after: None,
+                        through: WriteAheadPosition {
+                            sequence: 7,
+                            at_ns: 1,
+                        },
+                        parts: vec![(dataset.clone(), vec![trade(&dataset, "w-low", &low, 71)])],
+                        ..Default::default()
+                    },
+                    5_000,
+                )
+                .unwrap()
+            })
+        })
+    };
+    let began = std::time::Instant::now();
+    let answered = settled(&lake, stream, answer(), vec![wait()]).await;
+    assert!(
+        began.elapsed() >= std::time::Duration::from_millis(250),
+        "it waited"
+    );
+    committing.await.unwrap();
+    let (_, payload) = answered[0].1.clone().expect("answered once both committed");
+    let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+    let named: std::collections::BTreeMap<String, u64> = reply
+        .watermark
+        .unwrap()
+        .partitions
+        .into_iter()
+        .map(|at| (at.partition, at.sequence))
+        .collect();
+    // Read after the watermark: both parts there at once.
+    tokio::task::block_in_place(|| {
+        let heads = zero.heads().unwrap();
+        for range in [&lower, &upper] {
+            assert!(
+                named[range] >= 1 && heads[range] >= named[range],
+                "{range}: {named:?}"
+            );
+        }
+        for (subject, key) in [(&low, "w-low"), (&high, "w-high")] {
+            let read = zero
+                .read(&Query {
+                    datasets: vec![dataset.clone()],
+                    data_type: DataType::Trade,
+                    subjects: vec![subject.to_string()],
+                    kinds: vec![],
+                    interval_ns: 0,
+                    when: When::Latest { at_ns: 0 },
+                    as_of_ns: 0,
+                    published_as_of_ns: 0,
+                    latest_only: false,
+                })
+                .unwrap();
+            assert!(
+                read.iter().any(|row| row.meta().row_key == key),
+                "{key} read at once"
+            );
+        }
+    });
+    // A part never committed: refused OVERLOADED within the hold.
+    let never = settled(
+        &lake,
+        stream,
+        answer(),
+        vec![Wait {
+            sequence: 99,
+            ..wait()
+        }],
+    )
+    .await;
+    let refused = never[0].1.clone().unwrap_err();
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(refused.contains(&overloaded), "{refused}");
+    // Their connections closed off the runtime's threads.
+    tokio::task::block_in_place(move || drop((lake, zero, one)));
+}

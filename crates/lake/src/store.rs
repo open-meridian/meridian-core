@@ -853,6 +853,14 @@ pub trait Store: Send + Sync {
         Ok(BTreeMap::new())
     }
 
+    /// Writer group `group`'s position in the write-ahead stream, kept as
+    /// `key` in the database it writes (step 3d): how far that group has
+    /// committed its own rows of the stream's writes.
+    fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
+        let _ = group;
+        self.write_ahead_position(key)
+    }
+
     /// The data configuration as last heard.
     fn keep_configuration(&self, event: &EntitlementsChangedEvent) -> Result<()>;
 

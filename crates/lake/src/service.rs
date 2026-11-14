@@ -2487,6 +2487,33 @@ impl Lake {
         self.store.write_ahead_position(stream)
     }
 
+    /// Writer group `group`'s position in the write-ahead stream kept as
+    /// `key` (step 3d): what an answer spanning groups waits on.
+    pub fn group_position(
+        &self,
+        key: &str,
+        group: u32,
+    ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
+        self.store.group_position(key, group)
+    }
+
+    /// An answer's watermark read again (step 3d; spec 6.7): once every
+    /// group's part of the write has committed, each partition of its
+    /// datasets at its head now, the other groups' among them.
+    pub fn watermark_again(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let mut reply = RecordObservationsReply::decode(payload)
+            .map_err(|failed| format!("an answer did not read: {failed}"))?;
+        let datasets: BTreeSet<String> = reply
+            .watermark
+            .iter()
+            .flat_map(|watermark| watermark.partitions.iter())
+            .map(|at| crate::range::dataset_of(&at.partition).to_string())
+            .collect();
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        reply.watermark = Some(watermark(&heads, &datasets));
+        Ok(reply.encode_to_vec())
+    }
+
     /// What the lake found its write-ahead stream `stream` dropped, and each
     /// dataset's latest valid time recorded from it (W10.14).
     pub fn write_ahead_found(

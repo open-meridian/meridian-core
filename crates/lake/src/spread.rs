@@ -330,6 +330,11 @@ impl Store for Spread {
         self.own().write_ahead_position(stream)
     }
 
+    fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
+        self.database(meridian_changes::databases::of_group(group, self.count()))
+            .write_ahead_position(key)
+    }
+
     fn record_write_ahead(
         &self,
         batch: WriteAheadBatch,

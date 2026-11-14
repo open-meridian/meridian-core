@@ -78,10 +78,40 @@ pub struct Taken {
 /// kept it; each group past the first under `<stream>.group-<g>`, as its
 /// queue group is named.
 pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> String {
-    match groups.mine() {
+    group_key(stream, groups.mine())
+}
+
+/// Writer group `group`'s position's key in `stream`.
+fn group_key(stream: &str, group: u32) -> String {
+    match group {
         0 => stream.to_string(),
         group => format!("{stream}.group-{group}"),
     }
+}
+
+/// An answer this group gives once other groups have committed their own
+/// parts of its write (step 3d; spec 6.7): the answer's place in its batch,
+/// the write's stream sequence, and the groups whose positions must reach
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wait {
+    pub at: usize,
+    pub sequence: u64,
+    pub groups: Vec<u32>,
+}
+
+/// The groups besides this one owning an open range of `dataset`, as this
+/// member last read them: those whose parts of a write of it an answer
+/// waits for.
+fn other_groups(groups: meridian_changes::groups::Groups, dataset: &str) -> Vec<u32> {
+    let mut others: Vec<u32> = crate::range::leaves(&groups.ranges_of(dataset))
+        .into_iter()
+        .map(|(_, group)| group)
+        .filter(|group| *group != groups.mine())
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    others
 }
 
 /// Whether a write taken from the stream is this writer group's to commit:
@@ -138,6 +168,10 @@ pub struct Recorded {
 /// each batch moves, and what the stream dropped that the lake has found.
 pub struct Writer {
     lake: Arc<Lake>,
+    /// The stream's name, as every group's position is kept by.
+    base: String,
+    /// The waits of the answers of the batch taken last (step 3d).
+    waits: Vec<Wait>,
     stream: String,
     position: Option<WriteAheadPosition>,
     /// The sequence to take from next where it is not the one after the
@@ -152,11 +186,14 @@ impl Writer {
     /// with what it found the stream dropped.
     pub fn start(lake: Arc<Lake>, stream: &str) -> Result<Writer, StoreError> {
         // Each writer group's own position (step 3d; section 6.1).
+        let base = stream.to_string();
         let stream = position_key(stream, lake.groups());
         let position = lake.write_ahead_position(&stream)?;
         let (dropped, valid) = lake.write_ahead_found(&stream)?;
         Ok(Writer {
             lake,
+            base,
+            waits: Vec::new(),
             stream,
             position,
             from: None,
@@ -200,6 +237,7 @@ impl Writer {
     /// Refused whole where the store refused it: the writer reads its
     /// position again before it takes another.
     pub fn take(&mut self, taken: Vec<Taken>) -> Result<Answers, StoreError> {
+        self.waits.clear();
         let Some(last) = taken.last() else {
             return Ok(Vec::new());
         };
@@ -255,6 +293,18 @@ impl Writer {
                     .cloned()
             });
             let answering = answers(groups, &write);
+            // An answer of a write whose dataset's ranges span groups waits
+            // until each other group's part has committed (spec 6.7).
+            if answering && write.reply_to.is_some() && !write.dataset.is_empty() {
+                let others = other_groups(groups, &write.dataset);
+                if !others.is_empty() {
+                    self.waits.push(Wait {
+                        at: sent_to.len(),
+                        sequence: write.sequence,
+                        groups: others,
+                    });
+                }
+            }
             sent_to.push(write.reply_to.filter(|_| answering));
             writes.push(Written {
                 topic: write.topic,
@@ -330,6 +380,68 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)
             .unwrap_or_default(),
     })
+}
+
+impl Writer {
+    /// The waits of the batch taken last, taken out (step 3d).
+    pub fn take_waits(&mut self) -> Vec<Wait> {
+        std::mem::take(&mut self.waits)
+    }
+
+    /// The stream's name every group's position is kept by.
+    pub fn stream_name(&self) -> &str {
+        &self.base
+    }
+}
+
+/// A batch's answers once each wait is over (step 3d; spec 6.7): an answer
+/// of a write split across groups given once every other group's position
+/// has reached the write -- its part committed -- its watermark read again
+/// so it names each part's partitions at their heads; past
+/// `moves.holdSeconds`, refused OVERLOADED with a retry-after, its rows
+/// committed all the same and kept by the stream.
+pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec<Wait>) -> Answers {
+    let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
+    for wait in waits {
+        let Some((_, answer)) = answers.get_mut(wait.at) else {
+            continue;
+        };
+        let Ok((_, payload)) = answer else {
+            continue;
+        };
+        let reached = loop {
+            let all = tokio::task::block_in_place(|| {
+                wait.groups.iter().all(|group| {
+                    lake.group_position(&group_key(stream, *group), *group)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|at| at.sequence >= wait.sequence)
+                })
+            });
+            if all {
+                break true;
+            }
+            if tokio::time::Instant::now() >= until {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        *answer = if reached {
+            tokio::task::block_in_place(|| lake.watermark_again(payload))
+                .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
+        } else {
+            Err(meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                meridian_changes::moves::HELD_RETRY_SECONDS,
+                format!(
+                    "writer group(s) {:?} had not committed their part of this write within the \
+                     hold: its rows are kept and committed in turn; ask again",
+                    wait.groups
+                ),
+            ))
+        };
+    }
+    answers
 }
 
 /// Each answer sent to the inbox its write named, as the broker's request
@@ -456,6 +568,31 @@ fn bytes(said: &str) -> Option<i64> {
 /// this member writes: from the position the store holds, and back to it
 /// whenever a batch is refused. Ends only with an error the writer cannot
 /// go on from.
+/// A batch's answers sent: at once where none waits; else once its waits
+/// are over, on a task of its own, so the writer takes its next batch
+/// meanwhile -- another group's part it waits on may be in that group's
+/// next batch, which may wait on this one's (step 3d).
+async fn answer_when_settled(
+    lake: &Arc<Lake>,
+    client: &async_nats::Client,
+    writer: &mut Writer,
+    answers: Answers,
+) {
+    let waits = writer.take_waits();
+    if waits.is_empty() {
+        return answer(client, answers).await;
+    }
+    let (lake, client, stream) = (
+        lake.clone(),
+        client.clone(),
+        writer.stream_name().to_string(),
+    );
+    tokio::spawn(async move {
+        let answers = settled(&lake, &stream, answers, waits).await;
+        answer(&client, answers).await;
+    });
+}
+
 pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
@@ -595,7 +732,9 @@ pub async fn write_forever(
                     let mut alone = Ok(Vec::new());
                     for write in each {
                         match tokio::task::block_in_place(|| writer.take(vec![write])) {
-                            Ok(answers) => answer(&client, answers).await,
+                            Ok(answers) => {
+                                answer_when_settled(&lake, &client, &mut writer, answers).await
+                            }
                             Err(failed) => {
                                 alone = Err(failed);
                                 break;
@@ -607,7 +746,7 @@ pub async fn write_forever(
                 (took, _) => took,
             };
             match took {
-                Ok(answers) => answer(&client, answers).await,
+                Ok(answers) => answer_when_settled(&lake, &client, &mut writer, answers).await,
                 Err(StoreError::Fenced(fenced)) => {
                     return Err(format!("the lake's writer was fenced: {fenced}"));
                 }
@@ -877,14 +1016,23 @@ mod tests {
             dataset: dataset.clone(),
         };
         let (zero, one) = (Groups::new(0, 2).unwrap(), Groups::new(1, 2).unwrap());
-        assert!(ours(zero, &write) && !ours(one, &write), "whole: its owner's");
+        assert!(
+            ours(zero, &write) && !ours(one, &write),
+            "whole: its owner's"
+        );
         for groups in [zero, one] {
             groups.assign(&dataset, Some(0));
             groups.assign(&format!("{dataset}/0000-7fff"), Some(1));
             groups.assign(&format!("{dataset}/8000-ffff"), Some(0));
         }
-        assert!(ours(zero, &write) && ours(one, &write), "split: each group's");
-        assert!(answers(zero, &write) && !answers(one, &write), "answered once");
+        assert!(
+            ours(zero, &write) && ours(one, &write),
+            "split: each group's"
+        );
+        assert!(
+            answers(zero, &write) && !answers(one, &write),
+            "answered once"
+        );
     }
 
     /// The stream's leader, stood in: how far it says the stream reached.

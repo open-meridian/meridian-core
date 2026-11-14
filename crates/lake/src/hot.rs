@@ -800,6 +800,14 @@ impl Store for HotStore {
         self.inner.write_ahead_position(stream)
     }
 
+    fn group_position(
+        &self,
+        key: &str,
+        group: u32,
+    ) -> Result<Option<crate::store::WriteAheadPosition>> {
+        self.inner.group_position(key, group)
+    }
+
     fn record_write_ahead(
         &self,
         batch: crate::store::WriteAheadBatch,
