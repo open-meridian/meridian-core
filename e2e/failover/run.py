@@ -92,6 +92,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-failover-e2e")
@@ -193,6 +194,20 @@ INTEROP_IMAGE = os.environ.get("E2E_INTEROP_IMAGE", "meridian-python-interop")
 RPO_IN_CLASS = {"db-primary", "torn-write", "zone"}
 # The oms driver's history (Jepsen's invoke/ok/fail/info), kept for Elle.
 HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
+
+# The rebalance class (step 3d; the resilience spec's section 15), after
+# the two writer groups in the tolerant and ha runs: the lake's and the
+# book's group-0 movers' injected lag and digest mismatch, files in their
+# pods' own scratch (MERIDIAN_MOVE_LAG_FILE, MERIDIAN_MOVE_DIGEST_FILE,
+# which the chart never sets), and moves.holdSeconds as the chart sets it
+# by default.
+REBALANCED = DRIVEN and PROFILE in ("tolerant", "ha")
+MOVE_LAG_FILE = "/run/meridian-ready/move-lag"
+MOVE_DIGEST_FILE = "/run/meridian-ready/move-digest"
+HOLD_SECONDS = 5
+# The deployment admin's password, drawn by first_run for this process
+# alone: never printed, never written anywhere but as its hash.
+ADMIN_PASSWORD = None
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
@@ -476,6 +491,13 @@ def install(s):
     if PROFILE == "ha":
         # The book's reader may be held behind on purpose (reader_held).
         kubectl("set", "env", f"deployment/{FULL}-bor-reader", f"MERIDIAN_READER_HOLD_FILE={HOLD_FILE}")
+    if REBALANCED:
+        # A move's injected lag and digest mismatch (rebalance): the files
+        # group 0's movers look for, which the chart never sets, set here
+        # before the load starts, as set env restarts the pods.
+        for component in ("lake", "bor"):
+            kubectl("set", "env", f"deployment/{FULL}-{component}",
+                    f"MERIDIAN_MOVE_LAG_FILE={MOVE_LAG_FILE}", f"MERIDIAN_MOVE_DIGEST_FILE={MOVE_DIGEST_FILE}")
     if public:
         driver_trusted(public)
     if PROFILE == "ha":
@@ -605,6 +627,15 @@ def first_run(s):
         # memory (failover-repeat 43071322484, PR CI 43070882389).
         "local-accounts": base64.b64encode(b"on").decode(),
     }
+    if REBALANCED:
+        # Her account's name and password (step 3d): the rebalance class
+        # signs her in, as a deployment admin does, to move partitions by the
+        # dashboard's own tools and dialog. The password is drawn here and
+        # kept in this process alone, its Argon2id hash as the wizard's Job
+        # writes it; neither is ever printed.
+        addresses["data"]["local-account-name"] = base64.b64encode(ADMIN.split("|", 1)[1].encode()).decode()
+        addresses["data"]["administrator-password-hash"] = base64.b64encode(
+            admin_password_hash().encode()).decode()
     kubectl("replace", "-f", "-", input=json.dumps(addresses).encode(), quiet=True)
     del serving, migrating, passwords
     jobs = json.loads(out("get", "jobs", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
@@ -3595,6 +3626,533 @@ def page_entitled(s):
     s.check(reading, "the page reads the driver's price back")
 
 
+# ── Rebalance (step 3d; the resilience spec's sections 6.8 and 15) ──────────
+#
+# After the two writer groups (writer_groups), under the driver's load, as a
+# deployment admin does it: signed in at the dashboard, a lake range, a book
+# partition and an account moved by the dashboard's own tools
+# (`dashboard__move_partition`, `dashboard__move_account`) and its Move
+# dialog, within one database and then across two (`lake.databases` and
+# `bor.databases` set to 2 by an upgrade). Each move holds the writes to what
+# it moves for at most moves.holdSeconds: the driver's p99 write time while
+# it ran within it, and none of its writes refused; it switches only with the
+# digests equal (its PartitionMoved, no PartitionMoveAborted); and what was
+# committed before it reads the same after it, from where it is written now.
+# An injected lag and an injected digest mismatch each abort a move, the
+# source still owning and writing, with PartitionMoveAborted (and the
+# digest's IntegrityFinding).
+
+
+def admin_password_hash():
+    """The deployment admin's password, drawn and kept in ADMIN_PASSWORD,
+    and its Argon2id hash at the dashboard's defaults in the PHC form it
+    reads, made as the harness makes its own (deploy/harness/compose.yaml):
+    by OpenSSL 3.3's ARGON2ID, the password on its standard input alone."""
+    global ADMIN_PASSWORD
+    ADMIN_PASSWORD = "h" + os.urandom(24).hex()
+    salt = os.urandom(16)
+    done = run("docker", "run", "--rm", "-i", "--entrypoint", "sh", "alpine/openssl:3.3.2", "-c",
+               'openssl kdf -keylen 32 -kdfopt pass:"$(cat)" -kdfopt hexsalt:' + salt.hex()
+               + " -kdfopt iter:2 -kdfopt memcost:19456 -kdfopt lanes:1 ARGON2ID",
+               input=ADMIN_PASSWORD.encode(), quiet=True)
+    key = bytes.fromhex(done.stdout.decode().strip().replace(":", ""))
+
+    def b64(raw):
+        return base64.b64encode(raw).decode().rstrip("=")
+    return f"$argon2id$v=19$m=19456,t=2,p=1${b64(salt)}${b64(key)}"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class Dashboard:
+    """The deployment admin at the dashboard, over a port-forward to its
+    Service, as the host it is configured at: her browser's cookies, and an
+    MCP client she authorised through its own OAuth (as the harness's `mcp
+    connect` does)."""
+
+    HOST = "failover-e2e.localhost"
+    CALLBACK = "http://127.0.0.1:53682/callback"
+
+    def __init__(self):
+        import socket
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        self.forward = subprocess.Popen(
+            ["kubectl", "--namespace", NAMESPACE, "port-forward", f"svc/{FULL}-dashboard", f"{port}:80"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.base = f"http://127.0.0.1:{port}"
+        self.cookies = {}
+        self.access = None
+        if not happens(lambda: self.send("GET", "/sign-in")[0] == 200, 60, every=1):
+            self.close()
+            raise SystemExit("the dashboard did not answer over its port-forward")
+
+    def close(self):
+        self.forward.terminate()
+
+    def send(self, method, path, fields=None, body=None, bearer=None):
+        data, kind = None, None
+        if body is not None:
+            data, kind = json.dumps(body).encode(), "application/json"
+        elif fields is not None:
+            data, kind = urllib.parse.urlencode(fields).encode(), "application/x-www-form-urlencoded"
+        request = urllib.request.Request(self.base + path, data=data, method=method)
+        request.add_header("Host", self.HOST)
+        if kind:
+            request.add_header("Content-Type", kind)
+        if bearer:
+            request.add_header("Authorization", f"Bearer {bearer}")
+        elif self.cookies:
+            request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in self.cookies.items()))
+        try:
+            response = urllib.request.build_opener(NoRedirect).open(request, timeout=60)
+            status, raw, headers = response.status, response.read(), response.headers
+        except urllib.error.HTTPError as refused:
+            status, raw, headers = refused.code, refused.read(), refused.headers
+        if not bearer:
+            for value in headers.get_all("Set-Cookie") or []:
+                name, _, rest = value.partition("=")
+                self.cookies[name] = rest.split(";")[0]
+        return status, raw.decode("utf-8", errors="replace"), headers.get("Location")
+
+    def connect(self):
+        """Her MCP client, authorised for everything she holds."""
+        import hashlib
+        import secrets as drawn
+        resource = f"http://{self.HOST}/mcp"
+        status, said, _ = self.send("POST", "/oauth/register",
+                                    body={"client_name": "failover rebalance", "redirect_uris": [self.CALLBACK]})
+        if status != 201:
+            raise SystemExit(f"the MCP client was not registered: {status} {said[:300]}")
+        client_id = json.loads(said)["client_id"]
+        verifier = drawn.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        query = urllib.parse.urlencode({
+            "response_type": "code", "client_id": client_id, "redirect_uri": self.CALLBACK,
+            "code_challenge": challenge, "code_challenge_method": "S256", "state": "rebalance",
+            "resource": resource})
+        status, page, _ = self.send("GET", f"/oauth/authorize?{query}")
+        found = re.search(r'name="authorize" value="([^"]+)"', page)
+        if status != 200 or not found:
+            raise SystemExit(f"the authorisation did not ask her to sign in: {status}")
+        status, page, _ = self.send("POST", "/sign-in", fields={
+            "name": ADMIN.split("|", 1)[1], "password": ADMIN_PASSWORD, "authorize": found.group(1)})
+        request = re.search(r'name="request" value="([^"]+)"', page)
+        confirm = re.search(r'name="confirm" value="([^"]+)"', page)
+        if status != 200 or not request or not confirm:
+            raise SystemExit(f"she was not shown the consent page: {status}")
+        fields = [("request", request.group(1)), ("confirm", confirm.group(1)), ("decision", "allow"),
+                  ("covers", "everything"), ("days", "30")]
+        status, _, location = self.send("POST", "/oauth/authorize", fields=fields)
+        code = urllib.parse.parse_qs(urllib.parse.urlsplit(location or "").query).get("code", [""])[0]
+        if status != 302 or not code:
+            raise SystemExit(f"the consent sent back no code: {status}")
+        status, said, _ = self.send("POST", "/oauth/token", fields={
+            "grant_type": "authorization_code", "code": code, "code_verifier": verifier,
+            "redirect_uri": self.CALLBACK, "client_id": client_id, "resource": resource})
+        if status != 200:
+            raise SystemExit(f"the code was not exchanged: {status}")
+        self.access = json.loads(said)["access_token"]
+
+    def call(self, tool, arguments):
+        """A tool called as her client: its structured answer."""
+        status, said, _ = self.send("POST", "/mcp", body={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}},
+            bearer=self.access)
+        if status != 200:
+            raise SystemExit(f"{tool}: /mcp answered {status}: {said[:400]}")
+        return (json.loads(said).get("result") or {}).get("structuredContent") or {}
+
+    def move_dialog(self, partition, group, note):
+        """The Resilience page's Move dialog posted, as she posts it signed in:
+        its status and where it sent her."""
+        status, page, _ = self.send("GET", "/admin/resilience")
+        token = re.search(r'action="/admin/resilience/move-partition"><input type="hidden" '
+                          r'name="form_token" value="([^"]+)"', page)
+        if status != 200 or not token:
+            raise SystemExit(f"the Resilience page with its Move dialog was not shown: {status}")
+        status, _, location = self.send("POST", "/admin/resilience/move-partition", fields={
+            "form_token": token.group(1), "partition": partition, "target_group": str(group), "note": note})
+        return status, location or ""
+
+    def sign_in(self):
+        status, _, _ = self.send("POST", "/sign-in", fields={
+            "name": ADMIN.split("|", 1)[1], "password": ADMIN_PASSWORD})
+        if status != 303:
+            raise SystemExit(f"she was not signed in: {status}")
+
+
+def database_pod(store, d):
+    """Database `d` of `store`'s primary: the first's, or the one the chart
+    brings past it (`<release>-<store>-database-<d>`)."""
+    if d == 0:
+        return primary()
+    component = f"{ {'book': 'bor'}.get(store, store)}-database-{d}"
+    said = json.loads(out("get", "pods", "-l",
+                          f"app.kubernetes.io/instance={RELEASE},meridian.dev/component={component},"
+                          "meridian.dev/database-role=primary", "-o", "json"))["items"]
+    live = [p["metadata"]["name"] for p in said if not p["metadata"].get("deletionTimestamp")]
+    return live[0] if live else f"{FULL}-{component}-0"
+
+
+def driver_lines(path):
+    """The data and oms instances' lines of `path` in their pods' scratch."""
+    return [line.split() for instance in ("drive-data", "drive-oms")
+            for line in driver_file(instance, path).splitlines()]
+
+
+def window_held(s, what, began_ms, ended_ms):
+    """The driver's writes while a move ran: their p99 time within the
+    hold, and none refused."""
+    took = sorted(int(p[3]) for p in driver_lines("/tmp/took")
+                  if len(p) == 4 and p[2].isdigit() and began_ms <= int(p[2]) <= ended_ms + 1000)
+    refused = [p for p in driver_lines("/tmp/refused")
+               if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= ended_ms]
+    p99 = took[min(len(took) - 1, int(len(took) * 0.99))] if took else None
+    s.check(bool(took) and p99 <= HOLD_SECONDS * 1000,
+            f"rebalance: {what}: the driver's p99 write time while it moved within moves.holdSeconds "
+            f"({p99} ms of {len(took)} writes, the longest {took[-1] if took else None} ms)")
+    s.check(not refused, f"rebalance: {what}: no write refused while it moved ({len(refused)}: "
+                         f"{[' '.join(p[:3]) for p in refused[:3]]})")
+    if p99 is not None:
+        claim(s, "rebalance", what, p99 / 1000, HOLD_SECONDS,
+              {"move_s": round((ended_ms - began_ms) / 1000, 2), "writes": len(took)})
+
+
+def committed_before(store, d, kind, name, before_ns):
+    """What was committed before `before_ns` of a moved thing, in database
+    `d`: how many, and a digest of them, each by its key and place."""
+    if kind == "range":
+        dataset = name.split("/")[0]
+        sql = (f"select count(*), coalesce(md5(string_agg(row_key || ':' || sequence || ':' || version, ',' "
+               f"order by sequence, row_key)), '') from lake_row where dataset = '{dataset}' "
+               f"and coalesce(partition, dataset) = '{name}' and recorded_at_ns < {before_ns}")
+    elif kind == "partition":
+        sql = (f"select count(*), coalesce(md5(string_agg(entry_id || ':' || encode(digest, 'hex'), ',' "
+               f"order by first_sequence)), '') from book_entry where partition = '{name}' "
+               f"and committed_at_ns < {before_ns}")
+    else:
+        sql = (f"select count(*), coalesce(md5(string_agg(entry_id || ':' || encode(digest, 'hex'), ',' "
+               f"order by partition, first_sequence)), '') from book_entry where account_id = '{name}' "
+               f"and committed_at_ns < {before_ns}")
+    return psql(sql, pod=database_pod(store, d))
+
+
+def no_gap(store, d, kind, name):
+    """The moved thing's change log whole where it is written now: each
+    sequence once, none missing."""
+    if kind == "range":
+        sql = (f"select count(distinct sequence) - (max(sequence) - min(sequence) + 1) from lake_row "
+               f"where dataset = '{name.split('/')[0]}' and coalesce(partition, dataset) = '{name}'")
+    else:
+        sql = (f"with c as (select first_sequence f, last_sequence l, lag(last_sequence) over "
+               f"(order by first_sequence) p from book_entry where partition = '{name}') "
+               f"select count(*) filter (where p is not null and f <> p + 1) from c")
+    said = psql(sql, pod=database_pod(store, d))
+    return said in ("0", "")
+
+
+def varint_field(record, number):
+    """A protobuf message's varint field, by number: the first, or None."""
+    at = 0
+
+    def varint():
+        nonlocal at
+        shift = value = 0
+        while True:
+            byte = record[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value
+            shift += 7
+    while at < len(record):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value = varint()
+            if field == number:
+                return value
+        elif wire == 1:
+            at += 8
+        elif wire == 5:
+            at += 4
+        elif wire == 2:
+            at += varint()
+        else:
+            return None
+    return None
+
+
+def lake_records(kind, partition, since_ns):
+    """The lake's control records of `kind` naming `partition`, kept since:
+    each record's bytes."""
+    said = psql(f"select encode(body, 'hex') from lake_control_change where kind = '{kind}' "
+                f"and committed_at_ns >= {since_ns} "
+                f"and position(convert_to('{partition}', 'UTF8') in body) > 0 order by sequence")
+    return [bytes.fromhex(line) for line in said.split()]
+
+
+def book_records(key, since_ns):
+    """The book's `~control` entries whose key begins `key`, kept since."""
+    said = psql(f"select idempotency_key from book_entry where account_id = '~control' "
+                f"and idempotency_key like '{key}%' and committed_at_ns >= {since_ns}")
+    return said.split()
+
+
+def partition_moved(store, partition, since_ns, seconds):
+    """Whether `partition`'s move ended within `seconds`: 'moved' with its
+    PartitionMoved, 'aborted' with its PartitionMoveAborted, else None."""
+    def ended():
+        if store == "lake":
+            if lake_records("meridian.v1.PartitionMoved", partition, since_ns):
+                return "moved"
+            if lake_records("meridian.v1.PartitionMoveAborted", partition, since_ns):
+                return "aborted"
+        else:
+            if book_records(f"control-record:partition-moved:{partition}:", since_ns):
+                return "moved"
+            if book_records(f"control-record:partition-move-aborted:{partition}:", since_ns):
+                return "aborted"
+        return None
+    started = time.time()
+    while time.time() - started < seconds:
+        try:
+            said = ended()
+        except SystemExit:
+            said = None
+        if said:
+            return said
+        time.sleep(1)
+    return None
+
+
+def rendezvous(partition, count=2):
+    """The group of `count` a partition is its own by, unassigned
+    (meridian_changes::groups::owner): the highest weight, the first eight
+    bytes of SHA-256 over `<partition>/<group>`, the lower group on a tie."""
+    import hashlib
+    return max(range(count), key=lambda g: (
+        int.from_bytes(hashlib.sha256(f"{partition}/{g}".encode()).digest()[:8], "big"), -g))
+
+
+def book_owner(partition):
+    """The group its head names, else its own by rendezvous."""
+    said = psql(f"select coalesce(writer_group, -1) from book_partition_head where partition = '{partition}'")
+    named = int(said) if said.lstrip("-").isdigit() else -1
+    return named if named >= 0 else rendezvous(partition)
+
+
+def lake_owner(partition):
+    """The group its row names, else its dataset's by rendezvous."""
+    said = psql(f"select coalesce(writer_group, -1) from lake_partition where dataset = '{partition}'")
+    named = int(said) if said.lstrip("-").isdigit() else -1
+    return named if named >= 0 else rendezvous(partition.split("/")[0])
+
+
+def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
+    """One move under the driver's load, by her tool (or her Move dialog):
+    answered at once, ended moved within switchSeconds, the driver's writes
+    held to the hold, nothing committed before it changed, its change log
+    whole where it is written now. `where` is (source database, target
+    database). Says whether it moved."""
+    what = f"{store} {kind} {name} to {'group ' + str(target) if kind != 'account' else target}, {where_said(where)}"
+    since_ns = time.time_ns()
+    time.sleep(1)
+    before = committed_before(store, where[0], kind, name, since_ns)
+    began_ms = int(time.time() * 1000)
+    if kind == "account":
+        answer = dash.call("dashboard__move_account", {
+            "account_id": name, "target_partition": target, "note": "rebalance: an account moved under load"})
+        moved = answer.get("outcome") == "made"
+        s.check(moved, f"rebalance: {what}: dashboard__move_account answered with its move ({answer})")
+        ended = "moved" if moved else None
+    else:
+        note = f"rebalance: {kind} {name} moved under load"
+        if by_dialog:
+            status, location = dash.move_dialog(name, target, note)
+            s.check(status == 303 and location.endswith("#partitions"),
+                    f"rebalance: {what}: her Move dialog answered by the store, the move begun "
+                    f"({status} to {location})")
+        else:
+            answer = dash.call("dashboard__move_partition",
+                               {"partition": name, "target_group": target, "note": note})
+            s.check(answer.get("outcome") == "made",
+                    f"rebalance: {what}: dashboard__move_partition answered, the move begun ({answer})")
+        ended = partition_moved(store, name, since_ns, 120)
+        s.check(ended == "moved", f"rebalance: {what}: switched, its digests equal ({ended})")
+    ended_ms = int(time.time() * 1000)
+    window_held(s, what, began_ms, ended_ms)
+    after = committed_before(store, where[1], kind, name, since_ns)
+    s.check(before == after and not before.startswith("0|"),
+            f"rebalance: {what}: what was committed before it reads the same after it ({before} and {after})")
+    if kind != "account":
+        s.check(no_gap(store, where[1], kind, name), f"rebalance: {what}: its change log whole where it is written")
+    return ended == "moved"
+
+
+def where_said(where):
+    return "within one database" if where[0] == where[1] else f"from database {where[0]} to database {where[1]}"
+
+
+def injected(component, path, text):
+    """A file made (text) or removed (None) in each of the component's
+    group-0 members' scratch."""
+    for pod in pods(component):
+        name = pod["metadata"]["name"]
+        if text is None:
+            kubectl("exec", name, "-c", component, "--", "rm", "-f", path, check=False)
+        else:
+            kubectl("exec", name, "-c", component, "--", "sh", "-c", f"printf %s {text} > {path}")
+
+
+def an_abort(s, dash, store, name, target, cause):
+    """A move aborted by an injected lag or digest mismatch: the source still
+    owning, its PartitionMoveAborted naming the cause (and a digest's
+    IntegrityFinding), and the driver's writes going on."""
+    component = "lake" if store == "lake" else "bor"
+    path = MOVE_LAG_FILE if cause == "lag" else MOVE_DIGEST_FILE
+    owner = (lake_owner if store == "lake" else book_owner)(name)
+    since_ns = time.time_ns()
+    injected(component, path, "60000" if cause == "lag" else "differs")
+    try:
+        answer = dash.call("dashboard__move_partition", {
+            "partition": name, "target_group": target, "note": f"rebalance: an injected {cause}"})
+        s.check(answer.get("outcome") == "made", f"rebalance: {store} {name}: the move begun ({answer})")
+        ended = partition_moved(store, name, since_ns, 120)
+    finally:
+        injected(component, path, None)
+    s.check(ended == "aborted", f"rebalance: {store} {name}: an injected {cause} aborts its move ({ended})")
+    still = (lake_owner if store == "lake" else book_owner)(name)
+    s.check(still == owner, f"rebalance: {store} {name}: its source still owns it after the abort "
+                            f"(group {still}, before {owner})")
+    code = {"lag": 1, "digest": 3}[cause]
+    if store == "lake":
+        records = lake_records("meridian.v1.PartitionMoveAborted", name, since_ns)
+        causes = [varint_field(r, 6) for r in records]
+        s.check(code in causes, f"rebalance: {store} {name}: its PartitionMoveAborted names {cause} ({causes})")
+        if cause == "digest":
+            found = lake_records("meridian.v1.IntegrityFinding", name, since_ns)
+            s.check(bool(found), f"rebalance: {store} {name}: the digest's IntegrityFinding kept ({len(found)})")
+    else:
+        aborted = book_records(f"control-record:partition-move-aborted:{name}:", since_ns)
+        found = book_records(f"control-record:finding:move:{name}:", since_ns)
+        s.check(bool(aborted), f"rebalance: {store} {name}: its PartitionMoveAborted journalled on ~control")
+        s.check(bool(found) == (cause == "digest"),
+                f"rebalance: {store} {name}: an IntegrityFinding for a digest alone ({len(found)} for {cause})")
+    resumed_ms = int(time.time() * 1000)
+    writing = happens(lambda: sum(1 for p in driver_lines("/tmp/took")
+                                  if len(p) == 4 and p[2].isdigit() and int(p[2]) > resumed_ms) >= 4, 60, every=3)
+    s.check(writing, f"rebalance: {store} {name}: the driver writes on after the abort")
+
+
+def rebalance(s):
+    """The rebalance class (step 3d; section 15), after writer_groups."""
+    print("R: rebalance: a range, a partition and an account moved under load", flush=True)
+    began = time.time()
+    upgraded = upgrade("bor.partitions=4")
+    s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
+    for deployment in (f"{FULL}-bor", f"{FULL}-bor-group-1"):
+        run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+            "--timeout=420s", check=False)
+    wait_for("every component ready", all_ready, seconds=600)
+    dash = Dashboard()
+    try:
+        dash.connect()
+        dash.sign_in()
+        moves(s, dash)
+    finally:
+        dash.close()
+    print(f"R: rebalance held, {time.time() - began:.0f}s", flush=True)
+
+
+def moves(s, dash):
+    dataset = "drive-data:drive"
+    # The driver's dataset halved, its rows (one instrument's) in one half:
+    # that half is what moves under load.
+    answer = dash.call("dashboard__split_partition", {"partition": dataset, "note": "rebalance: halves to move"})
+    s.check(answer.get("outcome") == "made", f"rebalance: {dataset} split by dashboard__split_partition ({answer})")
+    halves = [f"{dataset}/0000-7fff", f"{dataset}/8000-ffff"]
+    loaded = ""
+
+    def newest_half():
+        nonlocal loaded
+        loaded = psql(f"select partition from lake_row where dataset = '{dataset}' and partition is not null "
+                      "order by sequence desc limit 1")
+        return loaded in halves
+    s.check(happens(newest_half, 120), f"rebalance: the driver writes into a half ({loaded})")
+    if loaded not in halves:
+        return
+    accounts = [a for a in DRIVER_ACCOUNTS if psql(
+        f"select partition from book_account where account_id = '{a}'") == "P0"]
+    owners = {p: str(book_owner(p)) for p in psql(
+        "select partition from book_partition_head where partition <> 'control'").split()}
+    # Within one database: the driver's half and the book's P0 to the other
+    # group; an account to a partition of the group P0 left.
+    half_from = lake_owner(loaded)
+    p0_from = int(owners.get("P0", "-1"))
+    s.check(half_from in (0, 1) and p0_from in (0, 1),
+            f"rebalance: the driver's half and P0 each held by a group ({half_from} and {p0_from})")
+    if half_from not in (0, 1) or p0_from not in (0, 1) or len(accounts) < 2:
+        return
+    a_move(s, dash, "lake", "range", loaded, 1 - half_from, (0, 0))
+    a_move(s, dash, "book", "partition", "P0", 1 - p0_from, (0, 0), by_dialog=True)
+    others = sorted(p for p, g in owners.items() if p != "P0" and int(g) == p0_from) or \
+        sorted(p for p in owners if p != "P0")
+    a_move(s, dash, "book", "account", accounts[0], others[0], (0, 0))
+    # Across two databases: each store's second database brought by an
+    # upgrade, group 1 writing to it; its partitions moved there by the
+    # count's change; then the driver's half, P0 and an account moved from
+    # group 0's database to group 1's.
+    upgraded = upgrade("lake.databases=2", "bor.databases=2")
+    s.check(upgraded.returncode == 0, "rebalance: the lake and the book at two databases")
+    if upgraded.returncode != 0:
+        return
+    for component in ("lake", "bor"):
+        rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
+                     f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
+        s.check(rolled.returncode == 0, f"rebalance: {component}'s database 1 brought and ready")
+    ready = happens(all_ready, 600, every=5)
+    s.check(ready, "rebalance: every component ready at two databases")
+    since_ms = int(time.time() * 1000)
+    writing = happens(lambda: all(sum(1 for at in driver_acked().get(kind, {}).values() if at > since_ms) >= 10
+                                  for kind in ("price", "order")), 300, every=3)
+    s.check(writing, "rebalance: the driver's prices and orders acknowledged again at two databases")
+    in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
+                                      pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
+    s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
+    if not (ready and writing):
+        return
+    owners = {p: str(book_owner(p)) for p in psql(
+        "select partition from book_partition_head where partition <> 'control'").split()}
+    zeros = sorted(p for p, g in owners.items() if int(g) == 0)
+    ones = sorted(p for p, g in owners.items() if int(g) == 1)
+    # An account of group 0's database to group 1's.
+    held = [a for a in accounts[1:] if psql(f"select partition from book_account where account_id = '{a}'") in zeros]
+    if held and ones:
+        a_move(s, dash, "book", "account", held[0], ones[0], (0, 1))
+    else:
+        s.check(False, f"rebalance: an account in group 0's database to move ({held}, {ones})")
+    if lake_owner(loaded) == 0:
+        a_move(s, dash, "lake", "range", loaded, 1, (0, 1))
+    else:
+        s.check(False, f"rebalance: the driver's half in group 0's database to move ({lake_owner(loaded)})")
+    moved_p0 = "P0" in zeros and a_move(s, dash, "book", "partition", "P0", 1, (0, 1))
+    if "P0" not in zeros:
+        s.check(False, f"rebalance: P0 in group 0's database to move ({owners})")
+    # The aborts, from group 1's database back towards group 0's: the
+    # lake's range by an injected digest mismatch, the book's P0 by an
+    # injected lag (the gate held shut for moves.switchSeconds).
+    if lake_owner(loaded) == 1:
+        an_abort(s, dash, "lake", loaded, 0, "digest")
+    if moved_p0:
+        an_abort(s, dash, "bor", "P0", 0, "lag")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -3730,6 +4288,10 @@ def main():
     s = Scorecard()
     asked = [f for f in os.environ.get("FAILURE", "").split(",") if f]
     failures = asked or DEFAULT_FAILURES[PROFILE]
+    # Rebalance (step 3d) runs after the two writer groups, last: asked for
+    # alone, the writer groups first.
+    rebalancing = "rebalance" in failures or (not asked and REBALANCED)
+    failures = [f for f in failures if f != "rebalance"]
     unknown = [f for f in failures if f not in FAILURES]
     if unknown:
         raise SystemExit(f"no such failure class: {', '.join(unknown)}; one of {', '.join(FAILURES)}")
@@ -3799,11 +4361,18 @@ def main():
         # Two writer groups (step 3d, stage G), last of the tolerant run's
         # with every class run, the driver still writing: its stores' groups
         # then stay as this leaves them.
-        if PROFILE == "tolerant" and not asked:
+        if (PROFILE == "tolerant" and not asked) or rebalancing:
             try:
                 writer_groups(s)
             except SystemExit as stopped:
                 s.check(False, f"writer groups: {stopped}")
+        # Rebalance (step 3d), the two groups' partitions moved under load
+        # within one database and across two: in the tolerant and ha runs.
+        if rebalancing and REBALANCED:
+            try:
+                rebalance(s)
+            except SystemExit as stopped:
+                s.check(False, f"rebalance: {stopped}")
         try:
             driver_history(s)
         except SystemExit as stopped:

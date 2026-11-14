@@ -125,6 +125,22 @@ def acked(kind, ident):
     kept("/tmp/acked", line)
 
 
+def took(kind, began):
+    """A write's own time, from its call to its answer, kept in /tmp/took as
+    `TOOK <kind> <unix ms answered> <ms taken>`: what the rebalance class
+    reads a move's write pause from (step 3d; the resilience spec's section
+    15)."""
+    now = time.time()
+    kept("/tmp/took", f"TOOK {kind} {int(now * 1000)} {int((now - began) * 1000)}")
+
+
+def refused(kind, ident, failed):
+    """A write refused, or answered by nothing, kept in /tmp/refused as
+    `REFUSED <kind> <id> <unix ms>`: what the rebalance class holds to none
+    inside a move's hold."""
+    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(time.time() * 1000)} {words(failed)[:200]}")
+
+
 def decimal(text):
     exact = Decimal(str(text))
     scale = max(0, -exact.as_tuple().exponent)
@@ -341,12 +357,15 @@ async def drive_data(plugin, gen):
             price=ops.Money(amount=decimal(f"{100 + n % 50}.25"), instrument_id=USD),
             basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT,
         )
+        began = time.time()
         try:
             done = await bounded(stub.RecordPrices(ops.RecordPricesParams(prices=[price])))
+            took("price", began)
             if done.recorded + done.restated + done.unchanged == 1:
                 acked("price", key)
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
             say(f"REFUSED price {key}: {words(failed)}")
+            refused("price", key, failed)
             await asyncio.sleep(0.5)
         await asyncio.sleep(0.5)
 
@@ -446,6 +465,7 @@ class Book:
         key = f"book/{account}"
         value = append_edn(key, number)
         self.history.write("invoke", process, value)
+        began = time.time()
         try:
             done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
                 account_id=account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
@@ -459,6 +479,7 @@ class Book:
                 venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
                 idempotency_key=f"drive-{number}", acting_for=self.person.assertion())))
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            refused("order", number, failed)
             if definitely_not(failed):
                 self.history.write("fail", process, value)
                 say(f"REFUSED order {number}: {words(failed)}")
@@ -466,6 +487,7 @@ class Book:
             self.history.write("info", process, value)
             say(f"UNKNOWN order {number}: {words(failed)}")
             return "info"
+        took("order", began)
         self.history.write("ok", process, value)
         acked("order", done.order.order_id)
         return "ok"
