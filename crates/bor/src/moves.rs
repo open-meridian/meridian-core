@@ -47,10 +47,17 @@ pub fn holding<T>(limit: std::time::Duration, mut act: impl FnMut() -> Result<T>
     }
 }
 
-/// The close's idempotency key: one close for each move of the account to
-/// that partition from where it is.
-pub fn close_key(account_id: &str, from: &str, to: &str) -> String {
-    format!("account-move:{account_id}:{from}:{to}")
+/// The close's idempotency key: one close for each request to move the
+/// account to that partition from where it is -- the request's message ID
+/// in it, so a move back to a partition it once left is a move of its own,
+/// never the first one's repeat (the review's C7). A request asked again
+/// under its message ID finds its own close.
+pub fn close_key(account_id: &str, from: &str, to: &str, message_id: &str) -> String {
+    if message_id.is_empty() {
+        format!("account-move:{account_id}:{from}:{to}")
+    } else {
+        format!("account-move:{account_id}:{from}:{to}:{message_id}")
+    }
 }
 
 /// The open's idempotency key: one open for each close.
@@ -114,7 +121,7 @@ pub fn close(book: &Book, head: u64, ctx: &Context, to: &str, reason: &str) -> R
         head,
         ctx,
         &moved,
-        close_key(&book.account_id, &book.partition, to),
+        close_key(&book.account_id, &book.partition, to, &ctx.message_id),
         format!(
             "account {} moves from {} to {}: {reason}",
             book.account_id, book.partition, to
@@ -333,8 +340,16 @@ pub fn move_account_with(
             format!("{account:?} is not an account a person moves"),
         ));
     }
+    // The partitions the book holds a head of, as its databases say -- never
+    // this member's count alone, which a member started before a raised
+    // `bor.partitions` still holds (CI 43636763392, ha: "the book has no
+    // partition P1: P0 to P0" after the raise to four).
     let count = store.partition_count();
-    if !(0..count).any(|n| crate::store::partition_named(n) == target) {
+    let held = (0..count).any(|n| crate::store::partition_named(n) == target)
+        || store.heads().is_ok_and(|heads| {
+            heads.contains_key(target) && target != crate::store::CONTROL_PARTITION
+        });
+    if !held {
         return Err(invalid(
             "target_partition",
             format!(
@@ -411,7 +426,7 @@ pub fn move_account_with(
             // entry is the one the copy was compared at -- the digest at the
             // close. An act since is copied and compared again; its
             // partition held past the bound aborts the move, nothing closed.
-            let key = close_key(account, &placed, target);
+            let key = close_key(account, &placed, target, &ctx.message_id);
             let switch = std::time::Instant::now();
             let timed_out = || {
                 aborted(
@@ -485,8 +500,12 @@ pub fn move_account_with(
                         StoreError::Unavailable("the move's close is not read back".into())
                     })?,
             };
-            crate::journal::moved_of(&entry)
-                .ok_or_else(|| StoreError::Unavailable("the move's close carries no move".into()))?
+            let closed = crate::journal::moved_of(&entry).ok_or_else(|| {
+                StoreError::Unavailable("the move's close carries no move".into())
+            })?;
+            meridian_changes::moves::points::reached("book.account.closed", account)
+                .map_err(StoreError::Unavailable)?;
+            closed
         }
     };
     // The open, in the new partition: handed to its writer where another
@@ -545,6 +564,72 @@ pub fn record(
     if let Err(failed) = crate::control::journal_one(bus, store, &owed) {
         tracing::debug!(%failed, "the account's move is journalled in control by its writer");
     }
+}
+
+/// Every account move closed and never opened, its open made (step 3d;
+/// section 6.8): the control group's sweep, over every database of the
+/// book, for a close committed before `before_ns` -- its member stopped,
+/// or the open's answer lost, between the two. Through `store`, which hands
+/// each open to its partition's writer. Says how many were opened.
+pub fn finish_opens(
+    bus: &meridian_bus::Bus,
+    store: &dyn crate::store::Store,
+    databases: &[std::sync::Arc<crate::postgres::PostgresStore>],
+    settings: &meridian_changes::moves::Settings,
+    before_ns: i64,
+) -> usize {
+    let mut opened = 0;
+    for database in databases {
+        let closes = match database.closes_without_opens(before_ns) {
+            Ok(closes) => closes,
+            Err(failed) => {
+                tracing::warn!(%failed, "the account moves owed an open were not read");
+                continue;
+            }
+        };
+        for close in closes {
+            let Some(moved) = crate::journal::moved_of(&close) else {
+                continue;
+            };
+            let key = open_key(
+                &moved.account_id,
+                &moved.from_partition,
+                moved.closing_sequence,
+            );
+            let elsewhere = databases
+                .iter()
+                .any(|other| other.holds_entry(&moved.account_id, &key).unwrap_or(true));
+            if elsewhere {
+                continue;
+            }
+            let ctx = Context {
+                acting_for: moved.moved_by.clone(),
+                received_at_ns: meridian_changes::now_ns(),
+                ..Default::default()
+            };
+            let request = meridian_domain::v1::MoveAccountRequest {
+                account_id: moved.account_id.clone(),
+                target_partition: moved.to_partition.clone(),
+                reason: moved.reason.clone(),
+            };
+            match move_account_with(bus, store, &ctx, &request, settings) {
+                Ok(_) => {
+                    opened += 1;
+                    tracing::info!(
+                        account_id = moved.account_id,
+                        to = moved.to_partition,
+                        "an account's move closed and never opened is opened"
+                    );
+                }
+                Err(failed) => tracing::warn!(
+                    account_id = moved.account_id,
+                    %failed,
+                    "an account's move closed and never opened is not opened yet"
+                ),
+            }
+        }
+    }
+    opened
 }
 
 #[cfg(test)]

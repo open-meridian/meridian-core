@@ -34,6 +34,10 @@ pub enum Switched {
     },
     /// The switch did not finish within its bound: the source owns.
     TimedOut,
+    /// The source let go at `closing`, its row naming the target, and the
+    /// target's row is not opened yet: moved, its open owed to the control
+    /// group's sweep (the review's C3), under `epoch` as read before.
+    LetGo { closing: u64, epoch: u64 },
 }
 
 fn range_tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Option<RangeTip>> {
@@ -184,6 +188,29 @@ impl PostgresStore {
         Ok(rows.len())
     }
 
+    /// Every range's row here: its group as named, its head, and whether
+    /// it is written (not a move's pointer).
+    #[allow(clippy::type_complexity)]
+    pub fn owner_rows(&self) -> Result<Vec<(String, Option<u32>, u64, bool)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, writer_group, head, epoch <> $1 FROM lake_partition",
+                &[&meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get::<_, Option<i32>>(1).map(|group| group as u32),
+                    row.get::<_, i64>(2).max(0) as u64,
+                    row.get(3),
+                )
+            })
+            .collect())
+    }
+
     /// Each range whose `writer_group` is NULL given its dataset's
     /// rendezvous owner at the lake's count (step 3d; ruled 2026-11-14):
     /// what the control partition's group does at its start, so a later
@@ -219,14 +246,25 @@ impl PostgresStore {
     }
 
     /// A move's switch of range `partition`, held by this database, to
-    /// writer group `target` in `to`'s (step 3d; section 6.8, step 4):
-    /// under the range's row, so the source's batch in flight finishes
-    /// first and the next leaves the range's parts to wait (the hold) while
-    /// its sibling ranges' commit; the source's close at its head N; the
-    /// digests at N compared; then the row named the target's at its
-    /// group's epoch, so a held part finds it there and is handed on, never
-    /// fenced. Within `bound` of its start, else nothing changes. `differ`
-    /// makes the digests differ (CI's MERIDIAN_MOVE_DIGEST_FILE).
+    /// writer group `target` in `to`'s (step 3d; section 6.8, step 4), its
+    /// target warmed up to `warmed`: under the range's row, so the source's
+    /// batch in flight finishes first and the next leaves the range's parts
+    /// to wait (the hold) while its sibling ranges' commit; the source's
+    /// close at its head N; the digests at N taken again on each side and
+    /// compared (the review's C9). Within one database, the row named the
+    /// target's at its group's epoch. Across two, never two owners (C3): the
+    /// target's row first made a pointer to the target
+    /// ([`meridian_changes::moves::POINTER_EPOCH`], under which nothing
+    /// commits), then the source lets go -- its row a pointer to the target
+    /// -- and is committed; only then is the target's row opened at N under
+    /// its group's epoch, its write-ahead position taken back to the
+    /// source's in the same transaction (C4). A failure between leaves the
+    /// source's pointer, the durable intent the control group's sweep
+    /// finishes from ([`Switched::LetGo`]). A move to the same group's own
+    /// database opens the target first and makes the source a pointer
+    /// after. Within `bound` of its start until the source lets go, else
+    /// nothing changes. `differ` makes the digests differ (CI's
+    /// MERIDIAN_MOVE_DIGEST_FILE).
     pub fn switch_range(
         &self,
         to: &PostgresStore,
@@ -234,6 +272,7 @@ impl PostgresStore {
         target: u32,
         bound: std::time::Duration,
         differ: bool,
+        warmed: u64,
     ) -> Result<Switched> {
         let began = std::time::Instant::now();
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
@@ -244,6 +283,18 @@ impl PostgresStore {
                 Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
                     | Some(&postgres::error::SqlState::QUERY_CANCELED)
             )
+        };
+        // What was warmed compared before the hold: under it, only the rest.
+        let verified = if same {
+            0
+        } else {
+            let theirs = range_digest(&mut *self.conn()?, partition, 0, warmed)?;
+            let ours = range_digest(&mut *to.conn()?, partition, 0, warmed)?;
+            if theirs == ours {
+                warmed
+            } else {
+                0
+            }
         };
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -279,125 +330,232 @@ impl PostgresStore {
         }
         let source = range_tip_of(&mut tx, partition)?.unwrap_or_default();
         let closing = source.head;
-        // The target at N: the same rows where it is this database; else
-        // the range's rows copied up to N while the source is held.
-        let held = if same {
-            source.clone()
-        } else {
-            let copied = held_of(&mut *to.conn()?, partition)?.0;
-            to.copy_range_from(self, partition, copied)?;
-            let (held, held_digest, held_at_ns) = held_of(&mut *to.conn()?, partition)?;
-            RangeTip {
-                head: closing,
-                held,
-                held_digest,
-                held_at_ns,
-                ..source.clone()
-            }
-        };
-        if left(began).is_zero() {
-            return Ok(Switched::TimedOut);
-        }
-        let mut target_digest = held.held_digest.clone();
-        if differ {
-            target_digest.push(0xff);
-        }
-        if held.head != closing || held.held != source.held || target_digest != source.held_digest {
-            return Ok(Switched::DigestDiffers {
-                closing,
-                source: source.held_digest,
-                target: target_digest,
-                at_ns: meridian_changes::now_ns(),
-            });
-        }
-        let epoch = if same {
-            group_epoch(&mut tx, target)?
-        } else {
-            // The target's row at the source's close, under its group's
-            // epoch, named its own -- before the source lets go, so no
-            // write finds neither owning.
-            to.open_moved_in(self, partition, closing, target)?
-        };
-        let epoch_here = if same { epoch } else { source.epoch };
-        // In `ha`, the target takes the range's rows from the source's
-        // committed stream position (spec 6.1; ruled 2026-11-14, CI
-        // 43621875619): its own position goes back to it, here, before the
-        // source lets go. Every row of the range the source committed is at
-        // or before that position -- its batches take the range's row,
-        // which this switch holds -- and none after it will be; the target
-        // takes the rest from the stream, a row it holds already an
-        // idempotent repeat. Its position is always moved (back by one
-        // where it is not past the source's: a deliberate compare-and-set
-        // invalidation, see take_back), so its next batch is refused
-        // PositionMoved and it reads the ranges' owners again, taking the
-        // range's rows as its own. Nothing where no write-ahead stream is
-        // kept.
         let from = source.writer_group.unwrap_or_else(|| {
             self.groups
                 .owner_by(partition, crate::range::dataset_of(partition))
         });
-        if from != target {
-            let theirs = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, from);
-            let ours = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, target);
-            let at = match stream_position(&mut tx, &theirs)? {
-                Some(at) => Some(at),
-                None if !same => stream_position(&mut *to.conn()?, &theirs)?,
-                None => None,
-            };
-            if same {
-                take_back(&mut tx, &ours, at)?;
-            } else {
-                take_back(&mut *to.conn()?, &ours, at)?;
+        // The source group's committed place in the write-ahead stream, as
+        // its batches -- which take this row -- left it.
+        let theirs_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, from);
+        let ours_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, target);
+        let at = match stream_position(&mut tx, &theirs_key)? {
+            Some(at) => Some(at),
+            None if !same => stream_position(&mut *to.conn()?, &theirs_key)?,
+            None => None,
+        };
+        if same {
+            let mut target_digest = source.held_digest.clone();
+            if differ {
+                target_digest.push(0xff);
             }
+            if target_digest != source.held_digest {
+                return Ok(Switched::DigestDiffers {
+                    closing,
+                    source: source.held_digest,
+                    target: target_digest,
+                    at_ns: meridian_changes::now_ns(),
+                });
+            }
+            let epoch = group_epoch(&mut tx, target)?;
+            // In `ha`, the target takes the range's rows from the source's
+            // committed stream position (spec 6.1; see `take_back`).
+            if from != target {
+                take_back(&mut tx, &ours_key, at)?;
+            }
+            let switched = tx
+                .execute(
+                    "UPDATE lake_partition SET writer_group = $2, epoch = $3 WHERE dataset = $1",
+                    &[&partition, &(target as i32), &(epoch as i64)],
+                )
+                .and_then(|_| tx.commit());
+            return match switched {
+                Ok(_) => {
+                    self.groups.assign(partition, Some(target));
+                    Ok(Switched::Moved { closing, epoch })
+                }
+                Err(failed) if timed_out(&failed) => Ok(Switched::TimedOut),
+                Err(failed) => Err(unavailable(failed)),
+            };
         }
-        if !same {
-            // The latest versions in the range itself are the target's to
-            // keep now: this database's let go, so a latest read here never
-            // answers one the target has replaced. Its rows stay, read where
-            // it went; a key last written before the split stays answered
-            // from its parent here, and the reader keeps the higher version
-            // where the target has restated it since.
+        // The target at N: the range's rows copied up to N while the source
+        // is held, both sides' digests taken again from what was compared.
+        to.copy_range_from(self, partition, warmed)?;
+        let theirs = range_digest(&mut tx, partition, verified, closing)?;
+        let mut ours = range_digest(&mut *to.conn()?, partition, verified, closing)?;
+        if differ {
+            ours.1.push(0xff);
+        }
+        if ours != theirs {
+            return Ok(Switched::DigestDiffers {
+                closing,
+                source: theirs.1,
+                target: ours.1,
+                at_ns: meridian_changes::now_ns(),
+            });
+        }
+        if left(began).is_zero() {
+            return Ok(Switched::TimedOut);
+        }
+        // The latest versions in the range itself are the target's to keep
+        // now: this database's let go, so a latest read here never answers
+        // one the target has replaced. Its rows stay, read where it went.
+        // A pointer's source keeps, beside it, the place in the stream the
+        // target takes the range's rows from (`at`, under the target's own
+        // key): what the sweep takes it back to where the target's open was
+        // owed (the review's C3 and C4). Its own source's, where this source
+        // is a pointer already, the open owed.
+        let kept = if source.epoch == meridian_changes::moves::POINTER {
+            stream_position(&mut tx, &ours_key)?
+        } else {
+            None
+        };
+        let keep = if from != target { at } else { None };
+        let let_go = |tx: &mut postgres::Transaction<'_>| -> Result<()> {
             tx.execute(
                 "DELETE FROM lake_latest WHERE dataset = $1 AND partition = $2",
                 &[&crate::range::dataset_of(partition), &partition],
             )
             .map_err(unavailable)?;
-        }
-        let switched = tx
-            .execute(
+            match keep {
+                Some(at) => tx.execute(
+                    "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (stream) DO UPDATE SET sequence = EXCLUDED.sequence,
+                        at_ns = EXCLUDED.at_ns, committed_at_ns = EXCLUDED.committed_at_ns",
+                    &[
+                        &ours_key,
+                        &(at.sequence as i64),
+                        &at.at_ns,
+                        &meridian_changes::now_ns(),
+                    ],
+                ),
+                None if kept.is_some() => tx.execute(
+                    "DELETE FROM lake_write_ahead WHERE stream = $1",
+                    &[&ours_key],
+                ),
+                None => Ok(0),
+            }
+            .map_err(unavailable)?;
+            tx.execute(
                 "UPDATE lake_partition SET writer_group = $2, epoch = $3 WHERE dataset = $1",
-                &[&partition, &(target as i32), &(epoch_here as i64)],
+                &[
+                    &partition,
+                    &(target as i32),
+                    &meridian_changes::moves::POINTER_EPOCH,
+                ],
             )
-            .and_then(|_| tx.commit());
-        if switched.is_err() && !same {
-            // The source still owns: the target's row named it again, so
-            // neither writes the range twice.
-            let from = source.writer_group.unwrap_or_else(|| {
-                self.groups
-                    .owner_by(partition, crate::range::dataset_of(partition))
-            });
-            to.conn()?
-                .execute(
-                    "UPDATE lake_partition SET writer_group = $2 WHERE dataset = $1",
-                    &[&partition, &(from as i32)],
-                )
-                .map_err(unavailable)?;
-        }
-        match switched {
-            Ok(_) => {}
-            Err(failed) if timed_out(&failed) => return Ok(Switched::TimedOut),
-            Err(failed) => return Err(unavailable(failed)),
-        }
-        if left(began).is_zero() {
-            // Committed past its bound: the target owns, as recorded.
-            tracing::warn!(
+            .map_err(unavailable)?;
+            Ok(())
+        };
+        if from == target {
+            // The same group, home: the target opened first; the source a
+            // pointer after, so a write routed there goes home.
+            let epoch = to.open_moved_in(
+                self,
                 partition,
-                "a range's switch committed past moves.switchSeconds"
-            );
+                closing,
+                target,
+                kept.map(|kept| (ours_key.as_str(), Some(kept))),
+            )?;
+            let_go(&mut tx)?;
+            if let Err(failed) = tx.commit() {
+                tracing::warn!(partition, %failed, "a range moved home: its old row stays its group's, level with home");
+            }
+            return Ok(Switched::Moved { closing, epoch });
+        }
+        // Another group's: the target's row a pointer to it first, so a
+        // write that finds it there waits, never committed or fenced; then
+        // the source lets go.
+        let epoch = group_epoch(&mut *to.conn()?, target)?;
+        to.point_moved_in(self, partition, closing, target)?;
+        let_go(&mut tx)?;
+        let committed = tx
+            .commit()
+            .map_err(|failed| (timed_out(&failed), unavailable(failed)))
+            .and_then(|_| {
+                meridian_changes::moves::points::reached("lake.switch.committed", partition)
+                    .map_err(|lost| (false, StoreError::Unavailable(lost)))
+            });
+        if let Err((timed_out, failed)) = committed {
+            // Committed, its answer lost, or not: as the source's row says
+            // now (the review's A1), never undone on the target's side.
+            let let_go = self.range_tip(partition)?.is_some_and(|tip| {
+                tip.writer_group == Some(target) && tip.epoch == meridian_changes::moves::POINTER
+            });
+            if !let_go {
+                // The target's pointer named the source again, so its
+                // database never answers the range.
+                to.point_moved_in(self, partition, closing, from)?;
+                return if timed_out {
+                    Ok(Switched::TimedOut)
+                } else {
+                    Err(failed)
+                };
+            }
         }
         self.groups.assign(partition, Some(target));
-        Ok(Switched::Moved { closing, epoch })
+        if let Err(failed) =
+            meridian_changes::moves::points::reached("lake.switch.between", partition)
+        {
+            tracing::warn!(
+                partition,
+                failed,
+                "a range let go: its target opens on the sweep"
+            );
+            return Ok(Switched::LetGo { closing, epoch });
+        }
+        match to.open_moved_in(self, partition, closing, target, Some((&ours_key, at))) {
+            Ok(epoch) => {
+                // Taken back: the point kept beside the pointer let go.
+                if at.is_some() {
+                    if let Err(failed) = self.conn().and_then(|mut conn| {
+                        conn.execute(
+                            "DELETE FROM lake_write_ahead WHERE stream = $1",
+                            &[&ours_key],
+                        )
+                        .map_err(unavailable)
+                    }) {
+                        tracing::warn!(partition, %failed, "a moved range's take-back point stays beside its pointer");
+                    }
+                }
+                Ok(Switched::Moved { closing, epoch })
+            }
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a range let go: its target opens on the sweep");
+                Ok(Switched::LetGo { closing, epoch })
+            }
+        }
     }
+}
+
+/// Range `partition`'s rows in this database numbered past `after` up to
+/// `upto`, taken again from their bodies: how many, and one digest over
+/// each row's sequence, key and body's digest in their order (step 3d;
+/// section 6.8's digest at N; the review's C9) -- a row missing, added or
+/// changed on either side makes two databases' differ.
+fn range_digest(
+    client: &mut impl GenericClient,
+    partition: &str,
+    after: u64,
+    upto: u64,
+) -> Result<(i64, Vec<u8>)> {
+    let row = client
+        .query_one(
+            "SELECT count(*),
+                    coalesce(sha256(string_agg(int8send(sequence) || convert_to(row_key, 'UTF8')
+                                               || sha256(body), ''::bytea
+                                               ORDER BY sequence, data_type, row_key)), ''::bytea)
+               FROM lake_row
+              WHERE dataset = $1 AND partition = $2 AND sequence > $3 AND sequence <= $4",
+            &[
+                &crate::range::dataset_of(partition),
+                &partition,
+                &(after as i64),
+                &(upto as i64),
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok((row.get(0), row.get(1)))
 }
 
 /// A writer group's committed place in the write-ahead stream, under `key`.
@@ -465,6 +623,11 @@ impl PostgresStore {
     /// Each range's last move logged in this database's control that was by
     /// hand (step 3d; section 6.8): the group the admin moved it to. A range
     /// whose last move was by a changed count is not named.
+    /// `partition` and every range it was split from, itself first.
+    pub fn lineage_of(&self, partition: &str) -> Result<Vec<String>> {
+        lineage(&mut *self.conn()?, partition)
+    }
+
     pub fn moved_by_hand(&self) -> Result<BTreeMap<String, u32>> {
         let mut out = BTreeMap::new();
         for row in self
@@ -480,6 +643,10 @@ impl PostgresStore {
             let Ok(moved) = meridian_domain::v1::PartitionMoved::decode(&body[..]) else {
                 continue;
             };
+            // A move to its own group's database places it nowhere new.
+            if moved.from_group == moved.to_group {
+                continue;
+            }
             if moved.by_hand {
                 out.insert(moved.partition, moved.to_group);
             } else {
@@ -528,8 +695,27 @@ impl PostgresStore {
         let dataset = crate::range::dataset_of(partition);
         let (_, lo, hi) = crate::range::parse(partition);
         let quote = |text: &str| text.replace('\'', "''");
-        let mut source = from.conn()?;
-        let lineage = lineage(&mut *source, partition)?;
+        // One snapshot of the source, the range's last sequence read first
+        // and nothing past it copied: the copy whole up to what it answers,
+        // never a later row ahead of an earlier one missed (the review's C2).
+        let mut source_conn = from.conn()?;
+        let mut source = source_conn
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let copied: i64 = source
+            .query_one(
+                "SELECT coalesce(max(sequence), $3) FROM lake_row
+                  WHERE dataset = $1 AND partition = $2",
+                &[&dataset, &partition, &(after as i64)],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        meridian_changes::moves::points::reached("lake.copy.read", partition)
+            .map_err(StoreError::Unavailable)?;
+        let lineage = lineage(&mut source, partition)?;
         let ancestors: Vec<String> = lineage.iter().skip(1).cloned().collect();
         let list = |names: &[String]| {
             names
@@ -539,7 +725,8 @@ impl PostgresStore {
                 .join(", ")
         };
         let mut rows_sql = format!(
-            "SELECT * FROM lake_row WHERE dataset = '{d}' AND partition = '{p}' AND sequence > {after}",
+            "SELECT * FROM lake_row WHERE dataset = '{d}' AND partition = '{p}' AND sequence > {after}
+                AND sequence <= {copied}",
             d = quote(dataset),
             p = quote(partition)
         );
@@ -580,20 +767,16 @@ impl PostgresStore {
             "SELECT * FROM lake_latest WHERE dataset = '{d}' AND anchor BETWEEN {lo} AND {hi}{since}",
             d = quote(dataset),
             since = if after == 0 {
-                String::new()
+                format!(" AND (partition <> '{}' OR sequence <= {copied})", quote(partition))
             } else {
-                format!(" AND partition = '{}' AND sequence > {after}", quote(partition))
+                format!(
+                    " AND partition = '{}' AND sequence > {after} AND sequence <= {copied}",
+                    quote(partition)
+                )
             }
         ))?;
-        let copied: i64 = source
-            .query_one(
-                "SELECT coalesce(max(sequence), $3) FROM lake_row
-                  WHERE dataset = $1 AND partition = $2",
-                &[&dataset, &partition, &(after as i64)],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        drop(source);
+        source.commit().map_err(unavailable)?;
+        drop(source_conn);
         let mut conn = self.conn()?;
         let load = |conn: &mut Connection, table: &str, like: &str, bytes: &[u8]| -> Result<()> {
             conn.batch_execute(&format!(
@@ -669,7 +852,9 @@ impl PostgresStore {
 
     /// Range `partition`'s row opened in this database, the target's, at
     /// the source's close `closing` (step 3d; section 6.8): as `from`'s
-    /// database holds it, named writer group `target`'s at its epoch here.
+    /// database holds it, whole (the review's M4), named writer group
+    /// `target`'s at its epoch here; in the same transaction, where given,
+    /// the target's write-ahead position taken back to the source's (C4).
     /// Answers the epoch.
     pub fn open_moved_in(
         &self,
@@ -677,6 +862,40 @@ impl PostgresStore {
         partition: &str,
         closing: u64,
         target: u32,
+        taken_back: Option<(&str, Option<WriteAheadPosition>)>,
+    ) -> Result<u64> {
+        self.moved_in(from, partition, closing, target, None, taken_back)
+    }
+
+    /// Range `partition`'s row here a pointer to writer group `group` at
+    /// `closing`, as `from`'s database holds it otherwise: nothing commits
+    /// under it, and a write that finds it waits (the review's C3).
+    pub fn point_moved_in(
+        &self,
+        from: &PostgresStore,
+        partition: &str,
+        closing: u64,
+        group: u32,
+    ) -> Result<()> {
+        self.moved_in(
+            from,
+            partition,
+            closing,
+            group,
+            Some(meridian_changes::moves::POINTER_EPOCH),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn moved_in(
+        &self,
+        from: &PostgresStore,
+        partition: &str,
+        closing: u64,
+        group: u32,
+        epoch: Option<i64>,
+        taken_back: Option<(&str, Option<WriteAheadPosition>)>,
     ) -> Result<u64> {
         use std::io::{Read, Write};
         let mut row = Vec::new();
@@ -701,24 +920,25 @@ impl PostgresStore {
             .write_all(&row)
             .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
         writer.finish().map_err(unavailable)?;
-        let epoch = group_epoch(&mut tx, target)?;
-        tx.execute(
-            "INSERT INTO lake_partition SELECT * FROM moving_range ON CONFLICT (dataset) DO NOTHING",
-            &[],
+        let epoch = match epoch {
+            Some(epoch) => epoch,
+            None => group_epoch(&mut tx, group)? as i64,
+        };
+        tx.batch_execute(
+            "DELETE FROM lake_partition WHERE dataset IN (SELECT dataset FROM moving_range);
+             INSERT INTO lake_partition SELECT * FROM moving_range;",
         )
         .map_err(unavailable)?;
         tx.execute(
             "UPDATE lake_partition SET head = $2, epoch = $3, writer_group = $4, closed_at = NULL
               WHERE dataset = $1",
-            &[
-                &partition,
-                &(closing as i64),
-                &(epoch as i64),
-                &(target as i32),
-            ],
+            &[&partition, &(closing as i64), &epoch, &(group as i32)],
         )
         .map_err(unavailable)?;
+        if let Some((key, at)) = taken_back {
+            take_back(&mut tx, key, at)?;
+        }
         tx.commit().map_err(unavailable)?;
-        Ok(epoch)
+        Ok(epoch.max(0) as u64)
     }
 }

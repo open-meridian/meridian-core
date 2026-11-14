@@ -3811,8 +3811,18 @@ def window_held(s, what, began_ms, ended_ms):
     than the driver's pace began no write of its own (CI 43626539705, ha:
     "None ms of 0 writes"), so the window is at least the hold."""
     until_ms = max(ended_ms, began_ms + HOLD_SECONDS * 1000) + 1000
+    # Each write by when it began (its answer's time less its own), never
+    # by its answer alone: a write begun in the window and answered after it
+    # is counted with its whole time (CI 43636763392, ha: "None ms of 0
+    # writes" through a range's move -- writes answered past the window's
+    # end were not counted at all). Read once the window's writes had the
+    # hold to answer.
+    settle = (until_ms + HOLD_SECONDS * 1000) / 1000 - time.time()
+    if settle > 0:
+        time.sleep(settle)
     took = sorted(int(p[3]) for p in driver_lines("/tmp/took")
-                  if len(p) == 4 and p[2].isdigit() and began_ms <= int(p[2]) <= until_ms)
+                  if len(p) == 4 and p[2].isdigit() and p[3].isdigit()
+                  and began_ms <= int(p[2]) - int(p[3]) <= until_ms)
     refused = [p for p in driver_lines("/tmp/refused")
                if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= until_ms]
     p99 = took[min(len(took) - 1, int(len(took) * 0.99))] if took else None
@@ -4147,6 +4157,12 @@ def moves(s, dash):
     writing = happens(lambda: all(sum(1 for at in driver_acked().get(kind, {}).values() if at > since_ms) >= 10
                                   for kind in ("price", "order")), 300, every=3)
     s.check(writing, "rebalance: the driver's prices and orders acknowledged again at two databases")
+    # The moves home are timed from here: the upgrade's own rollout (the
+    # chart restarts the lake's and the book's members for the new count)
+    # left both stores' public topics unserved for about 2 s after every
+    # pod was ready (CI 43636763392, 20:36:43-45, the lake's and the book's
+    # at once, before any move began) -- the restart's, not a move's.
+    since_ms = int(time.time() * 1000)
     in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
                                       pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
     s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
@@ -4158,8 +4174,8 @@ def moves(s, dash):
         pod=database_pod("lake", 1)) or 0) > 0, 300, every=5)
     s.check(lake_in_one, "rebalance: group 1's lake ranges moved to database 1 by the count's change")
     # Written where each head is until moved home (ruled 2026-11-14): from
-    # every component ready at two databases until the moves home are done,
-    # the driver's writes within the hold, none refused.
+    # the driver acknowledged again at two databases until the moves home
+    # are done, the driver's writes within the hold, none refused.
     window_held(s, "the count's moves home", since_ms, int(time.time() * 1000))
     if not (ready and writing):
         return

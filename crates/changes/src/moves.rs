@@ -127,3 +127,64 @@ pub struct Asked {
 pub fn short(digest: &[u8]) -> String {
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
+
+/// Points inside a move where a crate test stops or fails it (step 3d; the
+/// correctness review of 2026-11-14): each named by its step and the
+/// partition it moves. Nothing is armed outside a test, and an unarmed point
+/// costs one atomic load.
+pub mod points {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    /// What a point does when reached: `Err` fails the step there.
+    pub type Point = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    fn points() -> &'static RwLock<HashMap<(String, String), Point>> {
+        static POINTS: OnceLock<RwLock<HashMap<(String, String), Point>>> = OnceLock::new();
+        POINTS.get_or_init(Default::default)
+    }
+
+    /// `point` armed for `partition`: run where a move of it reaches it.
+    pub fn arm(point: &str, partition: &str, then: Point) {
+        points()
+            .write()
+            .expect("points poisoned")
+            .insert((point.to_string(), partition.to_string()), then);
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    /// `point` disarmed for `partition`.
+    pub fn disarm(point: &str, partition: &str) {
+        points()
+            .write()
+            .expect("points poisoned")
+            .remove(&(point.to_string(), partition.to_string()));
+    }
+
+    /// `point` reached by a move of `partition`: what it was armed with,
+    /// else nothing.
+    pub fn reached(point: &str, partition: &str) -> Result<(), String> {
+        if !ARMED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let then = points()
+            .read()
+            .expect("points poisoned")
+            .get(&(point.to_string(), partition.to_string()))
+            .cloned();
+        then.map_or(Ok(()), |then| then(partition))
+    }
+}
+
+/// The epoch a move's pointer carries (step 3d; the review's C3): a head
+/// a move let go, naming the group it went to, under which nothing ever
+/// commits. Negative, so never a writer's: every epoch a writer holds is
+/// at least 1 (the stores' migrations default it to 1; a takeover raises
+/// it past the greatest).
+pub const POINTER_EPOCH: i64 = -1;
+
+/// [`POINTER_EPOCH`] as a head's epoch is read (`as u64`).
+pub const POINTER: u64 = POINTER_EPOCH as u64;

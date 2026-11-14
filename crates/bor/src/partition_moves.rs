@@ -71,6 +71,9 @@ pub struct Mover {
     one: Mutex<()>,
     /// The deployment's clock, its records' times.
     clock: Arc<dyn meridian_clock::Clock>,
+    /// Where each move's record is journalled before the move is let go of
+    /// (the review's C8), where set.
+    journalling: Option<(Arc<meridian_bus::Bus>, Arc<dyn Store>)>,
 }
 
 impl Mover {
@@ -88,7 +91,16 @@ impl Mover {
             under_way: Mutex::default(),
             one: Mutex::new(()),
             clock,
+            journalling: None,
         }
+    }
+
+    /// Each move's record journalled through `bus` on `store`'s `~control`
+    /// as it ends, before the partition is free to move again (the review's
+    /// C8: never a window where a sweep finds a move without its record).
+    pub fn journalling(mut self, bus: Arc<meridian_bus::Bus>, store: Arc<dyn Store>) -> Self {
+        self.journalling = Some((bus, store));
+        self
     }
 
     fn database_of(&self, group: u32) -> &Arc<PostgresStore> {
@@ -96,12 +108,20 @@ impl Mover {
             [meridian_changes::databases::of_group(group, self.stores.len() as u32) as usize]
     }
 
-    /// The database other than its owner's that holds `partition` begun,
-    /// further on than its owner's does, named its owner's: the database
-    /// count was raised since it was written (step 3d; section 6.8).
+    /// The database `partition` is to be opened in its owner's home from:
+    /// another holding it further on than home, named its owner -- the
+    /// database count was raised since it was written, or a move between
+    /// databases let it go there and its target's open is owed (the
+    /// review's C3) -- or home itself, where its head there is a move's
+    /// pointer to its owner level with every other (step 3d; section 6.8).
     fn misplaced(&self, partition: &str, owner: u32) -> Result<Option<usize>> {
         let home = meridian_changes::databases::of_group(owner, self.stores.len() as u32) as usize;
-        let here = self.stores[home].tip(partition)?.map_or(0, |tip| tip.head);
+        let at_home = self.stores[home].tip(partition)?;
+        let here = at_home.as_ref().map_or(0, |tip| tip.head);
+        let named = |tip: &crate::postgres::Tip| {
+            tip.writer_group
+                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()))
+        };
         for (d, store) in self.stores.iter().enumerate() {
             if d == home {
                 continue;
@@ -109,14 +129,42 @@ impl Mover {
             let Some(tip) = store.tip(partition)? else {
                 continue;
             };
-            let named = tip
-                .writer_group
-                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()));
-            if named == owner && tip.head > here {
+            if named(&tip) == owner && tip.head > here {
                 return Ok(Some(d));
             }
         }
-        Ok(None)
+        Ok(at_home
+            .filter(|tip| tip.epoch == meridian_changes::moves::POINTER && named(tip) == owner)
+            .map(|_| home))
+    }
+
+    /// `partition`'s accounts let go in each database whose head of it is
+    /// a move's pointer, once its owner's home has opened it: what a move
+    /// copied there before an abort (the review's M4), or left behind
+    /// before its source forgot them (C5). Says how many accounts.
+    fn let_go_copies(&self, partition: &str) -> Result<usize> {
+        let owner = self.owner_now(partition)?;
+        let home = meridian_changes::databases::of_group(owner, self.stores.len() as u32) as usize;
+        let opened = self.stores[home]
+            .tip(partition)?
+            .filter(|tip| tip.epoch != meridian_changes::moves::POINTER)
+            .map(|tip| tip.head);
+        let Some(opened) = opened else {
+            return Ok(0);
+        };
+        let mut gone = 0;
+        for (d, store) in self.stores.iter().enumerate() {
+            if d == home {
+                continue;
+            }
+            let pointer = store.tip(partition)?.is_some_and(|tip| {
+                tip.epoch == meridian_changes::moves::POINTER && tip.head <= opened
+            });
+            if pointer {
+                gone += store.forget_partition(partition)?;
+            }
+        }
+        Ok(gone)
     }
 
     /// The group that owns `partition` now, as its source database's head
@@ -206,6 +254,9 @@ impl Mover {
     ) -> Result<Ended> {
         let _alone = self.one.lock().expect("moves poisoned");
         let ended = self.run_alone(partition, target, asked, from_database);
+        if let (Ok(done), Some((bus, store))) = (&ended, &self.journalling) {
+            journal(bus, store.as_ref(), done);
+        }
         self.under_way
             .lock()
             .expect("moves poisoned")
@@ -251,14 +302,14 @@ impl Mover {
                 Some(lag) => lag,
                 None if !across => Duration::ZERO,
                 None => {
-                    let (s, t) = (
-                        source.tip(partition)?.unwrap_or_default(),
-                        to.tip(partition)?.unwrap_or_default(),
-                    );
-                    if t.held >= s.held {
+                    // Against the copy's own watermark, never the most the
+                    // target holds (the review's C1).
+                    let s = source.tip(partition)?.unwrap_or_default();
+                    if copied >= s.held {
                         Duration::ZERO
                     } else {
-                        Duration::from_nanos((s.held_at_ns - t.held_at_ns).max(1) as u64)
+                        let t = to.held_at(partition, copied)?;
+                        Duration::from_nanos((s.held_at_ns - t).max(1) as u64)
                     }
                 }
             };
@@ -286,16 +337,37 @@ impl Mover {
             target,
             self.settings.switch,
             self.settings.digest_differs(),
-        )?;
-        match switched {
-            Switched::Moved { closing, epoch } => {
+            copied,
+        );
+        let switched = match switched {
+            Ok(switched) => switched,
+            Err(failed) => {
                 if across {
-                    let gone = source.forget_partition(partition)?;
-                    tracing::info!(
-                        partition,
-                        accounts = gone,
-                        "a partition moved out of a database: its projections let go, its entries kept"
-                    );
+                    self.let_go_aborted(to, partition);
+                }
+                return Err(failed);
+            }
+        };
+        if across && !matches!(switched, Switched::Moved { .. } | Switched::LetGo { .. }) {
+            self.let_go_aborted(to, partition);
+        }
+        match switched {
+            Switched::Moved { closing, epoch } | Switched::LetGo { closing, epoch } => {
+                if across && matches!(switched, Switched::Moved { .. }) {
+                    // Moved, whatever comes of this: never an error that
+                    // reads as the source still owning (the review's C8).
+                    match source.forget_partition(partition) {
+                        Ok(gone) => tracing::info!(
+                            partition,
+                            accounts = gone,
+                            "a partition moved out of a database: its projections let go, its entries kept"
+                        ),
+                        Err(failed) => tracing::warn!(
+                            partition,
+                            %failed,
+                            "a partition moved out of a database: its projections are let go on the sweep"
+                        ),
+                    }
                 }
                 tracing::info!(
                     partition,
@@ -348,6 +420,23 @@ impl Mover {
     }
 }
 
+impl Mover {
+    /// What an aborted move copied into `to` of `partition`'s accounts let
+    /// go there, where its head is not written (the review's M4, C5).
+    fn let_go_aborted(&self, to: &PostgresStore, partition: &str) {
+        let written = to.tip(partition).ok().flatten().is_some_and(|tip| {
+            tip.epoch != meridian_changes::moves::POINTER
+                && tip.writer_group == Some(self.owner_now(partition).unwrap_or(u32::MAX))
+        });
+        if written {
+            return;
+        }
+        if let Err(failed) = to.forget_partition(partition) {
+            tracing::warn!(partition, %failed, "an aborted move's copies are let go on the sweep");
+        }
+    }
+}
+
 fn invalid(field: &str, words: String) -> StoreError {
     StoreError::Malformed {
         fields: vec![field.to_string()],
@@ -361,9 +450,11 @@ pub fn journal(bus: &meridian_bus::Bus, store: &dyn Store, ended: &Ended) {
     let mut owed = Vec::new();
     match ended {
         Ended::Moved(moved) => owed.push(crate::control::Owed {
+            // Keyed by when it moved, so a move back and forth is recorded
+            // each time (the review's C8).
             key: format!(
                 "control-record:partition-moved:{}:{}",
-                moved.partition, moved.epoch
+                moved.partition, moved.moved_at_ns
             ),
             kind: MOVED,
             body: moved.encode_to_vec(),
@@ -472,6 +563,7 @@ pub fn serve(bus: &Arc<meridian_bus::Bus>, store: &Arc<dyn Store>, mover: &Arc<M
         let (bus3, store, mover) = (bus2.clone(), store.clone(), mover.clone());
         std::thread::spawn(move || {
             match mover.run(&request.partition, request.target_group, &asked) {
+                Ok(_) if mover.journalling.is_some() => {}
                 Ok(ended) => journal(&bus3, store.as_ref(), &ended),
                 Err(failed) => tracing::warn!(
                     partition = request.partition,
@@ -499,56 +591,92 @@ pub fn serve(bus: &Arc<meridian_bus::Bus>, store: &Arc<dyn Store>, mover: &Arc<M
 pub fn rebalance(bus: &meridian_bus::Bus, store: &dyn Store, mover: &Mover) -> Vec<Ended> {
     let count = mover.stores[0].partition_count().max(1);
     let mut ended = Vec::new();
+    // Each head made since the start and not named yet -- a raised
+    // `bor.partitions`, made by a member after this group's start -- named
+    // its rendezvous owner at the count now, so a write handed for it is
+    // handed on by the record's word, never refused as a guess (CI
+    // 43636763392: "handed to this writer group, which does not own its
+    // partition").
+    for database in &mover.stores {
+        if let Err(failed) = database.pin_owners() {
+            tracing::warn!(%failed, "the partitions not named yet were not named");
+        }
+    }
+    for n in 0..count {
+        let partition = crate::store::partition_named(n);
+        if !mover.begin(&partition) {
+            continue;
+        }
+        // Decided and run under the one-at-a-time lock, the moves by hand
+        // read then, so a move by hand that ended a moment ago is never
+        // undone (the review's C8).
+        let alone = mover.one.lock().expect("moves poisoned");
+        let done = rebalance_one(mover, &partition);
+        if let Some(Ok(done)) = &done {
+            journal(bus, store, done);
+        }
+        drop(alone);
+        mover
+            .under_way
+            .lock()
+            .expect("moves poisoned")
+            .remove(&partition);
+        match done {
+            Some(Ok(done)) => ended.push(done),
+            Some(Err(failed)) => tracing::warn!(
+                partition,
+                %failed,
+                "a partition's move by the changed count stopped: the source still owns it"
+            ),
+            None => {}
+        }
+        if let Err(failed) = mover.let_go_copies(&partition) {
+            tracing::warn!(partition, %failed, "a moved partition's copies were not let go");
+        }
+    }
+    // Each account's move closed and never opened, opened: a close older
+    // than two switches' bound, so a move under way finishes its own.
+    let before = mover.clock.now_ns() - 2 * mover.settings.switch.as_nanos() as i64;
+    crate::moves::finish_opens(bus, store, &mover.stores, &mover.settings, before);
+    ended
+}
+
+/// `partition` moved where the count now places it, or opened in its
+/// owner's home: its move's ending, or none where it stays.
+fn rebalance_one(mover: &Mover, partition: &str) -> Option<Result<Ended>> {
     // Where a deployment admin moved a partition by hand, it stays (section
     // 6.8): only a count lowered past its group moves it again.
     let by_hand = match mover.stores[0].moved_by_hand() {
         Ok(by_hand) => by_hand,
         Err(failed) => {
             tracing::warn!(%failed, "the moves by hand were not read: no partition moved by the count");
-            return ended;
+            return None;
         }
     };
-    for n in 0..count {
-        let partition = crate::store::partition_named(n);
-        let wanted = meridian_changes::groups::owner(&partition, mover.groups.count());
-        let now = match mover.owner_now(&partition) {
-            Ok(now) => now,
-            Err(failed) => {
-                tracing::warn!(partition, %failed, "a partition's owner was not read");
-                continue;
-            }
-        };
-        let placed = by_hand
-            .get(&partition)
-            .is_some_and(|group| *group == now && *group < mover.groups.count());
-        // Its owner kept, its records in another database than its owner's
-        // (a raised database count): moved there, its group unchanged.
-        let away = if now == wanted || placed {
-            match mover.misplaced(&partition, now) {
-                Ok(away) => away,
-                Err(failed) => {
-                    tracing::warn!(partition, %failed, "a partition's databases were not read");
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        if ((now == wanted || placed) && away.is_none()) || !mover.begin(&partition) {
-            continue;
+    let wanted = meridian_changes::groups::owner(partition, mover.groups.count());
+    let now = match mover.owner_now(partition) {
+        Ok(now) => now,
+        Err(failed) => {
+            tracing::warn!(partition, %failed, "a partition's owner was not read");
+            return None;
         }
-        let target = if away.is_some() { now } else { wanted };
-        match mover.run_from(&partition, target, &Asked::default(), away) {
-            Ok(done) => {
-                journal(bus, store, &done);
-                ended.push(done);
-            }
-            Err(failed) => tracing::warn!(
-                partition,
-                %failed,
-                "a partition's move by the changed count stopped: the source still owns it"
-            ),
+    };
+    let placed = by_hand
+        .get(partition)
+        .is_some_and(|group| *group == now && *group < mover.groups.count());
+    // Its owner kept, its records in another database than its owner's (a
+    // raised database count, or a move's open owed): moved there, its
+    // group unchanged.
+    let away = match mover.misplaced(partition, now) {
+        Ok(away) => away,
+        Err(failed) => {
+            tracing::warn!(partition, %failed, "a partition's databases were not read");
+            return None;
         }
+    };
+    if (now == wanted || placed) && away.is_none() {
+        return None;
     }
-    ended
+    let target = if away.is_some() { now } else { wanted };
+    Some(mover.run_alone(partition, target, &Asked::default(), away))
 }

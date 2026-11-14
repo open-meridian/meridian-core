@@ -7316,6 +7316,7 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
         at: 0,
         sequence: 7,
         groups: vec![1],
+        dataset: String::new(),
     };
     // Group 1's part commits a moment later: the answer waits for it.
     let committing = {
@@ -7632,4 +7633,397 @@ fn a_groups_stream_position_is_carried_home_when_the_database_count_is_raised() 
     );
     let (found, _) = one.write_ahead_found(&key).unwrap();
     assert_eq!(found, vec![run]);
+}
+
+// ---- The correctness review of the moves (2026-11-14, c30d-m7) ----------
+
+/// Two databases, a store of each of two writer groups over each, a
+/// member (Spread) of each group, and a dataset of group 0's in database
+/// 0 -- split into two halves where `split` -- with a row in each half.
+struct Across {
+    urls: Vec<String>,
+    zeros: Vec<Arc<PostgresStore>>,
+    ones: Vec<Arc<PostgresStore>>,
+    zero: Arc<meridian_lake::spread::Spread>,
+    one: Arc<meridian_lake::spread::Spread>,
+    dataset: String,
+    low: String,
+}
+
+fn across(tag: &str, split: bool) -> Across {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let zero = Arc::new(meridian_lake::spread::Spread::new(
+        zeros.clone(),
+        zeros[0].groups(),
+    ));
+    let one = Arc::new(meridian_lake::spread::Spread::new(
+        ones.clone(),
+        ones[0].groups(),
+    ));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:{tag}{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of(tag);
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    if split {
+        zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+            .unwrap();
+        zero.record(&dataset, vec![trade(&dataset, "split-l", &low, 12)], 1_200)
+            .unwrap();
+    }
+    zeros[0].pin_owners().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    Across {
+        urls,
+        zeros,
+        ones,
+        zero,
+        one,
+        dataset,
+        low,
+    }
+}
+
+impl Across {
+    fn lower(&self) -> String {
+        format!("{}/0000-7fff", self.dataset)
+    }
+
+    fn mover(&self) -> meridian_lake::partition_moves::Mover {
+        meridian_lake::partition_moves::Mover::new(
+            self.zeros.clone(),
+            self.zeros[0].groups(),
+            meridian_lake::partition_moves::Settings {
+                switch: std::time::Duration::from_secs(5),
+                ..Default::default()
+            },
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// The range's rows in database `d`: (sequence, row key) each.
+    fn rows(&self, d: usize, partition: &str) -> Vec<(i64, String)> {
+        postgres::Client::connect(&self.urls[d], postgres::NoTls)
+            .unwrap()
+            .query(
+                "SELECT sequence, row_key FROM lake_row WHERE partition = $1
+                  ORDER BY sequence, row_key",
+                &[&partition],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// The range's row in each database: (head, epoch, writer group).
+    fn heads(&self, partition: &str) -> Vec<Option<(i64, i64, Option<i32>)>> {
+        self.urls
+            .iter()
+            .map(|url| {
+                postgres::Client::connect(url, postgres::NoTls)
+                    .unwrap()
+                    .query_opt(
+                        "SELECT head, epoch, writer_group FROM lake_partition WHERE dataset = $1",
+                        &[&partition],
+                    )
+                    .unwrap()
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+            })
+            .collect()
+    }
+}
+
+/// C3: a range's switch between databases stopped between its two rows
+/// -- the source let go, the target not opened -- never leaves two owners;
+/// the control group's sweep opens the target, written on there alone.
+#[test]
+fn review_c3_a_range_switch_stopped_between_its_two_databases_leaves_one_owner() {
+    use meridian_changes::moves::points;
+    use meridian_lake::partition_moves::{Asked, Ended};
+    let a = across("review-c3", true);
+    let lower = a.lower();
+    let mover = a.mover();
+    points::arm(
+        "lake.switch.between",
+        &lower,
+        Arc::new(|_| Err("stopped between the two databases".into())),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover.run(&lower, 1, &Asked::default());
+    points::disarm("lake.switch.between", &lower);
+    let heads = a.heads(&lower);
+    let top = heads.iter().flatten().map(|h| h.0).max().unwrap();
+    let written: std::collections::BTreeSet<Option<i32>> = heads
+        .iter()
+        .flatten()
+        .filter(|h| h.0 == top && h.1 != meridian_changes::moves::POINTER_EPOCH)
+        .map(|h| h.2)
+        .collect();
+    assert!(written.len() <= 1, "two owners at {top}: {heads:?}");
+    assert!(matches!(ended, Ok(Ended::Moved(_))), "{ended:?}");
+    // The sweep opens the target; each member's write commits there once.
+    mover.rebalance();
+    for store in a.zeros.iter().chain(&a.ones) {
+        store.read_owners().unwrap();
+    }
+    // Group 0's member hands it on, never commits it; group 1's commits.
+    let handed = a.zero.record(
+        &a.dataset,
+        vec![trade(&a.dataset, "after-0", &a.low, 20)],
+        2_000,
+    );
+    assert!(
+        matches!(
+            handed,
+            Err(meridian_lake::store::StoreError::NotOwned { group: 1, .. })
+        ),
+        "{handed:?}"
+    );
+    for (n, at) in [(0, 2_100), (1, 2_200)] {
+        a.one
+            .record(
+                &a.dataset,
+                vec![trade(&a.dataset, &format!("after-{n}"), &a.low, 21 + n)],
+                at,
+            )
+            .unwrap();
+    }
+    let heads = a.heads(&lower);
+    let target = heads[1].unwrap();
+    assert_eq!(target.2, Some(1), "{heads:?}");
+    assert_ne!(
+        target.1,
+        meridian_changes::moves::POINTER_EPOCH,
+        "opened: {heads:?}"
+    );
+    assert_eq!(target.0, top + 2, "{heads:?}");
+    let (ours, theirs) = (a.rows(1, &lower), a.rows(0, &lower));
+    assert!(
+        theirs.iter().all(|(s, _)| *s <= top),
+        "written in both: {theirs:?}"
+    );
+    assert_eq!(ours.last().map(|r| r.0), Some(top + 2), "{ours:?}");
+}
+
+/// A1: the source's commit made but its answer lost: the switch reads the
+/// source's row again and goes on, never naming the source again on the
+/// target -- one owner, the target.
+#[test]
+fn review_a1_a_lost_answer_to_a_ranges_source_commit_leaves_one_owner() {
+    use meridian_changes::moves::points;
+    use meridian_lake::partition_moves::Asked;
+    let a = across("review-a1", true);
+    let lower = a.lower();
+    let mover = a.mover();
+    points::arm(
+        "lake.switch.committed",
+        &lower,
+        Arc::new(|_| Err("the commit's answer was lost".into())),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover.run(&lower, 1, &Asked::default());
+    points::disarm("lake.switch.committed", &lower);
+    let heads = a.heads(&lower);
+    assert_eq!(
+        (heads[0].unwrap().2, heads[1].unwrap().2),
+        (Some(1), Some(1)),
+        "{heads:?} {ended:?}"
+    );
+}
+
+/// C2: rows committed while a warm round copies leave no hole: each round
+/// copies up to the sequence it read first, in one snapshot, and the switch
+/// copies on from there.
+#[test]
+fn review_c2_rows_committed_during_a_warm_round_leave_no_hole() {
+    use meridian_changes::moves::points;
+    let a = across("review-c2", true);
+    let lower = a.lower();
+    let (source, target) = (a.zeros[0].clone(), a.zeros[1].clone());
+    let warmed = target.copy_range_from(&source, &lower, 0).unwrap();
+    let (zero, dataset, low) = (a.zero.clone(), a.dataset.clone(), a.low.clone());
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    points::arm(
+        "lake.copy.read",
+        &lower,
+        Arc::new(move |_| {
+            if !fired.swap(true, Ordering::SeqCst) {
+                zero.record(
+                    &dataset,
+                    vec![
+                        trade(&dataset, "during-1", &low, 30),
+                        trade(&dataset, "during-2", &low, 31),
+                    ],
+                    3_000,
+                )
+                .unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let warmed = target.copy_range_from(&source, &lower, warmed).unwrap();
+    points::disarm("lake.copy.read", &lower);
+    a.zero
+        .record(
+            &a.dataset,
+            vec![trade(&a.dataset, "later", &a.low, 32)],
+            3_100,
+        )
+        .unwrap();
+    let warmed = target.copy_range_from(&source, &lower, warmed).unwrap();
+    let switched = source
+        .switch_range(
+            &target,
+            &lower,
+            1,
+            std::time::Duration::from_secs(5),
+            false,
+            warmed,
+        )
+        .unwrap();
+    assert!(
+        matches!(switched, meridian_lake::postgres::Switched::Moved { .. }),
+        "{switched:?}"
+    );
+    assert_eq!(
+        a.rows(1, &lower),
+        a.rows(0, &lower),
+        "the target's rows differ"
+    );
+}
+
+/// C9: the switch's digest at N is each side's rows taken again, not a
+/// copied value: a row changed in the target after its copy aborts the
+/// move, cause digest, and the source still owns.
+#[test]
+fn review_c9_a_range_copy_changed_after_it_was_made_is_found_at_the_switch() {
+    let a = across("review-c9", true);
+    let lower = a.lower();
+    a.zero
+        .record(
+            &a.dataset,
+            vec![trade(&a.dataset, "more", &a.low, 40)],
+            4_000,
+        )
+        .unwrap();
+    let (source, target) = (a.zeros[0].clone(), a.zeros[1].clone());
+    let warmed = target.copy_range_from(&source, &lower, 0).unwrap();
+    let changed = postgres::Client::connect(&a.urls[1], postgres::NoTls)
+        .unwrap()
+        .execute(
+            "UPDATE lake_row SET body = body || '\\x00'::bytea
+              WHERE partition = $1 AND sequence = (SELECT min(sequence) FROM lake_row
+                                                    WHERE partition = $1)",
+            &[&lower],
+        )
+        .unwrap();
+    assert!(changed >= 1);
+    let switched = source
+        .switch_range(
+            &target,
+            &lower,
+            1,
+            std::time::Duration::from_secs(5),
+            false,
+            warmed,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            switched,
+            meridian_lake::postgres::Switched::DigestDiffers { .. }
+        ),
+        "{switched:?}"
+    );
+    assert_eq!(
+        a.heads(&lower)[0].unwrap().2,
+        Some(0),
+        "the source still owns"
+    );
+}
+
+/// C8: a dataset moved by hand, then split: the ranges split from it stay
+/// with the group it was moved to through the sweep.
+#[test]
+fn review_c8_a_dataset_moved_by_hand_then_split_stays_through_the_sweep() {
+    use meridian_lake::partition_moves::{Asked, Ended};
+    let a = across("review-c8", false);
+    let mover = a.mover();
+    assert!(mover.begin(&a.dataset));
+    let ended = mover
+        .run(
+            &a.dataset,
+            1,
+            &Asked {
+                by_hand: true,
+                moved_by: "https://directory.example.org|8812".into(),
+                reason: "to database 1".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(&ended, Ended::Moved(_)), "{ended:?}");
+    mover.log(&ended);
+    for store in a.zeros.iter().chain(&a.ones) {
+        store.read_owners().unwrap();
+    }
+    // Its database's timeline followed first, so its control's epoch is
+    // its leader's whatever M1 does.
+    a.one.follow_timeline().unwrap();
+    a.one
+        .split_partition(&a.dataset, "admin-1", "two halves", 5_000)
+        .unwrap();
+    let moved = mover.rebalance();
+    assert!(moved.is_empty(), "the sweep moved {moved:?}");
+    for child in [a.lower(), format!("{}/8000-ffff", a.dataset)] {
+        assert_eq!(a.heads(&child)[1].unwrap().2, Some(1), "{child}");
+    }
+}
+
+/// M1: a writer group past the first that leads its own database logs in
+/// that database's control under its own epoch right after its takeover,
+/// before any look at the timeline -- its control head raised with it.
+#[test]
+fn review_m1_a_group_leading_its_database_logs_control_right_after_its_takeover() {
+    let a = across("review-m1", false);
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:m1x{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 1)
+        .unwrap();
+    a.one
+        .record(&dataset, vec![trade(&dataset, "m", &a.low, 10)], 1_000)
+        .unwrap();
+    a.one
+        .split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
 }

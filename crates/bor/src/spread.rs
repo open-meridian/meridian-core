@@ -195,9 +195,12 @@ impl Spread {
                         return Ok(true);
                     }
                     let there = store.tip(&partition)?;
+                    // A move's pointer (its epoch `POINTER_EPOCH`) is never written there.
                     let named_mine = there.as_ref().is_some_and(|tip| {
-                        tip.writer_group
-                            .is_none_or(|group| group == self.groups.mine())
+                        tip.epoch != meridian_changes::moves::POINTER
+                            && tip
+                                .writer_group
+                                .is_none_or(|group| group == self.groups.mine())
                     });
                     let head_there = there.map_or(0, |tip| tip.head);
                     let head_home = own.tip(&partition)?.map_or(0, |tip| tip.head);
@@ -233,9 +236,14 @@ impl Spread {
         }
         let mut best = (0u64, home);
         for (d, store) in self.stores.iter().enumerate() {
+            // A pointer (its epoch `POINTER_EPOCH`) is where a move let it go, never where
+            // it is written.
             let Ok(Some(tip)) = store.tip(partition) else {
                 continue;
             };
+            if tip.epoch == meridian_changes::moves::POINTER {
+                continue;
+            }
             let named = tip
                 .writer_group
                 .filter(|group| *group < self.groups.count())
@@ -277,7 +285,21 @@ impl Spread {
         let partition = self
             .partition_of(account_id)
             .unwrap_or_else(|| crate::store::first_partition_of(account_id).to_string());
-        self.database(self.of(&partition))
+        let placed = self.database(self.of(&partition));
+        // Between its move's close and its open across databases, its new
+        // database holds nothing of it yet: read where it is held, whole
+        // (step 3d; the Elle read of CI 43631481777, an account read as
+        // empty after its close).
+        if self.stores.len() > 1 && matches!(placed.account_row(account_id), Ok(None)) {
+            if let Some(held) = self
+                .stores
+                .iter()
+                .find(|store| matches!(store.account_row(account_id), Ok(Some(_))))
+            {
+                return held;
+            }
+        }
+        placed
     }
 
     /// A read naming an account from its database; one of every account
@@ -339,7 +361,11 @@ impl Store for Spread {
         // Where it is placed, wherever that is: the store then hands an
         // account of another group's on, never placing it again here.
         let placed = self.partition_of(account_id);
-        for _ in 0..ROUTED_AGAIN {
+        // A write that finds its partition moving between databases waits
+        // for the target's open within the hold (step 3d; the review's C3).
+        let deadline = std::time::Instant::now() + crate::moves::hold();
+        let mut routed = 0;
+        while routed < ROUTED_AGAIN {
             // Its partition's head's database (step 3d; ruled 2026-11-14):
             // where its group writes it until it moves home.
             let partition = placed
@@ -365,6 +391,11 @@ impl Store for Spread {
                 // not yet -- routed again.
                 Err(StoreError::NotOwned { partition, group }) if group == self.groups.mine() => {
                     self.route_again(&partition);
+                    routed += 1;
+                }
+                Err(StoreError::Held(_)) if std::time::Instant::now() < deadline => {
+                    self.route_again(&partition);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 other => return other,
             }
@@ -535,7 +566,19 @@ impl Store for Spread {
     }
 
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
-        self.own().follow_timeline()
+        use meridian_changes::timeline::Timeline;
+        let mut found = self.own().follow_timeline()?;
+        // And each database where its group still writes a partition
+        // further on than at home (a raised database count): a new
+        // timeline there raises its epoch there too, so its hot books
+        // reload what that database kept (section 6.4, restore; the
+        // review's A2).
+        for store in self.ahead_away()? {
+            if let Timeline::Moved(epoch) = store.follow_timeline()? {
+                found = Timeline::Moved(epoch);
+            }
+        }
+        Ok(found)
     }
 
     fn read_changes(

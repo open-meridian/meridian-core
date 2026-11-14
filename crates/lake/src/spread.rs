@@ -298,6 +298,11 @@ impl Spread {
             let Ok(Some(tip)) = store.range_tip(partition) else {
                 continue;
             };
+            // A move's pointer is where it let go, never where it is
+            // written (the review's C3).
+            if tip.epoch == meridian_changes::moves::POINTER {
+                continue;
+            }
             let named = tip
                 .writer_group
                 .filter(|group| *group < count)
@@ -582,8 +587,26 @@ impl Store for Spread {
     }
 
     fn read_owners_again(&self) -> Result<()> {
+        if self.stores.len() == 1 {
+            self.own().read_owners()?;
+            return Ok(());
+        }
+        // Each range's group as its furthest row names it, a written row
+        // before a move's pointer at the same head -- never the last
+        // database read (the review's C4).
+        let mut furthest: BTreeMap<String, ((u64, bool), Option<u32>)> = BTreeMap::new();
         for store in &self.stores {
-            store.read_owners()?;
+            for (partition, named, head, written) in store.owner_rows()? {
+                let at = (head, written);
+                if furthest.get(&partition).is_none_or(|(held, _)| *held < at) {
+                    furthest.insert(partition, (at, named));
+                }
+            }
+        }
+        for (partition, (_, named)) in furthest {
+            if let Some(group) = named {
+                self.groups.assign(&partition, Some(group));
+            }
         }
         Ok(())
     }

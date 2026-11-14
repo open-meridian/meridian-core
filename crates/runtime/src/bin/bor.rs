@@ -236,6 +236,28 @@ fn run() -> Result<(), String> {
         // its books kept by the writer's change log, never acting.
         if member.is_reader() {
             bus.serve_only(meridian_bus::read_after::is_read);
+            // Each partition's writer group as its furthest head names it,
+            // at start and every few seconds, as a writer reads them: an
+            // account is read in the database its partition is written in
+            // (step 3d; CI 43631481777 and 43636763392, Elle: a reader that
+            // never read them took each partition for its rendezvous owner's
+            // and read P0's accounts as empty in database 1 once the count of
+            // databases was raised).
+            tokio::task::block_in_place(|| PostgresStore::read_owners_from(&every_database))
+                .map_err(|failed| format!("the writer groups could not be read: {failed}"))?;
+            let reading = every_database.clone();
+            meridian_runtime::background(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let stores = reading.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(failed) = PostgresStore::read_owners_from(&stores) {
+                            tracing::debug!(%failed, "the writer groups were not read again");
+                        }
+                    })
+                    .await;
+                }
+            });
             // Made before the runtime and held outside it (stage D): its
             // connections close after the runtime has stopped.
             let replica = replica.clone();
@@ -408,17 +430,47 @@ fn run() -> Result<(), String> {
         // A partition's move (step 3d; section 6.8): the control partition's
         // group runs each, one at a time, over every database.
         if groups.holds_control() {
-            let mover = Arc::new(meridian_bor::partition_moves::Mover::new(
-                every_database.clone(),
-                groups,
-                meridian_bor::partition_moves::Settings::from_env(),
-                clock(),
-            ));
+            let mover = Arc::new(
+                meridian_bor::partition_moves::Mover::new(
+                    every_database.clone(),
+                    groups,
+                    meridian_bor::partition_moves::Settings::from_env(),
+                    clock(),
+                )
+                .journalling(bus.clone(), Arc::clone(&store)),
+            );
             meridian_bor::partition_moves::serve(&bus, &store, &mover);
             // A changed count of writer groups (section 6.8, Triggers): each
             // partition its head names for another group than its owner at
             // the count now moved to it, one at a time, at start and each
             // minute after.
+            // One group: each account's move closed and never opened,
+            // opened, at start and each minute after (step 3d); with
+            // several, the rebalance below does it too.
+            if !groups.several() {
+                let (bus, store, databases) =
+                    (bus.clone(), Arc::clone(&store), every_database.clone());
+                meridian_runtime::background(async move {
+                    loop {
+                        let (bus, store, databases) =
+                            (bus.clone(), Arc::clone(&store), databases.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let settings = meridian_bor::partition_moves::Settings::from_env();
+                            let before = meridian_clock::Clock::now_ns(clock().as_ref())
+                                - 2 * settings.switch.as_nanos() as i64;
+                            meridian_bor::moves::finish_opens(
+                                &bus,
+                                store.as_ref(),
+                                &databases,
+                                &settings,
+                                before,
+                            )
+                        })
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
             if groups.several() {
                 let (bus, store, mover) = (bus.clone(), Arc::clone(&store), Arc::clone(&mover));
                 meridian_runtime::background(async move {

@@ -246,6 +246,29 @@ fn run() -> Result<(), String> {
         // its hot layer kept by the writer's change log, never writing.
         if member.is_reader() {
             bus.serve_only(meridian_bus::read_after::is_read);
+            // Each range's writer group, as a writer reads them, at start and
+            // every few seconds: a range is read where it is written (step
+            // 3d; a reader that never read them took each range for its
+            // dataset's rendezvous owner's once the count of databases was
+            // raised).
+            if groups.several() {
+                tokio::task::block_in_place(|| record.read_owners_again()).map_err(|failed| {
+                    format!("the ranges' writer groups could not be read: {failed}")
+                })?;
+                let reading = Arc::clone(&record);
+                meridian_runtime::background(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let record = Arc::clone(&reading);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(failed) = record.read_owners_again() {
+                                tracing::debug!(%failed, "the ranges' writer groups were not read again");
+                            }
+                        })
+                        .await;
+                    }
+                });
+            }
             // Made before the runtime and held outside it (stage D): its
             // connections close after the runtime has stopped.
             let replica = replica.clone();
@@ -309,8 +332,12 @@ fn run() -> Result<(), String> {
                             tracing::info!(pinned, "each range named its writer group");
                         }
                     }
-                    store.read_owners().map_err(|failed| failed.to_string())?;
                 }
+                // By the furthest row over every database, a written row
+                // before a move's pointer (the review's C4).
+                record
+                    .read_owners_again()
+                    .map_err(|failed| failed.to_string())?;
                 Ok(())
             })?;
         }
@@ -361,16 +388,14 @@ fn run() -> Result<(), String> {
             bus.route_writes_by(move |topic, envelope| {
                 meridian_lake::service::owner_of_write(groups, topic, envelope)
             });
-            let reading = every_database.clone();
+            let reading = Arc::clone(&record);
             meridian_runtime::background(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let stores = reading.clone();
+                    let record = Arc::clone(&reading);
                     let _ = tokio::task::spawn_blocking(move || {
-                        for store in &stores {
-                            if let Err(failed) = store.read_owners() {
-                                tracing::debug!(%failed, "the ranges' writer groups were not read again");
-                            }
+                        if let Err(failed) = record.read_owners_again() {
+                            tracing::debug!(%failed, "the ranges' writer groups were not read again");
                         }
                     })
                     .await;
@@ -448,12 +473,15 @@ fn run() -> Result<(), String> {
         // several groups, those a changed count calls for, at start and
         // each minute after.
         if groups.holds_control() {
-            let mover = Arc::new(meridian_lake::partition_moves::Mover::new(
-                every_database.clone(),
-                groups,
-                meridian_lake::partition_moves::Settings::from_env(),
-                clock(),
-            ));
+            let mover = Arc::new(
+                meridian_lake::partition_moves::Mover::new(
+                    every_database.clone(),
+                    groups,
+                    meridian_lake::partition_moves::Settings::from_env(),
+                    clock(),
+                )
+                .logging(),
+            );
             meridian_lake::partition_moves::serve(&bus, &mover);
             if groups.several() {
                 meridian_runtime::background(async move {

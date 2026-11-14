@@ -5147,3 +5147,791 @@ async fn a_raised_database_count_writes_where_each_head_is_and_moves_each_partit
     });
     blocking(move || drop((zero, one, bus_zero, bus_one, mover)));
 }
+
+// ---- The correctness review of the moves (2026-11-14, c30d-m7) ----------
+
+/// Two databases, a member of each of two writer groups over both, and the
+/// control group's mover over both: the review's cross-database harness.
+struct TwoDatabases {
+    urls: Vec<String>,
+    zero: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
+    one: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
+    mover: meridian_bor::partition_moves::Mover,
+}
+
+fn two_databases() -> TwoDatabases {
+    use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = (0..2)
+        .map(|_| {
+            let (url, migrated) = isolated();
+            migrated.make_partitions(8).unwrap();
+            apart(&url);
+            url
+        })
+        .collect();
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let member = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores: Vec<Arc<PostgresStore>> = urls
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 6)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        let spread = Arc::new(meridian_bor::spread::Spread::new(stores, groups));
+        let bus = Arc::new(Bus::single(
+            "bor-review-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        serve(bus.clone(), spread.clone(), bus.clock());
+        resolving_equities(&bus);
+        (bus, spread)
+    };
+    let (zero, one) = (member(0), member(1));
+    let mover = meridian_bor::partition_moves::Mover::new(
+        vec![zero.1.database(0).clone(), zero.1.database(1).clone()],
+        zero.1.database(0).groups(),
+        meridian_bor::partition_moves::Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    TwoDatabases {
+        urls,
+        zero,
+        one,
+        mover,
+    }
+}
+
+/// The `nth` partition of writer group `group`'s at two groups that no
+/// other test of this file writes (never P0, P1 or P4): each review test
+/// its own, so no switch of one holds another's writes.
+fn partition_of(group: u32, nth: usize) -> String {
+    (2..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| p != "P4" && meridian_changes::groups::owner(p, 2) == group)
+        .cycle()
+        .nth(nth)
+        .unwrap_or_else(|| panic!("no partition {nth} of group {group}'s"))
+}
+
+/// Accounts placed in `partition`, `count` of them, opened through `bus`.
+async fn accounts_in(
+    tag: &str,
+    partition: &str,
+    count: usize,
+    bus: &Bus,
+    store: &dyn Store,
+) -> Vec<String> {
+    let accounts: Vec<String> = (0..)
+        .map(|n| unique(&format!("{tag}-{n}")))
+        .filter(|a| meridian_bor::store::placement_of(a, 8) == partition)
+        .take(count)
+        .collect();
+    for account in &accounts {
+        blocking(|| store.place_first(account, account)).unwrap();
+        open(bus, account, "INS-AAPL").await;
+    }
+    accounts
+}
+
+/// One write to `account` through `bus`: its attribute set.
+async fn write_once(bus: &Bus, account: &str, n: u64) -> Result<(), String> {
+    let request = SetAccountAttributeRequest {
+        account_id: account.to_string(),
+        attribute: Some(
+            set_account_attribute_request::Attribute::WaitsForCompliance(n.is_multiple_of(2)),
+        ),
+        reason: format!("write {n}"),
+    };
+    send(bus, SET_ACCOUNT_ATTRIBUTE, &request, Some(PERSON))
+        .await
+        .map(|_| ())
+}
+
+/// `partition`'s heads in each database, furthest on first.
+fn heads_of(urls: &[String], partition: &str) -> Vec<meridian_bor::postgres::Tip> {
+    urls.iter()
+        .map(|url| {
+            PostgresStore::connect(url, 1)
+                .unwrap()
+                .tip(partition)
+                .unwrap()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// C3: a switch between databases stopped between its two heads -- the
+/// source let go, the target not yet opened -- never leaves two owners:
+/// the heads furthest on that are written name one group, a write to it
+/// waits rather than committing in both, and the control group's sweep
+/// opens the target, where it is written on, once, unbroken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c3_a_switch_stopped_between_its_two_databases_leaves_one_owner() {
+    use meridian_bor::partition_moves::{rebalance, Asked, Ended};
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 0);
+    let accounts = accounts_in("ACC-C3", &partition, 2, &h.one.0, h.one.1.as_ref()).await;
+    for n in 0..4 {
+        write_once(&h.one.0, &accounts[n % 2], n as u64)
+            .await
+            .unwrap();
+    }
+    points::arm(
+        "book.switch.between",
+        &partition,
+        Arc::new(|_| Err("stopped between the two databases".into())),
+    );
+    let ended = blocking(|| {
+        h.mover.begin(&partition);
+        h.mover.run(&partition, 0, &Asked::default())
+    });
+    points::disarm("book.switch.between", &partition);
+    let tips = blocking(|| heads_of(&h.urls, &partition));
+    let top = tips.iter().map(|tip| tip.head).max().unwrap();
+    let written: std::collections::BTreeSet<Option<u32>> = tips
+        .iter()
+        .filter(|tip| tip.head == top && tip.epoch != meridian_changes::moves::POINTER)
+        .map(|tip| tip.writer_group)
+        .collect();
+    assert!(written.len() <= 1, "two owners at {top}: {tips:?}");
+    assert!(matches!(ended, Ok(Ended::Moved(_))), "{ended:?}");
+    // The sweep opens the target; each member's write then commits once.
+    blocking(|| rebalance(&h.zero.0, h.zero.1.as_ref(), &h.mover));
+    write_once(&h.zero.0, &accounts[0], 10).await.unwrap();
+    write_once(&h.one.0, &accounts[1], 11).await.unwrap();
+    blocking(|| {
+        let tips = heads_of(&h.urls, &partition);
+        assert_eq!(tips[0].writer_group, Some(0));
+        assert_ne!(tips[0].epoch, 0, "opened: {tips:?}");
+        assert_eq!(tips[0].head, top + 2, "{tips:?}");
+        let rows = numbered(&h.urls[0], &partition);
+        assert_eq!((rows[0].0, rows.last().unwrap().1 as u64), (1, top + 2));
+        let old = numbered(&h.urls[1], &partition);
+        assert!(
+            old.last().unwrap().1 as u64 <= top,
+            "written in both: {old:?}"
+        );
+        for url in &h.urls {
+            let scrubbed = PostgresStore::connect(url, 1).unwrap().scrub().unwrap();
+            assert!(scrubbed.findings.is_empty(), "{:?}", scrubbed.findings);
+        }
+    });
+    blocking(move || drop(h));
+}
+
+/// A1: the source's commit made but its answer lost: the switch reads the
+/// source's head again and goes on, never naming the source again on the
+/// target -- one owner, the target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_a1_a_lost_answer_to_the_sources_commit_leaves_one_owner() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 1);
+    let accounts = accounts_in("ACC-A1", &partition, 1, &h.one.0, h.one.1.as_ref()).await;
+    write_once(&h.one.0, &accounts[0], 1).await.unwrap();
+    points::arm(
+        "book.switch.committed",
+        &partition,
+        Arc::new(|_| Err("the commit's answer was lost".into())),
+    );
+    let ended = blocking(|| {
+        h.mover.begin(&partition);
+        h.mover.run(&partition, 0, &Asked::default())
+    });
+    points::disarm("book.switch.committed", &partition);
+    let tips = blocking(|| heads_of(&h.urls, &partition));
+    assert_eq!(
+        (tips[0].writer_group, tips[1].writer_group),
+        (Some(0), Some(0)),
+        "{tips:?}"
+    );
+    assert!(matches!(ended, Ok(Ended::Moved(_))), "{ended:?}");
+    write_once(&h.one.0, &accounts[0], 2).await.unwrap();
+    blocking(|| {
+        let tips = heads_of(&h.urls, &partition);
+        assert!(tips[0].head > tips[1].head, "{tips:?}");
+    });
+    blocking(move || drop(h));
+}
+
+/// C1: entries committed while a warm round copies -- one account's later
+/// entry ahead of another's earlier -- leave no hole: the switch copies from
+/// the copy's own watermark, and the target's chain is whole to the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c1_entries_committed_during_a_warm_round_leave_no_hole() {
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 2);
+    let accounts = accounts_in("ACC-C1", &partition, 2, &h.one.0, h.one.1.as_ref()).await;
+    let (x, y) = (accounts[0].clone(), accounts[1].clone());
+    let (source, target) = (h.one.1.database(1).clone(), h.one.1.database(0).clone());
+    let warmed = blocking(|| target.copy_partition_from(&source, &partition, 0)).unwrap();
+    write_once(&h.one.0, &x, 1).await.unwrap();
+    let (bus, fired) = (
+        h.one.0.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let handle = tokio::runtime::Handle::current();
+    points::arm(
+        "book.copy.read",
+        &partition,
+        Arc::new(move |_| {
+            if !fired.swap(true, Ordering::SeqCst) {
+                handle.block_on(async {
+                    write_once(&bus, &y, 2).await.unwrap();
+                    write_once(&bus, &x, 3).await.unwrap();
+                });
+            }
+            Ok(())
+        }),
+    );
+    let warmed = blocking(|| target.copy_partition_from(&source, &partition, warmed)).unwrap();
+    points::disarm("book.copy.read", &partition);
+    let switched = blocking(|| {
+        source.switch_partition(
+            &target,
+            &partition,
+            0,
+            std::time::Duration::from_secs(10),
+            false,
+            warmed,
+        )
+    })
+    .unwrap();
+    assert!(
+        matches!(switched, meridian_bor::postgres::Switched::Moved { .. }),
+        "{switched:?}"
+    );
+    blocking(|| {
+        let ours = numbered(&h.urls[0], &partition);
+        let theirs = numbered(&h.urls[1], &partition);
+        assert_eq!(
+            ours, theirs,
+            "the target's entries differ from the source's"
+        );
+    });
+    blocking(move || drop(h));
+}
+
+/// C6: an account's entry committed while a warm round reads which
+/// accounts it copies leaves no projection stale: at the switch every
+/// account's projections are the source's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c6_an_entry_committed_during_a_warm_round_leaves_no_projection_stale() {
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 0);
+    let accounts = accounts_in("ACC-C6", &partition, 1, &h.one.0, h.one.1.as_ref()).await;
+    let x = accounts[0].clone();
+    let (source, target) = (h.one.1.database(1).clone(), h.one.1.database(0).clone());
+    let warmed = blocking(|| target.copy_partition_from(&source, &partition, 0)).unwrap();
+    let (bus, fired) = (
+        h.one.0.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let handle = tokio::runtime::Handle::current();
+    let xx = x.clone();
+    points::arm(
+        "book.copy.accounts",
+        &partition,
+        Arc::new(move |_| {
+            if !fired.swap(true, Ordering::SeqCst) {
+                handle.block_on(write_once(&bus, &xx, 1)).unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let warmed = blocking(|| target.copy_partition_from(&source, &partition, warmed)).unwrap();
+    points::disarm("book.copy.accounts", &partition);
+    blocking(|| {
+        source
+            .switch_partition(
+                &target,
+                &partition,
+                0,
+                std::time::Duration::from_secs(10),
+                false,
+                warmed,
+            )
+            .unwrap()
+    });
+    let attributes = |url: &str| -> Vec<Vec<u8>> {
+        postgres::Client::connect(url, postgres::NoTls)
+            .unwrap()
+            .query(
+                "SELECT record FROM book_attributes WHERE account_id = $1",
+                &[&x],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    blocking(|| assert_eq!(attributes(&h.urls[0]), attributes(&h.urls[1])));
+    blocking(move || drop(h));
+}
+
+/// C9: the switch's digest at N is the target's chain taken again, not a
+/// copied value: an entry changed in the target after its copy aborts the
+/// move, cause digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c9_a_copy_changed_after_it_was_made_is_found_at_the_switch() {
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 1);
+    let accounts = accounts_in("ACC-C9", &partition, 1, &h.one.0, h.one.1.as_ref()).await;
+    for n in 0..3 {
+        write_once(&h.one.0, &accounts[0], n).await.unwrap();
+    }
+    let (source, target) = (h.one.1.database(1).clone(), h.one.1.database(0).clone());
+    let warmed = blocking(|| target.copy_partition_from(&source, &partition, 0)).unwrap();
+    blocking(|| {
+        // Changed as only someone with the database's own rights could.
+        postgres::Client::connect(&h.urls[0], postgres::NoTls)
+            .unwrap()
+            .batch_execute(&format!(
+                "ALTER TABLE book_entry DISABLE TRIGGER book_entry_append_only;
+                 UPDATE book_entry SET message_id = message_id || '-altered'
+                  WHERE entry_id = (SELECT entry_id FROM book_entry WHERE partition = '{partition}'
+                                     ORDER BY first_sequence OFFSET 1 LIMIT 1);
+                 ALTER TABLE book_entry ENABLE TRIGGER book_entry_append_only;"
+            ))
+            .unwrap();
+    });
+    let switched = blocking(|| {
+        source.switch_partition(
+            &target,
+            &partition,
+            0,
+            std::time::Duration::from_secs(10),
+            false,
+            warmed,
+        )
+    })
+    .unwrap();
+    assert!(
+        matches!(
+            switched,
+            meridian_bor::postgres::Switched::DigestDiffers { .. }
+        ),
+        "{switched:?}"
+    );
+    let tips = blocking(|| heads_of(&h.urls, &partition));
+    assert_eq!(
+        tips[1].writer_group,
+        Some(1),
+        "the source still owns: {tips:?}"
+    );
+    blocking(move || drop(h));
+}
+
+/// C5: while a partition warms in another database, and after its move
+/// aborts, each account's positions are read once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c5_a_warming_or_aborted_move_reads_each_position_once() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 2);
+    let accounts = accounts_in("ACC-C5", &partition, 2, &h.one.0, h.one.1.as_ref()).await;
+    let read = PositionsRead {
+        scope: Scope::Everything,
+        account_id: String::new(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 500,
+        cursor: String::new(),
+    };
+    let once = |when: &str| {
+        let everyone = h.zero.1.positions(&read).unwrap().records;
+        for account in &accounts {
+            let n = everyone.iter().filter(|p| p.account_id == *account).count();
+            assert_eq!(n, 1, "{when}: {account} read {n} times");
+        }
+    };
+    let (source, target) = (h.one.1.database(1).clone(), h.one.1.database(0).clone());
+    blocking(|| target.copy_partition_from(&source, &partition, 0)).unwrap();
+    blocking(|| once("warming"));
+    // A move aborted at its switch, its digests made to differ.
+    let dir = std::env::temp_dir().join(unique("review-c5"));
+    std::fs::write(&dir, b"").unwrap();
+    let mover = meridian_bor::partition_moves::Mover::new(
+        vec![h.zero.1.database(0).clone(), h.zero.1.database(1).clone()],
+        h.zero.1.database(0).groups(),
+        meridian_bor::partition_moves::Settings {
+            switch: std::time::Duration::from_secs(10),
+            digest_file: Some(dir.clone()),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let ended = blocking(|| {
+        mover.begin(&partition);
+        mover.run(&partition, 0, &Asked::default())
+    })
+    .unwrap();
+    std::fs::remove_file(&dir).ok();
+    assert!(matches!(ended, Ended::Aborted(..)), "{ended:?}");
+    blocking(|| once("aborted"));
+    blocking(move || drop((h, mover)));
+}
+
+/// C8: a partition moved by hand back and forth is recorded each time, and
+/// the sweep never undoes the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c8_moves_by_hand_back_and_forth_are_each_recorded_and_kept() {
+    use meridian_bor::partition_moves::{journal, rebalance, Asked, Ended};
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    // A partition whose rendezvous owner is group 0.
+    let partition = partition_of(0, 0);
+    let by_hand = Asked {
+        by_hand: true,
+        moved_by: PERSON.into(),
+        reason: "placed by hand".into(),
+    };
+    for target in [1, 0, 1] {
+        let ended = blocking(|| {
+            mover.begin(&partition);
+            mover.run(&partition, target, &by_hand)
+        })
+        .unwrap();
+        assert!(
+            matches!(&ended, Ended::Moved(m) if m.to_group == target),
+            "{ended:?}"
+        );
+        blocking(|| journal(&zero, zero_store.as_ref(), &ended));
+    }
+    blocking(|| {
+        assert!(rebalance(&zero, zero_store.as_ref(), &mover).is_empty());
+        assert_eq!(
+            zero_store.tip(&partition).unwrap().unwrap().writer_group,
+            Some(1)
+        );
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        let records = control
+            .iter()
+            .filter(|e| {
+                e.idempotency_key
+                    .starts_with(&format!("control-record:partition-moved:{partition}:"))
+            })
+            .count();
+        assert_eq!(records, 3);
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
+/// No written head ever carries a move's pointer epoch
+/// (`meridian_changes::moves::POINTER_EPOCH`, negative): a fresh install of
+/// one writer group, and a database shaped as 3c left it (no writer group
+/// named, no group's own epoch) migrated forward and started at two groups,
+/// each commit normally, every head's epoch at least 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_no_written_head_carries_a_pointers_epoch() {
+    let lowest = |url: &str| -> i64 {
+        postgres::Client::connect(url, postgres::NoTls)
+            .unwrap()
+            .query_one("SELECT min(epoch) FROM book_partition_head", &[])
+            .unwrap()
+            .get(0)
+    };
+    // A fresh install, one group: its heads as made, before any writer
+    // adopts, then written.
+    let (url, migrated) = blocking(isolated);
+    blocking(|| migrated.make_partitions(8).unwrap());
+    assert!(blocking(|| lowest(&url)) >= 1);
+    let (bus, _) = wired_with(Arc::clone(&migrated));
+    let account = unique("ACC-FRESH");
+    open(&bus, &account, "INS-AAPL").await;
+    write_once(&bus, &account, 1).await.unwrap();
+    assert!(blocking(|| lowest(&url)) >= 1);
+    // 3c's shape, migrated forward and started at two groups.
+    let (url, migrated) = blocking(isolated);
+    blocking(|| {
+        migrated.make_partitions(8).unwrap();
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .batch_execute(
+                "UPDATE book_partition_head SET writer_group = NULL;
+                 DELETE FROM book_writer_group;",
+            )
+            .unwrap();
+        migrated.migrate(&meridian_clock::SystemClock).unwrap();
+    });
+    let (_broker, [(zero, _), (one, one_store)], _mover) = blocking(|| two_members(&url));
+    let accounts = accounts_in("ACC-3C", "P4", 1, &one, one_store.as_ref()).await;
+    write_once(&zero, &accounts[0], 1).await.unwrap();
+    write_once(&one, &accounts[0], 2).await.unwrap();
+    assert!(blocking(|| lowest(&url)) >= 1);
+    blocking(move || drop((bus, migrated, zero, one, one_store)));
+}
+
+/// C7: an account moved to a partition, back, and to it again, by three
+/// requests: three moves, each with its own close and open, and the
+/// account where the last put it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c7_an_account_moved_back_to_a_partition_it_left_moves() {
+    use meridian_bor::decide::Context;
+    use meridian_bor::moves::move_account_with;
+    use meridian_changes::moves::Settings;
+    use meridian_domain::v1::MoveAccountRequest;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], _mover) = blocking(|| two_members(&url));
+    let ones: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| meridian_changes::groups::owner(p, 2) == 1)
+        .collect();
+    let (a, b) = (ones[0].clone(), ones[1].clone());
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-C7-{n}")))
+        .find(|x| meridian_bor::store::placement_of(x, 8) == a)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    for (n, target) in [&b, &a, &b].into_iter().enumerate() {
+        let request = MoveAccountRequest {
+            account_id: account.clone(),
+            target_partition: target.clone(),
+            reason: format!("move {n}"),
+        };
+        let ctx = Context {
+            acting_for: PERSON.into(),
+            received_at_ns: 5_000 + n as i64,
+            message_id: unique("msg-c7"),
+            ..Default::default()
+        };
+        let moved = blocking(|| {
+            move_account_with(
+                &one,
+                one_store.as_ref(),
+                &ctx,
+                &request,
+                &Settings::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(&moved.to_partition, target, "move {n}: {moved:?}");
+    }
+    blocking(|| {
+        assert_eq!(
+            Store::partition_of(one_store.as_ref(), &account),
+            Some(b.clone())
+        );
+        let opens = Store::journal(one_store.as_ref(), &account)
+            .unwrap()
+            .iter()
+            .filter(|e| e.idempotency_key.starts_with("account-open:"))
+            .count();
+        assert_eq!(opens, 3);
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
+/// The Elle read (CI 43631481777): an account between its move's close and
+/// its open across databases is read whole through either member -- never
+/// empty where its new database holds nothing of it yet -- and the control
+/// group's sweep opens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_elle_an_account_between_its_close_and_its_open_reads_whole() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-ELLE-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (bus("elle-0", zero.clone()), bus("elle-1", one.clone()));
+    open(&bus_one, &account, &unique("INS-ELLE")).await;
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // Closed by group 1; its open, group 0's, never asked.
+    let handed = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    assert!(handed.is_err(), "the open is the new partition's group's");
+    let read = PositionsRead {
+        scope: Scope::Everything,
+        account_id: account.clone(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 500,
+        cursor: String::new(),
+    };
+    blocking(|| {
+        for (name, member) in [("zero", &zero), ("one", &one)] {
+            let held = member.positions(&read).unwrap().records;
+            assert!(
+                !held.is_empty(),
+                "{name} read the account as empty between its close and its open"
+            );
+            assert!(!member.journal(&account).unwrap().is_empty(), "{name}");
+        }
+    });
+    // The control group's sweep opens it, in group 0's database.
+    let opened = blocking(|| {
+        meridian_bor::moves::finish_opens(
+            &bus_zero,
+            zero.as_ref(),
+            &[zero.database(0).clone(), zero.database(1).clone()],
+            &meridian_changes::moves::Settings::default(),
+            meridian_clock::Clock::now_ns(&meridian_clock::SystemClock) + 1_000_000_000,
+        )
+    });
+    assert_eq!(opened, 1);
+    blocking(|| {
+        assert_eq!(
+            Store::partition_of(zero.as_ref(), &account),
+            Some(to.clone())
+        );
+        let opens = zero
+            .journal(&account)
+            .unwrap()
+            .iter()
+            .filter(|e| e.idempotency_key.starts_with("account-open:"))
+            .count();
+        assert_eq!(opens, 1);
+        for member in [&zero, &one] {
+            assert!(!member.positions(&read).unwrap().records.is_empty());
+        }
+        // Nothing more owed.
+        assert_eq!(
+            meridian_bor::moves::finish_opens(
+                &bus_zero,
+                zero.as_ref(),
+                &[zero.database(0).clone(), zero.database(1).clone()],
+                &meridian_changes::moves::Settings::default(),
+                meridian_clock::Clock::now_ns(&meridian_clock::SystemClock) + 1_000_000_000,
+            ),
+            0
+        );
+    });
+    drop((bus_zero, bus_one));
+}
+
+/// A2: a writer group still writing a partition in a database past its
+/// own (a raised database count) follows that database's timeline too: a
+/// new timeline there is reported moved and raises its epoch there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_a2_a_group_writing_away_follows_that_databases_timeline() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::timeline::Timeline;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(8).unwrap();
+                apart(&url);
+                url
+            })
+            .collect()
+    });
+    let partition = partition_of(1, 0);
+    // Group 1's partition written in database 0, its home database 1's
+    // head behind: the count of databases was raised since.
+    blocking(|| {
+        postgres::Client::connect(&urls[0], postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET sequence = 5, writer_group = 1 WHERE partition = $1",
+                &[&partition],
+            )
+            .unwrap();
+    });
+    let groups = Groups::new(1, 2).unwrap();
+    let one = blocking(|| {
+        let stores: Vec<Arc<PostgresStore>> = urls
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 4)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        meridian_bor::spread::Spread::new(stores, groups)
+    });
+    blocking(|| {
+        Store::adopt(&one).unwrap();
+        Store::follow_timeline(&one).unwrap();
+        assert_eq!(Store::follow_timeline(&one).unwrap(), Timeline::Same);
+        // Database 0 on a new timeline.
+        postgres::Client::connect(&urls[0], postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE book_partition_head SET database_identity = 'another/00000001'",
+                &[],
+            )
+            .unwrap();
+        let found = Store::follow_timeline(&one).unwrap();
+        assert!(matches!(found, Timeline::Moved(_)), "{found:?}");
+    });
+    blocking(move || drop(one));
+}

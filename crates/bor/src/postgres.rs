@@ -339,7 +339,7 @@ impl PostgresStore {
             let still = tx
                 .query_opt(
                     "SELECT partition, writer_group FROM book_partition_head
-                      WHERE partition = $1 FOR SHARE",
+                      WHERE partition = $1 AND epoch <> -1 FOR SHARE",
                     &[&anchor],
                 )
                 .map_err(unavailable)?
@@ -1820,6 +1820,14 @@ impl PostgresStore {
             }));
         }
         let mut epoch = held.get::<_, i64>(1) as u64;
+        // A pointer (its epoch `POINTER_EPOCH`): a move between databases let it go here and
+        // its target has not opened it yet, or opened it elsewhere -- never
+        // written under, never a fence (the review's C3). The write waits.
+        if epoch == meridian_changes::moves::POINTER {
+            return Err(Unbatched::Whole(StoreError::Held(format!(
+                "partition {partition} is moving between databases: ask again in a moment"
+            ))));
+        }
         // A head never written, made at the control partition's epoch for
         // a partition another group owns (make_partitions, a raised
         // `bor.partitions`): taken at its owner's epoch by its first batch,
@@ -3525,7 +3533,7 @@ fn raise(
              raised AS (
                 UPDATE book_partition_head
                    SET epoch = (SELECT epoch FROM next)
-                 WHERE partition = ANY($1)
+                 WHERE partition = ANY($1) AND epoch <> -1
                 RETURNING epoch)
              SELECT coalesce(max(epoch), (SELECT epoch FROM next))
                FROM raised",
@@ -3569,7 +3577,8 @@ fn anchor_of(
     }
     Ok(client
         .query(
-            "SELECT partition, writer_group FROM book_partition_head ORDER BY partition",
+            "SELECT partition, writer_group FROM book_partition_head WHERE epoch <> -1
+              ORDER BY partition",
             &[],
         )
         .map_err(unavailable)?
@@ -3605,6 +3614,10 @@ fn epochs_of(
         .map_err(unavailable)?
     {
         let epoch: i64 = row.get(2);
+        // A move's pointer is under no writer's epoch.
+        if epoch == meridian_changes::moves::POINTER_EPOCH {
+            continue;
+        }
         if owned_in_row(groups, &row) {
             mine.push(epoch as u64);
         } else {
@@ -3793,6 +3806,10 @@ pub enum Switched {
     },
     /// The switch did not finish within its bound: the source owns.
     TimedOut,
+    /// The source let go at `closing`, its head naming the target, and the
+    /// target's head is not opened yet: moved, its open owed to the control
+    /// group's sweep (the review's C3), under `epoch` as read before.
+    LetGo { closing: u64, epoch: u64 },
 }
 
 impl PostgresStore {
@@ -3816,12 +3833,15 @@ impl PostgresStore {
             .collect())
     }
 
-    /// `partition` copied from `from`'s database into this one past the
-    /// entry at `after` (step 3d; section 6.4, "a move between databases
-    /// copies the data"): every entry of it after `after`, by its key, and
-    /// each account it places, or that those entries are of, replaced whole
-    /// -- its projections as `from` holds them now. From 0, the snapshot;
-    /// after, the change log. Answers the last sequence copied.
+    /// `partition`'s entries copied from `from`'s database into this one
+    /// past the entry at `after` (step 3d; section 6.4, "a snapshot ... then
+    /// the change log"): in one snapshot of `from`, the partition's last
+    /// sequence read first and its entries up to it alone, so the copy is
+    /// whole up to the sequence it answers -- never a later entry ahead of
+    /// an earlier one missed (the review's C1). Its accounts are the
+    /// switch's to copy, under the partition's lock, so none is copied
+    /// before an entry of it (C5, C6). From 0, the snapshot; after, the
+    /// change log. Answers the last sequence copied.
     pub fn copy_partition_from(
         &self,
         from: &PostgresStore,
@@ -3830,30 +3850,24 @@ impl PostgresStore {
     ) -> Result<u64> {
         use std::io::{Read, Write};
         let mut source = from.conn()?;
-        let mut accounts: std::collections::BTreeSet<String> = source
-            .query(
-                "SELECT DISTINCT account_id FROM book_entry
-                  WHERE partition = $1 AND last_sequence > $2",
-                &[&partition, &(after as i64)],
-            )
-            .map_err(unavailable)?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
-        if after == 0 {
-            accounts.extend(from.accounts_in(partition)?);
-        }
-        let copied: i64 = source
+        let mut snapshot = source
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let copied: i64 = snapshot
             .query_one(
                 "SELECT coalesce(max(last_sequence), $2) FROM book_entry WHERE partition = $1",
                 &[&partition, &(after as i64)],
             )
             .map_err(unavailable)?
             .get(0);
-        // The partition's own entries first, those of accounts placed
-        // elsewhere since among them: its chain whole.
+        meridian_changes::moves::points::reached("book.copy.accounts", partition)
+            .and_then(|_| meridian_changes::moves::points::reached("book.copy.read", partition))
+            .map_err(StoreError::Unavailable)?;
         let mut rows = Vec::new();
-        source
+        snapshot
             .copy_out(&format!(
                 "COPY (SELECT * FROM book_entry WHERE partition = '{}' AND last_sequence > {after}
                         AND last_sequence <= {copied}) TO STDOUT (FORMAT binary)",
@@ -3862,38 +3876,33 @@ impl PostgresStore {
             .map_err(unavailable)?
             .read_to_end(&mut rows)
             .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        snapshot.commit().map_err(unavailable)?;
         drop(source);
-        {
-            let mut conn = self.conn()?;
-            let mut tx = conn.transaction().map_err(unavailable)?;
-            tx.batch_execute(
-                "CREATE TEMP TABLE IF NOT EXISTS moving_partition (LIKE book_entry) ON COMMIT DROP",
-            )
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(
+            "CREATE TEMP TABLE IF NOT EXISTS moving_partition (LIKE book_entry) ON COMMIT DROP",
+        )
+        .map_err(unavailable)?;
+        let mut writer = tx
+            .copy_in("COPY moving_partition FROM STDIN (FORMAT binary)")
             .map_err(unavailable)?;
-            let mut writer = tx
-                .copy_in("COPY moving_partition FROM STDIN (FORMAT binary)")
-                .map_err(unavailable)?;
-            writer
-                .write_all(&rows)
-                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
-            writer.finish().map_err(unavailable)?;
-            tx.execute(
-                "INSERT INTO book_entry SELECT * FROM moving_partition ON CONFLICT DO NOTHING",
-                &[],
-            )
-            .map_err(unavailable)?;
-            tx.commit().map_err(unavailable)?;
-        }
-        for account in &accounts {
-            self.replace_account_from(from, account)?;
-        }
+        writer
+            .write_all(&rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        writer.finish().map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO book_entry SELECT * FROM moving_partition ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
         Ok(copied as u64)
     }
 
     /// Everything `from`'s database holds of `account_id` copied into this
     /// one, its projections replaced by `from`'s, in one transaction: a
-    /// partition's move between databases, whose accounts keep changing
-    /// until the switch.
+    /// partition's move between databases, at its switch.
     fn replace_account_from(&self, from: &PostgresStore, account_id: &str) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -3909,16 +3918,85 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// `partition`'s chain as this database holds it, from the entry after
+    /// `after` (whose digest is `previous`) to `upto`, taken again entry by
+    /// entry (step 3d; section 6.8, step 4's digest at N; the review's C9):
+    /// each entry following the one before it with no sequence missed, and
+    /// matching its digest. Answers the digest at `upto`, or what broke.
+    pub fn chain_of(
+        &self,
+        partition: &str,
+        after: u64,
+        previous: &[u8],
+        upto: u64,
+    ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let mut conn = self.conn()?;
+        let mut at = after;
+        let mut digest = previous.to_vec();
+        while at < upto {
+            let rows = conn
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS} FROM book_entry
+                          WHERE partition = $1 AND first_sequence > $2 AND first_sequence <= $3
+                          ORDER BY first_sequence LIMIT 1000"
+                    ),
+                    &[&partition, &(at as i64), &(upto as i64)],
+                )
+                .map_err(unavailable)?;
+            if rows.is_empty() {
+                return Ok(Err(format!("the entries after sequence {at} are missing")));
+            }
+            for row in &rows {
+                let first = row.get::<_, i64>(3) as u64;
+                let last = row.get::<_, i64>(4) as u64;
+                if first != at + 1 {
+                    return Ok(Err(format!(
+                        "sequences {} to {} are missing",
+                        at + 1,
+                        first.saturating_sub(1)
+                    )));
+                }
+                let (canonical, stored_previous, stored) = stored_of(row);
+                if !stored.is_empty() {
+                    if !digest.is_empty() && stored_previous != digest {
+                        return Ok(Err(format!(
+                            "the entry at sequence {last} does not follow the one before it"
+                        )));
+                    }
+                    let taken = meridian_changes::integrity::chained(&stored_previous, &canonical);
+                    if taken != stored {
+                        return Ok(Err(format!(
+                            "the entry at sequence {last} does not match its digest"
+                        )));
+                    }
+                    digest = taken;
+                }
+                at = last;
+            }
+        }
+        Ok(Ok(digest))
+    }
+
     /// A move's switch of `partition`, held by this database, to writer
-    /// group `target` in `to`'s (step 3d; section 6.8, step 4): under the
-    /// partition's lock, so the source's batch in flight finishes first and
-    /// the next waits (the hold), the source's close at its head N; `to`
-    /// brought to N where it is another database; the digests at N
-    /// compared; then the target's head named its owner at its group's
-    /// epoch, and the source's head named it too, so a batch of the source
-    /// finds it there and hands its writes on, never fenced. Within
-    /// `bound` of its start, else nothing changes. `differ` makes the
-    /// digests differ (CI's MERIDIAN_MOVE_DIGEST_FILE).
+    /// group `target` in `to`'s (step 3d; section 6.8, step 4), its target
+    /// warmed up to `warmed`: under the partition's lock, so the source's
+    /// batch in flight finishes first and the next waits (the hold), the
+    /// source's close at its head N; `to` brought to N where it is another
+    /// database, its chain taken again to N and compared with the source's
+    /// digest there. Within one database, the head named the target's at
+    /// its group's epoch. Across two, never two owners (the review's C3):
+    /// the target's head first made a pointer to the target (epoch `POINTER_EPOCH`, under
+    /// which nothing commits), then the source lets go -- its head named the
+    /// target, a pointer too -- and is committed; only then is the target's
+    /// head opened at N under its group's epoch. A failure between leaves
+    /// the source's pointer, the durable intent the control group's sweep
+    /// finishes from ([`Switched::LetGo`]). A move to the same group's own
+    /// database (a database count raised) opens the target first and makes
+    /// the source a pointer after: one group, which writes where its head
+    /// is. Within `bound` of its start until the source lets go, else
+    /// nothing changes. `differ` makes the digests differ (CI's
+    /// MERIDIAN_MOVE_DIGEST_FILE).
     pub fn switch_partition(
         &self,
         to: &PostgresStore,
@@ -3926,6 +4004,7 @@ impl PostgresStore {
         target: u32,
         bound: std::time::Duration,
         differ: bool,
+        warmed: u64,
     ) -> Result<Switched> {
         let began = std::time::Instant::now();
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
@@ -3938,6 +4017,17 @@ impl PostgresStore {
                 Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
                     | Some(&postgres::error::SqlState::QUERY_CANCELED)
             )
+        };
+        // The target's chain to what was warmed, taken again before the
+        // hold: under it, only the rest.
+        let verified = if same {
+            None
+        } else {
+            let upto = warmed.min(to.tip(partition)?.map_or(0, |tip| tip.held));
+            match to.chain_of(partition, 0, &[], upto)? {
+                Ok(digest) => Some((upto, digest)),
+                Err(_) => None,
+            }
         };
         let bounded = left(began).as_millis().max(1).to_string();
         if let Err(failed) = tx.execute(
@@ -3961,96 +4051,226 @@ impl PostgresStore {
         )
         .map_err(unavailable)?;
         let closing = source.head;
-        // The target at N: the same rows where it is this database; else
-        // the change log copied up to N while the source is held.
-        let held = if same {
-            source.clone()
-        } else {
-            let copied = to.tip(partition)?.map_or(0, |tip| tip.held);
-            to.copy_partition_from(self, partition, copied)?;
-            to.tip(partition)?.unwrap_or_default()
-        };
-        if left(began).is_zero() {
-            return Ok(Switched::TimedOut);
-        }
-        let target_digest = if differ {
-            let mut changed = held.held_digest.clone();
-            changed.push(0xff);
-            changed
-        } else {
-            held.held_digest.clone()
-        };
-        if held.held != closing || target_digest != source.head_digest {
-            return Ok(Switched::DigestDiffers {
+        let from = source
+            .writer_group
+            .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()));
+        let differs = |target_digest: Vec<u8>| {
+            Ok(Switched::DigestDiffers {
                 closing,
-                source: source.head_digest,
+                source: source.head_digest.clone(),
                 target: target_digest,
                 at_ns: meridian_changes::now_ns(),
-            });
-        }
-        let group = target as i32;
-        let epoch = if same {
-            group_epoch(&mut tx, target)?
-        } else {
-            let mut theirs = to.conn()?;
-            let epoch = group_epoch(&mut *theirs, target)?;
-            // The target's head at the source's close, under its group's
-            // epoch, named its own -- before the source lets go, so no
-            // write finds neither owning.
-            theirs
-                .execute(
-                    "INSERT INTO book_partition_head (partition, sequence, epoch, origin,
-                                                      last_digest, writer_group)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (partition) DO UPDATE
-                        SET sequence = EXCLUDED.sequence, epoch = EXCLUDED.epoch,
-                            last_digest = EXCLUDED.last_digest,
-                            writer_group = EXCLUDED.writer_group",
-                    &[
-                        &partition,
-                        &(closing as i64),
-                        &(epoch as i64),
-                        &meridian_changes::origin(),
-                        &source.head_digest,
-                        &group,
-                    ],
-                )
-                .map_err(unavailable)?;
-            epoch
+            })
         };
+        if same {
+            let mut target_digest = source.held_digest.clone();
+            if differ {
+                target_digest.push(0xff);
+            }
+            if source.held != closing || target_digest != source.head_digest {
+                return differs(target_digest);
+            }
+            let epoch = group_epoch(&mut tx, target)?;
+            tx.execute(
+                "UPDATE book_partition_head SET writer_group = $2, epoch = $3 WHERE partition = $1",
+                &[&partition, &(target as i32), &(epoch as i64)],
+            )
+            .map_err(unavailable)?;
+            return match tx.commit() {
+                Ok(()) => {
+                    self.groups.assign(partition, Some(target));
+                    Ok(Switched::Moved { closing, epoch })
+                }
+                Err(failed) if timed_out(&failed) => Ok(Switched::TimedOut),
+                Err(failed) => Err(unavailable(failed)),
+            };
+        }
+        // The target at N: the change log copied up to N while the source
+        // is held, its chain taken again from where it was before the hold.
+        to.copy_partition_from(self, partition, warmed)?;
+        let (after, previous) = verified.unwrap_or((0, Vec::new()));
+        let mut target_digest = match to.chain_of(partition, after, &previous, closing)? {
+            Ok(digest) => digest,
+            Err(broken) => {
+                tracing::warn!(
+                    partition,
+                    broken,
+                    "a move's target holds the partition broken"
+                );
+                Vec::new()
+            }
+        };
+        if differ {
+            target_digest.push(0xff);
+        }
+        if target_digest != source.head_digest {
+            return differs(target_digest);
+        }
         if left(began).is_zero() {
             return Ok(Switched::TimedOut);
         }
-        let epoch_here = if same {
-            epoch as i64
-        } else {
-            source.epoch as i64
-        };
+        // Its accounts, their projections as the source holds them at N.
+        for account in self.accounts_in(partition)? {
+            to.replace_account_from(self, &account)?;
+        }
+        if left(began).is_zero() {
+            return Ok(Switched::TimedOut);
+        }
+        if from == target {
+            // The same group, home: the target opened first; the source a
+            // pointer after, so a write routed there goes home.
+            let epoch = to.open_at(partition, closing, target, &source.head_digest)?;
+            tx.execute(
+                "UPDATE book_partition_head SET epoch = -1 WHERE partition = $1",
+                &[&partition],
+            )
+            .map_err(unavailable)?;
+            if let Err(failed) = tx.commit() {
+                tracing::warn!(partition, %failed, "a partition moved home: its old head stays its group's, level with home");
+            }
+            return Ok(Switched::Moved { closing, epoch });
+        }
+        // Another group's: the target's head a pointer to it first, so a
+        // write that finds it there waits, never committed or fenced; then
+        // the source lets go.
+        let epoch = group_epoch(&mut *to.conn()?, target)?;
+        to.point_to(partition, target)?;
         tx.execute(
-            "UPDATE book_partition_head SET writer_group = $2, epoch = $3 WHERE partition = $1",
-            &[&partition, &group, &epoch_here],
+            "UPDATE book_partition_head SET writer_group = $2, epoch = -1 WHERE partition = $1",
+            &[&partition, &(target as i32)],
         )
         .map_err(unavailable)?;
-        if let Err(failed) = tx.commit() {
-            // The source still owns: the target's head named its owner
-            // again, so neither writes it twice.
-            if !same {
-                let from = self.groups.owner(partition) as i32;
-                to.conn()?
-                    .execute(
-                        "UPDATE book_partition_head SET writer_group = $2 WHERE partition = $1",
-                        &[&partition, &from],
-                    )
-                    .map_err(unavailable)?;
+        let committed = tx
+            .commit()
+            .map_err(|failed| (timed_out(&failed), unavailable(failed)))
+            .and_then(|_| {
+                meridian_changes::moves::points::reached("book.switch.committed", partition)
+                    .map_err(|lost| (false, StoreError::Unavailable(lost)))
+            });
+        if let Err((timed_out, failed)) = committed {
+            // Committed, its answer lost, or not: as the source's head says
+            // now (the review's A1), never undone on the target's side.
+            let let_go = self.tip(partition)?.is_some_and(|tip| {
+                tip.writer_group == Some(target) && tip.epoch == meridian_changes::moves::POINTER
+            });
+            if !let_go {
+                return if timed_out {
+                    Ok(Switched::TimedOut)
+                } else {
+                    Err(failed)
+                };
             }
-            return if timed_out(&failed) {
-                Ok(Switched::TimedOut)
-            } else {
-                Err(unavailable(failed))
-            };
         }
         self.groups.assign(partition, Some(target));
-        Ok(Switched::Moved { closing, epoch })
+        if let Err(failed) =
+            meridian_changes::moves::points::reached("book.switch.between", partition)
+        {
+            tracing::warn!(
+                partition,
+                failed,
+                "a partition let go: its target opens on the sweep"
+            );
+            return Ok(Switched::LetGo { closing, epoch });
+        }
+        match to.open_at(partition, closing, target, &source.head_digest) {
+            Ok(epoch) => Ok(Switched::Moved { closing, epoch }),
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a partition let go: its target opens on the sweep");
+                Ok(Switched::LetGo { closing, epoch })
+            }
+        }
+    }
+
+    /// Each account move's close this database holds with no open of it
+    /// here, committed before `before_ns` (step 3d): the opens the control
+    /// group's sweep owes, where no other database holds them either.
+    pub fn closes_without_opens(&self, before_ns: i64) -> Result<Vec<Entry>> {
+        self.conn()?
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry c
+                      WHERE c.idempotency_key LIKE 'account-move:%' AND c.committed_at_ns < $1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM book_entry o
+                             WHERE o.account_id = c.account_id
+                               AND o.idempotency_key = 'account-open:' || c.account_id || ':'
+                                                       || c.partition || ':' || c.first_sequence)"
+                ),
+                &[&before_ns],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(entry_of)
+            .collect()
+    }
+
+    /// Whether this database holds `account_id`'s entry kept by `key`.
+    pub fn holds_entry(&self, account_id: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM book_entry WHERE account_id = $1 AND idempotency_key = $2",
+                &[&account_id, &key],
+            )
+            .map_err(unavailable)?
+            .is_some())
+    }
+
+    /// When the entry of `partition` at `sequence` was committed, as this
+    /// database holds it; 0 where it holds none.
+    pub fn held_at(&self, partition: &str, sequence: u64) -> Result<i64> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT committed_at_ns FROM book_entry WHERE partition = $1 AND first_sequence <= $2
+                  ORDER BY first_sequence DESC LIMIT 1",
+                &[&partition, &(sequence as i64)],
+            )
+            .map_err(unavailable)?
+            .map_or(0, |row| row.get(0)))
+    }
+
+    /// `partition`'s head here a pointer to writer group `group` (its epoch `POINTER_EPOCH`):
+    /// nothing commits under it, and a write that finds it waits.
+    fn point_to(&self, partition: &str, group: u32) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch, origin, writer_group)
+                 VALUES ($1, 0, -1, $3, $2)
+                 ON CONFLICT (partition) DO UPDATE SET writer_group = EXCLUDED.writer_group, epoch = -1",
+                &[&partition, &(group as i32), &meridian_changes::origin()],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// `partition`'s head here opened at `closing`, its digest `digest`,
+    /// named writer group `group`'s at its epoch in this database: a move's
+    /// target, once its source let go. Answers the epoch.
+    pub fn open_at(&self, partition: &str, closing: u64, group: u32, digest: &[u8]) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let epoch = group_epoch(&mut tx, group)?;
+        tx.execute(
+            "INSERT INTO book_partition_head (partition, sequence, epoch, origin,
+                                              last_digest, writer_group)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (partition) DO UPDATE
+                SET sequence = EXCLUDED.sequence, epoch = EXCLUDED.epoch,
+                    last_digest = EXCLUDED.last_digest,
+                    writer_group = EXCLUDED.writer_group",
+            &[
+                &partition,
+                &(closing as i64),
+                &(epoch as i64),
+                &meridian_changes::origin(),
+                &digest,
+                &(group as i32),
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(epoch)
     }
 
     /// What this database projected of the accounts `partition` places let
@@ -4069,10 +4289,10 @@ impl PostgresStore {
 impl PostgresStore {
     /// `partition`'s `writer_group` read from this database's head row into
     /// the member's view (step 3d; ruled 2026-11-14); nothing where this
-    /// database holds no head of it.
-    pub fn read_owner(&self, partition: &str) -> Result<()> {
+    /// database holds no head of it. Says whether a head was read.
+    pub fn read_owner(&self, partition: &str) -> Result<bool> {
         if !self.groups.several() {
-            return Ok(());
+            return Ok(false);
         }
         // Where the book has several databases, the head furthest on names
         // it, as [`Self::read_owners_from`] reads every partition: a raised
@@ -4082,20 +4302,23 @@ impl PostgresStore {
             .get()
             .map(|stores| stores.iter().filter_map(std::sync::Weak::upgrade).collect())
             .unwrap_or_default();
-        let mut furthest: Option<(i64, Option<u32>)> = None;
+        // Furthest on, a written head before a move's pointer at the same
+        // sequence (the review's C3).
+        let mut furthest: Option<((i64, bool), Option<u32>)> = None;
         let mut read = |store: &PostgresStore| -> Result<()> {
             if let Some(row) = store
                 .conn()?
                 .query_opt(
-                    "SELECT writer_group, sequence FROM book_partition_head WHERE partition = $1",
+                    "SELECT writer_group, sequence, epoch <> -1 FROM book_partition_head
+                      WHERE partition = $1",
                     &[&partition],
                 )
                 .map_err(unavailable)?
             {
                 let named = row.get::<_, Option<i32>>(0).map(|group| group as u32);
-                let sequence: i64 = row.get(1);
-                if furthest.is_none_or(|(held, _)| held < sequence) {
-                    furthest = Some((sequence, named));
+                let at = (row.get::<_, i64>(1), row.get::<_, bool>(2));
+                if furthest.is_none_or(|(held, _)| held < at) {
+                    furthest = Some((at, named));
                 }
             }
             Ok(())
@@ -4107,10 +4330,11 @@ impl PostgresStore {
         } else {
             read(self)?;
         }
+        let read = furthest.is_some();
         if let Some((_, named)) = furthest {
             self.groups.assign(partition, named);
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Every partition's `writer_group` this database names, read into the
@@ -4150,24 +4374,26 @@ impl PostgresStore {
         if !stores.first().is_some_and(|store| store.groups.several()) {
             return Ok(0);
         }
-        let mut furthest: std::collections::BTreeMap<String, (i64, u32)> =
+        // Furthest on, a written head before a move's pointer at the same
+        // sequence: never two groups at once (the review's C3).
+        let mut furthest: std::collections::BTreeMap<String, ((i64, bool), u32)> =
             std::collections::BTreeMap::new();
         for store in stores {
             for row in store
                 .conn()?
                 .query(
-                    "SELECT partition, writer_group, sequence FROM book_partition_head
+                    "SELECT partition, writer_group, sequence, epoch <> -1 FROM book_partition_head
                       WHERE writer_group IS NOT NULL",
                     &[],
                 )
                 .map_err(unavailable)?
             {
-                let (partition, group, sequence): (String, i32, i64) =
-                    (row.get(0), row.get(1), row.get(2));
+                let (partition, group, at): (String, i32, (i64, bool)) =
+                    (row.get(0), row.get(1), (row.get(2), row.get(3)));
                 match furthest.get(&partition) {
-                    Some((held, _)) if *held >= sequence => {}
+                    Some((held, _)) if *held >= at => {}
                     _ => {
-                        furthest.insert(partition, (sequence, group as u32));
+                        furthest.insert(partition, (at, group as u32));
                     }
                 }
             }
@@ -4555,9 +4781,26 @@ impl PostgresStore {
                 .iter()
                 .filter(|other| !std::ptr::eq(other.as_ref(), self))
             {
-                let tip = other.tip(partition).map_err(Unbatched::Whole)?;
-                if tip.is_some_and(|tip| tip.head > here && names_mine(&tip)) {
+                // A pointer (its epoch `POINTER_EPOCH`) is a move's, never where it is written.
+                let Some(tip) = other
+                    .tip(partition)
+                    .map_err(Unbatched::Whole)?
+                    .filter(|tip| tip.epoch != meridian_changes::moves::POINTER)
+                else {
+                    continue;
+                };
+                if tip.head > here && names_mine(&tip) {
                     return Ok(true);
+                }
+                // Another group's head as far on or further, written: never
+                // both (the review's C3) -- the write goes to it.
+                if tip.head >= here && tip.head > 0 && !names_mine(&tip) {
+                    if let Some(group) = tip.writer_group.filter(|g| *g < self.groups.count()) {
+                        return Err(Unbatched::Whole(StoreError::NotOwned {
+                            partition: partition.to_string(),
+                            group,
+                        }));
+                    }
                 }
             }
             self.home_settled
@@ -4569,7 +4812,7 @@ impl PostgresStore {
         let home_head = home
             .tip(partition)
             .map_err(Unbatched::Whole)?
-            .filter(names_mine)
+            .filter(|tip| tip.epoch != meridian_changes::moves::POINTER && names_mine(tip))
             .map(|tip| tip.head);
         Ok(home_head.is_some_and(|head| head >= here))
     }
@@ -4597,6 +4840,10 @@ impl PostgresStore {
             let Ok(moved) = meridian_domain::v1::PartitionMoved::decode(&body[..]) else {
                 continue;
             };
+            // A move to its own group's database places it nowhere new.
+            if moved.from_group == moved.to_group {
+                continue;
+            }
             if moved.by_hand {
                 out.insert(moved.partition, moved.to_group);
             } else {

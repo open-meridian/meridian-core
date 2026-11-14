@@ -77,9 +77,19 @@ pub struct Mover {
     one: Mutex<()>,
     /// The deployment's clock, its records' times.
     clock: Arc<dyn meridian_clock::Clock>,
+    /// Whether each move's record is logged as it ends, before its dataset
+    /// is free to move again (the review's C8).
+    logs: bool,
 }
 
 impl Mover {
+    /// Each move's record logged in the lake's control as it ends, before
+    /// its dataset is free to move again (the review's C8).
+    pub fn logging(mut self) -> Self {
+        self.logs = true;
+        self
+    }
+
     pub fn new(
         stores: Vec<Arc<PostgresStore>>,
         groups: Groups,
@@ -94,6 +104,7 @@ impl Mover {
             under_way: Mutex::default(),
             one: Mutex::new(()),
             clock,
+            logs: false,
         }
     }
 
@@ -118,11 +129,18 @@ impl Mover {
                 .filter(|group| *group < self.groups.count())
                 .unwrap_or_else(|| meridian_changes::groups::owner(dataset, self.groups.count()));
             // Further on than at its owner's home: once moved home, the
-            // home holds it level, and it is not moved again.
+            // home holds it level, and it is not moved again. Or level with
+            // a home that is a move's pointer to it: its open owed (the
+            // review's C3).
             let home = self.database_of(owner);
+            let at_home = home.range_tip(partition)?;
+            let pointed = at_home
+                .as_ref()
+                .is_some_and(|at| at.epoch == meridian_changes::moves::POINTER);
             if !Arc::ptr_eq(store, home)
                 && !tip.closed
-                && home.range_tip(partition)?.map_or(0, |at| at.head) < tip.head
+                && (at_home.as_ref().map_or(0, |at| at.head) < tip.head
+                    || (pointed && at_home.as_ref().is_some_and(|at| at.head <= tip.head)))
             {
                 return Ok(Some((owner, d)));
             }
@@ -247,6 +265,9 @@ impl Mover {
     ) -> Result<Ended> {
         let _alone = self.one.lock().expect("moves poisoned");
         let ended = self.run_alone(partition, target, asked, away);
+        if let (true, Ok(done)) = (self.logs, &ended) {
+            self.log(done);
+        }
         self.under_way
             .lock()
             .expect("moves poisoned")
@@ -301,11 +322,13 @@ impl Mover {
                 Some(lag) => lag,
                 None if !across => Duration::ZERO,
                 None => {
+                    // Against the copy's own watermark, never the most the
+                    // target holds (the review's C2).
                     let (s, t) = (
                         source.range_tip(partition)?.unwrap_or_default(),
                         to.range_tip_held(partition)?,
                     );
-                    if t.0 >= s.held {
+                    if copied >= s.held {
                         Duration::ZERO
                     } else {
                         Duration::from_nanos((s.held_at_ns - t.1).max(1) as u64)
@@ -336,9 +359,10 @@ impl Mover {
             target,
             self.settings.switch,
             self.settings.digest_differs(),
+            copied,
         )?;
         match switched {
-            Switched::Moved { closing, epoch } => {
+            Switched::Moved { closing, epoch } | Switched::LetGo { closing, epoch } => {
                 tracing::info!(
                     partition,
                     from,
@@ -396,15 +420,6 @@ impl Mover {
     pub fn rebalance(&self) -> Vec<Ended> {
         let mut ended = Vec::new();
         let mut seen = BTreeSet::new();
-        // Where a deployment admin moved a range by hand, it stays (section
-        // 6.8): only a count lowered past its group moves it again.
-        let by_hand = match self.stores[0].moved_by_hand() {
-            Ok(by_hand) => by_hand,
-            Err(failed) => {
-                tracing::warn!(%failed, "the moves by hand were not read: no range moved by the count");
-                return ended;
-            }
-        };
         for store in &self.stores {
             let ranges = match store.ranges() {
                 Ok(ranges) => ranges,
@@ -414,67 +429,88 @@ impl Mover {
                 }
             };
             for (partition, closed, _) in ranges {
-                if closed || !seen.insert(partition.clone()) {
+                if closed || !seen.insert(partition.clone()) || !self.begin(&partition) {
                     continue;
                 }
-                let wanted = meridian_changes::groups::owner(
-                    crate::range::dataset_of(&partition),
-                    self.groups.count(),
-                );
-                let now = match self.owner_now(&partition) {
-                    Ok(Some((now, _))) => now,
-                    // Its owner's database holds none of it: a database
-                    // count raised, so it is moved there, its group kept.
-                    Ok(None) => {
-                        let away = match self.misplaced(&partition) {
-                            Ok(Some(away)) => away,
-                            Ok(None) => continue,
-                            Err(failed) => {
-                                tracing::warn!(partition, %failed, "a range's databases were not read");
-                                continue;
-                            }
-                        };
-                        if !self.begin(&partition) {
-                            continue;
-                        }
-                        match self.run_from(&partition, away.0, &Asked::default(), Some(away)) {
-                            Ok(done) => {
-                                self.log(&done);
-                                ended.push(done);
-                            }
-                            Err(failed) => tracing::warn!(
-                                partition,
-                                %failed,
-                                "a range's move to its owner's database stopped: it stays where it is"
-                            ),
-                        }
-                        continue;
-                    }
-                    Err(failed) => {
-                        tracing::warn!(partition, %failed, "a range's owner was not read");
-                        continue;
-                    }
-                };
-                let placed = by_hand
-                    .get(&partition)
-                    .is_some_and(|group| *group == now && *group < self.groups.count());
-                if now == wanted || placed || !self.begin(&partition) {
-                    continue;
+                // Decided and run under the one-at-a-time lock, the moves by
+                // hand read then, so a move by hand that ended a moment ago
+                // is never undone (the review's C8).
+                let alone = self.one.lock().expect("moves poisoned");
+                let done = self.rebalance_one(&partition);
+                if let Some(Ok(done)) = &done {
+                    self.log(done);
                 }
-                match self.run(&partition, wanted, &Asked::default()) {
-                    Ok(done) => {
-                        self.log(&done);
-                        ended.push(done);
-                    }
-                    Err(failed) => tracing::warn!(
+                drop(alone);
+                self.under_way
+                    .lock()
+                    .expect("moves poisoned")
+                    .remove(crate::range::dataset_of(&partition));
+                match done {
+                    Some(Ok(done)) => ended.push(done),
+                    Some(Err(failed)) => tracing::warn!(
                         partition,
                         %failed,
                         "a range's move by the changed count stopped: the source still owns it"
                     ),
+                    None => {}
                 }
             }
         }
         ended
+    }
+
+    /// `partition` moved where the count now places it, or opened in its
+    /// owner's home: its move's ending, or none where it stays.
+    fn rebalance_one(&self, partition: &str) -> Option<Result<Ended>> {
+        // Where a deployment admin moved a range by hand, it stays (section
+        // 6.8), and so do the ranges split from it since (C8): only a count
+        // lowered past its group moves it again.
+        let by_hand = match self.stores[0].moved_by_hand() {
+            Ok(by_hand) => by_hand,
+            Err(failed) => {
+                tracing::warn!(%failed, "the moves by hand were not read: no range moved by the count");
+                return None;
+            }
+        };
+        let away = match self.misplaced(partition) {
+            Ok(away) => away,
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a range's databases were not read");
+                return None;
+            }
+        };
+        // Its owner's database holds it behind another, or a move's open is
+        // owed there: moved there, its group kept.
+        if let Some(away) = away {
+            return Some(self.run_alone(partition, away.0, &Asked::default(), Some(away)));
+        }
+        let now = match self.owner_now(partition) {
+            Ok(Some((now, _))) => now,
+            Ok(None) => return None,
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a range's owner was not read");
+                return None;
+            }
+        };
+        let wanted = meridian_changes::groups::owner(
+            crate::range::dataset_of(partition),
+            self.groups.count(),
+        );
+        // Its lineage as the database it was split in holds it: the longest.
+        let lineage = self
+            .stores
+            .iter()
+            .filter_map(|store| store.lineage_of(partition).ok())
+            .max_by_key(Vec::len)
+            .unwrap_or_else(|| vec![partition.to_string()]);
+        let placed = lineage
+            .iter()
+            .find_map(|range| by_hand.get(range))
+            .is_some_and(|group| *group == now && *group < self.groups.count());
+        if now == wanted || placed {
+            return None;
+        }
+        Some(self.run_alone(partition, wanted, &Asked::default(), None))
     }
 
     /// How a move ended logged in the lake's `control` (database 0's), its
@@ -554,6 +590,7 @@ pub fn serve(bus: &Arc<meridian_bus::Bus>, mover: &Arc<Mover>) {
         let mover = mover.clone();
         std::thread::spawn(move || {
             match mover.run(&request.partition, request.target_group, &asked) {
+                Ok(_) if mover.logs => {}
                 Ok(ended) => mover.log(&ended),
                 Err(failed) => tracing::warn!(
                     partition = request.partition,

@@ -262,18 +262,19 @@ fn open_ranges_taken(
     dataset: &str,
 ) -> Result<(
     Vec<crate::range::Open>,
-    BTreeMap<String, (Option<u32>, bool, u64)>,
+    BTreeMap<String, (Option<u32>, bool, u64, bool)>,
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head
+            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head,
+                    p.epoch = $2
                FROM lake_partition p
                LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
                                    WHERE q.dataset = p.dataset
                                      FOR UPDATE SKIP LOCKED) AS l ON true
               WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
                 AND p.closed_at IS NULL",
-            &[&dataset],
+            &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
         )
         .map_err(unavailable)?;
     let mut open = Vec::new();
@@ -289,6 +290,7 @@ fn open_ranges_taken(
                 row.get::<_, Option<i32>>(3).map(|group| group as u32),
                 row.get::<_, bool>(4),
                 row.get::<_, i64>(5).max(0) as u64,
+                row.get::<_, bool>(6),
             ),
         );
         open.push(crate::range::Open {
@@ -665,6 +667,12 @@ impl PostgresStore {
                 &[&dataset],
             )
             .map_err(unavailable)?;
+        // A move's pointer: never written under, never a fence (C3).
+        if row.get::<_, i64>(1) == meridian_changes::moves::POINTER_EPOCH {
+            return Err(StoreError::Held(format!(
+                "range {dataset} is moving between databases: ask again in a moment"
+            )));
+        }
         self.fence.admits(row.get::<_, i64>(1) as u64)?;
         if row.get::<_, Option<i64>>(2).is_some() {
             // Never reached while the dataset's lock is held: its rows are
@@ -1859,7 +1867,7 @@ impl PostgresStore {
     fn refuse_not_ours(
         &self,
         dataset: &str,
-        states: &BTreeMap<String, (Option<u32>, bool, u64)>,
+        states: &BTreeMap<String, (Option<u32>, bool, u64, bool)>,
         by_range: &mut BTreeMap<String, Vec<(usize, Vec<Observation>)>>,
         answered: &mut [Result<Recorded>],
     ) {
@@ -1867,18 +1875,27 @@ impl PostgresStore {
         let mut refused: BTreeMap<usize, StoreError> = BTreeMap::new();
         for (partition, parts) in by_range.iter() {
             let failed = match states.get(partition) {
-                Some((_, false, _)) => Some(StoreError::Held(format!(
+                Some((_, false, _, _)) => Some(StoreError::Held(format!(
                     "range {partition} is switching to another writer group: ask again in a moment"
                 ))),
-                Some((named, true, here)) => {
+                Some((named, true, here, pointer)) => {
                     self.groups.assign(partition, *named);
                     let group = self.groups.owner_by(partition, dataset);
-                    (group != mine || self.headed_elsewhere(partition, *here)).then(|| {
-                        StoreError::NotOwned {
+                    if group != mine || self.headed_elsewhere(partition, *here) {
+                        Some(StoreError::NotOwned {
                             partition: partition.clone(),
                             group,
-                        }
-                    })
+                        })
+                    } else if *pointer {
+                        // A move's pointer to this group: let go here, its
+                        // open owed where it goes -- never written under
+                        // (the review's C3). The part waits.
+                        Some(StoreError::Held(format!(
+                            "range {partition} is moving between databases: ask again in a moment"
+                        )))
+                    } else {
+                        None
+                    }
                 }
                 // A range not begun yet: its dataset's first write.
                 None => {
@@ -2779,6 +2796,12 @@ impl Store for PostgresStore {
             }
         }
         let epoch: i64 = held.get(1);
+        // A move's pointer: moving between databases, split where it goes.
+        if epoch == meridian_changes::moves::POINTER_EPOCH {
+            return Err(StoreError::Held(format!(
+                "range {partition} is moving between databases: ask again in a moment"
+            )));
+        }
         self.fence.admits(epoch as u64)?;
         let closing: i64 = held.get(0);
         let origin: String = held.get(2);
@@ -4453,6 +4476,18 @@ impl Store for PostgresStore {
                 .map_err(unavailable)?;
         }
         let epoch = raise(&mut tx, by, Some(self.groups)).map_err(unavailable)?;
+        // A group past the first leading its database writes that
+        // database's control partition under its own epoch: raised with
+        // its takeover, so its deposed leader is fenced there at once, not
+        // only after the next look at the timeline (the review's M1).
+        if self.leads_database && !self.groups.holds_control() {
+            tx.execute(
+                "UPDATE lake_change_head SET epoch = $1
+                  WHERE partition = 'control' AND epoch < $1",
+                &[&(epoch as i64)],
+            )
+            .map_err(unavailable)?;
+        }
         tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
@@ -4697,9 +4732,10 @@ fn raise(
             &[&epoch],
         )?;
     }
+    // A move's pointer is under no writer's epoch.
     tx.execute(
-        "UPDATE lake_partition SET epoch = $1 WHERE dataset = ANY($2)",
-        &[&epoch, &datasets],
+        "UPDATE lake_partition SET epoch = $1 WHERE dataset = ANY($2) AND epoch <> $3",
+        &[&epoch, &datasets, &meridian_changes::moves::POINTER_EPOCH],
     )?;
     match groups {
         // Every group's own epoch with the rest: each writer past the first
@@ -4802,6 +4838,10 @@ fn epochs_of(
         .map_err(unavailable)?
     {
         let epoch: i64 = row.get(2);
+        // A move's pointer is under no writer's epoch.
+        if epoch == meridian_changes::moves::POINTER_EPOCH {
+            continue;
+        }
         if owned_in_row(groups, &row) {
             mine.push(epoch as u64);
         } else {
@@ -5086,6 +5126,7 @@ impl PostgresStore {
                 .flatten()
                 .is_some_and(|tip| {
                     !tip.closed
+                        && tip.epoch != meridian_changes::moves::POINTER
                         && tip
                             .writer_group
                             .filter(|named| *named < count)
@@ -5111,8 +5152,9 @@ impl PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT dataset, head, writer_group FROM lake_partition WHERE closed_at IS NULL",
-                &[],
+                "SELECT dataset, head, writer_group FROM lake_partition
+                  WHERE closed_at IS NULL AND epoch <> $1",
+                &[&meridian_changes::moves::POINTER_EPOCH],
             )
             .map_err(unavailable)?
             .iter()

@@ -2247,7 +2247,13 @@ impl Lake {
             return Ok(Some(mine));
         }
         let config = self.config();
-        for (group, parts) in theirs {
+        // A part a group did not take whole -- its view of the ranges
+        // differs from this member's: a range moved between -- is routed
+        // again by the owners read again, within the hold, never refused
+        // inside it (CI 43636763392; section 6.8, the hold).
+        let until = std::time::Instant::now() + meridian_changes::moves::hold();
+        let mut queue: Vec<(u32, Parts)> = theirs.into_iter().collect();
+        while let Some((group, parts)) = queue.pop() {
             let topic = envelope
                 .meta
                 .as_ref()
@@ -2261,6 +2267,32 @@ impl Lake {
             // differs from this member's may have left some (step 3d).
             let handed_rows: usize = parts.iter().map(|(_, rows)| rows.len()).sum();
             let taken = (reply.recorded + reply.restated + reply.unchanged) as usize;
+            if taken < handed_rows && std::time::Instant::now() < until {
+                if let Err(failed) = self.read_owners_again() {
+                    tracing::debug!(%failed, "the ranges' owners were not read again");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut again: BTreeMap<u32, Parts> = BTreeMap::new();
+                for (dataset, rows) in parts {
+                    let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+                    let mut split: BTreeMap<u32, Vec<Observation>> = BTreeMap::new();
+                    for (row, owner) in rows.into_iter().zip(owners) {
+                        split.entry(owner).or_default().push(row);
+                    }
+                    for (owner, rows) in split {
+                        if owner == self.groups.mine() {
+                            mine.entry(dataset.clone()).or_default().extend(rows);
+                        } else {
+                            again
+                                .entry(owner)
+                                .or_default()
+                                .push((dataset.clone(), rows));
+                        }
+                    }
+                }
+                queue.extend(again);
+                continue;
+            }
             if taken < handed_rows {
                 return Err(meridian_bus::refusal_with_status(
                     RefusalStatus::Unavailable,
@@ -8152,3 +8184,6 @@ impl Lake {
         Date::of_utc_instant(self.clock.now_ns())
     }
 }
+
+/// A write's parts for one writer group: each dataset's rows.
+type Parts = Vec<(String, Vec<Observation>)>;

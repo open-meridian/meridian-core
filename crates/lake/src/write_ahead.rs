@@ -98,6 +98,10 @@ pub struct Wait {
     pub at: usize,
     pub sequence: u64,
     pub groups: Vec<u32>,
+    /// The write's dataset: its ranges' owners as they are while the answer
+    /// waits are waited on too, never only those its taker saw (the
+    /// review's C4). None named, only `groups`.
+    pub dataset: String,
 }
 
 /// The groups besides this one owning an open range of `dataset`, as this
@@ -326,6 +330,7 @@ impl Writer {
                         at: sent_to.len(),
                         sequence: write.sequence,
                         groups: others,
+                        dataset: write.dataset.clone(),
                     });
                 }
             }
@@ -433,9 +438,24 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
         let Ok((_, payload)) = answer else {
             continue;
         };
+        let mut groups = wait.groups.clone();
+        let mut looked = tokio::time::Instant::now();
         let reached = loop {
+            // The dataset's ranges' owners now, read again now and then: a
+            // range moved to another group since the write was taken is
+            // waited on there too (the review's C4).
+            if !wait.dataset.is_empty() && looked.elapsed() >= Duration::from_millis(100) {
+                looked = tokio::time::Instant::now();
+                if tokio::task::block_in_place(|| lake.read_owners_again()).is_ok() {
+                    for group in other_groups(lake.groups(), &wait.dataset) {
+                        if !groups.contains(&group) {
+                            groups.push(group);
+                        }
+                    }
+                }
+            }
             let all = tokio::task::block_in_place(|| {
-                wait.groups.iter().all(|group| {
+                groups.iter().all(|group| {
                     lake.group_position(&group_key(stream, *group), *group)
                         .ok()
                         .flatten()
@@ -460,7 +480,7 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                 format!(
                     "writer group(s) {:?} had not committed their part of this write within the \
                      hold: its rows are kept and committed in turn; ask again",
-                    wait.groups
+                    groups
                 ),
             ))
         };
