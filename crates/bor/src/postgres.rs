@@ -291,6 +291,25 @@ impl PostgresStore {
     /// takeover raises it, adopted, and the takeover recorded with that
     /// cause. Nothing where it writes under no epoch.
     fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        self.follow_from(conn, None)
+    }
+
+    /// [`Self::follow_on`] from the partition a look read as this group's
+    /// just before (tests: read before a move's switch committed).
+    #[doc(hidden)]
+    pub fn follow_timeline_from(
+        &self,
+        anchor: &str,
+    ) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_from(&mut conn, Some(anchor))
+    }
+
+    fn follow_from(
+        &self,
+        conn: &mut Connection,
+        seen: Option<&str>,
+    ) -> Result<meridian_changes::timeline::Timeline> {
         use meridian_changes::timeline::Timeline;
         let _alone = self.watch.alone();
         let mine = self.fence.epoch();
@@ -304,10 +323,31 @@ impl PostgresStore {
             at_ns: meridian_changes::now_ns(),
         };
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let anchor = anchor_of(&mut tx, self.groups)?;
+        let anchor = match seen {
+            Some(seen) => Some(seen.to_string()),
+            None => anchor_of(&mut tx, self.groups)?,
+        };
         let Some(anchor) = anchor else {
             return Ok(Timeline::Same);
         };
+        // A group past the first anchors on a partition it writes: held
+        // here against a move's switch while it is followed, and read again
+        // under that hold (step 3d; CI 43621875619). A partition moved away
+        // after it was read carries its new group's epoch, which is never
+        // this member's deposer: looked at again at the next look.
+        if !self.groups.holds_control() {
+            let still = tx
+                .query_opt(
+                    "SELECT partition, writer_group FROM book_partition_head
+                      WHERE partition = $1 FOR SHARE",
+                    &[&anchor],
+                )
+                .map_err(unavailable)?
+                .is_some_and(|row| owned_in_row(self.groups, &row));
+            if !still {
+                return Ok(Timeline::Same);
+            }
+        }
         let groups = self.groups;
         let (found, identity) = meridian_changes::timeline::follow(
             &mut tx,

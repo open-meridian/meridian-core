@@ -4695,6 +4695,63 @@ async fn a_partition_moved_away_and_back_is_written_by_the_same_member_unfenced(
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// A partition moved away from a group past the first while that group's
+/// member looks at its database's timeline: the look, its anchor read as the
+/// group's before the switch committed, finds the partition another group's
+/// under its hold and never steps the member down on that group's epoch
+/// (step 3d; CI 43621875619: group 1's member stepped down, "the store's
+/// epoch is 1, another writer's", right after P0 was moved to group 0 by
+/// hand, and the account's move handed to it went unanswered).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_moved_away_while_its_group_looks_at_the_timeline_steps_no_member_down() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::groups::owner;
+    use meridian_changes::timeline::Timeline;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    assert_eq!(owner("P4", 2), 1, "P4 is group 1's");
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-PLOOK-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    blocking(|| {
+        let held = Store::epoch(one_store.as_ref());
+        assert!(held > 0);
+        let looked = one_store.follow_timeline_from("P4").unwrap();
+        assert!(
+            matches!(looked, Timeline::Same | Timeline::First),
+            "{looked:?}"
+        );
+        // P4 moved to group 0 between a look's read of its anchor and its
+        // follow.
+        assert!(mover.begin("P4"));
+        let ended = mover
+            .run(
+                "P4",
+                0,
+                &Asked {
+                    by_hand: true,
+                    moved_by: PERSON.into(),
+                    reason: "moved while looked at".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+        let tip = zero_store.tip("P4").unwrap().unwrap();
+        assert_eq!(tip.writer_group, Some(0));
+        assert_ne!(tip.epoch, held, "P4 carries group 0's epoch now");
+        let looked = one_store.follow_timeline_from("P4").unwrap();
+        assert!(
+            !matches!(looked, Timeline::NotMine(_)),
+            "group 1's member is not deposed by group 0's epoch: {looked:?}"
+        );
+        assert_eq!(Store::epoch(one_store.as_ref()), held);
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
 /// A deployment installed at two writer groups starts each partition with
 /// its rendezvous owner, pinned at the control partition's group's start:
 /// no partition moves and no PartitionMoved is recorded, as no owner
