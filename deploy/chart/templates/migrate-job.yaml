@@ -241,6 +241,75 @@ spec:
             {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaMount" $) }}{{ . | nindent 12 }}{{- end }}
           {{- end }}
+        {{- /* Each database past the first a store's writer groups write to
+               (step 3d; the resilience spec's section 6.4): migrated in a
+               container of its own, `<store>-database-<d>` (approved
+               2026-11-14); one this chart brings made first, with its roles
+               and each component's login, by its superuser. */}}
+        {{- range $component := list "bor" "lake" }}
+        {{- $values := index $.Values $component }}
+        {{- $context := dict "top" $ "component" $component "values" $values }}
+        {{- $count := int (include "meridian-runtime.storeDatabases" $context) }}
+        {{- $brings := include "meridian-runtime.storeBringsDatabases" $context }}
+        {{- range $d := untilStep 1 $count 1 }}
+        {{- $secret := printf "%s-%s-database-%d" (include "meridian-runtime.fullname" $) $component $d }}
+        {{- $migrating := "migrate-url" }}
+        {{- $serving := "url" }}
+        {{- if not $brings }}
+        {{- $secret = index $values.database.groupSecrets (sub $d 1) }}
+        {{- $serving = $values.database.key | default $.Values.database.key }}
+        {{- $migrating = include "meridian-runtime.migrateKey" $ }}
+        {{- end }}
+        - name: {{ $component }}-database-{{ $d }}
+          image: "{{ $.Values.image.repository }}:{{ $values.image.tag | default $.Values.image.tag }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: ["meridian-{{ $component }}", "migrate"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            {{- if eq $component "bor" }}
+            - name: MERIDIAN_BOR_PARTITIONS
+              value: {{ include "meridian-runtime.borPartitions" $ | quote }}
+            {{- end }}
+            - name: MERIDIAN_{{ upper $component }}_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret | quote }}
+                  key: {{ $migrating | quote }}
+            - name: MERIDIAN_SERVING_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret | quote }}
+                  key: {{ $serving | quote }}
+            - name: RUST_LOG
+              value: {{ $.Values.logLevel | quote }}
+            {{- if $brings }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" $secret $.Release.Namespace | quote }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER
+              value: postgres
+            {{- range $said := list "superuser" "serving" "migrating" }}
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_{{ upper $said }}_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-passwords" $secret | quote }}
+                  key: {{ $said }}
+            {{- end }}
+            {{- end }}
+            {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          {{- if or $.Values.tls.internal.enabled $.Values.database.caSecret }}
+          volumeMounts:
+            {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
+            {{- with (include "meridian-runtime.databaseCaMount" $) }}{{ . | nindent 12 }}{{- end }}
+          {{- end }}
+        {{- end }}
+        {{- end }}
         {{- if .Values.dashboard.enabled }}
         {{/*
           The dashboard's own tables: terminal sessions, kept so a restart

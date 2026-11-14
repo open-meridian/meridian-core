@@ -1920,6 +1920,22 @@ pub fn withdraw_allocation(
     booking_id: &str,
     allocation_id: &str,
 ) -> Result<Option<Made>> {
+    withdraw_allocation_because(book, head, ctx, booking_id, allocation_id, false)
+}
+
+/// [`withdraw_allocation`], saying why: its correction took it away, or
+/// (`lost`) its booking is not in its account at all -- a restore across
+/// databases took each to its time, and the booking's own database was
+/// taken to before it (step 3d; the resilience spec's section 6.4, ruled
+/// 2026-11-12). The child is reversed by an entry of its own naming that.
+pub fn withdraw_allocation_because(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    booking_id: &str,
+    allocation_id: &str,
+    lost: bool,
+) -> Result<Option<Made>> {
     let key = (booking_id.to_string(), allocation_id.to_string());
     let Some(received) = book.ledger.received.get(&key) else {
         return Ok(None);
@@ -1936,9 +1952,14 @@ pub fn withdraw_allocation(
             allocation_id: allocation_id.to_string(),
         }],
     )
-    .reason(&format!(
-        "allocation {allocation_id} of booking {booking_id} withdrawn by its correction"
-    ));
+    .reason(&if lost {
+        format!(
+            "allocation {allocation_id} of booking {booking_id} reversed: the booking is not in \
+             its account, which a restore took to a time before it"
+        )
+    } else {
+        format!("allocation {allocation_id} of booking {booking_id} withdrawn by its correction")
+    });
     plan.lines =
         crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count)?)?;
     plan.clearing = clearing_reversed(book, &received.clearing)?;

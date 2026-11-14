@@ -69,6 +69,7 @@ pub mod reader;
 pub mod reads;
 pub mod service;
 pub mod snapshot;
+pub mod spread;
 pub mod store;
 #[rustfmt::skip]
 pub mod transitions;

@@ -107,6 +107,10 @@ pub struct PostgresStore {
     groups: meridian_changes::groups::Groups,
     /// One adoption at once where it may raise the epoch (several groups).
     adopting: std::sync::Mutex<()>,
+    /// Whether its writer group leads a database past the first (step 3d;
+    /// section 6.4): it follows that database's timeline, as group 0 does
+    /// database 0's.
+    leads_database: bool,
     /// The range and month tables of `lake_row` this store has seen made
     /// (step 3d; section 6.2): never looked for again. Let go whenever a
     /// batch fails, so one a restore took away is made again.
@@ -305,6 +309,7 @@ impl PostgresStore {
             watch,
             groups: meridian_changes::groups::Groups::one(),
             adopting: std::sync::Mutex::new(()),
+            leads_database: false,
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -422,7 +427,7 @@ impl PostgresStore {
         // holds the control partition, raises every group's epoch, and each
         // other group's writer, fenced by it, steps down and starts again
         // (step 3d).
-        if !self.groups.holds_control() {
+        if !self.groups.holds_control() && !self.leads_database {
             return Ok(Timeline::Same);
         }
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -1588,10 +1593,14 @@ impl PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         self.prepare(&mut conn, &[dataset])?;
+        // How long the dataset's lane was busy (step 3d; the profile's
+        // advice on writer groups, approved 2026-11-14).
+        let began = std::time::Instant::now();
         let mut tx = conn.transaction().map_err(unavailable)?;
         let done = self
             .record_dataset(&mut tx, dataset, parts, now_ns)
             .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
         }
@@ -2367,7 +2376,10 @@ impl Store for PostgresStore {
         batch: WriteAheadBatch,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
+        // The stream's lane: one batch in flight (step 3d's advice).
+        let (began, stream) = (std::time::Instant::now(), batch.stream.clone());
         let done = self.record_write_ahead_batch(batch, now_ns);
+        meridian_changes::busy::record(&stream, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
         }
@@ -2449,51 +2461,8 @@ impl Store for PostgresStore {
         groups: meridian_changes::groups::Groups,
         at_ns: i64,
     ) -> Result<usize> {
-        self.epoch_now()?;
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        // Each dataset's group as last recorded: none, group 0.
-        let mut recorded: BTreeMap<String, u32> = BTreeMap::new();
-        for row in tx
-            .query(
-                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
-                &[&crate::store::CONTROL_OWNER],
-            )
-            .map_err(unavailable)?
-        {
-            let body: Vec<u8> = row.get(0);
-            let owner =
-                meridian_domain::v1::PartitionOwner::decode(&body[..]).map_err(unreadable)?;
-            recorded.insert(owner.partition, owner.group);
-        }
-        let mut changed = Vec::new();
-        for row in tx
-            .query(
-                "SELECT dataset, epoch FROM lake_partition ORDER BY dataset",
-                &[],
-            )
-            .map_err(unavailable)?
-        {
-            let (dataset, epoch): (String, i64) = (row.get(0), row.get(1));
-            // A range is its dataset's group's.
-            let group = groups.owner(crate::range::dataset_of(&dataset));
-            if recorded.get(&dataset).copied().unwrap_or(0) != group {
-                let owner = meridian_domain::v1::PartitionOwner {
-                    component: "lake".into(),
-                    partition: dataset,
-                    group,
-                    writer: String::new(),
-                    epoch: (epoch as u64).max(1),
-                };
-                changed.push((crate::store::CONTROL_OWNER, owner.encode_to_vec(), at_ns));
-            }
-        }
-        if changed.is_empty() {
-            return Ok(0);
-        }
-        self.log_control(&mut tx, &changed)?;
-        tx.commit().map_err(unavailable)?;
-        Ok(changed.len())
+        let held = self.partition_epochs()?;
+        self.record_assignments_for(&held, groups, at_ns)
     }
 
     fn split_partition(
@@ -4600,4 +4569,273 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
     // statement_timeout is answered with this component's own refusal for
     // load (the resilience spec's section 10a).
     StoreError::Unavailable(meridian_changes::serving::described(&failed))
+}
+
+/// A database past the first (step 3d; the resilience spec's section 6.4):
+/// what database 0 decided, copied into the database holding the rows it is
+/// about, and what this database's own control journal recorded, relayed
+/// into database 0's.
+impl PostgresStore {
+    /// Whether this store's writer group leads its database of `count`
+    /// (step 3d): the lowest group writing there, which follows that
+    /// database's timeline and raises every epoch in it, as group 0 does
+    /// database 0's.
+    pub fn with_databases(mut self, count: u32) -> Self {
+        self.leads_database =
+            meridian_changes::databases::leads(self.groups.mine(), count) && count > 1;
+        self
+    }
+
+    /// Every alias this database keeps: `(replaced, stays, heard_at_ns)`.
+    pub fn alias_rows(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT replaced, stays, heard_at_ns FROM lake_alias ORDER BY replaced",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// Aliases database 0 kept, copied here where missing: answers how many
+    /// were missing. Idempotent; logs nothing, as database 0 logged each.
+    pub fn copy_aliases(&self, aliases: &[(String, String, i64)]) -> Result<u64> {
+        if aliases.is_empty() {
+            return Ok(0);
+        }
+        let (replaced, rest): (Vec<&str>, Vec<(&str, i64)>) = aliases
+            .iter()
+            .map(|(r, s, at)| (r.as_str(), (s.as_str(), *at)))
+            .unzip();
+        let (stays, at): (Vec<&str>, Vec<i64>) = rest.into_iter().unzip();
+        let copied = self
+            .conn()?
+            .execute(
+                "INSERT INTO lake_alias (replaced, stays, heard_at_ns)
+                 SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[])
+                 ON CONFLICT (replaced) DO NOTHING",
+                &[&replaced, &stays, &at],
+            )
+            .map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Closed-day re-checks database 0 kept, copied here where missing (the
+    /// same row, re-check, reason and time): answers how many were missing.
+    pub fn copy_amendments(&self, amendments: &[ClosedDayAmendment]) -> Result<u64> {
+        if amendments.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut copied = 0;
+        for amendment in amendments {
+            copied += tx
+                .execute(
+                    "INSERT INTO lake_closed_day
+                            (dataset, sequence, reason, closed_day, why, at_ns, row_key)
+                     SELECT $1, $2, $3, $4, $5, $6, NULLIF($7, '')
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM lake_closed_day
+                             WHERE dataset = $1 AND sequence = $2 AND at_ns = $6 AND why = $5
+                               AND coalesce(row_key, '') = $7)",
+                    &[
+                        &amendment.dataset,
+                        &(amendment.sequence as i64),
+                        &closed_reason(amendment.closed_day.as_ref()),
+                        &amendment
+                            .closed_day
+                            .as_ref()
+                            .map(|check| check.encode_to_vec()),
+                        &amendment.why,
+                        &amendment.at_ns,
+                        &amendment.row_key,
+                    ],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Quality assessments database 0 kept, copied here where missing:
+    /// answers how many were missing.
+    pub fn copy_assessments(&self, assessments: &[Assessment]) -> Result<u64> {
+        if assessments.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut copied = 0;
+        for a in assessments {
+            let reasons: Vec<i16> = a.reasons.iter().map(|r| *r as i16).collect();
+            copied += tx
+                .execute(
+                    "INSERT INTO lake_quality_assessment
+                            (dataset, sequence, row_key, version, state, reasons, by_instance, at_ns)
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM lake_quality_assessment
+                             WHERE dataset = $1 AND sequence = $2 AND row_key = $3
+                               AND version = $4 AND by_instance = $7 AND at_ns = $8)",
+                    &[
+                        &a.dataset,
+                        &(a.sequence as i64),
+                        &a.row_key,
+                        &(a.version as i64),
+                        &(a.state as i16),
+                        &reasons,
+                        &a.by_instance,
+                        &a.at_ns,
+                    ],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Every entry of this database's own control journal, in order: `(kind,
+    /// body, committed_at_ns)`. A database past the first keeps a short one
+    /// -- its writer groups' takeovers, its ranges' splits and moves, its
+    /// datasets' gaps -- which database 0's relays.
+    pub fn control_entries(&self) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT kind, body, committed_at_ns FROM lake_control_change ORDER BY sequence",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// `entries` from another database's control journal, each logged in
+    /// this one's where it holds none of the same kind and body, in order,
+    /// in one transaction under this writer's epoch: answers how many. A
+    /// record keeps its own times; only its place in this journal is new.
+    pub fn relay_control(&self, entries: &[(String, Vec<u8>, i64)]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let kinds: Vec<&str> = {
+            let mut kinds: Vec<&str> = entries.iter().map(|(k, _, _)| k.as_str()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            kinds
+        };
+        let held: std::collections::HashSet<(String, Vec<u8>)> = tx
+            .query(
+                "SELECT kind, body FROM lake_control_change WHERE kind = ANY($1)",
+                &[&kinds],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let body: Vec<u8> = row.get(1);
+                (row.get(0), meridian_changes::integrity::digest(&body))
+            })
+            .collect();
+        let owed: Vec<(&str, Vec<u8>, i64)> = entries
+            .iter()
+            .filter(|(kind, body, _)| {
+                !held.contains(&(kind.clone(), meridian_changes::integrity::digest(body)))
+            })
+            .map(|(kind, body, at)| (kind.as_str(), body.clone(), *at))
+            .collect();
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        self.log_control(&mut tx, &owed)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(owed.len())
+    }
+}
+
+/// Assignments (step 3d; sections 6.1 and 6.4): what each database's
+/// partitions are, and their writer groups recorded in this one's control
+/// partition.
+impl PostgresStore {
+    /// Each partition this database holds, with its epoch.
+    pub fn partition_epochs(&self) -> Result<Vec<(String, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, epoch FROM lake_partition ORDER BY dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// `other`'s partitions' writer groups recorded in this store's control
+    /// partition where they changed: database 0's record of a database past
+    /// it.
+    pub fn record_assignments_of(
+        &self,
+        other: &PostgresStore,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        let held = other.partition_epochs()?;
+        self.record_assignments_for(&held, groups, at_ns)
+    }
+
+    /// Each of `held`'s partitions whose group the control partition last
+    /// recorded otherwise (none: group 0) recorded as `groups` assigns it.
+    fn record_assignments_for(
+        &self,
+        held: &[(String, i64)],
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // Each dataset's group as last recorded: none, group 0.
+        let mut recorded: BTreeMap<String, u32> = BTreeMap::new();
+        for row in tx
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
+                &[&crate::store::CONTROL_OWNER],
+            )
+            .map_err(unavailable)?
+        {
+            let body: Vec<u8> = row.get(0);
+            let owner =
+                meridian_domain::v1::PartitionOwner::decode(&body[..]).map_err(unreadable)?;
+            recorded.insert(owner.partition, owner.group);
+        }
+        let mut changed = Vec::new();
+        for (dataset, epoch) in held {
+            // A range is its dataset's group's.
+            let group = groups.owner(crate::range::dataset_of(dataset));
+            if recorded.get(dataset).copied().unwrap_or(0) != group {
+                let owner = meridian_domain::v1::PartitionOwner {
+                    component: "lake".into(),
+                    partition: dataset.clone(),
+                    group,
+                    writer: String::new(),
+                    epoch: (*epoch as u64).max(1),
+                };
+                changed.push((crate::store::CONTROL_OWNER, owner.encode_to_vec(), at_ns));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.log_control(&mut tx, &changed)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(changed.len())
+    }
 }

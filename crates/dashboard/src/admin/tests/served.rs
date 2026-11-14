@@ -2494,6 +2494,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 NeverBlindLine { data_type: "meridian.v1.Bar".into(), second_source: true, standby_pods: false, age_and_source: true },
             ],
             computed_at_ns: now,
+            advice: Vec::new(),
         };
         let mut members = Vec::new();
         for (component, n) in [

@@ -390,6 +390,28 @@ pub fn make_children_landed(
     correlation: Option<&str>,
     causation: Option<&str>,
 ) -> (usize, BTreeSet<(String, String)>) {
+    make_children_lost(
+        bus,
+        store,
+        moves,
+        withdrawals,
+        &BTreeSet::new(),
+        correlation,
+        causation,
+    )
+}
+
+/// [`make_children_landed`], each withdrawal of a booking in `lost` -- one
+/// not in its account at all -- saying so (step 3d; section 6.4).
+pub fn make_children_lost(
+    bus: &Bus,
+    store: &dyn Store,
+    moves: &[ChildMove],
+    withdrawals: &[(String, String, String)],
+    lost: &BTreeSet<String>,
+    correlation: Option<&str>,
+    causation: Option<&str>,
+) -> (usize, BTreeSet<(String, String)>) {
     let mut landed = BTreeSet::new();
     let mut made = 0;
     let now = bus.clock().now_ns();
@@ -403,7 +425,14 @@ pub fn make_children_landed(
     for (account, booking_id, allocation_id) in withdrawals {
         let key = format!("allocation-out:{booking_id}:{allocation_id}");
         let acted = store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
-            match booking::withdraw_allocation(book, head, &ctx, booking_id, allocation_id)? {
+            match booking::withdraw_allocation_because(
+                book,
+                head,
+                &ctx,
+                booking_id,
+                allocation_id,
+                lost.contains(booking_id),
+            )? {
                 Some(made) => Ok(crate::service::decided(made, Vec::new())),
                 None => Err(StoreError::Invalid(NOTHING_OWED.into())),
             }
@@ -550,9 +579,12 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
     // partitions -- its account, ID, version, the allocations it awaits and
     // since when -- resumed from the legs that survive.
     let mut awaiting: Vec<(String, String, u32, Vec<String>, i64)> = Vec::new();
+    // Every booking each account holds, cancelled or not.
+    let mut booked: BTreeSet<(String, String)> = BTreeSet::new();
     for account in &accounts {
         let book = store.book(account).map_err(|failed| failed.to_string())?;
         for (id, held) in &book.ledger.bookings {
+            booked.insert((account.clone(), id.clone()));
             if held.state == meridian_domain::v1::BookingState::Cancelled {
                 continue;
             }
@@ -618,6 +650,14 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
             moved.allocation.allocation_id.clone(),
         ))
     });
+    // A booking not in its account at all, though an allocation of it was
+    // received: lost by a restore across databases, each taken to its time
+    // (step 3d; section 6.4). Its child reversed, saying so.
+    let lost: BTreeSet<String> = receiving
+        .iter()
+        .filter(|(_, booking_id, _, from)| !booked.contains(&(from.clone(), booking_id.clone())))
+        .map(|(_, booking_id, _, _)| booking_id.clone())
+        .collect();
     let withdrawals: Vec<(String, String, String)> = receiving
         .into_iter()
         .filter(|(_, booking_id, allocation_id, from)| {
@@ -625,7 +665,8 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
         })
         .map(|(account, booking_id, allocation_id, _)| (account, booking_id, allocation_id))
         .collect();
-    let (mut made, landed) = make_children_landed(bus, store, &moves, &withdrawals, None, None);
+    let (mut made, landed) =
+        make_children_lost(bus, store, &moves, &withdrawals, &lost, None, None);
     for (account, net, members) in &nets {
         made += link_net_members(bus, store, account, net, members);
     }

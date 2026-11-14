@@ -17,6 +17,7 @@ pub mod lease;
 pub mod member;
 pub mod preflight;
 pub mod probe;
+pub mod provision;
 pub mod replicas;
 pub mod resilience;
 pub mod scrub;

@@ -1,4 +1,5 @@
 use super::*;
+use meridian_domain::v1::RefusalCount;
 
 fn member(component: &str, member: &str, mode: &str, zone: &str) -> ComponentReport {
     ComponentReport {
@@ -458,4 +459,82 @@ fn the_history_is_newest_first_and_paged() {
     );
     assert!(history.page(2, "x").is_err());
     assert_eq!(history.priorities().len(), 1);
+}
+
+/// Step 3d (the product owner's item of 2026-11-14; `advice` approved that
+/// day): the book's partitions not above its writer groups is advised
+/// raised, while it is small; above them, nothing.
+#[test]
+fn the_profile_advises_partitions_above_the_writer_groups() {
+    let (mut values, seen) = desktop();
+    values.writer_groups.insert("bor".into(), 2);
+    values.book_partitions = 2;
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    let (said, reason, changes) = state(&advised, "the book's partitions");
+    assert_eq!(said, ResilienceState::NotMet);
+    assert!(
+        reason.contains("raising the count then places new accounts alone"),
+        "{reason}"
+    );
+    assert_eq!(changes, vec!["bor.partitions: 4".to_string()]);
+    values.book_partitions = 4;
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    assert!(advised.iter().all(|l| l.subject != "the book's partitions"));
+}
+
+/// The lake's partitions, as its writers report them, not above its writer
+/// groups: a range split advised; more ranges than groups, nothing.
+#[test]
+fn the_profile_advises_a_split_where_the_lakes_ranges_are_too_few() {
+    let (mut values, mut seen) = desktop();
+    values.writer_groups.insert("lake".into(), 2);
+    for m in seen.members.iter_mut().filter(|m| m.component == "lake") {
+        m.partitions = vec!["control".into(), "coinbase-1:daily".into()];
+    }
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    let (said, _, changes) = state(&advised, "the lake's partitions");
+    assert_eq!(said, ResilienceState::NotMet);
+    assert!(changes[0].starts_with("Split partition"), "{changes:?}");
+    for m in seen.members.iter_mut().filter(|m| m.component == "lake") {
+        m.partitions = vec!["a".into(), "b".into(), "c".into()];
+    }
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    assert!(advised.iter().all(|l| l.subject != "the lake's partitions"));
+}
+
+/// A writer group busy past 70% of a minute at its busiest, or refusing
+/// work as overloaded, is advised a writer group more; at 70%, nothing.
+#[test]
+fn the_profile_advises_a_writer_group_more_past_its_bound_or_when_it_refused_work() {
+    let (mut values, mut seen) = desktop();
+    values.writer_groups.insert("bor".into(), 2);
+    values.book_partitions = 8;
+    let mut busy = member(
+        "bor",
+        "om-meridian-runtime-bor-group-1-6c5d-x2",
+        "writer",
+        "",
+    );
+    busy.peak_write_busy_percent = 75;
+    seen.members.push(busy);
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    let (said, reason, changes) = state(&advised, "the book's writer group 1");
+    assert_eq!(said, ResilienceState::NotMet);
+    assert!(
+        reason.contains("75%") && reason.contains("past 70%"),
+        "{reason}"
+    );
+    assert_eq!(changes, vec!["bor.writerGroups: 3".to_string()]);
+
+    seen.members.last_mut().unwrap().peak_write_busy_percent = 70;
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    assert!(advised.is_empty(), "{advised:?}");
+
+    seen.members.last_mut().unwrap().refusals = vec![RefusalCount {
+        reason: "REFUSAL_REASON_OVERLOADED".into(),
+        count: 3,
+    }];
+    let advised = profile(&values, &seen, &Tested::compiled(), 1).advice;
+    let (_, reason, _) = state(&advised, "the book's writer group 1");
+    assert_eq!(reason, "it refused work as overloaded");
 }

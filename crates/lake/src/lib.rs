@@ -42,6 +42,7 @@ pub mod read;
 pub mod reader;
 pub mod row;
 pub mod service;
+pub mod spread;
 pub mod store;
 pub mod switches;
 pub mod write_ahead;

@@ -124,6 +124,10 @@ pub struct PostgresStore {
     /// Its count of partitions (step 3d; `bor.partitions`): where a new
     /// account is placed.
     partitions: u32,
+    /// Every database's store, this one's among them, where the book has
+    /// several (step 3d; section 6.4): where an account placed in another
+    /// database is found.
+    databases: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
 }
 
 impl PostgresStore {
@@ -152,6 +156,7 @@ impl PostgresStore {
             groups: meridian_changes::groups::Groups::one(),
             adopting: Mutex::new(()),
             partitions: 1,
+            databases: std::sync::OnceLock::new(),
         })
     }
 
@@ -1523,15 +1528,25 @@ impl PostgresStore {
     /// The partition the record holds `account_id` in now; where it holds
     /// none, the partition an account starts in.
     fn found(&self, account_id: &str) -> Result<String> {
-        Ok(self
+        let here: Option<String> = self
             .conn()?
             .query_opt(
                 "SELECT partition FROM book_account WHERE account_id = $1",
                 &[&account_id],
             )
             .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| first_partition_of(account_id).to_string()))
+            .map(|row| row.get(0));
+        // Placed in another database (step 3d; section 6.4): found there.
+        let found = here.or_else(|| {
+            self.databases.get().and_then(|stores| {
+                stores
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .filter(|store| !std::ptr::eq(store.as_ref(), self))
+                    .find_map(|store| store.placement_held(account_id))
+            })
+        });
+        Ok(found.unwrap_or_else(|| first_partition_of(account_id).to_string()))
     }
 
     fn place(&self, account_id: &str, partition: &str) {
@@ -1556,6 +1571,20 @@ impl PostgresStore {
     /// each answered its own outcome in order. An unexpected database error
     /// mid-batch tries the batch again one command at a time.
     fn batch(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> Vec<Result<Acted>> {
+        // How long the partition's lane was busy (step 3d; the profile's
+        // advice on writer groups, approved 2026-11-14).
+        let began = std::time::Instant::now();
+        let outcomes = self.batch_timed(partition, batch, decider);
+        meridian_changes::busy::record(partition, began.elapsed(), meridian_changes::now_ns());
+        outcomes
+    }
+
+    fn batch_timed(
         &self,
         partition: &str,
         batch: &[Pending],
@@ -1887,80 +1916,13 @@ impl Store for PostgresStore {
     }
 
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
-        use meridian_changes::records;
-        let mut conn = self.conn()?;
-        let journalled: std::collections::BTreeSet<String> = conn
-            .query(
-                "SELECT idempotency_key FROM book_entry
-                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:%'",
-                &[&crate::store::CONTROL_ACCOUNT],
-            )
-            .map_err(unavailable)?
-            .iter()
-            .map(|row| row.get(0))
+        let journalled = self.journalled_keys()?;
+        let mut owed: Vec<crate::control::Owed> = self
+            .control_records_owed_in(0)?
+            .into_iter()
+            .filter(|owed| !journalled.contains(&owed.key))
             .collect();
-        let mut owed = Vec::new();
-        // Each takeover, by its epoch, as it was kept in its own fencing.
-        for row in conn
-            .query(
-                "SELECT epoch, member, partitions, why, at_ns FROM book_writer_took_over
-                  ORDER BY epoch",
-                &[],
-            )
-            .map_err(unavailable)?
-        {
-            let epoch: i64 = row.get(0);
-            let key = format!("control-record:took-over:{epoch}");
-            if journalled.contains(&key) {
-                continue;
-            }
-            let by = meridian_changes::TookOver {
-                member: row.get(1),
-                previous: String::new(),
-                why: row.get(3),
-                at_ns: row.get(4),
-            };
-            let record = records::took_over("bor", &by, row.get(2), epoch as u64);
-            owed.push(crate::control::Owed {
-                key,
-                kind: records::TOOK_OVER,
-                body: record.encode_to_vec(),
-                reason: format!("the book's writer took over: {}", by.why),
-            });
-        }
-        // Each finding, by its row, as the scrub kept it.
-        for row in conn
-            .query(
-                "SELECT id, partition, sequence, committed_at_ns, what, found_at_ns
-                   FROM book_integrity_finding ORDER BY id",
-                &[],
-            )
-            .map_err(unavailable)?
-        {
-            let id: i64 = row.get(0);
-            let key = format!("control-record:finding:{id}");
-            if journalled.contains(&key) {
-                continue;
-            }
-            let found = meridian_changes::integrity::Finding {
-                partition: row.get(1),
-                sequence: row.get::<_, i64>(2) as u64,
-                committed_at_ns: row.get(3),
-                what: row.get(4),
-            };
-            let record = records::finding(
-                "bor",
-                meridian_domain::v1::IntegrityCheck::JournalChain,
-                &found,
-                row.get(5),
-            );
-            owed.push(crate::control::Owed {
-                key,
-                kind: records::FINDING,
-                body: record.encode_to_vec(),
-                reason: format!("an integrity finding: {}", found.what),
-            });
-        }
+        let mut conn = self.conn()?;
         // Each partition's writer group, where its last assignment named
         // another (none: group 0).
         let mut assigned: std::collections::BTreeMap<String, u32> =
@@ -3369,4 +3331,153 @@ fn end_deposed_holders(
         );
     }
     Ok(ended)
+}
+
+/// The book over several databases (step 3d; section 6.4): what its
+/// [`crate::spread::Spread`] asks of each database's store.
+impl PostgresStore {
+    /// Every database's store, this one's among them: where an account
+    /// placed in another database is found.
+    pub fn link_databases(&self, stores: &[Arc<PostgresStore>]) {
+        let _ = self
+            .databases
+            .set(stores.iter().map(Arc::downgrade).collect());
+    }
+
+    /// Where `account_id` is placed, as this store last found it or as its
+    /// own database holds it; none where it is placed in neither.
+    pub fn placement_held(&self, account_id: &str) -> Option<String> {
+        if let Some(partition) = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+        {
+            return Some(partition.clone());
+        }
+        let found: Option<String> = self
+            .conn()
+            .ok()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .ok()?
+            .map(|row| row.get(0));
+        if let Some(partition) = &found {
+            self.place(account_id, partition);
+        }
+        found
+    }
+
+    /// Where `account_id` was found in another database: this store routes
+    /// it there, never placing it again.
+    pub fn learn_placement(&self, account_id: &str, partition: &str) {
+        self.place(account_id, partition);
+    }
+
+    /// The takeovers and findings database `d`'s store keeps beside its
+    /// journal and this store's `~control` has not journalled, and its
+    /// partitions whose writer group this one's last assignment did not
+    /// name: owed to database 0's `~control`, each keyed with its database.
+    pub fn control_records_owed_of(
+        &self,
+        other: &PostgresStore,
+        d: u32,
+    ) -> Result<Vec<crate::control::Owed>> {
+        let journalled = self.journalled_keys()?;
+        let theirs = other.control_records_owed_in(d)?;
+        Ok(theirs
+            .into_iter()
+            .filter(|owed| !journalled.contains(&owed.key))
+            .collect())
+    }
+}
+
+impl PostgresStore {
+    /// The keys of the records this store's `~control` has journalled.
+    fn journalled_keys(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT idempotency_key FROM book_entry
+                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:%'",
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// Each takeover and finding this store's database keeps beside its
+    /// journal, as a record owed to `~control`: keyed by its epoch or row,
+    /// and for a database `d` past the first by `<d>/` before it, as two
+    /// databases number their epochs and findings apart (step 3d).
+    fn control_records_owed_in(&self, d: u32) -> Result<Vec<crate::control::Owed>> {
+        use meridian_changes::records;
+        let place = |id: i64| {
+            if d == 0 {
+                id.to_string()
+            } else {
+                format!("{d}/{id}")
+            }
+        };
+        let mut conn = self.conn()?;
+        let mut owed = Vec::new();
+        // Each takeover, by its epoch, as it was kept in its own fencing.
+        for row in conn
+            .query(
+                "SELECT epoch, member, partitions, why, at_ns FROM book_writer_took_over
+                  ORDER BY epoch",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let epoch: i64 = row.get(0);
+            let by = meridian_changes::TookOver {
+                member: row.get(1),
+                previous: String::new(),
+                why: row.get(3),
+                at_ns: row.get(4),
+            };
+            let record = records::took_over("bor", &by, row.get(2), epoch as u64);
+            owed.push(crate::control::Owed {
+                key: format!("control-record:took-over:{}", place(epoch)),
+                kind: records::TOOK_OVER,
+                body: record.encode_to_vec(),
+                reason: format!("the book's writer took over: {}", by.why),
+            });
+        }
+        // Each finding, by its row, as the scrub kept it.
+        for row in conn
+            .query(
+                "SELECT id, partition, sequence, committed_at_ns, what, found_at_ns
+                   FROM book_integrity_finding ORDER BY id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let id: i64 = row.get(0);
+            let found = meridian_changes::integrity::Finding {
+                partition: row.get(1),
+                sequence: row.get::<_, i64>(2) as u64,
+                committed_at_ns: row.get(3),
+                what: row.get(4),
+            };
+            let record = records::finding(
+                "bor",
+                meridian_domain::v1::IntegrityCheck::JournalChain,
+                &found,
+                row.get(5),
+            );
+            owed.push(crate::control::Owed {
+                key: format!("control-record:finding:{}", place(id)),
+                kind: records::FINDING,
+                body: record.encode_to_vec(),
+                reason: format!("an integrity finding: {}", found.what),
+            });
+        }
+        Ok(owed)
+    }
 }

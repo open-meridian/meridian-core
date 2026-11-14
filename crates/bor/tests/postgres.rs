@@ -3146,3 +3146,116 @@ fn the_pre_check_routes_by_the_record_and_leaves_an_unplaced_account_unrouted() 
         "the book's own keys where they start"
     );
 }
+
+/// Step 3d (the resilience spec's section 6.4): the book on two databases,
+/// two writer groups and four partitions. An account is placed, journalled
+/// and read in its own group's database alone; a member of the other
+/// group finds it there and hands its acts on, never placing it again in
+/// its own; a read of every account fans out over both; and database 1's
+/// takeover is owed to database 0's `~control`, keyed with its database.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_groups_keep_their_partitions_in_two_databases() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-TWO-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    // Placed by a member of group 0, in group 1's database.
+    let landed = blocking(|| zero.place_first(&account, &account)).unwrap();
+    assert_eq!(groups.owner(&landed), 1);
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    blocking(|| {
+        assert_eq!(fresh(1).placement_held(&account), Some(landed.clone()));
+        assert_eq!(
+            fresh(0).placement_held(&account),
+            None,
+            "never in group 0's database"
+        );
+    });
+    // Journalled by group 1, in its database.
+    let bus = Arc::new(Bus::single(
+        "operations-test-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    serve(bus.clone(), one.clone(), bus.clock());
+    resolving_equities(&bus);
+    let instrument = unique("INS-TWO");
+    open(&bus, &account, &instrument).await;
+    blocking(|| {
+        assert_eq!(fresh(1).journal(&account).unwrap().len(), 1);
+        assert!(fresh(0).journal(&account).unwrap().is_empty());
+        // Read through either member, from its database.
+        assert_eq!(zero.journal(&account).unwrap().len(), 1);
+        assert_eq!(zero.writer_group_of(&account), Some(1));
+        assert!(!zero.writes(&account));
+        // A read of every account fans out over both databases.
+        let read = meridian_bor::store::PositionsRead {
+            scope: meridian_bor::store::Scope::Everything,
+            account_id: String::new(),
+            since: None,
+            business_date: String::new(),
+            at: None,
+            limit: 10,
+            cursor: String::new(),
+        };
+        let page = zero.positions(&read).unwrap();
+        assert!(page
+            .records
+            .iter()
+            .any(|position| position.account_id == account));
+        // An act through group 0 is handed on, never placed again here.
+        let handed = zero.act(&account, "", "k", b"x", &mut |_, _| {
+            Err(meridian_bor::store::StoreError::Invalid(
+                "never decided here".into(),
+            ))
+        });
+        assert!(
+            matches!(
+                handed,
+                Err(meridian_bor::store::StoreError::NotOwned { group: 1, .. })
+            ),
+            "{:?}",
+            handed.err()
+        );
+        assert_eq!(fresh(0).placement_held(&account), None);
+        // Database 1's takeover, owed to database 0's ~control.
+        one.take_over(&meridian_changes::TookOver::unnamed("a test's takeover"))
+            .unwrap();
+        let owed = zero.control_records_owed().unwrap();
+        assert!(
+            owed.iter()
+                .any(|owed| owed.key.starts_with("control-record:took-over:1/")),
+            "{:?}",
+            owed.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
+    });
+    // Their connections closed off the runtime's workers.
+    blocking(move || drop((zero, one, bus)));
+}

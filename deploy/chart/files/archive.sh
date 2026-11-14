@@ -9,6 +9,8 @@
 # Never prints the passphrase or a credential.
 set -eu
 say() { echo "archive: $*"; }
+# Its stanza (step 3d): meridian, or a database's past the first, by its
+# own name, which its pod names (PGBACKREST_STANZA).
 
 # The certificates, readable by the database's user alone, as pgBackRest
 # requires of a key: a Secret's volume makes them root's.
@@ -36,14 +38,14 @@ as_postgres() { su-exec postgres "$@"; }
 		primary=$(as_postgres psql -X -At -h /var/run/postgresql -U postgres -d postgres \
 			-c 'select not pg_is_in_recovery()' 2>/dev/null || true)
 		if [ "$primary" = t ]; then
-			if as_postgres pgbackrest --stanza=meridian stanza-create >/tmp/pgbackrest/stanza.log 2>&1; then
+			if as_postgres pgbackrest --stanza="${PGBACKREST_STANZA:-meridian}" stanza-create >/tmp/pgbackrest/stanza.log 2>&1; then
 				say "the stanza holds this database"
 				break
 			fi
 			# "backup and archive info files exist but do not match the
 			# database" (pgBackRest's 028): a database made again.
 			if grep -q '\[028\]' /tmp/pgbackrest/stanza.log \
-				&& as_postgres pgbackrest --stanza=meridian stanza-upgrade >>/tmp/pgbackrest/stanza.log 2>&1; then
+				&& as_postgres pgbackrest --stanza="${PGBACKREST_STANZA:-meridian}" stanza-upgrade >>/tmp/pgbackrest/stanza.log 2>&1; then
 				say "the stanza moved to this database, made again; the one before it is kept as history"
 				break
 			fi

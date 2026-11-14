@@ -180,6 +180,9 @@ pub struct Values {
     /// The lake's and the book's writer groups (`lake.writerGroups`,
     /// `bor.writerGroups`; step 3d), where above 1; none means one.
     pub writer_groups: BTreeMap<String, u32>,
+    /// The book's partitions (`bor.partitions`; step 3d), where stated; 0
+    /// where not known.
+    pub book_partitions: u32,
 }
 
 impl Values {
@@ -243,6 +246,7 @@ impl Values {
                     (groups > 1).then(|| (component.to_string(), groups))
                 })
                 .collect(),
+            book_partitions: count(&said["bor"]["partitions"]),
         })
     }
 
@@ -291,6 +295,7 @@ impl Values {
             analytics_coordinators: of("analytics-coordinator").count() as u32,
             analytics_workers: of("analytics-worker").count() as u32,
             writer_groups: BTreeMap::new(),
+            book_partitions: 0,
         }
     }
 }
@@ -1061,7 +1066,134 @@ pub fn profile(
         tiers,
         never_blind: never_blind(seen),
         computed_at_ns: now_ns,
+        advice: advice(values, seen),
     }
+}
+
+// ── The advice ──────────────────────────────────────────────────────────────
+
+/// Past this share of a minute, at its busiest in the profile's window, a
+/// writer group's commit lane is near its ceiling, and the profile advises
+/// a group more (the product owner, 2026-11-14: about 60 to 70 percent of
+/// the measured capacity).
+pub const BUSY_MOST_PERCENT: u32 = 70;
+
+/// The stores whose partitions writer groups own, as the profile names
+/// them.
+const GROUPED: [(&str, &str); 2] = [("lake", "the lake"), ("bor", "the book")];
+
+/// What the profile advises beyond the levels (step 3d; the resilience
+/// spec's sections 6.8 and 12; `advice`, approved 2026-11-14), each in a
+/// failure line's shape, a change named and never made:
+/// - **headroom:** a store whose partitions are not more than its writer
+///   groups, so a group added later would find nothing of its own to take:
+///   raise the count (the book) or split a range (the lake) while it is
+///   small -- raising it places new accounts or ranges only;
+/// - **load:** a writer group whose commit lane was busy past
+///   [`BUSY_MOST_PERCENT`] of a minute at its busiest in the window, or that
+///   refused work as overloaded: a writer group more.
+fn advice(values: &Values, seen: &Seen) -> Vec<ResilienceLine> {
+    let mut out = Vec::new();
+    // Headroom: the book's partitions are a chart value, stated.
+    let groups = values.writer_groups("bor");
+    if values.book_partitions > 0 && values.book_partitions <= groups {
+        out.push(line(
+            "the book's partitions",
+            ResilienceState::NotMet,
+            format!(
+                "bor.partitions is {} and bor.writerGroups {groups}: a writer group added later \
+                 would find no partition to take, and raising the count then places new \
+                 accounts alone",
+                values.book_partitions
+            ),
+            vec![change(
+                &format!("bor.partitions: {}", (groups * 2).max(2)),
+                "none now: new accounts placed over more partitions, each existing account \
+                 where it is until it is moved",
+            )],
+        ));
+    }
+    // Headroom: the lake's partitions are its datasets and their ranges, as
+    // its writers report them.
+    let groups = values.writer_groups("lake");
+    let ranges: BTreeSet<&str> = seen
+        .members
+        .iter()
+        .filter(|m| m.component == "lake" && m.mode == "writer")
+        .flat_map(|m| m.partitions.iter().map(String::as_str))
+        .filter(|partition| *partition != meridian_changes::CONTROL)
+        .collect();
+    if !ranges.is_empty() && ranges.len() as u32 <= groups {
+        out.push(line(
+            "the lake's partitions",
+            ResilienceState::NotMet,
+            format!(
+                "the lake writes {} partitions and lake.writerGroups is {groups}: a writer group \
+                 added later would find no range to take",
+                ranges.len()
+            ),
+            vec![change(
+                "Split partition on the busiest range (the Resilience page, \
+                 dashboard__split_partition or meridian partition split)",
+                "none: the range's halves numbered on from where it closes, nothing copied",
+            )],
+        ));
+    }
+    // Load: each writer group's member, as it reports itself.
+    let mut said: BTreeSet<(String, u32)> = BTreeSet::new();
+    for member in &seen.members {
+        let Some((store, name)) = GROUPED.iter().find(|(c, _)| member.component == *c) else {
+            continue;
+        };
+        if member.mode != "writer" {
+            continue;
+        }
+        let overloaded = member.refusals.iter().any(|refused| {
+            refused.count > 0
+                && refused.reason == meridian_pb::v1::RefusalReason::Overloaded.as_str_name()
+        });
+        let busy = member.peak_write_busy_percent;
+        if busy <= BUSY_MOST_PERCENT && !overloaded {
+            continue;
+        }
+        let group = group_of_member(store, &member.member);
+        if !said.insert((store.to_string(), group)) {
+            continue;
+        }
+        let groups = values.writer_groups(store);
+        let reason = if busy > BUSY_MOST_PERCENT {
+            format!(
+                "its commit lane was busy {busy}% of a minute at its busiest in the last {} \
+                 minutes, past {BUSY_MOST_PERCENT}%",
+                meridian_changes::busy::WINDOW_BUCKETS
+            )
+        } else {
+            "it refused work as overloaded".to_string()
+        };
+        out.push(line(
+            &format!("{name}'s writer group {group}"),
+            ResilienceState::NotMet,
+            reason,
+            vec![change(
+                &format!("{store}.writerGroups: {}", groups + 1),
+                "a writer Deployment more, with its standby where the store keeps one; \
+                 partitions moved to it one at a time",
+            )],
+        ));
+    }
+    out
+}
+
+/// A writer member's group, by its pod's name: `<release>-<store>-group-<g>-…`
+/// past the first, group 0 otherwise.
+fn group_of_member(store: &str, member: &str) -> u32 {
+    let marker = format!("-{store}-group-");
+    member
+        .find(&marker)
+        .map(|at| &member[at + marker.len()..])
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|group| group.parse().ok())
+        .unwrap_or(0)
 }
 
 // ── The history ─────────────────────────────────────────────────────────────

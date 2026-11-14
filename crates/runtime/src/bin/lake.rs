@@ -66,6 +66,12 @@ fn run() -> Result<(), String> {
 
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
+            // A database past the first the chart brings (step 3d; section
+            // 6.4): made, with its roles and each component's login, by its
+            // superuser before its schema is applied.
+            if let Some(serving) = var("MERIDIAN_SERVING_DATABASE_URL") {
+                meridian_runtime::provision::provision_brought(&serving, &url)?;
+            }
             meridian_runtime::migrate_once_it_answers(
                 "the lake's database",
                 &url,
@@ -127,21 +133,52 @@ fn run() -> Result<(), String> {
     };
     // Its own database login and its sessions' bounds (section 10a).
     meridian_runtime::serve_database_as("lake");
-    let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
-        "the lake's database",
-        &url,
-        |url| {
-            PostgresStore::connect(url, pool)
-                .map(|store| store.with_groups(groups))
-                .map_err(|failed| failed.to_string())
-        },
-        |store| {
-            store.verify().map_err(|failed| match failed {
-                StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
-                other => Wait::NotYet(other.to_string()),
-            })
-        },
-    )?);
+    // Its databases (step 3d; section 6.4; `lake.databases`): its group
+    // writes to database `group mod count`, and reads fan out over them all.
+    let databases = meridian_changes::databases::Databases::from_env("lake", &url)?;
+    let own = databases.of_group(groups.mine());
+    let connect = |d: u32, url: &str| {
+        let what = if d == 0 {
+            "the lake's database".to_string()
+        } else {
+            format!("the lake's database {d}")
+        };
+        wait_for_store(
+            &what,
+            url,
+            |url| {
+                // Its own database's pool, with the write-ahead writer's;
+                // every other's for its reads.
+                PostgresStore::connect(url, if d == own { pool } else { 8 })
+                    .map(|store| store.with_groups(groups).with_databases(databases.count()))
+                    .map_err(|failed| failed.to_string())
+            },
+            |store| {
+                store.verify().map_err(|failed| match failed {
+                    StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
+                    other => Wait::NotYet(other.to_string()),
+                })
+            },
+        )
+    };
+    let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
+        let mut stores = Vec::new();
+        for (d, url) in databases.urls().iter().enumerate() {
+            stores.push(Arc::new(connect(d as u32, url)?));
+        }
+        tracing::info!(
+            databases = databases.count(),
+            own,
+            "the lake writes its group's database and reads every one"
+        );
+        Some(Arc::new(meridian_lake::spread::Spread::new(stores, groups)))
+    } else {
+        None
+    };
+    let record: Arc<dyn meridian_lake::Store> = match &spread {
+        Some(spread) => spread.clone(),
+        None => Arc::new(connect(0, &url)?),
+    };
 
     // The hot layer in front of the record (step 3a), each layer bounded by
     // its chart value: lake.hotLayer.latestMiB, lake.hotLayer.listingsMiB.
@@ -166,18 +203,8 @@ fn run() -> Result<(), String> {
     // a reader made it inside the runtime from stage C2, connecting in
     // block_in_place after PR CI 43014977978's "Cannot start a runtime from
     // within a runtime").
-    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
-        meridian_runtime::read_replica(
-            "the lake's read replica",
-            "MERIDIAN_LAKE_READ_DATABASE_URL",
-            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-            |store| {
-                store
-                    .verify()
-                    .map_err(|failed| Wait::NotYet(failed.to_string()))
-            },
-        )?
-        .map(Arc::new)
+    let replica: Option<Arc<dyn meridian_lake::Store>> = if member.is_reader() {
+        lake_replica(&databases, groups)?
     } else {
         None
     };
@@ -207,9 +234,7 @@ fn run() -> Result<(), String> {
             bus.serve_only(meridian_bus::read_after::is_read);
             // Made before the runtime and held outside it (stage D): its
             // connections close after the runtime has stopped.
-            let replica = replica
-                .clone()
-                .map(|replica| replica as Arc<dyn meridian_lake::Store>);
+            let replica = replica.clone();
             // Where it starts following from: the primary's heads before its
             // hot layer holds anything.
             let start = tokio::task::block_in_place(|| record.heads())
@@ -313,10 +338,34 @@ fn run() -> Result<(), String> {
                 "the lake writes its writer group's datasets, and hands every other's to their owners"
             );
         }
+        // Several databases (step 3d; section 6.4): group 0's writer copies
+        // what database 0 keeps about rows elsewhere into their databases
+        // and relays each database's own control journal into database 0's,
+        // as it starts and at each sweep, under its lease.
+        if let (Some(spread), true) = (&spread, groups.holds_control()) {
+            let sweeping = Arc::clone(spread);
+            std::thread::spawn(move || loop {
+                sweeping.reconcile_and_say();
+                match sweeping.relay() {
+                    Ok(0) => {}
+                    Ok(relayed) => tracing::info!(
+                        relayed,
+                        "the lake's databases' own records relayed into database 0's"
+                    ),
+                    Err(failed) => {
+                        tracing::warn!(%failed, "the lake's databases' own records were not relayed; again at the next sweep")
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(SWEEP_SECONDS));
+            });
+        }
         // The scrub, under the lease (step 3b, integrity at rest): the
-        // control partition's group's, which reads every dataset.
-        let scrubbing = url.clone();
-        if groups.holds_control() {
+        // control partition's group's, which reads every dataset, in every
+        // database (each database's findings in its own journal).
+        for scrubbing in databases.urls().to_vec() {
+            if !groups.holds_control() {
+                break;
+            }
             meridian_runtime::scrub::forever("lake", move || {
                 meridian_runtime::scrub::run_once(
                     "lake",
@@ -457,4 +506,56 @@ fn write_ahead_bounds() -> Result<meridian_lake::write_ahead::Bounds, String> {
         var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES").as_deref(),
         3,
     )
+}
+
+/// How often group 0's writer reconciles the lake's databases and relays
+/// their own records (step 3d; section 6.4).
+const SWEEP_SECONDS: u64 = 30;
+
+/// A reader's record-read replicas (contract v30, stage B; step 3d): one
+/// database's where the lake has one, else every database's, each read from
+/// its own replica where the chart names one -- database 0's from
+/// `MERIDIAN_LAKE_READ_DATABASE_URL`, each past it from
+/// `MERIDIAN_LAKE_READ_DATABASE_URL_<d>` -- and from the database itself
+/// where it names none.
+fn lake_replica(
+    databases: &meridian_changes::databases::Databases,
+    groups: meridian_changes::groups::Groups,
+) -> Result<Option<Arc<dyn meridian_lake::Store>>, String> {
+    let verify = |store: &PostgresStore| {
+        store
+            .verify()
+            .map_err(|failed| Wait::NotYet(failed.to_string()))
+    };
+    let connect = |url: &str| {
+        PostgresStore::connect(url, 4)
+            .map(|store| store.with_groups(groups).with_databases(databases.count()))
+            .map_err(|failed| failed.to_string())
+    };
+    let first = meridian_runtime::read_replica(
+        "the lake's read replica",
+        &meridian_changes::databases::read_url_var("lake", 0),
+        connect,
+        verify,
+    )?;
+    if !databases.several() {
+        return Ok(first.map(|store| Arc::new(store) as Arc<dyn meridian_lake::Store>));
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let mut stores = vec![Arc::new(first)];
+    for (d, url) in databases.urls().iter().enumerate().skip(1) {
+        let replica = var(&meridian_changes::databases::read_url_var("lake", d as u32))
+            .unwrap_or_else(|| url.clone());
+        stores.push(Arc::new(wait_for_store(
+            &format!("the lake's read replica of database {d}"),
+            &replica,
+            connect,
+            verify,
+        )?));
+    }
+    Ok(Some(Arc::new(meridian_lake::spread::Spread::new(
+        stores, groups,
+    ))))
 }

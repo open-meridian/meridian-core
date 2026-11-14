@@ -647,6 +647,14 @@ pub fn member_report(
         lag_ms: said().lag_ms(),
         partitions: said().partitions(),
         member: member_name(),
+        // The busiest share of a minute its writer group's commit lane was
+        // busy, over the profile's window (step 3d; approved 2026-11-14):
+        // a writer's alone.
+        peak_write_busy_percent: if said().mode() == "writer" {
+            meridian_changes::busy::peak_percent(meridian_changes::now_ns())
+        } else {
+            0
+        },
         ..health()
     }
 }

@@ -1275,6 +1275,14 @@ message ReadResilienceProfileReply {
   repeated NeverBlindLine never_blind = 5;
   // When the profile was computed.
   int64 computed_at_ns = 6;
+  // What the profile advises beyond the levels (step 3d; the resilience
+  // spec's sections 6.8 and 12; approved 2026-11-14): each a line in a
+  // failure line's shape, its subject a store's partitions or writer group,
+  // its reason the measured cause, its changes the chart value to set and
+  // what it costs. A partition count not above the writer-group count, a
+  // writer group busy past its bound or refusing work as overloaded. A
+  // change named, never a change made.
+  repeated ResilienceLine advice = 7;
 }
 
 // One line of the profile: a failure class or a tier.

@@ -54,6 +54,45 @@ impl MemoryStore {
     pub(crate) fn crash_when(&self, crash: Option<Crash>) {
         *self.crash.lock().expect("unpoisoned") = crash;
     }
+
+    /// `partition` as a restore to a time leaves it (step 3d; section 6.4):
+    /// every entry numbered past `sequence` gone, with what it answered and
+    /// the keys it held, and each account it touched replayed from what is
+    /// left. Another partition is as it was: a restore across databases
+    /// takes each database to its own time.
+    pub(crate) fn restore_partition_to(&self, partition: &str, sequence: u64) {
+        let mut state = self.state();
+        let mut gone: Vec<Entry> = Vec::new();
+        for journal in state.journals.values_mut() {
+            let (kept, lost): (Vec<Entry>, Vec<Entry>) = journal.drain(..).partition(|entry| {
+                entry.partition != partition || entry.first_sequence <= sequence
+            });
+            *journal = kept;
+            gone.extend(lost);
+        }
+        for entry in &gone {
+            state.replies.remove(&entry.entry_id);
+            state.requests.remove(&entry.entry_id);
+            state.by_message.retain(|_, id| *id != entry.entry_id);
+            state.by_key.retain(|_, id| *id != entry.entry_id);
+        }
+        let touched: std::collections::BTreeSet<String> =
+            gone.iter().map(|entry| entry.account_id.clone()).collect();
+        for account in touched {
+            let journal = state.journals.get(&account).cloned().unwrap_or_default();
+            match journal.first() {
+                Some(first) => {
+                    let book = Book::replay(&account, &first.partition.clone(), &journal)
+                        .expect("a journal replays");
+                    state.books.insert(account, book);
+                }
+                None => {
+                    state.books.remove(&account);
+                }
+            }
+        }
+        state.heads.insert(partition.to_string(), sequence);
+    }
 }
 
 impl Default for MemoryStore {

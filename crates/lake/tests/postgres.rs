@@ -5728,3 +5728,230 @@ fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
         .get(0);
     assert_eq!(months, 6);
 }
+
+// ── A database per writer group (step 3d; the resilience spec's section 6.4) ──
+
+/// Two fresh databases beside the test database, each migrated: a lake of
+/// two writer groups on two databases, alone, so no other test's datasets
+/// are taken over by its groups.
+fn two_databases() -> Vec<String> {
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let (server, _) = url
+        .rsplit_once('/')
+        .expect("a database URL names its database");
+    let tag = unique("lake2").replace([':', '-'], "_");
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
+    (0..2)
+        .map(|d| {
+            let name = format!("{tag}_{d}");
+            admin
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .expect("a database made");
+            let made = format!("{server}/{name}");
+            PostgresStore::connect(&made, 2)
+                .unwrap()
+                .migrate(&SystemClock)
+                .unwrap();
+            made
+        })
+        .collect()
+}
+
+/// A member of writer group `group` of two, over both databases.
+fn spread(urls: &[String], group: u32) -> meridian_lake::spread::Spread {
+    let groups = meridian_changes::groups::Groups::new(group, 2).unwrap();
+    let stores = urls
+        .iter()
+        .map(|url| {
+            Arc::new(
+                PostgresStore::connect(url, 4)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_databases(urls.len() as u32),
+            )
+        })
+        .collect();
+    meridian_lake::spread::Spread::new(stores, groups)
+}
+
+/// A dataset writer group `group` of two owns.
+fn owned_by(group: u32) -> String {
+    loop {
+        let dataset = unique("coinbase-1:daily");
+        if meridian_changes::groups::owner(&dataset, 2) == group {
+            return dataset;
+        }
+    }
+}
+
+/// Section 6.4: group g writes to database g mod 2, alone; a read naming
+/// both groups' datasets fans out and answers both, in dataset order, and
+/// the heads of both; a write of another group's dataset is refused here
+/// (it is handed on).
+#[test]
+fn two_groups_write_two_databases_and_a_read_spans_both() {
+    let urls = two_databases();
+    let (zero, one) = (spread(&urls, 0), spread(&urls, 1));
+    let (mine, theirs) = (owned_by(0), owned_by(1));
+    let subject = unique("LCL-BTC");
+    zero.record(
+        &mine,
+        vec![close(&mine, "a", &subject, "2026-10-07", 10)],
+        1_000,
+    )
+    .unwrap();
+    one.record(
+        &theirs,
+        vec![close(&theirs, "a", &subject, "2026-10-07", 20)],
+        1_000,
+    )
+    .unwrap();
+    // Each in its own group's database alone.
+    assert!(zero.database(0).heads().unwrap().contains_key(&mine));
+    assert!(!zero.database(1).heads().unwrap().contains_key(&mine));
+    assert!(zero.database(1).heads().unwrap().contains_key(&theirs));
+    assert!(!zero.database(0).heads().unwrap().contains_key(&theirs));
+    // Refused where another group owns it, never written here.
+    assert!(matches!(
+        one.record(
+            &mine,
+            vec![close(&mine, "b", &subject, "2026-10-07", 11)],
+            1_000
+        ),
+        Err(meridian_lake::store::StoreError::NotOwned { group: 0, .. })
+    ));
+    let mut datasets = vec![mine.clone(), theirs.clone()];
+    datasets.sort();
+    let read = zero
+        .read(&Query {
+            datasets: datasets.clone(),
+            subjects: vec![subject.clone()],
+            data_type: DataType::Price,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::BusinessDate(Date::parse("2026-10-07").unwrap()),
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+        .unwrap();
+    let answered: Vec<String> = read.iter().map(|row| row.dataset().to_string()).collect();
+    assert_eq!(answered, datasets, "both databases' rows, in dataset order");
+    let heads = one.heads().unwrap();
+    assert_eq!((heads.get(&mine), heads.get(&theirs)), (Some(&1), Some(&1)));
+}
+
+/// Approved 2026-11-14: an alias database 0 keeps is in every database,
+/// where rule 5 reads it; one kept in database 0 alone -- a crash between
+/// the databases -- is found and copied by the reconcile, and said; a
+/// closed-day re-check of a row in database 1 likewise, and its read there
+/// carries it.
+#[test]
+fn what_database_zero_keeps_reaches_every_database_and_a_gap_between_is_repaired() {
+    let urls = two_databases();
+    let zero = spread(&urls, 0);
+    let theirs = owned_by(1);
+    let subject = unique("LCL-BTC");
+    let one = spread(&urls, 1);
+    let recorded = one
+        .record(
+            &theirs,
+            vec![close(&theirs, "a", &subject, "2026-10-07", 20)],
+            1_000,
+        )
+        .unwrap();
+    // Kept through the lake: in both at once.
+    zero.keep_alias("LCL-OLD-1", "INS-NEW-1", 1_000).unwrap();
+    assert!(zero
+        .database(1)
+        .alias_rows()
+        .unwrap()
+        .iter()
+        .any(|(replaced, _, _)| replaced == "LCL-OLD-1"));
+    // A crash between the databases: database 0 alone holds them.
+    zero.database(0)
+        .keep_alias("LCL-OLD-2", "INS-NEW-2", 1_001)
+        .unwrap();
+    let amendment = meridian_lake::store::ClosedDayAmendment {
+        dataset: theirs.clone(),
+        sequence: recorded.rows[0].meta().sequence,
+        row_key: "a".into(),
+        closed_day: Some(meridian_domain::v1::DateCheck {
+            date: "2026-10-07".into(),
+            reason: meridian_domain::v1::DateCheckReason::Holiday as i32,
+            ..Default::default()
+        }),
+        why: "calendar CAL-USSS version 2 applied".into(),
+        at_ns: 1_002,
+    };
+    zero.database(0)
+        .amend_closed_day(std::slice::from_ref(&amendment))
+        .unwrap();
+    assert!(zero.database(1).closed_day_amendments().unwrap().is_empty());
+    let repaired = zero.reconcile().unwrap();
+    assert_eq!(
+        (
+            repaired[1].aliases,
+            repaired[1].amendments,
+            repaired[1].assessments
+        ),
+        (1, 1, 0),
+        "the alias and the re-check database 1 was missing"
+    );
+    assert!(
+        !zero.reconcile().unwrap()[1].any(),
+        "a second reconcile finds nothing"
+    );
+    // The row read in its own database carries the re-check.
+    let read = zero
+        .read(&Query {
+            datasets: vec![theirs.clone()],
+            subjects: vec![subject.clone()],
+            data_type: DataType::Price,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::BusinessDate(Date::parse("2026-10-07").unwrap()),
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+        .unwrap();
+    assert_eq!(
+        read[0].meta().closed_day.as_ref().map(|day| day.reason),
+        Some(meridian_domain::v1::DateCheckReason::Holiday as i32)
+    );
+    // Through the lake, a re-check reaches database 1 at once.
+    let again = meridian_lake::store::ClosedDayAmendment {
+        at_ns: 1_003,
+        ..amendment
+    };
+    zero.amend_closed_day(std::slice::from_ref(&again)).unwrap();
+    assert_eq!(zero.database(1).closed_day_amendments().unwrap().len(), 2);
+    assert!(!zero.reconcile().unwrap()[1].any());
+}
+
+/// A database past the first records its writer group's takeover in its
+/// own control journal, atomic with its epochs, and database 0's relays
+/// it, once.
+#[test]
+fn a_database_past_the_firsts_own_records_are_relayed_into_database_zero_once() {
+    let urls = two_databases();
+    let (zero, one) = (spread(&urls, 0), spread(&urls, 1));
+    zero.adopt().unwrap();
+    one.take_over(&meridian_changes::TookOver::unnamed("a test's takeover"))
+        .unwrap();
+    let taken = |store: &PostgresStore| {
+        store
+            .control_entries()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _, _)| kind == "meridian.v1.WriterTookOver")
+            .count()
+    };
+    let before = taken(zero.database(0));
+    assert_eq!(taken(zero.database(1)), 1);
+    assert_eq!(zero.relay().unwrap(), 1);
+    assert_eq!(taken(zero.database(0)), before + 1);
+    assert_eq!(zero.relay().unwrap(), 0, "each record relayed once");
+    assert!(one.relay().is_err(), "database 0's writes are group 0's");
+}

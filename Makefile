@@ -2852,6 +2852,58 @@ chart-check:
 		$(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=$$bad >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: bor.partitions=$$bad rendered; 1 to 64" >&2; exit 1; }; \
 	done; true
+	@# Step 3d, stage D (section 6.4; lake.databases, bor.databases,
+	@# <store>.database.groupSecrets and <release>-<store>-database-<d>
+	@# approved 2026-11-12; the variables 2026-11-14): 1 by default and
+	@# nothing changed; at 2 with the database this chart brings, each
+	@# store's second database, labelled apart from the first, its URLs
+	@# beside its passwords, migrated by a container of its own given its
+	@# superuser, told to every member of the store and started by first
+	@# run, in its own stanza of the WAL archive with its own offline act;
+	@# with one somebody else runs, the Secret named, nothing brought; more
+	@# databases than writer groups, and missing Secrets, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -q "database-[0-9][0-9]*$$\|_DATABASES$$\|DATABASE_URL_[0-9]" \
+		&& { echo "chart-check FAILED: one database, the default, renders a database past the first or its environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set bor.writerGroups=2 --set bor.databases=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render two databases for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		name="check-meridian-runtime-$$store-database-1"; \
+		for kind in StatefulSet Service Secret NetworkPolicy; do \
+			echo "$$two" | grep -A2 "^kind: $$kind$$" | grep -q "^  name: $$name$$" \
+				|| { echo "chart-check FAILED: $$store.databases=2 renders no $$kind $$name (step 3d)" >&2; exit 1; }; \
+		done; \
+		echo "$$two" | grep -q "^  name: $$name-passwords$$" \
+			|| { echo "chart-check FAILED: $$store's second database keeps no passwords of its own" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: $$store's second database is not labelled $$store-database-1, apart from the first" >&2; exit 1; }; \
+		STORE=$$(echo $$store | tr a-z A-Z); \
+		[ "$$(echo "$$two" | grep -A4 "name: MERIDIAN_$${STORE}_DATABASE_URL_1$$" | grep -c "name: $$name$$")" -ge 2 ] \
+			|| { echo "chart-check FAILED: $$store's members are not each told its second database (MERIDIAN_$${STORE}_DATABASE_URL_1)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^        - name: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: the migrate Job has no container $$store-database-1 (approved 2026-11-14)" >&2; exit 1; }; \
+		echo "$$two" | grep -A1 "name: MERIDIAN_$${STORE}_DATABASES$$" | grep -q 'value: "2"' \
+			|| { echo "chart-check FAILED: first run and the members are not told $$store.databases, 2" >&2; exit 1; }; \
+	done; \
+	arch="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set backup.recipient=age1check --set backup.path=/var/lib/check --set backup.walArchive.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases did not render with the WAL archive" >&2; exit 1; }; \
+	echo "$$arch" | grep -q "archive_command=pgbackrest --stanza=lake-database-1 archive-push" \
+		&& echo "$$arch" | grep -q "^ *\[lake-database-1\]$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-offline$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-tls$$" \
+		|| { echo "chart-check FAILED: the lake's second database does not archive into its own stanza, lake-database-1, with its own certificates and offline act" >&2; exit 1; }; \
+	ext="$$($(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set lake.writerGroups=2 --set lake.databases=2 --set 'lake.database.groupSecrets[0]=lake-two' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases somebody else runs did not render with their Secret named" >&2; exit 1; }; \
+	echo "$$ext" | grep -A4 "name: MERIDIAN_LAKE_DATABASE_URL_1$$" | grep -q 'name: "lake-two"' \
+		&& ! echo "$$ext" | grep -q "check-meridian-runtime-lake-database-1" \
+		|| { echo "chart-check FAILED: a database somebody else runs is not read from the Secret lake.database.groupSecrets names, or one is brought" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set lake.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: lake.databases=2 rendered with one writer group; at most one database for each" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set bor.writerGroups=2 --set bor.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=2 rendered on a database somebody else runs with no group Secret named" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.databases=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=0 rendered; one database at least" >&2; exit 1; }; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and

@@ -1147,7 +1147,12 @@ tls-server-address=0.0.0.0
 tls-server-ca-file=/run/archive/tls/ca.crt
 tls-server-cert-file=/run/archive/tls/tls.crt
 tls-server-key-file=/run/archive/tls/tls.key
-tls-server-auth=meridian-backup=meridian
+{{- /* Each database past the first a store's writer groups write to has a
+       stanza of its own, by its name (step 3d; section 6.4). */}}
+{{- $extras := include "meridian-runtime.extraDatabases" $top | fromJsonArray }}
+{{- $stanzas := list "meridian" }}
+{{- range $extras }}{{ $stanzas = append $stanzas (printf "%s-database-%d" .component (int .d)) }}{{ end }}
+tls-server-auth=meridian-backup={{ join "," $stanzas }}
 {{- end }}
 
 [meridian]
@@ -1159,6 +1164,20 @@ pg1-host-type=tls
 pg1-host-ca-file=/run/archive/tls/ca.crt
 pg1-host-cert-file=/run/archive/tls/client.crt
 pg1-host-key-file=/run/archive/tls/client.key
+{{- end }}
+{{- range $extra := include "meridian-runtime.extraDatabases" $top | fromJsonArray }}
+{{- $stanza := printf "%s-database-%d" $extra.component (int $extra.d) }}
+
+[{{ $stanza }}]
+pg1-path=/var/lib/postgresql/data/pgdata
+pg1-socket-path=/var/run/postgresql
+{{- if eq $.role "backup" }}
+pg1-host={{ $extra.name }}
+pg1-host-type=tls
+pg1-host-ca-file=/run/archive/tls-{{ $stanza }}/ca.crt
+pg1-host-cert-file=/run/archive/tls-{{ $stanza }}/client.crt
+pg1-host-key-file=/run/archive/tls-{{ $stanza }}/client.key
+{{- end }}
 {{- end }}
 {{- end -}}
 
@@ -1555,6 +1574,10 @@ Takes the chart.
 {{- end -}}
 {{- if has $component (list "lake" "bor") -}}
 {{- $_ := set $one "writerGroups" (int (include "meridian-runtime.writerGroups" (dict "top" $ "component" $component "values" $values))) -}}
+{{- $_ := set $one "databases" (int (include "meridian-runtime.storeDatabases" (dict "top" $ "component" $component "values" $values))) -}}
+{{- end -}}
+{{- if eq $component "bor" -}}
+{{- $_ := set $one "partitions" (int (include "meridian-runtime.borPartitions" $)) -}}
 {{- end -}}
 {{- $_ := set $said $component $one -}}
 {{- end -}}
@@ -1567,4 +1590,107 @@ Takes the chart.
 {{- $_ := set $said "analytics" (dict "coordinator" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "coordinator" "replicaCount" nil .Values.analytics) "what" "analytics.coordinator.replicaCount")))) "worker" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "worker" "replicaCount" nil .Values.analytics) "what" "analytics.worker.replicaCount"))))) -}}
 {{- $_ := set $said "dashboard" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount")))) -}}
 {{- $said | toJson -}}
+{{- end -}}
+
+{{/*
+A store's databases (step 3d; the resilience spec's section 6.4;
+`lake.databases`, `bor.databases`, approved 2026-11-12): 1, the default, to
+its writer groups' count -- writer group g writes to database g mod the
+count, so one past the groups would hold nothing. With the database this
+chart brings, the chart brings each past the first; with one somebody else
+runs, `<store>.database.groupSecrets` names one Secret for each. Takes a
+dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.storeDatabases" -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "databases" -}}{{- $count = index .values "databases" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $count)) -}}
+{{- fail (printf "%s.databases is %v; a whole number of databases from 1, writer group g writing to database g mod the count (1, the default, for one database)" .component $count) -}}
+{{- end -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- if gt (int $count) $groups -}}
+{{- fail (printf "%s.databases is %v and %s.writerGroups %d; at most one database for each writer group" .component $count .component $groups) -}}
+{{- end -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $own := dig "database" "existingSecret" "" .values -}}
+{{- if and (gt (int $count) 1) (or (not .top.Values.database.brought.enabled) $own) (ne (len $secrets) (sub (int $count) 1)) -}}
+{{- fail (printf "%s.databases is %v on a database somebody else runs; %s.database.groupSecrets names one Secret for each database past the first, %d, and names %d" .component $count .component (sub (int $count) 1) (len $secrets)) -}}
+{{- end -}}
+{{- if and .top.Values.database.brought.enabled (not $own) (gt (len $secrets) 0) (ne (len $secrets) (sub (int $count) 1)) -}}
+{{- fail (printf "%s.database.groupSecrets names %d Secrets for %v databases; one for each past the first, or none for the databases this chart brings" .component (len $secrets) $count) -}}
+{{- end -}}
+{{- int $count -}}
+{{- end -}}
+
+{{/*
+Whether a store's databases past the first are the ones this chart brings
+(step 3d): the database is brought, and the store names no database of its
+own nor any group Secrets.
+*/}}
+{{- define "meridian-runtime.storeBringsDatabases" -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $own := dig "database" "existingSecret" "" .values -}}
+{{- if and .top.Values.database.brought.enabled (not $own) (eq (len $secrets) 0) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Each database past the first the chart brings, every store's (step 3d;
+section 6.4): a JSON list of {component, d, name}, the name
+`<release>-<store>-database-<d>` (approved 2026-11-12).
+*/}}
+{{- define "meridian-runtime.extraDatabases" -}}
+{{- $out := list -}}
+{{- $full := include "meridian-runtime.fullname" . -}}
+{{- range $component := list "lake" "bor" -}}
+{{- $values := index $.Values $component -}}
+{{- $context := dict "top" $ "component" $component "values" $values -}}
+{{- $count := int (include "meridian-runtime.storeDatabases" $context) -}}
+{{- if and (gt $count 1) (include "meridian-runtime.storeBringsDatabases" $context) -}}
+{{- range $d := untilStep 1 $count 1 -}}
+{{- $out = append $out (dict "component" $component "d" $d "name" (printf "%s-%s-database-%d" $full $component $d)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/*
+A store member's databases past the first (step 3d; section 6.4; the
+variables approved 2026-11-14): MERIDIAN_<STORE>_DATABASES, and each
+database d's URL as MERIDIAN_<STORE>_DATABASE_URL_<d> -- from the Secret
+the chart brings with it, or the group Secret named -- and, where the chart
+brings it read replicas, its replica's as MERIDIAN_<STORE>_READ_DATABASE_URL_<d>.
+Nothing with one database. Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.databasesEnv" -}}
+{{- $count := int (include "meridian-runtime.storeDatabases" .) -}}
+{{- if gt $count 1 -}}
+{{- $full := include "meridian-runtime.fullname" .top -}}
+{{- $store := upper .component -}}
+{{- $brings := include "meridian-runtime.storeBringsDatabases" . -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $key := dig "database" "key" "" .values | default .top.Values.database.key -}}
+{{- $replicas := int (include "meridian-runtime.databaseReadReplicas" .top) }}
+- name: MERIDIAN_{{ $store }}_DATABASES
+  value: {{ $count | quote }}
+{{- range $d := untilStep 1 $count 1 }}
+- name: MERIDIAN_{{ $store }}_DATABASE_URL_{{ $d }}
+  valueFrom:
+    secretKeyRef:
+      {{- if $brings }}
+      name: {{ printf "%s-%s-database-%d" $full $.component $d }}
+      key: url
+      {{- else }}
+      name: {{ index $secrets (sub $d 1) | quote }}
+      key: {{ $key | quote }}
+      {{- end }}
+{{- if and $brings (gt $replicas 0) }}
+- name: MERIDIAN_{{ $store }}_READ_DATABASE_URL_{{ $d }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ printf "%s-%s-database-%d" $full $.component $d }}
+      key: read-url
+{{- end }}
+{{- end }}
+{{- end -}}
 {{- end -}}

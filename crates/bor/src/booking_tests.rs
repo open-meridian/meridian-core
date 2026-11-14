@@ -1819,3 +1819,135 @@ async fn account_again(w: &Wired, account: &str) {
     )
     .await;
 }
+
+/// Step 3d (section 6.4, ruled 2026-11-12; section 15's restore across two
+/// databases): a restore takes each database to its own time, so a
+/// booking's legs in two partitions can come back at different points. The
+/// book completes what survives and reverses what lost its parent, each by
+/// an entry of its own, and every partition balances throughout:
+/// - the child's database taken to before its child: the child is made
+///   again from the parent that survives;
+/// - the parent's database taken to before its booking: the child it
+///   received is reversed, saying why, and the clearing accounts net to
+///   zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_across_databases_completes_what_survives_and_reverses_what_lost_its_parent() {
+    let w = wired_with(MemoryStore::new().with_partitions(3));
+    account(&w, ACC).await;
+    let home = w.store.partition_of(ACC).unwrap();
+    let mut other = None;
+    for n in 2..=12 {
+        let candidate = format!("ACC-{n}");
+        account(&w, &candidate).await;
+        if w.store.partition_of(&candidate).unwrap() != home {
+            other = Some(candidate);
+            break;
+        }
+    }
+    let other = other.expect("an account in another partition");
+    let away = w.store.partition_of(&other).unwrap();
+    let split = |order: &str| SetAllocationInstructionRequest {
+        order_id: order.to_string(),
+        allocation_instruction: Some(AllocationInstruction {
+            lines: vec![
+                AllocationLine {
+                    account_id: other.clone(),
+                    quantity: d("4"),
+                    ..Default::default()
+                },
+                AllocationLine {
+                    account_id: ACC.into(),
+                    quantity: d("6"),
+                    ..Default::default()
+                },
+            ],
+        }),
+        reason: "the client's split".into(),
+    };
+    let allocations = || {
+        vec![
+            allocation(&other, "4", "909.64"),
+            allocation(ACC, "6", "1364.46"),
+        ]
+    };
+    let received = |booking_id: &str| {
+        w.store
+            .book(&other)
+            .unwrap()
+            .ledger
+            .received
+            .iter()
+            .any(|((id, _), held)| id == booking_id && !held.withdrawn)
+    };
+
+    // The child's database to before its child.
+    let (order, executions) = filled_in(&w, ACC, "10", &["10"]).await;
+    order_command(
+        &w,
+        SET_ALLOCATION_INSTRUCTION,
+        "meridian.v1.SetAllocationInstructionRequest",
+        &split(&order.order_id),
+        &anywhere(PM),
+    )
+    .await
+    .unwrap();
+    let before_child = w.store.heads().unwrap()[&away];
+    let first = book(&w, &order.order_id, &executions, allocations(), false)
+        .await
+        .unwrap();
+    sweep_children(&w.bus, w.store.as_ref()).unwrap();
+    assert!(received(&first.booking_id));
+    w.store.restore_partition_to(&away, before_child);
+    assert!(!received(&first.booking_id), "the restore took the child");
+    legs_balance(&w);
+    sweep_children(&w.bus, w.store.as_ref()).unwrap();
+    assert!(received(&first.booking_id), "made again from the parent");
+    legs_balance(&w);
+
+    // The parent's database to before its booking.
+    let (order, executions) = filled_in(&w, ACC, "10", &["10"]).await;
+    order_command(
+        &w,
+        SET_ALLOCATION_INSTRUCTION,
+        "meridian.v1.SetAllocationInstructionRequest",
+        &split(&order.order_id),
+        &anywhere(PM),
+    )
+    .await
+    .unwrap();
+    let before_booking = w.store.heads().unwrap()[&home];
+    let second = book(&w, &order.order_id, &executions, allocations(), false)
+        .await
+        .unwrap();
+    sweep_children(&w.bus, w.store.as_ref()).unwrap();
+    assert!(received(&second.booking_id));
+    w.store.restore_partition_to(&home, before_booking);
+    assert!(!w
+        .store
+        .book(ACC)
+        .unwrap()
+        .ledger
+        .bookings
+        .contains_key(&second.booking_id));
+    sweep_children(&w.bus, w.store.as_ref()).unwrap();
+    assert!(!received(&second.booking_id), "its child reversed");
+    let reversal = w
+        .store
+        .journal(&other)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|entry| {
+            entry.body.acts.iter().any(|act| matches!(act,
+                crate::orders::Act::AllocationWithdrawn { booking_id, .. } if *booking_id == second.booking_id))
+        })
+        .expect("an entry of its own");
+    assert!(
+        reversal.meta.reason.contains("a restore"),
+        "{}",
+        reversal.meta.reason
+    );
+    for (instrument, net) in legs_balance(&w) {
+        assert!(net.is_zero(), "~clearing nets {net} in {instrument}");
+    }
+}

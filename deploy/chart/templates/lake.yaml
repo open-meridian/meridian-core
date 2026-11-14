@@ -103,6 +103,8 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.lake.database.key | default .Values.database.key }}
+            {{- /* Its databases past the first (step 3d; section 6.4). */}}
+            {{- with (include "meridian-runtime.databasesEnv" (dict "top" $ "component" "lake" "values" .Values.lake)) }}{{ . | nindent 12 }}{{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
