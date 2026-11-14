@@ -293,14 +293,18 @@ impl WriteAhead {
         }
         let (reply_to, answer) = self.replies.wait();
         let mut headers = async_nats::HeaderMap::new();
-        headers.insert(TOPIC_HEADER, topic);
-        headers.insert(REPLY_HEADER, reply_to.as_str());
+        // Every header's words on one line (crate::nats::header_words).
+        headers.insert(TOPIC_HEADER, crate::nats::header_words(topic).as_str());
+        headers.insert(REPLY_HEADER, crate::nats::header_words(&reply_to).as_str());
         headers.insert(
             crate::nats::TIMEOUT_HEADER,
             timeout.as_millis().to_string().as_str(),
         );
         if let Some(meta) = envelope.meta.as_ref().filter(|m| !m.message_id.is_empty()) {
-            headers.insert(MESSAGE_ID_HEADER, meta.message_id.as_str());
+            headers.insert(
+                MESSAGE_ID_HEADER,
+                crate::nats::header_words(&meta.message_id).as_str(),
+            );
         }
         if let Some(after) = self.after_of(&subject, deadline).await {
             headers.insert(AFTER_HEADER, after.to_string().as_str());
