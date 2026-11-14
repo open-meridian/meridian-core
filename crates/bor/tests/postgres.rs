@@ -3625,6 +3625,13 @@ type TwoMembers = (
 );
 
 fn two_members(url: &str) -> TwoMembers {
+    two_members_at(url, 8)
+}
+
+/// [`two_members`] whose members place accounts in `partitions`
+/// partitions, the book's heads made for 8 as they start: a raised
+/// `bor.partitions` whose heads are made after.
+fn two_members_at(url: &str, partitions: u32) -> TwoMembers {
     use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
     let broker = Arc::new(GroupsBroker {
@@ -3637,7 +3644,7 @@ fn two_members(url: &str) -> TwoMembers {
             PostgresStore::connect(url, 4)
                 .unwrap()
                 .with_groups(Groups::new(group, 2).unwrap())
-                .with_partitions(8),
+                .with_partitions(partitions),
         );
         store.make_partitions(8).unwrap();
         store.pin_owners().unwrap();
@@ -5677,6 +5684,53 @@ async fn review_c5_a_read_during_the_switch_reads_each_account_once() {
         );
     }
     blocking(move || drop((h, mover)));
+}
+
+/// T1 (CI 43636763392): a partition made by a raise of `bor.partitions`
+/// after the members started -- its head naming no writer group -- is named
+/// by the control group's sweep, and an act on an account placed in it,
+/// sent to the group that does not own it, is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn t1_a_partition_made_by_a_raised_count_is_named_by_the_sweep_and_answered() {
+    use meridian_bor::partition_moves::rebalance;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) =
+        blocking(|| two_members_at(&url, 16));
+    // The raise: its heads made after the members started, named by none.
+    blocking(|| migrated.make_partitions(16).unwrap());
+    let partition = (8..16)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| meridian_changes::groups::owner(partition, 2) == 1)
+        .expect("a raised partition group 1 owns");
+    assert_eq!(
+        blocking(|| zero_store.tip(&partition))
+            .unwrap()
+            .unwrap()
+            .writer_group,
+        None
+    );
+    blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    assert_eq!(
+        blocking(|| zero_store.tip(&partition))
+            .unwrap()
+            .unwrap()
+            .writer_group,
+        Some(1),
+        "the sweep named the raised partition's writer group"
+    );
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-T1-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 16) == partition)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    // Sent to group 0, which hands it to group 1 by the record's word.
+    open(&zero, &account, "INS-AAPL").await;
+    write_once(&zero, &account, 1).await.unwrap();
+    assert_eq!(
+        blocking(|| zero_store.partition_of(&account)).as_deref(),
+        Some(partition.as_str())
+    );
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
 /// C8: a partition moved by hand back and forth is recorded each time, and
