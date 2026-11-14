@@ -114,6 +114,18 @@ pub enum StoreError {
     /// placed by its ID instead. UNAVAILABLE, with a retry-after.
     #[error("{0}")]
     NotPlaced(String),
+
+    /// An act on an account between its move's close and its open (step
+    /// 3d; the resilience spec's section 6.8, the hold): UNAVAILABLE, with
+    /// a retry-after, until the open.
+    #[error("{0}")]
+    Held(String),
+
+    /// An act refused while something else under way stands in its way
+    /// (step 3d: a move of the same account), naming the field:
+    /// FAILED_PRECONDITION.
+    #[error("{words}")]
+    Precondition { field: &'static str, words: String },
 }
 
 /// How many times a decision may ask for bodies before it is a fault: each
@@ -213,6 +225,16 @@ impl StoreError {
             StoreError::NotPlaced(words) => meridian_bus::refusal_status_retrying(
                 meridian_bus::RefusalStatus::Unavailable,
                 PLACEMENT_RETRY_SECONDS,
+                words,
+            ),
+            StoreError::Precondition { field, words } => meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::FailedPrecondition,
+                &[field.to_string()],
+                words,
+            ),
+            StoreError::Held(words) => meridian_bus::refusal_status_retrying(
+                meridian_bus::RefusalStatus::Unavailable,
+                crate::moves::HELD_RETRY_SECONDS,
                 words,
             ),
             other => other.to_string(),

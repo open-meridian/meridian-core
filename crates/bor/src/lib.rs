@@ -59,6 +59,7 @@ pub mod ids;
 pub mod journal;
 pub mod lifecycle;
 pub mod migrations;
+pub mod moves;
 pub mod numbers;
 pub mod order_decide;
 pub mod order_reads;

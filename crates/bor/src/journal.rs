@@ -440,3 +440,78 @@ impl Entry {
         })
     }
 }
+
+/// An account's move's entries' kind (step 3d; the resilience spec's
+/// section 6.8; W9.8, "An account moves between partitions by
+/// continuation"): the close in its old partition and the open in its new,
+/// each carrying the move's `AccountMoved` as a `~control` entry carries its
+/// record.
+pub const ACCOUNT_MOVED: &str = "meridian.v1.AccountMoved";
+
+/// An entry's `AccountMoved`, where it is a move's close or open.
+pub fn moved_of(entry: &Entry) -> Option<meridian_domain::v1::AccountMoved> {
+    if entry.meta.kind != ACCOUNT_MOVED {
+        return None;
+    }
+    let (_, body) = entry.body.record.as_ref()?;
+    meridian_domain::v1::AccountMoved::decode(body.as_slice()).ok()
+}
+
+/// Whether `entry` closes its account's chain in its partition, naming the
+/// partition it continues in.
+pub fn closes(entry: &Entry) -> Option<String> {
+    moved_of(entry)
+        .filter(|moved| moved.from_partition == entry.partition)
+        .map(|moved| moved.to_partition)
+}
+
+/// Whether `entry` opens its account's chain in its partition after a move.
+pub fn opens(entry: &Entry) -> bool {
+    moved_of(entry).is_some_and(|moved| moved.to_partition == entry.partition)
+}
+
+/// An account's journal in the order it was written (step 3d; W9.8): within
+/// a partition by sequence, and across a move from the close in the old
+/// partition to the open in the new, which numbers from its own head. An
+/// account that never moved is in one partition, in sequence order.
+pub fn in_order(mut entries: Vec<Entry>) -> Vec<Entry> {
+    if !entries.iter().any(|entry| entry.meta.kind == ACCOUNT_MOVED) {
+        entries.sort_by_key(|entry| entry.first_sequence);
+        return entries;
+    }
+    let mut by: std::collections::BTreeMap<String, std::collections::VecDeque<Entry>> =
+        std::collections::BTreeMap::new();
+    entries.sort_by(|a, b| {
+        (a.partition.as_str(), a.first_sequence).cmp(&(b.partition.as_str(), b.first_sequence))
+    });
+    for entry in entries {
+        by.entry(entry.partition.clone())
+            .or_default()
+            .push_back(entry);
+    }
+    // The chain starts in the partition whose first entry opens nothing.
+    let mut at = by
+        .iter()
+        .find(|(_, held)| held.front().is_some_and(|first| !opens(first)))
+        .map(|(partition, _)| partition.clone())
+        .or_else(|| by.keys().next().cloned());
+    let mut out = Vec::new();
+    while let Some(partition) = at.take() {
+        let Some(held) = by.get_mut(&partition) else {
+            break;
+        };
+        while let Some(entry) = held.pop_front() {
+            let next = closes(&entry);
+            out.push(entry);
+            if let Some(next) = next {
+                at = Some(next);
+                break;
+            }
+        }
+    }
+    // What no move links, after the chain, in its own order: never lost.
+    for (_, held) in by {
+        out.extend(held);
+    }
+    out
+}

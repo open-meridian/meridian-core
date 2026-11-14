@@ -151,10 +151,10 @@ impl Store for MemoryStore {
     }
 
     fn partition_of(&self, account_id: &str) -> Option<String> {
-        self.state()
-            .books
-            .get(account_id)
-            .map(|book| book.partition.clone())
+        let state = self.state();
+        let book = state.books.get(account_id)?;
+        // Between a move's close and its open: its new partition's (step 3d).
+        Some(moving_to(book).unwrap_or_else(|| book.partition.clone()))
     }
 
     fn act(
@@ -204,7 +204,18 @@ impl Store for MemoryStore {
             .unwrap_or_else(|| Book::new(account_id, &self.starts_in(account_id)));
         let epoch = self.fence.adopt_once(state.epoch);
         self.fence.admits(state.epoch)?;
-        let head = state.heads.get(&book.partition).copied().unwrap_or(0);
+        // An account between its move's close and its open is held, but for
+        // the open, which is numbered in its new partition (step 3d).
+        let acting_in = match moving_to(&book) {
+            Some(to) if crate::moves::is_open_key(idempotency_key) => to,
+            Some(to) => {
+                return Err(StoreError::Held(format!(
+                    "account {account_id} is moving to {to}: ask again in a moment"
+                )))
+            }
+            None => book.partition.clone(),
+        };
+        let head = state.heads.get(&acting_in).copied().unwrap_or(0);
         // The book holds no entry's body, as a store's never does (contract
         // v26, W9.10): each one a decision asks for is read from the journal,
         // so every test drives the bodies-on-demand path.
@@ -270,12 +281,13 @@ impl Store for MemoryStore {
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
-        Ok(self
-            .state()
-            .journals
-            .get(account_id)
-            .cloned()
-            .unwrap_or_default())
+        Ok(crate::journal::in_order(
+            self.state()
+                .journals
+                .get(account_id)
+                .cloned()
+                .unwrap_or_default(),
+        ))
     }
 
     fn adopt(&self) -> Result<u64> {
@@ -746,4 +758,10 @@ pub(crate) fn open_break_instrument(record: &Break) -> Option<&str> {
 
 fn names(record: &Break, instrument_id: &str) -> bool {
     open_break_instrument(record) == Some(instrument_id)
+}
+
+/// Where `book`'s account is moving, where its last entry is a move's close
+/// not yet opened (step 3d; the resilience spec's section 6.8).
+fn moving_to(book: &Book) -> Option<String> {
+    book.moved_to.clone()
 }

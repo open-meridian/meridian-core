@@ -1951,3 +1951,97 @@ async fn a_restore_across_databases_completes_what_survives_and_reverses_what_lo
         assert!(net.is_zero(), "~clearing nets {net} in {instrument}");
     }
 }
+
+/// Step 3d (the resilience spec's section 6.8; W9.8, W6.39; fixtures/book/
+/// move-account.yaml): an account moves by continuation -- a close in its
+/// old partition, an open in its new, linked by value -- its journal reads
+/// across both in the order written and its book replays the same; its
+/// next act is the new partition's; the same request again is answered as
+/// it opened; its own partition and one the book does not have are
+/// refused naming target_partition; and the move is its own record in the
+/// book's control partition.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_moves_by_continuation_and_replays_the_same() {
+    use meridian_domain::v1::{MoveAccountReply, MoveAccountRequest};
+    let w = wired_with(MemoryStore::new().with_partitions(3));
+    account(&w, ACC).await;
+    filled_in(&w, ACC, "10", &["10"]).await;
+    let from = w.store.partition_of(ACC).unwrap();
+    let to = (0..3)
+        .map(crate::store::partition_named)
+        .find(|partition| *partition != from)
+        .unwrap();
+    let request = MoveAccountRequest {
+        account_id: ACC.into(),
+        target_partition: to.clone(),
+        reason: "the busiest accounts apart".into(),
+    };
+    let ask = |request: MoveAccountRequest| {
+        let bus = w.bus.clone();
+        async move {
+            send_from(
+                &bus,
+                crate::moves::MOVE_ACCOUNT,
+                "meridian.v1.MoveAccountRequest",
+                &request,
+                &admin(),
+            )
+            .await
+            .map(|reply| MoveAccountReply::decode(&reply[..]).unwrap().moved.unwrap())
+        }
+    };
+    let moved = ask(request.clone()).await.unwrap();
+    assert_eq!(
+        (moved.from_partition.as_str(), moved.to_partition.as_str()),
+        (from.as_str(), to.as_str())
+    );
+    assert!(moved.closing_sequence > 0 && moved.opening_sequence > 0);
+    assert_eq!(moved.moved_by, ADMIN);
+    assert_eq!(w.store.partition_of(ACC).as_deref(), Some(to.as_str()));
+    // The close, then the open, in the order written.
+    let journal = w.store.journal(ACC).unwrap();
+    let n = journal.len();
+    assert_eq!(journal[n - 2].partition, from);
+    assert_eq!(journal[n - 1].partition, to);
+    assert!(crate::journal::closes(&journal[n - 2]).is_some());
+    assert!(crate::journal::opens(&journal[n - 1]));
+    // It replays the same.
+    let replayed = crate::Book::replay(ACC, &journal[0].partition, &journal).unwrap();
+    let mut held = w.store.book(ACC).unwrap();
+    held.release_bodies();
+    let mut again = replayed.clone();
+    again.release_bodies();
+    assert_eq!(again, held, "the book replays across its move the same");
+    // Its next act is the new partition's.
+    filled_in(&w, ACC, "5", &["5"]).await;
+    assert!(w
+        .store
+        .journal(ACC)
+        .unwrap()
+        .iter()
+        .skip(n)
+        .all(|entry| entry.partition == to));
+    // Asked again: answered as it opened, nothing more written.
+    let entries = w.store.journal(ACC).unwrap().len();
+    assert_eq!(ask(request.clone()).await.unwrap(), moved);
+    assert_eq!(w.store.journal(ACC).unwrap().len(), entries);
+    // Its own partition, and one the book does not have.
+    for target in [to.clone(), "P9".to_string()] {
+        let refused = ask(MoveAccountRequest {
+            target_partition: target,
+            reason: "again".into(),
+            ..request.clone()
+        })
+        .await
+        .unwrap_err();
+        assert!(refused.contains("target_partition"), "{refused}");
+    }
+    // Its own record in the book's control partition.
+    crate::control::journal_owed(&w.bus, w.store.as_ref()).unwrap();
+    assert!(w
+        .store
+        .journal(crate::store::CONTROL_ACCOUNT)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.idempotency_key == crate::moves::control_key(&moved)));
+}

@@ -77,6 +77,8 @@ const ACCOUNT_FIRST: &[&str] = &[
     "platform.book.command.record-locate",
     "platform.book.command.handle-break",
     "platform.book.command.close-breaks-as-cleared",
+    // Its close is the account's partition's writer's (step 3d).
+    crate::moves::MOVE_ACCOUNT,
 ];
 
 /// The account a command acts in, read from its request's first field
@@ -1120,6 +1122,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         });
     }
     serve_lifecycle(&bus, &store, &clock);
+    // An account moved between partitions (step 3d; the resilience spec's
+    // section 6.8; W6.39).
+    crate::moves::serve(&bus, &store, &clock);
     {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(HANDLE_BREAK, move |envelope| {

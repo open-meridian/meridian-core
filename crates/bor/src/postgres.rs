@@ -592,6 +592,12 @@ fn entry_of(row: &Row) -> Result<Entry> {
 }
 
 fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<Entry>> {
+    journal_rows(client, account_id).map(crate::journal::in_order)
+}
+
+/// An account's entries as its partitions hold them, by sequence: across a
+/// move, [`crate::journal::in_order`] puts them in the order written.
+fn journal_rows(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<Entry>> {
     client
         .query(
             &format!(
@@ -625,20 +631,42 @@ fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<E
 fn journal_after(
     client: &mut impl GenericClient,
     account_id: &str,
-    after: u64,
+    kept: &Book,
+    current: &str,
 ) -> Result<Vec<Entry>> {
-    client
+    let Some(last) = kept.entries.last().map(|entry| entry.first.clone()) else {
+        return journal_of(client, account_id);
+    };
+    let tail: Vec<Entry> = client
         .query(
             &format!(
-                "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND first_sequence > $2
+                "SELECT {ENTRY_COLUMNS} FROM book_entry
+                  WHERE account_id = $1 AND partition = $2 AND first_sequence > $3
                   ORDER BY first_sequence"
             ),
-            &[&account_id, &(after as i64)],
+            &[&account_id, &last.partition, &(last.sequence as i64)],
         )
         .map_err(unavailable)?
         .iter()
         .map(entry_of)
-        .collect()
+        .collect::<Result<_>>()?;
+    // The account moved since the snapshot (step 3d; W9.8): its tail is
+    // the rest of its journal in the order written, across partitions.
+    let moved = current != last.partition
+        || tail
+            .iter()
+            .any(|entry| crate::journal::closes(entry).is_some());
+    if !moved {
+        return Ok(tail);
+    }
+    let whole = journal_of(client, account_id)?;
+    let after = whole
+        .iter()
+        .position(|entry| {
+            entry.partition == last.partition && entry.first_sequence == last.sequence
+        })
+        .map_or(0, |at| at + 1);
+    Ok(whole.into_iter().skip(after).collect())
 }
 
 /// An account's latest usable snapshot (contract v25, W9.10): of this
@@ -711,7 +739,7 @@ fn book_from(
 ) -> Result<(Book, Replayed)> {
     match snapshot_of(client, account_id, None, None)? {
         Some(kept) => {
-            let tail = journal_after(client, account_id, crate::snapshot::last_sequence(&kept))?;
+            let tail = journal_after(client, account_id, &kept, partition)?;
             Ok((crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail)))
         }
         None => {
@@ -842,8 +870,7 @@ fn book_as_of_in(
     let at = at.get(&partition).copied().unwrap_or(0);
     let (book, entries) = match snapshot_of(client, account_id, Some(at), until)? {
         Some(kept) => {
-            let after = crate::snapshot::last_sequence(&kept);
-            let tail = journal_after(client, account_id, after)?;
+            let tail = journal_after(client, account_id, &kept, &partition)?;
             (kept.resume_as_of(&tail, Some(at), until)?, tail)
         }
         None => {
@@ -1763,6 +1790,15 @@ impl PostgresStore {
         // From its latest snapshot and the journal's tail (contract v25,
         // W9.10), never the whole journal once one is kept.
         let (book, replayed) = book_from(tx, account_id, partition)?;
+        // Between its move's close and its open, the account is held but
+        // for the open (step 3d; the resilience spec's section 6.8).
+        if let Some(to) = &book.moved_to {
+            if !crate::moves::is_open_key(idempotency_key) {
+                return Ok(Err(StoreError::Held(format!(
+                    "account {account_id} is moving to {to}: ask again in a moment"
+                ))));
+            }
+        }
         // Decided by its own caller, each entry's body the decision asks for
         // read in this transaction (contract v26, W9.10). A read that failed
         // broke the transaction, and so the batch.
@@ -1821,6 +1857,15 @@ impl PostgresStore {
             ],
         )
         .map_err(unavailable)?;
+        // A move's close moves the account's placement with it, in its own
+        // transaction (step 3d): its next act is the new partition's.
+        if let Some(to) = crate::journal::closes(entry) {
+            tx.execute(
+                "UPDATE book_account SET partition = $2 WHERE account_id = $1",
+                &[account_id, &to],
+            )
+            .map_err(unavailable)?;
+        }
         project(tx, account_id, &decided.changes)?;
         project_order_entries(
             tx,
@@ -3447,6 +3492,34 @@ impl PostgresStore {
                 kind: records::TOOK_OVER,
                 body: record.encode_to_vec(),
                 reason: format!("the book's writer took over: {}", by.why),
+            });
+        }
+        // Each account's move, by its open (step 3d): its record in control.
+        for row in conn
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE kind = $1
+                      ORDER BY partition, first_sequence"
+                ),
+                &[&crate::journal::ACCOUNT_MOVED],
+            )
+            .map_err(unavailable)?
+        {
+            let entry = entry_of(&row)?;
+            if !crate::journal::opens(&entry) {
+                continue;
+            }
+            let Some(moved) = crate::journal::moved_of(&entry) else {
+                continue;
+            };
+            owed.push(crate::control::Owed {
+                key: crate::moves::control_key(&moved),
+                kind: crate::journal::ACCOUNT_MOVED,
+                body: moved.encode_to_vec(),
+                reason: format!(
+                    "account {} moved from {} to {}: {}",
+                    moved.account_id, moved.from_partition, moved.to_partition, moved.reason
+                ),
             });
         }
         // Each finding, by its row, as the scrub kept it.

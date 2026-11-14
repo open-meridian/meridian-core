@@ -45,47 +45,57 @@ pub fn journal_owed(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
         .map_err(|failed| failed.to_string())?;
     let mut journalled = 0;
     for record in owed {
-        let now = bus.clock().now_ns();
-        let ctx = Context {
-            instance_id: bus.instance_id().to_string(),
-            event_time_ns: now,
-            received_at_ns: now,
-            committed_at_ns: now,
-            ..Default::default()
-        };
-        let acted = store.act(
-            CONTROL_ACCOUNT,
-            "",
-            &record.key,
-            record.key.as_bytes(),
-            &mut |book, head| {
-                let draft = Draft {
-                    entry_id: ctx.mint(crate::ids::ENTRY),
-                    kind: record.kind,
-                    effective_date: ctx.today(),
-                    reason: record.reason.clone(),
-                    break_ids: Vec::new(),
-                    idempotency_key: record.key.clone(),
-                    actor: ctx.actor(),
-                    body: Body {
-                        record: Some((record.kind.to_string(), record.body.clone())),
-                        ..Default::default()
-                    },
-                };
-                let made = crate::decide::made(book, head, &ctx, draft)?;
-                Ok(crate::service::decided(made, Vec::new()))
-            },
-        );
-        match acted {
-            Ok(Acted::Committed(_)) => journalled += 1,
-            Ok(Acted::Duplicate(_)) => {}
-            Err(StoreError::Invalid(said)) if said == JOURNALLED => {}
+        match journal_one(bus, store, &record) {
+            Ok(true) => journalled += 1,
+            Ok(false) => {}
             // The control partition another group's writer holds.
             Err(StoreError::NotOwned { .. }) => return Ok(journalled),
             Err(failed) => return Err(failed.to_string()),
         }
     }
     Ok(journalled)
+}
+
+/// One record journalled in `~control`, the book's own act: whether it was
+/// journalled now (false where it was already).
+pub fn journal_one(bus: &Bus, store: &dyn Store, record: &Owed) -> Result<bool, StoreError> {
+    let now = bus.clock().now_ns();
+    let ctx = Context {
+        instance_id: bus.instance_id().to_string(),
+        event_time_ns: now,
+        received_at_ns: now,
+        committed_at_ns: now,
+        ..Default::default()
+    };
+    let acted = store.act(
+        CONTROL_ACCOUNT,
+        "",
+        &record.key,
+        record.key.as_bytes(),
+        &mut |book, head| {
+            let draft = Draft {
+                entry_id: ctx.mint(crate::ids::ENTRY),
+                kind: record.kind,
+                effective_date: ctx.today(),
+                reason: record.reason.clone(),
+                break_ids: Vec::new(),
+                idempotency_key: record.key.clone(),
+                actor: ctx.actor(),
+                body: Body {
+                    record: Some((record.kind.to_string(), record.body.clone())),
+                    ..Default::default()
+                },
+            };
+            let made = crate::decide::made(book, head, &ctx, draft)?;
+            Ok(crate::service::decided(made, Vec::new()))
+        },
+    );
+    match acted {
+        Ok(Acted::Committed(_)) => Ok(true),
+        Ok(Acted::Duplicate(_)) => Ok(false),
+        Err(StoreError::Invalid(said)) if said == JOURNALLED => Ok(false),
+        Err(failed) => Err(failed),
+    }
 }
 
 /// The record a book change carries, where it is a `~control` entry with

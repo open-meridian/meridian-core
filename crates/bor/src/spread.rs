@@ -270,7 +270,13 @@ impl Store for Spread {
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<crate::journal::Entry>> {
-        self.holding(account_id).journal(account_id)
+        // An account moved between databases has entries in each, in the
+        // order written across its move (step 3d; W9.8).
+        let mut entries = Vec::new();
+        for store in &self.stores {
+            entries.extend(store.journal(account_id)?);
+        }
+        Ok(crate::journal::in_order(entries))
     }
 
     fn adopt(&self) -> Result<u64> {

@@ -1321,6 +1321,34 @@ impl History {
                     });
                 }
             }
+            // Step 3d (section 6.8): an account's move, a partition's move,
+            // and a move that did not switch.
+            "meridian.v1.AccountMoved" => {
+                if let Ok(moved) = meridian_domain::v1::AccountMoved::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::AccountMoved(moved)),
+                    });
+                }
+            }
+            "meridian.v1.PartitionMoved" => {
+                if let Ok(moved) =
+                    meridian_domain::v1::PartitionMoved::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionMoved(moved)),
+                    });
+                }
+            }
+            "meridian.v1.PartitionMoveAborted" => {
+                if let Ok(aborted) =
+                    meridian_domain::v1::PartitionMoveAborted::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionMoveAborted(aborted)),
+                    });
+                }
+            }
             "meridian.v1.SourcePriority" => {
                 if let Ok(priority) = SourcePriority::decode(change.body.as_slice()) {
                     held.priorities

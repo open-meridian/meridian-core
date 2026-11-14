@@ -162,6 +162,10 @@ struct Shape {
     waits_stated: bool,
     #[serde(default)]
     lifecycle_events: Vec<(String, String)>,
+    /// Step 3d: the partition the account is moving to, between its move's
+    /// close and its open.
+    #[serde(default)]
+    moved_to: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -331,6 +335,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
         // The bodies a decision asked for: the journal's, never a
         // snapshot's (format 2).
         bodies: _,
+        moved_to,
     } = book;
     let shape = Shape {
         format: FORMAT,
@@ -350,6 +355,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
         chains: chains.to_vec(),
         ledger: ledger_shape(ledger),
         waits_stated: *waits_stated,
+        moved_to: moved_to.clone(),
     };
     serde_json::to_vec(&shape).expect("a snapshot's shape always serializes")
 }
@@ -678,6 +684,7 @@ pub fn decode(bytes: &[u8]) -> Result<Book> {
         ledger: ledger_from(shape.ledger)?,
         waits_stated: shape.waits_stated,
         bodies: Default::default(),
+        moved_to: shape.moved_to,
     })
 }
 
