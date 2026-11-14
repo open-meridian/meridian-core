@@ -74,6 +74,9 @@ pub struct Said {
     mode: Mutex<String>,
     lag_ms: AtomicU64,
     partitions: Mutex<Vec<String>>,
+    /// What it waits on before it can do its whole job, where it waits
+    /// (step 3d): reported degraded, saying why.
+    waiting: Mutex<String>,
 }
 
 impl Said {
@@ -88,6 +91,18 @@ impl Said {
     }
     pub fn set_mode(&self, mode: Mode) {
         *self.mode.lock().expect("said poisoned") = mode.as_str().to_string();
+    }
+    /// What it waits on, empty where it waits on nothing.
+    pub fn waiting(&self) -> String {
+        self.waiting.lock().expect("said poisoned").clone()
+    }
+    /// It waits on `why` (step 3d): reported degraded until it is
+    /// [`Said::done_waiting`].
+    pub fn set_waiting(&self, why: impl Into<String>) {
+        *self.waiting.lock().expect("said poisoned") = why.into();
+    }
+    pub fn done_waiting(&self) {
+        self.waiting.lock().expect("said poisoned").clear();
     }
     pub fn set_lag_ms(&self, lag: u64) {
         self.lag_ms.store(lag, Ordering::Relaxed);
@@ -613,12 +628,19 @@ pub fn member_report(
     schema: i64,
     started_at_ns: i64,
 ) -> meridian_domain::v1::ComponentReport {
+    // Waiting on what it needs to do its whole job: degraded, saying why.
+    let waiting = said().waiting();
+    let state = if waiting.is_empty() {
+        meridian_domain::v1::ComponentHealth::Serving
+    } else {
+        meridian_domain::v1::ComponentHealth::Degraded
+    };
     meridian_domain::v1::ComponentReport {
         component: component.to_string(),
         version: crate::VERSION.to_string(),
         schema_version: schema,
-        health: meridian_domain::v1::ComponentHealth::Serving as i32,
-        detail: String::new(),
+        health: state as i32,
+        detail: waiting,
         started_at_ns,
         mode: said().mode(),
         zone: zone(),

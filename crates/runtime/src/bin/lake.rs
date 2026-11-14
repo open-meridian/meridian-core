@@ -363,7 +363,13 @@ fn run() -> Result<(), String> {
             let writing = Arc::clone(&lake);
             meridian_runtime::background(async move {
                 if let Err(failed) =
-                    meridian_lake::write_ahead::write_forever(writing, client, bounds).await
+                    meridian_lake::write_ahead::write_forever(writing, client, bounds, |why| {
+                        match why {
+                            Some(why) => meridian_runtime::member::said().set_waiting(why),
+                            None => meridian_runtime::member::said().done_waiting(),
+                        }
+                    })
+                    .await
                 {
                     meridian_runtime::member::step_down("lake", &failed);
                 }

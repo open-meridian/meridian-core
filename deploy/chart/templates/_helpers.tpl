@@ -123,6 +123,17 @@ HA standbys serve no reads. Takes the chart.
 {{- $n -}}
 {{- end -}}
 
+{{/*
+The broker's own full health check, as its probes run it (step 3d): NATS's
+/healthz on the pod's loopback, where its monitoring alone listens, which
+answers 200 only once the server is current -- with JetStream, in the
+metadata group and current with its leader. Bash's own TCP, as the image
+carries no HTTP client.
+*/}}
+{{- define "meridian-runtime.brokerHealthz" -}}
+["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8222 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+{{- end -}}
+
 {{- define "meridian-runtime.jetstreamReplicas" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" (index (.Values.broker.jetstream | default dict) "replicas") "tolerant" 0 "ha" 3) -}}
 {{- if not (has (toString $n) (list "0" "3")) -}}

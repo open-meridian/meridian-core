@@ -2386,6 +2386,23 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker does not generate its permissions from the contract" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
 		&& { echo "chart-check FAILED: a deployment with its own broker got one from the chart as well" >&2; exit 1; }; true
+	@# Step 3d (decided 2026-11-14): the broker is ready only when its own full
+	@# health check says so -- routes, and with JetStream its place in the
+	@# metadata group -- read on its loopback by its startup and readiness
+	@# probes, alone and as three; and each server's name resolves before it
+	@# is ready, so no server waits on another's readiness to start.
+	@for profile in tolerant ha; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
+			--set resilience.profile=$$profile --show-only templates/broker.yaml 2>/dev/null)"; \
+		[ "$$(echo "$$said" | grep -c "GET /healthz HTTP/1.0")" -eq 2 ] \
+			|| { echo "chart-check FAILED: the broker's startup and readiness probes are not its full /healthz ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q 'js-enabled-only' \
+			&& { echo "chart-check FAILED: the broker's probe reads only that JetStream is on ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  publishNotReadyAddresses: true$$' \
+			|| { echo "chart-check FAILED: a broker server's name does not resolve before it is ready ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  podManagementPolicy: Parallel$$' \
+			|| { echo "chart-check FAILED: the broker's servers do not start in parallel ($$profile)" >&2; exit 1; }; \
+	done; true
 	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
 	@# a broker credential of its own, made by the bundled broker and read by
 	@# its pod, not the runtime's shared one.

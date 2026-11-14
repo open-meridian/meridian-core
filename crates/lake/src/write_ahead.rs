@@ -440,10 +440,13 @@ pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
+    waiting: impl Fn(Option<String>),
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
     let config = stream_config(&bounds);
-    // Made, or brought to the bounds this release sets.
+    // Made, or brought to the bounds this release sets: never with fewer
+    // replicas than set, to get past a broker not yet ready (step 3d). Until
+    // then the lake takes no write, and says why in its report.
     loop {
         let made = match context.get_stream(STREAM).await {
             Ok(_) => context
@@ -458,9 +461,17 @@ pub async fn write_forever(
                 .map_err(|f| f.to_string()),
         };
         match made {
-            Ok(()) => break,
+            Ok(()) => {
+                waiting(None);
+                break;
+            }
             Err(failed) => {
                 tracing::warn!(%failed, "the lake's write-ahead stream could not be made yet");
+                waiting(Some(format!(
+                    "taking no write: its write-ahead stream, kept on {} servers, could not be \
+                     made yet ({failed})",
+                    config.num_replicas
+                )));
                 tokio::time::sleep(AGAIN_AFTER * 4).await;
             }
         }

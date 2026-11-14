@@ -259,6 +259,11 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   clusterIP: None
+  # Each server's name resolves before it is ready (step 3d): a server is
+  # ready only once its routes and JetStream's metadata group hold, which
+  # needs the other servers' names first. Clients reconnect past one not
+  # ready, as past one lost.
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -433,6 +438,29 @@ spec:
               mountPath: /etc/meridian-internal-tls-server
               readOnly: true
             {{- end }}
+          # Ready means ready (step 3d, decided 2026-11-14): the server's own
+          # full health check -- its routes, and with JetStream its place in
+          # the metadata group, current with its leader -- read on the pod's
+          # own loopback, where its monitoring alone listens. Found in the
+          # reconfigure run: a third server outside the metadata group while
+          # the switch to ha said every member ready, and the lake's
+          # write-ahead stream, kept on three, could not be placed for six
+          # minutes. A server that does not come right within its start's
+          # bound is started again, and joins afresh. The set starts its
+          # servers in parallel and each name resolves before it is ready,
+          # so no server waits on another's readiness to start.
+          startupProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
