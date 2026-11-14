@@ -5733,8 +5733,9 @@ fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
 
 /// Two fresh databases beside the test database, each migrated: a lake of
 /// two writer groups on two databases, alone, so no other test's datasets
-/// are taken over by its groups.
-fn two_databases() -> Vec<String> {
+/// are taken over by its groups. Dropped with the value, a failed test's
+/// too (m9: every run left its `lake2_*` databases behind).
+fn two_databases() -> TwoDatabases {
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
     let (server, _) = url
         .rsplit_once('/')
@@ -5754,7 +5755,49 @@ fn two_databases() -> Vec<String> {
                 .unwrap();
             made
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// [`two_databases`]' URLs, each database dropped with them.
+struct TwoDatabases(Vec<String>);
+
+impl From<Vec<String>> for TwoDatabases {
+    fn from(urls: Vec<String>) -> Self {
+        Self(urls)
+    }
+}
+
+impl std::ops::Deref for TwoDatabases {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.0
+    }
+}
+
+impl Drop for TwoDatabases {
+    fn drop(&mut self) {
+        let Ok(url) = std::env::var("MERIDIAN_TEST_DATABASE_URL") else {
+            return;
+        };
+        let names: Vec<String> = self
+            .0
+            .iter()
+            .filter_map(|made| made.rsplit_once('/'))
+            .map(|(_, name)| name.split('?').next().unwrap_or(name).to_string())
+            .collect();
+        // On a thread of its own, so a sync client is never dropped inside a
+        // runtime; FORCE ends a pool's connections still open.
+        let _ = std::thread::spawn(move || {
+            if let Ok(mut admin) = postgres::Client::connect(&url, postgres::NoTls) {
+                for name in names {
+                    let _ = admin
+                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+                }
+            }
+        })
+        .join();
+    }
 }
 
 /// A member of writer group `group` of two, over both databases.
@@ -7641,13 +7684,14 @@ fn a_groups_stream_position_is_carried_home_when_the_database_count_is_raised() 
 /// member (Spread) of each group, and a dataset of group 0's in database
 /// 0 -- split into two halves where `split` -- with a row in each half.
 struct Across {
-    urls: Vec<String>,
     zeros: Vec<Arc<PostgresStore>>,
     ones: Vec<Arc<PostgresStore>>,
     zero: Arc<meridian_lake::spread::Spread>,
     one: Arc<meridian_lake::spread::Spread>,
     dataset: String,
     low: String,
+    // Last, so its databases are dropped after the stores over them.
+    urls: TwoDatabases,
 }
 
 fn across(tag: &str, split: bool) -> Across {

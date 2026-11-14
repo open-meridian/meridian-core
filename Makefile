@@ -702,8 +702,12 @@ e2e-cluster: network runtime-image analytics-image
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
 	@# Each image proved in the node, retried once, the run stopped with the
-	@# reason where one never arrives (e2e/cluster/image-load.sh).
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)),:)
+	@# reason where one never arrives (e2e/cluster/image-load.sh). The
+	@# database the wizard's deployment brings is handed over too, as the
+	@# backup and failover runs hand it: a node pulling it from Docker Hub
+	@# itself was refused for the rate limit, 429 for six minutes, and the
+	@# database never came (PR CI 43648472142, k3s v1.33.13).
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) postgres:16-alpine $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)),:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with

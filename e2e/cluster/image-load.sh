@@ -53,9 +53,20 @@ lacking() {
 for image in "$@"; do
 	# An image this host never built or pulled (postgres:16-alpine) is not
 	# there for k3d to hand over: pulled first, said so.
+	# A registry's rate limit (Docker Hub's 429) answered by waiting and
+	# asking again, three times at most.
 	if ! docker image inspect "$image" >/dev/null 2>&1; then
 		echo "image-load: $image is not on this host; pulling it"
-		docker pull -q "$image" >"$log" 2>&1 || {
+		pulled=
+		for wait in 0 20 60; do
+			sleep "$wait"
+			if docker pull -q "$image" >"$log" 2>&1; then
+				pulled=yes
+				break
+			fi
+			echo "image-load: $image was not pulled (attempt after a ${wait}s wait)" >&2
+		done
+		[ -n "$pulled" ] || {
 			echo "image-load: $image could not be pulled:" >&2
 			tail -20 "$log" >&2
 			exit 1
