@@ -853,6 +853,13 @@ pub trait Store: Send + Sync {
         Ok(BTreeMap::new())
     }
 
+    /// The ranges' writer groups read again into the member's view (step
+    /// 3d): by a write-ahead writer whose position a move took back, before
+    /// it takes the stream again. Nothing with one group.
+    fn read_owners_again(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Writer group `group`'s position in the write-ahead stream, kept as
     /// `key` in the database it writes (step 3d): how far that group has
     /// committed its own rows of the stream's writes.

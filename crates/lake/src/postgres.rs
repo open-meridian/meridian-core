@@ -2394,6 +2394,19 @@ fn offer_latest(
     Ok(())
 }
 
+/// What refuses a write-ahead batch whole (step 3d): a part held by a
+/// move's switch, or a part with a range another writer group owns.
+pub(crate) fn write_ahead_refusal<'a>(
+    refused: impl IntoIterator<Item = &'a StoreError>,
+    mine: u32,
+) -> Option<StoreError> {
+    refused.into_iter().find_map(|failed| match failed {
+        StoreError::Held(_) => Some(again(failed)),
+        StoreError::NotOwned { group, .. } if *group != mine => Some(again(failed)),
+        _ => None,
+    })
+}
+
 impl PostgresStore {
     /// [`Store::record_write_ahead`]'s batch, in one transaction.
     fn record_write_ahead_batch(
@@ -2451,6 +2464,20 @@ impl PostgresStore {
             for (place, part) in places.into_iter().zip(done) {
                 answered[place] = part;
             }
+        }
+        // A range held by a move's switch, or another group's since this
+        // member's view was read (step 3d; spec 6.1 and 6.8): the batch is
+        // refused whole, nothing committed, and taken again -- once the
+        // switch is done, or at once on the view the refusal corrected. A
+        // part is one write's rows of a dataset, all its ranges together:
+        // committed past, a held range's rows would be left to nobody if the
+        // switch aborted, and a refused part's rows of this group's own
+        // ranges to nobody at all.
+        if let Some(refused) = write_ahead_refusal(
+            answered.iter().filter_map(|part| part.as_ref().err()),
+            self.groups.mine(),
+        ) {
+            return Err(refused);
         }
         // What the batch found the stream dropped, each dataset's latest
         // valid time it recorded, and each gap it found: with its rows and
@@ -2516,6 +2543,10 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
+    fn read_owners_again(&self) -> Result<()> {
+        self.read_owners().map(|_| ())
+    }
+
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         self.record_together(dataset, vec![rows], now_ns)?
             .pop()

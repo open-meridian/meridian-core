@@ -319,6 +319,37 @@ impl PostgresStore {
             to.open_moved_in(self, partition, closing, target)?
         };
         let epoch_here = if same { epoch } else { source.epoch };
+        // In `ha`, the target takes the range's rows from the source's
+        // committed stream position (spec 6.1; ruled 2026-11-14, CI
+        // 43621875619): its own position goes back to it, here, before the
+        // source lets go. Every row of the range the source committed is at
+        // or before that position -- its batches take the range's row,
+        // which this switch holds -- and none after it will be; the target
+        // takes the rest from the stream, a row it holds already an
+        // idempotent repeat. Its position is always moved (back by one
+        // where it is not past the source's: a deliberate compare-and-set
+        // invalidation, see take_back), so its next batch is refused
+        // PositionMoved and it reads the ranges' owners again, taking the
+        // range's rows as its own. Nothing where no write-ahead stream is
+        // kept.
+        let from = source.writer_group.unwrap_or_else(|| {
+            self.groups
+                .owner_by(partition, crate::range::dataset_of(partition))
+        });
+        if from != target {
+            let theirs = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, from);
+            let ours = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, target);
+            let at = match stream_position(&mut tx, &theirs)? {
+                Some(at) => Some(at),
+                None if !same => stream_position(&mut *to.conn()?, &theirs)?,
+                None => None,
+            };
+            if same {
+                take_back(&mut tx, &ours, at)?;
+            } else {
+                take_back(&mut *to.conn()?, &ours, at)?;
+            }
+        }
         if !same {
             // The latest versions in the range itself are the target's to
             // keep now: this database's let go, so a latest read here never
@@ -367,6 +398,67 @@ impl PostgresStore {
         self.groups.assign(partition, Some(target));
         Ok(Switched::Moved { closing, epoch })
     }
+}
+
+/// A writer group's committed place in the write-ahead stream, under `key`.
+fn stream_position(
+    client: &mut impl GenericClient,
+    key: &str,
+) -> Result<Option<WriteAheadPosition>> {
+    Ok(client
+        .query_opt(
+            "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1",
+            &[&key],
+        )
+        .map_err(unavailable)?
+        .map(|row| WriteAheadPosition {
+            sequence: row.get::<_, i64>(0) as u64,
+            at_ns: row.get(1),
+        }))
+}
+
+/// A move's target's place in the write-ahead stream, under `key`, taken
+/// back to the source's `source` where that is earlier, else back by one
+/// write (spec 6.1). Nothing where it holds none: its first start takes from
+/// the stream's first.
+///
+/// The step back by one where the two are equal (or the target's is
+/// earlier) is deliberate, not an off-by-one: it is a compare-and-set
+/// invalidation. The target's writer holds the position it last committed,
+/// and a batch whose `after` is not the stored position is refused
+/// `StoreError::PositionMoved` (record_write_ahead_batch). Moving the stored
+/// position, always, is what forces that refusal, so the target reads its
+/// place and the ranges' owners again before its next batch and never takes
+/// the range's rows on a view that still names the source. Left equal, a
+/// stale target would go on skipping them. The write it steps back over is
+/// taken again: an idempotent repeat.
+fn take_back(
+    client: &mut impl GenericClient,
+    key: &str,
+    source: Option<WriteAheadPosition>,
+) -> Result<()> {
+    let Some(row) = client
+        .query_opt(
+            "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
+            &[&key],
+        )
+        .map_err(unavailable)?
+    else {
+        return Ok(());
+    };
+    let (sequence, at_ns): (i64, i64) = (row.get(0), row.get(1));
+    let (back, back_at) = match source {
+        Some(at) if (at.sequence as i64) < sequence => (at.sequence as i64, at.at_ns),
+        _ => ((sequence - 1).max(0), at_ns),
+    };
+    client
+        .execute(
+            "UPDATE lake_write_ahead SET sequence = $2, at_ns = $3, committed_at_ns = $4
+              WHERE stream = $1",
+            &[&key, &back, &back_at, &meridian_changes::now_ns()],
+        )
+        .map_err(unavailable)?;
+    Ok(())
 }
 
 impl PostgresStore {

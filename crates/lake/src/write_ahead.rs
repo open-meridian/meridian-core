@@ -82,7 +82,7 @@ pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> S
 }
 
 /// Writer group `group`'s position's key in `stream`.
-fn group_key(stream: &str, group: u32) -> String {
+pub fn group_key(stream: &str, group: u32) -> String {
     match group {
         0 => stream.to_string(),
         group => format!("{stream}.group-{group}"),
@@ -219,8 +219,17 @@ impl Writer {
         self.from = Some(sequence);
     }
 
+    /// The ranges' writer groups read again into the member's view.
+    pub fn read_owners(&self) -> Result<(), StoreError> {
+        self.lake.read_owners_again()
+    }
+
     /// The position read again from the store: after a batch it refused.
     pub fn reread(&mut self) -> Result<(), StoreError> {
+        // The ranges' owners first: a move's switch takes the target's
+        // position back so that it takes the range's rows as its own from
+        // there (step 3d; spec 6.1).
+        self.lake.read_owners_again()?;
         self.position = self.lake.write_ahead_position(&self.stream)?;
         let (dropped, valid) = self.lake.write_ahead_found(&self.stream)?;
         self.dropped = dropped;
@@ -611,6 +620,49 @@ async fn answer_when_settled(
     });
 }
 
+/// A batch taken, tried again while a range of it is held by a move's
+/// switch (step 3d; spec 6.8): refused whole while held, nothing committed,
+/// and taken again once the switch is done -- at most moves.holdSeconds,
+/// then refused as held and the writer goes on from its position. Every
+/// dataset this group takes waits with it: a switch takes milliseconds. A
+/// batch refused for a range another group owns since the view was read is
+/// taken again at once on the corrected view.
+pub async fn taken_past_a_switch(
+    writer: &mut Writer,
+    batch: Vec<Taken>,
+) -> Result<Answers, StoreError> {
+    let hold = meridian_changes::moves::hold();
+    let began = std::time::Instant::now();
+    let mut wait = Duration::from_millis(5);
+    loop {
+        let took = tokio::task::block_in_place(|| writer.take(batch.clone()));
+        match took {
+            Err(StoreError::Held(_)) if began.elapsed() + wait < hold => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_millis(100));
+            }
+            // A range another group's since the view was read: the refusal
+            // corrected the view, and the batch is split by it again at once
+            // -- the range's rows its owner's to take from the stream, the
+            // answer waiting for its commit (spec 6.1, ruled 2026-11-14).
+            Err(StoreError::NotOwned { .. }) if began.elapsed() < hold => {
+                if let Err(failed) = tokio::task::block_in_place(|| writer.read_owners()) {
+                    tracing::debug!(%failed, "the ranges' owners were not read again");
+                }
+            }
+            other => {
+                if began.elapsed() >= Duration::from_millis(5) && other.is_ok() {
+                    tracing::debug!(
+                        held_ms = began.elapsed().as_millis() as u64,
+                        "a write-ahead batch waited for a move's switch"
+                    );
+                }
+                return other;
+            }
+        }
+    }
+}
+
 pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
@@ -735,7 +787,7 @@ pub async fn write_forever(
             // Kept to be tried again one write at a time (step 3d, group
             // commit; section 6.5): a batch is at most 512 KiB.
             let each = (batch.len() > 1).then(|| batch.clone());
-            let took = tokio::task::block_in_place(|| writer.take(batch));
+            let took = taken_past_a_switch(&mut writer, batch).await;
             let took = match (took, each) {
                 // An unexpected database error: each write tried alone, in
                 // the stream's order, so the batch is held up only by the

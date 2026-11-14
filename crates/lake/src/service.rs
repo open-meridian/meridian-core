@@ -2506,6 +2506,12 @@ impl Lake {
         self.store.write_ahead_position(stream)
     }
 
+    /// The ranges' writer groups read again into this member's view (step
+    /// 3d; spec 6.1): a write-ahead writer whose position a move took back.
+    pub fn read_owners_again(&self) -> Result<(), crate::store::StoreError> {
+        self.store.read_owners_again()
+    }
+
     /// Writer group `group`'s position in the write-ahead stream kept as
     /// `key` (step 3d): what an answer spanning groups waits on.
     pub fn group_position(

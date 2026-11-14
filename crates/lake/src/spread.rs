@@ -581,6 +581,13 @@ impl Store for Spread {
         self.own().write_ahead_position(stream)
     }
 
+    fn read_owners_again(&self) -> Result<()> {
+        for store in &self.stores {
+            store.read_owners()?;
+        }
+        Ok(())
+    }
+
     fn group_position(&self, key: &str, _group: u32) -> Result<Option<WriteAheadPosition>> {
         // Wherever the group keeps it: home, or where it was before the
         // count was raised (step 3d).
@@ -613,6 +620,17 @@ impl Store for Spread {
                     })
                     .pop();
             }
+        }
+        // A part held by a move's switch elsewhere, or another group's: the
+        // batch refused whole before its position commits, and taken again
+        // (step 3d; as PostgresStore's own).
+        if let Some(refused) = crate::postgres::write_ahead_refusal(
+            answers
+                .iter()
+                .filter_map(|answer| answer.as_ref()?.as_ref().err()),
+            self.groups.mine(),
+        ) {
+            return Err(refused);
         }
         let again = here.clone();
         batch.parts = here;
