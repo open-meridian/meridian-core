@@ -33,12 +33,30 @@ pub const ASSIGNED: &str = "the writer group's partitions were assigned to it";
 /// would ever need, and a count CI does not test is never offered.
 pub const MOST: u32 = 64;
 
+/// Where a member last found its store's partitions assigned (step 3d;
+/// ruled 2026-11-14): each partition's `writer_group` column as read, by
+/// partition name. Shared by every copy of one [`Groups`], so one member's
+/// stores and its router see one view; never by two made apart, so two
+/// members in one process -- tests' -- keep their own.
+type Assigned = std::sync::RwLock<std::collections::HashMap<String, u32>>;
+
 /// A member's writer group and its store's count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Groups {
     mine: u32,
     count: u32,
+    /// The assignments this member has read; none with one group, where
+    /// group 0 owns everything.
+    assigned: Option<&'static Assigned>,
 }
+
+impl PartialEq for Groups {
+    fn eq(&self, other: &Self) -> bool {
+        (self.mine, self.count) == (other.mine, other.count)
+    }
+}
+
+impl Eq for Groups {}
 
 impl Default for Groups {
     fn default() -> Self {
@@ -49,7 +67,11 @@ impl Default for Groups {
 impl Groups {
     /// One group, which owns every partition: the default.
     pub const fn one() -> Self {
-        Self { mine: 0, count: 1 }
+        Self {
+            mine: 0,
+            count: 1,
+            assigned: None,
+        }
     }
 
     /// Group `mine` of `count`; refused where it is not one of them.
@@ -65,7 +87,14 @@ impl Groups {
                  groups are numbered from 0 below the count"
             ));
         }
-        Ok(Self { mine, count })
+        // One view of the assignments for this member's life: a process
+        // makes its groups once, and each test its own.
+        let assigned = (count > 1).then(|| -> &'static Assigned { Box::leak(Box::default()) });
+        Ok(Self {
+            mine,
+            count,
+            assigned,
+        })
     }
 
     /// From what the chart sets: [`GROUP_VAR`] and [`COUNT_VAR`].
@@ -99,9 +128,52 @@ impl Groups {
         self.count > 1
     }
 
-    /// The group that owns `partition`.
+    /// The group that owns `partition`: the one its `writer_group` names,
+    /// as last read (step 3d; ruled 2026-11-14), else its rendezvous owner.
     pub fn owner(&self, partition: &str) -> u32 {
-        owner(partition, self.count)
+        self.owner_by(partition, partition)
+    }
+
+    /// The group that owns `partition`: the one assigned to it, else the
+    /// rendezvous owner of `hashed` -- a lake range's dataset, whose ranges
+    /// stay with its group until moved.
+    pub fn owner_by(&self, partition: &str, hashed: &str) -> u32 {
+        if partition == crate::CONTROL {
+            return 0;
+        }
+        self.assigned(partition)
+            .unwrap_or_else(|| owner(hashed, self.count))
+    }
+
+    /// The group `partition`'s `writer_group` named when last read; none
+    /// where it named none, or a group the store no longer has.
+    pub fn assigned(&self, partition: &str) -> Option<u32> {
+        let assigned = self.assigned?;
+        let group = *assigned
+            .read()
+            .expect("assignments poisoned")
+            .get(partition)?;
+        (group < self.count).then_some(group)
+    }
+
+    /// `partition`'s `writer_group` as just read: `group`, or none (the
+    /// rendezvous owner). What a member does at start, on its sweep, and on
+    /// every write handed back to it by the group the column names.
+    pub fn assign(&self, partition: &str, group: Option<u32>) {
+        let Some(assigned) = self.assigned else {
+            return;
+        };
+        let mut assigned = assigned.write().expect("assignments poisoned");
+        match group {
+            Some(group) => {
+                if assigned.get(partition) != Some(&group) {
+                    assigned.insert(partition.to_string(), group);
+                }
+            }
+            None => {
+                assigned.remove(partition);
+            }
+        }
     }
 
     /// Whether this member's group owns `partition`.
@@ -178,5 +250,31 @@ mod tests {
         assert!(Groups::new(0, MOST + 1).is_err());
         let g = Groups::new(1, 2).unwrap();
         assert!(g.owns("P0") && !g.owns("control") && !g.holds_control());
+    }
+
+    #[test]
+    fn an_assignment_read_decides_the_owner_and_each_member_keeps_its_own() {
+        let (one, other) = (Groups::new(0, 2).unwrap(), Groups::new(1, 2).unwrap());
+        assert_eq!(one.owner("P0"), 1);
+        let copy = one;
+        copy.assign("P0", Some(0));
+        assert_eq!(one.owner("P0"), 0, "a copy shares its member's view");
+        assert_eq!(other.owner("P0"), 1, "another member's view is its own");
+        // A range unassigned is its dataset's group's; assigned, its own.
+        let dataset = "dataset-7";
+        let range = "dataset-7/8000-ffff";
+        assert_eq!(one.owner_by(range, dataset), owner(dataset, 2));
+        one.assign(range, Some(1 - owner(dataset, 2)));
+        assert_eq!(one.owner_by(range, dataset), 1 - owner(dataset, 2));
+        // A group the store no longer has is no assignment; nor is control.
+        one.assign("P1", Some(5));
+        assert_eq!(one.owner("P1"), owner("P1", 2));
+        one.assign("control", Some(1));
+        assert_eq!(one.owner("control"), 0);
+        one.assign("P0", None);
+        assert_eq!(one.owner("P0"), 1);
+        // One group assigns nothing.
+        Groups::one().assign("P0", Some(0));
+        assert_eq!(Groups::one().assigned("P0"), None);
     }
 }

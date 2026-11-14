@@ -79,6 +79,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "placement",
         sql: include_str!("../migrations/0011_placement.sql"),
     },
+    // A partition's writer group (step 3d; ruled 2026-11-14): set by a
+    // move's switch, and filled with the rendezvous owner at start.
+    Migration {
+        version: 12,
+        name: "writer_group",
+        sql: include_str!("../migrations/0012_writer_group.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\
