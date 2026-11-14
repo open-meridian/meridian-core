@@ -58,23 +58,69 @@ trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit $?' TERM INT
           -H 'Content-Type: application/json' --data "${PATRONI_DYNAMIC}" 2>/dev/null; then
         echo "database.sh: Patroni's dynamic settings held to the chart's"
         # A setting Postgres reads only as it starts -- max_connections,
-        # counted from what the chart deploys -- changed by the PATCH
-        # leaves this member's server running on the old one, pending a
-        # restart nothing else asks for: a primary still at the old count
-        # refuses the new pods' connections. Restarted once, in place, on
-        # this member alone; members started after the PATCH start on the
-        # new one, and a standby takes the primary's where it is higher.
-        for _ in $(seq 1 10); do
-          sleep 2
-          if api patroni 2>/dev/null | grep -q '"pending_restart": *true'; then
+        # counted from what the chart deploys, which raising a count
+        # (writer groups, members) raises -- changed by the PATCH leaves
+        # servers running on the old one, pending a restart nothing else
+        # asks for: a primary still at the old count refuses the new pods'
+        # connections, and every migration waits for a server allowing the
+        # new one (PR CI 43648472142, ha: 220 of 303 from the writer
+        # groups' upgrade on, the roll having made the first member it
+        # restarted the leader before Patroni said its restart was
+        # pending). So the cluster applies it, as an upgrade's own work,
+        # for as long as this member runs: a standby restarts, one at a
+        # time -- every other member running, the lowest name first -- and
+        # the leader last, by a switchover to a standby already restarted,
+        # then restarts as a standby itself; a leader with no standby to
+        # hand over to restarts in place. Each member decides for itself
+        # from the cluster's own view (`decide`), so no two act at once.
+        decide='
+import json, sys
+me = sys.argv[1]
+members = json.load(sys.stdin).get("members", [])
+mine = next((m for m in members if m.get("name") == me), None)
+if not mine or not mine.get("pending_restart"):
+    print("none"); sys.exit()
+others = [m for m in members if m.get("name") != me]
+def healthy(m):
+    return m.get("state") in ("running", "streaming")
+if mine.get("role") in ("leader", "standby_leader"):
+    standbys = [m for m in others if m.get("role") not in ("leader", "standby_leader")]
+    if any(m.get("pending_restart") for m in standbys):
+        print("wait")
+    elif any(healthy(m) and not (m.get("tags") or {}).get("nofailover") for m in standbys):
+        print("switchover")
+    elif not any(not (m.get("tags") or {}).get("nofailover") for m in standbys):
+        print("restart")
+    else:
+        print("wait")
+elif not all(healthy(m) for m in others):
+    print("wait")
+elif any(m.get("pending_restart") and m.get("role") not in ("leader", "standby_leader")
+         and m.get("name", "") < me for m in others):
+    print("wait")
+else:
+    print("restart")
+'
+        while sleep 10; do
+          said=$(api cluster 2>/dev/null | python3 -c "$decide" "${PATRONI_NAME}" 2>/dev/null) || continue
+          case "$said" in
+          restart)
             if api restart -o /dev/null -u "patroni:${PATRONI_RESTAPI_PASSWORD}" -X POST \
                 -H 'Content-Type: application/json' --data '{"restart_pending": true}' 2>/dev/null; then
               echo "database.sh: restarted for a setting read only at start"
             else
-              echo "database.sh: a setting read only at start is pending and the restart was refused" >&2
+              echo "database.sh: a setting read only at start is pending and the restart was refused; asked again" >&2
             fi
-            break
-          fi
+            ;;
+          switchover)
+            if api switchover -o /dev/null -u "patroni:${PATRONI_RESTAPI_PASSWORD}" -X POST \
+                -H 'Content-Type: application/json' --data "{\"leader\": \"${PATRONI_NAME}\"}" 2>/dev/null; then
+              echo "database.sh: handed the leader to a standby already restarted, to restart for a setting read only at start"
+            else
+              echo "database.sh: a setting read only at start is pending and the switchover was refused; asked again" >&2
+            fi
+            ;;
+          esac
         done
         exit 0
       fi
