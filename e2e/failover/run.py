@@ -3806,12 +3806,15 @@ def driver_lines(path):
 
 
 def window_held(s, what, began_ms, ended_ms):
-    """The driver's writes while a move ran: their p99 time within the
-    hold, and none refused."""
+    """The driver's writes while a move ran, and through the hold after it
+    began: their p99 time within the hold, and none refused. A move shorter
+    than the driver's pace began no write of its own (CI 43626539705, ha:
+    "None ms of 0 writes"), so the window is at least the hold."""
+    until_ms = max(ended_ms, began_ms + HOLD_SECONDS * 1000) + 1000
     took = sorted(int(p[3]) for p in driver_lines("/tmp/took")
-                  if len(p) == 4 and p[2].isdigit() and began_ms <= int(p[2]) <= ended_ms + 1000)
+                  if len(p) == 4 and p[2].isdigit() and began_ms <= int(p[2]) <= until_ms)
     refused = [p for p in driver_lines("/tmp/refused")
-               if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= ended_ms]
+               if len(p) >= 4 and p[3].isdigit() and began_ms <= int(p[3]) <= until_ms]
     p99 = took[min(len(took) - 1, int(len(took) * 0.99))] if took else None
     s.check(bool(took) and p99 <= HOLD_SECONDS * 1000,
             f"rebalance: {what}: the driver's p99 write time while it moved within moves.holdSeconds "
@@ -4137,8 +4140,12 @@ def moves(s, dash):
     in_one = happens(lambda: int(psql("select count(*) from book_entry where account_id <> '~control'",
                                       pod=database_pod("bor", 1)) or 0) > 0, 300, every=5)
     s.check(in_one, "rebalance: group 1's book partitions moved to database 1 by the count's change")
-    lake_in_one = happens(lambda: int(psql("select count(*) from lake_row", pod=database_pod("lake", 1)) or 0) > 0,
-                          300, every=5)
+    # A range is home once its row is in database 1, named group 1's: the
+    # driver's rows are in a half group 0 holds by then, and group 1's
+    # other half holds none to count (CI 43626539705).
+    lake_in_one = happens(lambda: int(psql(
+        "select count(*) from lake_partition where writer_group = 1 and closed_at is null",
+        pod=database_pod("lake", 1)) or 0) > 0, 300, every=5)
     s.check(lake_in_one, "rebalance: group 1's lake ranges moved to database 1 by the count's change")
     # Written where each head is until moved home (ruled 2026-11-14): from
     # every component ready at two databases until the moves home are done,
