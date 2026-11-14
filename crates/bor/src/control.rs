@@ -59,6 +59,15 @@ pub fn journal_owed(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
 /// One record journalled in `~control`, the book's own act: whether it was
 /// journalled now (false where it was already).
 pub fn journal_one(bus: &Bus, store: &dyn Store, record: &Owed) -> Result<bool, StoreError> {
+    // Where another group's writer holds `control`: said so, never acted
+    // on, so the request this member answers is never handed to group 0
+    // in its place (step 3d).
+    if !store.writes(CONTROL_ACCOUNT) {
+        return Err(StoreError::NotOwned {
+            partition: crate::store::CONTROL_PARTITION.to_string(),
+            group: 0,
+        });
+    }
     let now = bus.clock().now_ns();
     let ctx = Context {
         instance_id: bus.instance_id().to_string(),
