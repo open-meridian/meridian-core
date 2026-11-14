@@ -355,6 +355,27 @@ pub fn mark_of(watermark: Option<&Watermark>) -> Option<Mark> {
     })
 }
 
+/// The watermark a read of `account_id` is answered at (step 3d): its own
+/// partition's head alone where the book has several, since a record of the
+/// account is numbered in its partition and no other's number is comparable
+/// with it. A follower that read an account with nothing to hand on is had
+/// to its partition's head, never another partition's (found by e2e-orders
+/// at two partitions: a venue's SDK took P0's head for an account in P1, and
+/// passed over the account's first placement as had). No partition where
+/// the account is not placed yet; every partition for a read of no account,
+/// and with one partition, as ever.
+pub fn watermark_for(store: &dyn Store, account_id: &str, mark: &Mark) -> Watermark {
+    if account_id.is_empty() || store.partition_count() < 2 {
+        return watermark_of(mark);
+    }
+    let own: Mark = store
+        .partition_of(account_id)
+        .and_then(|partition| mark.get(&partition).map(|head| (partition, *head)))
+        .into_iter()
+        .collect();
+    watermark_of(&own)
+}
+
 pub fn watermark_of(mark: &Mark) -> Watermark {
     Watermark {
         partitions: mark

@@ -47,8 +47,8 @@ use prost::Message;
 
 use crate::decide::{self, Context, Made, RecordSays};
 use crate::store::{
-    mark_of, page_limit, watermark_of, Acted, AttributesRead, BreaksRead, Decided, FiguresRead,
-    PositionsRead, Scope, Store, StoreError,
+    mark_of, page_limit, Acted, AttributesRead, BreaksRead, Decided, FiguresRead, PositionsRead,
+    Scope, Store, StoreError,
 };
 
 pub use meridian_clock::Clock;
@@ -1277,7 +1277,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListPositionsReply {
                 positions: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1312,7 +1316,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListBreaksReply {
                 breaks: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1346,7 +1354,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListAccountFiguresReply {
                 figures: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1393,7 +1405,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     })
                     .collect(),
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             }
             .encode_to_vec(),
         ))

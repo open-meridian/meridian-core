@@ -1401,7 +1401,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             .map_err(|failed| failed.on_the_bus())?;
         let mut reply = ListOrdersReply {
             orders: page.orders,
-            as_of: Some(watermark_of(&page.as_of)),
+            as_of: Some(crate::store::watermark_for(
+                reading.as_ref(),
+                &request.account_id,
+                &page.as_of,
+            )),
             next_cursor: page.next_cursor,
             placements: page.placements,
             executions: page.executions,
@@ -1487,7 +1491,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             "meridian.v1.ListLocatesReply".to_string(),
             ListLocatesReply {
                 locates: page.records,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
                 next_cursor: page.next_cursor,
             }
             .encode_to_vec(),

@@ -39,8 +39,8 @@ use crate::booking::{self, ChildMove, MemberView};
 use crate::decide::{Context, Made};
 use crate::service::{command_store, context_of, decode, references, scope_of, Clock};
 use crate::store::{
-    mark_of, page_limit, watermark_of, Acted, AlertsRead, AttributesRead, BookingsRead, Decided,
-    Record, Scope, Store, StoreError, CONTROL_ACCOUNT,
+    mark_of, page_limit, Acted, AlertsRead, AttributesRead, BookingsRead, Decided, Record, Scope,
+    Store, StoreError, CONTROL_ACCOUNT,
 };
 
 pub const SET_ALLOCATION_INSTRUCTION: &str = "platform.book.command.set-allocation-instruction";
@@ -1345,7 +1345,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             .map_err(|failed| failed.on_the_bus())?;
         let mut reply = ListBookingsReply {
             bookings: page.records,
-            as_of: Some(watermark_of(&page.as_of)),
+            as_of: Some(crate::store::watermark_for(
+                reading.as_ref(),
+                &request.account_id,
+                &page.as_of,
+            )),
             next_cursor: page.next_cursor,
         };
         meridian_domain::money::fill_known(&mut reply);
@@ -1376,7 +1380,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             "meridian.v1.ListAlertsReply".to_string(),
             ListAlertsReply {
                 alerts: page.records,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
                 next_cursor: page.next_cursor,
             }
             .encode_to_vec(),

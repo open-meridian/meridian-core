@@ -195,7 +195,12 @@ def run():
 
     # 1. Set up. The account the orders are in is granted to the desk's
     # instance, which may map it to a venue account code (W6.30, W11.22).
-    account = runner("account", "Orders fund", "--instance", "desk").strip().splitlines()[-1]
+    # Placed by its owner label in P0 (step 3d), as step 11's funds are, so
+    # P0 numbers far past P1 by step 11: a follower that took one
+    # partition's number for another's would pass over the block's
+    # placement in P1, every run rather than by chance.
+    account = runner("account", "Orders fund", "owner=Pension trust",
+                     "--instance", "desk").strip().splitlines()[-1]
     elsewhere = runner("account", "Elsewhere", "--instance", "pm").strip().splitlines()[-1]
     # The portfolio plugin on All accounts; the desk and compliance on the
     # orders' account alone, so Elsewhere is outside the desk's write scope.
@@ -432,8 +437,14 @@ def run():
     must(block.get("state") == "ORDER_STATE_RELEASED", f"step 11, the block released on creation: {block}")
     page("desk", "write", f"/claim?order={block['order_id']}")
     page("desk", "write", f"/place?order={block['order_id']}&quantity=10&connectivity=venue&code=SIM-BLOCK-1")
-    until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
-        order_of(orders("desk"), block["order_id"])), "step 11, the block was not filled")
+    try:
+        until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
+            order_of(orders("desk"), block["order_id"])), "step 11, the block was not filled")
+    except Failed:
+        # What the venue heard and the block as it stands, for the log.
+        log(f"step 11 diagnosis: venue {page('venue', 'admin', '/heard')}")
+        log(f"step 11 diagnosis: block {order_of(orders('desk'), block['order_id'])}")
+        raise
     fills = page("desk", "write", f"/executions?account={block_account}&order={block['order_id']}")["executions"]
     gross = {"6": "1364.46", "4": "909.64"}
     booked = page("desk", "write",

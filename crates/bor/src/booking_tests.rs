@@ -1745,3 +1745,77 @@ async fn with_one_partition_a_booking_is_unchanged() {
         }
     }
 }
+
+/// Step 3d (found by e2e-orders at two partitions): a read of one account is
+/// answered at its own partition's head alone, never another partition's.
+/// A follower that reads an account holding nothing yet is had to the
+/// watermark's partition, and a venue's SDK took P0's head for an account
+/// in P1. It then passed over the account's first placement in P1, numbered
+/// far below P0's head, as had. A read of no account names every partition,
+/// as ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_of_one_account_is_answered_at_its_own_partitions_head() {
+    let w = wired_with(MemoryStore::new().with_partitions(2));
+    let others: Vec<String> = (10..40).map(|n| format!("ACC-{n}")).collect();
+    for other in &others {
+        account(&w, other).await;
+    }
+    let partition = |account: &str| w.store.partition_of(account).unwrap();
+    let (in_p0, in_p1): (Vec<&String>, Vec<&String>) = others
+        .iter()
+        .partition(|account| partition(account) == "P0");
+    // P0 well ahead of P1, as a busier partition is.
+    for account in &in_p0 {
+        account_again(&w, account).await;
+    }
+    let quiet = in_p1[0].as_str();
+    let ask = |account: &str| ListOrdersRequest {
+        account_id: account.into(),
+        ..Default::default()
+    };
+    let read = |bytes: Vec<u8>| ListOrdersReply::decode(&bytes[..]).unwrap().as_of.unwrap();
+    let mine = read(
+        send_from(
+            &w.bus,
+            LIST_ORDERS,
+            "meridian.v1.ListOrdersRequest",
+            &ask(quiet),
+            &anywhere(TRADER),
+        )
+        .await
+        .unwrap(),
+    );
+    let heads = w.store.heads().unwrap();
+    assert!(heads["P0"] > heads["P1"], "P0 is ahead: {heads:?}");
+    assert_eq!(
+        mine.partitions
+            .iter()
+            .map(|held| (held.partition.as_str(), held.sequence))
+            .collect::<Vec<_>>(),
+        [("P1", heads["P1"])],
+        "its own partition's head alone"
+    );
+    let every = read(
+        send_from(
+            &w.bus,
+            LIST_ORDERS,
+            "meridian.v1.ListOrdersRequest",
+            &ask(""),
+            &anywhere(TRADER),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(every.partitions.iter().any(|held| held.partition == "P0"));
+    assert!(every.partitions.iter().any(|held| held.partition == "P1"));
+}
+
+/// An account's attribute set again, one more entry in its partition.
+async fn account_again(w: &Wired, account: &str) {
+    attribute(
+        w,
+        account,
+        set_account_attribute_request::Attribute::BaseCurrencyCode("EUR".into()),
+    )
+    .await;
+}
