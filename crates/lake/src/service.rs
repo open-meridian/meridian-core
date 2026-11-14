@@ -2591,6 +2591,25 @@ impl Lake {
                         ),
                     );
                 }
+                // A dataset whose ranges span groups (step 3d; spec 6.1,
+                // ruling 2 of 2026-11-14): every group's consumer sees the
+                // whole write and commits its own ranges' rows alone; the
+                // rest are their owners' consumers' to commit.
+                let rows = if self.groups.several() {
+                    let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+                    let mine: Vec<Observation> = rows
+                        .into_iter()
+                        .zip(owners)
+                        .filter(|(_, group)| *group == self.groups.mine())
+                        .map(|(row, _)| row)
+                        .collect();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    mine
+                } else {
+                    rows
+                };
                 if config.licence(&dataset).kept {
                     let latest = rows.iter().map(|row| row.meta().valid_from_ns).max();
                     if let Some(latest) = latest {

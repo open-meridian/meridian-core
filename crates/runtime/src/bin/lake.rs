@@ -150,7 +150,12 @@ fn run() -> Result<(), String> {
                 // Its own database's pool, with the write-ahead writer's;
                 // every other's for its reads.
                 PostgresStore::connect(url, if d == own { pool } else { 8 })
-                    .map(|store| store.with_groups(groups).with_databases(databases.count()))
+                    .map(|store| {
+                        store
+                            .with_groups(groups)
+                            .with_databases(databases.count())
+                            .in_database(d)
+                    })
                     .map_err(|failed| failed.to_string())
             },
             |store| {
@@ -623,12 +628,16 @@ fn lake_replica(
     for (d, url) in databases.urls().iter().enumerate().skip(1) {
         let replica = var(&meridian_changes::databases::read_url_var("lake", d as u32))
             .unwrap_or_else(|| url.clone());
-        stores.push(Arc::new(wait_for_store(
-            &format!("the lake's read replica of database {d}"),
-            &replica,
-            connect,
-            verify,
-        )?));
+        // Each answering the ranges its database's groups write (step 3d).
+        stores.push(Arc::new(
+            wait_for_store(
+                &format!("the lake's read replica of database {d}"),
+                &replica,
+                connect,
+                verify,
+            )?
+            .in_database(d as u32),
+        ));
     }
     Ok(Some(Arc::new(meridian_lake::spread::Spread::new(
         stores, groups,

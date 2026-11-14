@@ -86,7 +86,26 @@ pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> S
 
 /// Whether a write taken from the stream is this writer group's to commit:
 /// its dataset's owner is the group; one naming no dataset is group 0's.
+///
+/// A dataset whose ranges span groups (step 3d; ruling 2 of 2026-11-14) is
+/// every such group's: each commits its own ranges' rows of the write and
+/// skips the rest, which their owner's consumer commits from the same
+/// stream. The group owning the dataset's own partition answers it.
 fn ours(groups: meridian_changes::groups::Groups, write: &Taken) -> bool {
+    if write.dataset.is_empty() {
+        groups.holds_control()
+    } else {
+        groups.owns(&write.dataset)
+            || crate::range::leaves(&groups.ranges_of(&write.dataset))
+                .iter()
+                .any(|(_, group)| *group == groups.mine())
+    }
+}
+
+/// Whether this group answers a write it took: the group owning the
+/// write's dataset's own partition (its full range, split or not), or
+/// group 0 for one naming none.
+fn answers(groups: meridian_changes::groups::Groups, write: &Taken) -> bool {
     if write.dataset.is_empty() {
         groups.holds_control()
     } else {
@@ -235,7 +254,8 @@ impl Writer {
                     .find(|run| run.holds(after))
                     .cloned()
             });
-            sent_to.push(write.reply_to);
+            let answering = answers(groups, &write);
+            sent_to.push(write.reply_to.filter(|_| answering));
             writes.push(Written {
                 topic: write.topic,
                 envelope: write.envelope,
@@ -836,6 +856,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dataset whose ranges span groups is taken by each group owning one
+    /// of its open ranges, each committing its own rows; the group of its
+    /// own partition answers (step 3d; spec 6.1).
+    #[test]
+    fn a_dataset_split_across_groups_is_taken_by_each_and_answered_by_one() {
+        use meridian_changes::groups::{owner, Groups};
+        let dataset = (0..)
+            .map(|n| format!("kraken-1:w{n}"))
+            .find(|dataset| owner(dataset, 2) == 0)
+            .unwrap();
+        let write = Taken {
+            sequence: 1,
+            at_ns: 0,
+            topic: String::new(),
+            reply_to: Some("_INBOX.1".into()),
+            after: None,
+            envelope: Envelope::default(),
+            dataset: dataset.clone(),
+        };
+        let (zero, one) = (Groups::new(0, 2).unwrap(), Groups::new(1, 2).unwrap());
+        assert!(ours(zero, &write) && !ours(one, &write), "whole: its owner's");
+        for groups in [zero, one] {
+            groups.assign(&dataset, Some(0));
+            groups.assign(&format!("{dataset}/0000-7fff"), Some(1));
+            groups.assign(&format!("{dataset}/8000-ffff"), Some(0));
+        }
+        assert!(ours(zero, &write) && ours(one, &write), "split: each group's");
+        assert!(answers(zero, &write) && !answers(one, &write), "answered once");
+    }
 
     /// The stream's leader, stood in: how far it says the stream reached.
     struct Says(u64);

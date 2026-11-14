@@ -101,9 +101,20 @@ impl Spread {
             return 0;
         }
         meridian_changes::databases::of_group(
-            self.groups.owner(crate::range::dataset_of(partition)),
+            self.groups
+                .owner_by(partition, crate::range::dataset_of(partition)),
             self.count(),
         )
+    }
+
+    /// Every database a read of `dataset` asks (step 3d): its own, and each
+    /// its ranges' groups write, as this member last read them.
+    fn databases_of(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
+        let mut out = std::collections::BTreeSet::from([self.of(dataset)]);
+        for (_, group) in self.groups.ranges_of(dataset) {
+            out.insert(meridian_changes::databases::of_group(group, self.count()));
+        }
+        out
     }
 
     fn holding(&self, partition: &str) -> &Arc<PostgresStore> {
@@ -130,10 +141,13 @@ impl Spread {
         sorted.dedup();
         let mut runs: Vec<(u32, Vec<String>)> = Vec::new();
         for dataset in sorted {
-            let d = self.of(&dataset);
-            match runs.last_mut() {
-                Some((at, run)) if *at == d => run.push(dataset),
-                _ => runs.push((d, vec![dataset])),
+            // A dataset whose ranges are in several databases is read from
+            // each, each answering its own ranges (step 3d).
+            for d in self.databases_of(&dataset) {
+                match runs.last_mut() {
+                    Some((at, run)) if *at == d => run.push(dataset.clone()),
+                    _ => runs.push((d, vec![dataset.clone()])),
+                }
             }
         }
         runs
@@ -243,6 +257,41 @@ impl Spread {
         if runs.len() <= 1 {
             let d = runs.first().map_or(0, |(d, _)| *d);
             return self.database(d).read_each(query, each);
+        }
+        // A dataset read from several databases (step 3d): a key last
+        // written before its range moved may be answered by the source's
+        // database from the range's parent and by the target's once
+        // restated there -- the higher version is the latest.
+        let spans = {
+            let mut seen = std::collections::BTreeSet::new();
+            runs.iter()
+                .flat_map(|(_, datasets)| datasets.iter())
+                .any(|dataset| !seen.insert(dataset.clone()))
+        };
+        if spans && matches!(query.when, crate::store::When::Latest { .. }) {
+            let mut latest: BTreeMap<(String, i16, String), Observation> = BTreeMap::new();
+            for (d, datasets) in runs {
+                let mut part = query.clone();
+                part.datasets = datasets;
+                self.database(d).read_each(&part, &mut |row| {
+                    let key = (
+                        row.dataset().to_string(),
+                        row.data_type().code(),
+                        row.meta().row_key.clone(),
+                    );
+                    match latest.get(&key) {
+                        Some(held) if held.meta().version >= row.meta().version => {}
+                        _ => {
+                            latest.insert(key, row);
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            for row in latest.into_values() {
+                each(row)?;
+            }
+            return Ok(());
         }
         for (d, datasets) in runs {
             let mut part = query.clone();
@@ -405,7 +454,16 @@ impl Store for Spread {
     }
 
     fn heads(&self) -> Result<BTreeMap<String, u64>> {
-        self.union_maps(|store| store.heads())
+        // A range moved between databases has a head in each, its source's
+        // stopped at the switch: the furthest is its own (step 3d).
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for store in &self.stores {
+            for (partition, head) in store.heads()? {
+                let at = out.entry(partition).or_insert(head);
+                *at = (*at).max(head);
+            }
+        }
+        Ok(out)
     }
 
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
@@ -537,7 +595,17 @@ impl Store for Spread {
         after: u64,
         most: usize,
     ) -> Result<Vec<Observation>> {
-        self.holding(dataset).dated_on(dataset, dates, after, most)
+        let databases = self.databases_of(dataset);
+        if databases.len() <= 1 {
+            return self.holding(dataset).dated_on(dataset, dates, after, most);
+        }
+        let mut out = Vec::new();
+        for d in databases {
+            out.extend(self.database(d).dated_on(dataset, dates, after, most)?);
+        }
+        out.sort_by_key(|row| row.meta().sequence);
+        out.truncate(most);
+        Ok(out)
     }
 
     fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()> {
@@ -579,8 +647,16 @@ impl Store for Spread {
         as_of_ns: i64,
         published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
-        self.holding(dataset)
-            .read_dataset(dataset, data_type, as_of_ns, published_as_of_ns)
+        let mut out = Vec::new();
+        for d in self.databases_of(dataset) {
+            out.extend(self.database(d).read_dataset(
+                dataset,
+                data_type,
+                as_of_ns,
+                published_as_of_ns,
+            )?);
+        }
+        Ok(out)
     }
 
     fn read_dataset_each(
@@ -590,8 +666,11 @@ impl Store for Spread {
         as_of_ns: i64,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        self.holding(dataset)
-            .read_dataset_each(dataset, data_type, as_of_ns, each)
+        for d in self.databases_of(dataset) {
+            self.database(d)
+                .read_dataset_each(dataset, data_type, as_of_ns, each)?;
+        }
+        Ok(())
     }
 
     fn read_dataset_versions(
@@ -599,12 +678,22 @@ impl Store for Spread {
         dataset: &str,
         data_type: DataType,
     ) -> Result<Vec<Observation>> {
-        self.holding(dataset)
-            .read_dataset_versions(dataset, data_type)
+        let mut out = Vec::new();
+        for d in self.databases_of(dataset) {
+            out.extend(self.database(d).read_dataset_versions(dataset, data_type)?);
+        }
+        Ok(out)
     }
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
-        self.holding(dataset).row_version(dataset, row_key, version)
+        // The key's range is in one of them.
+        for d in self.databases_of(dataset) {
+            let found = self.database(d).row_version(dataset, row_key, version)?;
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn assess(&self, assessments: &[Assessment]) -> Result<()> {

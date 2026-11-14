@@ -5762,12 +5762,14 @@ fn spread(urls: &[String], group: u32) -> meridian_lake::spread::Spread {
     let groups = meridian_changes::groups::Groups::new(group, 2).unwrap();
     let stores = urls
         .iter()
-        .map(|url| {
+        .enumerate()
+        .map(|(d, url)| {
             Arc::new(
                 PostgresStore::connect(url, 4)
                     .unwrap()
                     .with_groups(groups)
-                    .with_databases(urls.len() as u32),
+                    .with_databases(urls.len() as u32)
+                    .in_database(d as u32),
             )
         })
         .collect();
@@ -6088,8 +6090,8 @@ fn two_groups_and_a_split(
 /// group a NotOwned names. Says how many committed, each refusal, and the
 /// longest wait between two commits.
 fn writing_range(
-    zero: Arc<PostgresStore>,
-    one: Arc<PostgresStore>,
+    zero: Arc<dyn Store>,
+    one: Arc<dyn Store>,
     dataset: String,
     subject: String,
     tag: &'static str,
@@ -6186,16 +6188,16 @@ fn a_lake_range_moved_under_load_keeps_its_chain_and_its_sibling_writes_on() {
     let before = zero.heads().unwrap()[&lower];
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let moving = writing_range(
-        zero.clone(),
-        one.clone(),
+        zero.clone() as Arc<dyn Store>,
+        one.clone() as Arc<dyn Store>,
         dataset.clone(),
         low.clone(),
         "l",
         stop.clone(),
     );
     let sibling = writing_range(
-        zero.clone(),
-        one.clone(),
+        zero.clone() as Arc<dyn Store>,
+        one.clone() as Arc<dyn Store>,
         dataset.clone(),
         high.clone(),
         "h",
@@ -6469,4 +6471,173 @@ fn an_aliased_key_restated_after_a_merge_is_routed_to_its_anchors_range() {
         .unwrap()
         .get(0);
     assert_eq!(in_upper, 0, "nothing in the wrong range");
+}
+
+/// A lake range moved to a writer group of another database under write
+/// load (step 3d; sections 6.4 and 6.8): the target's database first
+/// copies the range, its lineage's rows its anchors hold and its keys'
+/// latest versions, then the rest up to the source's close under the
+/// switch; the subject's chain reads whole in the target's database across
+/// the split and the move; its sibling writes on in the source's; and a
+/// read through either member answers each range from the database it is
+/// written in, the moved range's latest from the target's alone.
+#[test]
+fn a_lake_range_moved_between_databases_is_copied_and_its_chain_reads_whole() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let zero = Arc::new(meridian_lake::spread::Spread::new(
+        zeros.clone(),
+        zeros[0].groups(),
+    ));
+    let one = Arc::new(meridian_lake::spread::Spread::new(
+        ones.clone(),
+        ones[0].groups(),
+    ));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:x{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of("lake-across");
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    zero.record(&dataset, vec![trade(&dataset, "split-l", &low, 12)], 1_200)
+        .unwrap();
+    zeros[0].pin_owners().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    let lower = format!("{dataset}/0000-7fff");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moving = writing_range(
+        zero.clone() as Arc<dyn Store>,
+        one.clone() as Arc<dyn Store>,
+        dataset.clone(),
+        low.clone(),
+        "l",
+        stop.clone(),
+    );
+    let sibling = writing_range(
+        zero.clone() as Arc<dyn Store>,
+        one.clone() as Arc<dyn Store>,
+        dataset.clone(),
+        high.clone(),
+        "h",
+        stop.clone(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mover = Mover::new(
+        zeros.clone(),
+        zeros[0].groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(5),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let began = std::time::Instant::now();
+    let ended = mover
+        .run(
+            &lower,
+            1,
+            &Asked {
+                by_hand: true,
+                moved_by: "https://directory.example.org|8812".into(),
+                reason: "the lower half to database 1".into(),
+            },
+        )
+        .unwrap();
+    let took = began.elapsed();
+    for store in ones.iter() {
+        store.read_owners().unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let (moved_rows, refused, moved_wait) = moving.join().unwrap();
+    let (sibling_rows, sibling_refused, sibling_wait) = sibling.join().unwrap();
+    assert!(
+        refused.is_empty() && sibling_refused.is_empty(),
+        "{refused:?} {sibling_refused:?}"
+    );
+    println!(
+        "lake range move across databases: warm and switch {took:?}; the moved range's longest \
+         wait {moved_wait:?}, its sibling's {sibling_wait:?}; {moved_rows} and {sibling_rows} rows"
+    );
+    let Ended::Moved(moved) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!(
+        moved.epoch,
+        ones[1].epoch(),
+        "group 1's own epoch in its database"
+    );
+    // The target's database reads the subject's chain whole: the parent's
+    // rows before the split, the range's own, and the target's after.
+    let chain = chain_of(&urls[1], &dataset, &low);
+    assert!(
+        chain.first().is_some_and(|(p, _, _)| p == &dataset),
+        "{chain:?}"
+    );
+    assert!(chain.iter().any(|(_, _, e)| *e as u64 == moved.epoch));
+    assert!(chain
+        .last()
+        .is_some_and(|(p, _, e)| p == &lower && *e as u64 == moved.epoch));
+    // Its sibling stays and writes on in database 0.
+    chain_of(&urls[0], &dataset, &high);
+    // A read through either member: each range from its own database.
+    for member in [&zero, &one] {
+        let read = |subject: &str| {
+            member
+                .read(&Query {
+                    datasets: vec![dataset.clone()],
+                    data_type: DataType::Trade,
+                    subjects: vec![subject.to_string()],
+                    kinds: vec![],
+                    interval_ns: 0,
+                    when: When::Latest { at_ns: 0 },
+                    as_of_ns: 0,
+                    published_as_of_ns: 0,
+                    latest_only: false,
+                })
+                .unwrap()
+        };
+        let lows = read(&low);
+        let mut keys: Vec<&str> = lows.iter().map(|row| row.meta().row_key.as_str()).collect();
+        let whole = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), whole, "each key once, from one database");
+        assert_eq!(whole as u64, moved_rows + 2, "every key of the moved range");
+        assert_eq!(read(&high).len() as u64, sibling_rows + 1);
+    }
+    // The moved range's head is the target's: past the source's close.
+    assert!(one.heads().unwrap()[&lower] > zeros[0].heads().unwrap()[&lower]);
 }

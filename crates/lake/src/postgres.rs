@@ -114,6 +114,11 @@ pub struct PostgresStore {
     /// section 6.4): it follows that database's timeline, as group 0 does
     /// database 0's.
     leads_database: bool,
+    /// Its database's number and the lake's count of databases (step 3d;
+    /// section 6.4): a read here answers the ranges whose group writes this
+    /// database, so a range moved out of it is read where it went.
+    database: u32,
+    databases: u32,
     /// The range and month tables of `lake_row` this store has seen made
     /// (step 3d; section 6.2): never looked for again. Let go whenever a
     /// batch fails, so one a restore took away is made again.
@@ -364,6 +369,8 @@ impl PostgresStore {
             groups: meridian_changes::groups::Groups::one(),
             adopting: std::sync::Mutex::new(()),
             leads_database: false,
+            database: 0,
+            databases: 1,
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -2878,7 +2885,7 @@ impl Store for PostgresStore {
             // A range named reads on into every range split from it since,
             // each numbering past the sequence named (step 3d; section 6.1),
             // where the watermark does not name that range itself.
-            let every = partitions_of(&mut tx, &query.datasets)?;
+            let every = self.served_partitions(&mut tx, &query.datasets)?;
             let mut asked: BTreeMap<String, i64> = BTreeMap::new();
             for (named, sequence) in watermark {
                 if query
@@ -2999,7 +3006,7 @@ impl Store for PostgresStore {
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
         // Every range of the datasets: the read reads their tables alone.
-        let partitions = partitions_of(&mut tx, &query.datasets)?;
+        let partitions = self.served_partitions(&mut tx, &query.datasets)?;
         let cut_off = if query.as_of_ns == 0 {
             i64::MAX
         } else {
@@ -3204,7 +3211,7 @@ impl Store for PostgresStore {
         // Its heads from this snapshot, where its thread asked (stage C).
         note_snapshot(&mut tx, datasets)?;
         let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
-        let partitions = partitions_of(&mut tx, datasets)?;
+        let partitions = self.served_partitions(&mut tx, datasets)?;
         let rows = tx
             .query(LISTING, &[&datasets, &subjects, &cut_off, &partitions])
             .map_err(unavailable)?;
@@ -3720,7 +3727,7 @@ impl Store for PostgresStore {
 
     fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>> {
         let mut conn = self.conn()?;
-        let partitions = partitions_of(&mut *conn, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let row = conn
             .query_one(
                 "SELECT min(business_date)::text, max(business_date)::text FROM lake_row
@@ -3754,7 +3761,7 @@ impl Store for PostgresStore {
                 .start()
                 .map_err(unavailable)?;
             let code = data_type.code();
-            let partitions = partitions_of(&mut tx, &[dataset.to_string()])?;
+            let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
             let portal = tx
                 .bind(
                     "SELECT body FROM lake_row
@@ -3785,7 +3792,7 @@ impl Store for PostgresStore {
             as_assessed(&mut out, &assessments, as_of_ns);
             return Ok(out);
         }
-        let partitions = partitions_of(&mut *conn, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT body FROM lake_row
@@ -3826,7 +3833,7 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
-        let partitions = partitions_of(&mut tx, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
         let portal = tx
             .bind(
                 "SELECT body FROM (
@@ -3866,7 +3873,7 @@ impl Store for PostgresStore {
         data_type: crate::row::DataType,
     ) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = partitions_of(&mut *conn, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT body FROM lake_row
@@ -3902,7 +3909,7 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         // By the key, from where the last chunk ended: each chunk an index
         // range, never the dataset sorted again.
-        let partitions = partitions_of(&mut tx, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
         let mut rows = tx
             .query(
                 "SELECT data_type, body, sequence, row_key FROM lake_row
@@ -4155,7 +4162,7 @@ impl Store for PostgresStore {
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = partitions_of(&mut *conn, &[dataset.to_string()])?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT data_type, body FROM lake_row
@@ -4824,7 +4831,55 @@ impl PostgresStore {
     pub fn with_databases(mut self, count: u32) -> Self {
         self.leads_database =
             meridian_changes::databases::leads(self.groups.mine(), count) && count > 1;
+        self.databases = count.max(1);
         self
+    }
+
+    /// The same store, as database `d` of the lake's (step 3d; section
+    /// 6.4): its reads answer the ranges whose group writes it.
+    pub fn in_database(mut self, d: u32) -> Self {
+        self.database = d;
+        self
+    }
+
+    /// Every partition of `datasets` a read here answers (step 3d; section
+    /// 6.4): with one database, every one; with several, those whose group
+    /// -- its row's `writer_group`, else its dataset's -- writes this
+    /// database. A range moved to another database is read there, and the
+    /// ranges its lineage copied here are read where they stay.
+    fn served_partitions(
+        &self,
+        client: &mut impl GenericClient,
+        datasets: &[String],
+    ) -> Result<Vec<String>> {
+        let every = partitions_of(client, datasets)?;
+        if self.databases <= 1 {
+            return Ok(every);
+        }
+        let named: BTreeMap<String, Option<i32>> = client
+            .query(
+                "SELECT dataset, writer_group FROM lake_partition WHERE dataset = ANY($1)",
+                &[&every],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let count = self.groups.count();
+        Ok(every
+            .into_iter()
+            .filter(|partition| {
+                let dataset = crate::range::dataset_of(partition);
+                let group = named
+                    .get(partition)
+                    .copied()
+                    .flatten()
+                    .map(|group| group as u32)
+                    .filter(|group| *group < count)
+                    .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count));
+                meridian_changes::databases::of_group(group, self.databases) == self.database
+            })
+            .collect())
     }
 
     /// Every alias this database keeps: `(replaced, stays, heard_at_ns)`.

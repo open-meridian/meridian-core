@@ -46,8 +46,22 @@ fn range_tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Opti
     else {
         return Ok(None);
     };
-    // Its own rows' last: led by the range, then its dataset and sequence,
-    // which each month's `_seq` index answers.
+    let (held, held_digest, held_at_ns) = held_of(client, partition)?;
+    Ok(Some(RangeTip {
+        head: row.get::<_, i64>(0).max(0) as u64,
+        epoch: row.get::<_, i64>(1) as u64,
+        writer_group: row.get::<_, Option<i32>>(2).map(|group| group as u32),
+        closed: row.get::<_, Option<i64>>(3).is_some(),
+        held,
+        held_digest,
+        held_at_ns,
+    }))
+}
+
+/// The last row of `partition`'s own this database holds: its sequence,
+/// digest and recording time; zeros where it holds none. Led by the range,
+/// then its dataset and sequence, which each month's `_seq` index answers.
+fn held_of(client: &mut impl GenericClient, partition: &str) -> Result<(u64, Vec<u8>, i64)> {
     let held = client
         .query_opt(
             "SELECT sequence, digest, recorded_at_ns FROM lake_row
@@ -56,21 +70,19 @@ fn range_tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Opti
             &[&partition, &crate::range::dataset_of(partition)],
         )
         .map_err(unavailable)?;
-    Ok(Some(RangeTip {
-        head: row.get::<_, i64>(0).max(0) as u64,
-        epoch: row.get::<_, i64>(1) as u64,
-        writer_group: row.get::<_, Option<i32>>(2).map(|group| group as u32),
-        closed: row.get::<_, Option<i64>>(3).is_some(),
-        held: held
-            .as_ref()
-            .map_or(0, |row| row.get::<_, i64>(0).max(0) as u64),
-        held_digest: held
-            .as_ref()
-            .and_then(|row| row.get::<_, Option<Vec<u8>>>(1))
-            .unwrap_or_default(),
-        held_at_ns: held.as_ref().map_or(0, |row| row.get(2)),
+    Ok(held.map_or((0, Vec::new(), 0), |row| {
+        (
+            row.get::<_, i64>(0).max(0) as u64,
+            row.get::<_, Option<Vec<u8>>>(1).unwrap_or_default(),
+            row.get(2),
+        )
     }))
 }
+
+/// A row's anchor in SQL: its own, else -- a row kept before 3d -- the
+/// first two bytes of SHA-256 over its first subject, as `range::hash`.
+const ANCHOR_SQL: &str =
+    "coalesce(anchor, ('x' || left(encode(sha256(convert_to(subject, 'UTF8')), 'hex'), 4))::bit(16)::int)";
 
 /// The epoch writer group `group` commits under in this database: the
 /// control partition's for group 0, its `lake_writer_group` row's past it
@@ -118,6 +130,13 @@ impl PostgresStore {
     pub fn range_tip(&self, partition: &str) -> Result<Option<RangeTip>> {
         let mut conn = self.conn()?;
         range_tip_of(&mut *conn, partition)
+    }
+
+    /// The last row of `partition`'s own this database holds: its sequence
+    /// and recording time (a move's target, warming).
+    pub fn range_tip_held(&self, partition: &str) -> Result<(u64, i64)> {
+        let (held, _, at_ns) = held_of(&mut *self.conn()?, partition)?;
+        Ok((held, at_ns))
     }
 
     /// Every range this database holds, open and closed, with the group
@@ -219,11 +238,6 @@ impl PostgresStore {
         let began = std::time::Instant::now();
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
         let same = std::ptr::eq(self, to);
-        if !same {
-            return Err(StoreError::Unavailable(format!(
-                "range {partition}: a move between the lake's databases is not built yet"
-            )));
-        }
         let timed_out = |failed: &postgres::Error| {
             matches!(
                 failed.code(),
@@ -265,8 +279,22 @@ impl PostgresStore {
         }
         let source = range_tip_of(&mut tx, partition)?.unwrap_or_default();
         let closing = source.head;
-        // The target at N: the same rows, in this database.
-        let held = source.clone();
+        // The target at N: the same rows where it is this database; else
+        // the range's rows copied up to N while the source is held.
+        let held = if same {
+            source.clone()
+        } else {
+            let copied = held_of(&mut *to.conn()?, partition)?.0;
+            to.copy_range_from(self, partition, copied)?;
+            let (held, held_digest, held_at_ns) = held_of(&mut *to.conn()?, partition)?;
+            RangeTip {
+                head: closing,
+                held,
+                held_digest,
+                held_at_ns,
+                ..source.clone()
+            }
+        };
         if left(began).is_zero() {
             return Ok(Switched::TimedOut);
         }
@@ -282,13 +310,48 @@ impl PostgresStore {
                 at_ns: meridian_changes::now_ns(),
             });
         }
-        let epoch = group_epoch(&mut tx, target)?;
+        let epoch = if same {
+            group_epoch(&mut tx, target)?
+        } else {
+            // The target's row at the source's close, under its group's
+            // epoch, named its own -- before the source lets go, so no
+            // write finds neither owning.
+            to.open_moved_in(self, partition, closing, target)?
+        };
+        let epoch_here = if same { epoch } else { source.epoch };
+        if !same {
+            // The latest versions in the range itself are the target's to
+            // keep now: this database's let go, so a latest read here never
+            // answers one the target has replaced. Its rows stay, read where
+            // it went; a key last written before the split stays answered
+            // from its parent here, and the reader keeps the higher version
+            // where the target has restated it since.
+            tx.execute(
+                "DELETE FROM lake_latest WHERE dataset = $1 AND partition = $2",
+                &[&crate::range::dataset_of(partition), &partition],
+            )
+            .map_err(unavailable)?;
+        }
         let switched = tx
             .execute(
                 "UPDATE lake_partition SET writer_group = $2, epoch = $3 WHERE dataset = $1",
-                &[&partition, &(target as i32), &(epoch as i64)],
+                &[&partition, &(target as i32), &(epoch_here as i64)],
             )
             .and_then(|_| tx.commit());
+        if switched.is_err() && !same {
+            // The source still owns: the target's row named it again, so
+            // neither writes the range twice.
+            let from = source.writer_group.unwrap_or_else(|| {
+                self.groups
+                    .owner_by(partition, crate::range::dataset_of(partition))
+            });
+            to.conn()?
+                .execute(
+                    "UPDATE lake_partition SET writer_group = $2 WHERE dataset = $1",
+                    &[&partition, &(from as i32)],
+                )
+                .map_err(unavailable)?;
+        }
         match switched {
             Ok(_) => {}
             Err(failed) if timed_out(&failed) => return Ok(Switched::TimedOut),
@@ -322,5 +385,219 @@ impl PostgresStore {
         self.log_control(&mut tx, &entries)?;
         tx.commit().map_err(unavailable)?;
         Ok(())
+    }
+}
+
+impl PostgresStore {
+    /// Range `partition` copied from `from`'s database into this one (step
+    /// 3d; section 6.4, "a move between databases copies the data"): from
+    /// 0, the snapshot -- its rows, its lineage's ranges and the rows of
+    /// theirs its anchors place in it, so each subject's previous sequence
+    /// is found here, and its keys' latest versions; after, the change log
+    /// -- its own rows past `after`, and the latest versions they made.
+    /// Each row by its keys, so a copy made again adds nothing. Answers the
+    /// last sequence of the range's own copied.
+    pub fn copy_range_from(
+        &self,
+        from: &PostgresStore,
+        partition: &str,
+        after: u64,
+    ) -> Result<u64> {
+        use std::io::{Read, Write};
+        let dataset = crate::range::dataset_of(partition);
+        let (_, lo, hi) = crate::range::parse(partition);
+        let quote = |text: &str| text.replace('\'', "''");
+        let mut source = from.conn()?;
+        let lineage = lineage(&mut *source, partition)?;
+        let ancestors: Vec<String> = lineage.iter().skip(1).cloned().collect();
+        let list = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| format!("'{}'", quote(name)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut rows_sql = format!(
+            "SELECT * FROM lake_row WHERE dataset = '{d}' AND partition = '{p}' AND sequence > {after}",
+            d = quote(dataset),
+            p = quote(partition)
+        );
+        if after == 0 && !ancestors.is_empty() {
+            // The lineage's rows this range's anchors hold: a row kept
+            // before 3d is its dataset's full range's.
+            let root = ancestors.contains(&dataset.to_string());
+            rows_sql.push_str(&format!(
+                " UNION ALL SELECT * FROM lake_row WHERE dataset = '{d}'
+                    AND (partition IN ({a}){null})
+                    AND {ANCHOR_SQL} BETWEEN {lo} AND {hi}",
+                d = quote(dataset),
+                a = list(&ancestors),
+                null = if root { " OR partition IS NULL" } else { "" },
+            ));
+        }
+        let mut copy = |sql: &str| -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            source
+                .copy_out(&format!("COPY ({sql}) TO STDOUT (FORMAT binary)"))
+                .map_err(unavailable)?
+                .read_to_end(&mut out)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            Ok(out)
+        };
+        let rows = copy(&rows_sql)?;
+        // The lineage's ranges, closed, each named the group it was; and the
+        // keys' latest versions the copied rows are.
+        let partitions = if after == 0 && !ancestors.is_empty() {
+            copy(&format!(
+                "SELECT * FROM lake_partition WHERE dataset IN ({})",
+                list(&ancestors)
+            ))?
+        } else {
+            Vec::new()
+        };
+        let latest = copy(&format!(
+            "SELECT * FROM lake_latest WHERE dataset = '{d}' AND anchor BETWEEN {lo} AND {hi}{since}",
+            d = quote(dataset),
+            since = if after == 0 {
+                String::new()
+            } else {
+                format!(" AND partition = '{}' AND sequence > {after}", quote(partition))
+            }
+        ))?;
+        let copied: i64 = source
+            .query_one(
+                "SELECT coalesce(max(sequence), $3) FROM lake_row
+                  WHERE dataset = $1 AND partition = $2",
+                &[&dataset, &partition, &(after as i64)],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        drop(source);
+        let mut conn = self.conn()?;
+        let load = |conn: &mut Connection, table: &str, like: &str, bytes: &[u8]| -> Result<()> {
+            conn.batch_execute(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {table} (LIKE {like}); TRUNCATE {table}"
+            ))
+            .map_err(unavailable)?;
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let mut writer = conn
+                .copy_in(&format!("COPY {table} FROM STDIN (FORMAT binary)"))
+                .map_err(unavailable)?;
+            writer
+                .write_all(bytes)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            writer.finish().map_err(unavailable)?;
+            Ok(())
+        };
+        load(&mut conn, "moving_rows", "lake_row", &rows)?;
+        load(&mut conn, "moving_ranges", "lake_partition", &partitions)?;
+        load(&mut conn, "moving_latest", "lake_latest", &latest)?;
+        conn.execute(
+            "UPDATE moving_rows SET partition = dataset WHERE partition IS NULL",
+            &[],
+        )
+        .map_err(unavailable)?;
+        // Each range's and month's table made first, in transactions of
+        // their own (`leaves::ensure_ranges` holds no lock on lake_row).
+        let mut needed: std::collections::BTreeSet<(String, crate::leaves::Month)> =
+            std::collections::BTreeSet::new();
+        for row in conn
+            .query(
+                "SELECT DISTINCT partition, valid_from_ns FROM moving_rows",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            needed.insert((row.get(0), crate::leaves::Month::of(row.get(1))));
+        }
+        let mut ranges: std::collections::BTreeSet<String> =
+            needed.iter().map(|(p, _)| p.clone()).collect();
+        ranges.insert(partition.to_string());
+        {
+            let mut tx = conn.transaction().map_err(unavailable)?;
+            crate::leaves::ensure_ranges(&mut tx, &ranges).map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
+        }
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        crate::leaves::ensure_months(&mut tx, &needed).map_err(unavailable)?;
+        tx.batch_execute(
+            "INSERT INTO lake_partition SELECT * FROM moving_ranges ON CONFLICT (dataset) DO NOTHING;
+             INSERT INTO lake_row SELECT * FROM moving_rows ON CONFLICT DO NOTHING;
+             INSERT INTO lake_latest SELECT * FROM moving_latest
+             ON CONFLICT (dataset, data_type, row_key) DO UPDATE SET
+                partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                version = EXCLUDED.version, valid_from_ns = EXCLUDED.valid_from_ns,
+                anchor = EXCLUDED.anchor, force_partition = EXCLUDED.force_partition,
+                force_sequence = EXCLUDED.force_sequence, force_version = EXCLUDED.force_version,
+                force_published = EXCLUDED.force_published,
+                force_valid_from = EXCLUDED.force_valid_from, subject = EXCLUDED.subject,
+                kind = EXCLUDED.kind, venue_id = EXCLUDED.venue_id,
+                interval_ns = EXCLUDED.interval_ns, latest_key = EXCLUDED.latest_key,
+                quality = EXCLUDED.quality
+              WHERE lake_latest.version < EXCLUDED.version;",
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        conn.batch_execute("DROP TABLE IF EXISTS moving_rows, moving_ranges, moving_latest")
+            .map_err(unavailable)?;
+        self.forget_made();
+        Ok(copied.max(0) as u64)
+    }
+
+    /// Range `partition`'s row opened in this database, the target's, at
+    /// the source's close `closing` (step 3d; section 6.8): as `from`'s
+    /// database holds it, named writer group `target`'s at its epoch here.
+    /// Answers the epoch.
+    pub fn open_moved_in(
+        &self,
+        from: &PostgresStore,
+        partition: &str,
+        closing: u64,
+        target: u32,
+    ) -> Result<u64> {
+        use std::io::{Read, Write};
+        let mut row = Vec::new();
+        from.conn()?
+            .copy_out(&format!(
+                "COPY (SELECT * FROM lake_partition WHERE dataset = '{}') TO STDOUT (FORMAT binary)",
+                partition.replace('\'', "''")
+            ))
+            .map_err(unavailable)?
+            .read_to_end(&mut row)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(
+            "CREATE TEMP TABLE IF NOT EXISTS moving_range (LIKE lake_partition) ON COMMIT DROP",
+        )
+        .map_err(unavailable)?;
+        let mut writer = tx
+            .copy_in("COPY moving_range FROM STDIN (FORMAT binary)")
+            .map_err(unavailable)?;
+        writer
+            .write_all(&row)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        writer.finish().map_err(unavailable)?;
+        let epoch = group_epoch(&mut tx, target)?;
+        tx.execute(
+            "INSERT INTO lake_partition SELECT * FROM moving_range ON CONFLICT (dataset) DO NOTHING",
+            &[],
+        )
+        .map_err(unavailable)?;
+        tx.execute(
+            "UPDATE lake_partition SET head = $2, epoch = $3, writer_group = $4, closed_at = NULL
+              WHERE dataset = $1",
+            &[
+                &partition,
+                &(closing as i64),
+                &(epoch as i64),
+                &(target as i32),
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(epoch)
     }
 }

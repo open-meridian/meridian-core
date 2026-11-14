@@ -233,11 +233,33 @@ impl Mover {
                 finding,
             )
         };
-        // Warm: within one database the target reads the same rows.
+        // Warm: within one database the target reads the same rows; across
+        // databases its database first copies the range, then its change
+        // log (section 6.4).
+        let across = !Arc::ptr_eq(source, to);
+        let mut copied = if across {
+            to.copy_range_from(source, partition, 0)?
+        } else {
+            0
+        };
         // Gate: the target's lag under readyLagMs within switchSeconds.
         let gate = Instant::now();
         loop {
-            let lag = self.settings.injected_lag().unwrap_or(Duration::ZERO);
+            let lag = match self.settings.injected_lag() {
+                Some(lag) => lag,
+                None if !across => Duration::ZERO,
+                None => {
+                    let (s, t) = (
+                        source.range_tip(partition)?.unwrap_or_default(),
+                        to.range_tip_held(partition)?,
+                    );
+                    if t.0 >= s.held {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_nanos((s.held_at_ns - t.1).max(1) as u64)
+                    }
+                }
+            };
             if lag < self.settings.ready_lag {
                 break;
             }
@@ -249,6 +271,9 @@ impl Mover {
                     "a range's move did not switch: its target's lag stayed above readyLagMs"
                 );
                 return Ok(aborted(MoveAbortCause::Lag, None));
+            }
+            if across {
+                copied = to.copy_range_from(source, partition, copied)?;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
