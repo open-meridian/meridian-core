@@ -3259,3 +3259,188 @@ async fn two_groups_keep_their_partitions_in_two_databases() {
     // Their connections closed off the runtime's workers.
     blocking(move || drop((zero, one, bus)));
 }
+
+/// An account moved to a partition another database holds (step 3d; the
+/// resilience spec's sections 6.4 and 6.8): the close in its own database,
+/// the open handed to the new partition's group, which copies everything
+/// the old database holds of the account first; the account replays the
+/// same across both, its positions read once, from its new database, the
+/// old one keeping its entries and letting go of the rest; each database's
+/// chain scrubs clean; and its next act is the new partition's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_moved_between_databases_is_copied_and_replays_the_same() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-CROSS-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    let from = blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (bus("cross-0", zero.clone()), bus("cross-1", one.clone()));
+    let instrument = unique("INS-CROSS");
+    open(&bus_one, &account, &instrument).await;
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    // The close, by group 1 in its database; its open is group 0's.
+    let handed = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await;
+    assert!(handed.is_err(), "the open is the new partition's group's");
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    blocking(|| {
+        assert_eq!(fresh(1).account_row(&account).unwrap(), Some(to.clone()));
+        assert_eq!(fresh(0).account_row(&account).unwrap(), None);
+    });
+    // Handed to group 0: copied into its database, and opened there.
+    let moved = MoveAccountReply::decode(
+        &send(
+            &bus_zero,
+            meridian_bor::moves::MOVE_ACCOUNT,
+            &request,
+            Some(PERSON),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .moved
+    .unwrap();
+    assert_eq!(
+        (moved.from_partition.as_str(), moved.to_partition.as_str()),
+        (from.as_str(), to.as_str())
+    );
+    assert!(moved.opening_sequence > 0);
+    blocking(|| {
+        // Read through either member: each entry once, in the order written.
+        let journal = zero.journal(&account).unwrap();
+        assert_eq!(journal.len(), 3, "the opening balance, the close, the open");
+        assert_eq!(
+            journal
+                .iter()
+                .map(|e| e.partition.as_str())
+                .collect::<Vec<_>>(),
+            [from.as_str(), from.as_str(), to.as_str()]
+        );
+        assert_eq!(one.journal(&account).unwrap(), journal);
+        let mut replayed = meridian_bor::Book::replay(&account, &from, &journal).unwrap();
+        let mut held = zero.book(&account).unwrap();
+        replayed.release_bodies();
+        held.release_bodies();
+        assert_eq!(replayed, held, "it replays the same across both databases");
+        // Its position from its new database alone; the old one keeps its
+        // entries and nothing else.
+        let read = PositionsRead {
+            scope: Scope::Everything,
+            account_id: account.clone(),
+            since: None,
+            business_date: String::new(),
+            at: None,
+            limit: 10,
+            cursor: String::new(),
+        };
+        let mine = |store: &PostgresStore| store.positions(&read).unwrap().records;
+        assert_eq!(mine(&fresh(0)).len(), 1);
+        assert!(mine(&fresh(1)).is_empty());
+        assert_eq!(
+            read_position(&zero.positions(&read).unwrap().records[0]),
+            "12.5"
+        );
+        assert_eq!(fresh(1).account_row(&account).unwrap(), None);
+        assert_eq!(fresh(1).journal(&account).unwrap().len(), 2);
+        assert_eq!(
+            zero.accounts()
+                .unwrap()
+                .iter()
+                .filter(|a| **a == account)
+                .count(),
+            1
+        );
+        // Each database's chain scrubs clean: the copied entries are the
+        // old database's chain, never the new one's.
+        for d in 0..2 {
+            let scrubbed = fresh(d).scrub().unwrap();
+            assert!(
+                scrubbed.findings.is_empty(),
+                "database {d}: {:?}",
+                scrubbed.findings
+            );
+        }
+    });
+    // Asked again: answered as it opened, settled again, nothing written.
+    let again = MoveAccountReply::decode(
+        &send(
+            &bus_zero,
+            meridian_bor::moves::MOVE_ACCOUNT,
+            &request,
+            Some(PERSON),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .moved
+    .unwrap();
+    assert_eq!(again, moved);
+    // Its next act is the new partition's, in its new database.
+    let next = a_break(&account);
+    send(&bus_zero, RECORD_BREAK, &next, Some(PERSON))
+        .await
+        .unwrap();
+    blocking(|| {
+        let journal = zero.journal(&account).unwrap();
+        assert_eq!(journal.len(), 4);
+        assert_eq!(journal[3].partition, to);
+        assert_eq!(fresh(0).journal(&account).unwrap().len(), 4);
+    });
+    blocking(move || drop((zero, one, bus_zero, bus_one)));
+}
+
+fn read_position(position: &BookPosition) -> String {
+    read(&position.trade_date_quantity)
+}

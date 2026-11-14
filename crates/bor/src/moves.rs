@@ -265,6 +265,9 @@ pub fn move_account(
                 .find(|moved| moved.to_partition == target && moved.opening_sequence > 0)
                 .filter(|moved| moved.reason == request.reason)
             {
+                // Settled again: a member that stopped after the open may
+                // not have let go where the account was (step 3d).
+                store.settle_move(account)?;
                 return Ok(opened);
             }
             return Err(invalid(
@@ -315,6 +318,9 @@ pub fn move_account(
             .and_then(crate::journal::moved_of),
     }
     .ok_or_else(|| StoreError::Unavailable("the move's open is not read back".into()))?;
+    // Where it crossed databases, the one it left lets go of what it
+    // projected of it (step 3d; section 6.4).
+    store.settle_move(account)?;
     // Its record in `control`, now where this writer holds it; the control
     // partition's writer journals it otherwise, from the open.
     record(bus, store, &opened);

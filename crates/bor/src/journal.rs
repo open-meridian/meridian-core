@@ -475,6 +475,10 @@ pub fn opens(entry: &Entry) -> bool {
 /// partition to the open in the new, which numbers from its own head. An
 /// account that never moved is in one partition, in sequence order.
 pub fn in_order(mut entries: Vec<Entry>) -> Vec<Entry> {
+    // An account moved between databases is read from each, its entries
+    // before the move from both: each once (step 3d; section 6.4).
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| seen.insert(entry.entry_id.clone()));
     if !entries.iter().any(|entry| entry.meta.kind == ACCOUNT_MOVED) {
         entries.sort_by_key(|entry| entry.first_sequence);
         return entries;

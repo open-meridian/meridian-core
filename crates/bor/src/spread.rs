@@ -137,6 +137,33 @@ impl Spread {
         &self.stores[0]
     }
 
+    /// The account copied into this member's own database from any other
+    /// whose row names a partition placed here: its move closed there,
+    /// toward this database (step 3d; section 6.4). Nothing where it is
+    /// here already, or closed toward nowhere here.
+    fn bring_in(&self, account_id: &str) -> Result<()> {
+        let own = self.own();
+        let here = meridian_changes::databases::of_group(self.groups.mine(), self.count());
+        for (d, store) in self.stores.iter().enumerate() {
+            if Arc::ptr_eq(store, own) {
+                continue;
+            }
+            let Some(partition) = store.account_row(account_id)? else {
+                continue;
+            };
+            if self.of(&partition) == here {
+                let added = own.copy_account_from(store, account_id)?;
+                tracing::info!(
+                    account_id,
+                    from = d,
+                    added,
+                    "an account's move copied it into this database"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The database holding `partition` (`control` is database 0's).
     pub fn of(&self, partition: &str) -> u32 {
         if partition == crate::store::CONTROL_PARTITION {
@@ -215,8 +242,41 @@ impl Store for Spread {
         if let Some(partition) = self.partition_of(account_id) {
             self.own().learn_placement(account_id, &partition);
         }
+        // A move's open in this database, the account closed in another:
+        // everything that one holds of it copied here first (step 3d;
+        // section 6.4, "a move between databases copies the data").
+        if crate::moves::is_open_key(idempotency_key) {
+            self.bring_in(account_id)?;
+        }
         self.own()
             .act(account_id, message_id, idempotency_key, request, decide)
+    }
+
+    fn settle_move(&self, account_id: &str) -> Result<()> {
+        // Its database: where its row names a partition placed in the
+        // database holding that row, and holds its open.
+        let Some(at) = self.stores.iter().enumerate().find_map(|(d, store)| {
+            store
+                .account_row(account_id)
+                .ok()
+                .flatten()
+                .filter(|partition| self.of(partition) == d as u32)
+                .map(|_| d)
+        }) else {
+            return Ok(());
+        };
+        for (d, store) in self.stores.iter().enumerate() {
+            if d != at && store.account_row(account_id)?.is_some() {
+                let gone = store.forget_moved_out(account_id)?;
+                tracing::info!(
+                    account_id,
+                    database = d,
+                    gone,
+                    "an account moved out of a database: its projections let go, its entries kept"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn on_commit(&self, observer: Committed) -> bool {

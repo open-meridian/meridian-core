@@ -262,7 +262,13 @@ impl Store for Writer {
             .inner
             .act(account_id, message_id, idempotency_key, request, decide)?;
         if let Acted::Committed(decided) = &acted {
-            self.books().put(decided.book.clone(), self.bound);
+            // An account moving away is not held here: its next acts are
+            // another partition's, perhaps another group's (step 3d).
+            if crate::journal::closes(&decided.entry).is_some() {
+                self.books().forget(account_id);
+            } else {
+                self.books().put(decided.book.clone(), self.bound);
+            }
             if self.batched {
                 return Ok(acted);
             }
@@ -281,6 +287,10 @@ impl Store for Writer {
 
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {
         self.inner.writer_group_of(account_id)
+    }
+
+    fn settle_move(&self, account_id: &str) -> Result<()> {
+        self.inner.settle_move(account_id)
     }
 
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {

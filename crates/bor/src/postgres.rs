@@ -403,6 +403,31 @@ impl PostgresStore {
     }
 }
 
+/// Every table holding an account's rows by its `account_id`: what a move
+/// between databases copies, its row first (step 3d; section 6.4).
+const ACCOUNT_TABLES: &[&str] = &[
+    "book_account",
+    "book_entry",
+    "book_snapshot",
+    "book_position",
+    "book_lot",
+    "book_pending",
+    "book_break",
+    "book_figures",
+    "book_attributes",
+    "book_order",
+    "book_placement",
+    "book_execution",
+    "book_unplaced",
+    "book_locate",
+    "book_instruction",
+    "book_change_request",
+    "book_order_entry",
+    "book_booking",
+    "book_alert",
+    "book_block_member",
+];
+
 /// Follow every partition's chain (step 3b, integrity at rest): each
 /// entry's digest taken again of its canonical form after the digest it
 /// names, and the digest it names the one before it in its partition, so a
@@ -410,16 +435,20 @@ impl PostgresStore {
 /// bad one in each partition.
 pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity::Scrubbed> {
     let mut scrubbed = meridian_changes::integrity::Scrubbed::default();
-    let partitions: Vec<String> = conn
+    // Each partition's chain as far as its head here commits to it: an
+    // account moved in from another database brings entries of a partition
+    // this one does not write, which that database's own chain holds (step
+    // 3d; section 6.4).
+    let partitions: Vec<(String, i64)> = conn
         .query(
-            "SELECT partition FROM book_partition_head ORDER BY partition",
+            "SELECT partition, sequence FROM book_partition_head ORDER BY partition",
             &[],
         )
         .map_err(unavailable)?
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
-    for partition in partitions {
+    for (partition, head) in partitions {
         let mut after: i64 = 0;
         let mut previous: Option<Vec<u8>> = None;
         'partition: loop {
@@ -427,10 +456,10 @@ pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity:
                 .query(
                     &format!(
                         "SELECT {ENTRY_COLUMNS}, committed_at_ns FROM book_entry
-                          WHERE partition = $1 AND first_sequence > $2
+                          WHERE partition = $1 AND first_sequence > $2 AND first_sequence <= $3
                           ORDER BY first_sequence LIMIT 500"
                     ),
-                    &[&partition, &after],
+                    &[&partition, &after, &head],
                 )
                 .map_err(unavailable)?;
             if rows.is_empty() {
@@ -737,20 +766,24 @@ fn book_from(
     account_id: &str,
     partition: &str,
 ) -> Result<(Book, Replayed)> {
-    match snapshot_of(client, account_id, None, None)? {
+    let (mut book, replayed) = match snapshot_of(client, account_id, None, None)? {
         Some(kept) => {
             let tail = journal_after(client, account_id, &kept, partition)?;
-            Ok((crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail)))
+            (crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail))
         }
         None => {
             let entries = journal_of(client, account_id)?;
             let replayed = Replayed::of(&entries);
-            Ok((
+            (
                 Book::replay_lean(account_id, partition, &entries)?,
                 replayed,
-            ))
+            )
         }
-    }
+    };
+    // Acted on in the partition its placement names, read under that
+    // partition's lock (section 6.3), whichever its last entry is in.
+    book.partition = partition.to_string();
+    Ok((book, replayed))
 }
 
 /// A read's snapshot (v26's core; W9.10's note "when a snapshot is taken",
@@ -1793,6 +1826,11 @@ impl PostgresStore {
         // Between its move's close and its open, the account is held but
         // for the open (step 3d; the resilience spec's section 6.8).
         if let Some(to) = &book.moved_to {
+            // Closed toward another partition this database does not see
+            // opened (a move between databases, step 3d): acted on there.
+            if to != partition {
+                return Ok(Err(StoreError::Moved(to.clone())));
+            }
             if !crate::moves::is_open_key(idempotency_key) {
                 return Ok(Err(StoreError::Held(format!(
                     "account {account_id} is moving to {to}: ask again in a moment"
@@ -1944,8 +1982,15 @@ impl Store for PostgresStore {
                     partition = now;
                 }
                 other => {
-                    if other.is_ok() {
-                        self.place(account_id, &partition);
+                    // Where it is now: its new partition once a move's
+                    // close commits (step 3d).
+                    match &other {
+                        Ok(Acted::Committed(decided)) => self.place(
+                            account_id,
+                            &crate::journal::closes(&decided.entry).unwrap_or(partition),
+                        ),
+                        Ok(_) => self.place(account_id, &partition),
+                        Err(_) => {}
                     }
                     return other;
                 }
@@ -3387,6 +3432,99 @@ impl PostgresStore {
         let _ = self
             .databases
             .set(stores.iter().map(Arc::downgrade).collect());
+    }
+
+    /// Where `account_id` is placed as this store's database records it,
+    /// never as last found: none where it holds no row of the account.
+    pub fn account_row(&self, account_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0)))
+    }
+
+    /// Everything `from`'s database holds of `account_id` copied into this
+    /// one, in one transaction (step 3d; section 6.4, "a move between
+    /// databases copies the data"): its row, its entries, its snapshots and
+    /// every projection of it, each table's rows by their own keys, so a
+    /// copy made again adds nothing. Its row takes `from`'s placement. Says
+    /// how many rows were added.
+    pub fn copy_account_from(&self, from: &PostgresStore, account_id: &str) -> Result<u64> {
+        use std::io::{Read, Write};
+        let quoted = format!("'{}'", account_id.replace('\'', "''"));
+        let mut source = from.conn()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut added = 0;
+        for table in ACCOUNT_TABLES {
+            let mut rows = Vec::new();
+            source
+                .copy_out(&format!(
+                    "COPY (SELECT * FROM {table} WHERE account_id = {quoted}) TO STDOUT (FORMAT binary)"
+                ))
+                .map_err(unavailable)?
+                .read_to_end(&mut rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            tx.batch_execute(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS moving_{table} (LIKE {table}) ON COMMIT DROP"
+            ))
+            .map_err(unavailable)?;
+            let mut writer = tx
+                .copy_in(&format!("COPY moving_{table} FROM STDIN (FORMAT binary)"))
+                .map_err(unavailable)?;
+            writer
+                .write_all(&rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            writer.finish().map_err(unavailable)?;
+            let on_conflict = if *table == "book_account" {
+                "ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition"
+            } else {
+                "ON CONFLICT DO NOTHING"
+            };
+            added += tx
+                .execute(
+                    &format!("INSERT INTO {table} SELECT * FROM moving_{table} {on_conflict}"),
+                    &[],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        if let Some(partition) = from.account_row(account_id)? {
+            self.place(account_id, &partition);
+        }
+        Ok(added)
+    }
+
+    /// What this database projected of `account_id` let go, its entries
+    /// kept (step 3d; section 6.4): the account moved to another database,
+    /// which holds it whole. Its row goes too, so no read of every account
+    /// here finds it; an act sent here finds its close and goes on there.
+    /// Says how many rows went.
+    pub fn forget_moved_out(&self, account_id: &str) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut gone = 0;
+        for table in ACCOUNT_TABLES
+            .iter()
+            .filter(|table| **table != "book_entry")
+        {
+            gone += tx
+                .execute(
+                    &format!("DELETE FROM {table} WHERE account_id = $1"),
+                    &[&account_id],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        self.placed
+            .lock()
+            .expect("placements poisoned")
+            .remove(account_id);
+        Ok(gone)
     }
 
     /// Where `account_id` is placed, as this store last found it or as its

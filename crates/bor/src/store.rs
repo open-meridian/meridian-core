@@ -631,6 +631,16 @@ pub trait Store: Send + Sync {
         None
     }
 
+    /// An account's move settled where it crossed databases (step 3d;
+    /// section 6.4, "a move between databases copies the data"): once its
+    /// open is journalled in the new partition's database, every other
+    /// database lets go of what it projected of the account, keeping its
+    /// entries. Idempotent; nothing for a store of one database.
+    fn settle_move(&self, account_id: &str) -> Result<()> {
+        let _ = account_id;
+        Ok(())
+    }
+
     /// The records the `~control` journal owes (step 3d; section 6.3,
     /// option (c)): each takeover and finding kept beside the journal and
     /// not yet in it, and each partition whose writer group is not the one
