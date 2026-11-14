@@ -4092,3 +4092,33 @@ async fn a_changed_count_of_writer_groups_moves_each_partition_once() {
     });
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
+
+/// A deployment installed at two writer groups starts each partition with
+/// its rendezvous owner, pinned at the control partition's group's start:
+/// no partition moves and no PartitionMoved is recorded, as no owner
+/// changed (decisions/031: no history that did not happen).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deployment_installed_at_two_writer_groups_moves_nothing() {
+    use meridian_bor::partition_moves::rebalance;
+    use meridian_changes::groups::owner;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    blocking(|| {
+        for n in 0..8 {
+            let p = meridian_bor::store::partition_named(n);
+            assert_eq!(
+                zero_store.tip(&p).unwrap().unwrap().writer_group,
+                Some(owner(&p, 2)),
+                "{p} pinned to its rendezvous owner"
+            );
+        }
+        assert!(rebalance(&zero, zero_store.as_ref(), &mover).is_empty());
+        let control = zero_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        assert!(!control.iter().any(|e| e
+            .idempotency_key
+            .starts_with("control-record:partition-moved:")));
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
