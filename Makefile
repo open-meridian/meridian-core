@@ -2864,7 +2864,7 @@ chart-check:
 	@# databases than writer groups, and missing Secrets, refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	echo "$$one" | grep -q "database-[0-9][0-9]*$$\|_DATABASES$$\|DATABASE_URL_[0-9]" \
+	echo "$$one" | grep -Eq "database-[1-9][0-9]*$$|_DATABASES$$|DATABASE_URL_[0-9]" \
 		&& { echo "chart-check FAILED: one database, the default, renders a database past the first or its environment (step 3d: nothing changes)" >&2; exit 1; }; \
 	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set bor.writerGroups=2 --set bor.databases=2 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart did not render two databases for the lake and the book" >&2; exit 1; }; \
