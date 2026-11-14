@@ -161,6 +161,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "leaves",
         sql: include_str!("../migrations/0023_leaves.sql"),
     },
+    // A month's table analysed once its first batch is in (step 3d;
+    // `lake_analyze_month` approved 2026-11-14).
+    Migration {
+        version: 24,
+        name: "analyse_months",
+        sql: include_str!("../migrations/0024_analyse_months.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

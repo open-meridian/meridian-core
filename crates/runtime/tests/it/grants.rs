@@ -354,4 +354,31 @@ fn the_lake_serving_role_makes_its_partitions_through_the_owners_functions() {
         bound,
         "FOR VALUES FROM ('1796083200000000000') TO ('1798761600000000000')"
     );
+    // Migration 24: a month's table analysed by its owner, as the serving
+    // role asks -- only a month of lake_row's that holds rows and was never
+    // analysed, once; every malformed argument refused, nothing named by it.
+    for (partition, month) in [
+        ("x'); DROP TABLE lake_row; --", "2026-12"),
+        ("coinbase-1:live/0000-FFFF", "2026-12"),
+        (dataset, "2026-13"),
+        (dataset, "2026-12'; ANALYZE; --"),
+    ] {
+        assert!(
+            server
+                .query_one("SELECT lake_analyze_month($1, $2)", &[&partition, &month])
+                .is_err(),
+            "refused: {partition:?} {month:?}"
+        );
+    }
+    let analysed = |server: &mut postgres::Client, month: &str| -> bool {
+        server
+            .query_one("SELECT lake_analyze_month($1, $2)", &[&dataset, &month])
+            .expect("a valid month")
+            .get(0)
+    };
+    assert!(
+        !analysed(&mut server, "2026-12"),
+        "empty: nothing to analyse"
+    );
+    assert!(!analysed(&mut server, "2031-01"), "a month not made");
 }

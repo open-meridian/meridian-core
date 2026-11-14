@@ -5955,3 +5955,71 @@ fn a_database_past_the_firsts_own_records_are_relayed_into_database_zero_once() 
     assert_eq!(zero.relay().unwrap(), 0, "each record relayed once");
     assert!(one.relay().is_err(), "database 0's writes are group 0's");
 }
+
+/// A month's table is analysed once the batch that first fills it commits
+/// (step 3d; migration 24, `lake_analyze_month` approved 2026-11-14): until
+/// then every estimate of it clamped to one row, and a lookup of one row
+/// could take the subject index and scan the dataset's month whole.
+#[test]
+fn a_months_table_is_analysed_once_its_first_batch_commits() {
+    let store = store();
+    let dataset = unique("analysed");
+    store
+        .record(
+            &dataset,
+            (0..3)
+                .map(|n| close(&dataset, &format!("k{n}"), "INS-1", "2026-09-08", n))
+                .collect(),
+            1,
+        )
+        .unwrap();
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let (leaf, reltuples): (String, f32) = {
+        let row = raw
+            .query_one(
+                "SELECT c.relname::text, c.reltuples FROM pg_class c
+                  WHERE c.oid = (SELECT tableoid FROM lake_row WHERE dataset = $1 LIMIT 1)",
+                &[&dataset],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    assert!(leaf.starts_with("lake_row_"), "{leaf}");
+    assert_eq!(
+        reltuples, 3.0,
+        "{leaf} analysed with its first batch's rows"
+    );
+    let (analysed_at, again): (Option<std::time::SystemTime>, bool) = {
+        let at = raw
+            .query_one(
+                "SELECT last_analyze::timestamptz FROM pg_stat_user_tables WHERE relname = $1",
+                &[&leaf],
+            )
+            .unwrap()
+            .get::<_, Option<std::time::SystemTime>>(0);
+        store
+            .record(
+                &dataset,
+                vec![close(&dataset, "k9", "INS-1", "2026-09-08", 9)],
+                2,
+            )
+            .unwrap();
+        let later = raw
+            .query_one(
+                "SELECT last_analyze::timestamptz FROM pg_stat_user_tables WHERE relname = $1",
+                &[&leaf],
+            )
+            .unwrap()
+            .get::<_, Option<std::time::SystemTime>>(0);
+        (at, later != at)
+    };
+    assert!(
+        analysed_at.is_some(),
+        "analysed by the lake, not autovacuum"
+    );
+    assert!(
+        !again,
+        "analysed once: the month's next batch leaves it to autovacuum"
+    );
+}

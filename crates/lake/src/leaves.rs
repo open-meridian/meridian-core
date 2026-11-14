@@ -230,6 +230,21 @@ pub fn ensure_months(
     Ok(made)
 }
 
+/// `partition`'s `month` table analysed by lake_row's owner (migration 24),
+/// where it holds rows and was never analysed: whether it was.
+pub fn analyse_month(
+    client: &mut impl GenericClient,
+    partition: &str,
+    month: Month,
+) -> Result<bool, postgres::Error> {
+    Ok(client
+        .query_one(
+            "SELECT lake_analyze_month($1, $2)",
+            &[&partition, &month.label()],
+        )?
+        .get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

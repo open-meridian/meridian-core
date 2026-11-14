@@ -117,6 +117,9 @@ pub struct PostgresStore {
     made: std::sync::Mutex<std::collections::HashSet<(String, crate::leaves::Month)>>,
     /// The ranges whose tables this store has seen made, likewise.
     ranges_made: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The month tables this store's batches first wrote, to be analysed
+    /// once their batch commits (migration 24; step 3d).
+    unanalysed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
     /// The datasets whose open ranges' tables this store has seen made:
     /// their ranges are not read again before a batch, as a split makes its
     /// children's tables itself. Let go likewise.
@@ -312,6 +315,7 @@ impl PostgresStore {
             leads_database: false,
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             latest_all: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1603,6 +1607,8 @@ impl PostgresStore {
         meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
+        } else {
+            self.analyse_months(&mut *conn);
         }
         done
     }
@@ -1795,8 +1801,40 @@ impl PostgresStore {
         if made > 0 {
             tracing::info!(partition, made, "the lake made its range's month tables");
         }
+        self.unanalysed
+            .lock()
+            .expect("unanalysed poisoned")
+            .extend(needed.iter().cloned());
         self.made.lock().expect("made poisoned").extend(needed);
         Ok(())
+    }
+
+    /// Each month table a committed batch first wrote analysed, where it
+    /// never was (migration 24): until a month is, every estimate of it
+    /// clamps to one row, and a lookup of one row could take an index that
+    /// scans the dataset's month whole, once for each row looked up. Once
+    /// a month per range per process, after its batch's commit; derived,
+    /// so a failure is logged and the month tried again after the next.
+    fn analyse_months(&self, conn: &mut impl GenericClient) {
+        let months: Vec<(String, crate::leaves::Month)> =
+            std::mem::take(&mut *self.unanalysed.lock().expect("unanalysed poisoned"))
+                .into_iter()
+                .collect();
+        for (partition, month) in months {
+            match crate::leaves::analyse_month(conn, &partition, month) {
+                Ok(true) => {
+                    tracing::debug!(partition, month = month.label(), "a month's table analysed")
+                }
+                Ok(false) => {}
+                Err(failed) => {
+                    tracing::warn!(partition, month = month.label(), %failed, "a month's table was not analysed: tried after the next batch");
+                    self.unanalysed
+                        .lock()
+                        .expect("unanalysed poisoned")
+                        .insert((partition, month));
+                }
+            }
+        }
     }
 
     /// Let go of the tables this store has seen made: a batch failed.
@@ -2312,6 +2350,7 @@ impl PostgresStore {
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        self.analyse_months(&mut *conn);
         Ok(answered)
     }
 }
