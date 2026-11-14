@@ -42,6 +42,12 @@ pub enum StoreError {
     #[error("dataset {partition} is writer group {group}'s to write; this member's group does not own it")]
     NotOwned { partition: String, group: u32 },
 
+    /// A write to a range a move is switching (step 3d; section 6.8, the
+    /// hold): tried again until the switch ends, at most
+    /// `moves.holdSeconds`, then refused OVERLOADED with a retry-after.
+    #[error("{0}")]
+    Held(String),
+
     /// A restatement that changes its row key's valid time or first subject
     /// (step 3d; the-lake rule 5, ruled 2026-11-12): refused
     /// INVALID_ARGUMENT naming the field, `field` its path within the row
@@ -832,6 +838,20 @@ pub trait Store: Send + Sync {
 
     /// Each replaced record and the record that stays.
     fn aliases(&self) -> Result<BTreeMap<String, String>>;
+
+    /// The anchor each of `keys` (data type code, row key) of `dataset` is
+    /// placed by -- its first version's first subject's hash -- where the
+    /// lake holds one (step 3d; ruling 2 of 2026-11-14): what a write's
+    /// router reads, in one look, for a key restated under the record that
+    /// replaced its subject. None where the store keeps no ranges.
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        let _ = (dataset, keys);
+        Ok(BTreeMap::new())
+    }
 
     /// The data configuration as last heard.
     fn keep_configuration(&self, event: &EntitlementsChangedEvent) -> Result<()>;

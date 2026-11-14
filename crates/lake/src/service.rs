@@ -191,15 +191,80 @@ pub fn owner_of_write(
     if topic == SPLIT_PARTITION {
         let request =
             meridian_domain::v1::SplitPartitionRequest::decode(envelope.payload.as_slice()).ok()?;
-        return Some(groups.owner(crate::range::dataset_of(&request.partition)));
+        return Some(groups.owner_by(
+            &request.partition,
+            crate::range::dataset_of(&request.partition),
+        ));
     }
     let (_, rows, want_id) = rows_of(topic, envelope).ok()?;
     if !want_id.is_empty() {
         return Some(0);
     }
-    let mut owners = rows.iter().map(|row| groups.owner(row.dataset()));
-    let first = owners.next()?;
-    owners.all(|group| group == first).then_some(first)
+    // A dataset whose open ranges span groups is the handler's to split.
+    let mut owners = rows.iter().map(|row| whole_owner(groups, row.dataset()));
+    let first = owners.next()??;
+    owners.all(|group| group == Some(first)).then_some(first)
+}
+
+/// The group owning each of `rows` of `dataset` (step 3d; ruling 2 of
+/// 2026-11-14): the group of the open range holding the row's anchor, as
+/// `groups` last read the ranges. The anchor is the hash of the row's first
+/// subject, except for a key restated under the record that replaced its
+/// first version's subject: its anchor is read from `store`, in one look
+/// for the batch, and only where the dataset's open ranges span groups.
+pub fn owners_of_rows(
+    groups: meridian_changes::groups::Groups,
+    store: &dyn Store,
+    dataset: &str,
+    rows: &[Observation],
+) -> Vec<u32> {
+    if let Some(group) = whole_owner(groups, dataset) {
+        return vec![group; rows.len()];
+    }
+    let open = crate::range::leaves(&groups.ranges_of(dataset));
+    let stays: BTreeSet<String> = store
+        .aliases()
+        .map(|aliases| aliases.into_values().collect())
+        .unwrap_or_default();
+    let probe: Vec<(i16, String)> = rows
+        .iter()
+        .filter(|row| stays.contains(row.subject()))
+        .map(|row| (row.data_type().code(), row.meta().row_key.clone()))
+        .collect();
+    let anchors = if probe.is_empty() {
+        BTreeMap::new()
+    } else {
+        store.anchors(dataset, &probe).unwrap_or_else(|failed| {
+            tracing::warn!(dataset, %failed, "the restated keys' anchors were not read");
+            BTreeMap::new()
+        })
+    };
+    rows.iter()
+        .map(|row| {
+            let anchor = anchors
+                .get(&(row.data_type().code(), row.meta().row_key.clone()))
+                .copied()
+                .unwrap_or_else(|| crate::range::hash(row.subject()));
+            open.iter()
+                .find(|(range, _)| range.holds(anchor))
+                .map_or_else(|| groups.owner(dataset), |(_, group)| *group)
+        })
+        .collect()
+}
+
+/// The group owning every open range of `dataset`, as this member last read
+/// them (step 3d; ruling 2 of 2026-11-14); none where its ranges span
+/// groups.
+pub fn whole_owner(groups: meridian_changes::groups::Groups, dataset: &str) -> Option<u32> {
+    let named = groups.ranges_of(dataset);
+    if named.is_empty() {
+        return Some(groups.owner(dataset));
+    }
+    let open = crate::range::leaves(&named);
+    let first = open.first().map(|(_, group)| *group)?;
+    open.iter()
+        .all(|(_, group)| *group == first)
+        .then_some(first)
 }
 
 /// A deployment admin halves a lake range (step 3d; section 6.1, approved
@@ -612,6 +677,12 @@ fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, Strin
                 words,
             )
         }
+        // Held past the hold (section 6.8): OVERLOADED, its retry-after.
+        crate::store::StoreError::Held(words) => meridian_bus::refusal_retrying(
+            meridian_pb::v1::RefusalReason::Overloaded as i32,
+            meridian_changes::moves::HELD_RETRY_SECONDS,
+            words,
+        ),
         other => other.to_string(),
     }
 }
@@ -2065,22 +2136,45 @@ impl Lake {
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
         let keys = row_keys(&rows);
-        let by_dataset = self.prepared(field, rows, envelope)?;
+        let mut pending = self.prepared(field, rows, envelope)?;
         let now = self.clock.now_ns();
         let mut said = Said::default();
-        let by_dataset = if self.groups.several() {
-            match self.routed(by_dataset, want_id, envelope, &mut said)? {
-                Some(mine) => mine,
-                None => return Err("handed to the lake's writer group 0".into()),
+        // A range a move is switching holds its rows -- its siblings'
+        // commit -- until the switch ends, at most `moves.holdSeconds`;
+        // they are then routed again, to the group it moved to (step 3d;
+        // section 6.8, the hold).
+        let until = std::time::Instant::now() + meridian_changes::moves::hold();
+        let mut again = false;
+        loop {
+            let mine = if self.groups.several() {
+                match self.routed(pending, want_id, envelope, &mut said, again)? {
+                    Some(mine) => mine,
+                    None => return Err("handed to the lake's writer group 0".into()),
+                }
+            } else {
+                pending
+            };
+            let mut held = BTreeMap::new();
+            for (dataset, rows) in mine {
+                let kept = self.groups.several().then(|| rows.clone());
+                match self.write_one(&dataset, rows, want_id, now) {
+                    Ok(done) => self.published(&dataset, &done, &mut said),
+                    Err(
+                        failed @ (crate::store::StoreError::Held(_)
+                        | crate::store::StoreError::NotOwned { .. }),
+                    ) if std::time::Instant::now() < until => {
+                        tracing::debug!(dataset, %failed, "a write's rows held: routed again");
+                        held.insert(dataset, kept.unwrap_or_default());
+                    }
+                    Err(failed) => return Err(refusal_of(failed, field, &keys)),
+                }
             }
-        } else {
-            by_dataset
-        };
-        for (dataset, rows) in by_dataset {
-            let done = self
-                .write_one(&dataset, rows, want_id, now)
-                .map_err(|failed| refusal_of(failed, field, &keys))?;
-            self.published(&dataset, &done, &mut said);
+            if held.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            pending = held;
+            again = true;
         }
         self.answered(said, want_id, envelope, now)
     }
@@ -2099,21 +2193,35 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
         said: &mut Said,
+        again: bool,
     ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
         let handed = meridian_bus::owners::handed();
-        if !handed && !want_id.is_empty() && !self.groups.holds_control() {
+        if !again && !handed && !want_id.is_empty() && !self.groups.holds_control() {
             meridian_bus::owners::hand_to(0);
             return Ok(None);
         }
-        let coordinates = !handed || (!want_id.is_empty() && self.groups.holds_control());
-        let mut mine = BTreeMap::new();
+        // Rows held by a switch and routed again are handed on wherever
+        // they now belong: their range moved since this member took them.
+        let coordinates = again || !handed || (!want_id.is_empty() && self.groups.holds_control());
+        let mut mine: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
         let mut theirs: BTreeMap<u32, Vec<(String, Vec<Observation>)>> = BTreeMap::new();
         for (dataset, rows) in by_dataset {
-            match self.groups.owner(&dataset) {
-                group if group == self.groups.mine() => {
-                    mine.insert(dataset, rows);
+            // Each row by its range's group (ruling 2 of 2026-11-14): a
+            // dataset split across groups is split by them.
+            let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+            let mut split: BTreeMap<u32, Vec<Observation>> = BTreeMap::new();
+            for (row, group) in rows.into_iter().zip(owners) {
+                split.entry(group).or_default().push(row);
+            }
+            for (group, rows) in split {
+                if group == self.groups.mine() {
+                    mine.entry(dataset.clone()).or_default().extend(rows);
+                } else {
+                    theirs
+                        .entry(group)
+                        .or_default()
+                        .push((dataset.clone(), rows));
                 }
-                group => theirs.entry(group).or_default().push((dataset, rows)),
             }
         }
         if !coordinates {
@@ -2130,6 +2238,20 @@ impl Lake {
             let reply = RecordObservationsReply::decode(answer.as_slice()).map_err(|failed| {
                 format!("writer group {group}'s answer did not read: {failed}")
             })?;
+            // Every row handed was taken: a group whose view of the ranges
+            // differs from this member's may have left some (step 3d).
+            let handed_rows: usize = parts.iter().map(|(_, rows)| rows.len()).sum();
+            let taken = (reply.recorded + reply.restated + reply.unchanged) as usize;
+            if taken < handed_rows {
+                return Err(meridian_bus::refusal_with_status(
+                    RefusalStatus::Unavailable,
+                    &[],
+                    format!(
+                        "writer group {group} took {taken} of the {handed_rows} rows handed to \
+                         it: their ranges' route has changed; ask again"
+                    ),
+                ));
+            }
             let named: BTreeSet<&str> = reply
                 .watermark
                 .iter()

@@ -161,23 +161,32 @@ fn run() -> Result<(), String> {
             },
         )
     };
-    let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
-        let mut stores = Vec::new();
+    // Every database's store, database 0 first: what the lake writes and
+    // reads through, and what a move warms and switches (step 3d).
+    let mut every_database: Vec<Arc<PostgresStore>> = Vec::new();
+    if databases.several() {
         for (d, url) in databases.urls().iter().enumerate() {
-            stores.push(Arc::new(connect(d as u32, url)?));
+            every_database.push(Arc::new(connect(d as u32, url)?));
         }
+    } else {
+        every_database.push(Arc::new(connect(0, &url)?));
+    }
+    let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
         tracing::info!(
             databases = databases.count(),
             own,
             "the lake writes its group's database and reads every one"
         );
-        Some(Arc::new(meridian_lake::spread::Spread::new(stores, groups)))
+        Some(Arc::new(meridian_lake::spread::Spread::new(
+            every_database.clone(),
+            groups,
+        )))
     } else {
         None
     };
     let record: Arc<dyn meridian_lake::Store> = match &spread {
         Some(spread) => spread.clone(),
-        None => Arc::new(connect(0, &url)?),
+        None => every_database[0].clone(),
     };
 
     // The hot layer in front of the record (step 3a), each layer bounded by
@@ -279,6 +288,27 @@ fn run() -> Result<(), String> {
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
         let holding = member.wait_to_write(&bus).await?;
+        // Each range's writer group (step 3d; `writer_group` ruled
+        // 2026-11-14): the control partition's group names every one not
+        // named yet, by its dataset's owner at the count now, so a later
+        // change of the count moves nothing until a move moves it; every
+        // member reads them at start and every few seconds, and again
+        // wherever a write found them changed. Read before the epoch is
+        // adopted, which goes by them.
+        if groups.several() {
+            tokio::task::block_in_place(|| -> Result<(), String> {
+                for store in &every_database {
+                    if groups.holds_control() {
+                        let pinned = store.pin_owners().map_err(|failed| failed.to_string())?;
+                        if pinned > 0 {
+                            tracing::info!(pinned, "each range named its writer group");
+                        }
+                    }
+                    store.read_owners().map_err(|failed| failed.to_string())?;
+                }
+                Ok(())
+            })?;
+        }
         let epoch = tokio::task::block_in_place(|| {
             holding.epoch(
                 || {
@@ -325,6 +355,21 @@ fn run() -> Result<(), String> {
             // handed to it before any of its rows is checked.
             bus.route_writes_by(move |topic, envelope| {
                 meridian_lake::service::owner_of_write(groups, topic, envelope)
+            });
+            let reading = every_database.clone();
+            meridian_runtime::background(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let stores = reading.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for store in &stores {
+                            if let Err(failed) = store.read_owners() {
+                                tracing::debug!(%failed, "the ranges' writer groups were not read again");
+                            }
+                        }
+                    })
+                    .await;
+                }
             });
             if !groups.holds_control() {
                 let changes = meridian_changes::read_changes_topic("lake");
@@ -392,6 +437,36 @@ fn run() -> Result<(), String> {
         if groups.holds_control() {
             let converting = url.clone();
             std::thread::spawn(move || convert_forever(&converting));
+        }
+        // A range's move (step 3d; section 6.8): the control partition's
+        // group runs each, one at a time, over every database; and, with
+        // several groups, those a changed count calls for, at start and
+        // each minute after.
+        if groups.holds_control() {
+            let mover = Arc::new(meridian_lake::partition_moves::Mover::new(
+                every_database.clone(),
+                groups,
+                meridian_lake::partition_moves::Settings::from_env(),
+                clock(),
+            ));
+            meridian_lake::partition_moves::serve(&bus, &mover);
+            if groups.several() {
+                meridian_runtime::background(async move {
+                    loop {
+                        let mover = Arc::clone(&mover);
+                        let moved = tokio::task::spawn_blocking(move || mover.rebalance().len())
+                            .await
+                            .unwrap_or(0);
+                        if moved > 0 {
+                            tracing::info!(
+                                moved,
+                                "ranges moved by the changed count of writer groups"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
         }
         // Every handler and subscription in place before this returns.
         let lake =

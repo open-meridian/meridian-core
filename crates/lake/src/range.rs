@@ -111,9 +111,62 @@ pub fn placed<'a>(dataset: &'a str, ranges: &'a [Open], anchor: u16) -> std::bor
     }
 }
 
+/// The open ranges among a dataset's ranges `named` (`<dataset>/<lo>-<hi>`,
+/// open and closed, each with its group): those no other of them lies
+/// within, as a split's children lie within their parent. In hash order.
+pub fn leaves(named: &[(String, u32)]) -> Vec<(Open, u32)> {
+    let parsed: Vec<(Open, u32)> = named
+        .iter()
+        .map(|(partition, group)| {
+            let (_, lo, hi) = parse(partition);
+            (
+                Open {
+                    partition: partition.clone(),
+                    lo,
+                    hi,
+                },
+                *group,
+            )
+        })
+        .collect();
+    let mut open: Vec<(Open, u32)> = parsed
+        .iter()
+        .filter(|(range, _)| {
+            !parsed.iter().any(|(other, _)| {
+                other.partition != range.partition && range.lo <= other.lo && other.hi <= range.hi
+            })
+        })
+        .cloned()
+        .collect();
+    open.sort_by_key(|(range, _)| range.lo);
+    open
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_open_ranges_are_those_no_other_lies_within() {
+        let named = vec![
+            ("d/0000-7fff".to_string(), 0),
+            ("d/0000-3fff".to_string(), 1),
+            ("d/4000-7fff".to_string(), 0),
+            ("d/8000-ffff".to_string(), 1),
+        ];
+        let open: Vec<(String, u32)> = leaves(&named)
+            .into_iter()
+            .map(|(range, group)| (range.partition, group))
+            .collect();
+        assert_eq!(
+            open,
+            vec![
+                ("d/0000-3fff".to_string(), 1),
+                ("d/4000-7fff".to_string(), 0),
+                ("d/8000-ffff".to_string(), 1)
+            ]
+        );
+    }
 
     #[test]
     fn a_full_range_keeps_its_datasets_id_and_a_split_one_is_named_by_its_hex_range() {

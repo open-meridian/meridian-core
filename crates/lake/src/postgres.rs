@@ -22,6 +22,9 @@ use meridian_domain::v1::{
     EntitlementsChangedEvent, InstrumentType, ObservationsWantedEvent, SourcePriority,
 };
 
+mod moves;
+pub use moves::{RangeTip, Switched};
+
 use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;
 use crate::row::{DataType, Observation};
@@ -233,6 +236,54 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
         .collect();
     open.sort_by_key(|range| range.lo);
     Ok(open)
+}
+
+/// [`open_ranges`], each range's row taken for the rest of `tx` where no
+/// move's switch holds it (step 3d; section 6.8), skipped where one does:
+/// with the group each names and whether `tx` holds it. Under the
+/// dataset's lock, so the ranges stand still.
+#[allow(clippy::type_complexity)]
+fn open_ranges_taken(
+    client: &mut impl GenericClient,
+    dataset: &str,
+) -> Result<(
+    Vec<crate::range::Open>,
+    BTreeMap<String, (Option<u32>, bool)>,
+)> {
+    let rows = client
+        .query(
+            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL
+               FROM lake_partition p
+               LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
+                                   WHERE q.dataset = p.dataset
+                                     FOR UPDATE SKIP LOCKED) AS l ON true
+              WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+                AND p.closed_at IS NULL",
+            &[&dataset],
+        )
+        .map_err(unavailable)?;
+    let mut open = Vec::new();
+    let mut states = BTreeMap::new();
+    for row in rows {
+        let partition: String = row.get(0);
+        if !crate::range::is_of(&partition, dataset) {
+            continue;
+        }
+        states.insert(
+            partition.clone(),
+            (
+                row.get::<_, Option<i32>>(3).map(|group| group as u32),
+                row.get::<_, bool>(4),
+            ),
+        );
+        open.push(crate::range::Open {
+            partition,
+            lo: row.get::<_, i32>(1) as u16,
+            hi: row.get::<_, i32>(2) as u16,
+        });
+    }
+    open.sort_by_key(|range| range.lo);
+    Ok((open, states))
 }
 
 /// A range and every range it was split from: where a subject's earlier
@@ -468,16 +519,17 @@ impl PostgresStore {
     /// Refused where another writer group owns `dataset` (step 3d): its
     /// writes are handed to that group's writer, never committed here.
     fn owned(&self, partition: &str) -> Result<()> {
-        // A range is its dataset's group's: a split's children stay with
-        // their parent's (section 6.1).
+        // A range is the group its `writer_group` names, as last read, else
+        // its dataset's: a split's children stay with their parent's
+        // (section 6.1) until a move moves one (ruled 2026-11-14).
         let dataset = crate::range::dataset_of(partition);
-        if self.groups.owns(dataset) {
+        let group = self.groups.owner_by(partition, dataset);
+        if group == self.groups.mine() {
             return Ok(());
         }
-        let group = self.groups.owner(dataset);
         meridian_bus::owners::hand_to(group);
         Err(StoreError::NotOwned {
-            partition: dataset.to_string(),
+            partition: partition.to_string(),
             group,
         })
     }
@@ -1547,6 +1599,7 @@ fn again(failed: &StoreError) -> StoreError {
             partition: partition.clone(),
             group: *group,
         },
+        StoreError::Held(words) => StoreError::Held(words.clone()),
         StoreError::KeyFixed {
             data_type,
             row_key,
@@ -1627,9 +1680,16 @@ impl PostgresStore {
         parts: Vec<Vec<Observation>>,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
-        self.owned(dataset)?;
         lock_dataset_to_record(tx, dataset)?;
-        let ranges = open_ranges(tx, dataset)?;
+        // With several groups, each open range's row taken for the batch
+        // where no move's switch holds it, with the group it names (step
+        // 3d; section 6.8): a range held, or another group's, refuses only
+        // the parts with rows in it.
+        let (ranges, states) = if self.groups.several() {
+            open_ranges_taken(tx, dataset)?
+        } else {
+            (open_ranges(tx, dataset)?, BTreeMap::new())
+        };
         let from_latest = self.latest_all(tx)?;
         let latest = latest_of_each(tx, dataset, parts.iter().flatten(), from_latest)?;
         // The aliases, read only where a key held names another subject.
@@ -1686,6 +1746,9 @@ impl PostgresStore {
                 }
             }
         }
+        if self.groups.several() {
+            self.refuse_not_ours(dataset, &states, &mut by_range, &mut answered);
+        }
         for (partition, parts) in by_range {
             let mut head = self.head(tx, &partition)?;
             let epoch = self.fence.epoch();
@@ -1731,6 +1794,63 @@ impl PostgresStore {
             }
         }
         Ok(answered)
+    }
+}
+
+impl PostgresStore {
+    /// The parts of a batch with rows in a range a move's switch holds, or
+    /// one another writer group owns, refused alone and taken out of the
+    /// batch (step 3d; sections 6.7 and 6.8): held ones are tried again by
+    /// the lake until the switch ends; another group's are handed to it.
+    /// The member's view of each range's group is the one read here, under
+    /// the range's row.
+    fn refuse_not_ours(
+        &self,
+        dataset: &str,
+        states: &BTreeMap<String, (Option<u32>, bool)>,
+        by_range: &mut BTreeMap<String, Vec<(usize, Vec<Observation>)>>,
+        answered: &mut [Result<Recorded>],
+    ) {
+        let mine = self.groups.mine();
+        let mut refused: BTreeMap<usize, StoreError> = BTreeMap::new();
+        for (partition, parts) in by_range.iter() {
+            let failed = match states.get(partition) {
+                Some((_, false)) => Some(StoreError::Held(format!(
+                    "range {partition} is switching to another writer group: ask again in a moment"
+                ))),
+                Some((named, true)) => {
+                    self.groups.assign(partition, *named);
+                    let group = self.groups.owner_by(partition, dataset);
+                    (group != mine).then(|| StoreError::NotOwned {
+                        partition: partition.clone(),
+                        group,
+                    })
+                }
+                // A range not begun yet: its dataset's first write.
+                None => {
+                    let group = self.groups.owner_by(partition, dataset);
+                    (group != mine).then(|| StoreError::NotOwned {
+                        partition: partition.clone(),
+                        group,
+                    })
+                }
+            };
+            if let Some(failed) = failed {
+                for (at, _) in parts {
+                    refused.entry(*at).or_insert_with(|| again(&failed));
+                }
+            }
+        }
+        if refused.is_empty() {
+            return;
+        }
+        for parts in by_range.values_mut() {
+            parts.retain(|(at, _)| !refused.contains_key(at));
+        }
+        by_range.retain(|_, parts| !parts.is_empty());
+        for (at, failed) in refused {
+            answered[at] = Err(failed);
+        }
     }
 }
 
@@ -2533,7 +2653,7 @@ impl Store for PostgresStore {
             )));
         };
         // A range another group writes is its writer's to split.
-        self.owned(dataset)?;
+        self.owned(partition)?;
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -2541,7 +2661,7 @@ impl Store for PostgresStore {
         lock_dataset(&mut tx, dataset)?;
         let held = tx
             .query_opt(
-                "SELECT head, epoch, origin, closed_at, lo, hi FROM lake_partition
+                "SELECT head, epoch, origin, closed_at, lo, hi, writer_group FROM lake_partition
                   WHERE dataset = $1 FOR UPDATE",
                 &[&partition],
             )
@@ -2556,6 +2676,21 @@ impl Store for PostgresStore {
                  range split before, or no partition of the lake"
             )));
         };
+        // Moved to another group since this member last read it (step 3d;
+        // ruled 2026-11-14): its writer's to split, never a fence.
+        let named = held.get::<_, Option<i32>>(6);
+        if self.groups.several() {
+            self.groups
+                .assign(partition, named.map(|group| group as u32));
+            let group = self.groups.owner_by(partition, dataset);
+            if group != self.groups.mine() {
+                meridian_bus::owners::hand_to_named(group);
+                return Err(StoreError::NotOwned {
+                    partition: partition.to_string(),
+                    group,
+                });
+            }
+        }
         let epoch: i64 = held.get(1);
         self.fence.admits(epoch as u64)?;
         let closing: i64 = held.get(0);
@@ -2574,8 +2709,9 @@ impl Store for PostgresStore {
         for (child, (lo, hi)) in children.iter().zip([(lo_a, hi_a), (lo_b, hi_b)]) {
             tx.execute(
                 "INSERT INTO lake_partition
-                        (dataset, head, epoch, origin, kept_from, in_force, lo, hi, parent)
-                 VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)",
+                        (dataset, head, epoch, origin, kept_from, in_force, lo, hi, parent,
+                         writer_group)
+                 VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9)",
                 &[
                     child,
                     &closing,
@@ -2585,6 +2721,7 @@ impl Store for PostgresStore {
                     &i32::from(lo),
                     &i32::from(hi),
                     &partition,
+                    &named,
                 ],
             )
             .map_err(unavailable)?;
@@ -2606,6 +2743,10 @@ impl Store for PostgresStore {
             &[(crate::store::CONTROL_SPLIT, split.encode_to_vec(), now_ns)],
         )?;
         tx.commit().map_err(unavailable)?;
+        // The children stay with the parent's group (section 6.1).
+        for child in &children {
+            self.groups.assign(child, named.map(|group| group as u32));
+        }
         Ok(split)
     }
 
@@ -3508,6 +3649,42 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (types, row_keys): (Vec<i16>, Vec<String>) = keys.iter().cloned().unzip();
+        // One lateral probe a key, led by it, as the write path's own
+        // (`lake_latest_by_key`; the dataset named as no index takes it).
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT k.data_type, k.row_key, l.anchor
+                   FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+                  CROSS JOIN LATERAL (
+                        SELECT anchor FROM lake_latest
+                         WHERE row_key = k.row_key AND (dataset || '') = $1
+                           AND data_type = k.data_type
+                         LIMIT 1) AS l
+                  WHERE l.anchor IS NOT NULL",
+                &[&dataset, &types, &row_keys],
+            )
+            .map_err(unavailable)?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    (row.get::<_, i16>(0), row.get::<_, String>(1)),
+                    row.get::<_, i32>(2) as u16,
+                )
+            })
+            .collect())
+    }
+
     fn aliases(&self) -> Result<BTreeMap<String, String>> {
         Ok(self
             .conn()?
@@ -4337,14 +4514,12 @@ fn raise(
     let epoch = control.max(highest) + 1;
     let datasets: Vec<String> = tx
         .query(
-            "SELECT dataset FROM lake_partition ORDER BY dataset FOR UPDATE",
+            "SELECT dataset, writer_group FROM lake_partition ORDER BY dataset FOR UPDATE",
             &[],
         )?
         .iter()
+        .filter(|row| groups.is_none_or(|groups| owned_in_row(groups, row)))
         .map(|row| row.get::<_, String>(0))
-        .filter(|partition| {
-            groups.is_none_or(|groups| groups.owns(crate::range::dataset_of(partition)))
-        })
         .collect();
     let holds_control = groups.is_none_or(|groups| groups.holds_control());
     if holds_control {
@@ -4404,6 +4579,19 @@ fn raise(
     Ok(epoch as u64)
 }
 
+/// Whether `groups`' group owns the range in `row` (its ID, then its
+/// `writer_group`): the group the row names, else its dataset's rendezvous
+/// owner (step 3d; ruled 2026-11-14). Read from the row, never the member's
+/// view alone, so an epoch is raised only on what the group owns now.
+fn owned_in_row(groups: meridian_changes::groups::Groups, row: &postgres::Row) -> bool {
+    let partition: String = row.get(0);
+    let named = row.get::<_, Option<i32>>(1).map(|group| group as u32);
+    if groups.several() {
+        groups.assign(&partition, named);
+    }
+    groups.owner_by(&partition, crate::range::dataset_of(&partition)) == groups.mine()
+}
+
 /// `groups`' group's own epoch where it has one -- the control partition's
 /// for group 0, its row's past it -- the epochs of the datasets it owns,
 /// and every other group's epoch, its datasets' and its own.
@@ -4438,11 +4626,14 @@ fn epochs_of(
     }
     let mut mine = Vec::new();
     for row in client
-        .query("SELECT dataset, epoch FROM lake_partition", &[])
+        .query(
+            "SELECT dataset, writer_group, epoch FROM lake_partition",
+            &[],
+        )
         .map_err(unavailable)?
     {
-        let (partition, epoch): (String, i64) = (row.get(0), row.get(1));
-        if groups.owns(crate::range::dataset_of(&partition)) {
+        let epoch: i64 = row.get(2);
+        if owned_in_row(groups, &row) {
             mine.push(epoch as u64);
         } else {
             others.insert(epoch as u64);
@@ -4458,12 +4649,16 @@ fn end_deposed_holders(
     tx: &mut Transaction<'_>,
     groups: meridian_changes::groups::Groups,
 ) -> std::result::Result<i64, postgres::Error> {
+    // The lock of each dataset a range of the group's is of (a dataset's
+    // batches take it, whichever group writes them).
     let keys: Vec<i64> = tx
-        .query("SELECT dataset FROM lake_partition", &[])?
+        .query("SELECT dataset, writer_group FROM lake_partition", &[])?
         .iter()
+        .filter(|row| owned_in_row(groups, row))
         .map(|row| crate::range::dataset_of(&row.get::<_, String>(0)).to_string())
-        .filter(|dataset| groups.owns(dataset))
-        .map(|dataset| dataset_lock(&dataset))
+        .collect::<std::collections::BTreeSet<_>>()
+        .iter()
+        .map(|dataset| dataset_lock(dataset))
         .collect();
     let ended: i64 = tx
         .query_one(

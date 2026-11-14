@@ -496,6 +496,28 @@ impl Store for Spread {
         Ok(())
     }
 
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        // A key's latest is in the database of its range: each asked for
+        // the keys not found yet.
+        let mut found = BTreeMap::new();
+        for store in &self.stores {
+            let left: Vec<(i16, String)> = keys
+                .iter()
+                .filter(|key| !found.contains_key(*key))
+                .cloned()
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            found.extend(store.anchors(dataset, &left)?);
+        }
+        Ok(found)
+    }
+
     fn aliases(&self) -> Result<BTreeMap<String, String>> {
         self.home().aliases()
     }

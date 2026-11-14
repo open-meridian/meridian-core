@@ -38,7 +38,33 @@ pub const MOST: u32 = 64;
 /// partition name. Shared by every copy of one [`Groups`], so one member's
 /// stores and its router see one view; never by two made apart, so two
 /// members in one process -- tests' -- keep their own.
-type Assigned = std::sync::RwLock<std::collections::HashMap<String, u32>>;
+type Assigned = std::sync::RwLock<View>;
+
+/// A member's view: each partition's group by name, and each lake dataset's
+/// ranges named apart from it (`<dataset>/<lo>-<hi>`), so a write finds its
+/// dataset's ranges without reading every partition's name.
+#[derive(Debug, Default)]
+struct View {
+    by_partition: std::collections::HashMap<String, u32>,
+    ranges: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+    /// How many times each lake dataset's ranges (or the dataset itself)
+    /// changed group in this view: what a cache of its rows is kept by.
+    changed: std::collections::HashMap<String, u64>,
+}
+
+/// The dataset a lake range's ID names (`<dataset>/<lo>-<hi>`); none for any
+/// other partition.
+fn dataset_of_range(partition: &str) -> Option<&str> {
+    let (dataset, range) = partition.rsplit_once('/')?;
+    let (lo, hi) = range.split_once('-')?;
+    let hex = |said: &str| {
+        said.len() == 4
+            && said
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    (hex(lo) && hex(hi) && !dataset.is_empty()).then_some(dataset)
+}
 
 /// A member's writer group and its store's count.
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +178,7 @@ impl Groups {
         let group = *assigned
             .read()
             .expect("assignments poisoned")
+            .by_partition
             .get(partition)?;
         (group < self.count).then_some(group)
     }
@@ -166,14 +193,77 @@ impl Groups {
         let mut assigned = assigned.write().expect("assignments poisoned");
         match group {
             Some(group) => {
-                if assigned.get(partition) != Some(&group) {
-                    assigned.insert(partition.to_string(), group);
+                if let Some(was) = assigned
+                    .by_partition
+                    .insert(partition.to_string(), group)
+                    .filter(|was| *was != group)
+                {
+                    let _ = was;
+                    let dataset = dataset_of_range(partition).unwrap_or(partition).to_string();
+                    *assigned.changed.entry(dataset).or_default() += 1;
+                }
+                if let Some(dataset) = dataset_of_range(partition) {
+                    if !assigned
+                        .ranges
+                        .get(dataset)
+                        .is_some_and(|ranges| ranges.contains(partition))
+                    {
+                        assigned
+                            .ranges
+                            .entry(dataset.to_string())
+                            .or_default()
+                            .insert(partition.to_string());
+                    }
                 }
             }
             None => {
-                assigned.remove(partition);
+                if assigned.by_partition.remove(partition).is_some() {
+                    let dataset = dataset_of_range(partition).unwrap_or(partition).to_string();
+                    *assigned.changed.entry(dataset).or_default() += 1;
+                }
             }
         }
+    }
+
+    /// How many times lake dataset `dataset`'s ranges changed group in
+    /// this member's view: a cache of its rows taken at another count is
+    /// stale (step 3d).
+    pub fn changes_of(&self, dataset: &str) -> u64 {
+        self.assigned.map_or(0, |assigned| {
+            assigned
+                .read()
+                .expect("assignments poisoned")
+                .changed
+                .get(dataset)
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    /// The ranges split from lake dataset `dataset` this member has read,
+    /// open and closed, each with the group named its owner (or its
+    /// dataset's rendezvous owner): none where the dataset is whole, as
+    /// last read (step 3d; ruling 2, 2026-11-14).
+    pub fn ranges_of(&self, dataset: &str) -> Vec<(String, u32)> {
+        let Some(assigned) = self.assigned else {
+            return Vec::new();
+        };
+        let view = assigned.read().expect("assignments poisoned");
+        let Some(ranges) = view.ranges.get(dataset) else {
+            return Vec::new();
+        };
+        ranges
+            .iter()
+            .map(|range| {
+                let group = view
+                    .by_partition
+                    .get(range)
+                    .copied()
+                    .filter(|group| *group < self.count)
+                    .unwrap_or_else(|| owner(dataset, self.count));
+                (range.clone(), group)
+            })
+            .collect()
     }
 
     /// Whether this member's group owns `partition`.
@@ -276,5 +366,26 @@ mod tests {
         // One group assigns nothing.
         Groups::one().assign("P0", Some(0));
         assert_eq!(Groups::one().assigned("P0"), None);
+    }
+
+    #[test]
+    fn a_datasets_ranges_are_found_by_its_name_alone() {
+        let one = Groups::new(0, 2).unwrap();
+        assert!(one.ranges_of("a:b").is_empty());
+        one.assign("a:b", Some(0));
+        one.assign("a:b/0000-7fff", Some(1));
+        one.assign("a:b/8000-ffff", Some(0));
+        one.assign("a:bc/0000-7fff", Some(1));
+        one.assign("P3", Some(1));
+        assert_eq!(
+            one.ranges_of("a:b"),
+            vec![
+                ("a:b/0000-7fff".to_string(), 1),
+                ("a:b/8000-ffff".to_string(), 0)
+            ]
+        );
+        // A range let go of is its dataset's group's again.
+        one.assign("a:b/0000-7fff", None);
+        assert_eq!(one.ranges_of("a:b")[0].1, owner("a:b", 2));
     }
 }

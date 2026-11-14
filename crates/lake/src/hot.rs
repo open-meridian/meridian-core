@@ -380,6 +380,10 @@ pub struct HotStore {
     /// Its member's writer group (step 3d): a dataset another group writes
     /// is read from the record, since its commits never reach this layer.
     groups: std::sync::RwLock<meridian_changes::groups::Groups>,
+    /// Each dataset's count of group changes as this layer last held it
+    /// (step 3d): what it held of one is let go once its ranges changed
+    /// group since, as another group may have written it meanwhile.
+    held_at: Mutex<HashMap<String, u64>>,
 }
 
 impl HotStore {
@@ -393,7 +397,30 @@ impl HotStore {
     /// holds what each committed.
     fn holds(&self, datasets: &[String]) -> bool {
         let groups = *self.groups.read().expect("groups poisoned");
-        !groups.several() || datasets.iter().all(|dataset| groups.owns(dataset))
+        // Every open range of each its group's (step 3d; ruling 2 of
+        // 2026-11-14): a dataset split across groups is read from the store.
+        if !groups.several() {
+            return true;
+        }
+        let mut held = true;
+        for dataset in datasets {
+            let dataset = crate::range::dataset_of(dataset);
+            if crate::service::whole_owner(groups, dataset) != Some(groups.mine()) {
+                held = false;
+                continue;
+            }
+            let now = groups.changes_of(dataset);
+            let was = self
+                .held_at
+                .lock()
+                .expect("held-at poisoned")
+                .insert(dataset.to_string(), now);
+            if was.unwrap_or(0) != now {
+                // Moved away and back: what memory held of it is stale.
+                self.evict_dataset(dataset);
+            }
+        }
+        held
     }
 
     /// The store, its hot layer bounded by `bounds`, and a loader thread
@@ -412,6 +439,7 @@ impl HotStore {
             }),
             wake: Condvar::new(),
             groups: std::sync::RwLock::new(meridian_changes::groups::Groups::one()),
+            held_at: Mutex::new(HashMap::new()),
         });
         let held = Arc::downgrade(&hot);
         std::thread::Builder::new()
@@ -1032,6 +1060,14 @@ impl Store for HotStore {
 
     fn keep_alias(&self, replaced: &str, stays: &str, at_ns: i64) -> Result<()> {
         self.inner.keep_alias(replaced, stays, at_ns)
+    }
+
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        self.inner.anchors(dataset, keys)
     }
 
     fn aliases(&self) -> Result<BTreeMap<String, String>> {

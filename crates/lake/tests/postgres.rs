@@ -6023,3 +6023,450 @@ fn a_months_table_is_analysed_once_its_first_batch_commits() {
         "analysed once: the month's next batch leaves it to autovacuum"
     );
 }
+
+// ── Range moves (step 3d; section 6.8; ruled 2026-11-14) ────────────────────
+
+/// Two writer groups' members over one database (isolated), each at its own
+/// epoch, and a dataset of group 0's split in two, each half pinned to
+/// group 0: (url, group 0, group 1, dataset, lower, upper, a low subject,
+/// a high subject).
+#[allow(clippy::type_complexity)]
+fn two_groups_and_a_split(
+    tag: &str,
+) -> (
+    String,
+    Arc<PostgresStore>,
+    Arc<PostgresStore>,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
+    use meridian_changes::groups::Groups;
+    let (url, migrated) = isolated(tag);
+    drop(migrated);
+    let member = |group: u32| {
+        Arc::new(
+            PostgresStore::connect(&url, 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap()),
+        )
+    };
+    let (zero, one) = (member(0), member(1));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:mv{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of(tag);
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    assert_eq!(
+        zero.pin_owners().unwrap(),
+        3,
+        "the parent and both children"
+    );
+    one.read_owners().unwrap();
+    let lower = format!("{dataset}/0000-7fff");
+    let upper = format!("{dataset}/8000-ffff");
+    (url, zero, one, dataset, lower, upper, low, high)
+}
+
+/// Rows written to `dataset` by `subject` until `stop`, each sent to the
+/// group that owns its range now: tried again while held, handed to the
+/// group a NotOwned names. Says how many committed, each refusal, and the
+/// longest wait between two commits.
+fn writing_range(
+    zero: Arc<PostgresStore>,
+    one: Arc<PostgresStore>,
+    dataset: String,
+    subject: String,
+    tag: &'static str,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<(u64, Vec<String>, std::time::Duration)> {
+    use meridian_lake::store::StoreError;
+    std::thread::spawn(move || {
+        let (mut written, mut refused) = (0u64, Vec::new());
+        let mut longest = std::time::Duration::ZERO;
+        let mut last = std::time::Instant::now();
+        let mut to = 0u32;
+        let mut n = 0u64;
+        while !stop.load(Ordering::SeqCst) {
+            n += 1;
+            let rows = vec![trade(
+                &dataset,
+                &format!("{tag}{n}"),
+                &subject,
+                100 + n as i64,
+            )];
+            let store = if to == 0 { &zero } else { &one };
+            match store.record(&dataset, rows, 2_000 + n as i64) {
+                Ok(_) => {
+                    written += 1;
+                    longest = longest.max(last.elapsed());
+                    last = std::time::Instant::now();
+                }
+                Err(StoreError::Held(_)) => {
+                    n -= 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(StoreError::NotOwned { group, .. }) => {
+                    n -= 1;
+                    to = group;
+                }
+                Err(failed) => refused.push(failed.to_string()),
+            }
+        }
+        (written, refused, longest)
+    })
+}
+
+/// Each subject's rows of `dataset` in this database, by sequence across
+/// its ranges' lineage: each names the one before as its previous, never
+/// a hole. Answers (partition, sequence, epoch) of `subject`'s.
+fn chain_of(url: &str, dataset: &str, subject: &str) -> Vec<(String, i64, i64)> {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let rows: Vec<(String, i64, i64, i64)> = admin
+        .query(
+            "SELECT coalesce(partition, dataset), sequence, previous_sequence, epoch FROM lake_row
+              WHERE dataset = $1 AND subject = $2 ORDER BY sequence",
+            &[&dataset, &subject],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    for pair in rows.windows(2) {
+        assert_eq!(
+            pair[1].2, pair[0].1,
+            "{subject}: its chain broken at {pair:?}"
+        );
+    }
+    rows.into_iter().map(|(p, s, _, e)| (p, s, e)).collect()
+}
+
+/// The kinds the lake's control partition logged, in order.
+fn control_kinds(url: &str) -> Vec<String> {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    admin
+        .query(
+            "SELECT kind FROM lake_control_change ORDER BY sequence",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// A lake range moved to another writer group under write load, within one
+/// database (step 3d; section 6.8; fixtures/lake/move-lake-partition.yaml,
+/// "a split range"): the switch holds the range's row, so its writes wait
+/// while its sibling's commit on; they then find the target named and go
+/// to it, none refused; the subject's chain runs on unbroken across the
+/// split and the switch, the target's epoch from it on; the rows a read
+/// named before the switch are read after it; the record is logged in the
+/// lake's control; and the range moved back is written by group 0 at its
+/// own epoch again, never fenced.
+#[test]
+fn a_lake_range_moved_under_load_keeps_its_chain_and_its_sibling_writes_on() {
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let (url, zero, one, dataset, lower, upper, low, high) = two_groups_and_a_split("lake-move");
+    let before = zero.heads().unwrap()[&lower];
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moving = writing_range(
+        zero.clone(),
+        one.clone(),
+        dataset.clone(),
+        low.clone(),
+        "l",
+        stop.clone(),
+    );
+    let sibling = writing_range(
+        zero.clone(),
+        one.clone(),
+        dataset.clone(),
+        high.clone(),
+        "h",
+        stop.clone(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(2),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    let request = meridian_domain::v1::MovePartitionRequest {
+        partition: lower.clone(),
+        target_group: 1,
+        reason: "spread the dataset's halves over both writer groups".into(),
+    };
+    assert_eq!(mover.check(&request).unwrap(), 0);
+    // The parent, split, is refused: each half moves on its own.
+    let parent = mover
+        .check(&meridian_domain::v1::MovePartitionRequest {
+            partition: dataset.clone(),
+            ..request.clone()
+        })
+        .unwrap_err();
+    assert!(parent.on_the_bus().contains("partition"), "{parent:?}");
+    assert!(mover.begin(&lower));
+    let again = mover.check(&request).unwrap_err();
+    assert!(again.on_the_bus().contains("partition"), "{again:?}");
+    let asked = Asked {
+        by_hand: true,
+        moved_by: "https://directory.example.org|8812".into(),
+        reason: request.reason.clone(),
+    };
+    let switched_at = std::time::Instant::now();
+    let ended = mover.run(&lower, 1, &asked).unwrap();
+    let switch_took = switched_at.elapsed();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let (moved_rows, refused, moved_wait) = moving.join().unwrap();
+    let (sibling_rows, sibling_refused, sibling_wait) = sibling.join().unwrap();
+    assert!(
+        refused.is_empty() && sibling_refused.is_empty(),
+        "{refused:?} {sibling_refused:?}"
+    );
+    assert!(
+        moved_rows > 5 && sibling_rows > 5,
+        "{moved_rows} {sibling_rows}"
+    );
+    println!(
+        "lake range move within one database: switch {switch_took:?}; the moved range's longest \
+         wait {moved_wait:?}, its sibling's {sibling_wait:?}; {moved_rows} and {sibling_rows} rows"
+    );
+    let Ended::Moved(moved) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!((moved.from_group, moved.to_group), (0, 1));
+    assert_eq!(moved.epoch, one.epoch(), "group 1's own epoch");
+    mover.log(&ended);
+    assert!(control_kinds(&url).contains(&"meridian.v1.PartitionMoved".to_string()));
+    let tip = zero.range_tip(&lower).unwrap().unwrap();
+    assert_eq!((tip.writer_group, tip.epoch), (Some(1), one.epoch()));
+    // Unbroken: across the split and the switch, the target's epoch after.
+    let chain = chain_of(&url, &dataset, &low);
+    let switched = chain
+        .iter()
+        .position(|(_, _, epoch)| *epoch as u64 == moved.epoch)
+        .expect("written by the target after the switch");
+    assert!(
+        switched > 1
+            && chain[switched..]
+                .iter()
+                .all(|(p, _, e)| p == &lower && *e as u64 == moved.epoch)
+    );
+    assert!(chain_of(&url, &dataset, &high)
+        .iter()
+        .all(|(_, _, epoch)| *epoch as u64 == zero.epoch()));
+    assert!(zero.scrub().unwrap().findings.is_empty());
+    // The rows a read named before the switch, read after it from the
+    // range's lineage: its head is past them.
+    let heads = one.heads().unwrap();
+    assert!(heads[&lower] > before && heads[&upper] > 1);
+    let read = one
+        .read(&Query {
+            datasets: vec![dataset.clone()],
+            data_type: DataType::Trade,
+            subjects: vec![low.clone()],
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Latest { at_ns: 0 },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })
+        .unwrap();
+    assert!(!read.is_empty());
+    // Moved back: group 0's own epoch, written by its same writer.
+    assert!(mover.begin(&lower));
+    let back = mover
+        .run(
+            &lower,
+            0,
+            &Asked {
+                reason: "back".into(),
+                ..asked
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(back, Ended::Moved(ref m) if m.epoch == zero.epoch()),
+        "{back:?}"
+    );
+    zero.read_owners().unwrap();
+    zero.record(&dataset, vec![trade(&dataset, "back", &low, 999)], 9_000)
+        .expect("group 0 writes the range moved back, never fenced");
+}
+
+/// Every cause a range's move aborts for (section 6.8; MoveAbortCause): the
+/// injected lag before anything is held, a switch that cannot finish
+/// within moves.switchSeconds (a batch holds the range's row), and the
+/// injected digest mismatch, with an IntegrityFinding. Each leaves the
+/// source owning at its epoch, writing on with no gap, and its record in
+/// the lake's control.
+#[test]
+fn a_lake_range_move_aborts_for_lag_timeout_and_digest_and_the_source_owns() {
+    use meridian_domain::v1::MoveAbortCause;
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let (url, zero, _one, dataset, lower, _upper, low, _high) =
+        two_groups_and_a_split("lake-abort");
+    let dir = std::env::temp_dir().join(unique("lake-abort"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lag, digest) = (dir.join("lag"), dir.join("digest"));
+    std::fs::write(&lag, "60000").unwrap();
+    std::fs::write(&digest, "").unwrap();
+    let mover = |lag_file: Option<std::path::PathBuf>, digest_file| {
+        Mover::new(
+            vec![zero.clone()],
+            zero.groups(),
+            Settings {
+                switch: std::time::Duration::from_secs(1),
+                lag_file,
+                digest_file,
+                ..Default::default()
+            },
+            Arc::new(SystemClock),
+        )
+    };
+    let attempt = |mover: &Mover| {
+        assert!(mover.begin(&lower));
+        let ended = mover.run(&lower, 1, &Asked::default()).unwrap();
+        mover.log(&ended);
+        ended
+    };
+    let mut n = 0;
+    let mut writes_on = || {
+        n += 1;
+        zero.record(
+            &dataset,
+            vec![trade(&dataset, &format!("a{n}"), &low, n)],
+            5_000 + n,
+        )
+        .expect("the source writes on");
+    };
+    // Lag: the gate never opens.
+    let ended = attempt(&mover(Some(lag.clone()), None));
+    assert!(
+        matches!(ended, Ended::Aborted(ref a, None) if a.cause == MoveAbortCause::Lag as i32),
+        "{ended:?}"
+    );
+    writes_on();
+    // Timeout: a batch holds the range's row past the bound.
+    let mut holder = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut held = holder.transaction().unwrap();
+    held.execute(
+        "SELECT 1 FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+        &[&lower],
+    )
+    .unwrap();
+    let ended = attempt(&mover(None, None));
+    held.rollback().unwrap();
+    assert!(
+        matches!(ended, Ended::Aborted(ref a, None) if a.cause == MoveAbortCause::Timeout as i32),
+        "{ended:?}"
+    );
+    writes_on();
+    // Digest: the target's differs at N.
+    let ended = attempt(&mover(None, Some(digest.clone())));
+    let Ended::Aborted(aborted, Some(finding)) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!(aborted.cause, MoveAbortCause::Digest as i32);
+    assert_eq!(
+        (aborted.component.as_str(), aborted.target_group),
+        ("lake", 1)
+    );
+    assert!(finding.detail.contains(&lower), "{finding:?}");
+    writes_on();
+    // The source owns at its epoch; no hole; each record logged.
+    let tip = zero.range_tip(&lower).unwrap().unwrap();
+    assert_eq!((tip.writer_group, tip.epoch), (Some(0), zero.epoch()));
+    chain_of(&url, &dataset, &low);
+    let kinds = control_kinds(&url);
+    let count = |kind: &str| kinds.iter().filter(|k| *k == kind).count();
+    assert_eq!(count("meridian.v1.PartitionMoveAborted"), 3);
+    assert_eq!(count("meridian.v1.PartitionMoved"), 0);
+    assert_eq!(count(meridian_changes::records::FINDING), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An aliased key restated after a merge, routed across two groups to its
+/// anchor's range (step 3d; ruling 2 of 2026-11-14): a key first written
+/// under a subject in the lower half, whose record then merged into one in
+/// the upper half, is restated under the record that stays. Its range is
+/// its anchor's -- the lower, moved to group 1 -- never its new subject's:
+/// the router reads the anchor in one look and sends it to group 1, which
+/// records it there as its next version; group 0 is refused it, and the
+/// upper range holds nothing of it.
+#[test]
+fn an_aliased_key_restated_after_a_merge_is_routed_to_its_anchors_range() {
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_lake::store::StoreError;
+    let (url, zero, one, dataset, lower, upper, low, high) = two_groups_and_a_split("lake-alias");
+    zero.record(&dataset, vec![trade(&dataset, "k", &low, 50)], 2_000)
+        .unwrap();
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings::default(),
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover.run(&lower, 1, &Asked::default()).unwrap();
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    one.read_owners().unwrap();
+    // The low subject's record merged into the high one's.
+    zero.keep_alias(&low, &high, 2_500).unwrap();
+    let mut restated = trade(&dataset, "k", &high, 50);
+    restated.meta_mut().valid_until_ns += 1;
+    let rows = vec![restated];
+    // Its new subject's hash says group 0; its anchor says group 1.
+    assert!(meridian_lake::range::hash(&high) >= 0x8000);
+    for member in [&zero, &one] {
+        assert_eq!(
+            meridian_lake::service::owners_of_rows(
+                member.groups(),
+                member.as_ref(),
+                &dataset,
+                &rows
+            ),
+            vec![1],
+            "routed to the anchor's range's group"
+        );
+    }
+    assert!(matches!(
+        zero.record(&dataset, rows.clone(), 3_000),
+        Err(StoreError::NotOwned { group: 1, .. })
+    ));
+    let done = one.record(&dataset, rows, 3_000).unwrap();
+    assert_eq!(done.restated, 1);
+    assert_eq!(done.partition_of(&dataset, 0), lower);
+    assert_eq!(done.rows[0].meta().version, 2);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let in_upper: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM lake_row WHERE partition = $1 AND row_key = 'k'",
+            &[&upper],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(in_upper, 0, "nothing in the wrong range");
+}
