@@ -478,7 +478,10 @@ async fn answer(client: &async_nats::Client, answers: Answers) {
             None => client.publish(to, body.into()).await,
             Some(detail) => {
                 let mut headers = async_nats::HeaderMap::new();
-                headers.insert(meridian_bus::write_ahead::REFUSAL_HEADER, detail.as_str());
+                headers.insert(
+                    meridian_bus::write_ahead::REFUSAL_HEADER,
+                    meridian_bus::header_words(&detail).as_str(),
+                );
                 client.publish_with_headers(to, headers, body.into()).await
             }
         };

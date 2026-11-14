@@ -45,6 +45,14 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 /// answer's shape and a refusal is not an answer of that shape.
 pub(crate) const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
+/// Words carried in a header, on one line: a header's value may hold no
+/// line break, and the client panics on one, so the answer is never sent and
+/// its caller waits out its whole timeout (step 3d; CI 43621875619, a
+/// database's error with its DETAIL line). Each line break read as a space.
+pub fn header_words(words: &str) -> String {
+    words.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 /// How long a request's caller waits for its answer, in milliseconds, carried
 /// beside the request as gRPC's own `grpc-timeout` is: relative, so no two
 /// clocks are compared. The answering side holds a read to its `read_after`
@@ -820,7 +828,7 @@ impl NatsBackend {
                         None => client.publish(reply_to, encoded.into()).await,
                         Some(detail) => {
                             let mut headers = async_nats::HeaderMap::new();
-                            headers.insert(REFUSAL_HEADER, detail.as_str());
+                            headers.insert(REFUSAL_HEADER, header_words(&detail).as_str());
                             client
                                 .publish_with_headers(reply_to, headers, encoded.into())
                                 .await

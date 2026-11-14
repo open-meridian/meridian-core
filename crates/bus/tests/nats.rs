@@ -304,6 +304,52 @@ async fn a_refusal_crosses_with_its_reason() {
     }
 }
 
+/// A refusal whose words span lines, as a database's error does with its
+/// DETAIL line, is answered at once, on one line: a header holds no line
+/// break, and the answer was never sent (step 3d; CI 43621875619, a
+/// writer's refusal its caller waited 19.7 s for).
+#[tokio::test]
+async fn a_refusal_of_several_lines_crosses_on_one() {
+    let asking = bus("asking-lines").await;
+    let answering = bus("answering-lines").await;
+    let topic = topic("query.refused-lines");
+
+    answering.serve(&topic, |_| {
+        Err(
+            "db error: ERROR: duplicate key value\nDETAIL: Key (message_id) already exists.\r\n"
+                .to_string(),
+        )
+    });
+    settle().await;
+
+    let started = std::time::Instant::now();
+    let refused = asking
+        .call(
+            &topic,
+            "meridian.test.Question",
+            vec![],
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("the handler refused");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "answered at once, not waited out ({:?})",
+        started.elapsed()
+    );
+    match refused {
+        BusError::HandlerFailed { detail, .. } => {
+            assert!(
+                detail.contains("duplicate key value DETAIL: Key"),
+                "{detail}"
+            );
+            assert!(!detail.contains(['\r', '\n']), "{detail:?}");
+        }
+        other => panic!("expected HandlerFailed, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_local_handler_answers_without_the_broker() {
     // A deployment running everything in one process should not need a broker
