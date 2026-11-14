@@ -153,14 +153,18 @@ impl Spread {
         runs
     }
 
-    /// Each database's answer, merged: maps by key.
-    fn union_maps<V>(
+    /// Each database's counts, a dataset's summed across them (step 3d):
+    /// each database counts what is read there, so nothing twice.
+    fn summed<V: Default>(
         &self,
         each: impl Fn(&PostgresStore) -> Result<BTreeMap<String, V>>,
+        add: impl Fn(&mut V, V),
     ) -> Result<BTreeMap<String, V>> {
-        let mut out = BTreeMap::new();
+        let mut out: BTreeMap<String, V> = BTreeMap::new();
         for store in &self.stores {
-            out.extend(each(store)?);
+            for (dataset, counted) in each(store)? {
+                add(out.entry(dataset).or_default(), counted);
+            }
         }
         Ok(out)
     }
@@ -472,11 +476,19 @@ impl Store for Spread {
     }
 
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
-        self.union_maps(|store| store.counts())
+        // A dataset whose ranges are in several databases: each database's
+        // count of the ranges read there, summed (step 3d).
+        self.summed(
+            |store| store.counts(),
+            |sum, (rows, unconverted)| {
+                sum.0 += rows;
+                sum.1 += unconverted;
+            },
+        )
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
-        self.union_maps(|store| store.unconverted_counts())
+        self.summed(|store| store.unconverted_counts(), |sum, n| *sum += n)
     }
 
     fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
@@ -634,11 +646,24 @@ impl Store for Spread {
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
         // Each counted where its rows are: a re-check database 0 keeps of
         // another database's row joins no row there.
-        self.union_maps(|store| store.closed_day_counts())
+        self.summed(
+            |store| store.closed_day_counts(),
+            |sum, (one, two)| {
+                sum.0 += one;
+                sum.1 += two;
+            },
+        )
     }
 
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
-        self.union_maps(|store| store.quality_counts())
+        self.summed(
+            |store| store.quality_counts(),
+            |sum, (fine, suspicious, invalid)| {
+                sum.0 += fine;
+                sum.1 += suspicious;
+                sum.2 += invalid;
+            },
+        )
     }
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>> {

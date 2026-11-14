@@ -3919,8 +3919,11 @@ impl Lake {
         let config = self.config();
         for dataset in config.datasets.keys() {
             let licence = config.licence(dataset);
-            // Each writer group its own datasets' (step 3d).
-            if licence.retention_days == 0 || !self.groups.owns(dataset) {
+            // Each writer group its own ranges', in its own database, as
+            // the store's rows name them (step 3d): a dataset's ranges may
+            // sit in several groups and databases.
+            if licence.retention_days == 0 || !(self.groups.several() || self.groups.owns(dataset))
+            {
                 continue;
             }
             let before = now - i64::from(licence.retention_days) * 86_400 * 1_000_000_000;

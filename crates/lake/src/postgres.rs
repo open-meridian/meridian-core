@@ -2807,13 +2807,23 @@ impl Store for PostgresStore {
         now_ns: i64,
     ) -> Result<Recorded> {
         self.epoch_now()?;
-        self.owned(dataset)?;
+        let several = self.groups.several();
+        if !several {
+            self.owned(dataset)?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         lock_dataset(&mut tx, dataset)?;
         // Each row in the open range of its first subject's hash, as a kept
         // row is placed (step 3d): numbered there, its values kept nowhere.
-        let ranges = open_ranges(&mut tx, dataset)?;
+        // With several groups, each range's row taken as a batch takes it,
+        // and the rows refused whole where one is held by a move's switch
+        // or another group's: the lake routes them again (section 6.8).
+        let (ranges, states) = if several {
+            open_ranges_taken(&mut tx, dataset)?
+        } else {
+            (open_ranges(&mut tx, dataset)?, BTreeMap::new())
+        };
         let mut by_range: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
         for row in rows {
             let anchor = crate::range::hash(row.subject());
@@ -2821,6 +2831,16 @@ impl Store for PostgresStore {
                 .entry(crate::range::placed(dataset, &ranges, anchor).into_owned())
                 .or_default()
                 .push(row);
+        }
+        if several {
+            let mut parts: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = by_range
+                .keys()
+                .map(|partition| (partition.clone(), vec![(0, Vec::new())]))
+                .collect();
+            let mut answered = [Ok(Recorded::default())];
+            self.refuse_not_ours(dataset, &states, &mut parts, &mut answered);
+            let [answered] = answered;
+            answered?;
         }
         let mut answer = Recorded::default();
         for (partition, rows) in by_range {
@@ -3252,22 +3272,44 @@ impl Store for PostgresStore {
     }
 
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
-        Ok(self
-            .conn()?
+        let mut conn = self.conn()?;
+        let Some(served) = self.served_everywhere(&mut *conn)? else {
+            return Ok(conn
+                .query(
+                    "SELECT dataset, count(*), count(*) FILTER (WHERE unconverted)
+                       FROM lake_row GROUP BY dataset",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>(0),
+                        (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
+                    )
+                })
+                .collect());
+        };
+        // Several databases (step 3d): each range's rows where it is read,
+        // a dataset's ranges summed here and across databases by the spread.
+        let mut out: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for r in conn
             .query(
-                "SELECT dataset, count(*), count(*) FILTER (WHERE unconverted)
-                   FROM lake_row GROUP BY dataset",
+                "SELECT dataset, coalesce(partition, dataset), count(*),
+                        count(*) FILTER (WHERE unconverted)
+                   FROM lake_row GROUP BY 1, 2",
                 &[],
             )
             .map_err(unavailable)?
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<_, String>(0),
-                    (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
-                )
-            })
-            .collect())
+        {
+            if !served(&r.get::<_, String>(1)) {
+                continue;
+            }
+            let at = out.entry(r.get(0)).or_default();
+            at.0 += r.get::<_, i64>(2) as u64;
+            at.1 += r.get::<_, i64>(3) as u64;
+        }
+        Ok(out)
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
@@ -3468,7 +3510,10 @@ impl Store for PostgresStore {
         why: &str,
         now_ns: i64,
     ) -> Result<u64> {
-        self.owned(dataset)?;
+        let several = self.groups.several();
+        if !several {
+            self.owned(dataset)?;
+        }
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -3482,44 +3527,77 @@ impl Store for PostgresStore {
         // Every range of the dataset held as a batch holds it (step 3d).
         lock_dataset(&mut tx, dataset)?;
         let partitions = partitions_of(&mut tx, &[dataset.to_string()])?;
+        // With several groups, each group's own ranges, as this database's
+        // rows name them (step 3d; section 6.4): a dataset whose ranges sit
+        // in several groups and databases has each range's retention kept
+        // by its own writer, in the database where it is read.
+        let mut ours: Vec<String> = Vec::new();
         for held in tx
             .query(
-                "SELECT epoch FROM lake_partition WHERE dataset = ANY($1) ORDER BY dataset
-                    FOR UPDATE",
+                "SELECT dataset, epoch, writer_group FROM lake_partition
+                  WHERE dataset = ANY($1) ORDER BY dataset FOR UPDATE",
                 &[&partitions],
             )
             .map_err(unavailable)?
         {
-            self.fence.admits(held.get::<_, i64>(0) as u64)?;
+            let partition: String = held.get(0);
+            if several {
+                let group = self.group_named(&partition, held.get(2));
+                if group != self.groups.mine() {
+                    // A lineage's range a move copied here, read where it
+                    // stays: its copies go by the same retention, with it.
+                    if !self.serves(&partition, held.get(2)) {
+                        ours.push(partition);
+                    }
+                    continue;
+                }
+            }
+            self.fence.admits(held.get::<_, i64>(1) as u64)?;
+            ours.push(partition);
+        }
+        if several && ours.is_empty() {
+            return Ok(0);
         }
         // The rows removed, and the row keys left with no version kept: a
         // key whose later version stays is still in force at it. Each range
         // its own: its last row removed, and its keys gone where their last
-        // version was.
-        let gone = tx
-            .query(
-                "WITH gone AS (
-                    DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2
-                    RETURNING coalesce(partition, dataset) AS partition, data_type, row_key,
-                              sequence, version),
-                 per_key AS (
-                    SELECT DISTINCT ON (data_type, row_key) partition, data_type, row_key
-                      FROM gone ORDER BY data_type, row_key, version DESC),
-                 keys_gone AS (
-                    SELECT g.partition, count(*) AS n FROM per_key g
-                     WHERE NOT EXISTS (
-                           SELECT 1 FROM lake_row k
-                            WHERE k.dataset = $1 AND k.data_type = g.data_type
-                              AND k.row_key = g.row_key AND k.recorded_at_ns >= $2)
-                     GROUP BY g.partition),
-                 rows_gone AS (
-                    SELECT partition, count(*) AS n, max(sequence) AS last FROM gone
-                     GROUP BY partition)
-                 SELECT r.partition, r.n, r.last, coalesce(k.n, 0)
-                   FROM rows_gone r LEFT JOIN keys_gone k USING (partition)",
-                &[&dataset, &recorded_before_ns],
+        // version was. With several groups, only this group's ranges' rows,
+        // a key kept where another range keeps any version of it.
+        let (only, kept) = if several {
+            (
+                "AND coalesce(partition, dataset) = ANY($3)",
+                "(k.recorded_at_ns >= $2 OR NOT coalesce(k.partition, k.dataset) = ANY($3))",
             )
-            .map_err(unavailable)?;
+        } else {
+            ("", "k.recorded_at_ns >= $2")
+        };
+        let sql = format!(
+            "WITH gone AS (
+                DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2 {only}
+                RETURNING coalesce(partition, dataset) AS partition, data_type, row_key,
+                          sequence, version),
+             per_key AS (
+                SELECT DISTINCT ON (data_type, row_key) partition, data_type, row_key
+                  FROM gone ORDER BY data_type, row_key, version DESC),
+             keys_gone AS (
+                SELECT g.partition, count(*) AS n FROM per_key g
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM lake_row k
+                        WHERE k.dataset = $1 AND k.data_type = g.data_type
+                          AND k.row_key = g.row_key AND {kept})
+                 GROUP BY g.partition),
+             rows_gone AS (
+                SELECT partition, count(*) AS n, max(sequence) AS last FROM gone
+                 GROUP BY partition)
+             SELECT r.partition, r.n, r.last, coalesce(k.n, 0)
+               FROM rows_gone r LEFT JOIN keys_gone k USING (partition)"
+        );
+        let gone = if several {
+            tx.query(&sql, &[&dataset, &recorded_before_ns, &ours])
+        } else {
+            tx.query(&sql, &[&dataset, &recorded_before_ns])
+        }
+        .map_err(unavailable)?;
         let mut removed = 0u64;
         for range in &gone {
             let partition: String = range.get(0);
@@ -4029,6 +4107,7 @@ impl Store for PostgresStore {
             .start()
             .map_err(unavailable)?;
         let superseded = self.superseded(&mut tx)?;
+        let served = self.served_everywhere(&mut tx)?;
         let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         for row in tx
             .query(
@@ -4037,8 +4116,11 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?
         {
-            // A dataset's ranges summed (step 3d).
+            // A dataset's ranges summed (step 3d), each where it is read.
             let partition: String = row.get(0);
+            if served.as_ref().is_some_and(|served| !served(&partition)) {
+                continue;
+            }
             counts
                 .entry(crate::range::dataset_of(&partition).to_string())
                 .or_default()
@@ -4865,21 +4947,51 @@ impl PostgresStore {
             .iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
-        let count = self.groups.count();
         Ok(every
             .into_iter()
-            .filter(|partition| {
-                let dataset = crate::range::dataset_of(partition);
-                let group = named
-                    .get(partition)
-                    .copied()
-                    .flatten()
-                    .map(|group| group as u32)
-                    .filter(|group| *group < count)
-                    .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count));
-                meridian_changes::databases::of_group(group, self.databases) == self.database
-            })
+            .filter(|partition| self.serves(partition, named.get(partition).copied().flatten()))
             .collect())
+    }
+
+    /// The writer group of `partition` as this database's row names it
+    /// (`named`), else its dataset's rendezvous owner (step 3d).
+    fn group_named(&self, partition: &str, named: Option<i32>) -> u32 {
+        let count = self.groups.count();
+        named
+            .map(|group| group as u32)
+            .filter(|group| *group < count)
+            .unwrap_or_else(|| {
+                meridian_changes::groups::owner(crate::range::dataset_of(partition), count)
+            })
+    }
+
+    /// Whether a read here answers `partition`, its row naming `named`:
+    /// where its group writes this database.
+    fn serves(&self, partition: &str, named: Option<i32>) -> bool {
+        meridian_changes::databases::of_group(self.group_named(partition, named), self.databases)
+            == self.database
+    }
+
+    /// Whether a read here answers each partition, of every dataset (step
+    /// 3d; section 6.4): `None` with one database, where it answers every
+    /// one. A count of what the lake holds counts these alone, so a range a
+    /// move copied to another database is counted once, where it is read.
+    fn served_everywhere(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<Option<impl Fn(&str) -> bool + '_>> {
+        if self.databases <= 1 {
+            return Ok(None);
+        }
+        let named: BTreeMap<String, Option<i32>> = client
+            .query("SELECT dataset, writer_group FROM lake_partition", &[])
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        Ok(Some(move |partition: &str| {
+            self.serves(partition, named.get(partition).copied().flatten())
+        }))
     }
 
     /// Every alias this database keeps: `(replaced, stays, heard_at_ns)`.

@@ -6642,6 +6642,178 @@ fn a_lake_range_moved_between_databases_is_copied_and_its_chain_reads_whole() {
     assert!(one.heads().unwrap()[&lower] > zeros[0].heads().unwrap()[&lower]);
 }
 
+/// A dataset whose ranges sit in two groups and two databases (step 3d;
+/// sections 6.4 and 6.8): its counts are each database's of the ranges
+/// read there, summed -- never one database's overwriting the other's, and
+/// a range a move copied counted once; retention removes each range's rows
+/// by its own writer, in its own database, each range's kept-from its own,
+/// and the copies a move left with them; and rows served unkept are
+/// numbered in their own range by its own group, a request with another
+/// group's rows refused whole to be routed again.
+#[test]
+fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept_rows() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let zero = meridian_lake::spread::Spread::new(zeros.clone(), zeros[0].groups());
+    let one = meridian_lake::spread::Spread::new(ones.clone(), ones[0].groups());
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:r{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of("lake-retain");
+    // Old rows: two before the split (the dataset's own range), one after
+    // in the lower half; then the lower half moved to group 1's database.
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    zero.record(&dataset, vec![trade(&dataset, "l1", &low, 12)], 1_200)
+        .unwrap();
+    zeros[0].pin_owners().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    let (lower, upper) = (
+        format!("{dataset}/0000-7fff"),
+        format!("{dataset}/8000-ffff"),
+    );
+    let mover = Mover::new(
+        zeros.clone(),
+        zeros[0].groups(),
+        Settings::default(),
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let ended = mover.run(&lower, 1, &Asked::default()).unwrap();
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    // New rows, each half by its own writer.
+    let l2 = one
+        .record(&dataset, vec![trade(&dataset, "l2", &low, 13)], 5_000)
+        .unwrap();
+    assert_eq!(l2.partition_of(&dataset, 0), lower);
+    let h1 = zero
+        .record(&dataset, vec![trade(&dataset, "h1", &high, 14)], 5_000)
+        .unwrap();
+    assert_eq!(h1.partition_of(&dataset, 0), upper);
+    // Counted once each, wherever read: l0 and h0 in the dataset's own
+    // range (database 0), l1 and l2 in the lower half (database 1), h1 in
+    // the upper (database 0). Database 1's count of its range alone would
+    // have stood for the whole dataset before.
+    for member in [&zero, &one] {
+        assert_eq!(member.counts().unwrap()[&dataset].0, 5);
+    }
+    // Retention: rows recorded before 2,000 removed, each group its own.
+    let raw = |d: usize, sql: &str| -> i64 {
+        postgres::Client::connect(&urls[d], postgres::NoTls)
+            .unwrap()
+            .query_one(sql, &[&dataset])
+            .unwrap()
+            .get(0)
+    };
+    let old = "SELECT count(*) FROM lake_row WHERE dataset = $1 AND recorded_at_ns < 2000";
+    assert!(raw(0, old) > 0 && raw(1, old) > 0);
+    let why = "retention under the dataset's licence: a test";
+    // Group 0: in database 0, the dataset's own range's l0 and h0, and the
+    // copy of l1 the move left there.
+    assert_eq!(zero.remove_before(&dataset, 2_000, why, 6_000).unwrap(), 3);
+    assert_eq!(raw(0, old), 0);
+    assert!(raw(1, old) > 0, "database 1's are group 1's to remove");
+    // Group 1: in database 1, its l1 and the lineage's copy of l0.
+    assert_eq!(one.remove_before(&dataset, 2_000, why, 6_000).unwrap(), 2);
+    assert_eq!(raw(1, old), 0);
+    for member in [&zero, &one] {
+        assert_eq!(member.counts().unwrap()[&dataset].0, 2);
+    }
+    // Each range kept from its own first row kept, in its own database.
+    let first = |done: &meridian_lake::store::Recorded| done.rows[0].meta().sequence;
+    assert_eq!(zero.lowest_kept(&lower).unwrap(), Some(first(&l2)));
+    assert_eq!(one.lowest_kept(&upper).unwrap(), Some(first(&h1)));
+    let kept_from = |d: usize, partition: &str| -> i64 {
+        postgres::Client::connect(&urls[d], postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT kept_from FROM lake_partition WHERE dataset = $1",
+                &[&partition],
+            )
+            .unwrap()
+            .get(0)
+    };
+    assert!(kept_from(1, &lower) > 1, "the lower half's, in database 1");
+    assert!(
+        kept_from(0, &dataset) > 2,
+        "the dataset's own, in database 0"
+    );
+    // Rows served unkept: numbered in their own range by its own group.
+    let heads = one.heads().unwrap();
+    let mixed = vec![
+        trade(&dataset, "u-l", &low, 20),
+        trade(&dataset, "u-h", &high, 21),
+    ];
+    let refused = zero
+        .serve_unkept(&dataset, mixed, &["reader".into()], 7_000)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            meridian_lake::store::StoreError::NotOwned { group: 1, .. }
+        ),
+        "{refused:?}"
+    );
+    let served_high = zero
+        .serve_unkept(
+            &dataset,
+            vec![trade(&dataset, "u-h", &high, 21)],
+            &["reader".into()],
+            7_000,
+        )
+        .unwrap();
+    assert_eq!(served_high.partition_of(&dataset, 0), upper);
+    let served_low = one
+        .serve_unkept(
+            &dataset,
+            vec![trade(&dataset, "u-l", &low, 20)],
+            &["reader".into()],
+            7_000,
+        )
+        .unwrap();
+    assert_eq!(served_low.partition_of(&dataset, 0), lower);
+    let now = one.heads().unwrap();
+    assert_eq!(now[&lower], heads[&lower] + 1);
+    assert_eq!(now[&upper], heads[&upper] + 1);
+    for member in [&zero, &one] {
+        assert_eq!(member.counts().unwrap()[&dataset].0, 2, "nothing kept");
+    }
+}
+
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
 /// group answering it waits until the other group's consumer has committed
 /// its part -- its position in the stream past the write -- and answers
