@@ -124,27 +124,31 @@ pub(crate) fn rule_five(
     mut latest: impl FnMut(&Observation) -> Option<Observation>,
     mut same_record: impl FnMut(&str, &str) -> bool,
 ) -> Vec<Option<StoreError>> {
-    let mut kept: std::collections::HashMap<(i16, String), Observation> =
+    // Each key's last row in the parts before, and in this part so far: by
+    // reference, one look a row (step 3d).
+    let mut kept: std::collections::HashMap<(i16, &str), &Observation> =
         std::collections::HashMap::new();
     parts
         .iter()
         .map(|rows| {
-            let mut mine: Vec<((i16, String), Observation)> = Vec::new();
+            let mut mine: std::collections::HashMap<(i16, &str), &Observation> =
+                std::collections::HashMap::new();
             for row in rows {
-                let key = (row.data_type().code(), row.meta().row_key.clone());
-                let held = mine
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, held)| held.clone())
-                    .or_else(|| kept.get(&key).cloned())
-                    .or_else(|| latest(row));
+                let key = (row.data_type().code(), row.meta().row_key.as_str());
+                let fetched;
+                let held = match mine.get(&key).or_else(|| kept.get(&key)) {
+                    Some(held) => Some(*held),
+                    None => {
+                        fetched = latest(row);
+                        fetched.as_ref()
+                    }
+                };
                 if let Some(held) = held {
                     let (was, is) = (held.meta().valid_from_ns, row.meta().valid_from_ns);
                     if was != is {
                         return Some(StoreError::KeyFixed {
                             data_type: row.data_type(),
-                            row_key: key.1,
+                            row_key: key.1.to_string(),
                             field: crate::store::VALID_TIME_FIELD,
                             words: format!(
                                 "row key {:?} was recorded valid from {was} and is restated valid from {is}: a row key fixes its valid time; cancel the old key and record a new one",
@@ -156,7 +160,7 @@ pub(crate) fn rule_five(
                     if was != is && !same_record(was, is) {
                         return Some(StoreError::KeyFixed {
                             data_type: row.data_type(),
-                            row_key: key.1,
+                            row_key: key.1.to_string(),
                             field: crate::store::FIRST_SUBJECT_FIELD,
                             words: format!(
                                 "row key {:?} was recorded about {was} and is restated about {is}: a row key fixes its first subject; cancel the old key and record a new one",
@@ -165,7 +169,7 @@ pub(crate) fn rule_five(
                         });
                     }
                 }
-                mine.push((key, row.clone()));
+                mine.insert(key, row);
             }
             kept.extend(mine);
             None

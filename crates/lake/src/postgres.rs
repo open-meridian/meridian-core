@@ -113,6 +113,10 @@ pub struct PostgresStore {
     made: std::sync::Mutex<std::collections::HashSet<(String, crate::leaves::Month)>>,
     /// The ranges whose tables this store has seen made, likewise.
     ranges_made: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The datasets whose open ranges' tables this store has seen made:
+    /// their ranges are not read again before a batch, as a split makes its
+    /// children's tables itself. Let go likewise.
+    datasets_made: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Whether `lake_latest` holds every row key kept (step 3d): read once
     /// it does, and held, as it never stops.
     latest_all: std::sync::atomic::AtomicBool,
@@ -152,6 +156,27 @@ fn is_book_partition(partition: &str) -> bool {
 fn lock_dataset(tx: &mut Transaction<'_>, dataset: &str) -> Result<()> {
     tx.execute(
         "SELECT pg_advisory_xact_lock($1)",
+        &[&dataset_lock(dataset)],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+/// [`lock_dataset`], for a batch recording the dataset's rows: with sorts
+/// set aside for the rest of `tx`, in the same statement. A subject's last
+/// entry is then found by the one index ordered by it
+/// (`lake_row_subject_sequence`): a month's table has no statistics until it
+/// is first analysed, a minute or so after its first rows, and until then
+/// the planner took any index of the dataset's data type as good as that
+/// one, sorting its every row of the month to find the subject's last, each
+/// batch slower than the last. A statement that can only sort still sorts,
+/// its plan then priced past any other -- so the batch's statements are
+/// never compiled (`jit` off, as the read of a chunk sets it), which took
+/// longer than the batch.
+fn lock_dataset_to_record(tx: &mut Transaction<'_>, dataset: &str) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1), set_config('enable_sort', 'off', true),
+                set_config('jit', 'off', true)",
         &[&dataset_lock(dataset)],
     )
     .map_err(unavailable)?;
@@ -207,6 +232,10 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
 /// rows are, numbered below the range's own.
 fn lineage(client: &mut impl GenericClient, partition: &str) -> Result<Vec<String>> {
     let mut out = vec![partition.to_string()];
+    // A dataset's full range is never split from another.
+    if crate::range::dataset_of(partition) == partition {
+        return Ok(out);
+    }
     let mut at = partition.to_string();
     for _ in 0..32 {
         let parent: Option<String> = client
@@ -278,6 +307,7 @@ impl PostgresStore {
             adopting: std::sync::Mutex::new(()),
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
+            datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             latest_all: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -484,13 +514,13 @@ impl PostgresStore {
     /// the writer's (step 3a): a batch commits only while the head row's
     /// epoch is its own. A dataset begun here takes the writer's epoch, the
     /// `control` partition's checked first, so a takeover that raised it is
-    /// never undone by a dataset its deposed writer begins.
+    /// never undone by a dataset its deposed writer begins. Its caller
+    /// holds the dataset's lock ([`lock_dataset`]), which its writes and its
+    /// splits take, so its ranges stand still while a batch places its rows
+    /// (step 3d).
     fn head(&self, tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
         self.owned(dataset)?;
         let epoch = self.epoch_now()?;
-        // The dataset's lock, which its writes and its splits take, so its
-        // ranges stand still while a batch places its rows (step 3d).
-        lock_dataset(tx, crate::range::dataset_of(dataset))?;
         let begun = tx
             .execute(
                 "INSERT INTO lake_partition (dataset, head, epoch, origin) VALUES ($1, 0, $2, $3)
@@ -575,10 +605,10 @@ struct Held {
     anchor: u16,
 }
 
-fn latest_of_each(
+fn latest_of_each<'a>(
     client: &mut impl GenericClient,
     dataset: &str,
-    rows: &[Observation],
+    rows: impl IntoIterator<Item = &'a Observation>,
     from_latest: bool,
 ) -> Result<BTreeMap<(i16, String), Held>> {
     let mut asked: BTreeMap<(i16, String), DataType> = BTreeMap::new();
@@ -592,7 +622,14 @@ fn latest_of_each(
     // Every range of the dataset, open and closed: a key's versions follow
     // its anchor down the ranges split from where it began. Found by
     // `lake_latest` where it holds every key -- one probe a key, then its
-    // row in its own range's month -- else by each key's versions.
+    // row in its own range's month -- else by each key's versions. Each
+    // probe is a lateral one, led by the key, which only
+    // `lake_latest_by_key` answers (its dataset named as no index takes
+    // it): where the statistics do not know a dataset yet -- a new one, or
+    // a lake's first minutes -- every index the dataset leads looks as good
+    // as another to the planner, which took one reading the dataset's every
+    // key to find each, or read them all to join them, each batch slower
+    // than the last.
     let partitions = if from_latest {
         Vec::new()
     } else {
@@ -602,11 +639,16 @@ fn latest_of_each(
         client.query(
             "SELECT k.data_type, k.row_key, r.body, l.anchor
                FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
-               JOIN lake_latest l
-                 ON l.dataset = $1 AND l.data_type = k.data_type AND l.row_key = k.row_key
-               JOIN lake_row r
-                 ON r.partition = l.partition AND r.valid_from_ns = l.valid_from_ns
-                AND r.dataset = $1 AND r.sequence = l.sequence AND r.row_key = l.row_key",
+              CROSS JOIN LATERAL (
+                    SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
+                     WHERE row_key = k.row_key AND (dataset || '') = $1
+                       AND data_type = k.data_type
+                     LIMIT 1) AS l
+              CROSS JOIN LATERAL (
+                    SELECT body FROM lake_row
+                     WHERE partition = l.partition AND valid_from_ns = l.valid_from_ns
+                       AND dataset = $1 AND sequence = l.sequence AND row_key = k.row_key
+                     LIMIT 1) AS r",
             &[&dataset, &types, &keys],
         )
     } else {
@@ -749,34 +791,33 @@ fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
 /// the top of each subject's own entries, one probe a subject. The subject
 /// is named as that index keys it, `subject || ''`, which no other read
 /// names, so a read of the latest is never planned on it.
-fn previous_of_each(
+fn previous_of_each<'a>(
     client: &mut impl GenericClient,
     dataset: &str,
     lineage: &[String],
-    rows: &[Observation],
+    rows: impl IntoIterator<Item = &'a Observation>,
 ) -> Result<BTreeMap<(i16, String), u64>> {
     let asked: std::collections::BTreeSet<(i16, String)> = rows
-        .iter()
+        .into_iter()
         .map(|row| (row.data_type().code(), row.subject().to_string()))
         .collect();
     let (types, subjects): (Vec<i16>, Vec<String>) = asked.into_iter().unzip();
     let found = client
         .query(
-            "SELECT k.data_type, k.subject,
-                    (SELECT max(sequence) FROM lake_row
-                      WHERE dataset = $1 AND data_type = k.data_type
-                        AND (subject || '') = k.subject
-                        AND (partition = ANY($4) OR partition IS NULL))
-               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, subject)",
+            "SELECT k.data_type, k.subject, r.sequence
+               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, subject)
+              CROSS JOIN LATERAL (
+                    SELECT sequence FROM lake_row
+                     WHERE dataset = $1 AND data_type = k.data_type
+                       AND (subject || '') = k.subject
+                       AND (partition = ANY($4) OR partition IS NULL)
+                     ORDER BY sequence DESC LIMIT 1) AS r",
             &[&dataset, &types, &subjects, &lineage],
         )
         .map_err(unavailable)?;
     Ok(found
         .iter()
-        .filter_map(|row| {
-            let last: Option<i64> = row.get(2);
-            last.map(|last| ((row.get(0), row.get(1)), last as u64))
-        })
+        .map(|row| ((row.get(0), row.get(1)), row.get::<_, i64>(2) as u64))
         .collect())
 }
 
@@ -1572,18 +1613,17 @@ impl PostgresStore {
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
         self.owned(dataset)?;
-        lock_dataset(tx, dataset)?;
+        lock_dataset_to_record(tx, dataset)?;
         let ranges = open_ranges(tx, dataset)?;
-        let every: Vec<Observation> = parts.iter().flatten().cloned().collect();
         let from_latest = self.latest_all(tx)?;
-        let latest = latest_of_each(tx, dataset, &every, from_latest)?;
+        let latest = latest_of_each(tx, dataset, parts.iter().flatten(), from_latest)?;
         // The aliases, read only where a key held names another subject.
-        let differs = every.iter().any(|row| {
-            latest
-                .get(&key_of(row))
-                .is_some_and(|held| held.row.subject() != row.subject())
+        let differs = parts.iter().flatten().any(|row| {
+            !latest.is_empty()
+                && latest
+                    .get(&key_of(row))
+                    .is_some_and(|held| held.row.subject() != row.subject())
         });
-        drop(every);
         let aliases = if differs {
             aliases_in(tx)?
         } else {
@@ -1595,9 +1635,11 @@ impl PostgresStore {
             |was, is| crate::memory::same_record(&aliases, was, is),
         );
         // Each row's range: its key's anchor's, the first version's
-        // subject's hash, held across every later version.
+        // subject's hash, held across every later version. A subject's hash
+        // taken once a batch.
         let mut anchors: std::collections::HashMap<(i16, String), u16> =
             std::collections::HashMap::new();
+        let mut hashed: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
         let mut by_range: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
         let mut answered: Vec<Result<Recorded>> = Vec::with_capacity(parts.len());
         for (at, (rows, refused)) in parts.into_iter().zip(refused).enumerate() {
@@ -1609,9 +1651,17 @@ impl PostgresStore {
             for row in rows {
                 let key = key_of(&row);
                 let anchor = *anchors.entry(key.clone()).or_insert_with(|| {
-                    latest
-                        .get(&key)
-                        .map_or_else(|| crate::range::hash(row.subject()), |held| held.anchor)
+                    latest.get(&key).map_or_else(
+                        || match hashed.get(row.subject()) {
+                            Some(hash) => *hash,
+                            None => {
+                                let hash = crate::range::hash(row.subject());
+                                hashed.insert(row.subject().to_string(), hash);
+                                hash
+                            }
+                        },
+                        |held| held.anchor,
+                    )
                 });
                 let partition = crate::range::placed(dataset, &ranges, anchor).into_owned();
                 let placed = by_range.entry(partition).or_default();
@@ -1625,12 +1675,12 @@ impl PostgresStore {
             let mut head = self.head(tx, &partition)?;
             let epoch = self.fence.epoch();
             let lineage = lineage(tx, &partition)?;
-            let mine: Vec<Observation> = parts
-                .iter()
-                .flat_map(|(_, rows)| rows.iter().cloned())
-                .collect();
-            let previous = previous_of_each(tx, dataset, &lineage, &mine)?;
-            drop(mine);
+            let previous = previous_of_each(
+                tx,
+                dataset,
+                &lineage,
+                parts.iter().flat_map(|(_, rows)| rows.iter()),
+            )?;
             let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
             let done = number_parts(
                 rows,
@@ -1650,7 +1700,11 @@ impl PostgresStore {
                 .collect();
             self.leaves_for(tx, &partition, &numbered)?;
             insert_all(tx, dataset, &partition, &anchors, &numbered, epoch)?;
-            keep_latest(tx, dataset, &partition, &anchors, &numbered)?;
+            // A key `lake_latest` held no version of, read under the
+            // dataset's lock, is new to it: inserted, never upserted.
+            keep_latest(tx, dataset, &partition, &anchors, &numbered, |key| {
+                from_latest && !latest.contains_key(key)
+            })?;
             // Each row numbered version 1 is a key the dataset held no
             // version of; every other replaces its key's last.
             let new_keys: u64 = done.iter().map(|part| u64::from(part.recorded)).sum();
@@ -1740,6 +1794,10 @@ impl PostgresStore {
     fn forget_made(&self) {
         self.made.lock().expect("made poisoned").clear();
         self.ranges_made.lock().expect("ranges poisoned").clear();
+        self.datasets_made
+            .lock()
+            .expect("datasets poisoned")
+            .clear();
     }
 
     /// The tables of `datasets`' open ranges -- a dataset's own where it has
@@ -1749,7 +1807,18 @@ impl PostgresStore {
     /// batch already reading the lake would hold against it.
     fn prepare(&self, conn: &mut Connection, datasets: &[&str]) -> Result<()> {
         let mut wanted = std::collections::BTreeSet::new();
-        for dataset in datasets {
+        let seen: Vec<&str> = {
+            let made = self.datasets_made.lock().expect("datasets poisoned");
+            datasets
+                .iter()
+                .copied()
+                .filter(|dataset| !made.contains(*dataset))
+                .collect()
+        };
+        if seen.is_empty() {
+            return Ok(());
+        }
+        for dataset in &seen {
             let ranges = open_ranges(&mut **conn, dataset)?;
             if ranges.is_empty() {
                 wanted.insert(dataset.to_string());
@@ -1764,6 +1833,10 @@ impl PostgresStore {
                 .contains(partition)
         });
         if wanted.is_empty() {
+            self.datasets_made
+                .lock()
+                .expect("datasets poisoned")
+                .extend(seen.iter().map(|dataset| dataset.to_string()));
             return Ok(());
         }
         // While the table kept before 3d is the default partition, its lock
@@ -1795,6 +1868,10 @@ impl PostgresStore {
             .lock()
             .expect("ranges poisoned")
             .extend(wanted);
+        self.datasets_made
+            .lock()
+            .expect("datasets poisoned")
+            .extend(seen.iter().map(|dataset| dataset.to_string()));
         Ok(())
     }
 
@@ -1978,6 +2055,7 @@ fn keep_latest(
     partition: &str,
     anchors: &std::collections::HashMap<(i16, String), u16>,
     rows: &[Observation],
+    new: impl Fn(&(i16, String)) -> bool,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -2005,6 +2083,31 @@ fn keep_latest(
             }
         }
     }
+    // The keys new to `lake_latest` in one plain INSERT, every other
+    // offered in one upsert.
+    let (fresh, held): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(key, _)| new(key));
+    for (keys, upsert) in [(fresh, false), (held, true)] {
+        if !keys.is_empty() {
+            offer_latest(tx, dataset, partition, anchors, &keys, upsert)?;
+        }
+    }
+    Ok(())
+}
+
+/// A key's latest version and its version in force, as `keep_latest` pairs
+/// them.
+type LatestOf<'a> = ((i16, String), (&'a Observation, &'a Observation));
+
+/// One statement keeping `keys` in `lake_latest`, each with its latest
+/// version and its version in force: inserted, or offered where `upsert`.
+fn offer_latest(
+    tx: &mut Transaction<'_>,
+    dataset: &str,
+    partition: &str,
+    anchors: &std::collections::HashMap<(i16, String), u16>,
+    keys: &[LatestOf<'_>],
+    upsert: bool,
+) -> Result<()> {
     // One array a column, unnested: what a batch keeps in one statement.
     let mut types: Vec<i16> = Vec::with_capacity(keys.len());
     let mut row_keys: Vec<&str> = Vec::with_capacity(keys.len());
@@ -2015,7 +2118,7 @@ fn keep_latest(
         (Vec::new(), Vec::new());
     let (mut subjects, mut kinds, mut venues) = (Vec::new(), Vec::new(), Vec::new());
     let (mut intervals, mut latest_keys, mut qualities) = (Vec::new(), Vec::new(), Vec::new());
-    for (key, (last, force)) in &keys {
+    for (key, (last, force)) in keys {
         types.push(key.0);
         row_keys.push(key.1.as_str());
         sequences.push(last.meta().sequence as i64);
@@ -2049,8 +2152,15 @@ fn keep_latest(
                            $7::bigint[], $8::integer[], $2::text[], $9::bigint[], $10::bigint[],
                            $11::bigint[], $12::bigint[], $13::text[], $14::smallint[],
                            $15::text[], $16::bigint[], $17::text[], $18::smallint[]) AS x
-             ON CONFLICT (dataset, data_type, row_key) DO UPDATE SET {}",
-            *LATEST_SET
+             {}",
+            if upsert {
+                format!(
+                    "ON CONFLICT (dataset, data_type, row_key) DO UPDATE SET {}",
+                    *LATEST_SET
+                )
+            } else {
+                String::new()
+            }
         ),
         &[
             &dataset,

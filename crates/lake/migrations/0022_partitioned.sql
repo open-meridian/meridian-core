@@ -58,8 +58,11 @@ CREATE TABLE IF NOT EXISTS lake_latest (
     PRIMARY KEY (dataset, data_type, row_key)
 );
 -- A key's row found by its dataset and key alone: an escalation or a
--- re-check names no data type.
-CREATE INDEX IF NOT EXISTS lake_latest_by_key ON lake_latest (dataset, row_key);
+-- re-check names no data type. The key leads, so the write path's probe of
+-- each key it records is one look at it whatever the statistics say of its
+-- dataset: a dataset they do not know yet looks empty, and by them every
+-- index led by the dataset looked as good as another.
+CREATE INDEX IF NOT EXISTS lake_latest_by_key ON lake_latest (row_key, dataset);
 CREATE INDEX IF NOT EXISTS lake_latest_by_subject
     ON lake_latest (dataset, data_type, subject, kind, venue_id, interval_ns, latest_key,
                     force_valid_from DESC, force_sequence DESC);
