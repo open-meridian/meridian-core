@@ -121,6 +121,60 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "unattributed_gap",
         sql: include_str!("../migrations/0017_unattributed_gap.sql"),
     },
+    // Writer groups (step 3d; approved 2026-11-12): each group past the
+    // first's epoch, which a dataset its writer begins is checked against.
+    Migration {
+        version: 18,
+        name: "writer_group",
+        sql: include_str!("../migrations/0018_writer_group.sql"),
+    },
+    // Hash ranges (step 3d; section 6.1, approved 2026-11-12): each range's
+    // own head row, and each row's range and anchor.
+    Migration {
+        version: 19,
+        name: "ranges",
+        sql: include_str!("../migrations/0019_ranges.sql"),
+    },
+    // lake_row partitioned online (step 3d; section 6.2): the rows kept so
+    // far said to name no range, checked without holding reads back, then
+    // the table kept so far made the new table's default partition, and
+    // `lake_latest` (approved 2026-11-12).
+    Migration {
+        version: 20,
+        name: "partitioned_prepare",
+        sql: include_str!("../migrations/0020_partitioned_prepare.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "partitioned_validate",
+        sql: include_str!("../migrations/0021_partitioned_validate.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "partitioned",
+        sql: include_str!("../migrations/0022_partitioned.sql"),
+    },
+    // lake_row's partitions made by lake_row's owner (step 3d): the lake
+    // serves under a login that may not create in the schema.
+    Migration {
+        version: 23,
+        name: "leaves",
+        sql: include_str!("../migrations/0023_leaves.sql"),
+    },
+    // A month's table analysed once its first batch is in (step 3d;
+    // `lake_analyze_month` approved 2026-11-14).
+    Migration {
+        version: 24,
+        name: "analyse_months",
+        sql: include_str!("../migrations/0024_analyse_months.sql"),
+    },
+    // A range's writer group (step 3d; ruled 2026-11-14): set by a move's
+    // switch, and filled with the rendezvous owner at start.
+    Migration {
+        version: 25,
+        name: "writer_group",
+        sql: include_str!("../migrations/0025_writer_group.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

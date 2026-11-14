@@ -497,12 +497,24 @@ fn listed(items: &BTreeSet<&str>) -> String {
 
 /// Whether an instance name is one of core's own (contract v18; v17's
 /// security review, Nit 3): a component's name (`dashboard`, `lake`), a
-/// component's instance (`dashboard-1`), or the runtime's broker user. A
-/// plugin launched as one would list its tools in core's `dashboard__`
-/// namespace or speak as a component on the broker.
-pub fn is_reserved(contract: &Contract, instance_id: &str) -> bool {
+/// component's instance (`dashboard-1`), the runtime's broker user, or --
+/// step 3d -- a component's instance as this deployment's chart names it,
+/// `<release>-<component>` (`meridian-runtime-bor`), exactly. A plugin
+/// launched as one would list its tools in core's `dashboard__` namespace or
+/// speak as a component on the bus: its sidecar stamps the plugin's instance
+/// as the publisher, which the conductor's and the lake's checks of the book
+/// and the analytics component trust. Never `*-<component>`: a plugin may
+/// be `sample-analytics`.
+pub fn is_reserved(contract: &Contract, release: Option<&str>, instance_id: &str) -> bool {
     let component = |name: &str| contract.is_component(name);
     if instance_id == "runtime" || component(instance_id) {
+        return true;
+    }
+    if release
+        .and_then(|release| instance_id.strip_prefix(release))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(component)
+    {
         return true;
     }
     instance_id.rsplit_once('-').is_some_and(|(head, tail)| {
@@ -510,10 +522,21 @@ pub fn is_reserved(contract: &Contract, instance_id: &str) -> bool {
     })
 }
 
+/// The release a conductor's instance names (step 3d): the chart names each
+/// core component `<release>-<component>`, so `<release>-conductor`'s
+/// release is `<release>`; none for a name the chart did not give it, as
+/// the development default `conductor-1`.
+pub fn release_of(conductor: &str) -> Option<&str> {
+    conductor
+        .strip_suffix("-conductor")
+        .filter(|release| !release.is_empty())
+}
+
 /// The version a launch runs, if it is recorded and the approval is exactly
 /// what it declares (W8.3).
 pub fn launch<'a>(
     snapshot: &'a Snapshot,
+    release: Option<&str>,
     request: &LaunchPluginRequest,
 ) -> Result<&'a PluginVersion, String> {
     if !is_name(&request.instance_id) {
@@ -523,10 +546,14 @@ pub fn launch<'a>(
             request.instance_id
         ));
     }
-    if is_reserved(Contract::embedded(), &request.instance_id) {
-        return Err(format!(
-            "`{}` is one of core's own names, which no plugin instance takes",
-            request.instance_id
+    if is_reserved(Contract::embedded(), release, &request.instance_id) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["instance_id".to_string()],
+            format!(
+                "`{}` is one of core's own names, which no plugin instance takes",
+                request.instance_id
+            ),
         ));
     }
     // An instance's ID names one plugin for good (contract v18; v17's
@@ -691,7 +718,7 @@ impl Plugins {
         envelope: &Envelope,
     ) -> Result<PluginLaunch, String> {
         let snapshot = self.snapshot()?;
-        let version = launch(&snapshot, &request)?;
+        let version = launch(&snapshot, release_of(self.bus.instance_id()), &request)?;
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
         }

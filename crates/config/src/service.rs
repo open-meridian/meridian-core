@@ -1230,6 +1230,40 @@ pub(crate) fn delegation(envelope: &Envelope) -> String {
         .unwrap_or_default()
 }
 
+/// The book's instance where nothing names another: its default as the
+/// conductor's is `conductor-1`.
+pub const BOOK: &str = "bor-1";
+
+static BOOK_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name the book's instance, every member of it: the one publisher whose
+/// unscoped read of the accounts is answered in full (ReadAccountsForPlacement).
+/// Set once, by the conductor's process at start; [`BOOK`] otherwise.
+pub fn reads_for_book(instance: &str) {
+    let _ = BOOK_INSTANCE.set(instance.to_string());
+}
+
+/// The book's instance beside a conductor's: the chart names both
+/// `<release>-<component>`, so `<release>-conductor`'s book is
+/// `<release>-bor`; none where the conductor's name says no component.
+pub fn book_beside(conductor: &str) -> Option<String> {
+    conductor
+        .rsplit_once("conductor")
+        .map(|(head, tail)| format!("{head}bor{tail}"))
+}
+
+/// Whether a read is the book's as itself: published by the book's
+/// instance, for nobody and with no plugin's scope.
+fn book_reading(envelope: &Envelope) -> bool {
+    let book = BOOK_INSTANCE.get().map(String::as_str).unwrap_or(BOOK);
+    envelope.meta.as_ref().is_some_and(|meta| {
+        meta.publisher_instance_id == book
+            && !meta.account_scope_applies
+            && meta.acting_for_subject.is_empty()
+            && meta.acting_through_delegation.is_empty()
+    })
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -2551,6 +2585,27 @@ pub fn serve_with(
         ACCOUNTS,
         ("meridian.v1.AccountsRequest", "meridian.v1.Accounts"),
         |cx, _: AccountsRequest, envelope| {
+            // The book reading as itself, to place a new account by its
+            // owner label (step 3d; matrix row ReadAccountsForPlacement,
+            // W6.39, ruled 2026-11-13): every account's record, as held. Told
+            // by the bus identity it arrived on -- the publisher the bus
+            // stamps, which a plugin never sets, its sidecar stamping its own
+            // instance -- never by what the request leaves out.
+            if book_reading(envelope) {
+                let snapshot = cx.snapshot()?;
+                return Ok(Accounts {
+                    accounts: snapshot.records.accounts.clone(),
+                });
+            }
+            // For nobody, from anyone else: refused (least privilege).
+            if subject(envelope).is_empty() {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &[],
+                    "the deployment's accounts are read for a person, or by the book as itself; \
+                     this is sent for nobody",
+                ));
+            }
             admin_acting(envelope, "the deployment's accounts")?;
             // Each account as the configuration holds it, its custodian,
             // type, owner and note with it: nothing of who may read them,

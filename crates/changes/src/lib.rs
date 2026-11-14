@@ -37,8 +37,13 @@ use meridian_bus::Bus;
 pub use meridian_domain::v1::{Change, ReadChangesReply, ReadChangesRequest};
 use prost::Message;
 
+pub mod busy;
 pub mod captured;
+pub mod databases;
+pub mod group_commit;
+pub mod groups;
 pub mod integrity;
+pub mod moves;
 pub mod records;
 pub mod serving;
 pub mod timeline;

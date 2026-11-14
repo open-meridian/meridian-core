@@ -85,7 +85,11 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// No other stream is reached by it, and the analytics component's stays
 /// its own. A data plugin's credential publishes to the stream's subjects of
 /// its own instance alone ([`write_ahead::instance_subjects`]).
-const COMPONENT_TOPICS: [(&str, &str); 20] = [
+///
+/// From step 3d (the resilience spec's section 6.7), a write handed to the
+/// writer group owning its partition: the lake's `internal.record` and the
+/// book's `internal.command`, each to its store's members alone.
+const COMPONENT_TOPICS: [(&str, &str); 22] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
     ("analytics", "platform.analytics.internal.members"),
     ("analytics", "platform.analytics.internal.standing.*"),
@@ -94,12 +98,14 @@ const COMPONENT_TOPICS: [(&str, &str); 20] = [
     ("lake", "platform.lake.internal.read-changes"),
     ("lake", "platform.lake.internal.changes.*"),
     ("lake", "platform.lake.internal.read-from-writer"),
+    ("lake", "platform.lake.internal.record"),
     ("lake", "$JS.API.STREAM.*.LAKE_WRITE_AHEAD"),
     ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD"),
     ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>"),
     ("lake", "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*"),
     ("bor", "platform.book.internal.read-changes"),
     ("bor", "platform.book.internal.changes.*"),
+    ("bor", "platform.book.internal.command"),
     ("instrument", "platform.reference.internal.read-changes"),
     ("instrument", "platform.reference.internal.changes.*"),
     ("street", "platform.street.internal.read-changes"),

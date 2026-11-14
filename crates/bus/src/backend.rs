@@ -88,6 +88,21 @@ pub fn refusal_retrying(
     )
 }
 
+/// A refusal with a status and how long to wait before asking again, at
+/// least a second (step 3d): UNAVAILABLE where what the answer needs is not
+/// there yet and will be.
+pub fn refusal_status_retrying(
+    status: RefusalStatus,
+    retry_after_seconds: u32,
+    words: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{REFUSAL_STATUS_PREFIX}{} {REFUSAL_RETRY}{}] {words}",
+        status.word(),
+        retry_after_seconds.max(1)
+    )
+}
+
 /// A component's refusal of a request its budget had no room for
 /// (REFUSAL_REASON_OVERLOADED), with its retry-after.
 pub fn overloaded(over: &meridian_budget::Overloaded) -> String {
@@ -100,7 +115,15 @@ pub fn overloaded(over: &meridian_budget::Overloaded) -> String {
 
 /// How long a refusal for load says to wait, in seconds; none on any other.
 pub fn refusal_retry_after(detail: &str) -> Option<u32> {
-    refusal_parts(detail).and_then(|(_, _, retry, _)| retry)
+    refusal_parts(detail)
+        .and_then(|(_, _, retry, _)| retry)
+        .or_else(|| {
+            let rest = detail.strip_prefix(REFUSAL_STATUS_PREFIX)?;
+            let (head, _) = rest.split_once("] ")?;
+            head.split(' ')
+                .find_map(|part| part.strip_prefix(REFUSAL_RETRY))
+                .and_then(|seconds| seconds.parse().ok())
+        })
 }
 
 /// The code, the fields, the retry-after and the words, where the detail
@@ -200,18 +223,21 @@ pub fn refusal_with_status(
 pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, &str)> {
     let rest = detail.strip_prefix(REFUSAL_STATUS_PREFIX)?;
     let (head, words) = rest.split_once("] ")?;
-    let (word, fields) = match head.split_once(' ') {
-        Some((word, named)) => (
-            word,
-            named
-                .strip_prefix(REFUSAL_FIELDS)?
-                .split(';')
-                .filter(|field| !field.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        None => (head, Vec::new()),
-    };
+    let mut parts = head.split(' ');
+    let word = parts.next()?;
+    let mut fields = Vec::new();
+    for part in parts {
+        if let Some(named) = part.strip_prefix(REFUSAL_FIELDS) {
+            fields.extend(
+                named
+                    .split(';')
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_string),
+            );
+        } else if part.strip_prefix(REFUSAL_RETRY).is_none() {
+            return None;
+        }
+    }
     let status = match word {
         "invalid-argument" => RefusalStatus::InvalidArgument,
         "permission-denied" => RefusalStatus::PermissionDenied,
@@ -259,6 +285,20 @@ mod refusal_status_tests {
             Some((RefusalStatus::FailedPrecondition, vec!["pack".to_string()]))
         );
         assert!(read_refusal_status("[refusal-reason 21] words").is_none());
+        // Step 3d: a status with a retry-after, at least a second.
+        let later = refusal_status_retrying(RefusalStatus::Unavailable, 5, "not placed yet");
+        assert_eq!(
+            read_refusal_status(&later).map(|(status, fields, words)| (
+                status,
+                fields.len(),
+                words
+            )),
+            Some((RefusalStatus::Unavailable, 0, "not placed yet"))
+        );
+        assert_eq!(refusal_retry_after(&later), Some(5));
+        let soon = refusal_status_retrying(RefusalStatus::Unavailable, 0, "now");
+        assert_eq!(refusal_retry_after(&soon), Some(1));
+        assert!(read_refusal(&later).is_none(), "never a reason code");
     }
 
     #[test]
@@ -394,6 +434,12 @@ pub type HandlerReply = std::result::Result<(String, Vec<u8>), String>;
 /// A registered answer to one topic.
 pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync>;
 
+/// Where a request is to be handed before it is admitted here (step 3d;
+/// section 6.7): the internal topic and the writer group that owns the
+/// write, where it is another group's; none where it is this member's to
+/// answer, or the request says nothing of its owner.
+pub type PreRoute = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
+
 /// A future a backend returns, boxed so the trait stays object-safe.
 ///
 /// Only the call path pays for this. `publish` and `subscribe` stay
@@ -443,6 +489,29 @@ pub trait Backend: Send + Sync {
         Box::pin(async move { Err(BusError::NoHandler(topic.to_string())) })
     }
 
+    /// Ask writer group `group` of whoever serves `topic` (step 3d; the
+    /// resilience spec's section 6.7): a write handed to its partition's
+    /// owner. Defaulted to an unaddressed ask: a backend with one member of
+    /// everything has one group.
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: u32,
+    ) -> Answer<'a> {
+        let _ = group;
+        self.request(topic, envelope, timeout)
+    }
+
+    /// Offer `topic` to writer group `group`'s callers alone, one member of
+    /// `queue` taking each: a request addressed to another group is left
+    /// unanswered, for that group's member.
+    fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
+        let _ = group;
+        self.serve(topic, queue, handler);
+    }
+
     /// Offer this topic's answer to callers in other processes.
     ///
     /// Defaulted to nothing, because an in-process backend has nowhere else to
@@ -452,6 +521,17 @@ pub trait Backend: Send + Sync {
     /// it as one `group` (the component's name), so each request is answered
     /// once, not once per copy with all but the first answer thrown away.
     fn serve(&self, _topic: &str, _group: &str, _handler: Handler) {}
+
+    /// [`Backend::serve`], each request first offered to `route`: one it
+    /// names another writer group's is passed to that group on the internal
+    /// topic as it came, its caller's reply address kept, so the owner
+    /// answers the caller itself -- never admitted here, never waited on
+    /// here (step 3d). Defaulted to serving alone: an in-process backend's
+    /// router hands it on in its handler.
+    fn serve_routed(&self, topic: &str, group: &str, handler: Handler, route: PreRoute) {
+        let _ = route;
+        self.serve(topic, group, handler);
+    }
 
     /// The same, and signal once an answer has actually reached the broker.
     ///

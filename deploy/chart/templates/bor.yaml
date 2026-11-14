@@ -77,11 +77,18 @@ spec:
             - name: MERIDIAN_BOR_SNAPSHOT_INTERVAL
               value: {{ . | quote }}
             {{- end }}
+            # Its partitions, where a new account is placed (step 3d).
+            - name: MERIDIAN_BOR_PARTITIONS
+              value: {{ include "meridian-runtime.borPartitions" $ | quote }}
+            # A move's hold and its switch's bound (step 3d; section 6.8).
+            {{- include "meridian-runtime.movesEnv" $ | nindent 12 }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.bor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.bor.database.key | default .Values.database.key }}
+            {{- /* Its databases past the first (step 3d; section 6.4). */}}
+            {{- with (include "meridian-runtime.databasesEnv" (dict "top" $ "component" "bor" "values" .Values.bor)) }}{{ . | nindent 12 }}{{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
@@ -107,3 +114,6 @@ spec:
        Deployment in a reads-only mode, `bor.readers` of them. */}}
 {{ include "meridian-runtime.readers" (dict "top" $ "component" "bor" "values" .Values.bor "readUrl" "MERIDIAN_BOR_READ_DATABASE_URL" "rendered" (include "meridian-runtime.bor.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}
+{{- /* Each writer group past the first (step 3d): its own writer
+       Deployment, Lease and standby, `bor.writerGroups` in all. */}}
+{{ include "meridian-runtime.writerGroupDeployments" (dict "top" $ "component" "bor" "values" .Values.bor "rendered" (include "meridian-runtime.bor.deployment" .)) }}

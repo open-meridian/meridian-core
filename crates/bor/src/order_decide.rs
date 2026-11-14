@@ -562,6 +562,10 @@ pub(crate) struct Plan {
     pub(crate) reason: String,
     pub(crate) idempotency_key: String,
     pub(crate) effective_date: String,
+    /// Step 3d (section 6.3): the lines the partition's clearing account
+    /// takes against these, and a booking's pending marker.
+    pub(crate) clearing: Vec<MovementLine>,
+    pub(crate) pending: Vec<(String, String, String)>,
 }
 
 impl Plan {
@@ -574,6 +578,8 @@ impl Plan {
             reason: String::new(),
             idempotency_key: String::new(),
             effective_date: String::new(),
+            clearing: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -667,6 +673,8 @@ pub(crate) fn finish(book: &Book, head: u64, ctx: &Context, mut plan: Plan) -> R
             trade,
             attributes: first.then(|| attributes_of(book)),
             states_waits: first,
+            clearing: landed(book, plan.clearing),
+            pending: plan.pending,
             ..Default::default()
         },
     };

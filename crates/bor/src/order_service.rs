@@ -1401,7 +1401,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             .map_err(|failed| failed.on_the_bus())?;
         let mut reply = ListOrdersReply {
             orders: page.orders,
-            as_of: Some(watermark_of(&page.as_of)),
+            as_of: Some(crate::store::watermark_for(
+                reading.as_ref(),
+                &request.account_id,
+                &page.as_of,
+            )),
             next_cursor: page.next_cursor,
             placements: page.placements,
             executions: page.executions,
@@ -1487,7 +1491,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             "meridian.v1.ListLocatesReply".to_string(),
             ListLocatesReply {
                 locates: page.records,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
                 next_cursor: page.next_cursor,
             }
             .encode_to_vec(),
@@ -1542,6 +1550,8 @@ pub fn expire_due(bus: &Bus, store: &Arc<dyn Store>) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }
@@ -1619,6 +1629,8 @@ pub fn backfill_waits(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }

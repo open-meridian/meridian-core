@@ -97,6 +97,35 @@ pub enum StoreError {
     /// decides again ([`with_bodies`]). Never leaves the store.
     #[error("the book holds no body for entries {0:?}")]
     BodiesNeeded(Vec<String>),
+
+    /// An account found, under its partition's lock, in another partition
+    /// than the one its act was queued in (step 3d; the resilience spec's
+    /// section 6.3): the act goes on in that one. Never leaves the store.
+    #[error("the account is in partition {0}")]
+    Moved(String),
+
+    /// An act on a partition another writer group owns (step 3d; the
+    /// resilience spec's section 6.7): handed to that group's writer.
+    #[error("partition {partition} is writer group {group}'s to write; this member's group does not own it")]
+    NotOwned { partition: String, group: u32 },
+
+    /// An account's first act, refused because its owner label could not
+    /// be read to place it (step 3d; section 6.3, ruled 2026-11-13): never
+    /// placed by its ID instead. UNAVAILABLE, with a retry-after.
+    #[error("{0}")]
+    NotPlaced(String),
+
+    /// An act on an account between its move's close and its open (step
+    /// 3d; the resilience spec's section 6.8, the hold): UNAVAILABLE, with
+    /// a retry-after, until the open.
+    #[error("{0}")]
+    Held(String),
+
+    /// An act refused while something else under way stands in its way
+    /// (step 3d: a move of the same account), naming the field:
+    /// FAILED_PRECONDITION.
+    #[error("{words}")]
+    Precondition { field: &'static str, words: String },
 }
 
 /// How many times a decision may ask for bodies before it is a fault: each
@@ -193,6 +222,22 @@ impl StoreError {
                 words,
             ),
             StoreError::Recorded(said) => said.clone(),
+            StoreError::NotPlaced(words) => meridian_bus::refusal_status_retrying(
+                meridian_bus::RefusalStatus::Unavailable,
+                PLACEMENT_RETRY_SECONDS,
+                words,
+            ),
+            StoreError::Precondition { field, words } => meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::FailedPrecondition,
+                &[field.to_string()],
+                words,
+            ),
+            // Held past the hold (section 6.8): OVERLOADED, its retry-after.
+            StoreError::Held(words) => meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                crate::moves::HELD_RETRY_SECONDS,
+                words,
+            ),
             other => other.to_string(),
         }
     }
@@ -217,9 +262,70 @@ pub const CONTROL_ACCOUNT: &str = "~control";
 /// the accounts, and read by no plugin's scope.
 pub const NO_ACCOUNT: &str = "~unplaced";
 
+/// An account's copy in its move's target database, compared with its
+/// source (step 3d; section 6.8, "the target compares its digest at N with
+/// the source's"): each digest is taken over the account's entries in
+/// order, each named by its ID -- the source's as its own chain committed
+/// them, the copy's taken again of what the copy holds -- so a changed,
+/// missing or extra entry in the copy differs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Warmed {
+    /// The account's last entry the copy holds: its close follows it, or
+    /// the copy is brought up to date and compared again.
+    pub last_entry: String,
+    /// The source's digest of the account's entries.
+    pub source: Vec<u8>,
+    /// The copy's digest of the same, taken again of its rows.
+    pub copy: Vec<u8>,
+    /// The entry whose copy differs first, where one does.
+    pub differs_at: Option<String>,
+}
+
 /// Whether a key the store holds a book under is an account's.
 pub fn is_account(key: &str) -> bool {
     !key.starts_with('~')
+}
+
+/// How long an account's first act waits before asking again when its
+/// owner label could not be read (step 3d).
+pub const PLACEMENT_RETRY_SECONDS: u32 = 5;
+
+/// The conductor's accounts read the book asks at an account's first
+/// placement (matrix row ReadAccountsForPlacement, ruled 2026-11-13).
+pub const READ_ACCOUNTS: &str = "platform.config.query.accounts";
+
+/// The book's count of partitions in the environment (step 3d; section
+/// 6.3; `bor.partitions`, the variable ruled 2026-11-13): `P0` to `P<n-1>`.
+pub const PARTITIONS_VAR: &str = "MERIDIAN_BOR_PARTITIONS";
+
+/// The most partitions a book takes, as the most writer groups.
+pub const PARTITIONS_MOST: u32 = meridian_changes::groups::MOST;
+
+/// The count of partitions the chart said; 1 where it said nothing.
+pub fn partitions_from(said: Option<&str>) -> std::result::Result<u32, String> {
+    match said.map(str::trim).filter(|said| !said.is_empty()) {
+        None => Ok(1),
+        Some(text) => text
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=PARTITIONS_MOST).contains(n))
+            .ok_or_else(|| {
+                format!("{PARTITIONS_VAR} is {text:?}; a whole number of partitions from 1 to {PARTITIONS_MOST}")
+            }),
+    }
+}
+
+/// A partition's name: `P<n>`.
+pub fn partition_named(n: u32) -> String {
+    format!("P{n}")
+}
+
+/// The partition a new account is placed in (step 3d; section 6.3): by
+/// rendezvous hashing of its placement key -- its owner label when set,
+/// else its ID -- over `P0` to `P<count-1>`, so a fund's or a household's
+/// accounts land together, and raising the count moves none placed before.
+pub fn placement_of(key: &str, count: u32) -> String {
+    partition_named(meridian_changes::groups::owner(key, count.max(1)))
 }
 
 /// The partition a book key starts in.
@@ -289,6 +395,27 @@ pub fn mark_of(watermark: Option<&Watermark>) -> Option<Mark> {
             .map(|held| (held.partition.clone(), held.sequence))
             .collect()
     })
+}
+
+/// The watermark a read of `account_id` is answered at (step 3d): its own
+/// partition's head alone where the book has several, since a record of the
+/// account is numbered in its partition and no other's number is comparable
+/// with it. A follower that read an account with nothing to hand on is had
+/// to its partition's head, never another partition's (found by e2e-orders
+/// at two partitions: a venue's SDK took P0's head for an account in P1, and
+/// passed over the account's first placement as had). No partition where
+/// the account is not placed yet; every partition for a read of no account,
+/// and with one partition, as ever.
+pub fn watermark_for(store: &dyn Store, account_id: &str, mark: &Mark) -> Watermark {
+    if account_id.is_empty() || store.partition_count() < 2 {
+        return watermark_of(mark);
+    }
+    let own: Mark = store
+        .partition_of(account_id)
+        .and_then(|partition| mark.get(&partition).map(|head| (partition, *head)))
+        .into_iter()
+        .collect();
+    watermark_of(&own)
 }
 
 pub fn watermark_of(mark: &Mark) -> Watermark {
@@ -466,6 +593,11 @@ pub struct Decided {
     pub reply: Vec<u8>,
 }
 
+/// What a store tells of a batch's commits, once they commit (step 3d,
+/// group commit): the epoch they committed under, and each decision in its
+/// order in the partition.
+pub type Committed = Box<dyn Fn(u64, &[&Decided]) + Send + Sync>;
+
 /// What acting did.
 pub enum Acted {
     /// The same command again, by its message identifier or its idempotency
@@ -493,6 +625,105 @@ pub trait Store: Send + Sync {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted>;
+
+    /// Have `observer` told of each batch's commits, in order, once they
+    /// commit (step 3d, group commit), and answer whether this store tells
+    /// it. One that does not leaves its wrapper to tell each act's own.
+    fn on_commit(&self, observer: Committed) -> bool {
+        let _ = observer;
+        false
+    }
+
+    /// Whether this store's writer group writes `account_id`'s partition
+    /// (step 3d; section 6.3): a book of another group's is never held in
+    /// this member's memory, which that group's commits never reach.
+    fn writes(&self, account_id: &str) -> bool {
+        let _ = account_id;
+        true
+    }
+
+    /// The writer group `account_id`'s commands are its owner's by, decided
+    /// from its placement as this store last found it, never read from the
+    /// record (step 3d; the ownership pre-check decided 2026-11-13): none
+    /// with one writer group, where nothing is handed on.
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        let _ = account_id;
+        None
+    }
+
+    /// An account's move settled where it crossed databases (step 3d;
+    /// section 6.4, "a move between databases copies the data"): once its
+    /// open is journalled in the new partition's database, every other
+    /// database lets go of what it projected of the account, keeping its
+    /// entries. Idempotent; nothing for a store of one database.
+    fn settle_move(&self, account_id: &str) -> Result<()> {
+        let _ = account_id;
+        Ok(())
+    }
+
+    /// The writer group that owns `partition`, as this store last read it
+    /// (step 3d): 0 with one group.
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        let _ = partition;
+        0
+    }
+
+    /// An account's move warmed (step 3d; section 6.8): where its target
+    /// partition is in another database, the account's entries copied there
+    /// before the close, and the copy compared with the source (VDiff). None
+    /// within one database, where the target reads the same rows.
+    fn warm_account(&self, account_id: &str, target_partition: &str) -> Result<Option<Warmed>> {
+        let _ = (account_id, target_partition);
+        Ok(None)
+    }
+
+    /// The records the `~control` journal owes (step 3d; section 6.3,
+    /// option (c)): each takeover and finding kept beside the journal and
+    /// not yet in it, and each partition whose writer group is not the one
+    /// its last assignment named. A store keeping none owes none.
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        Ok(Vec::new())
+    }
+
+    /// A record owed to `~control` kept where this member writes, by its
+    /// key, for the control partition's group to journal (step 3d;
+    /// `book_control_owed`, approved 2026-11-14): this member does not write
+    /// `~control`. Idempotent by the key. A store of one writer group, which
+    /// journals each itself, keeps none.
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        let _ = (record, kept_at_ns);
+        Err(StoreError::Unavailable(
+            "this store keeps no record owed to the control journal".into(),
+        ))
+    }
+
+    /// Whether `account_id` is to be placed before its first act (step 3d;
+    /// section 6.3): an account the store has not placed, where it has more
+    /// than one partition. Never the book's own keys.
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        let _ = account_id;
+        Ok(false)
+    }
+
+    /// Place `account_id` by `key` -- its owner label, else its ID -- where
+    /// nothing placed it yet, and answer its partition; an account placed
+    /// already keeps its own, whatever the key.
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        let _ = (account_id, key);
+        Ok(FIRST_PARTITION.to_string())
+    }
+
+    /// How many partitions the book places accounts over (step 3d;
+    /// `bor.partitions`): 1, the default, and a booking is as it always was.
+    fn partition_count(&self) -> u32 {
+        1
+    }
+
+    /// The partition `account_id` is in, where it is placed.
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        let _ = account_id;
+        None
+    }
 
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;

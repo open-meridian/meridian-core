@@ -125,6 +125,12 @@ pub fn lease_holders(list: &Value) -> BTreeMap<String, String> {
     let mut held = BTreeMap::new();
     for lease in list["items"].as_array().into_iter().flatten() {
         let name = lease["metadata"]["name"].as_str().unwrap_or_default();
+        // A writer group past the first's Lease (step 3d):
+        // `<release>-<store>-group-<g>`, held as `<store>-group-<g>`.
+        let (name, group) = match name.rsplit_once("-group-") {
+            Some((store, group)) if group.parse::<u32>().is_ok() => (store, Some(group)),
+            _ => (name, None),
+        };
         let Some((component, _)) = STORES
             .iter()
             .find(|(component, _)| name.ends_with(&format!("-{component}")))
@@ -132,7 +138,11 @@ pub fn lease_holders(list: &Value) -> BTreeMap<String, String> {
             continue;
         };
         let holder = lease["spec"]["holderIdentity"].as_str().unwrap_or_default();
-        held.insert(component.to_string(), crate::member::holder_member(holder));
+        let key = match group {
+            Some(group) => format!("{component}-group-{group}"),
+            None => component.to_string(),
+        };
+        held.insert(key, crate::member::holder_member(holder));
     }
     held
 }
@@ -167,9 +177,24 @@ pub struct Values {
     /// `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount`.
     pub analytics_coordinators: u32,
     pub analytics_workers: u32,
+    /// The lake's and the book's writer groups (`lake.writerGroups`,
+    /// `bor.writerGroups`; step 3d), where above 1; none means one.
+    pub writer_groups: BTreeMap<String, u32>,
+    /// The book's partitions (`bor.partitions`; step 3d), where stated; 0
+    /// where not known.
+    pub book_partitions: u32,
 }
 
 impl Values {
+    /// `component`'s writer groups: 1 where the values say none.
+    pub fn writer_groups(&self, component: &str) -> u32 {
+        self.writer_groups
+            .get(component)
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// The chart's values as the release states them: a JSON object of the
     /// settings above by their chart paths. Carries no secret and no
     /// credential; a key it does not know is passed over.
@@ -214,6 +239,14 @@ impl Values {
             },
             analytics_coordinators: count(&said["analytics"]["coordinator"]["replicaCount"]),
             analytics_workers: count(&said["analytics"]["worker"]["replicaCount"]),
+            writer_groups: ["lake", "bor"]
+                .into_iter()
+                .filter_map(|component| {
+                    let groups = count(&said[component]["writerGroups"]);
+                    (groups > 1).then(|| (component.to_string(), groups))
+                })
+                .collect(),
+            book_partitions: count(&said["bor"]["partitions"]),
         })
     }
 
@@ -261,6 +294,8 @@ impl Values {
             scrub_days,
             analytics_coordinators: of("analytics-coordinator").count() as u32,
             analytics_workers: of("analytics-worker").count() as u32,
+            writer_groups: BTreeMap::new(),
+            book_partitions: 0,
         }
     }
 }
@@ -1031,7 +1066,134 @@ pub fn profile(
         tiers,
         never_blind: never_blind(seen),
         computed_at_ns: now_ns,
+        advice: advice(values, seen),
     }
+}
+
+// ── The advice ──────────────────────────────────────────────────────────────
+
+/// Past this share of a minute, at its busiest in the profile's window, a
+/// writer group's commit lane is near its ceiling, and the profile advises
+/// a group more (the product owner, 2026-11-14: about 60 to 70 percent of
+/// the measured capacity).
+pub const BUSY_MOST_PERCENT: u32 = 70;
+
+/// The stores whose partitions writer groups own, as the profile names
+/// them.
+const GROUPED: [(&str, &str); 2] = [("lake", "the lake"), ("bor", "the book")];
+
+/// What the profile advises beyond the levels (step 3d; the resilience
+/// spec's sections 6.8 and 12; `advice`, approved 2026-11-14), each in a
+/// failure line's shape, a change named and never made:
+/// - **headroom:** a store whose partitions are not more than its writer
+///   groups, so a group added later would find nothing of its own to take:
+///   raise the count (the book) or split a range (the lake) while it is
+///   small -- raising it places new accounts or ranges only;
+/// - **load:** a writer group whose commit lane was busy past
+///   [`BUSY_MOST_PERCENT`] of a minute at its busiest in the window, or that
+///   refused work as overloaded: a writer group more.
+fn advice(values: &Values, seen: &Seen) -> Vec<ResilienceLine> {
+    let mut out = Vec::new();
+    // Headroom: the book's partitions are a chart value, stated.
+    let groups = values.writer_groups("bor");
+    if values.book_partitions > 0 && values.book_partitions <= groups {
+        out.push(line(
+            "the book's partitions",
+            ResilienceState::NotMet,
+            format!(
+                "bor.partitions is {} and bor.writerGroups {groups}: a writer group added later \
+                 would find no partition to take, and raising the count then places new \
+                 accounts alone",
+                values.book_partitions
+            ),
+            vec![change(
+                &format!("bor.partitions: {}", (groups * 2).max(2)),
+                "none now: new accounts placed over more partitions, each existing account \
+                 where it is until it is moved",
+            )],
+        ));
+    }
+    // Headroom: the lake's partitions are its datasets and their ranges, as
+    // its writers report them.
+    let groups = values.writer_groups("lake");
+    let ranges: BTreeSet<&str> = seen
+        .members
+        .iter()
+        .filter(|m| m.component == "lake" && m.mode == "writer")
+        .flat_map(|m| m.partitions.iter().map(String::as_str))
+        .filter(|partition| *partition != meridian_changes::CONTROL)
+        .collect();
+    if !ranges.is_empty() && ranges.len() as u32 <= groups {
+        out.push(line(
+            "the lake's partitions",
+            ResilienceState::NotMet,
+            format!(
+                "the lake writes {} partitions and lake.writerGroups is {groups}: a writer group \
+                 added later would find no range to take",
+                ranges.len()
+            ),
+            vec![change(
+                "Split partition on the busiest range (the Resilience page, \
+                 dashboard__split_partition or meridian partition split)",
+                "none: the range's halves numbered on from where it closes, nothing copied",
+            )],
+        ));
+    }
+    // Load: each writer group's member, as it reports itself.
+    let mut said: BTreeSet<(String, u32)> = BTreeSet::new();
+    for member in &seen.members {
+        let Some((store, name)) = GROUPED.iter().find(|(c, _)| member.component == *c) else {
+            continue;
+        };
+        if member.mode != "writer" {
+            continue;
+        }
+        let overloaded = member.refusals.iter().any(|refused| {
+            refused.count > 0
+                && refused.reason == meridian_pb::v1::RefusalReason::Overloaded.as_str_name()
+        });
+        let busy = member.peak_write_busy_percent;
+        if busy <= BUSY_MOST_PERCENT && !overloaded {
+            continue;
+        }
+        let group = group_of_member(store, &member.member);
+        if !said.insert((store.to_string(), group)) {
+            continue;
+        }
+        let groups = values.writer_groups(store);
+        let reason = if busy > BUSY_MOST_PERCENT {
+            format!(
+                "its commit lane was busy {busy}% of a minute at its busiest in the last {} \
+                 minutes, past {BUSY_MOST_PERCENT}%",
+                meridian_changes::busy::WINDOW_BUCKETS
+            )
+        } else {
+            "it refused work as overloaded".to_string()
+        };
+        out.push(line(
+            &format!("{name}'s writer group {group}"),
+            ResilienceState::NotMet,
+            reason,
+            vec![change(
+                &format!("{store}.writerGroups: {}", groups + 1),
+                "a writer Deployment more, with its standby where the store keeps one; \
+                 partitions moved to it one at a time",
+            )],
+        ));
+    }
+    out
+}
+
+/// A writer member's group, by its pod's name: `<release>-<store>-group-<g>-…`
+/// past the first, group 0 otherwise.
+fn group_of_member(store: &str, member: &str) -> u32 {
+    let marker = format!("-{store}-group-");
+    member
+        .find(&marker)
+        .map(|at| &member[at + marker.len()..])
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|group| group.parse().ok())
+        .unwrap_or(0)
 }
 
 // ── The history ─────────────────────────────────────────────────────────────
@@ -1065,6 +1227,12 @@ pub const SOURCES: &[Source] = &[
         domain: "config",
         component: "conductor",
     },
+    // The book's control journal (step 3d; section 6.3, option (c)): its
+    // takeovers and findings as `~control` entries.
+    Source {
+        domain: "book",
+        component: "bor",
+    },
 ];
 
 /// The history the conductor holds: the newest items of every source, each
@@ -1093,8 +1261,8 @@ fn at_of(item: &ResilienceHistoryItem) -> i64 {
         Some(Item::SourceSwitched(r)) => r.switched_at_ns,
         Some(Item::AccountMoved(r)) => r.moved_at_ns,
         Some(Item::IntegrityFinding(r)) => r.found_at_ns,
-        // Contract v30's 3d records (approved 2026-11-12): none is recorded
-        // until 3d builds the split and the move.
+        // Contract v30's 3d records (approved 2026-11-12): the split from
+        // step 3d's stage H; the move that did not switch from stage M.
         Some(Item::PartitionSplit(r)) => r.split_at_ns,
         Some(Item::PartitionMoveAborted(r)) => r.aborted_at_ns,
         None => 0,
@@ -1105,6 +1273,27 @@ impl History {
     /// What one control change adds: its records as items, and a lake
     /// source priority in force.
     fn take(held: &mut Held, change: &meridian_changes::Change) {
+        // A book change is a `~control` entry: the record it carries, as a
+        // control change of every other store carries one.
+        let carried;
+        let change = if change.partition == meridian_changes::CONTROL
+            && change.kind.starts_with("meridian.v1.")
+            && change.body.first() == Some(&b'{')
+        {
+            match meridian_bor::control::record_of_change(change) {
+                Some((kind, body)) => {
+                    carried = meridian_changes::Change {
+                        kind,
+                        body,
+                        ..change.clone()
+                    };
+                    &carried
+                }
+                None => change,
+            }
+        } else {
+            change
+        };
         let mut items: Vec<ResilienceHistoryItem> = records::of_change(change)
             .into_iter()
             .map(|record| ResilienceHistoryItem {
@@ -1119,6 +1308,44 @@ impl History {
                 if let Ok(switch) = SourceSwitched::decode(change.body.as_slice()) {
                     items.push(ResilienceHistoryItem {
                         item: Some(Item::SourceSwitched(switch)),
+                    });
+                }
+            }
+            // A lake range's split (step 3d; section 6.1).
+            "meridian.v1.PartitionSplit" => {
+                if let Ok(split) =
+                    meridian_domain::v1::PartitionSplit::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionSplit(split)),
+                    });
+                }
+            }
+            // Step 3d (section 6.8): an account's move, a partition's move,
+            // and a move that did not switch.
+            "meridian.v1.AccountMoved" => {
+                if let Ok(moved) = meridian_domain::v1::AccountMoved::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::AccountMoved(moved)),
+                    });
+                }
+            }
+            "meridian.v1.PartitionMoved" => {
+                if let Ok(moved) =
+                    meridian_domain::v1::PartitionMoved::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionMoved(moved)),
+                    });
+                }
+            }
+            "meridian.v1.PartitionMoveAborted" => {
+                if let Ok(aborted) =
+                    meridian_domain::v1::PartitionMoveAborted::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::PartitionMoveAborted(aborted)),
                     });
                 }
             }
@@ -1329,7 +1556,28 @@ impl Answering {
                 Some(holder) => holder.clone(),
                 None => writer.map(|w| w.member.clone()).unwrap_or_default(),
             };
+            // Each partition's writer group (step 3d): by the store's count
+            // of groups, its writer the holder of that group's Lease.
+            let groups = self
+                .values
+                .as_ref()
+                .map_or(1, |values| values.writer_groups(component));
             for partition in partitions {
+                // A lake range is its dataset's group's (step 3d).
+                let owned_by = if component == "lake" {
+                    meridian_lake::range::dataset_of(&partition)
+                } else {
+                    partition.as_str()
+                };
+                let group = meridian_changes::groups::owner(owned_by, groups);
+                let named = if group == 0 {
+                    named.clone()
+                } else {
+                    holders
+                        .get(&format!("{component}-group-{group}"))
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 let asked = meridian_changes::ReadChangesRequest {
                     partition: partition.clone(),
                     after_sequence: i64::MAX as u64,
@@ -1357,8 +1605,8 @@ impl Answering {
                 owners.push(PartitionOwner {
                     component: component.to_string(),
                     partition,
-                    group: 0,
-                    writer: named.clone(),
+                    group,
+                    writer: named,
                     epoch,
                 });
             }

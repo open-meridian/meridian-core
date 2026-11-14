@@ -315,6 +315,9 @@ class Dgm(data.Role):
         self.streams = {}
         self.streamed = 0
         self.started = time.time_ns()
+        self.running = False
+        self.run_recorded = 0
+        self.run_failed = []
 
     def dataset(self, key):
         return f"{self.plugin.identity.instance_id}:{key}"
@@ -630,16 +633,21 @@ class Dgm(data.Role):
                 source_times=[SourceTime(kind="published", at_ns=published)],
                 raw=self.plugin.raw_record(f"edgar/{row_key}"))
 
+        # A row key fixes its valid time (the-lake rule 5, enforced from step
+        # 3d): each row's is a constant of the row, so asking again restates
+        # nothing it may not, and a restatement changes what was published.
+        filed_at = int(datetime(2026, 10, 30, tzinfo=timezone.utc).timestamp()) * 10**9
+        period_end = int(datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()) * 10**9
         eight_k = "0000320193-26-000105"
         filed = await self.record_filings(filings=[meridian.Filing(
-            meta=meta(eight_k, [(apple, "filer")], first, first),
+            meta=meta(eight_k, [(apple, "filer")], filed_at, first),
             filing=ops.FilingRef(accession_number=eight_k, form="8-K"),
             kind="current_report", items=["2.02", "9.01"], filed_date="2026-10-30")])
         eps_key = "320193:us-gaap:EarningsPerShareBasic:USD/shares:2026-06-28:2026-09-27"
 
         def eps(amount, accession, published):
             return meridian.ReportedFact(
-                meta=meta(eps_key, [(apple, "filer")], published, published),
+                meta=meta(eps_key, [(apple, "filer")], period_end, published),
                 concept="us-gaap:EarningsPerShareBasic", amount=Money(Decimal(amount), "USD"),
                 period_start="2026-06-28", period_end="2026-09-27",
                 filing=ops.FilingRef(accession_number=accession, form="10-K"))
@@ -838,6 +846,42 @@ class Dgm(data.Role):
         return {"trades": [trade_json(t) for t in answer.trades],
                 "watermark": [[p.partition, p.sequence] for p in answer.watermark.partitions]}
 
+    async def split_run(self, query):
+        """Step 3d (section 6.1): trades of BTC and USDC on `live`, two a
+        tenth of a second, recorded from `?start=1` until `?stop=1` -- what
+        the lake writes while its range of `live` is split -- each its own
+        row key; answered with how many were recorded and any refusal."""
+        if query.get("stop"):
+            self.running = False
+            await asyncio.sleep(0.5)
+            return {"recorded": self.run_recorded, "failed": self.run_failed[:5]}
+        await self.resolve()
+        self.running, self.run_recorded, self.run_failed = True, 0, []
+
+        async def record_forever():
+            n = 0
+            while self.running:
+                n += 1
+                at = time.time_ns()
+                rows = [ops.Trade(
+                    meta=ops.ObservationMeta(
+                        row_key=f"SPLIT-{name}-{n}",
+                        subjects=[ops.SubjectRef(entity_id=self.ids[name])],
+                        source=ops.Source(dataset=self.dataset("live"), venue_id=VENUE),
+                        valid_from_ns=at),
+                    price=self.money("62000"), quantity=_decimal("0.25"),
+                    attributes=ops.TradeAttributes(), aggressor=ops.AGGRESSOR_BUY)
+                    for name in ("btc", "usdc")]
+                try:
+                    done = await self._operations().RecordTrades(ops.RecordTradesParams(trades=rows))
+                    self.run_recorded += done.recorded
+                except Exception as failed:  # said on the page, for the run to quote
+                    self.run_failed.append(str(failed)[:300])
+                await asyncio.sleep(0.1)
+
+        asyncio.get_running_loop().create_task(record_forever())
+        return {"started": True}
+
     async def licences(self):
         """Contract v20 (W10.9): its own datasets' licences."""
         answer = await self._operations().ListDatasets(ops.ListDatasetsParams())
@@ -878,6 +922,8 @@ class Dgm(data.Role):
             return await self.record()
         if path == "/restate":
             return await self.restate()
+        if path == "/split-run":
+            return await self.split_run(query)
         if path == "/wants":
             return {"wants": self.wants, "withdrawn": self.withdrawn, "streaming": sorted(self.streams),
                     "streamed": self.streamed, "started": self.started}
@@ -1100,6 +1146,7 @@ def _amount(decimal):
 def trade_json(trade):
     meta = trade.meta
     return {"row_key": meta.row_key, "version": meta.version, "sequence": meta.sequence,
+            "previous_sequence": meta.previous_sequence,
             "dataset": meta.source.dataset, "venue_id": meta.source.venue_id,
             "valid_from_ns": meta.valid_from_ns,
             "amount": _amount(trade.price.amount) if trade.HasField("price") else "",

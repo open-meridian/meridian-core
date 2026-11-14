@@ -680,13 +680,18 @@ def account(args):
     granting = "--no-grant" not in args
     if not granting:
         args.remove("--no-grant")
+    # Its owner label, where one is given (owner=<label>): what the book
+    # places it by when it has several partitions (step 3d).
+    owner = next((arg.split("=", 1)[1] for arg in args if arg.startswith("owner=")), "")
+    args = [arg for arg in args if not arg.startswith("owner=")]
     if len(args) != 1:
         raise Failed("account takes a name")
     name = args[0]
     admin = signed_in()
     page = admin.get("/admin")
     done = admin.post("/admin/accounts",
-                      {"account_id": "", "name": name, "form_token": form_token(page)})
+                      {"account_id": "", "name": name, "owner": owner,
+                       "form_token": form_token(page)})
     if done.status != 303:
         raise Failed(f"the account was not defined: {done.status} {sentence(done)}")
 

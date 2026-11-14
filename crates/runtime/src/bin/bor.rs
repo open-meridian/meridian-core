@@ -69,9 +69,19 @@ fn run() -> Result<(), String> {
     // (contract v25, W9.10): the chart's `bor.snapshotInterval`.
     let interval =
         meridian_bor::snapshot::interval_from(var("MERIDIAN_BOR_SNAPSHOT_INTERVAL").as_deref())?;
+    // Its partitions (step 3d; section 6.3; `bor.partitions`): where a new
+    // account is placed, and the head rows `migrate` makes.
+    let partitions =
+        meridian_bor::store::partitions_from(var(meridian_bor::store::PARTITIONS_VAR).as_deref())?;
 
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
+            // A database past the first the chart brings (step 3d; section
+            // 6.4): made, with its roles and each component's login, by its
+            // superuser before its schema is applied.
+            if let Some(serving) = var("MERIDIAN_SERVING_DATABASE_URL") {
+                meridian_runtime::provision::provision_brought(&serving, &url)?;
+            }
             meridian_runtime::migrate_once_it_answers(
                 "the book's database",
                 &url,
@@ -79,6 +89,7 @@ fn run() -> Result<(), String> {
                 |store| {
                     store
                         .migrate(&*clock())
+                        .and_then(|()| store.make_partitions(partitions).map(|_| ()))
                         .map_err(|failed| failed.to_string())
                 },
             )
@@ -138,23 +149,60 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its writer group and the book's count (step 3d; section 6.3): the
+    // partitions it writes, and those it hands to their owners.
+    let groups = meridian_changes::groups::Groups::from_env()?;
     // Its own database login and its sessions' bounds (section 10a).
     meridian_runtime::serve_database_as("bor");
-    let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
-        "the book's database",
-        &url,
-        |url| {
-            PostgresStore::connect(url, 8)
-                .map(|store| store.with_snapshot_interval(interval))
-                .map_err(|failed| failed.to_string())
-        },
-        |store| {
-            store.verify().map_err(|failed| match failed {
-                StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
-                other => Wait::NotYet(other.to_string()),
-            })
-        },
-    )?);
+    // Its databases (step 3d; section 6.4; `bor.databases`): its group
+    // writes to database `group mod count`, and reads fan out over them all.
+    let databases = meridian_changes::databases::Databases::from_env("bor", &url)?;
+    let own = databases.of_group(groups.mine()) as usize;
+    let connect = |d: usize, url: &str| -> Result<Arc<PostgresStore>, String> {
+        let what = if d == 0 {
+            "the book's database".to_string()
+        } else {
+            format!("the book's database {d}")
+        };
+        wait_for_store(
+            &what,
+            url,
+            |url| {
+                PostgresStore::connect(url, 8)
+                    .map(|store| {
+                        store
+                            .with_snapshot_interval(interval)
+                            .with_groups(groups)
+                            .with_partitions(partitions)
+                    })
+                    .map_err(|failed| failed.to_string())
+            },
+            |store| {
+                store.verify().map_err(|failed| match failed {
+                    StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
+                    other => Wait::NotYet(other.to_string()),
+                })
+            },
+        )
+        .map(Arc::new)
+    };
+    let mut stores = Vec::new();
+    for (d, url) in databases.urls().iter().enumerate() {
+        stores.push(connect(d, url)?);
+    }
+    // Its own database's store, and the book over every database.
+    let postgres: Arc<PostgresStore> = Arc::clone(&stores[own]);
+    let every_database: Vec<Arc<PostgresStore>> = stores.clone();
+    let record: Arc<dyn meridian_bor::Store> = if databases.several() {
+        tracing::info!(
+            databases = databases.count(),
+            own,
+            "the book writes its group's database and reads every one"
+        );
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    } else {
+        postgres.clone()
+    };
     // The deployment every change is made in, and the writer's epoch,
     // adopted before the first command (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
@@ -165,18 +213,8 @@ fn run() -> Result<(), String> {
     // a reader made it inside the runtime from stage C2, connecting in
     // block_in_place after PR CI 43014977978's "Cannot start a runtime from
     // within a runtime").
-    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
-        meridian_runtime::read_replica(
-            "the book's read replica",
-            "MERIDIAN_BOR_READ_DATABASE_URL",
-            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-            |store| {
-                store
-                    .verify()
-                    .map_err(|failed| Wait::NotYet(failed.to_string()))
-            },
-        )?
-        .map(Arc::new)
+    let replica: Option<Arc<dyn meridian_bor::Store>> = if member.is_reader() {
+        book_replica(&databases, groups, partitions)?
     } else {
         None
     };
@@ -200,24 +238,21 @@ fn run() -> Result<(), String> {
             bus.serve_only(meridian_bus::read_after::is_read);
             // Made before the runtime and held outside it (stage D): its
             // connections close after the runtime has stopped.
-            let replica = replica
-                .clone()
-                .map(|replica| replica as Arc<dyn meridian_bor::Store>);
-            let start =
-                tokio::task::block_in_place(|| meridian_bor::Store::heads(postgres.as_ref()))
-                    .map_err(|failed| format!("the book's heads could not be read: {failed}"))?;
+            let replica = replica.clone();
+            let start = tokio::task::block_in_place(|| meridian_bor::Store::heads(record.as_ref()))
+                .map_err(|failed| format!("the book's heads could not be read: {failed}"))?;
             let followed = meridian_runtime::member::Followed::from_heads(start);
             // Its replies' watermarks: what it has applied, for a read from
             // the books it holds (spec section 5).
             let applied = Arc::clone(&followed);
             let reading = Arc::new(meridian_bor::reader::ReaderStore::new(
-                postgres.clone(),
+                record.clone(),
                 replica,
                 books_bound,
                 Arc::new(move || applied.heads().into_iter().collect()),
             ));
             meridian_bor::service::serve(bus.clone(), reading.clone(), clock());
-            let primary = postgres.clone();
+            let primary = record.clone();
             member.read(
                 &bus,
                 followed,
@@ -241,21 +276,40 @@ fn run() -> Result<(), String> {
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
         let holding = member.wait_to_write(&bus).await?;
+        // Each partition's writer group as its head names it (step 3d;
+        // ruled 2026-11-14): the control partition's group names every
+        // one not named yet, by the count now, so a later change of the
+        // count moves nothing until a move moves it; every member reads
+        // them at start and every few seconds, and again on each write
+        // handed back to it.
+        // Read before the epoch is adopted, which goes by them.
+        tokio::task::block_in_place(|| -> Result<(), String> {
+            for store in &every_database {
+                if groups.holds_control() {
+                    let pinned = store.pin_owners().map_err(|failed| failed.to_string())?;
+                    if pinned > 0 {
+                        tracing::info!(pinned, "each partition named its writer group");
+                    }
+                }
+                store.read_owners().map_err(|failed| failed.to_string())?;
+            }
+            Ok(())
+        })?;
         let epoch = tokio::task::block_in_place(|| {
             holding.epoch(
                 || {
-                    meridian_bor::Store::adopt(postgres.as_ref())
+                    meridian_bor::Store::adopt(record.as_ref())
                         .map_err(|failed| format!("the book could not adopt its epoch: {failed}"))
                 },
                 |by| {
-                    meridian_bor::Store::take_over(postgres.as_ref(), by)
+                    meridian_bor::Store::take_over(record.as_ref(), by)
                         .map_err(|failed| format!("the book could not take over: {failed}"))
                 },
             )
         })?;
         tracing::info!(epoch, "the book writes under its epoch");
-        let watched = postgres.clone();
-        let writing = postgres.clone();
+        let watched = record.clone();
+        let writing = record.clone();
         holding.keep(
             move || meridian_bor::Store::epoch(writing.as_ref()),
             move || {
@@ -263,29 +317,81 @@ fn run() -> Result<(), String> {
                     .map_err(|failed| failed.to_string())
             },
         );
-        // The scrub, under the lease (step 3b, integrity at rest).
-        let scrubbing = url.clone();
-        meridian_runtime::scrub::forever("book", move || {
-            meridian_runtime::scrub::run_once(
-                "book",
-                || {
-                    let store = PostgresStore::connect(&scrubbing, 1)
-                        .map_err(|failed| failed.to_string())?;
-                    store.scrub().map_err(|failed| failed.to_string())
-                },
-                |scrubbed, member, started, finished| {
-                    PostgresStore::connect(&scrubbing, 1)
-                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
-                        .map_err(|failed| failed.to_string())
-                },
-            )
-        });
+        // Several writer groups (step 3d; section 6.7): each command whose
+        // account another group writes handed to it, unchanged, and the
+        // commands handed to this group answered here. Before the book's
+        // handlers and its shared work, which are this group's own.
+        if groups.several() {
+            bus.hand_writes_on(
+                meridian_bor::writer::INTERNAL_COMMAND,
+                groups.mine(),
+                meridian_bor::writer::is_command,
+            );
+            // Its owner decided from the request first (the ownership
+            // pre-check decided 2026-11-13): a command naming its account
+            // handed to that account's group before any of its handler's
+            // work, by the placement this member last found it in.
+            let placing = record.clone();
+            bus.route_writes_by(move |topic, envelope| {
+                // A partition's move is the control partition's group's
+                // to run (step 3d; section 6.8).
+                if topic == meridian_bor::partition_moves::MOVE_PARTITION {
+                    return Some(0);
+                }
+                let account = meridian_bor::service::account_of_write(topic, &envelope.payload)?;
+                meridian_bor::Store::writer_group_of(placing.as_ref(), &account)
+            });
+            let reading = every_database.clone();
+            meridian_runtime::background(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let stores = reading.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for store in &stores {
+                            if let Err(failed) = store.read_owners() {
+                                tracing::debug!(%failed, "the writer groups were not read again");
+                            }
+                        }
+                    })
+                    .await;
+                }
+            });
+            tracing::info!(
+                group = groups.mine(),
+                groups = groups.count(),
+                "the book writes its writer group's partitions, and hands every other's commands to their owners"
+            );
+        }
+        // The scrub, under the lease (step 3b, integrity at rest): the
+        // control partition's group's, which reads every partition.
+        for scrubbing in databases.urls().to_vec() {
+            if !groups.holds_control() {
+                break;
+            }
+            meridian_runtime::scrub::forever("book", move || {
+                meridian_runtime::scrub::run_once(
+                    "book",
+                    || {
+                        let store = PostgresStore::connect(&scrubbing, 1)
+                            .map_err(|failed| failed.to_string())?;
+                        store.scrub().map_err(|failed| failed.to_string())
+                    },
+                    |scrubbed, member, started, finished| {
+                        PostgresStore::connect(&scrubbing, 1)
+                            .and_then(|store| {
+                                store.record_scrub(scrubbed, member, started, finished)
+                            })
+                            .map_err(|failed| failed.to_string())
+                    },
+                )
+            });
+        }
         // Every commit, whichever path makes it, told on its partition's
         // tail (step 3a).
         // and each account's book at its head held in memory, bounded by
         // bor.hotLayer.booksMiB (the hot layer).
         let store: Arc<dyn meridian_bor::Store> = Arc::new(meridian_bor::writer::Writer::bounded(
-            postgres.clone(),
+            record.clone(),
             bus.clone(),
             books_bound,
         ));
@@ -299,6 +405,43 @@ fn run() -> Result<(), String> {
         });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // A partition's move (step 3d; section 6.8): the control partition's
+        // group runs each, one at a time, over every database.
+        if groups.holds_control() {
+            let mover = Arc::new(meridian_bor::partition_moves::Mover::new(
+                every_database.clone(),
+                groups,
+                meridian_bor::partition_moves::Settings::from_env(),
+                clock(),
+            ));
+            meridian_bor::partition_moves::serve(&bus, &store, &mover);
+            // A changed count of writer groups (section 6.8, Triggers): each
+            // partition its head names for another group than its owner at
+            // the count now moved to it, one at a time, at start and each
+            // minute after.
+            if groups.several() {
+                let (bus, store, mover) = (bus.clone(), Arc::clone(&store), Arc::clone(&mover));
+                meridian_runtime::background(async move {
+                    loop {
+                        let (bus, store, mover) =
+                            (bus.clone(), Arc::clone(&store), Arc::clone(&mover));
+                        let moved = tokio::task::spawn_blocking(move || {
+                            meridian_bor::partition_moves::rebalance(&bus, store.as_ref(), &mover)
+                                .len()
+                        })
+                        .await
+                        .unwrap_or(0);
+                        if moved > 0 {
+                            tracing::info!(
+                                moved,
+                                "partitions moved by the changed count of writer groups"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
+        }
         // The start's snapshots (v26; W9.10): every account whose journal
         // since its latest snapshot of this format reaches the interval --
         // a quiet one, or one upgraded from an older format -- kept now, off
@@ -357,6 +500,33 @@ fn run() -> Result<(), String> {
             meridian_bor::order_service::EXPIRE_EVERY,
         ));
 
+        // The control journal (step 3d; section 6.3, option (c)): the
+        // book's takeovers, findings and assignments journalled on
+        // `~control` by the control partition's group, the ones kept before
+        // 3d backfilled first, then each new one within a minute.
+        if groups.holds_control() {
+            let journaling = bus.clone();
+            let held = Arc::clone(&store);
+            meridian_runtime::background(async move {
+                loop {
+                    let (bus, store) = (journaling.clone(), Arc::clone(&held));
+                    match tokio::task::spawn_blocking(move || {
+                        meridian_bor::control::journal_owed(&bus, store.as_ref())
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(journalled)) => tracing::info!(
+                            journalled,
+                            "the book's takeovers, findings and assignments journalled on its control"
+                        ),
+                        Ok(Err(why)) => tracing::warn!(why, "the book's control journal was not brought up to date"),
+                        Err(failed) => tracing::warn!(%failed, "the book's control journal failed"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
+        }
         // Booking (W11.30, contract v24): the child entries every booking
         // owes the other accounts it allocates to, swept for on start and
         // every quarter hour; and, once at the upgrade, the escape hatch for
@@ -444,4 +614,53 @@ fn run() -> Result<(), String> {
         holding.release().await;
         Ok(())
     })
+}
+
+/// A reader's record-read replicas (contract v30, stage B; step 3d): one
+/// database's where the book has one, else every database's, each read from
+/// its own replica where the chart names one -- database 0's from
+/// `MERIDIAN_BOR_READ_DATABASE_URL`, each past it from
+/// `MERIDIAN_BOR_READ_DATABASE_URL_<d>` -- and from the database itself
+/// where it names none.
+fn book_replica(
+    databases: &meridian_changes::databases::Databases,
+    groups: meridian_changes::groups::Groups,
+    partitions: u32,
+) -> Result<Option<Arc<dyn meridian_bor::Store>>, String> {
+    let verify = |store: &PostgresStore| {
+        store
+            .verify()
+            .map_err(|failed| Wait::NotYet(failed.to_string()))
+    };
+    let connect = |url: &str| {
+        PostgresStore::connect(url, 4)
+            .map(|store| store.with_groups(groups).with_partitions(partitions))
+            .map_err(|failed| failed.to_string())
+    };
+    let first = meridian_runtime::read_replica(
+        "the book's read replica",
+        &meridian_changes::databases::read_url_var("bor", 0),
+        connect,
+        verify,
+    )?;
+    if !databases.several() {
+        return Ok(first.map(|store| Arc::new(store) as Arc<dyn meridian_bor::Store>));
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let mut stores = vec![Arc::new(first)];
+    for (d, url) in databases.urls().iter().enumerate().skip(1) {
+        let replica = var(&meridian_changes::databases::read_url_var("bor", d as u32))
+            .unwrap_or_else(|| url.clone());
+        stores.push(Arc::new(wait_for_store(
+            &format!("the book's read replica of database {d}"),
+            &replica,
+            connect,
+            verify,
+        )?));
+    }
+    Ok(Some(Arc::new(meridian_bor::spread::Spread::new(
+        stores, groups,
+    ))))
 }

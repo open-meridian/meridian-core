@@ -97,7 +97,10 @@ COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
            "-f", ".harness/plugins.yaml", "-f", "e2e/orders/stand-in.yaml",
            "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
-           MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/orders"))
+           MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/orders"),
+           # Step 3d: the book over two partitions, so step 11's block books
+           # across them through each partition's ~clearing account.
+           MERIDIAN_BOR_PARTITIONS="2")
 INSTANCES = ("pm", "desk", "comp", "venue", "venue2", "ops")
 CODE = "SIM-ACCT-1"
 # The cash instruments of the platform's stand-in (deploy/harness/platform.py),
@@ -176,6 +179,13 @@ def store_book():
     return compose("run", "--rm", "-T", "store", "book").stdout
 
 
+def sql(query):
+    """One query's rows from the deployment's database, as psql prints
+    them unaligned."""
+    return compose("exec", "-T", "postgres", "psql", "-U", "meridian", "-d", "meridian",
+                   "-At", "-v", "ON_ERROR_STOP=1", "-c", query).stdout.strip().splitlines()
+
+
 def run():
     started = time.time()
     compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
@@ -185,7 +195,12 @@ def run():
 
     # 1. Set up. The account the orders are in is granted to the desk's
     # instance, which may map it to a venue account code (W6.30, W11.22).
-    account = runner("account", "Orders fund", "--instance", "desk").strip().splitlines()[-1]
+    # Placed by its owner label in P0 (step 3d), as step 11's funds are, so
+    # P0 numbers far past P1 by step 11: a follower that took one
+    # partition's number for another's would pass over the block's
+    # placement in P1, every run rather than by chance.
+    account = runner("account", "Orders fund", "owner=Pension trust",
+                     "--instance", "desk").strip().splitlines()[-1]
     elsewhere = runner("account", "Elsewhere", "--instance", "pm").strip().splitlines()[-1]
     # The portfolio plugin on All accounts; the desk and compliance on the
     # orders' account alone, so Elsewhere is outside the desk's write scope.
@@ -394,8 +409,13 @@ def run():
     # hand-off.
     # Step 7's stop lifted, at the level that set it, so the venue fills.
     runner("instruction", "active", "--plugin", "venue", "note=The venue trades again.")
-    funds = [runner("account", name, "--instance", "desk").strip().splitlines()[-1]
-             for name in ("Fund A", "Fund B", "Block", "Errors")]
+    # Step 3d: each placed by its owner label over the book's two
+    # partitions -- the funds' in P0, the block's in P1 -- so the block's
+    # booking books across them.
+    funds = [runner("account", name, *([f"owner={owner}"] if owner else []),
+                    "--instance", "desk").strip().splitlines()[-1]
+             for name, owner in (("Fund A", "Pension trust"), ("Fund B", "Endowment"),
+                                 ("Block", "Desk"), ("Errors", ""))]
     fund_a, fund_b, block_account, errors = funds
     for marked, mark in ((block_account, "allocation"), (errors, "error")):
         runner("core-form", "/admin", "/admin/accounts/book", f"account_id={marked}",
@@ -417,8 +437,14 @@ def run():
     must(block.get("state") == "ORDER_STATE_RELEASED", f"step 11, the block released on creation: {block}")
     page("desk", "write", f"/claim?order={block['order_id']}")
     page("desk", "write", f"/place?order={block['order_id']}&quantity=10&connectivity=venue&code=SIM-BLOCK-1")
-    until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
-        order_of(orders("desk"), block["order_id"])), "step 11, the block was not filled")
+    try:
+        until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
+            order_of(orders("desk"), block["order_id"])), "step 11, the block was not filled")
+    except Failed:
+        # What the venue heard and the block as it stands, for the log.
+        log(f"step 11 diagnosis: venue {page('venue', 'admin', '/heard')}")
+        log(f"step 11 diagnosis: block {order_of(orders('desk'), block['order_id'])}")
+        raise
     fills = page("desk", "write", f"/executions?account={block_account}&order={block['order_id']}")["executions"]
     gross = {"6": "1364.46", "4": "909.64"}
     booked = page("desk", "write",
@@ -434,6 +460,26 @@ def run():
     must(held("Fund A") == ["6"] and held("Fund B") == ["4"],
          f"step 11, each fund holds its allocation: {held('Fund A')}, {held('Fund B')}")
     must(held("Block") in ([], ["0"]), f"step 11, the allocation account nets to zero: {held('Block')}")
+    # Step 3d (section 6.3): placed by owner label, the block in P1 and the
+    # funds in P0, each key kept; the booking journalled pending naming its
+    # children, each child against its partition's ~clearing account, and
+    # the booking posted.
+    placed = sorted(sql("SELECT account_id || '|' || partition || '|' || coalesce(placement_key, '') "
+                        f"FROM book_account WHERE account_id IN ('{fund_a}', '{fund_b}', '{block_account}')"))
+    must(placed == sorted([f"{fund_a}|P0|Pension trust", f"{fund_b}|P0|Endowment",
+                           f"{block_account}|P1|Desk"]),
+         f"step 11, each account placed by its owner label: {placed}")
+    body = "convert_from(body, 'UTF8')::jsonb"
+    pending = sql(f"SELECT jsonb_array_length({body}->'pending') FROM book_entry "
+                  f"WHERE account_id = '{block_account}' AND kind = 'booking-booked'")
+    must(pending and all(n == "2" for n in pending),
+         f"step 11, the booking journalled pending, naming its two children: {pending}")
+    cleared = sorted(sql(f"SELECT DISTINCT partition FROM book_entry WHERE {body} ? 'clearing'"))
+    must(cleared == ["P0", "P1"],
+         f"step 11, each partition's leg against its own ~clearing account: {cleared}")
+    posted = lambda: sql("SELECT count(*) FROM book_entry "
+                         f"WHERE account_id = '{block_account}' AND kind = 'booking-posted'")[0]
+    until(60, lambda: posted() == "1" or None, "step 11, the booking was not posted")
 
     # The overfill: ten ordered and filled, two more from the venue's own
     # app accepted to it; the excess booked to the error account.
@@ -465,6 +511,8 @@ def run():
     book = store_book()
     must(held("Fund A") == ["5"] and held("Fund B") == ["5"],
          f"step 11, each fund holds the corrected allocation: {held('Fund A')}, {held('Fund B')}")
+    # The replaced version posted in its turn (step 3d).
+    until(60, lambda: posted() == "2" or None, "step 11, the replaced booking was not posted")
     # The booking is the block's, in the allocation account it was booked in.
     listed = page("ops", "write", f"/bookings?account={block_account}")["bookings"]
     must([b["booking_id"] for b in listed] == [booked["booking_id"]],
@@ -617,7 +665,9 @@ def run():
           "venue-originated fills waiting unmatched, one accepted to a new order at filled, one "
           "answered DK by the ems's tool, the venue hearing both, a later fill waiting on its own; "
           "EUR/USD's spot date Tuesday 13 October, by the platform's IDs, the deployment's own; "
-          "a block across two funds booked and handed off, each member filled by its allocation; "
+          "a block across two funds in another partition booked and handed off through each "
+          "partition's ~clearing account, placed by owner label, posted, each member filled by "
+          "its allocation; "
           "an overfill's excess booked to the error account; a correction by replace after the "
           "hand-off; execution costs recorded by the analytics component from the order "
           "path's orders, placements, executions and history, once; a bond ordered in face "

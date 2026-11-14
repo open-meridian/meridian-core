@@ -109,6 +109,92 @@ pub(crate) fn number(
         .unwrap_or_default()
 }
 
+/// The-lake rule 5 (step 3d; ruled 2026-11-12): a row key fixes its valid
+/// time and its first subject. A part restating a key held -- or one an
+/// earlier part of the batch keeps -- under another valid time, or another
+/// first subject that is not the record replacing or merged into it
+/// (`same_record`, which follows the alias), is refused whole, naming the
+/// field. A key's every new version keeps it, a confirmation's too (a fact
+/// a later filing repeats or restates carries its own published time in
+/// its source times, under the key's first valid time). `None` for a part
+/// that keeps the rule; a refused part's keys are not held for the parts
+/// after it.
+pub(crate) fn rule_five(
+    parts: &[Vec<Observation>],
+    mut latest: impl FnMut(&Observation) -> Option<Observation>,
+    mut same_record: impl FnMut(&str, &str) -> bool,
+) -> Vec<Option<StoreError>> {
+    // Each key's last row in the parts before, and in this part so far: by
+    // reference, one look a row (step 3d).
+    let mut kept: std::collections::HashMap<(i16, &str), &Observation> =
+        std::collections::HashMap::new();
+    parts
+        .iter()
+        .map(|rows| {
+            let mut mine: std::collections::HashMap<(i16, &str), &Observation> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let key = (row.data_type().code(), row.meta().row_key.as_str());
+                let fetched;
+                let held = match mine.get(&key).or_else(|| kept.get(&key)) {
+                    Some(held) => Some(*held),
+                    None => {
+                        fetched = latest(row);
+                        fetched.as_ref()
+                    }
+                };
+                if let Some(held) = held {
+                    let (was, is) = (held.meta().valid_from_ns, row.meta().valid_from_ns);
+                    if was != is {
+                        return Some(StoreError::KeyFixed {
+                            data_type: row.data_type(),
+                            row_key: key.1.to_string(),
+                            field: crate::store::VALID_TIME_FIELD,
+                            words: format!(
+                                "row key {:?} was recorded valid from {was} and is restated valid from {is}: a row key fixes its valid time; cancel the old key and record a new one",
+                                row.meta().row_key
+                            ),
+                        });
+                    }
+                    let (was, is) = (held.subject(), row.subject());
+                    if was != is && !same_record(was, is) {
+                        return Some(StoreError::KeyFixed {
+                            data_type: row.data_type(),
+                            row_key: key.1.to_string(),
+                            field: crate::store::FIRST_SUBJECT_FIELD,
+                            words: format!(
+                                "row key {:?} was recorded about {was} and is restated about {is}: a row key fixes its first subject; cancel the old key and record a new one",
+                                row.meta().row_key
+                            ),
+                        });
+                    }
+                }
+                mine.insert(key, row);
+            }
+            kept.extend(mine);
+            None
+        })
+        .collect()
+}
+
+/// Whether two subjects name one record: either replaced by, or merged
+/// into, the other, followed through `aliases` (replaced to the one that
+/// stays) as the lake follows a placeholder's replacement.
+pub(crate) fn same_record(aliases: &BTreeMap<String, String>, was: &str, is: &str) -> bool {
+    let reaches = |from: &str, to: &str| {
+        let mut at = from;
+        for _ in 0..64 {
+            match aliases.get(at) {
+                Some(next) if next == to => return true,
+                Some(next) => at = next,
+                None => return false,
+            }
+        }
+        false
+    };
+    was == is || reaches(was, is) || reaches(is, was)
+}
+
 /// [`number`], for several batches of one dataset numbered in turn as one
 /// (the write-ahead stream's, the resilience spec's section 4): each part is
 /// decided against what is held and what every part before it numbered, and
@@ -210,6 +296,26 @@ impl Store for MemoryStore {
         let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);
         let stored = held.rows.clone();
+        let latest_held = |row: &Observation| {
+            stored
+                .iter()
+                .filter(|h| {
+                    h.dataset() == dataset
+                        && h.data_type() == row.data_type()
+                        && h.meta().row_key == row.meta().row_key
+                })
+                .max_by_key(|h| h.meta().version)
+                .cloned()
+        };
+        let aliases = held.aliases.clone();
+        if let Some(Some(refused)) =
+            rule_five(std::slice::from_ref(&rows), latest_held, |was, is| {
+                same_record(&aliases, was, is)
+            })
+            .pop()
+        {
+            return Err(refused);
+        }
         let done = number(
             rows,
             &mut head,
@@ -251,7 +357,11 @@ impl Store for MemoryStore {
         Ok(self.lock().write_ahead.get(stream).copied())
     }
 
-    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+    fn record_write_ahead(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let at = held.write_ahead.get(&batch.stream).copied();
@@ -261,7 +371,11 @@ impl Store for MemoryStore {
                 batch.stream, batch.after
             )));
         }
-        let mut answered = vec![Recorded::default(); batch.parts.len()];
+        let mut answered: Vec<Result<Recorded>> = batch
+            .parts
+            .iter()
+            .map(|_| Ok(Recorded::default()))
+            .collect();
         let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
         for (at, (dataset, rows)) in batch.parts.into_iter().enumerate() {
             by_dataset.entry(dataset).or_default().push((at, rows));
@@ -270,6 +384,35 @@ impl Store for MemoryStore {
             let mut head = held.heads.get(&dataset).copied().unwrap_or(0);
             let stored = &held.rows;
             let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
+            // The-lake rule 5: a part restating a key's valid time or first
+            // subject refused alone (step 3d).
+            let refused = rule_five(
+                &rows,
+                |row| {
+                    stored
+                        .iter()
+                        .filter(|h| {
+                            h.dataset() == dataset
+                                && h.data_type() == row.data_type()
+                                && h.meta().row_key == row.meta().row_key
+                        })
+                        .max_by_key(|h| h.meta().version)
+                        .cloned()
+                },
+                |was, is| same_record(&held.aliases, was, is),
+            );
+            let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = places
+                .into_iter()
+                .zip(rows)
+                .zip(refused)
+                .filter_map(|((place, rows), refused)| match refused {
+                    Some(refused) => {
+                        answered[place] = Err(refused);
+                        None
+                    }
+                    None => Some((place, rows)),
+                })
+                .unzip();
             let done = number_parts(
                 rows,
                 &mut head,
@@ -305,7 +448,7 @@ impl Store for MemoryStore {
                         .insert((dataset.clone(), row.meta().sequence), epoch);
                 }
                 held.rows.extend(done.rows.iter().cloned());
-                answered[place] = done;
+                answered[place] = Ok(done);
             }
         }
         held.dropped
@@ -442,19 +585,30 @@ impl Store for MemoryStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let held = self.lock();
-        let by_place: BTreeMap<(&str, u64), &Observation> = held
+        let by_place: BTreeMap<(&str, u64, u32), &Observation> = held
             .rows
             .iter()
             .filter(|row| row.data_type() == data_type)
-            .map(|row| ((row.dataset(), row.meta().sequence), row))
+            .map(|row| {
+                (
+                    (
+                        row.dataset(),
+                        row.meta().sequence,
+                        crate::range::key_hash(&row.meta().row_key),
+                    ),
+                    row,
+                )
+            })
             .collect();
         let mut out: Vec<Observation> = places
             .iter()
-            .filter_map(|(dataset, sequence)| by_place.get(&(dataset.as_str(), *sequence)))
+            .filter_map(|(dataset, sequence, key_hash)| {
+                by_place.get(&(dataset.as_str(), *sequence, *key_hash))
+            })
             .map(|row| (*row).clone())
             .collect();
         as_flagged(&mut out, &held.amendments, as_of_ns);

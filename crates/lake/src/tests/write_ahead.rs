@@ -26,6 +26,7 @@ fn written(sequence: u64, instance: &str, prices: Vec<Price>) -> Taken {
         reply_to: Some(format!("_INBOX.test.{sequence}")),
         after: None,
         envelope,
+        dataset: String::new(),
     }
 }
 
@@ -458,4 +459,168 @@ async fn a_gap_is_recorded_the_moment_the_stream_skips_and_each_dataset_names_it
         .filter(|g| g.dataset.is_empty())
         .collect::<Vec<_>>();
     assert_eq!(still, vec![unattributed]);
+}
+
+/// Step 3d (section 6.1): one reader of the stream per writer group, each
+/// with its own position. Every group reads the whole stream; each commits
+/// its own datasets' writes and answers them, and moves its position past
+/// the rest, which their owners answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_its_own_position() {
+    use meridian_changes::groups::{owner, Groups};
+    let h = harness();
+    let dataset = "coinbase-1:daily";
+    let owning = owner(dataset, 2);
+    let lake_of = |group: u32| {
+        let lake = service::Lake::grouped(
+            h.bus.clone(),
+            h.store.clone(),
+            h.clock.clone(),
+            Groups::new(group, 2).unwrap(),
+        );
+        lake.configured(&configuration(true, &[]));
+        lake
+    };
+    let write = |sequence: u64| {
+        let mut taken = written(
+            sequence,
+            "coinbase-1",
+            vec![close(
+                "coinbase-1",
+                &format!("BTC:{sequence}"),
+                BTC,
+                "2026-10-07",
+                "62000",
+            )],
+        );
+        taken.dataset = dataset.to_string();
+        taken
+    };
+    let batch = vec![write(1), write(2)];
+    let other = lake_of(1 - owning);
+    let mut skipping = tokio::task::block_in_place(|| Writer::start(other, STREAM)).unwrap();
+    let skipped = tokio::task::block_in_place(|| skipping.take(batch.clone())).unwrap();
+    assert!(
+        skipped.is_empty(),
+        "another group's writes are its owner's to answer"
+    );
+    let key = |group: u32| crate::write_ahead::position_key(STREAM, Groups::new(group, 2).unwrap());
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(1 - owning))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(2),
+        "its own position moved past them"
+    );
+    assert_eq!(
+        h.store.heads().unwrap().get(dataset),
+        None,
+        "nothing of them kept"
+    );
+    let mut taking =
+        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    let answers = tokio::task::block_in_place(|| taking.take(batch)).unwrap();
+    assert_eq!(answers.len(), 2);
+    assert_eq!(reply(&answers[1].1).recorded, 1);
+    assert_eq!(h.store.heads().unwrap()[dataset], 2);
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(owning))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(2)
+    );
+    assert_eq!(key(0), STREAM, "group 0 keeps the position every lake kept");
+}
+
+/// Step 3d (section 6.1; CI 43615034712): a writer group past the first,
+/// started for the first time after `writerGroups` was raised, has no
+/// position of its own. The stream's earlier writes were group 0's to take,
+/// and were taken, so the group begins at the first write the stream still
+/// holds and counts none before it dropped: no run, no gap, nothing logged
+/// in the control partition, which group 0 writes. Its own dataset's write
+/// is committed and answered. Group 0 with no position still finds the run
+/// it never took.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_streams_first_with_no_gap(
+) {
+    use meridian_changes::groups::{owner, Groups};
+    let h = harness();
+    let dataset = "coinbase-1:daily";
+    // A count of groups at which the dataset is a group's past the first.
+    let count = (2..16)
+        .find(|count| owner(dataset, *count) > 0)
+        .expect("a count where a group past the first owns it");
+    let owning = owner(dataset, count);
+    let lake_of = |group: u32| {
+        let lake = service::Lake::grouped(
+            h.bus.clone(),
+            h.store.clone(),
+            h.clock.clone(),
+            Groups::new(group, count).unwrap(),
+        );
+        lake.configured(&configuration(true, &[]));
+        lake
+    };
+    let key =
+        |group: u32| crate::write_ahead::position_key(STREAM, Groups::new(group, count).unwrap());
+    let write = |sequence: u64| {
+        let mut taken = written(
+            sequence,
+            "coinbase-1",
+            vec![close("coinbase-1", "first", BTC, "2026-10-07", "62000")],
+        );
+        taken.dataset = dataset.to_string();
+        taken
+    };
+    // The stream holds 1,810 on: what came before aged out after group 0
+    // took it.
+    let mut fresh = tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    assert_eq!(fresh.position(), None);
+    let answers = tokio::task::block_in_place(|| fresh.take(vec![write(1_810)])).unwrap();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(reply(&answers[0].1).recorded, 1, "its own write committed");
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(owning))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(1_810)
+    );
+    let (dropped, _) = h.store.write_ahead_found(&key(owning)).unwrap();
+    assert!(dropped.is_empty(), "no run counted dropped: {dropped:?}");
+    assert!(
+        gaps(&h, "", GapState::Unspecified).is_empty(),
+        "no gap recorded"
+    );
+    // Committed since: the stream aging past its position later is a gap
+    // it marks, as group 0 would ("lake loss is re-sent, never silent").
+    let mut again = tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    tokio::task::block_in_place(|| again.take(vec![write(2_500)])).unwrap();
+    let (dropped, _) = h.store.write_ahead_found(&key(owning)).unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(1_811, 2_499)],
+        "a group that has committed marks the run past its position"
+    );
+    assert_eq!(
+        gaps(&h, "", GapState::Unspecified).len(),
+        1,
+        "its gap recorded"
+    );
+    // Group 0, with no position, never took 1 to 1,809: those it finds.
+    let mut zero = tokio::task::block_in_place(|| Writer::start(lake_of(0), STREAM)).unwrap();
+    tokio::task::block_in_place(|| zero.take(vec![write(1_811)])).unwrap();
+    let (dropped, _) = h.store.write_ahead_found(&key(0)).unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(1, 1_810)]
+    );
 }

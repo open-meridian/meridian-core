@@ -72,6 +72,34 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "database_identity",
         sql: include_str!("../migrations/0010_database_identity.sql"),
     },
+    // An account's placement key (step 3d; section 6.3): what it was placed
+    // in its partition by, kept at its creation.
+    Migration {
+        version: 11,
+        name: "placement",
+        sql: include_str!("../migrations/0011_placement.sql"),
+    },
+    // A partition's writer group (step 3d; ruled 2026-11-14): set by a
+    // move's switch, and filled with the rendezvous owner at start.
+    Migration {
+        version: 12,
+        name: "writer_group",
+        sql: include_str!("../migrations/0012_writer_group.sql"),
+    },
+    // Each writer group's epoch (step 3d; `book_writer_group` approved
+    // 2026-11-14): kept while the group owns no partition.
+    Migration {
+        version: 13,
+        name: "writer_group_epoch",
+        sql: include_str!("../migrations/0013_writer_group_epoch.sql"),
+    },
+    // The records owed to `~control` by a member that does not write it
+    // (step 3d; `book_control_owed` approved 2026-11-14).
+    Migration {
+        version: 14,
+        name: "control_owed",
+        sql: include_str!("../migrations/0014_control_owed.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

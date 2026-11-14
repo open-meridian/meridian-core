@@ -1305,3 +1305,156 @@ async fn a_client_that_stops_reading_is_cut_off_alone_and_every_other_keeps_its_
         "the stalled client was sent everything: {left} bytes"
     );
 }
+
+/// Step 3d (section 6.7): a write the request says another writer group
+/// owns is passed to that group's member before it is admitted here, the
+/// caller's reply address kept: the owner answers the caller itself, this
+/// member's handler never runs, and it waits on nothing.
+#[tokio::test]
+async fn a_write_another_group_owns_is_passed_to_it_and_answered_by_it() {
+    let instance = format!("store-{}", mark("pass"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    let ran = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let mut members = Vec::new();
+    for group in 0..2u32 {
+        let member = bus(&instance).await;
+        member.hand_writes_on(&internal, group, {
+            let write = write.clone();
+            move |topic| topic == write
+        });
+        // Every write is group 1's, as its request says.
+        member.route_writes_by(|_, _| Some(1));
+        let counted = std::sync::Arc::clone(&ran);
+        member.serve(&write, move |envelope| {
+            counted[group as usize].fetch_add(1, Ordering::SeqCst);
+            Ok((
+                "meridian.test.Answer".to_string(),
+                [format!("group {group}: ").into_bytes(), envelope.payload].concat(),
+            ))
+        });
+        members.push(member);
+    }
+    settle().await;
+    let asking = bus("asking").await;
+    let (before, _, _) = meridian_bus::owners::handed_on();
+    for n in 0..20u32 {
+        let (_, payload) = asking
+            .call(
+                &write,
+                "meridian.test.Question",
+                n.to_string().into_bytes(),
+                None,
+                None,
+            )
+            .await
+            .expect("answered");
+        assert_eq!(payload, format!("group 1: {n}").into_bytes());
+    }
+    assert_eq!(
+        ran[0].load(Ordering::SeqCst),
+        0,
+        "group 0's handler never ran"
+    );
+    assert_eq!(ran[1].load(Ordering::SeqCst), 20);
+    let (after, _, _) = meridian_bus::owners::handed_on();
+    assert!(after > before, "the writes group 0 received were passed on");
+}
+
+/// Step 3d (section 6.7): a passed write keeps its caller's own envelope --
+/// the publisher its bus stamped and the person it acts for -- so the owner
+/// admits, shares and authorises it as that caller's, never the passing
+/// member's; and keeps what is left of its caller's wait, so one whose wait
+/// is spent by the time it reaches the owner is dropped there, never run.
+#[tokio::test]
+async fn a_passed_write_keeps_its_callers_identity_and_wait() {
+    let instance = format!("store-{}", mark("keep"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let passed = std::sync::Arc::new(AtomicU64::new(0));
+    let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut members = Vec::new();
+    for group in 0..2u32 {
+        let member = bus(&instance).await;
+        member.hand_writes_on(&internal, group, {
+            let write = write.clone();
+            move |topic| topic == write
+        });
+        let (passed, slow) = (std::sync::Arc::clone(&passed), std::sync::Arc::clone(&slow));
+        member.route_writes_by(move |_, _| {
+            if group == 0 {
+                passed.fetch_add(1, Ordering::SeqCst);
+                // Slow to decide: what is left of the caller's wait is spent.
+                if slow.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+            }
+            Some(1)
+        });
+        let seeing = std::sync::Arc::clone(&seen);
+        member.serve(&write, move |envelope| {
+            let meta = envelope.meta.clone().unwrap_or_default();
+            seeing.lock().unwrap().push((
+                group,
+                meta.publisher_instance_id,
+                meta.acting_for_subject,
+            ));
+            Ok(("meridian.test.Answer".to_string(), Vec::new()))
+        });
+        members.push(member);
+    }
+    settle().await;
+    let asking = bus("asking-plugin-1").await;
+    for n in 0..20u32 {
+        asking
+            .call_for(
+                &write,
+                "meridian.test.Question",
+                n.to_string().into_bytes(),
+                None,
+                None,
+                "https://directory.example.org|8812",
+            )
+            .await
+            .expect("answered");
+    }
+    assert!(
+        passed.load(Ordering::SeqCst) > 0,
+        "some reached group 0 and were passed"
+    );
+    for (group, publisher, person) in seen.lock().unwrap().drain(..) {
+        assert_eq!(group, 1);
+        assert_eq!(publisher, "asking-plugin-1", "the caller's own publisher");
+        assert_eq!(person, "https://directory.example.org|8812", "and person");
+    }
+
+    // A wait spent on the way: dropped at the owner, never run.
+    slow.store(true, Ordering::SeqCst);
+    let before = passed.load(Ordering::SeqCst);
+    let mut timed_out = 0;
+    for n in 0..20u32 {
+        if asking
+            .call(
+                &write,
+                "meridian.test.Question",
+                n.to_string().into_bytes(),
+                None,
+                Some(Duration::from_millis(250)),
+            )
+            .await
+            .is_err()
+        {
+            timed_out += 1;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let reached_group_0 = passed.load(Ordering::SeqCst) - before;
+    let ran = seen.lock().unwrap().len() as u64;
+    assert!(reached_group_0 > 0);
+    assert_eq!(
+        timed_out, reached_group_0,
+        "each one passed late timed out for its caller"
+    );
+    assert_eq!(ran, 20 - reached_group_0, "and was never run at the owner");
+}

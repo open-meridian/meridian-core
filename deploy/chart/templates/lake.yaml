@@ -98,11 +98,15 @@ spec:
             # How many whole answers it builds at once (rulings 957, 958).
             - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
               value: {{ .Values.lake.maxConcurrentAnswers | int | quote }}
+            # A move's hold and its switch's bound (step 3d; section 6.8).
+            {{- include "meridian-runtime.movesEnv" $ | nindent 12 }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.lake.database.key | default .Values.database.key }}
+            {{- /* Its databases past the first (step 3d; section 6.4). */}}
+            {{- with (include "meridian-runtime.databasesEnv" (dict "top" $ "component" "lake" "values" .Values.lake)) }}{{ . | nindent 12 }}{{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
@@ -132,3 +136,6 @@ spec:
        Deployment in a reads-only mode, `lake.readers` of them. */}}
 {{ include "meridian-runtime.readers" (dict "top" $ "component" "lake" "values" .Values.lake "readUrl" "MERIDIAN_LAKE_READ_DATABASE_URL" "rendered" (include "meridian-runtime.lake.deployment" .)) }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "lake" "values" $.Values.lake) }}
+{{- /* Each writer group past the first (step 3d): its own writer
+       Deployment, Lease and standby, `lake.writerGroups` in all. */}}
+{{ include "meridian-runtime.writerGroupDeployments" (dict "top" $ "component" "lake" "values" .Values.lake "rendered" (include "meridian-runtime.lake.deployment" .)) }}

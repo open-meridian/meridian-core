@@ -204,6 +204,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    environment:
+      # The book's partitions, whose head rows it makes (step 3d): 1 unless
+      # a run says more.
+      MERIDIAN_BOR_PARTITIONS: ${MERIDIAN_BOR_PARTITIONS:-1}
     volumes:
       - secrets:/secrets:ro
 
@@ -240,6 +244,8 @@ services:
     depends_on: *serving
     environment:
       MERIDIAN_INSTANCE_ID: bor-1
+      # Where a new account is placed (step 3d), as the migrate step made.
+      MERIDIAN_BOR_PARTITIONS: ${MERIDIAN_BOR_PARTITIONS:-1}
     volumes:
       - secrets:/secrets:ro
 

@@ -6109,6 +6109,16 @@ pub struct ComponentReport {
     pub last_restart_reason: ::prost::alloc::string::String,
     #[prost(int64, tag = "21")]
     pub last_restart_at_ns: i64,
+    /// Step 3d (the resilience spec's sections 6.6 and 12; approved
+    /// 2026-11-14): the highest share of the profile's window, in whole
+    /// percent from 0 to 100, that this member's writer group's commit lane
+    /// was busy committing -- one transaction in flight at once per partition
+    /// (section 6.5) -- so the profile can advise a writer group before the
+    /// group is saturated. 0 for a member that commits nothing (a standby, a
+    /// reader, a component with no writer groups). A share of time, never a
+    /// record.
+    #[prost(uint32, tag = "22")]
+    pub peak_write_busy_percent: u32,
 }
 /// One reason a member refused requests for load, and how many since it
 /// started (W6.40; stage M): the reason a RefusalReason's name.
@@ -24508,6 +24518,15 @@ pub struct ReadResilienceProfileReply {
     /// When the profile was computed.
     #[prost(int64, tag = "6")]
     pub computed_at_ns: i64,
+    /// What the profile advises beyond the levels (step 3d; the resilience
+    /// spec's sections 6.8 and 12; approved 2026-11-14): each a line in a
+    /// failure line's shape, its subject a store's partitions or writer group,
+    /// its reason the measured cause, its changes the chart value to set and
+    /// what it costs. A partition count not above the writer-group count, a
+    /// writer group busy past its bound or refusing work as overloaded. A
+    /// change named, never a change made.
+    #[prost(message, repeated, tag = "7")]
+    pub advice: ::prost::alloc::vec::Vec<ResilienceLine>,
 }
 /// One line of the profile: a failure class or a tier.
 #[derive(Clone, PartialEq, ::prost::Message)]

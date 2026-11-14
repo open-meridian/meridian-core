@@ -2434,10 +2434,12 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     // dataset's gap found from it.
     {
         use meridian_domain::v1::{
-            resilience_history_item::Item, ComponentReport, DatasetGap, IntegrityFinding,
-            ListDatasetGapsReply, ListSourceSwitchesReply, NeverBlindLine, PartitionOwner,
+            resilience_history_item::Item, AccountMoved, ComponentReport, DatasetGap,
+            IntegrityFinding, ListDatasetGapsReply, ListSourceSwitchesReply, MoveAccountReply,
+            MovePartitionReply, NeverBlindLine, PartitionMoved, PartitionOwner, PartitionSplit,
             ReadResilienceProfileReply, ReadResilienceReply, ResilienceChange,
-            ResilienceHistoryItem, ResilienceLine, SourceSwitched, WriterTookOver,
+            ResilienceHistoryItem, ResilienceLine, SourceSwitched, SplitPartitionReply,
+            WriterTookOver,
         };
         let now = meridian_clock::SystemClock.now_ns();
         let line =
@@ -2494,6 +2496,11 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 NeverBlindLine { data_type: "meridian.v1.Bar".into(), second_source: true, standby_pods: false, age_and_source: true },
             ],
             computed_at_ns: now,
+            // Step 3d, stage M: the profile's advice, in its lines' shape.
+            advice: vec![
+                line("the book's partitions", 3, "bor.partitions is 2 and bor.writerGroups 2: a writer group added later would find no partition to take, and raising the count then places new accounts alone", &[("bor.partitions: 4", "none now: new accounts placed over more partitions, each existing account where it is until it is moved")]),
+                line("the lake's writer group 1", 3, "its commit lane was busy 78% of a minute at its busiest in the last 15 minutes, past 70%", &[("lake.writerGroups: 3", "a writer pod and its standby, and the partitions moved to it one at a time")]),
+            ],
         };
         let mut members = Vec::new();
         for (component, n) in [
@@ -2543,21 +2550,26 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             "control",
         ]
         .iter()
-        .map(|partition| PartitionOwner {
+        .enumerate()
+        .map(|(i, partition)| PartitionOwner {
             component: "lake".into(),
             partition: (*partition).into(),
-            writer: "om-meridian-runtime-lake-7d9f0-x2k0q".into(),
+            // Two writer groups (step 3d): control with group 0.
+            group: u32::from(i % 2 == 1 && *partition != "control"),
+            writer: format!(
+                "om-meridian-runtime-lake-7d9f{g}-x2k{g}q",
+                g = u32::from(i % 2 == 1 && *partition != "control")
+            ),
             epoch: 4,
-            ..Default::default()
         })
         .collect();
-        for partition in ["P0", "control"] {
+        for (partition, group) in [("P0", 0), ("P1", 1), ("control", 0)] {
             partitions.push(PartitionOwner {
                 component: "bor".into(),
                 partition: partition.into(),
-                writer: "om-meridian-runtime-bor-7d9f0-x2k0q".into(),
+                group,
+                writer: format!("om-meridian-runtime-bor-7d9f{group}-x2k{group}q"),
                 epoch: 7,
-                ..Default::default()
             });
         }
         let minute = 60_000_000_000;
@@ -2597,7 +2609,110 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             };
             history.push(ResilienceHistoryItem { item: Some(item) });
         }
+        // Step 3d, stage M: a move, a split and an account's move, newest.
+        history.splice(
+            0..0,
+            [
+                Item::AccountMoved(AccountMoved {
+                    account_id: "ACC-7".into(),
+                    from_partition: "P0".into(),
+                    closing_sequence: 81_240,
+                    to_partition: "P1".into(),
+                    opening_sequence: 1,
+                    moved_by: "local|ada".into(),
+                    reason: "P0 holds the firm's busiest accounts".into(),
+                    moved_at_ns: now - minute,
+                }),
+                Item::PartitionMoved(PartitionMoved {
+                    component: "lake".into(),
+                    partition: "coinbase-1:daily".into(),
+                    from_group: 0,
+                    to_group: 1,
+                    epoch: 5,
+                    by_hand: true,
+                    moved_by: "local|ada".into(),
+                    reason: "group 0 was busy".into(),
+                    moved_at_ns: now - 2 * minute,
+                }),
+                Item::PartitionSplit(PartitionSplit {
+                    parent: "kraken-1:daily".into(),
+                    children: vec![
+                        "kraken-1:daily/0000-7fff".into(),
+                        "kraken-1:daily/8000-ffff".into(),
+                    ],
+                    closing_sequence: 40_960,
+                    split_by: "local|ada".into(),
+                    reason: "a busy range".into(),
+                    split_at_ns: now - 3 * minute,
+                }),
+            ]
+            .into_iter()
+            .map(|item| ResilienceHistoryItem { item: Some(item) }),
+        );
         let history = Arc::new(history);
+        // The Partitions tab's three acts, answered as the stores answer
+        // them (step 3d, stage M).
+        bus.serve(crate::mcp::resilience::MOVE_LAKE_PARTITION, move |_| {
+            Ok((
+                "meridian.v1.MovePartitionReply".into(),
+                MovePartitionReply {
+                    from_group: 0,
+                    started_at_ns: now,
+                }
+                .encode_to_vec(),
+            ))
+        });
+        bus.serve(crate::mcp::resilience::MOVE_BOOK_PARTITION, move |_| {
+            Ok((
+                "meridian.v1.MovePartitionReply".into(),
+                MovePartitionReply {
+                    from_group: 0,
+                    started_at_ns: now,
+                }
+                .encode_to_vec(),
+            ))
+        });
+        bus.serve(crate::mcp::resilience::SPLIT_PARTITION, move |envelope| {
+            let asked = meridian_domain::v1::SplitPartitionRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            Ok((
+                "meridian.v1.SplitPartitionReply".into(),
+                SplitPartitionReply {
+                    split: Some(PartitionSplit {
+                        children: vec![
+                            format!("{}/0000-7fff", asked.partition),
+                            format!("{}/8000-ffff", asked.partition),
+                        ],
+                        parent: asked.partition,
+                        closing_sequence: 1,
+                        split_by: "local|ada".into(),
+                        reason: asked.reason,
+                        split_at_ns: now,
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        bus.serve(crate::mcp::resilience::MOVE_ACCOUNT, move |envelope| {
+            let asked = meridian_domain::v1::MoveAccountRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            Ok((
+                "meridian.v1.MoveAccountReply".into(),
+                MoveAccountReply {
+                    moved: Some(AccountMoved {
+                        account_id: asked.account_id,
+                        from_partition: "P0".into(),
+                        closing_sequence: 12,
+                        to_partition: asked.target_partition,
+                        opening_sequence: 1,
+                        moved_by: "local|ada".into(),
+                        reason: asked.reason,
+                        moved_at_ns: now,
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
         bus.serve(
             crate::admin::resilience::READ_RESILIENCE_PROFILE,
             move |_| {

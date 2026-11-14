@@ -22,6 +22,9 @@ use meridian_domain::v1::{
     EntitlementsChangedEvent, InstrumentType, ObservationsWantedEvent, SourcePriority,
 };
 
+mod moves;
+pub use moves::{RangeTip, Switched};
+
 use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;
 use crate::row::{DataType, Observation};
@@ -69,10 +72,12 @@ fn note_snapshot(tx: &mut Transaction<'_>, datasets: &[String]) -> Result<()> {
     if !STAMPING.with(std::cell::Cell::get) {
         return Ok(());
     }
+    // Every range of the datasets (step 3d), each its own head.
+    let partitions = partitions_of(tx, datasets)?;
     let rows = tx
         .query(
             "SELECT dataset, head FROM lake_partition WHERE dataset = ANY($1)",
-            &[&datasets],
+            &[&partitions],
         )
         .map_err(unavailable)?;
     SNAPSHOT_HEADS.with(|heads| {
@@ -100,9 +105,244 @@ pub struct PostgresStore {
     /// Its database's identity as its connections found it (contract v30,
     /// stage C): a new timeline raises the epoch before a batch there.
     watch: std::sync::Arc<meridian_changes::timeline::Watch>,
+    /// Its writer group and the lake's count (step 3d; section 6.1): the
+    /// datasets it may commit to, and those it raises the epoch of.
+    groups: meridian_changes::groups::Groups,
+    /// One adoption at once where it may raise the epoch (several groups).
+    adopting: std::sync::Mutex<()>,
+    /// Whether its writer group leads a database past the first (step 3d;
+    /// section 6.4): it follows that database's timeline, as group 0 does
+    /// database 0's.
+    leads_database: bool,
+    /// Its database's number and the lake's count of databases (step 3d;
+    /// section 6.4): a read here answers the ranges whose group writes this
+    /// database, so a range moved out of it is read where it went.
+    database: u32,
+    databases: u32,
+    /// Every database's store, this one's among them, where the lake has
+    /// several (step 3d; ruled 2026-11-14): where a range's head is.
+    linked: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
+    /// Ranges of a group writing another database found held there at or
+    /// past this one's head: written and read there, never here again.
+    away_settled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Ranges at their group's home here found held no further on in any
+    /// other database: written here, never asked again.
+    home_settled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The range and month tables of `lake_row` this store has seen made
+    /// (step 3d; section 6.2): never looked for again. Let go whenever a
+    /// batch fails, so one a restore took away is made again.
+    made: std::sync::Mutex<std::collections::HashSet<(String, crate::leaves::Month)>>,
+    /// The ranges whose tables this store has seen made, likewise.
+    ranges_made: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The month tables this store's batches first wrote, to be analysed
+    /// once their batch commits (migration 24; step 3d).
+    unanalysed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// The datasets whose open ranges' tables this store has seen made:
+    /// their ranges are not read again before a batch, as a split makes its
+    /// children's tables itself. Let go likewise.
+    datasets_made: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether `lake_latest` holds every row key kept (step 3d): read once
+    /// it does, and held, as it never stops.
+    latest_all: std::sync::atomic::AtomicBool,
+}
+
+/// The dataset locks' space (several writer groups): a dataset's batch
+/// takes its lock, so a takeover ends its own group's deposed writer alone.
+const DATASET_LOCKS: i64 = 0x6c61_6b65_0000_0000_u64 as i64;
+
+/// A 32-bit hash of a dataset's ID, stable across releases (FNV-1a), in
+/// [`DATASET_LOCKS`]' low half.
+fn dataset_lock(dataset: &str) -> i64 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in dataset.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    DATASET_LOCKS | i64::from(hash)
+}
+
+/// A range's table's name in `lake_row` (step 3d; section 6.2).
+pub fn range_table_of(partition: &str) -> String {
+    crate::leaves::range_table(partition)
+}
+
+/// Whether `partition` is a book partition's ID (`P0`, `P1`, ...): never a
+/// lake range.
+fn is_book_partition(partition: &str) -> bool {
+    partition
+        .strip_prefix('P')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Take `dataset`'s lock for the rest of `tx` (step 3d): its batches, its
+/// splits and a takeover's end of a deposed writer all take it, so a split
+/// never runs beside a batch placing rows in its ranges.
+fn lock_dataset(tx: &mut Transaction<'_>, dataset: &str) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&dataset_lock(dataset)],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+/// [`lock_dataset`], for a batch recording the dataset's rows: with sorts
+/// set aside for the rest of `tx`, in the same statement. A subject's last
+/// entry is then found by the one index ordered by it
+/// (`lake_row_subject_sequence`): a month's table has no statistics until it
+/// is first analysed, a minute or so after its first rows, and until then
+/// the planner took any index of the dataset's data type as good as that
+/// one, sorting its every row of the month to find the subject's last, each
+/// batch slower than the last. A statement that can only sort still sorts,
+/// its plan then priced past any other -- so the batch's statements are
+/// never compiled (`jit` off, as the read of a chunk sets it), which took
+/// longer than the batch.
+fn lock_dataset_to_record(tx: &mut Transaction<'_>, dataset: &str) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1), set_config('enable_sort', 'off', true),
+                set_config('jit', 'off', true)",
+        &[&dataset_lock(dataset)],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+/// Every partition of `datasets`, open and closed, with each dataset's own
+/// ID among them: what a read of the datasets names, so it reads each range.
+fn partitions_of(client: &mut impl GenericClient, datasets: &[String]) -> Result<Vec<String>> {
+    let found = client
+        .query(
+            "SELECT p.dataset FROM lake_partition p
+              WHERE p.dataset = ANY($1)
+                 OR EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(id)
+                             WHERE starts_with(p.dataset, d.id || '/'))",
+            &[&datasets],
+        )
+        .map_err(unavailable)?;
+    let mut out: Vec<String> = datasets.to_vec();
+    for row in found {
+        let partition: String = row.get(0);
+        if datasets.iter().any(|d| crate::range::is_of(&partition, d)) {
+            out.push(partition);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// `dataset`'s open ranges, in hash order: none before its first write.
+fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<crate::range::Open>> {
+    let mut open: Vec<crate::range::Open> = client
+        .query(
+            "SELECT dataset, lo, hi FROM lake_partition
+              WHERE (dataset = $1 OR starts_with(dataset, $1 || '/')) AND closed_at IS NULL",
+            &[&dataset],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| crate::range::Open {
+            partition: row.get(0),
+            lo: row.get::<_, i32>(1) as u16,
+            hi: row.get::<_, i32>(2) as u16,
+        })
+        .filter(|range| crate::range::is_of(&range.partition, dataset))
+        .collect();
+    open.sort_by_key(|range| range.lo);
+    Ok(open)
+}
+
+/// [`open_ranges`], each range's row taken for the rest of `tx` where no
+/// move's switch holds it (step 3d; section 6.8), skipped where one does:
+/// with the group each names and whether `tx` holds it. Under the
+/// dataset's lock, so the ranges stand still.
+#[allow(clippy::type_complexity)]
+fn open_ranges_taken(
+    client: &mut impl GenericClient,
+    dataset: &str,
+) -> Result<(
+    Vec<crate::range::Open>,
+    BTreeMap<String, (Option<u32>, bool, u64)>,
+)> {
+    let rows = client
+        .query(
+            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head
+               FROM lake_partition p
+               LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
+                                   WHERE q.dataset = p.dataset
+                                     FOR UPDATE SKIP LOCKED) AS l ON true
+              WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+                AND p.closed_at IS NULL",
+            &[&dataset],
+        )
+        .map_err(unavailable)?;
+    let mut open = Vec::new();
+    let mut states = BTreeMap::new();
+    for row in rows {
+        let partition: String = row.get(0);
+        if !crate::range::is_of(&partition, dataset) {
+            continue;
+        }
+        states.insert(
+            partition.clone(),
+            (
+                row.get::<_, Option<i32>>(3).map(|group| group as u32),
+                row.get::<_, bool>(4),
+                row.get::<_, i64>(5).max(0) as u64,
+            ),
+        );
+        open.push(crate::range::Open {
+            partition,
+            lo: row.get::<_, i32>(1) as u16,
+            hi: row.get::<_, i32>(2) as u16,
+        });
+    }
+    open.sort_by_key(|range| range.lo);
+    Ok((open, states))
+}
+
+/// A range and every range it was split from: where a subject's earlier
+/// rows are, numbered below the range's own.
+fn lineage(client: &mut impl GenericClient, partition: &str) -> Result<Vec<String>> {
+    let mut out = vec![partition.to_string()];
+    // A dataset's full range is never split from another.
+    if crate::range::dataset_of(partition) == partition {
+        return Ok(out);
+    }
+    let mut at = partition.to_string();
+    for _ in 0..32 {
+        let parent: Option<String> = client
+            .query_opt(
+                "SELECT parent FROM lake_partition WHERE dataset = $1",
+                &[&at],
+            )
+            .map_err(unavailable)?
+            .and_then(|row| row.get(0));
+        match parent {
+            Some(parent) => {
+                out.push(parent.clone());
+                at = parent;
+            }
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 impl PostgresStore {
+    /// The same store, writing for writer group `groups` (step 3d; section
+    /// 6.1): it commits only to the datasets its group owns, and its
+    /// takeover raises only theirs.
+    pub fn with_groups(mut self, groups: meridian_changes::groups::Groups) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// Its writer group and the lake's count.
+    pub fn groups(&self) -> meridian_changes::groups::Groups {
+        self.groups
+    }
+
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let mut config = meridian_changes::database_config(url).map_err(unavailable)?;
         // The lake's batches commit locally, never waiting on a synchronous
@@ -136,6 +376,19 @@ impl PostgresStore {
             pool,
             fence: meridian_changes::Fence::new(),
             watch,
+            groups: meridian_changes::groups::Groups::one(),
+            adopting: std::sync::Mutex::new(()),
+            leads_database: false,
+            database: 0,
+            databases: 1,
+            linked: std::sync::OnceLock::new(),
+            away_settled: std::sync::Mutex::default(),
+            home_settled: std::sync::Mutex::default(),
+            made: std::sync::Mutex::new(std::collections::HashSet::new()),
+            ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
+            latest_all: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -245,13 +498,20 @@ impl PostgresStore {
             why: meridian_changes::timeline::DATABASE_TIMELINE.to_string(),
             at_ns: meridian_changes::now_ns(),
         };
+        // A new timeline is the whole database's: group 0's writer, which
+        // holds the control partition, raises every group's epoch, and each
+        // other group's writer, fenced by it, steps down and starts again
+        // (step 3d).
+        if !self.groups.holds_control() && !self.leads_database {
+            return Ok(Timeline::Same);
+        }
         let mut tx = conn.transaction().map_err(unavailable)?;
         let (found, identity) = meridian_changes::timeline::follow(
             &mut tx,
             "lake_change_head",
             meridian_changes::CONTROL,
             mine,
-            |tx| raise(tx, &by),
+            |tx| raise(tx, &by, None),
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
@@ -276,6 +536,24 @@ impl PostgresStore {
         }
     }
 
+    /// Refused where another writer group owns `dataset` (step 3d): its
+    /// writes are handed to that group's writer, never committed here.
+    fn owned(&self, partition: &str) -> Result<()> {
+        // A range is the group its `writer_group` names, as last read, else
+        // its dataset's: a split's children stay with their parent's
+        // (section 6.1) until a move moves one (ruled 2026-11-14).
+        let dataset = crate::range::dataset_of(partition);
+        let group = self.groups.owner_by(partition, dataset);
+        if group == self.groups.mine() {
+            return Ok(());
+        }
+        meridian_bus::owners::hand_to(group);
+        Err(StoreError::NotOwned {
+            partition: partition.to_string(),
+            group,
+        })
+    }
+
     /// Log what is not a dataset's row in the `control` partition, in this
     /// transaction (step 3b): its head taken under its lock, the writer's
     /// epoch checked against it as a batch's is, one change each.
@@ -294,7 +572,23 @@ impl PostgresStore {
             )
             .map_err(unavailable)?;
         let epoch: i64 = row.get(1);
-        self.fence.admits(epoch as u64)?;
+        // The writer's own epoch checked: the control partition's for the
+        // group that writes it, else its writer group's own (step 3d; a
+        // range split by a group past the first, CI 43615034712), so a
+        // group that does not write `control` is fenced by its own epoch,
+        // never by another group's.
+        if self.groups.mine() == 0 || self.leads_database {
+            self.fence.admits(epoch as u64)?;
+        } else {
+            let own: i64 = tx
+                .query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
+                    &[&(self.groups.mine() as i32)],
+                )
+                .map_err(unavailable)?
+                .map_or(0, |row| row.get(0));
+            self.fence.admits(own as u64)?;
+        }
         let mut sequence: i64 = row.get(0);
         for (kind, body, at_ns) in entries {
             sequence += 1;
@@ -317,8 +611,12 @@ impl PostgresStore {
     /// the writer's (step 3a): a batch commits only while the head row's
     /// epoch is its own. A dataset begun here takes the writer's epoch, the
     /// `control` partition's checked first, so a takeover that raised it is
-    /// never undone by a dataset its deposed writer begins.
+    /// never undone by a dataset its deposed writer begins. Its caller
+    /// holds the dataset's lock ([`lock_dataset`]), which its writes and its
+    /// splits take, so its ranges stand still while a batch places its rows
+    /// (step 3d).
     fn head(&self, tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
+        self.owned(dataset)?;
         let epoch = self.epoch_now()?;
         let begun = tx
             .execute(
@@ -328,22 +626,37 @@ impl PostgresStore {
             )
             .map_err(unavailable)?;
         if begun == 1 {
-            let control: i64 = tx
-                .query_one(
+            // The group's own epoch: the control partition's for group 0,
+            // its own row past it (step 3d).
+            let anchor: Option<i64> = if self.groups.holds_control() {
+                tx.query_opt(
                     "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
                     &[],
                 )
-                .map_err(unavailable)?
-                .get(0);
-            self.fence.admits(control as u64)?;
+            } else {
+                tx.query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
+                    &[&(self.groups.mine() as i32)],
+                )
+            }
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+            self.fence.admits(anchor.unwrap_or(0) as u64)?;
         }
         let row = tx
             .query_one(
-                "SELECT head, epoch FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                "SELECT head, epoch, closed_at FROM lake_partition WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
             .map_err(unavailable)?;
         self.fence.admits(row.get::<_, i64>(1) as u64)?;
+        if row.get::<_, Option<i64>>(2).is_some() {
+            // Never reached while the dataset's lock is held: its rows are
+            // placed in its open ranges alone.
+            return Err(StoreError::Unavailable(format!(
+                "range {dataset} was split; its rows go to its children: ask again"
+            )));
+        }
         Ok(row.get::<_, i64>(0) as u64)
     }
 
@@ -383,11 +696,18 @@ impl PostgresStore {
 /// Each row key's latest version held, for a whole batch in one look
 /// (ruled 2026-11-10): one probe of `lake_row_version` a key, inside one
 /// statement, rather than one round trip a key.
-fn latest_of_each(
+/// A row key's latest version held, the range it is in and its anchor.
+struct Held {
+    row: Observation,
+    anchor: u16,
+}
+
+fn latest_of_each<'a>(
     client: &mut impl GenericClient,
     dataset: &str,
-    rows: &[Observation],
-) -> Result<BTreeMap<(i16, String), Observation>> {
+    rows: impl IntoIterator<Item = &'a Observation>,
+    from_latest: bool,
+) -> Result<BTreeMap<(i16, String), Held>> {
     let mut asked: BTreeMap<(i16, String), DataType> = BTreeMap::new();
     for row in rows {
         asked.insert(
@@ -396,17 +716,51 @@ fn latest_of_each(
         );
     }
     let (types, keys): (Vec<i16>, Vec<String>) = asked.keys().cloned().unzip();
-    let found = client
-        .query(
-            "SELECT k.data_type, k.row_key, r.body
+    // Every range of the dataset, open and closed: a key's versions follow
+    // its anchor down the ranges split from where it began. Found by
+    // `lake_latest` where it holds every key -- one probe a key, then its
+    // row in its own range's month -- else by each key's versions. Each
+    // probe is a lateral one, led by the key, which only
+    // `lake_latest_by_key` answers (its dataset named as no index takes
+    // it): where the statistics do not know a dataset yet -- a new one, or
+    // a lake's first minutes -- every index the dataset leads looks as good
+    // as another to the planner, which took one reading the dataset's every
+    // key to find each, or read them all to join them, each batch slower
+    // than the last.
+    let partitions = if from_latest {
+        Vec::new()
+    } else {
+        partitions_of(client, &[dataset.to_string()])?
+    };
+    let found = if from_latest {
+        client.query(
+            "SELECT k.data_type, k.row_key, r.body, l.anchor
                FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
               CROSS JOIN LATERAL (
+                    SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
+                     WHERE row_key = k.row_key AND (dataset || '') = $1
+                       AND data_type = k.data_type
+                     LIMIT 1) AS l
+              CROSS JOIN LATERAL (
                     SELECT body FROM lake_row
-                     WHERE dataset = $1 AND data_type = k.data_type AND row_key = k.row_key
-                     ORDER BY version DESC LIMIT 1) AS r",
+                     WHERE partition = l.partition AND valid_from_ns = l.valid_from_ns
+                       AND dataset = $1 AND sequence = l.sequence AND row_key = k.row_key
+                     LIMIT 1) AS r",
             &[&dataset, &types, &keys],
         )
-        .map_err(unavailable)?;
+    } else {
+        client.query(
+            "SELECT k.data_type, k.row_key, r.body, r.anchor
+               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+              CROSS JOIN LATERAL (
+                    SELECT body, anchor FROM lake_row
+                     WHERE dataset = $1 AND data_type = k.data_type AND row_key = k.row_key
+                       AND (partition = ANY($4) OR partition IS NULL)
+                     ORDER BY version DESC LIMIT 1) AS r",
+            &[&dataset, &types, &keys, &partitions],
+        )
+    }
+    .map_err(unavailable)?;
     let mut latest = BTreeMap::new();
     for row in found {
         let key = (row.get::<_, i16>(0), row.get::<_, String>(1));
@@ -414,10 +768,12 @@ fn latest_of_each(
             continue;
         };
         let body: &[u8] = row.get(2);
-        latest.insert(
-            key,
-            Observation::decode(data_type, body).map_err(unreadable)?,
-        );
+        let held = Observation::decode(data_type, body).map_err(unreadable)?;
+        // A row kept before 3d: its own first subject's hash.
+        let anchor = row
+            .get::<_, Option<i32>>(3)
+            .map_or_else(|| crate::range::hash(held.subject()), |a| a as u16);
+        latest.insert(key, Held { row: held, anchor });
     }
     Ok(latest)
 }
@@ -433,7 +789,8 @@ fn amendments_at(
     }
     let rows = client
         .query(
-            "SELECT dataset, sequence, closed_day, why, at_ns FROM lake_closed_day
+            "SELECT dataset, sequence, closed_day, why, at_ns, coalesce(row_key, '')
+               FROM lake_closed_day
               WHERE dataset = $1 AND sequence = ANY($2) ORDER BY amendment_id",
             &[&dataset, &sequences],
         )
@@ -457,7 +814,7 @@ fn amendments_for(
         .unzip();
     let found = client
         .query(
-            "SELECT c.dataset, c.sequence, c.closed_day, c.why, c.at_ns
+            "SELECT c.dataset, c.sequence, c.closed_day, c.why, c.at_ns, coalesce(c.row_key, '')
                FROM lake_closed_day c
                JOIN (SELECT DISTINCT * FROM unnest($1::text[], $2::bigint[])) AS asked(dataset, sequence)
                  ON c.dataset = asked.dataset AND c.sequence = asked.sequence
@@ -517,6 +874,7 @@ fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
     Ok(ClosedDayAmendment {
         dataset: row.get(0),
         sequence: row.get::<_, i64>(1) as u64,
+        row_key: row.get(5),
         closed_day: body
             .map(|body| meridian_domain::v1::DateCheck::decode(&body[..]).map_err(unreadable))
             .transpose()?,
@@ -530,32 +888,33 @@ fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
 /// the top of each subject's own entries, one probe a subject. The subject
 /// is named as that index keys it, `subject || ''`, which no other read
 /// names, so a read of the latest is never planned on it.
-fn previous_of_each(
+fn previous_of_each<'a>(
     client: &mut impl GenericClient,
     dataset: &str,
-    rows: &[Observation],
+    lineage: &[String],
+    rows: impl IntoIterator<Item = &'a Observation>,
 ) -> Result<BTreeMap<(i16, String), u64>> {
     let asked: std::collections::BTreeSet<(i16, String)> = rows
-        .iter()
+        .into_iter()
         .map(|row| (row.data_type().code(), row.subject().to_string()))
         .collect();
     let (types, subjects): (Vec<i16>, Vec<String>) = asked.into_iter().unzip();
     let found = client
         .query(
-            "SELECT k.data_type, k.subject,
-                    (SELECT max(sequence) FROM lake_row
-                      WHERE dataset = $1 AND data_type = k.data_type
-                        AND (subject || '') = k.subject)
-               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, subject)",
-            &[&dataset, &types, &subjects],
+            "SELECT k.data_type, k.subject, r.sequence
+               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, subject)
+              CROSS JOIN LATERAL (
+                    SELECT sequence FROM lake_row
+                     WHERE dataset = $1 AND data_type = k.data_type
+                       AND (subject || '') = k.subject
+                       AND (partition = ANY($4) OR partition IS NULL)
+                     ORDER BY sequence DESC LIMIT 1) AS r",
+            &[&dataset, &types, &subjects, &lineage],
         )
         .map_err(unavailable)?;
     Ok(found
         .iter()
-        .filter_map(|row| {
-            let last: Option<i64> = row.get(2);
-            last.map(|last| ((row.get(0), row.get(1)), last as u64))
-        })
+        .map(|row| ((row.get(0), row.get(1)), row.get::<_, i64>(2) as u64))
         .collect())
 }
 
@@ -566,6 +925,8 @@ fn previous_of_each(
 fn insert_all(
     tx: &mut Transaction<'_>,
     dataset: &str,
+    partition: &str,
+    anchors: &std::collections::HashMap<(i16, String), u16>,
     rows: &[Observation],
     epoch: u64,
 ) -> Result<()> {
@@ -581,7 +942,8 @@ fn insert_all(
                   (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                    interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
                    recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                   latest_key, quality, expires, listed_type, published_at_ns, epoch, digest)
+                   latest_key, quality, expires, listed_type, published_at_ns, epoch, digest,
+                   partition, anchor)
              FROM STDIN (FORMAT binary)",
         )
         .map_err(unavailable)?;
@@ -611,6 +973,8 @@ fn insert_all(
         Type::INT8,
         Type::INT8,
         Type::BYTEA,
+        Type::TEXT,
+        Type::INT4,
     ];
     let mut writer = BinaryCopyInWriter::new(sink, &types);
     let epoch = epoch as i64;
@@ -628,6 +992,12 @@ fn insert_all(
         // Its digest, kept beside it (step 3b, integrity at rest).
         let body = row.encode();
         let digest = meridian_changes::integrity::digest(&body);
+        let anchor = i32::from(
+            anchors
+                .get(&(row.data_type().code(), meta.row_key.clone()))
+                .copied()
+                .unwrap_or_else(|| crate::range::hash(row.subject())),
+        );
         writer
             .write(&[
                 &dataset,
@@ -657,6 +1027,8 @@ fn insert_all(
                 &crate::store::published_order(row),
                 &epoch,
                 &digest,
+                &partition,
+                &anchor,
             ])
             .map_err(unavailable)?;
     }
@@ -719,22 +1091,35 @@ impl postgres::types::ToSql for PgDate {
 /// rate's by published time ([`LATEST_BY_PUBLISHED`]). Each part is written
 /// so a table without statistics yet (a fresh deployment, the gate's) is
 /// read by the same indexes.
-static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(false));
+static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(false, false));
 
 /// [`LATEST`] for rates (ruling 1006 (b)): a row key's version in force is
 /// its latest by published time, then by version
 /// ([`crate::store::force_order`]), read from `lake_row.published_at_ns`
 /// (migration 8), so a late-arriving older publication never takes force.
 /// A rate row not yet given its published time orders first.
-static LATEST_BY_PUBLISHED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(true));
+static LATEST_BY_PUBLISHED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| latest(true, false));
 
-fn latest(by_published: bool) -> String {
+/// [`LATEST`] now, unwindowed, from `lake_latest` once it holds every row
+/// key (step 3d; section 6.2): each key's version in force is its row
+/// there, a rate's by published time too, so no key's versions are read to
+/// choose it, and the months of a long history are not walked.
+static LATEST_NOW: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(false, true));
+
+/// `$11`: the partitions of the read's datasets, every range of each
+/// ([`partitions_of`]), so each read reads only its datasets' tables; a row
+/// kept before 3d names none.
+const PRUNED_R: &str = "(r.partition = ANY($11) OR r.partition IS NULL)";
+
+fn latest(by_published: bool, from_latest: bool) -> String {
     // The read's own conditions on a row, as the whole read applies them.
     let window = |a: &str| {
         format!(
             "{a}.recorded_at_ns <= $6
              AND ($7::text IS NULL OR {a}.business_date = $7::text::date)
-             AND {a}.valid_from_ns >= $8 AND {a}.valid_from_ns < $9 AND {a}.valid_from_ns <= $10"
+             AND {a}.valid_from_ns >= $8 AND {a}.valid_from_ns < $9 AND {a}.valid_from_ns <= $10
+             AND ({a}.partition = ANY($11) OR {a}.partition IS NULL)"
         )
     };
     let narrowed = |a: &str| {
@@ -771,30 +1156,75 @@ fn latest(by_published: bool) -> String {
     let invalid = "(COALESCE(r.quality, 0) = 3
           OR EXISTS (SELECT 1 FROM lake_quality_assessment a
                       WHERE a.dataset = r.dataset AND a.sequence = r.sequence
-                        AND a.state = 3 AND a.at_ns <= $6))";
-    let down_the_key = |also: &str| {
+                        AND a.row_key = r.row_key AND a.state = 3 AND a.at_ns <= $6))";
+    // A row's place: its range (one kept before 3d its dataset's), its
+    // sequence, its key and its valid time, which finds its month.
+    let place = |a: &str| {
         format!(
-            "(SELECT r.dataset, r.sequence FROM lake_row r
-               WHERE r.dataset = k.dataset AND r.data_type = $3 AND r.subject = k.subject
-                 AND r.kind = k.kind AND r.venue_id = k.venue_id
-                 AND r.interval_ns = k.interval_ns AND r.latest_key = k.latest_key
-                 AND {} AND {in_force} {also}
-               ORDER BY r.valid_from_ns DESC, r.sequence DESC
-               LIMIT 1)",
-            window("r")
+            "coalesce({a}.partition, {a}.dataset) AS partition, {a}.sequence, {a}.row_key, \
+             {a}.valid_from_ns"
         )
+    };
+    let down_the_key = |also: &str| {
+        if from_latest {
+            // `lake_latest`: one row a key, its version in force.
+            let invalid = "(COALESCE(l.quality, 0) = 3
+                  OR EXISTS (SELECT 1 FROM lake_quality_assessment a
+                              WHERE a.dataset = l.dataset AND a.sequence = l.force_sequence
+                                AND a.row_key = l.row_key AND a.state = 3))";
+            let also = if also.is_empty() {
+                String::new()
+            } else {
+                format!("AND NOT {invalid}")
+            };
+            format!(
+                "(SELECT l.force_partition AS partition, l.force_sequence AS sequence,
+                         l.row_key, l.force_valid_from AS valid_from_ns
+                    FROM lake_latest l
+                   WHERE l.dataset = k.dataset AND l.data_type = $3 AND l.subject = k.subject
+                     AND l.kind = k.kind AND l.venue_id = k.venue_id
+                     AND l.interval_ns = k.interval_ns AND l.latest_key = k.latest_key {also}
+                   ORDER BY l.force_valid_from DESC, l.force_sequence DESC
+                   LIMIT 1)"
+            )
+        } else {
+            format!(
+                "(SELECT {} FROM lake_row r
+                   WHERE r.dataset = k.dataset AND r.data_type = $3 AND r.subject = k.subject
+                     AND r.kind = k.kind AND r.venue_id = k.venue_id
+                     AND r.interval_ns = k.interval_ns AND r.latest_key = k.latest_key
+                     AND {} AND {in_force} {also}
+                   ORDER BY r.valid_from_ns DESC, r.sequence DESC
+                   LIMIT 1)",
+                place("r"),
+                window("r")
+            )
+        }
     };
     // The next key of a dataset's subject past `after`, by the index's order.
     let next_key = |dataset: &str, subject: &str, after: &str| {
-        format!(
-            "SELECT r.dataset, r.subject, r.kind, r.venue_id, r.interval_ns, r.latest_key
-               FROM lake_row r
-              WHERE r.dataset = {dataset} AND r.data_type = $3 AND r.subject = {subject}
-                AND {after}
-              ORDER BY r.kind, r.venue_id, r.interval_ns, r.latest_key
-              LIMIT 1"
-        )
+        if from_latest {
+            format!(
+                "SELECT l.dataset, l.subject, l.kind, l.venue_id, l.interval_ns, l.latest_key
+                   FROM lake_latest l
+                  WHERE l.dataset = {dataset} AND l.data_type = $3 AND l.subject = {subject}
+                    AND {}
+                  ORDER BY l.kind, l.venue_id, l.interval_ns, l.latest_key
+                  LIMIT 1",
+                after.replace("r.", "l.")
+            )
+        } else {
+            format!(
+                "SELECT r.dataset, r.subject, r.kind, r.venue_id, r.interval_ns, r.latest_key
+                   FROM lake_row r
+                  WHERE r.dataset = {dataset} AND r.data_type = $3 AND r.subject = {subject}
+                    AND {after} AND {PRUNED_R}
+                  ORDER BY r.kind, r.venue_id, r.interval_ns, r.latest_key
+                  LIMIT 1"
+            )
+        }
     };
+    let invalid_valid = format!("AND NOT {invalid}");
     format!(
         "
 WITH RECURSIVE keys (dataset, subject, kind, venue_id, interval_ns, latest_key) AS (
@@ -810,8 +1240,8 @@ WITH RECURSIVE keys (dataset, subject, kind, venue_id, interval_ns, latest_key) 
 -- Found by the later subjects' index alone: the datasets and the data type
 -- asked are kept apart, so no index they lead is scanned beside it.
 named_later AS MATERIALIZED (
-    SELECT r.dataset, r.data_type, r.sequence, r.subject, r.kind, r.venue_id,
-           r.interval_ns, r.latest_key, r.valid_from_ns, {invalid} AS invalid
+    SELECT r.dataset, r.data_type, {place_r}, r.subject, r.kind, r.venue_id,
+           r.interval_ns, r.latest_key, {invalid} AS invalid
       FROM lake_row r
      WHERE (r.subjects[2:]) && $2::text[]
        AND NOT (r.subject = ANY($2)) AND r.latest_key IS NOT NULL
@@ -823,33 +1253,43 @@ later AS (
     SELECT * FROM named_later WHERE dataset = ANY($1) AND data_type = $3
 ),
 chosen AS (
-    SELECT c.dataset, c.sequence
+    SELECT k.dataset, c.partition, c.sequence, c.row_key, c.valid_from_ns
       FROM keys k
      CROSS JOIN LATERAL ({latest} UNION ALL {latest_valid}) AS c
      WHERE (cardinality($4::smallint[]) = 0 OR k.kind = ANY($4))
        AND ($5::bigint = 0 OR k.interval_ns = $5)
   UNION ALL
-    SELECT r.dataset, r.sequence
+    SELECT r.dataset, {place_r}
       FROM lake_row r
      WHERE r.dataset = ANY($1) AND r.latest_key IS NULL AND r.subjects && $2::text[]
        AND {narrowed_r} AND {in_force}
   UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
-            dataset, sequence
+            dataset, partition, sequence, row_key, valid_from_ns
        FROM later
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
   UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
-            dataset, sequence
+            dataset, partition, sequence, row_key, valid_from_ns
        FROM later
       WHERE NOT invalid
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
 )
-SELECT r.body FROM lake_row r
-  JOIN (SELECT DISTINCT dataset, sequence FROM chosen) c
-    ON r.dataset = c.dataset AND r.sequence = c.sequence
+-- Each chosen row fetched by its own index probe, its dataset and sequence,
+-- in its own month: driven by the few rows chosen, never by the range's
+-- every row (step 3d: a new month's table has no statistics yet, and a
+-- join the planner chose by them read the range whole, a row at a time,
+-- against every row chosen).
+SELECT r.body FROM (SELECT DISTINCT dataset, partition, sequence, row_key, valid_from_ns
+                      FROM chosen) c
+ CROSS JOIN LATERAL (
+    SELECT f.dataset, f.sequence, f.body FROM lake_row f
+     WHERE f.dataset = c.dataset AND f.sequence = c.sequence
+       AND f.row_key = c.row_key AND f.valid_from_ns = c.valid_from_ns
+       AND coalesce(f.partition, f.dataset) = c.partition
+       AND (f.partition = ANY($11) OR f.partition IS NULL)) r
  ORDER BY r.dataset, r.sequence",
         first = next_key("d.dataset", "s.subject", "r.latest_key IS NOT NULL"),
         next = next_key(
@@ -859,9 +1299,10 @@ SELECT r.body FROM lake_row r
                  > (k.kind, k.venue_id, k.interval_ns, k.latest_key)"
         ),
         latest = down_the_key(""),
-        latest_valid = down_the_key(&format!("AND NOT {invalid}")),
+        latest_valid = down_the_key(&invalid_valid),
         narrowed_r = narrowed("r"),
         window_r = window("r"),
+        place_r = place("r"),
     )
 }
 
@@ -877,6 +1318,13 @@ const SUPERSEDED: &str = "EXISTS (
      WHERE n.dataset = r.dataset AND n.data_type = r.data_type AND n.row_key = r.row_key
        AND (COALESCE(n.published_at_ns, 0), n.version)
            > (COALESCE(r.published_at_ns, 0), r.version))";
+
+/// [`SUPERSEDED`] now, from `lake_latest` once it holds every key (step 3d):
+/// one probe of the key's own row, never its versions in every month.
+const SUPERSEDED_NOW: &str = "NOT EXISTS (
+    SELECT 1 FROM lake_latest l
+     WHERE l.dataset = r.dataset AND l.data_type = r.data_type AND l.row_key = r.row_key
+       AND l.force_version = r.version)";
 
 /// How many rows a backfill of `latest_key` and `quality` reads at a time.
 const BACKFILL_BATCH: i64 = 2000;
@@ -1074,20 +1522,23 @@ const LISTING: &str = "
 SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
        CASE WHEN r.listed_type IS NULL OR r.latest_key IS NULL
             THEN (SELECT b.body FROM lake_row b
-                   WHERE b.dataset = r.dataset AND b.sequence = r.sequence) END
+                   WHERE b.dataset = r.dataset AND b.sequence = r.sequence
+                     AND b.row_key = r.row_key
+                     AND (b.partition = ANY($4) OR b.partition IS NULL)) END
   FROM (SELECT DISTINCT unnest($2::text[])) AS s (subject)
  CROSS JOIN (SELECT DISTINCT unnest($1::text[])) AS d (dataset)
  CROSS JOIN LATERAL (
     SELECT DISTINCT ON (l.row_key)
-           l.dataset, l.sequence, l.latest_key, l.expires, l.listed_type, l.quality
+           l.dataset, l.sequence, l.row_key, l.latest_key, l.expires, l.listed_type, l.quality
       FROM lake_row l
      WHERE l.data_type = 9 AND l.subject = s.subject AND l.dataset = d.dataset
+       AND (l.partition = ANY($4) OR l.partition IS NULL)
        AND l.recorded_at_ns <= $3
      ORDER BY l.row_key, l.version DESC) AS r
  WHERE COALESCE(r.quality, 0) <> 3
    AND NOT EXISTS (SELECT 1 FROM lake_quality_assessment a
                     WHERE a.dataset = r.dataset AND a.sequence = r.sequence
-                      AND a.state = 3 AND a.at_ns <= $3)";
+                      AND a.row_key = r.row_key AND a.state = 3 AND a.at_ns <= $3)";
 
 /// How many rows a read takes from the database at once, decoded and
 /// handed on before the next ([`crate::store::READ_CHUNK`]).
@@ -1097,7 +1548,8 @@ const READ_CHUNK: i32 = crate::store::READ_CHUNK as i32;
 /// recorded: where every version is answered (`every_version`).
 const EVERY_VERSION: &str = "
 SELECT body FROM lake_row
- WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+ WHERE dataset = ANY($1) AND (partition = ANY($11) OR partition IS NULL)
+   AND subjects && $2 AND data_type = $3
    AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
    AND ($5::bigint = 0 OR interval_ns = $5)
    AND recorded_at_ns <= $6
@@ -1115,16 +1567,19 @@ SELECT body FROM lake_row
 /// choose them, a page at a time, took the lake past its 1 GiB twice).
 const IN_FORCE: &str = "
 SELECT r.body FROM lake_row r
-  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence
+  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence, row_key, valid_from_ns
           FROM lake_row
-         WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+         WHERE dataset = ANY($1) AND (partition = ANY($11) OR partition IS NULL)
+           AND subjects && $2 AND data_type = $3
            AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
            AND ($5::bigint = 0 OR interval_ns = $5)
            AND recorded_at_ns <= $6
            AND ($7::text IS NULL OR business_date = $7::text::date)
            AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
          ORDER BY dataset, row_key, COALESCE(published_at_ns, 0) DESC, version DESC) AS f
-    ON r.dataset = f.dataset AND r.sequence = f.sequence
+    ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
+   AND r.valid_from_ns = f.valid_from_ns
+ WHERE (r.partition = ANY($11) OR r.partition IS NULL)
  ORDER BY r.dataset, r.sequence";
 
 /// [`IN_FORCE`] as published by a time (contract v27, W10.6): a rate's row
@@ -1138,17 +1593,20 @@ SELECT r.body FROM lake_row r
 /// subject).
 const IN_FORCE_PUBLISHED: &str = "
 SELECT r.body FROM lake_row r
-  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence
+  JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence, row_key, valid_from_ns
           FROM lake_row
-         WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+         WHERE dataset = ANY($1) AND (partition = ANY($11) OR partition IS NULL)
+           AND subjects && $2 AND data_type = $3
            AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
            AND ($5::bigint = 0 OR interval_ns = $5)
            AND recorded_at_ns <= $6
            AND ($7::text IS NULL OR business_date = $7::text::date)
            AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
-           AND published_at_ns <= $11
+           AND published_at_ns <= $12
          ORDER BY dataset, row_key, published_at_ns DESC, version DESC) AS f
-    ON r.dataset = f.dataset AND r.sequence = f.sequence
+    ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
+   AND r.valid_from_ns = f.valid_from_ns
+ WHERE (r.partition = ANY($11) OR r.partition IS NULL)
  ORDER BY r.dataset, r.sequence";
 
 /// [`EVERY_VERSION`] a row key at a time, each key's versions together:
@@ -1157,7 +1615,8 @@ SELECT r.body FROM lake_row r
 /// one row a key as it reads ([`crate::read::ByPublished`]).
 const EVERY_VERSION_BY_KEY: &str = "
 SELECT body FROM lake_row
- WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+ WHERE dataset = ANY($1) AND (partition = ANY($11) OR partition IS NULL)
+   AND subjects && $2 AND data_type = $3
    AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
    AND ($5::bigint = 0 OR interval_ns = $5)
    AND recorded_at_ns <= $6
@@ -1165,63 +1624,791 @@ SELECT body FROM lake_row
    AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
  ORDER BY dataset, row_key, version";
 
-impl Store for PostgresStore {
-    fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+/// The same refusal again, for each part of a batch.
+fn again(failed: &StoreError) -> StoreError {
+    match failed {
+        StoreError::Fenced(fenced) => StoreError::Fenced(*fenced),
+        StoreError::PositionMoved(words) => StoreError::PositionMoved(words.clone()),
+        StoreError::SchemaAhead(words) => StoreError::SchemaAhead(words.clone()),
+        StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
+        StoreError::NotOwned { partition, group } => StoreError::NotOwned {
+            partition: partition.clone(),
+            group: *group,
+        },
+        StoreError::Held(words) => StoreError::Held(words.clone()),
+        StoreError::KeyFixed {
+            data_type,
+            row_key,
+            field,
+            words,
+        } => StoreError::KeyFixed {
+            data_type: *data_type,
+            row_key: row_key.clone(),
+            field,
+            words: words.clone(),
+        },
+        StoreError::Invalid { field, words } => StoreError::Invalid {
+            field,
+            words: words.clone(),
+        },
+    }
+}
+
+/// A row's data type and row key: what its versions are kept by.
+fn key_of(row: &Observation) -> (i16, String) {
+    (row.data_type().code(), row.meta().row_key.clone())
+}
+
+/// Every alias the lake keeps, replaced to the record that stays.
+fn aliases_in(client: &mut impl GenericClient) -> Result<BTreeMap<String, String>> {
+    Ok(client
+        .query("SELECT replaced, stays FROM lake_alias", &[])
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+impl PostgresStore {
+    /// Batches of one dataset recorded in one transaction (step 3d, group
+    /// commit; section 6.5), numbered in turn as one, each answered with what
+    /// it did: the epoch checked once, every row's latest version and every
+    /// subject's last sequence read in one look each, and the rows written
+    /// in one INSERT (ruled 2026-11-10).
+    fn record_together(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         // Adopted before a connection is taken: one store never waits on
         // itself for a second (step 3a).
         self.epoch_now()?;
         let mut conn = self.conn()?;
+        self.prepare(&mut conn, &[dataset])?;
+        // How long the dataset's lane was busy (step 3d; the profile's
+        // advice on writer groups, approved 2026-11-14).
+        let began = std::time::Instant::now();
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let mut head = self.head(&mut tx, dataset)?;
-        let epoch = self.fence.epoch();
-        // Read what each row is decided against first, then number: the
-        // closures cannot borrow the transaction the inserts need. Each in
-        // one look for the whole batch -- every key's latest version, every
-        // subject's last sequence -- and the batch written in one INSERT
-        // (ruled 2026-11-10): before, two round trips a row.
-        let latest = latest_of_each(&mut tx, dataset, &rows)?;
-        let previous = previous_of_each(&mut tx, dataset, &rows)?;
-        let done = number(
-            rows,
-            &mut head,
-            now_ns,
-            |row| {
-                latest
-                    .get(&(row.data_type().code(), row.meta().row_key.clone()))
-                    .cloned()
-            },
-            |row| {
-                previous
-                    .get(&(row.data_type().code(), row.subject().to_string()))
-                    .copied()
-                    .unwrap_or(0)
-            },
-        );
-        insert_all(&mut tx, dataset, &done.rows, epoch)?;
-        // Each row numbered version 1 is a key the partition held no
-        // version of; every other replaces its key's last.
-        Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;
-        tx.commit().map_err(unavailable)?;
-        Ok(done)
+        let done = self
+            .record_dataset(&mut tx, dataset, parts, now_ns)
+            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
+        if done.is_err() {
+            self.forget_made();
+        } else {
+            self.analyse_months(&mut *conn);
+        }
+        done
     }
 
-    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+    /// One dataset's parts recorded in `tx` (step 3d; sections 6.1 and 6.5):
+    /// each part that keeps the lake's rule 5 placed row by row in the open
+    /// range holding its key's anchor, and each range's rows numbered from
+    /// its own head under its own lock; a part that breaks the rule refused
+    /// alone. Every row key's latest version is read across the dataset's
+    /// ranges in one look, and each subject's last sequence across its
+    /// range's lineage.
+    fn record_dataset(
+        &self,
+        tx: &mut Transaction<'_>,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
+        lock_dataset_to_record(tx, dataset)?;
+        // With several groups, each open range's row taken for the batch
+        // where no move's switch holds it, with the group it names (step
+        // 3d; section 6.8): a range held, or another group's, refuses only
+        // the parts with rows in it.
+        let (ranges, states) = if self.groups.several() {
+            open_ranges_taken(tx, dataset)?
+        } else {
+            (open_ranges(tx, dataset)?, BTreeMap::new())
+        };
+        let from_latest = self.latest_all(tx)?;
+        let latest = latest_of_each(tx, dataset, parts.iter().flatten(), from_latest)?;
+        // The aliases, read only where a key held names another subject.
+        let differs = parts.iter().flatten().any(|row| {
+            !latest.is_empty()
+                && latest
+                    .get(&key_of(row))
+                    .is_some_and(|held| held.row.subject() != row.subject())
+        });
+        let aliases = if differs {
+            aliases_in(tx)?
+        } else {
+            BTreeMap::new()
+        };
+        let refused = crate::memory::rule_five(
+            &parts,
+            |row| latest.get(&key_of(row)).map(|held| held.row.clone()),
+            |was, is| crate::memory::same_record(&aliases, was, is),
+        );
+        // Each row's range: its key's anchor's, the first version's
+        // subject's hash, held across every later version. A subject's hash
+        // taken once a batch.
+        let mut anchors: std::collections::HashMap<(i16, String), u16> =
+            std::collections::HashMap::new();
+        let mut hashed: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        let mut by_range: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
+        let mut answered: Vec<Result<Recorded>> = Vec::with_capacity(parts.len());
+        for (at, (rows, refused)) in parts.into_iter().zip(refused).enumerate() {
+            if let Some(refused) = refused {
+                answered.push(Err(refused));
+                continue;
+            }
+            answered.push(Ok(Recorded::default()));
+            for row in rows {
+                let key = key_of(&row);
+                let anchor = *anchors.entry(key.clone()).or_insert_with(|| {
+                    latest.get(&key).map_or_else(
+                        || match hashed.get(row.subject()) {
+                            Some(hash) => *hash,
+                            None => {
+                                let hash = crate::range::hash(row.subject());
+                                hashed.insert(row.subject().to_string(), hash);
+                                hash
+                            }
+                        },
+                        |held| held.anchor,
+                    )
+                });
+                let partition = crate::range::placed(dataset, &ranges, anchor).into_owned();
+                let placed = by_range.entry(partition).or_default();
+                match placed.last_mut() {
+                    Some((last, rows)) if *last == at => rows.push(row),
+                    _ => placed.push((at, vec![row])),
+                }
+            }
+        }
+        if self.groups.several() {
+            self.refuse_not_ours(dataset, &states, &mut by_range, &mut answered);
+        }
+        for (partition, parts) in by_range {
+            let mut head = self.head(tx, &partition)?;
+            let epoch = self.fence.epoch();
+            let lineage = lineage(tx, &partition)?;
+            let previous = previous_of_each(
+                tx,
+                dataset,
+                &lineage,
+                parts.iter().flat_map(|(_, rows)| rows.iter()),
+            )?;
+            let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
+            let done = number_parts(
+                rows,
+                &mut head,
+                now_ns,
+                |row| latest.get(&key_of(row)).map(|held| held.row.clone()),
+                |row| {
+                    previous
+                        .get(&(row.data_type().code(), row.subject().to_string()))
+                        .copied()
+                        .unwrap_or(0)
+                },
+            );
+            let numbered: Vec<Observation> = done
+                .iter()
+                .flat_map(|part| part.rows.iter().cloned())
+                .collect();
+            self.leaves_for(tx, &partition, &numbered)?;
+            insert_all(tx, dataset, &partition, &anchors, &numbered, epoch)?;
+            // A key `lake_latest` held no version of, read under the
+            // dataset's lock, is new to it: inserted, never upserted.
+            keep_latest(tx, dataset, &partition, &anchors, &numbered, |key| {
+                from_latest && !latest.contains_key(key)
+            })?;
+            // Each row numbered version 1 is a key the dataset held no
+            // version of; every other replaces its key's last.
+            let new_keys: u64 = done.iter().map(|part| u64::from(part.recorded)).sum();
+            Self::move_head(tx, &partition, head, new_keys)?;
+            for (at, part) in places.into_iter().zip(done) {
+                if let Ok(answer) = &mut answered[at] {
+                    answer.joined(dataset, part, &partition);
+                }
+            }
+        }
+        Ok(answered)
+    }
+}
+
+impl PostgresStore {
+    /// The parts of a batch with rows in a range a move's switch holds, or
+    /// one another writer group owns, refused alone and taken out of the
+    /// batch (step 3d; sections 6.7 and 6.8): held ones are tried again by
+    /// the lake until the switch ends; another group's are handed to it.
+    /// The member's view of each range's group is the one read here, under
+    /// the range's row.
+    fn refuse_not_ours(
+        &self,
+        dataset: &str,
+        states: &BTreeMap<String, (Option<u32>, bool, u64)>,
+        by_range: &mut BTreeMap<String, Vec<(usize, Vec<Observation>)>>,
+        answered: &mut [Result<Recorded>],
+    ) {
+        let mine = self.groups.mine();
+        let mut refused: BTreeMap<usize, StoreError> = BTreeMap::new();
+        for (partition, parts) in by_range.iter() {
+            let failed = match states.get(partition) {
+                Some((_, false, _)) => Some(StoreError::Held(format!(
+                    "range {partition} is switching to another writer group: ask again in a moment"
+                ))),
+                Some((named, true, here)) => {
+                    self.groups.assign(partition, *named);
+                    let group = self.groups.owner_by(partition, dataset);
+                    (group != mine || self.headed_elsewhere(partition, *here)).then(|| {
+                        StoreError::NotOwned {
+                            partition: partition.clone(),
+                            group,
+                        }
+                    })
+                }
+                // A range not begun yet: its dataset's first write.
+                None => {
+                    let group = self.groups.owner_by(partition, dataset);
+                    (group != mine || self.headed_elsewhere(partition, 0)).then(|| {
+                        StoreError::NotOwned {
+                            partition: partition.clone(),
+                            group,
+                        }
+                    })
+                }
+            };
+            if let Some(failed) = failed {
+                for (at, _) in parts {
+                    refused.entry(*at).or_insert_with(|| again(&failed));
+                }
+            }
+        }
+        if refused.is_empty() {
+            return;
+        }
+        for parts in by_range.values_mut() {
+            parts.retain(|(at, _)| !refused.contains_key(at));
+        }
+        by_range.retain(|_, parts| !parts.is_empty());
+        for (at, failed) in refused {
+            answered[at] = Err(failed);
+        }
+    }
+}
+
+impl PostgresStore {
+    /// Whether a row `r` is no longer its key's version in force, in SQL:
+    /// [`SUPERSEDED_NOW`] once `lake_latest` holds every key, else
+    /// [`SUPERSEDED`].
+    fn superseded(&self, client: &mut impl GenericClient) -> Result<&'static str> {
+        Ok(if self.latest_all(client)? {
+            SUPERSEDED_NOW
+        } else {
+            SUPERSEDED
+        })
+    }
+
+    /// Whether `lake_latest` holds every row key kept (step 3d): once it
+    /// does, held.
+    fn latest_all(&self, client: &mut impl GenericClient) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        if self.latest_all.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let all: bool = client
+            .query_one("SELECT latest_all FROM lake_conversion", &[])
+            .map_err(unavailable)?
+            .get(0);
+        if all {
+            self.latest_all.store(true, Ordering::Relaxed);
+        }
+        Ok(all)
+    }
+
+    /// The month tables `rows` need in `partition`, made where they are not
+    /// (step 3d; section 6.2), in `tx`.
+    fn leaves_for(
+        &self,
+        tx: &mut Transaction<'_>,
+        partition: &str,
+        rows: &[Observation],
+    ) -> Result<()> {
+        let needed: std::collections::BTreeSet<(String, crate::leaves::Month)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    partition.to_string(),
+                    crate::leaves::Month::of(row.meta().valid_from_ns),
+                )
+            })
+            .filter(|need| !self.made.lock().expect("made poisoned").contains(need))
+            .collect();
+        if needed.is_empty() {
+            return Ok(());
+        }
+        // Its range's table made before the batch began ([`Self::prepare`]);
+        // one split since is made by the split, and is never missing.
+        if !self
+            .ranges_made
+            .lock()
+            .expect("ranges poisoned")
+            .contains(partition)
+            && !crate::leaves::range_made(tx, partition).map_err(unavailable)?
+        {
+            return Err(StoreError::Unavailable(format!(
+                "range {partition}'s table is not made yet: ask again"
+            )));
+        }
+        let made = crate::leaves::ensure_months(tx, &needed).map_err(unavailable)?;
+        if made > 0 {
+            tracing::info!(partition, made, "the lake made its range's month tables");
+        }
+        self.unanalysed
+            .lock()
+            .expect("unanalysed poisoned")
+            .extend(needed.iter().cloned());
+        self.made.lock().expect("made poisoned").extend(needed);
+        Ok(())
+    }
+
+    /// Each month table a committed batch first wrote analysed, where it
+    /// never was (migration 24): until a month is, every estimate of it
+    /// clamps to one row, and a lookup of one row could take an index that
+    /// scans the dataset's month whole, once for each row looked up. Once
+    /// a month per range per process, after its batch's commit; derived,
+    /// so a failure is logged and the month tried again after the next.
+    fn analyse_months(&self, conn: &mut impl GenericClient) {
+        let months: Vec<(String, crate::leaves::Month)> =
+            std::mem::take(&mut *self.unanalysed.lock().expect("unanalysed poisoned"))
+                .into_iter()
+                .collect();
+        for (partition, month) in months {
+            match crate::leaves::analyse_month(conn, &partition, month) {
+                Ok(true) => {
+                    tracing::debug!(partition, month = month.label(), "a month's table analysed")
+                }
+                Ok(false) => {}
+                Err(failed) => {
+                    tracing::warn!(partition, month = month.label(), %failed, "a month's table was not analysed: tried after the next batch");
+                    self.unanalysed
+                        .lock()
+                        .expect("unanalysed poisoned")
+                        .insert((partition, month));
+                }
+            }
+        }
+    }
+
+    /// Let go of the tables this store has seen made: a batch failed.
+    fn forget_made(&self) {
+        self.made.lock().expect("made poisoned").clear();
+        self.ranges_made.lock().expect("ranges poisoned").clear();
+        self.datasets_made
+            .lock()
+            .expect("datasets poisoned")
+            .clear();
+    }
+
+    /// The tables of `datasets`' open ranges -- a dataset's own where it has
+    /// none open yet -- made where they are not, on `conn` before its batch
+    /// begins (step 3d; section 6.2): attaching one takes, while the table
+    /// kept before 3d is the default partition, that table's lock, which a
+    /// batch already reading the lake would hold against it.
+    fn prepare(&self, conn: &mut Connection, datasets: &[&str]) -> Result<()> {
+        let mut wanted = std::collections::BTreeSet::new();
+        let seen: Vec<&str> = {
+            let made = self.datasets_made.lock().expect("datasets poisoned");
+            datasets
+                .iter()
+                .copied()
+                .filter(|dataset| !made.contains(*dataset))
+                .collect()
+        };
+        if seen.is_empty() {
+            return Ok(());
+        }
+        for dataset in &seen {
+            let ranges = open_ranges(&mut **conn, dataset)?;
+            if ranges.is_empty() {
+                wanted.insert(dataset.to_string());
+            }
+            wanted.extend(ranges.into_iter().map(|range| range.partition));
+        }
+        wanted.retain(|partition| {
+            !self
+                .ranges_made
+                .lock()
+                .expect("ranges poisoned")
+                .contains(partition)
+        });
+        if wanted.is_empty() {
+            self.datasets_made
+                .lock()
+                .expect("datasets poisoned")
+                .extend(seen.iter().map(|dataset| dataset.to_string()));
+            return Ok(());
+        }
+        // While the table kept before 3d is the default partition, its lock
+        // is waited for two seconds at a time, a read holding it let finish.
+        let mut tries = 0;
+        let made = loop {
+            tries += 1;
+            let mut tx = conn.transaction().map_err(unavailable)?;
+            match crate::leaves::ensure_ranges(&mut tx, &wanted) {
+                Ok(made) => {
+                    tx.commit().map_err(unavailable)?;
+                    break made;
+                }
+                Err(failed)
+                    if tries < 15
+                        && failed.code()
+                            == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) =>
+                {
+                    drop(tx);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(failed) => return Err(unavailable(failed)),
+            }
+        };
+        if made > 0 {
+            tracing::info!(made, "the lake made its ranges' tables");
+        }
+        self.ranges_made
+            .lock()
+            .expect("ranges poisoned")
+            .extend(wanted);
+        self.datasets_made
+            .lock()
+            .expect("datasets poisoned")
+            .extend(seen.iter().map(|dataset| dataset.to_string()));
+        Ok(())
+    }
+
+    /// Copy one page of the rows kept before 3d behind, into their ranges'
+    /// months (step 3d; section 6.2, an online transition): at most 512 KiB
+    /// of them, each deleted from the default partition and inserted into
+    /// its month in one statement, its row key offered to `lake_latest` in
+    /// the same, so every read answers each row once whenever it reads.
+    /// Answers how many it moved; none once the default is empty, when it
+    /// is let go and `lake_latest` holds every key. The writer's background
+    /// work: what the lake holds of it is the page's row places alone; the
+    /// rows move inside Postgres.
+    pub fn convert_page(&self) -> Result<u64> {
         let mut conn = self.conn()?;
-        Ok(conn
-            .query_opt(
-                "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1",
-                &[&stream],
+        let legacy: bool = conn
+            .query_one("SELECT to_regclass('lake_row_legacy') IS NOT NULL", &[])
+            .map_err(unavailable)?
+            .get(0);
+        if !legacy {
+            conn.execute("UPDATE lake_conversion SET latest_all = true", &[])
+                .map_err(unavailable)?;
+            self.latest_all
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(0);
+        }
+        // The page picked, then its ranges' tables made in a transaction of
+        // their own, holding nothing of `lake_row` (see [`Self::prepare`]).
+        let picked = conn
+            .query(
+                "SELECT ctid::text, dataset, valid_from_ns, octet_length(body)
+                   FROM lake_row_legacy LIMIT 4096",
+                &[],
+            )
+            .map_err(unavailable)?;
+        if picked.is_empty() {
+            // Empty: the default let go, under a short wait for its lock, and
+            // tried again later where a read holds it.
+            let mut tx = conn.transaction().map_err(unavailable)?;
+            // Let go by lake_row's owner (migration 23).
+            tx.batch_execute(
+                "SET LOCAL lock_timeout = '2s';
+                 SELECT lake_drop_legacy();
+                 UPDATE lake_conversion SET latest_all = true;",
+            )
+            .map_err(unavailable)?;
+            tx.commit().map_err(unavailable)?;
+            self.latest_all
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("the lake's rows kept before its ranges are all in their months");
+            return Ok(0);
+        }
+        let mut places: Vec<String> = Vec::new();
+        let mut needed = std::collections::BTreeSet::new();
+        let mut bytes = 0usize;
+        for row in &picked {
+            let size = row.get::<_, i32>(3) as usize;
+            if !places.is_empty() && bytes + size > meridian_changes::PAGE_MOST {
+                break;
+            }
+            bytes += size;
+            places.push(row.get(0));
+            needed.insert((
+                row.get::<_, String>(1),
+                crate::leaves::Month::of(row.get(2)),
+            ));
+        }
+        let ranges: std::collections::BTreeSet<String> =
+            needed.iter().map(|(range, _)| range.clone()).collect();
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        crate::leaves::ensure_ranges(&mut tx, &ranges).map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        crate::leaves::ensure_months(&mut tx, &needed).map_err(unavailable)?;
+        let columns: String = tx
+            .query_one(
+                "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
+                   FROM information_schema.columns
+                  WHERE table_schema = current_schema() AND table_name = 'lake_row_legacy'
+                    AND column_name NOT IN ('partition', 'anchor')",
+                &[],
             )
             .map_err(unavailable)?
-            .map(|row| WriteAheadPosition {
-                sequence: row.get::<_, i64>(0) as u64,
-                at_ns: row.get(1),
-            }))
+            .get(0);
+        tx.execute(
+            &format!(
+                "WITH moved AS (
+                        DELETE FROM lake_row_legacy WHERE ctid = ANY($1::text[]::tid[])
+                        RETURNING *),
+                     kept AS (
+                        INSERT INTO lake_row ({columns}, partition, anchor)
+                        SELECT {columns}, dataset, coalesce(anchor, {anchor})
+                          FROM moved
+                        RETURNING 1),
+                     last AS (
+                        SELECT DISTINCT ON (dataset, data_type, row_key) * FROM moved
+                         ORDER BY dataset, data_type, row_key, version DESC),
+                     force AS (
+                        SELECT DISTINCT ON (dataset, data_type, row_key) * FROM moved
+                         ORDER BY dataset, data_type, row_key,
+                                  coalesce(published_at_ns, 0) DESC, version DESC)
+                     INSERT INTO lake_latest
+                            (dataset, data_type, row_key, partition, sequence, version,
+                             valid_from_ns, anchor, force_partition, force_sequence,
+                             force_version, force_published, force_valid_from, subject, kind,
+                             venue_id, interval_ns, latest_key, quality)
+                     SELECT l.dataset, l.data_type, l.row_key, l.dataset, l.sequence, l.version,
+                            l.valid_from_ns,
+                            coalesce(l.anchor, {l_anchor}),
+                            f.dataset, f.sequence, f.version, f.published_at_ns, f.valid_from_ns,
+                            f.subject, f.kind, f.venue_id, f.interval_ns, f.latest_key, f.quality
+                       FROM last l JOIN force f USING (dataset, data_type, row_key)
+                     ON CONFLICT (dataset, data_type, row_key) DO UPDATE SET {set}",
+                anchor = anchor_of("subject"),
+                l_anchor = anchor_of("l.subject"),
+                set = *LATEST_SET
+            ),
+            &[&places],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(places.len() as u64)
     }
+}
 
-    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+/// What a row key's `lake_latest` row takes of one offered it (`EXCLUDED`):
+/// its latest version where the offer's is later, its version in force
+/// where the offer's takes force after it.
+static LATEST_SET: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let newer = "EXCLUDED.version > lake_latest.version";
+    let in_force = "(coalesce(EXCLUDED.force_published, 0), EXCLUDED.force_version) \
+                    > (coalesce(lake_latest.force_published, 0), lake_latest.force_version)";
+    let pick = |column: &str, when: &str| {
+        format!("{column} = CASE WHEN {when} THEN EXCLUDED.{column} ELSE lake_latest.{column} END")
+    };
+    [
+        "partition",
+        "sequence",
+        "version",
+        "valid_from_ns",
+        "anchor",
+    ]
+    .iter()
+    .map(|c| pick(c, newer))
+    .chain(
+        [
+            "force_partition",
+            "force_sequence",
+            "force_version",
+            "force_published",
+            "force_valid_from",
+            "subject",
+            "kind",
+            "venue_id",
+            "interval_ns",
+            "latest_key",
+            "quality",
+        ]
+        .iter()
+        .map(|c| pick(c, in_force)),
+    )
+    .collect::<Vec<_>>()
+    .join(", ")
+});
+
+/// A row's anchor in SQL, for a row kept before 3d: the hash of its first
+/// subject, `subject` ([`crate::range::hash`]).
+fn anchor_of(subject: &str) -> String {
+    format!(
+        "(get_byte(sha256(convert_to({subject}, 'UTF8')), 0) * 256 \
+          + get_byte(sha256(convert_to({subject}, 'UTF8')), 1))"
+    )
+}
+
+/// Each row key of `rows` -- one range's, as numbered -- kept in
+/// `lake_latest` (step 3d; section 6.2), in the record's own transaction:
+/// its latest version, and its version in force where it is one
+/// ([`crate::store::force_order`]: a rate's by published time).
+fn keep_latest(
+    tx: &mut Transaction<'_>,
+    dataset: &str,
+    partition: &str,
+    anchors: &std::collections::HashMap<(i16, String), u16>,
+    rows: &[Observation],
+    new: impl Fn(&(i16, String)) -> bool,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut keys: BTreeMap<(i16, String), (&Observation, &Observation)> = BTreeMap::new();
+    for row in rows {
+        let key = key_of(row);
+        let order = |r: &Observation| {
+            (
+                crate::store::published_order(r).unwrap_or(0),
+                r.meta().version,
+            )
+        };
+        match keys.get_mut(&key) {
+            None => {
+                keys.insert(key, (row, row));
+            }
+            Some((last, force)) => {
+                if row.meta().version > last.meta().version {
+                    *last = row;
+                }
+                if order(row) > order(force) {
+                    *force = row;
+                }
+            }
+        }
+    }
+    // The keys new to `lake_latest` in one plain INSERT, every other
+    // offered in one upsert.
+    let (fresh, held): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(key, _)| new(key));
+    for (keys, upsert) in [(fresh, false), (held, true)] {
+        if !keys.is_empty() {
+            offer_latest(tx, dataset, partition, anchors, &keys, upsert)?;
+        }
+    }
+    Ok(())
+}
+
+/// A key's latest version and its version in force, as `keep_latest` pairs
+/// them.
+type LatestOf<'a> = ((i16, String), (&'a Observation, &'a Observation));
+
+/// One statement keeping `keys` in `lake_latest`, each with its latest
+/// version and its version in force: inserted, or offered where `upsert`.
+fn offer_latest(
+    tx: &mut Transaction<'_>,
+    dataset: &str,
+    partition: &str,
+    anchors: &std::collections::HashMap<(i16, String), u16>,
+    keys: &[LatestOf<'_>],
+    upsert: bool,
+) -> Result<()> {
+    // One array a column, unnested: what a batch keeps in one statement.
+    let mut types: Vec<i16> = Vec::with_capacity(keys.len());
+    let mut row_keys: Vec<&str> = Vec::with_capacity(keys.len());
+    let (mut sequences, mut versions, mut valid) = (Vec::new(), Vec::new(), Vec::new());
+    let mut held_anchors: Vec<i32> = Vec::new();
+    let (mut force_sequences, mut force_versions) = (Vec::new(), Vec::new());
+    let (mut force_published, mut force_valid): (Vec<Option<i64>>, Vec<i64>) =
+        (Vec::new(), Vec::new());
+    let (mut subjects, mut kinds, mut venues) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut intervals, mut latest_keys, mut qualities) = (Vec::new(), Vec::new(), Vec::new());
+    for (key, (last, force)) in keys {
+        types.push(key.0);
+        row_keys.push(key.1.as_str());
+        sequences.push(last.meta().sequence as i64);
+        versions.push(last.meta().version as i64);
+        valid.push(last.meta().valid_from_ns);
+        held_anchors.push(i32::from(
+            anchors
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| crate::range::hash(last.subject())),
+        ));
+        force_sequences.push(force.meta().sequence as i64);
+        force_versions.push(force.meta().version as i64);
+        force_published.push(crate::store::published_order(force));
+        force_valid.push(force.meta().valid_from_ns);
+        subjects.push(force.subject().to_string());
+        kinds.push(force.kind() as i16);
+        venues.push(force.venue().to_string());
+        intervals.push(force.interval_ns());
+        latest_keys.push(force.latest_key());
+        qualities.push(force.meta().quality as i16);
+    }
+    tx.execute(
+        &format!(
+            "INSERT INTO lake_latest
+                    (dataset, data_type, row_key, partition, sequence, version, valid_from_ns,
+                     anchor, force_partition, force_sequence, force_version, force_published,
+                     force_valid_from, subject, kind, venue_id, interval_ns, latest_key, quality)
+             SELECT $1, x.*
+               FROM unnest($3::smallint[], $4::text[], $2::text[], $5::bigint[], $6::bigint[],
+                           $7::bigint[], $8::integer[], $2::text[], $9::bigint[], $10::bigint[],
+                           $11::bigint[], $12::bigint[], $13::text[], $14::smallint[],
+                           $15::text[], $16::bigint[], $17::text[], $18::smallint[]) AS x
+             {}",
+            if upsert {
+                format!(
+                    "ON CONFLICT (dataset, data_type, row_key) DO UPDATE SET {}",
+                    *LATEST_SET
+                )
+            } else {
+                String::new()
+            }
+        ),
+        &[
+            &dataset,
+            &vec![partition; keys.len()],
+            &types,
+            &row_keys,
+            &sequences,
+            &versions,
+            &valid,
+            &held_anchors,
+            &force_sequences,
+            &force_versions,
+            &force_published,
+            &force_valid,
+            &subjects,
+            &kinds,
+            &venues,
+            &intervals,
+            &latest_keys,
+            &qualities,
+        ],
+    )
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+impl PostgresStore {
+    /// [`Store::record_write_ahead`]'s batch, in one transaction.
+    fn record_write_ahead_batch(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         self.epoch_now()?;
         let mut conn = self.conn()?;
+        let datasets: std::collections::BTreeSet<&str> = batch
+            .parts
+            .iter()
+            .map(|(dataset, _)| dataset.as_str())
+            .collect();
+        self.prepare(&mut conn, &datasets.into_iter().collect::<Vec<_>>())?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The stream's batch is written whatever its size, and waits on its
         // position's lock: without the serving session's statement_timeout
@@ -1247,8 +2434,11 @@ impl Store for PostgresStore {
                 batch.stream, batch.after
             )));
         }
-        let epoch = self.fence.epoch();
-        let mut answered = vec![Recorded::default(); batch.parts.len()];
+        let mut answered: Vec<Result<Recorded>> = batch
+            .parts
+            .iter()
+            .map(|_| Ok(Recorded::default()))
+            .collect();
         // Each dataset's parts as one batch of it, the datasets taken in
         // their names' order: every batch takes the heads' locks in one order.
         let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
@@ -1256,35 +2446,8 @@ impl Store for PostgresStore {
             by_dataset.entry(dataset).or_default().push((place, rows));
         }
         for (dataset, parts) in by_dataset {
-            let mut head = self.head(&mut tx, &dataset)?;
             let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
-            let every: Vec<Observation> = rows.iter().flatten().cloned().collect();
-            let latest = latest_of_each(&mut tx, &dataset, &every)?;
-            let previous = previous_of_each(&mut tx, &dataset, &every)?;
-            drop(every);
-            let done = number_parts(
-                rows,
-                &mut head,
-                now_ns,
-                |row| {
-                    latest
-                        .get(&(row.data_type().code(), row.meta().row_key.clone()))
-                        .cloned()
-                },
-                |row| {
-                    previous
-                        .get(&(row.data_type().code(), row.subject().to_string()))
-                        .copied()
-                        .unwrap_or(0)
-                },
-            );
-            let numbered: Vec<Observation> = done
-                .iter()
-                .flat_map(|part| part.rows.iter().cloned())
-                .collect();
-            insert_all(&mut tx, &dataset, &numbered, epoch)?;
-            let new_keys: u64 = done.iter().map(|part| u64::from(part.recorded)).sum();
-            Self::move_head(&mut tx, &dataset, head, new_keys)?;
+            let done = self.record_dataset(&mut tx, &dataset, rows, now_ns)?;
             for (place, part) in places.into_iter().zip(done) {
                 answered[place] = part;
             }
@@ -1347,7 +2510,79 @@ impl Store for PostgresStore {
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        self.analyse_months(&mut *conn);
         Ok(answered)
+    }
+}
+
+impl Store for PostgresStore {
+    fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        self.record_together(dataset, vec![rows], now_ns)?
+            .pop()
+            .unwrap_or_else(|| Ok(Recorded::default()))
+    }
+
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        if parts.len() < 2 {
+            return parts
+                .into_iter()
+                .map(|rows| self.record(dataset, rows, now_ns))
+                .collect();
+        }
+        // Kept to be tried again alone: a batch is at most 512 KiB.
+        let each = parts.clone();
+        match self.record_together(dataset, parts, now_ns) {
+            Ok(done) => done,
+            // An unexpected database error: each part tried again alone
+            // (section 6.5), so it is refused only for the part it was. A
+            // part that did commit is decided unchanged the second time.
+            Err(StoreError::Unavailable(failed)) => {
+                tracing::warn!(
+                    dataset,
+                    parts = each.len(),
+                    failed,
+                    "a batch's transaction failed: each of its parts is tried alone"
+                );
+                each.into_iter()
+                    .map(|rows| self.record(dataset, rows, now_ns))
+                    .collect()
+            }
+            Err(failed) => each.iter().map(|_| Err(again(&failed))).collect(),
+        }
+    }
+
+    fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1",
+                &[&stream],
+            )
+            .map_err(unavailable)?
+            .map(|row| WriteAheadPosition {
+                sequence: row.get::<_, i64>(0) as u64,
+                at_ns: row.get(1),
+            }))
+    }
+
+    fn record_write_ahead(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
+        // The stream's lane: one batch in flight (step 3d's advice).
+        let (began, stream) = (std::time::Instant::now(), batch.stream.clone());
+        let done = self.record_write_ahead_batch(batch, now_ns);
+        meridian_changes::busy::record(&stream, began.elapsed(), meridian_changes::now_ns());
+        if done.is_err() {
+            self.forget_made();
+        }
+        done
     }
 
     fn write_ahead_found(
@@ -1420,6 +2655,156 @@ impl Store for PostgresStore {
         tx.commit().map_err(unavailable)
     }
 
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        let held = self.partition_epochs()?;
+        self.record_assignments_for(&held, groups, at_ns)
+    }
+
+    fn split_partition(
+        &self,
+        partition: &str,
+        split_by: &str,
+        reason: &str,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::PartitionSplit> {
+        let invalid = |words: String| StoreError::Invalid {
+            field: "partition",
+            words,
+        };
+        if partition == meridian_changes::CONTROL {
+            return Err(invalid(
+                "the lake's control partition is never split: it holds no dataset's rows".into(),
+            ));
+        }
+        if is_book_partition(partition) {
+            return Err(invalid(format!(
+                "{partition} is a book partition: the book is split by bor.partitions, never by \
+                 SplitPartition"
+            )));
+        }
+        let (dataset, lo, hi) = crate::range::parse(partition);
+        let Some(((lo_a, hi_a), (lo_b, hi_b))) = crate::range::halves(lo, hi) else {
+            return Err(invalid(format!(
+                "range {partition} holds one hash value, which cannot halve"
+            )));
+        };
+        // A range another group writes is its writer's to split.
+        self.owned(partition)?;
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // Its batches wait for this one commit (section 6.1).
+        lock_dataset(&mut tx, dataset)?;
+        let held = tx
+            .query_opt(
+                "SELECT head, epoch, origin, closed_at, lo, hi, writer_group FROM lake_partition
+                  WHERE dataset = $1 FOR UPDATE",
+                &[&partition],
+            )
+            .map_err(unavailable)?;
+        let Some(held) = held.filter(|row| {
+            row.get::<_, Option<i64>>(3).is_none()
+                && row.get::<_, i32>(4) as u16 == lo
+                && row.get::<_, i32>(5) as u16 == hi
+        }) else {
+            return Err(invalid(format!(
+                "{partition} is not a range this lake has open: a dataset not yet written, a \
+                 range split before, or no partition of the lake"
+            )));
+        };
+        // Moved to another group since this member last read it (step 3d;
+        // ruled 2026-11-14): its writer's to split, never a fence.
+        let named = held.get::<_, Option<i32>>(6);
+        if self.groups.several() {
+            self.groups
+                .assign(partition, named.map(|group| group as u32));
+            let group = self.groups.owner_by(partition, dataset);
+            if group != self.groups.mine() {
+                meridian_bus::owners::hand_to_named(group);
+                return Err(StoreError::NotOwned {
+                    partition: partition.to_string(),
+                    group,
+                });
+            }
+        }
+        let epoch: i64 = held.get(1);
+        self.fence.admits(epoch as u64)?;
+        let closing: i64 = held.get(0);
+        let origin: String = held.get(2);
+        // The parent closes at N with its rows kept; each child opens naming
+        // it, numbering from N + 1, its log reaching from there.
+        tx.execute(
+            "UPDATE lake_partition SET closed_at = head WHERE dataset = $1",
+            &[&partition],
+        )
+        .map_err(unavailable)?;
+        let children = [
+            crate::range::id(dataset, lo_a, hi_a),
+            crate::range::id(dataset, lo_b, hi_b),
+        ];
+        for (child, (lo, hi)) in children.iter().zip([(lo_a, hi_a), (lo_b, hi_b)]) {
+            tx.execute(
+                "INSERT INTO lake_partition
+                        (dataset, head, epoch, origin, kept_from, in_force, lo, hi, parent,
+                         writer_group)
+                 VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9)",
+                &[
+                    child,
+                    &closing,
+                    &epoch,
+                    &origin,
+                    &(closing + 1),
+                    &i32::from(lo),
+                    &i32::from(hi),
+                    &partition,
+                    &named,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        // The children's tables, made in the split's own transaction: it has
+        // read nothing of `lake_row`.
+        crate::leaves::ensure_ranges(&mut tx, &children.iter().cloned().collect())
+            .map_err(unavailable)?;
+        let split = meridian_domain::v1::PartitionSplit {
+            parent: partition.to_string(),
+            children: children.to_vec(),
+            closing_sequence: closing as u64,
+            split_by: split_by.to_string(),
+            reason: reason.to_string(),
+            split_at_ns: now_ns,
+        };
+        self.log_control(
+            &mut tx,
+            &[(crate::store::CONTROL_SPLIT, split.encode_to_vec(), now_ns)],
+        )?;
+        tx.commit().map_err(unavailable)?;
+        // The children stay with the parent's group (section 6.1).
+        for child in &children {
+            self.groups.assign(child, named.map(|group| group as u32));
+        }
+        Ok(split)
+    }
+
+    fn splits(&self) -> Result<Vec<meridian_domain::v1::PartitionSplit>> {
+        self.conn()?
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
+                &[&crate::store::CONTROL_SPLIT],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let body: Vec<u8> = row.get(0);
+                meridian_domain::v1::PartitionSplit::decode(&body[..]).map_err(unreadable)
+            })
+            .collect()
+    }
+
     fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
         self.conn()?
             .query(
@@ -1455,35 +2840,73 @@ impl Store for PostgresStore {
         now_ns: i64,
     ) -> Result<Recorded> {
         self.epoch_now()?;
+        let several = self.groups.several();
+        if !several {
+            self.owned(dataset)?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let mut head = self.head(&mut tx, dataset)?;
-        let epoch = self.fence.epoch();
-        let first = head + 1;
-        let done = number(rows, &mut head, now_ns, |_| None, |_| 0);
-        if !done.rows.is_empty() {
-            let served = served_of(dataset, &done.rows, first, head, readers, now_ns);
-            tx.execute(
-                "INSERT INTO lake_served
-                        (dataset, first_sequence, last_sequence, subjects, fields, readers, at_ns,
-                         epoch)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[
-                    &served.dataset,
-                    &(served.first_sequence as i64),
-                    &(served.last_sequence as i64),
-                    &served.subjects,
-                    &served.fields,
-                    &served.readers,
-                    &served.at_ns,
-                    &(epoch as i64),
-                ],
-            )
-            .map_err(unavailable)?;
+        lock_dataset(&mut tx, dataset)?;
+        // Each row in the open range of its first subject's hash, as a kept
+        // row is placed (step 3d): numbered there, its values kept nowhere.
+        // With several groups, each range's row taken as a batch takes it,
+        // and the rows refused whole where one is held by a move's switch
+        // or another group's: the lake routes them again (section 6.8).
+        let (ranges, states) = if several {
+            open_ranges_taken(&mut tx, dataset)?
+        } else {
+            (open_ranges(&mut tx, dataset)?, BTreeMap::new())
+        };
+        let mut by_range: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
+        for row in rows {
+            let anchor = crate::range::hash(row.subject());
+            by_range
+                .entry(crate::range::placed(dataset, &ranges, anchor).into_owned())
+                .or_default()
+                .push(row);
         }
-        Self::move_head(&mut tx, dataset, head, 0)?;
+        if several {
+            let mut parts: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = by_range
+                .keys()
+                .map(|partition| (partition.clone(), vec![(0, Vec::new())]))
+                .collect();
+            let mut answered = [Ok(Recorded::default())];
+            self.refuse_not_ours(dataset, &states, &mut parts, &mut answered);
+            let [answered] = answered;
+            answered?;
+        }
+        let mut answer = Recorded::default();
+        for (partition, rows) in by_range {
+            let mut head = self.head(&mut tx, &partition)?;
+            let epoch = self.fence.epoch();
+            let first = head + 1;
+            let done = number(rows, &mut head, now_ns, |_| None, |_| 0);
+            if !done.rows.is_empty() {
+                let served = served_of(dataset, &done.rows, first, head, readers, now_ns);
+                tx.execute(
+                    "INSERT INTO lake_served
+                            (dataset, first_sequence, last_sequence, subjects, fields, readers,
+                             at_ns, epoch, partition)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &served.dataset,
+                        &(served.first_sequence as i64),
+                        &(served.last_sequence as i64),
+                        &served.subjects,
+                        &served.fields,
+                        &served.readers,
+                        &served.at_ns,
+                        &(epoch as i64),
+                        &partition,
+                    ],
+                )
+                .map_err(unavailable)?;
+            }
+            Self::move_head(&mut tx, &partition, head, 0)?;
+            answer.joined(dataset, done, &partition);
+        }
         tx.commit().map_err(unavailable)?;
-        Ok(done)
+        Ok(answer)
     }
 
     fn read(&self, query: &Query) -> Result<Vec<Observation>> {
@@ -1512,11 +2935,37 @@ impl Store for PostgresStore {
         if let When::After(watermark) = &query.when {
             // The rows each partition named recorded after its sequence
             // there, by the partition's own key (contract v19, the plan's Q33).
-            let (datasets, after): (Vec<String>, Vec<i64>) = watermark
+            // A range named reads on into every range split from it since,
+            // each numbering past the sequence named (step 3d; section 6.1),
+            // where the watermark does not name that range itself.
+            let every = self.served_partitions(&mut tx, &query.datasets)?;
+            let mut asked: BTreeMap<String, i64> = BTreeMap::new();
+            for (named, sequence) in watermark {
+                if query
+                    .datasets
+                    .iter()
+                    .any(|dataset| crate::range::is_of(named, dataset))
+                {
+                    asked.insert(named.clone(), *sequence as i64);
+                }
+            }
+            for (named, sequence) in watermark {
+                let (dataset, lo, hi) = crate::range::parse(named);
+                if !query.datasets.iter().any(|d| d == dataset) {
+                    continue;
+                }
+                for partition in &every {
+                    let (of, from, to) = crate::range::parse(partition);
+                    if of == dataset && partition != named && lo <= from && to <= hi {
+                        asked.entry(partition.clone()).or_insert(*sequence as i64);
+                    }
+                }
+            }
+            let (partitions, after): (Vec<String>, Vec<i64>) = asked.into_iter().unzip();
+            let datasets: Vec<String> = partitions
                 .iter()
-                .filter(|(dataset, _)| query.datasets.contains(dataset))
-                .map(|(dataset, sequence)| (dataset.clone(), *sequence as i64))
-                .unzip();
+                .map(|p| crate::range::dataset_of(p).to_string())
+                .collect();
             let cut_off = if query.as_of_ns == 0 {
                 i64::MAX
             } else {
@@ -1534,14 +2983,16 @@ impl Store for PostgresStore {
             // for every one, by the time each was recorded.
             let chosen = if query.published_as_of_ns != 0 {
                 "SELECT body FROM lake_row
-                   JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
+                   JOIN unnest($1::text[], $2::bigint[], $6::text[]) AS asked(partition, after, dataset)
                      ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
+                    AND coalesce(lake_row.partition, lake_row.dataset) = asked.partition
                   WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
                   ORDER BY lake_row.dataset, row_key, version"
             } else if crate::store::every_version(query) {
                 "SELECT body FROM lake_row
-                   JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
+                   JOIN unnest($1::text[], $2::bigint[], $6::text[]) AS asked(partition, after, dataset)
                      ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
+                    AND coalesce(lake_row.partition, lake_row.dataset) = asked.partition
                   WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
                   ORDER BY lake_row.dataset, sequence"
             } else {
@@ -1549,8 +3000,9 @@ impl Store for PostgresStore {
                      SELECT DISTINCT ON (lake_row.dataset, row_key) body,
                             lake_row.dataset AS in_dataset, sequence AS at_sequence
                        FROM lake_row
-                       JOIN unnest($1::text[], $2::bigint[]) AS asked(dataset, after)
+                       JOIN unnest($1::text[], $2::bigint[], $6::text[]) AS asked(partition, after, dataset)
                          ON lake_row.dataset = asked.dataset AND lake_row.sequence > asked.after
+                        AND coalesce(lake_row.partition, lake_row.dataset) = asked.partition
                       WHERE subjects && $3 AND data_type = $4 AND recorded_at_ns <= $5
                       ORDER BY lake_row.dataset, row_key,
                                COALESCE(published_at_ns, 0) DESC, version DESC
@@ -1558,8 +3010,14 @@ impl Store for PostgresStore {
                  ORDER BY in_dataset, at_sequence"
             };
             let data_type = query.data_type.code();
-            let params: [&(dyn postgres::types::ToSql + Sync); 5] =
-                [&datasets, &after, &query.subjects, &data_type, &cut_off];
+            let params: [&(dyn postgres::types::ToSql + Sync); 6] = [
+                &partitions,
+                &after,
+                &query.subjects,
+                &data_type,
+                &cut_off,
+                &datasets,
+            ];
             let portal = tx.bind(chosen, &params).map_err(unavailable)?;
             // As published by a time (contract v27, W10.6): each row key's
             // versions read together, the one in force by then kept as they
@@ -1600,6 +3058,8 @@ impl Store for PostgresStore {
             return Ok(());
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
+        // Every range of the datasets: the read reads their tables alone.
+        let partitions = self.served_partitions(&mut tx, &query.datasets)?;
         let cut_off = if query.as_of_ns == 0 {
             i64::MAX
         } else {
@@ -1644,7 +3104,17 @@ impl Store for PostgresStore {
         let mut by_published = (published && query.data_type != DataType::Rate)
             .then(|| crate::read::ByPublished::new(query.published_as_of_ns));
         let cut_published = published && by_published.is_none();
-        let sql = if latest && query.data_type == DataType::Rate {
+        // Now and unwindowed, from `lake_latest` once it holds every key
+        // (step 3d).
+        let now_unwindowed = query.as_of_ns == 0
+            && date.is_none()
+            && from == i64::MIN
+            && until == i64::MAX
+            && at == i64::MAX;
+        let from_latest = latest && now_unwindowed && self.latest_all(&mut tx)?;
+        let sql = if from_latest {
+            LATEST_NOW.as_str()
+        } else if latest && query.data_type == DataType::Rate {
             LATEST_BY_PUBLISHED.as_str()
         } else if latest {
             LATEST.as_str()
@@ -1669,6 +3139,7 @@ impl Store for PostgresStore {
             &from,
             &until,
             &at,
+            &partitions,
         ];
         if cut_published {
             params.push(&query.published_as_of_ns);
@@ -1715,7 +3186,7 @@ impl Store for PostgresStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         if places.is_empty() {
@@ -1723,7 +3194,7 @@ impl Store for PostgresStore {
         }
         let (datasets, sequences): (Vec<String>, Vec<i64>) = places
             .iter()
-            .map(|(dataset, sequence)| (dataset.clone(), *sequence as i64))
+            .map(|(dataset, sequence, _)| (dataset.clone(), *sequence as i64))
             .unzip();
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -1735,23 +3206,36 @@ impl Store for PostgresStore {
         // Its heads from this snapshot, where its thread asked (stage C).
         note_snapshot(
             &mut tx,
-            &places.iter().map(|(d, _)| d.clone()).collect::<Vec<_>>(),
+            &places.iter().map(|(d, _, _)| d.clone()).collect::<Vec<_>>(),
         )?;
         let code = data_type.code();
+        // Each place by the month's unique (dataset, sequence) index alone:
+        // its data type named so no index leads with it. A month not yet
+        // analysed otherwise took the subject index, whose sequence follows
+        // the subject, and scanned the dataset's every row of the type for
+        // each place -- a page's 500 places in seconds, its burst past the
+        // pool's wait (CI run 43560029609; base fd50b1b0 the same, half its
+        // runs).
         let found = tx
             .query(
-                "SELECT r.body
+                "SELECT r.body, p.n
                    FROM unnest($1::text[], $2::bigint[]) WITH ORDINALITY AS p(dataset, sequence, n)
                    JOIN lake_row r ON r.dataset = p.dataset AND r.sequence = p.sequence
-                  WHERE r.data_type = $3
+                  WHERE r.data_type + 0::smallint = $3
                   ORDER BY p.n",
                 &[&datasets, &sequences, &code],
             )
             .map_err(unavailable)?;
+        // Two ranges split from one number on from the same sequence: each
+        // place's own row by its key's hash.
         let mut out = Vec::with_capacity(found.len());
         for row in found {
+            let at = row.get::<_, i64>(1) as usize - 1;
             let body: &[u8] = row.get(0);
-            out.push(Observation::decode(data_type, body).map_err(unreadable)?);
+            let found = Observation::decode(data_type, body).map_err(unreadable)?;
+            if crate::range::key_hash(&found.meta().row_key) == places[at].2 {
+                out.push(found);
+            }
         }
         let mut named: Vec<String> = datasets;
         named.sort();
@@ -1780,8 +3264,9 @@ impl Store for PostgresStore {
         // Its heads from this snapshot, where its thread asked (stage C).
         note_snapshot(&mut tx, datasets)?;
         let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
+        let partitions = self.served_partitions(&mut tx, datasets)?;
         let rows = tx
-            .query(LISTING, &[&datasets, &subjects, &cut_off])
+            .query(LISTING, &[&datasets, &subjects, &cut_off, &partitions])
             .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -1820,34 +3305,57 @@ impl Store for PostgresStore {
     }
 
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
-        Ok(self
-            .conn()?
+        let mut conn = self.conn()?;
+        let Some(served) = self.served_everywhere(&mut *conn)? else {
+            return Ok(conn
+                .query(
+                    "SELECT dataset, count(*), count(*) FILTER (WHERE unconverted)
+                       FROM lake_row GROUP BY dataset",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>(0),
+                        (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
+                    )
+                })
+                .collect());
+        };
+        // Several databases (step 3d): each range's rows where it is read,
+        // a dataset's ranges summed here and across databases by the spread.
+        let mut out: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for r in conn
             .query(
-                "SELECT dataset, count(*), count(*) FILTER (WHERE unconverted)
-                   FROM lake_row GROUP BY dataset",
+                "SELECT dataset, coalesce(partition, dataset), count(*),
+                        count(*) FILTER (WHERE unconverted)
+                   FROM lake_row GROUP BY 1, 2",
                 &[],
             )
             .map_err(unavailable)?
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<_, String>(0),
-                    (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
-                )
-            })
-            .collect())
+        {
+            if !served(&r.get::<_, String>(1)) {
+                continue;
+            }
+            let at = out.entry(r.get(0)).or_default();
+            at.0 += r.get::<_, i64>(2) as u64;
+            at.1 += r.get::<_, i64>(3) as u64;
+        }
+        Ok(out)
     }
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         // Read from lake_row_unconverted, which holds only these rows
         // (migration 6), each counted while it is its row key's version in
         // force (ruling 1006 (c)).
-        Ok(self
-            .conn()?
+        let mut conn = self.conn()?;
+        let superseded = self.superseded(&mut *conn)?;
+        Ok(conn
             .query(
                 &format!(
                     "SELECT r.dataset, count(*) FROM lake_row r
-                      WHERE r.unconverted AND NOT {SUPERSEDED}
+                      WHERE r.unconverted AND NOT {superseded}
                       GROUP BY r.dataset"
                 ),
                 &[],
@@ -1858,12 +3366,13 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
+    fn lowest_kept(&self, partition: &str) -> Result<Option<u64>> {
         let found: Option<i64> = self
             .conn()?
             .query_one(
-                "SELECT min(sequence) FROM lake_row WHERE dataset = $1",
-                &[&dataset],
+                "SELECT min(sequence) FROM lake_row
+                  WHERE dataset = $2 AND (partition = $1 OR (partition IS NULL AND dataset = $1))",
+                &[&partition, &crate::range::dataset_of(partition)],
             )
             .map_err(unavailable)?
             .get(0);
@@ -2034,6 +3543,10 @@ impl Store for PostgresStore {
         why: &str,
         now_ns: i64,
     ) -> Result<u64> {
+        let several = self.groups.several();
+        if !several {
+            self.owned(dataset)?;
+        }
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -2044,43 +3557,129 @@ impl Store for PostgresStore {
         // version is recorded between finding a key left with none and
         // counting it out of the rows in force (contract v29, ruling 619
         // (2); migration 8).
-        let held = tx
-            .query_opt(
-                "SELECT epoch FROM lake_partition WHERE dataset = $1 FOR UPDATE",
-                &[&dataset],
+        // Every range of the dataset held as a batch holds it (step 3d).
+        lock_dataset(&mut tx, dataset)?;
+        let partitions = partitions_of(&mut tx, &[dataset.to_string()])?;
+        // With several groups, each group's own ranges, as this database's
+        // rows name them (step 3d; section 6.4): a dataset whose ranges sit
+        // in several groups and databases has each range's retention kept
+        // by its own writer, in the database where it is read.
+        let mut ours: Vec<String> = Vec::new();
+        for held in tx
+            .query(
+                "SELECT dataset, epoch, writer_group FROM lake_partition
+                  WHERE dataset = ANY($1) ORDER BY dataset FOR UPDATE",
+                &[&partitions],
             )
-            .map_err(unavailable)?;
-        if let Some(held) = held {
-            self.fence.admits(held.get::<_, i64>(0) as u64)?;
+            .map_err(unavailable)?
+        {
+            let partition: String = held.get(0);
+            if several {
+                let group = self.group_named(&partition, held.get(2));
+                if group != self.groups.mine() {
+                    // A lineage's range a move copied here, read where it
+                    // stays: its copies go by the same retention, with it.
+                    if !self.serves(&partition, held.get(2)) {
+                        ours.push(partition);
+                    }
+                    continue;
+                }
+            }
+            self.fence.admits(held.get::<_, i64>(1) as u64)?;
+            ours.push(partition);
+        }
+        if several && ours.is_empty() {
+            return Ok(0);
         }
         // The rows removed, and the row keys left with no version kept: a
-        // key whose later version stays is still in force at it.
-        let gone = tx
-            .query_one(
-                "WITH gone AS (
-                    DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2
-                    RETURNING data_type, row_key, sequence)
-                 SELECT (SELECT count(*) FROM gone), (SELECT max(sequence) FROM gone),
-                        (SELECT count(*)
-                           FROM (SELECT DISTINCT data_type, row_key FROM gone) g
-                          WHERE NOT EXISTS (
-                                SELECT 1 FROM lake_row k
-                                 WHERE k.dataset = $1 AND k.data_type = g.data_type
-                                   AND k.row_key = g.row_key AND k.recorded_at_ns >= $2))",
-                &[&dataset, &recorded_before_ns],
+        // key whose later version stays is still in force at it. Each range
+        // its own: its last row removed, and its keys gone where their last
+        // version was. With several groups, only this group's ranges' rows,
+        // a key kept where another range keeps any version of it.
+        let (only, kept) = if several {
+            (
+                "AND coalesce(partition, dataset) = ANY($3)",
+                "(k.recorded_at_ns >= $2 OR NOT coalesce(k.partition, k.dataset) = ANY($3))",
             )
-            .map_err(unavailable)?;
-        let removed = gone.get::<_, i64>(0) as u64;
-        let last_gone: Option<i64> = gone.get(1);
-        let keys_gone = gone.get::<_, i64>(2);
-        if removed > 0 {
+        } else {
+            ("", "k.recorded_at_ns >= $2")
+        };
+        let sql = format!(
+            "WITH gone AS (
+                DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2 {only}
+                RETURNING coalesce(partition, dataset) AS partition, data_type, row_key,
+                          sequence, version),
+             per_key AS (
+                SELECT DISTINCT ON (data_type, row_key) partition, data_type, row_key
+                  FROM gone ORDER BY data_type, row_key, version DESC),
+             keys_gone AS (
+                SELECT g.partition, count(*) AS n FROM per_key g
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM lake_row k
+                        WHERE k.dataset = $1 AND k.data_type = g.data_type
+                          AND k.row_key = g.row_key AND {kept})
+                 GROUP BY g.partition),
+             rows_gone AS (
+                SELECT partition, count(*) AS n, max(sequence) AS last FROM gone
+                 GROUP BY partition)
+             SELECT r.partition, r.n, r.last, coalesce(k.n, 0)
+               FROM rows_gone r LEFT JOIN keys_gone k USING (partition)"
+        );
+        let gone = if several {
+            tx.query(&sql, &[&dataset, &recorded_before_ns, &ours])
+        } else {
+            tx.query(&sql, &[&dataset, &recorded_before_ns])
+        }
+        .map_err(unavailable)?;
+        let mut removed = 0u64;
+        for range in &gone {
+            let partition: String = range.get(0);
+            removed += range.get::<_, i64>(1) as u64;
+            let last_gone: Option<i64> = range.get(2);
+            let keys_gone = range.get::<_, i64>(3);
             // The log reaches no lower than the rows removed (step 3a): a
             // follower behind them reloads the partition at its head.
             tx.execute(
                 "UPDATE lake_partition SET in_force = greatest(in_force - $2, 0),
                         kept_from = greatest(kept_from, $3)
                   WHERE dataset = $1",
-                &[&dataset, &keys_gone, &(last_gone.unwrap_or(0) + 1)],
+                &[&partition, &keys_gone, &(last_gone.unwrap_or(0) + 1)],
+            )
+            .map_err(unavailable)?;
+        }
+        if removed > 0 {
+            // `lake_latest` kept with the rows (step 3d): a key whose latest
+            // version went is gone whole, its earlier versions recorded
+            // before it; a key whose version in force went (a rate's, by
+            // published time) is in force at the one left that takes it.
+            tx.execute(
+                "DELETE FROM lake_latest l
+                  WHERE l.dataset = $1
+                    AND NOT EXISTS (SELECT 1 FROM lake_row r
+                                     WHERE r.dataset = l.dataset AND r.data_type = l.data_type
+                                       AND r.row_key = l.row_key AND r.version = l.version)",
+                &[&dataset],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
+                "UPDATE lake_latest l
+                    SET (force_partition, force_sequence, force_version, force_published,
+                         force_valid_from, subject, kind, venue_id, interval_ns, latest_key,
+                         quality) =
+                        (SELECT coalesce(r.partition, r.dataset), r.sequence, r.version,
+                                r.published_at_ns, r.valid_from_ns, r.subject, r.kind,
+                                r.venue_id, r.interval_ns, r.latest_key, r.quality
+                           FROM lake_row r
+                          WHERE r.dataset = l.dataset AND r.data_type = l.data_type
+                            AND r.row_key = l.row_key
+                          ORDER BY coalesce(r.published_at_ns, 0) DESC, r.version DESC
+                          LIMIT 1)
+                  WHERE l.dataset = $1
+                    AND NOT EXISTS (SELECT 1 FROM lake_row f
+                                     WHERE f.dataset = l.dataset AND f.data_type = l.data_type
+                                       AND f.row_key = l.row_key
+                                       AND f.version = l.force_version)",
+                &[&dataset],
             )
             .map_err(unavailable)?;
             tx.execute(
@@ -2168,6 +3767,42 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let (types, row_keys): (Vec<i16>, Vec<String>) = keys.iter().cloned().unzip();
+        // One lateral probe a key, led by it, as the write path's own
+        // (`lake_latest_by_key`; the dataset named as no index takes it).
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT k.data_type, k.row_key, l.anchor
+                   FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+                  CROSS JOIN LATERAL (
+                        SELECT anchor FROM lake_latest
+                         WHERE row_key = k.row_key AND (dataset || '') = $1
+                           AND data_type = k.data_type
+                         LIMIT 1) AS l
+                  WHERE l.anchor IS NOT NULL",
+                &[&dataset, &types, &row_keys],
+            )
+            .map_err(unavailable)?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    (row.get::<_, i16>(0), row.get::<_, String>(1)),
+                    row.get::<_, i32>(2) as u16,
+                )
+            })
+            .collect())
+    }
+
     fn aliases(&self) -> Result<BTreeMap<String, String>> {
         Ok(self
             .conn()?
@@ -2202,12 +3837,14 @@ impl Store for PostgresStore {
     }
 
     fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>> {
-        let row = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
+        let row = conn
             .query_one(
                 "SELECT min(business_date)::text, max(business_date)::text FROM lake_row
-                  WHERE dataset = $1 AND business_date IS NOT NULL",
-                &[&dataset],
+                  WHERE dataset = $1 AND business_date IS NOT NULL
+                    AND (partition = ANY($2) OR partition IS NULL)",
+                &[&dataset, &partitions],
             )
             .map_err(unavailable)?;
         let first: Option<String> = row.get(0);
@@ -2235,12 +3872,14 @@ impl Store for PostgresStore {
                 .start()
                 .map_err(unavailable)?;
             let code = data_type.code();
+            let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
             let portal = tx
                 .bind(
                     "SELECT body FROM lake_row
                       WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                        AND (partition = ANY($4) OR partition IS NULL)
                       ORDER BY row_key, version",
-                    &[&dataset, &code, &cut_off],
+                    &[&dataset, &code, &cut_off, &partitions],
                 )
                 .map_err(unavailable)?;
             let mut choosing = crate::read::ByPublished::new(published_as_of_ns);
@@ -2264,12 +3903,14 @@ impl Store for PostgresStore {
             as_assessed(&mut out, &assessments, as_of_ns);
             return Ok(out);
         }
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                    AND (partition = ANY($4) OR partition IS NULL)
                   ORDER BY sequence",
-                &[&dataset, &data_type.code(), &cut_off],
+                &[&dataset, &data_type.code(), &cut_off, &partitions],
             )
             .map_err(unavailable)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -2303,16 +3944,18 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
         let portal = tx
             .bind(
                 "SELECT body FROM (
                      SELECT DISTINCT ON (row_key) body, sequence AS at_sequence
                        FROM lake_row
                       WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                        AND (partition = ANY($4) OR partition IS NULL)
                       ORDER BY row_key, COALESCE(published_at_ns, 0) DESC, version DESC
                  ) AS in_force
                  ORDER BY at_sequence",
-                &[&dataset, &code, &cut_off],
+                &[&dataset, &code, &cut_off, &partitions],
             )
             .map_err(unavailable)?;
         loop {
@@ -2341,12 +3984,14 @@ impl Store for PostgresStore {
         data_type: crate::row::DataType,
     ) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2
+                    AND (partition = ANY($3) OR partition IS NULL)
                   ORDER BY sequence",
-                &[&dataset, &data_type.code()],
+                &[&dataset, &data_type.code(), &partitions],
             )
             .map_err(unavailable)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -2375,21 +4020,43 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         // By the key, from where the last chunk ended: each chunk an index
         // range, never the dataset sorted again.
-        let rows = tx
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let mut rows = tx
             .query(
-                "SELECT data_type, body FROM lake_row
+                "SELECT data_type, body, sequence, row_key FROM lake_row
                   WHERE dataset = $1 AND sequence > $2
                     AND business_date = ANY($3::text[]::date[])
-                  ORDER BY sequence
+                    AND (partition = ANY($5) OR partition IS NULL)
+                  ORDER BY sequence, row_key
                   LIMIT $4",
                 &[
                     &dataset,
                     &(after as i64),
                     &dates,
                     &i64::try_from(most).unwrap_or(i64::MAX),
+                    &partitions,
                 ],
             )
             .map_err(unavailable)?;
+        // Two ranges split from one number on from the same sequence: a
+        // chunk ends after every row at its last sequence, never between
+        // them, as the next starts after that sequence (step 3d).
+        if rows.len() == most {
+            if let Some(last) = rows.last() {
+                let (at, key): (i64, String) = (last.get(2), last.get(3));
+                rows.extend(
+                    tx.query(
+                        "SELECT data_type, body, sequence, row_key FROM lake_row
+                          WHERE dataset = $1 AND sequence = $2 AND row_key > $3
+                            AND business_date = ANY($4::text[]::date[])
+                            AND (partition = ANY($5) OR partition IS NULL)
+                          ORDER BY row_key",
+                        &[&dataset, &at, &key, &dates, &partitions],
+                    )
+                    .map_err(unavailable)?,
+                );
+            }
+        }
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let code: i16 = row.get(0);
@@ -2413,8 +4080,9 @@ impl Store for PostgresStore {
         let mut tx = conn.transaction().map_err(unavailable)?;
         for amendment in amendments {
             tx.execute(
-                "INSERT INTO lake_closed_day (dataset, sequence, reason, closed_day, why, at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO lake_closed_day
+                        (dataset, sequence, reason, closed_day, why, at_ns, row_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))",
                 &[
                     &amendment.dataset,
                     &(amendment.sequence as i64),
@@ -2425,6 +4093,7 @@ impl Store for PostgresStore {
                         .map(|check| check.encode_to_vec()),
                     &amendment.why,
                     &amendment.at_ns,
+                    &amendment.row_key,
                 ],
             )
             .map_err(unavailable)?;
@@ -2447,8 +4116,8 @@ impl Store for PostgresStore {
     fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>> {
         self.conn()?
             .query(
-                "SELECT dataset, sequence, closed_day, why, at_ns FROM lake_closed_day
-                  ORDER BY amendment_id",
+                "SELECT dataset, sequence, closed_day, why, at_ns, coalesce(row_key, '')
+                   FROM lake_closed_day ORDER BY amendment_id",
                 &[],
             )
             .map_err(unavailable)?
@@ -2470,6 +4139,8 @@ impl Store for PostgresStore {
             .read_only(true)
             .start()
             .map_err(unavailable)?;
+        let superseded = self.superseded(&mut tx)?;
+        let served = self.served_everywhere(&mut tx)?;
         let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         for row in tx
             .query(
@@ -2478,29 +4149,53 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?
         {
-            counts.insert(row.get::<_, String>(0), (row.get::<_, i64>(1) as u64, 0, 0));
+            // A dataset's ranges summed (step 3d), each where it is read.
+            let partition: String = row.get(0);
+            if served.as_ref().is_some_and(|served| !served(&partition)) {
+                continue;
+            }
+            counts
+                .entry(crate::range::dataset_of(&partition).to_string())
+                .or_default()
+                .0 += row.get::<_, i64>(1) as u64;
         }
-        for row in tx
-            .query(
-                &format!(
-                    "SELECT r.dataset,
-                        count(*) FILTER (WHERE e.state = 2),
-                        count(*) FILTER (WHERE e.state = 3)
-                   FROM (SELECT dataset, sequence, max(state) AS state
-                           FROM (SELECT dataset, sequence, quality AS state
-                                   FROM lake_row WHERE quality IN (2, 3)
-                                 UNION ALL
-                                 SELECT dataset, sequence, state
-                                   FROM lake_quality_assessment) flagged
-                          GROUP BY dataset, sequence) e
-                   JOIN lake_row r ON r.dataset = e.dataset AND r.sequence = e.sequence
-                  WHERE NOT {SUPERSEDED}
-                  GROUP BY r.dataset"
-                ),
-                &[],
+        // Once `lake_latest` holds every key (step 3d), a flagged row or an
+        // escalation counts where its version is its key's in force there:
+        // no row's every month read to find it.
+        let flagged = if superseded == SUPERSEDED_NOW {
+            "SELECT l.dataset,
+                    count(*) FILTER (WHERE e.state = 2),
+                    count(*) FILTER (WHERE e.state = 3)
+               FROM (SELECT dataset, row_key, version, max(state) AS state
+                       FROM (SELECT dataset, row_key, version, quality AS state
+                               FROM lake_row WHERE quality IN (2, 3)
+                             UNION ALL
+                             SELECT dataset, row_key, version, state
+                               FROM lake_quality_assessment) flagged
+                      GROUP BY dataset, row_key, version) e
+               JOIN lake_latest l ON l.dataset = e.dataset AND l.row_key = e.row_key
+                                 AND l.force_version = e.version
+              GROUP BY l.dataset"
+                .to_string()
+        } else {
+            format!(
+                "SELECT r.dataset,
+                    count(*) FILTER (WHERE e.state = 2),
+                    count(*) FILTER (WHERE e.state = 3)
+               FROM (SELECT dataset, sequence, row_key, max(state) AS state
+                       FROM (SELECT dataset, sequence, row_key, quality AS state
+                               FROM lake_row WHERE quality IN (2, 3)
+                             UNION ALL
+                             SELECT dataset, sequence, row_key, state
+                               FROM lake_quality_assessment) flagged
+                      GROUP BY dataset, sequence, row_key) e
+               JOIN lake_row r ON r.dataset = e.dataset AND r.sequence = e.sequence
+                              AND r.row_key = e.row_key
+              WHERE NOT {superseded}
+              GROUP BY r.dataset"
             )
-            .map_err(unavailable)?
-        {
+        };
+        for row in tx.query(&flagged, &[]).map_err(unavailable)? {
             let dataset = row.get::<_, String>(0);
             let (suspicious, invalid) = (row.get::<_, i64>(1) as u64, row.get::<_, i64>(2) as u64);
             let count = counts.entry(dataset).or_default();
@@ -2518,8 +4213,36 @@ impl Store for PostgresStore {
         // migration 6) or re-checked since (lake_closed_day) can count, so
         // only those are read, never every row kept (ruling 816); each while
         // it is its row key's version in force (ruling 1006 (c)).
-        Ok(self
-            .conn()?
+        let mut conn = self.conn()?;
+        let superseded = self.superseded(&mut *conn)?;
+        // The re-checks of rows recorded unflagged and in force: once
+        // `lake_latest` holds every key (step 3d), each found by its key's
+        // row there, and its row read in its own range's month alone.
+        let rechecked = if superseded == SUPERSEDED_NOW {
+            "(SELECT DISTINCT ON (c.dataset, c.sequence, c.row_key) c.dataset, c.reason
+                FROM lake_closed_day c
+                JOIN lake_latest l ON l.dataset = c.dataset AND l.force_sequence = c.sequence
+                                  AND l.row_key = coalesce(c.row_key, l.row_key)
+               CROSS JOIN LATERAL (
+                     SELECT 1 FROM lake_row r
+                      WHERE r.partition = l.force_partition
+                        AND r.valid_from_ns = l.force_valid_from
+                        AND r.dataset = l.dataset AND r.sequence = l.force_sequence
+                        AND r.row_key = l.row_key AND r.closed_reason = 0
+                      LIMIT 1) r
+               ORDER BY c.dataset, c.sequence, c.row_key, c.amendment_id DESC)"
+                .to_string()
+        } else {
+            format!(
+                "(SELECT DISTINCT ON (r.dataset, r.sequence, r.row_key) c.dataset, c.reason
+                    FROM lake_closed_day c
+                    JOIN lake_row r ON r.dataset = c.dataset AND r.sequence = c.sequence
+                                   AND coalesce(c.row_key, r.row_key) = r.row_key
+                   WHERE r.closed_reason = 0 AND NOT {superseded}
+                   ORDER BY r.dataset, r.sequence, r.row_key, c.amendment_id DESC)"
+            )
+        };
+        Ok(conn
             .query(
                 &format!(
                     "SELECT dataset,
@@ -2531,14 +4254,11 @@ impl Store for PostgresStore {
                           LEFT JOIN LATERAL (
                                SELECT c.reason FROM lake_closed_day c
                                 WHERE c.dataset = r.dataset AND c.sequence = r.sequence
+                                  AND coalesce(c.row_key, r.row_key) = r.row_key
                                 ORDER BY c.amendment_id DESC LIMIT 1) a ON true
-                         WHERE r.closed_reason <> 0 AND NOT {SUPERSEDED}
+                         WHERE r.closed_reason <> 0 AND NOT {superseded}
                         UNION ALL
-                        (SELECT DISTINCT ON (c.dataset, c.sequence) c.dataset, c.reason
-                           FROM lake_closed_day c
-                           JOIN lake_row r ON r.dataset = c.dataset AND r.sequence = c.sequence
-                          WHERE r.closed_reason = 0 AND NOT {SUPERSEDED}
-                          ORDER BY c.dataset, c.sequence, c.amendment_id DESC)
+                        {rechecked}
                    ) flagged
                   GROUP BY dataset"
                 ),
@@ -2557,12 +4277,14 @@ impl Store for PostgresStore {
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
+        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
         let rows = conn
             .query(
                 "SELECT data_type, body FROM lake_row
                   WHERE dataset = $1 AND row_key = $2 AND version = $3
+                    AND (partition = ANY($4) OR partition IS NULL)
                   ORDER BY sequence",
-                &[&dataset, &row_key, &(version as i64)],
+                &[&dataset, &row_key, &(version as i64), &partitions],
             )
             .map_err(unavailable)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -2637,14 +4359,34 @@ impl Store for PostgresStore {
             &[&meridian_changes::origin()],
         )
         .map_err(unavailable)?;
-        let epoch: i64 = conn
-            .query_one(
-                "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
-                &[],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        Ok(self.fence.adopt_once(epoch as u64))
+        if !self.groups.several() {
+            let epoch: i64 = conn
+                .query_one(
+                    "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .get(0);
+            return Ok(self.fence.adopt_once(epoch as u64));
+        }
+        // Several groups (step 3d; section 6.1): the group's own epoch,
+        // where every dataset it owns holds it and no other group's does;
+        // else its datasets were assigned to it -- the count changed -- and
+        // it takes them over, so the writer that held them is fenced.
+        let _alone = self.adopting.lock().expect("adopting poisoned");
+        if self.fence.epoch() != 0 {
+            return Ok(self.fence.epoch());
+        }
+        let (anchor, mine, others) = epochs_of(&mut *conn, self.groups)?;
+        drop(conn);
+        match anchor {
+            Some(epoch) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                Ok(self.fence.adopt_once(epoch))
+            }
+            _ => self.take_over(&meridian_changes::TookOver::unnamed(
+                meridian_changes::groups::ASSIGNED,
+            )),
+        }
     }
 
     fn epoch(&self) -> u64 {
@@ -2655,9 +4397,15 @@ impl Store for PostgresStore {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // A deposed writer stopped mid-batch holds the rows it took.
-        meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
-            .map_err(unavailable)?;
-        let epoch = raise(&mut tx, by).map_err(unavailable)?;
+        if self.groups.several() {
+            // Only its own group's deposed writer, by its datasets' locks:
+            // another group's writer holds its own.
+            end_deposed_holders(&mut tx, self.groups).map_err(unavailable)?;
+        } else {
+            meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
+                .map_err(unavailable)?;
+        }
+        let epoch = raise(&mut tx, by, Some(self.groups)).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
@@ -2669,8 +4417,18 @@ impl Store for PostgresStore {
     }
 
     fn head_epoch(&self) -> Result<u64> {
-        let epoch: i64 = self
-            .conn()?
+        let mut conn = self.conn()?;
+        if !self.groups.holds_control() {
+            // A group past the first: its own row's (step 3d).
+            return Ok(conn
+                .query_opt(
+                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1",
+                    &[&(self.groups.mine() as i32)],
+                )
+                .map_err(unavailable)?
+                .map_or(0, |row| row.get::<_, i64>(0) as u64));
+        }
+        let epoch: i64 = conn
             .query_one(
                 "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
                 &[],
@@ -2775,8 +4533,10 @@ impl Store for PostgresStore {
             for row in tx
                 .query(
                     "SELECT sequence, epoch, origin, recorded_at_ns, data_type, body, digest FROM lake_row
-                      WHERE dataset = $1 AND sequence > $2 AND sequence <= $3 ORDER BY sequence",
-                    &[&partition, &(from as i64), &until],
+                      WHERE dataset = $4 AND (partition = $1 OR (partition IS NULL AND dataset = $1))
+                        AND sequence > $2 AND sequence <= $3
+                      ORDER BY sequence",
+                    &[&partition, &(from as i64), &until, &crate::range::dataset_of(partition)],
                 )
                 .map_err(|e| failed(unavailable(e)))?
             {
@@ -2798,8 +4558,14 @@ impl Store for PostgresStore {
                     "SELECT first_sequence, last_sequence, subjects, fields, readers, at_ns, epoch,
                             origin
                        FROM lake_served
-                      WHERE dataset = $1 AND last_sequence > $2 AND last_sequence <= $3",
-                    &[&partition, &(from as i64), &until],
+                      WHERE dataset = $4 AND coalesce(partition, dataset) = $1
+                        AND last_sequence > $2 AND last_sequence <= $3",
+                    &[
+                        &partition,
+                        &(from as i64),
+                        &until,
+                        &crate::range::dataset_of(partition),
+                    ],
                 )
                 .map_err(|e| failed(unavailable(e)))?
             {
@@ -2841,41 +4607,80 @@ impl Store for PostgresStore {
 }
 
 /// Raise the epoch of the `control` partition and of every dataset's head
-/// in `tx`, and record who raised it and why (step 3b, `WriterTookOver`):
-/// answer the epoch. What a takeover does, and a writer on a new database
-/// timeline (contract v30, stage C).
+/// in `tx` -- with several writer groups (step 3d), of `groups`' group's
+/// datasets and its own epoch alone, past every epoch the lake holds; with
+/// `None`, of every group's, as a new database timeline does -- and record
+/// who raised it and why (step 3b, `WriterTookOver`): answer the epoch. What
+/// a takeover does, and a writer on a new database timeline (contract v30,
+/// stage C).
 fn raise(
     tx: &mut Transaction<'_>,
     by: &meridian_changes::TookOver,
+    groups: Option<meridian_changes::groups::Groups>,
 ) -> std::result::Result<u64, postgres::Error> {
     // The control partition first: a dataset a deposed writer is beginning
     // holds it shared until it commits, and is then raised with the rest.
     let control: i64 = tx
         .query_one(
-            "UPDATE lake_change_head SET epoch = epoch + 1 WHERE partition = 'control'
-             RETURNING epoch",
+            "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR UPDATE",
             &[],
         )?
         .get(0);
-    let highest: Option<i64> = tx
-        .query_one("SELECT max(epoch) FROM lake_partition", &[])?
+    let highest: i64 = tx
+        .query_one(
+            "SELECT greatest(coalesce((SELECT max(epoch) FROM lake_partition), 0),
+                             coalesce((SELECT max(epoch) FROM lake_writer_group), 0))",
+            &[],
+        )?
         .get(0);
-    let epoch = control.max(highest.unwrap_or(0) + 1);
+    let epoch = control.max(highest) + 1;
+    let datasets: Vec<String> = tx
+        .query(
+            "SELECT dataset, writer_group FROM lake_partition ORDER BY dataset FOR UPDATE",
+            &[],
+        )?
+        .iter()
+        .filter(|row| groups.is_none_or(|groups| owned_in_row(groups, row)))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let holds_control = groups.is_none_or(|groups| groups.holds_control());
+    if holds_control {
+        tx.execute(
+            "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
+            &[&epoch],
+        )?;
+    }
     tx.execute(
-        "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
-        &[&epoch],
+        "UPDATE lake_partition SET epoch = $1 WHERE dataset = ANY($2)",
+        &[&epoch, &datasets],
     )?;
-    tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])?;
+    match groups {
+        // Every group's own epoch with the rest: each writer past the first
+        // is fenced, and takes its datasets over again as it starts.
+        None => {
+            tx.execute("UPDATE lake_writer_group SET epoch = $1", &[&epoch])?;
+        }
+        Some(groups) if !groups.holds_control() => {
+            tx.execute(
+                "INSERT INTO lake_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+                 ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
+                &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+            )?;
+        }
+        Some(_) => {}
+    }
+    let mut partitions = datasets;
+    if holds_control {
+        partitions.push(meridian_changes::CONTROL.to_string());
+    }
     // Who raised it and why, in the same transaction (step 3b).
     tx.execute(
         "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-         SELECT $1, $2,
-                array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control'),
-                $3, $4, $5
-           FROM lake_partition",
+         VALUES ($1, $2, $3, $4, $5, $6)",
         &[
             &epoch,
             &by.member,
+            &partitions,
             &by.why,
             &meridian_changes::origin(),
             &by.at_ns,
@@ -2883,13 +4688,6 @@ fn raise(
     )?;
     // And in the control partition, in the same transaction (contract v30,
     // stage D): the record the conductor reads.
-    let partitions: Vec<String> = tx
-        .query_one(
-            "SELECT array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control')
-               FROM lake_partition",
-            &[],
-        )?
-        .get(0);
     log_record(
         tx,
         &meridian_changes::records::Record::TookOver(meridian_changes::records::took_over(
@@ -2901,6 +4699,107 @@ fn raise(
         by.at_ns,
     )?;
     Ok(epoch as u64)
+}
+
+/// Whether `groups`' group owns the range in `row` (its ID, then its
+/// `writer_group`): the group the row names, else its dataset's rendezvous
+/// owner (step 3d; ruled 2026-11-14). Read from the row, never the member's
+/// view alone, so an epoch is raised only on what the group owns now.
+fn owned_in_row(groups: meridian_changes::groups::Groups, row: &postgres::Row) -> bool {
+    let partition: String = row.get(0);
+    let named = row.get::<_, Option<i32>>(1).map(|group| group as u32);
+    if groups.several() {
+        groups.assign(&partition, named);
+    }
+    groups.owner_by(&partition, crate::range::dataset_of(&partition)) == groups.mine()
+}
+
+/// `groups`' group's own epoch where it has one -- the control partition's
+/// for group 0, its row's past it -- the epochs of the datasets it owns,
+/// and every other group's epoch, its datasets' and its own.
+fn epochs_of(
+    client: &mut impl postgres::GenericClient,
+    groups: meridian_changes::groups::Groups,
+) -> Result<(Option<u64>, Vec<u64>, std::collections::BTreeSet<u64>)> {
+    let control: i64 = client
+        .query_one(
+            "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+            &[],
+        )
+        .map_err(unavailable)?
+        .get(0);
+    let mut others = std::collections::BTreeSet::new();
+    let mut anchor = None;
+    if groups.holds_control() {
+        anchor = Some(control as u64);
+    } else {
+        others.insert(control as u64);
+    }
+    for row in client
+        .query("SELECT writer_group, epoch FROM lake_writer_group", &[])
+        .map_err(unavailable)?
+    {
+        let (group, epoch): (i32, i64) = (row.get(0), row.get(1));
+        if group as u32 == groups.mine() {
+            anchor = Some(epoch as u64);
+        } else {
+            others.insert(epoch as u64);
+        }
+    }
+    let mut mine = Vec::new();
+    for row in client
+        .query(
+            "SELECT dataset, writer_group, epoch FROM lake_partition",
+            &[],
+        )
+        .map_err(unavailable)?
+    {
+        let epoch: i64 = row.get(2);
+        if owned_in_row(groups, &row) {
+            mine.push(epoch as u64);
+        } else {
+            others.insert(epoch as u64);
+        }
+    }
+    Ok((anchor, mine, others))
+}
+
+/// End every other session holding a dataset lock of `groups`' group before
+/// its takeover raises their epoch (step 3d): its own deposed writer stopped
+/// mid-batch, never another group's.
+fn end_deposed_holders(
+    tx: &mut Transaction<'_>,
+    groups: meridian_changes::groups::Groups,
+) -> std::result::Result<i64, postgres::Error> {
+    // The lock of each dataset a range of the group's is of (a dataset's
+    // batches take it, whichever group writes them).
+    let keys: Vec<i64> = tx
+        .query("SELECT dataset, writer_group FROM lake_partition", &[])?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| crate::range::dataset_of(&row.get::<_, String>(0)).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .iter()
+        .map(|dataset| dataset_lock(dataset))
+        .collect();
+    let ended: i64 = tx
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, $2))
+               FROM (SELECT DISTINCT l.pid
+                       FROM pg_locks l
+                      WHERE l.locktype = 'advisory' AND l.granted
+                        AND l.pid <> pg_backend_pid()
+                        AND ((l.classid::bigint << 32) | l.objid::bigint) = ANY($1)) AS held",
+            &[&keys, &meridian_changes::DEPOSED_GONE_WITHIN_MS],
+        )?
+        .get(0);
+    if ended > 0 {
+        tracing::warn!(
+            sessions = ended,
+            "ended this writer group's deposed writer's sessions still holding its datasets' locks"
+        );
+    }
+    Ok(ended)
 }
 
 /// A finding of the lake's, kept for the first time, appended to its
@@ -2954,8 +4853,9 @@ fn scrub_rows(
     loop {
         let done = conn.execute(
             "UPDATE lake_row SET digest = sha256(body)
-                      WHERE (dataset, sequence) IN (
-                          SELECT dataset, sequence FROM lake_row WHERE digest IS NULL LIMIT 2000)",
+                      WHERE (dataset, sequence, row_key) IN (
+                          SELECT dataset, sequence, row_key FROM lake_row
+                           WHERE digest IS NULL LIMIT 2000)",
             &[],
         )?;
         filled += done;
@@ -2969,8 +4869,9 @@ fn scrub_rows(
         .get::<_, i64>(0) as u64;
     let findings = conn
         .query(
-            "SELECT dataset, min(sequence), min(recorded_at_ns) FROM lake_row
-                  WHERE digest <> sha256(body) GROUP BY dataset ORDER BY dataset",
+            "SELECT coalesce(partition, dataset) AS at, min(sequence), min(recorded_at_ns)
+                   FROM lake_row
+                  WHERE digest <> sha256(body) GROUP BY at ORDER BY at",
             &[],
         )?
         .iter()
@@ -3031,4 +4932,504 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
     // statement_timeout is answered with this component's own refusal for
     // load (the resilience spec's section 10a).
     StoreError::Unavailable(meridian_changes::serving::described(&failed))
+}
+
+/// Where a range's head is, over the lake's several databases (step 3d;
+/// ruled 2026-11-14: each range is written and read where its head is).
+impl PostgresStore {
+    /// Every database's store, this one's among them.
+    pub fn link_databases(&self, stores: &[std::sync::Arc<PostgresStore>]) {
+        let _ = self
+            .linked
+            .set(stores.iter().map(std::sync::Arc::downgrade).collect());
+    }
+
+    /// The store of writer group `group`'s home database, where several.
+    fn home_of(&self, group: u32) -> Option<std::sync::Arc<PostgresStore>> {
+        let linked = self.linked.get().filter(|linked| linked.len() > 1)?;
+        linked
+            .get(meridian_changes::databases::of_group(group, linked.len() as u32) as usize)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Whether `partition`'s group's home database, not this one, holds it
+    /// at or past this one's head, named that group: moved home, or never
+    /// here. Once so, always so -- only a move home settles it.
+    fn headed_home(&self, partition: &str, group: u32) -> bool {
+        let Some(home) = self.home_of(group) else {
+            return true;
+        };
+        if std::ptr::eq(home.as_ref(), self) {
+            return false;
+        }
+        if self
+            .away_settled
+            .lock()
+            .expect("settled poisoned")
+            .contains(partition)
+        {
+            return true;
+        }
+        let here = match self.range_tip(partition) {
+            Ok(tip) => tip.map_or(0, |tip| tip.head),
+            Err(_) => return true,
+        };
+        let count = self.groups.count();
+        let dataset = crate::range::dataset_of(partition);
+        let there = match home.range_tip(partition) {
+            Ok(tip) => tip.filter(|tip| {
+                tip.writer_group
+                    .filter(|named| *named < count)
+                    .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                    == group
+            }),
+            Err(_) => return true,
+        };
+        let held = there.is_some_and(|tip| tip.head >= here) || here == 0;
+        if held && here > 0 {
+            self.away_settled
+                .lock()
+                .expect("settled poisoned")
+                .insert(partition.to_string());
+        }
+        held
+    }
+
+    /// Whether `partition`, this member's group's, standing at `here` in
+    /// this database, is to be written in another (the same-group fence):
+    /// away from home, its home holds it at or past `here`; at home,
+    /// another database holds it further on -- the database count was
+    /// raised and it is not moved home yet.
+    fn headed_elsewhere(&self, partition: &str, here: u64) -> bool {
+        let mine = self.groups.mine();
+        let Some(home) = self.home_of(mine) else {
+            return false;
+        };
+        if !std::ptr::eq(home.as_ref(), self) {
+            let count = self.groups.count();
+            let dataset = crate::range::dataset_of(partition);
+            return home.range_tip(partition).ok().flatten().is_some_and(|tip| {
+                !tip.closed
+                    && tip
+                        .writer_group
+                        .filter(|named| *named < count)
+                        .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                        == mine
+                    && tip.head >= here
+            });
+        }
+        if self
+            .home_settled
+            .lock()
+            .expect("settled poisoned")
+            .contains(partition)
+        {
+            return false;
+        }
+        let count = self.groups.count();
+        let dataset = crate::range::dataset_of(partition);
+        let linked = self.linked.get().map(Vec::as_slice).unwrap_or_default();
+        for other in linked.iter().filter_map(std::sync::Weak::upgrade) {
+            if std::ptr::eq(other.as_ref(), self) {
+                continue;
+            }
+            let ahead = other
+                .range_tip(partition)
+                .ok()
+                .flatten()
+                .is_some_and(|tip| {
+                    !tip.closed
+                        && tip
+                            .writer_group
+                            .filter(|named| *named < count)
+                            .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count))
+                            == mine
+                        && tip.head > here
+                });
+            if ahead {
+                return true;
+            }
+        }
+        self.home_settled
+            .lock()
+            .expect("settled poisoned")
+            .insert(partition.to_string());
+        false
+    }
+
+    /// The open ranges this database holds named writer group `group` (or
+    /// its dataset's rendezvous owner), with their heads.
+    pub fn open_ranges_of(&self, group: u32) -> Result<Vec<(String, u64)>> {
+        let count = self.groups.count();
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, head, writer_group FROM lake_partition WHERE closed_at IS NULL",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .filter(|row| {
+                let partition: String = row.get(0);
+                row.get::<_, Option<i32>>(2)
+                    .map(|named| named as u32)
+                    .filter(|named| *named < count)
+                    .unwrap_or_else(|| {
+                        meridian_changes::groups::owner(crate::range::dataset_of(&partition), count)
+                    })
+                    == group
+            })
+            .map(|row| (row.get(0), row.get::<_, i64>(1).max(0) as u64))
+            .collect())
+    }
+}
+
+/// A database past the first (step 3d; the resilience spec's section 6.4):
+/// what database 0 decided, copied into the database holding the rows it is
+/// about, and what this database's own control journal recorded, relayed
+/// into database 0's.
+impl PostgresStore {
+    /// Whether this store's writer group leads its database of `count`
+    /// (step 3d): the lowest group writing there, which follows that
+    /// database's timeline and raises every epoch in it, as group 0 does
+    /// database 0's.
+    pub fn with_databases(mut self, count: u32) -> Self {
+        self.leads_database =
+            meridian_changes::databases::leads(self.groups.mine(), count) && count > 1;
+        self.databases = count.max(1);
+        self
+    }
+
+    /// The same store, as database `d` of the lake's (step 3d; section
+    /// 6.4): its reads answer the ranges whose group writes it.
+    pub fn in_database(mut self, d: u32) -> Self {
+        self.database = d;
+        self
+    }
+
+    /// Every partition of `datasets` a read here answers (step 3d; section
+    /// 6.4): with one database, every one; with several, those whose group
+    /// -- its row's `writer_group`, else its dataset's -- writes this
+    /// database. A range moved to another database is read there, and the
+    /// ranges its lineage copied here are read where they stay.
+    fn served_partitions(
+        &self,
+        client: &mut impl GenericClient,
+        datasets: &[String],
+    ) -> Result<Vec<String>> {
+        let every = partitions_of(client, datasets)?;
+        if self.databases <= 1 {
+            return Ok(every);
+        }
+        let named: BTreeMap<String, Option<i32>> = client
+            .query(
+                "SELECT dataset, writer_group FROM lake_partition WHERE dataset = ANY($1)",
+                &[&every],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        Ok(every
+            .into_iter()
+            .filter(|partition| self.serves(partition, named.get(partition).copied().flatten()))
+            .collect())
+    }
+
+    /// The writer group of `partition` as this database's row names it
+    /// (`named`), else its dataset's rendezvous owner (step 3d).
+    fn group_named(&self, partition: &str, named: Option<i32>) -> u32 {
+        let count = self.groups.count();
+        named
+            .map(|group| group as u32)
+            .filter(|group| *group < count)
+            .unwrap_or_else(|| {
+                meridian_changes::groups::owner(crate::range::dataset_of(partition), count)
+            })
+    }
+
+    /// Whether a read here answers `partition`, its row naming `named`:
+    /// where its group writes this database.
+    fn serves(&self, partition: &str, named: Option<i32>) -> bool {
+        let group = self.group_named(partition, named);
+        meridian_changes::databases::of_group(group, self.databases) == self.database
+            // Held here, its group's home not at or past it yet: its head
+            // is here (step 3d; ruled 2026-11-14).
+            || !self.headed_home(partition, group)
+    }
+
+    /// Whether a read here answers each partition, of every dataset (step
+    /// 3d; section 6.4): `None` with one database, where it answers every
+    /// one. A count of what the lake holds counts these alone, so a range a
+    /// move copied to another database is counted once, where it is read.
+    fn served_everywhere(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<Option<impl Fn(&str) -> bool + '_>> {
+        if self.databases <= 1 {
+            return Ok(None);
+        }
+        let named: BTreeMap<String, Option<i32>> = client
+            .query("SELECT dataset, writer_group FROM lake_partition", &[])
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        Ok(Some(move |partition: &str| {
+            self.serves(partition, named.get(partition).copied().flatten())
+        }))
+    }
+
+    /// Every alias this database keeps: `(replaced, stays, heard_at_ns)`.
+    pub fn alias_rows(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT replaced, stays, heard_at_ns FROM lake_alias ORDER BY replaced",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// Aliases database 0 kept, copied here where missing: answers how many
+    /// were missing. Idempotent; logs nothing, as database 0 logged each.
+    pub fn copy_aliases(&self, aliases: &[(String, String, i64)]) -> Result<u64> {
+        if aliases.is_empty() {
+            return Ok(0);
+        }
+        let (replaced, rest): (Vec<&str>, Vec<(&str, i64)>) = aliases
+            .iter()
+            .map(|(r, s, at)| (r.as_str(), (s.as_str(), *at)))
+            .unzip();
+        let (stays, at): (Vec<&str>, Vec<i64>) = rest.into_iter().unzip();
+        let copied = self
+            .conn()?
+            .execute(
+                "INSERT INTO lake_alias (replaced, stays, heard_at_ns)
+                 SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[])
+                 ON CONFLICT (replaced) DO NOTHING",
+                &[&replaced, &stays, &at],
+            )
+            .map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Closed-day re-checks database 0 kept, copied here where missing (the
+    /// same row, re-check, reason and time): answers how many were missing.
+    pub fn copy_amendments(&self, amendments: &[ClosedDayAmendment]) -> Result<u64> {
+        if amendments.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut copied = 0;
+        for amendment in amendments {
+            copied += tx
+                .execute(
+                    "INSERT INTO lake_closed_day
+                            (dataset, sequence, reason, closed_day, why, at_ns, row_key)
+                     SELECT $1, $2, $3, $4, $5, $6, NULLIF($7, '')
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM lake_closed_day
+                             WHERE dataset = $1 AND sequence = $2 AND at_ns = $6 AND why = $5
+                               AND coalesce(row_key, '') = $7)",
+                    &[
+                        &amendment.dataset,
+                        &(amendment.sequence as i64),
+                        &closed_reason(amendment.closed_day.as_ref()),
+                        &amendment
+                            .closed_day
+                            .as_ref()
+                            .map(|check| check.encode_to_vec()),
+                        &amendment.why,
+                        &amendment.at_ns,
+                        &amendment.row_key,
+                    ],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Quality assessments database 0 kept, copied here where missing:
+    /// answers how many were missing.
+    pub fn copy_assessments(&self, assessments: &[Assessment]) -> Result<u64> {
+        if assessments.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut copied = 0;
+        for a in assessments {
+            let reasons: Vec<i16> = a.reasons.iter().map(|r| *r as i16).collect();
+            copied += tx
+                .execute(
+                    "INSERT INTO lake_quality_assessment
+                            (dataset, sequence, row_key, version, state, reasons, by_instance, at_ns)
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM lake_quality_assessment
+                             WHERE dataset = $1 AND sequence = $2 AND row_key = $3
+                               AND version = $4 AND by_instance = $7 AND at_ns = $8)",
+                    &[
+                        &a.dataset,
+                        &(a.sequence as i64),
+                        &a.row_key,
+                        &(a.version as i64),
+                        &(a.state as i16),
+                        &reasons,
+                        &a.by_instance,
+                        &a.at_ns,
+                    ],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(copied)
+    }
+
+    /// Every entry of this database's own control journal, in order: `(kind,
+    /// body, committed_at_ns)`. A database past the first keeps a short one
+    /// -- its writer groups' takeovers, its ranges' splits and moves, its
+    /// datasets' gaps -- which database 0's relays.
+    pub fn control_entries(&self) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT kind, body, committed_at_ns FROM lake_control_change ORDER BY sequence",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// `entries` from another database's control journal, each logged in
+    /// this one's where it holds none of the same kind and body, in order,
+    /// in one transaction under this writer's epoch: answers how many. A
+    /// record keeps its own times; only its place in this journal is new.
+    pub fn relay_control(&self, entries: &[(String, Vec<u8>, i64)]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let kinds: Vec<&str> = {
+            let mut kinds: Vec<&str> = entries.iter().map(|(k, _, _)| k.as_str()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            kinds
+        };
+        let held: std::collections::HashSet<(String, Vec<u8>)> = tx
+            .query(
+                "SELECT kind, body FROM lake_control_change WHERE kind = ANY($1)",
+                &[&kinds],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let body: Vec<u8> = row.get(1);
+                (row.get(0), meridian_changes::integrity::digest(&body))
+            })
+            .collect();
+        let owed: Vec<(&str, Vec<u8>, i64)> = entries
+            .iter()
+            .filter(|(kind, body, _)| {
+                !held.contains(&(kind.clone(), meridian_changes::integrity::digest(body)))
+            })
+            .map(|(kind, body, at)| (kind.as_str(), body.clone(), *at))
+            .collect();
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        self.log_control(&mut tx, &owed)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(owed.len())
+    }
+}
+
+/// Assignments (step 3d; sections 6.1 and 6.4): what each database's
+/// partitions are, and their writer groups recorded in this one's control
+/// partition.
+impl PostgresStore {
+    /// Each partition this database holds, with its epoch.
+    pub fn partition_epochs(&self) -> Result<Vec<(String, i64)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, epoch FROM lake_partition ORDER BY dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// `other`'s partitions' writer groups recorded in this store's control
+    /// partition where they changed: database 0's record of a database past
+    /// it.
+    pub fn record_assignments_of(
+        &self,
+        other: &PostgresStore,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        let held = other.partition_epochs()?;
+        self.record_assignments_for(&held, groups, at_ns)
+    }
+
+    /// Each of `held`'s partitions whose group the control partition last
+    /// recorded otherwise (none: group 0) recorded as `groups` assigns it.
+    fn record_assignments_for(
+        &self,
+        held: &[(String, i64)],
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // Each dataset's group as last recorded: none, group 0.
+        let mut recorded: BTreeMap<String, u32> = BTreeMap::new();
+        for row in tx
+            .query(
+                "SELECT body FROM lake_control_change WHERE kind = $1 ORDER BY sequence",
+                &[&crate::store::CONTROL_OWNER],
+            )
+            .map_err(unavailable)?
+        {
+            let body: Vec<u8> = row.get(0);
+            let owner =
+                meridian_domain::v1::PartitionOwner::decode(&body[..]).map_err(unreadable)?;
+            recorded.insert(owner.partition, owner.group);
+        }
+        let mut changed = Vec::new();
+        for (dataset, epoch) in held {
+            // A range is its dataset's group's.
+            let group = groups.owner(crate::range::dataset_of(dataset));
+            if recorded.get(dataset).copied().unwrap_or(0) != group {
+                let owner = meridian_domain::v1::PartitionOwner {
+                    component: "lake".into(),
+                    partition: dataset.clone(),
+                    group,
+                    writer: String::new(),
+                    epoch: (*epoch as u64).max(1),
+                };
+                changed.push((crate::store::CONTROL_OWNER, owner.encode_to_vec(), at_ns));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.log_control(&mut tx, &changed)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(changed.len())
+    }
 }

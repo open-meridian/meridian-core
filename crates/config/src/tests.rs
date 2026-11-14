@@ -1452,7 +1452,72 @@ async fn the_deployments_accounts_are_read_for_a_deployment_admin_with_what_desc
             None,
         )
         .await;
-    assert!(for_nobody.is_err(), "for nobody, nothing is answered");
+    let refused = for_nobody
+        .expect_err("for nobody, nothing is answered")
+        .to_string();
+    assert!(refused.contains("permission-denied"), "{refused}");
+}
+
+/// The book reads every account's record as itself, to place a new one by
+/// its owner label (step 3d; ReadAccountsForPlacement, ruled 2026-11-13):
+/// told by the bus identity it arrived on. The same unscoped read from any
+/// other instance is refused PERMISSION_DENIED.
+#[tokio::test]
+async fn the_book_reads_every_account_as_itself_and_no_one_else_reads_them_for_nobody() {
+    assert_eq!(
+        crate::service::book_beside("meridian-runtime-conductor").as_deref(),
+        Some("meridian-runtime-bor")
+    );
+    assert_eq!(
+        crate::service::book_beside("conductor-1").as_deref(),
+        Some("bor-1")
+    );
+    assert_eq!(crate::service::book_beside("dashboard-1"), None);
+    for (instance, answered) in [
+        (crate::service::BOOK, true),
+        ("oms-1", false),
+        ("snaptrade-1", false),
+    ] {
+        let h = harness(instance);
+        let fund = define(
+            &h,
+            DefineAccountRequest {
+                name: "Growth".into(),
+                owner: "Fund I".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let plain = account(&h, "Income").await;
+        let asked = h
+            .bus
+            .call(
+                ACCOUNTS,
+                "meridian.v1.AccountsRequest",
+                AccountsRequest {}.encode_to_vec(),
+                None,
+                None,
+            )
+            .await;
+        if answered {
+            let (_, bytes) = asked.expect("the book reads as itself");
+            let read = Accounts::decode(&bytes[..]).unwrap();
+            assert_eq!(
+                read.accounts,
+                [fund.clone(), plain.clone()],
+                "every account, owner included"
+            );
+        } else {
+            let refused = asked
+                .expect_err("an unscoped read from another instance")
+                .to_string();
+            assert!(
+                refused.contains("permission-denied"),
+                "{instance}: {refused}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

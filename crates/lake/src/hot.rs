@@ -377,9 +377,52 @@ pub struct HotStore {
     layer: Mutex<Layer>,
     /// The loader waits here for keys wanted.
     wake: Condvar,
+    /// Its member's writer group (step 3d): a dataset another group writes
+    /// is read from the record, since its commits never reach this layer.
+    groups: std::sync::RwLock<meridian_changes::groups::Groups>,
+    /// Each dataset's count of group changes as this layer last held it
+    /// (step 3d): what it held of one is let go once its ranges changed
+    /// group since, as another group may have written it meanwhile.
+    held_at: Mutex<HashMap<String, u64>>,
 }
 
 impl HotStore {
+    /// Its member writes for writer group `groups` (step 3d): only its own
+    /// datasets are answered from memory.
+    pub fn for_group(&self, groups: meridian_changes::groups::Groups) {
+        *self.groups.write().expect("groups poisoned") = groups;
+    }
+
+    /// Whether every one of `datasets` is this member's group's, so memory
+    /// holds what each committed.
+    fn holds(&self, datasets: &[String]) -> bool {
+        let groups = *self.groups.read().expect("groups poisoned");
+        // Every open range of each its group's (step 3d; ruling 2 of
+        // 2026-11-14): a dataset split across groups is read from the store.
+        if !groups.several() {
+            return true;
+        }
+        let mut held = true;
+        for dataset in datasets {
+            let dataset = crate::range::dataset_of(dataset);
+            if crate::service::whole_owner(groups, dataset) != Some(groups.mine()) {
+                held = false;
+                continue;
+            }
+            let now = groups.changes_of(dataset);
+            let was = self
+                .held_at
+                .lock()
+                .expect("held-at poisoned")
+                .insert(dataset.to_string(), now);
+            if was.unwrap_or(0) != now {
+                // Moved away and back: what memory held of it is stale.
+                self.evict_dataset(dataset);
+            }
+        }
+        held
+    }
+
     /// The store, its hot layer bounded by `bounds`, and a loader thread
     /// that loads each key asked and not held.
     pub fn new(inner: Arc<dyn Store>, bounds: Bounds) -> Arc<Self> {
@@ -395,6 +438,8 @@ impl HotStore {
                 counts: Counts::default(),
             }),
             wake: Condvar::new(),
+            groups: std::sync::RwLock::new(meridian_changes::groups::Groups::one()),
+            held_at: Mutex::new(HashMap::new()),
         });
         let held = Arc::downgrade(&hot);
         std::thread::Builder::new()
@@ -620,6 +665,8 @@ impl HotStore {
             }
             return;
         }
+        // A range's rows are its dataset's (step 3d).
+        let partition = crate::range::dataset_of(partition);
         let mut rows = Vec::with_capacity(changes.len());
         for change in changes {
             // Rows served and not kept were never the record's, nor held.
@@ -642,7 +689,7 @@ impl HotStore {
     /// Everything held of a dataset dropped: a reader's partition whose
     /// changes it did not follow.
     pub fn forget_dataset(&self, dataset: &str) {
-        self.evict_dataset(dataset);
+        self.evict_dataset(crate::range::dataset_of(dataset));
     }
 
     fn evict_all(&self) {
@@ -732,6 +779,20 @@ impl Store for HotStore {
         Ok(done)
     }
 
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        let done = self.inner.record_parts(dataset, parts, now_ns);
+        // Held in the parts' order, as they were numbered.
+        for part in done.iter().flatten() {
+            self.committed(dataset, &part.rows);
+        }
+        done
+    }
+
     fn write_ahead_position(
         &self,
         stream: &str,
@@ -739,15 +800,25 @@ impl Store for HotStore {
         self.inner.write_ahead_position(stream)
     }
 
+    fn group_position(
+        &self,
+        key: &str,
+        group: u32,
+    ) -> Result<Option<crate::store::WriteAheadPosition>> {
+        self.inner.group_position(key, group)
+    }
+
     fn record_write_ahead(
         &self,
         batch: crate::store::WriteAheadBatch,
         now_ns: i64,
-    ) -> Result<Vec<Recorded>> {
+    ) -> Result<Vec<Result<Recorded>>> {
         let datasets: Vec<String> = batch.parts.iter().map(|(d, _)| d.clone()).collect();
         let done = self.inner.record_write_ahead(batch, now_ns)?;
         for (dataset, part) in datasets.iter().zip(&done) {
-            self.committed(dataset, &part.rows);
+            if let Ok(part) = part {
+                self.committed(dataset, &part.rows);
+            }
         }
         Ok(done)
     }
@@ -766,8 +837,32 @@ impl Store for HotStore {
         self.inner.record_gap(gap)
     }
 
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        self.inner.record_assignments(groups, at_ns)
+    }
+
     fn dataset_gaps(&self) -> Result<Vec<meridian_domain::v1::DatasetGap>> {
         self.inner.dataset_gaps()
+    }
+
+    fn split_partition(
+        &self,
+        partition: &str,
+        split_by: &str,
+        reason: &str,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::PartitionSplit> {
+        // Nothing a split changes is what a key answers: its rows stay.
+        self.inner
+            .split_partition(partition, split_by, reason, now_ns)
+    }
+
+    fn splits(&self) -> Result<Vec<meridian_domain::v1::PartitionSplit>> {
+        self.inner.splits()
     }
 
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
@@ -799,7 +894,7 @@ impl Store for HotStore {
     }
 
     fn read(&self, query: &Query) -> Result<Vec<Observation>> {
-        if answers_latest(query) {
+        if answers_latest(query) && self.holds(&query.datasets) {
             if let Some(rows) = self.latest_from_memory(query) {
                 noted::memory("latest");
                 return Ok(rows);
@@ -814,7 +909,7 @@ impl Store for HotStore {
         query: &Query,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        if answers_latest(query) {
+        if answers_latest(query) && self.holds(&query.datasets) {
             if let Some(rows) = self.latest_from_memory(query) {
                 noted::memory("latest");
                 for row in rows {
@@ -832,7 +927,7 @@ impl Store for HotStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         self.inner.rows_at(data_type, places, as_of_ns)
@@ -844,7 +939,7 @@ impl Store for HotStore {
         subjects: &[String],
         as_of_ns: i64,
     ) -> Result<Vec<Listed>> {
-        if as_of_ns == 0 {
+        if as_of_ns == 0 && self.holds(datasets) {
             if let Some(listed) = self.listing_from_memory(datasets, subjects) {
                 noted::memory("listings");
                 return Ok(listed);
@@ -973,6 +1068,14 @@ impl Store for HotStore {
 
     fn keep_alias(&self, replaced: &str, stays: &str, at_ns: i64) -> Result<()> {
         self.inner.keep_alias(replaced, stays, at_ns)
+    }
+
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        self.inner.anchors(dataset, keys)
     }
 
     fn aliases(&self) -> Result<BTreeMap<String, String>> {

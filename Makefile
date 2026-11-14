@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: bench-book ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -26,6 +26,7 @@ help:
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
 	@echo "  make bench          measure the stated capacity INSTALL.md gives (by hand)"
+	@echo "  make bench-book     the book's bench for one shape, headless: BENCH_DATABASE_URL, BENCH_OUT (JSON)"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
@@ -551,6 +552,44 @@ bench: network
 		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
 	@grep -E '^CAPACITY |inversions' .bench.log
 	@$(COMPOSE) --profile tests down --remove-orphans >/dev/null 2>&1 || true
+
+# The book's bench for one shape, headless (step 3d, checkpoint 2; the PO's
+# ruling of 2026-11-13: decision-grade figures from a dedicated cloud VM):
+# BENCH_PROPOSALS proposals (100,000) at BENCH_IN_FLIGHT at once (64), over
+# BENCH_GROUPS writer groups and BENCH_PARTITIONS partitions, against the
+# Postgres BENCH_DATABASE_URL names and the broker BENCH_BROKER_URL names,
+# then a light run asked one at a time. Built and run with cargo at the
+# workspace's rust-version (1.90 or newer), optimised, so a plain Linux VM
+# runs it: no container. It writes JSON to BENCH_OUT -- each run's rate, p50,
+# p99 and most, timeouts and retries, the shape, the commit, the host's CPU
+# count and its load -- and the run's own output beside it, BENCH_OUT.log.
+# It prints only `done <path>`: core is public, and so are its CI logs, so
+# no figure is ever printed. Never wired into CI (stage T's write-scale is
+# separate).
+BENCH_GROUPS ?= 1
+BENCH_PARTITIONS ?= 1
+BENCH_IN_FLIGHT ?= 64
+BENCH_PROPOSALS ?= 100000
+BENCH_LIGHT ?= 2000
+BENCH_BROKER_URL ?= nats://127.0.0.1:4222
+bench-book:
+	@test -n "$(BENCH_DATABASE_URL)" \
+		|| { echo "bench-book: set BENCH_DATABASE_URL=<a Postgres the bench may make schemas in>" >&2; exit 1; }
+	@test -n "$(BENCH_OUT)" || { echo "bench-book: set BENCH_OUT=<path for the JSON>" >&2; exit 1; }
+	@MERIDIAN_TEST_DATABASE_URL="$(BENCH_DATABASE_URL)" \
+	MERIDIAN_BENCH_BROKER_URL="$(BENCH_BROKER_URL)" \
+	MERIDIAN_BENCH_SHAPES="$(BENCH_GROUPS)x$(BENCH_PARTITIONS)" \
+	MERIDIAN_BENCH_IN_FLIGHT="$(BENCH_IN_FLIGHT)" \
+	MERIDIAN_BENCH_PROPOSALS="$(BENCH_PROPOSALS)" \
+	MERIDIAN_BENCH_LIGHT="$(BENCH_LIGHT)" \
+	MERIDIAN_BENCH_JSON="$(abspath $(BENCH_OUT))" \
+	MERIDIAN_BENCH_COMMIT="$$(git rev-parse HEAD 2>/dev/null)" \
+	MERIDIAN_BENCH_LOAD_BEFORE="$$(cat /proc/loadavg 2>/dev/null || uptime)" \
+		cargo test --release --locked -p meridian-bor --test postgres \
+			-- --ignored --exact capacity_book_partitions --nocapture \
+		>"$(abspath $(BENCH_OUT)).log" 2>&1 \
+		|| { echo "bench-book FAILED; its output is in $(abspath $(BENCH_OUT)).log" >&2; exit 1; }
+	@echo "done $(abspath $(BENCH_OUT))"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -1650,7 +1689,7 @@ e2e-settings-page: runtime-image settings-binary-image
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first; and the Service accounts tab, one line an account, one created from its dialog prepare only, and a role's Runs as on the Access tab, each dialog within the viewport; and a connectivity plugin's ems on its Access tab, withdrawn and made available again from its dialog, its link's dialog within the viewport, an ems's connectivity plugins, linked from its own page by its admin, and its venue account map read-only, and the Instruments page's Calendars tab and a calendar's year, one line each"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first; and the Service accounts tab, one line an account, one created from its dialog prepare only, and a role's Runs as on the Access tab, each dialog within the viewport; and a connectivity plugin's ems on its Access tab, withdrawn and made available again from its dialog, its link's dialog within the viewport, an ems's connectivity plugins, linked from its own page by its admin, and its venue account map read-only, and the Instruments page's Calendars tab and a calendar's year, one line each; and the Resilience page's four tabs, the profile's advice among its lines, and the Partitions tab's Move, Split and Move account dialogs, each with a note and Cancel, at 375, 582 and 1280 px, light and dark, one screen, Move account posted back to its tab"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,
@@ -2347,6 +2386,23 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker does not generate its permissions from the contract" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
 		&& { echo "chart-check FAILED: a deployment with its own broker got one from the chart as well" >&2; exit 1; }; true
+	@# Step 3d (decided 2026-11-14): the broker is ready only when its own full
+	@# health check says so -- routes, and with JetStream its place in the
+	@# metadata group -- read on its loopback by its startup and readiness
+	@# probes, alone and as three; and each server's name resolves before it
+	@# is ready, so no server waits on another's readiness to start.
+	@for profile in tolerant ha; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
+			--set resilience.profile=$$profile --show-only templates/broker.yaml 2>/dev/null)"; \
+		[ "$$(echo "$$said" | grep -c "GET /healthz HTTP/1.0")" -eq 2 ] \
+			|| { echo "chart-check FAILED: the broker's startup and readiness probes are not its full /healthz ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q 'js-enabled-only' \
+			&& { echo "chart-check FAILED: the broker's probe reads only that JetStream is on ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  publishNotReadyAddresses: true$$' \
+			|| { echo "chart-check FAILED: a broker server's name does not resolve before it is ready ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  podManagementPolicy: Parallel$$' \
+			|| { echo "chart-check FAILED: the broker's servers do not start in parallel ($$profile)" >&2; exit 1; }; \
+	done; true
 	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
 	@# a broker credential of its own, made by the bundled broker and read by
 	@# its pod, not the runtime's shared one.
@@ -2736,6 +2792,144 @@ chart-check:
 		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
 			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
 	done
+	@# Step 3d, stage G (the resilience spec's sections 6.1, 6.3, 6.7 and 11;
+	@# names approved 2026-11-12): lake.writerGroups and bor.writerGroups, 1
+	@# by default and nothing changed; above it each group past the first a
+	@# writer Deployment of its own, <release>-<store>-group-<g>, its group
+	@# and the count in its environment, its own Lease, and with a standby
+	@# its standby and PodDisruptionBudget; the resilience values carry the
+	@# count; the lake's above 1 with the write-ahead stream on rendered
+	@# from stage H, each group's writer with its own Lease; and 0 refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -q "MERIDIAN_WRITER_GROUP\|-group-[0-9]" \
+		&& { echo "chart-check FAILED: one writer group, the default, renders a writer group's Deployment or environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render at two writer groups for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store.writerGroups=2 renders no writer Deployment check-meridian-runtime-$$store-group-1 (step 3d)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-2$$" \
+			&& { echo "chart-check FAILED: $$store.writerGroups=2 renders a third group's Deployment" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store's writer group 1 is not labelled $$store-group-1, apart from group 0's members" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUPS$$' | grep -c 'value: "2"')" = 4 ] \
+		|| { echo "chart-check FAILED: each writer group's member of the lake and the book is not told the count, 2 (MERIDIAN_WRITER_GROUPS)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "1"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-1 writers are not told their group, 1 (MERIDIAN_WRITER_GROUP)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "0"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-0 writers are not told their group, 0" >&2; exit 1; }; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with the book at two writer groups" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-bor-group-1"' \
+		|| { echo "chart-check FAILED: the book's writer group 1 does not take a Lease of its own, check-meridian-runtime-bor-group-1" >&2; exit 1; }; \
+	echo "$$ha" | grep -A2 "kind: PodDisruptionBudget" | grep -q "name: check-meridian-runtime-bor-group-1$$" \
+		|| { echo "chart-check FAILED: the book's writer group 1 has no PodDisruptionBudget of its own" >&2; exit 1; }; \
+	echo "$$ha" | awk '/^  name: check-meridian-runtime-bor-group-1$$/{f=1} f&&/^  replicas:/{print; exit}' | grep -q "replicas: 2" \
+		|| { echo "chart-check FAILED: bor.standby does not count per writer group: group 1 runs no standby beside its writer" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | grep -q '\\"writerGroups\\":2' \
+		|| { echo "chart-check FAILED: the resilience values do not carry bor.writerGroups" >&2; exit 1; }; \
+	lake_ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set lake.writerGroups=2 2>&1)" \
+		|| { echo "chart-check FAILED: lake.writerGroups=2 did not render with the write-ahead stream on (stage H: each group reads the stream itself): $$lake_ha" >&2; exit 1; }; \
+	echo "$$lake_ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-lake-group-1"' \
+		|| { echo "chart-check FAILED: the lake's writer group 1 in ha does not take a Lease of its own, check-meridian-runtime-lake-group-1" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.writerGroups=0 rendered; a store has one writer group at least" >&2; exit 1; }; true
+	@# Step 3d, stage B (section 6.3; MERIDIAN_BOR_PARTITIONS ruled
+	@# 2026-11-13): bor.partitions, 1 by default, told to every bor member
+	@# and the migrate Job, which makes the partitions' head rows; 0 and 65
+	@# refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	[ "$$(echo "$$one" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "1"')" -ge 2 ] \
+		|| { echo "chart-check FAILED: the book and its migrate Job are not told bor.partitions, 1 by default (MERIDIAN_BOR_PARTITIONS)" >&2; exit 1; }; \
+	four="$$($(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=4 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render bor.partitions=4" >&2; exit 1; }; \
+	[ "$$(echo "$$four" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "4"')" -ge 3 ] \
+		|| { echo "chart-check FAILED: bor.partitions=4 is not told to each writer group's member and the migrate Job" >&2; exit 1; }; \
+	for bad in 0 65; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=$$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: bor.partitions=$$bad rendered; 1 to 64" >&2; exit 1; }; \
+	done; true
+	@# Step 3d, stage D (section 6.4; lake.databases, bor.databases,
+	@# <store>.database.groupSecrets and <release>-<store>-database-<d>
+	@# approved 2026-11-12; the variables 2026-11-14): 1 by default and
+	@# nothing changed; at 2 with the database this chart brings, each
+	@# store's second database, labelled apart from the first, its URLs
+	@# beside its passwords, migrated by a container of its own given its
+	@# superuser, told to every member of the store and started by first
+	@# run, in its own stanza of the WAL archive with its own offline act;
+	@# with one somebody else runs, the Secret named, nothing brought; more
+	@# databases than writer groups, and missing Secrets, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -Eq "database-[1-9][0-9]*$$|_DATABASES$$|DATABASE_URL_[0-9]" \
+		&& { echo "chart-check FAILED: one database, the default, renders a database past the first or its environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set bor.writerGroups=2 --set bor.databases=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render two databases for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		name="check-meridian-runtime-$$store-database-1"; \
+		for kind in StatefulSet Service Secret NetworkPolicy; do \
+			echo "$$two" | grep -A2 "^kind: $$kind$$" | grep -q "^  name: $$name$$" \
+				|| { echo "chart-check FAILED: $$store.databases=2 renders no $$kind $$name (step 3d)" >&2; exit 1; }; \
+		done; \
+		echo "$$two" | grep -q "^  name: $$name-passwords$$" \
+			|| { echo "chart-check FAILED: $$store's second database keeps no passwords of its own" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: $$store's second database is not labelled $$store-database-1, apart from the first" >&2; exit 1; }; \
+		STORE=$$(echo $$store | tr a-z A-Z); \
+		[ "$$(echo "$$two" | grep -A4 "name: MERIDIAN_$${STORE}_DATABASE_URL_1$$" | grep -c "name: $$name$$")" -ge 2 ] \
+			|| { echo "chart-check FAILED: $$store's members are not each told its second database (MERIDIAN_$${STORE}_DATABASE_URL_1)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^        - name: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: the migrate Job has no container $$store-database-1 (approved 2026-11-14)" >&2; exit 1; }; \
+		echo "$$two" | grep -A1 "name: MERIDIAN_$${STORE}_DATABASES$$" | grep -q 'value: "2"' \
+			|| { echo "chart-check FAILED: first run and the members are not told $$store.databases, 2" >&2; exit 1; }; \
+	done; \
+	arch="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set backup.recipient=age1check --set backup.path=/var/lib/check --set backup.walArchive.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases did not render with the WAL archive" >&2; exit 1; }; \
+	echo "$$arch" | grep -q "archive_command=pgbackrest --stanza=lake-database-1 archive-push" \
+		&& echo "$$arch" | grep -q "^ *\[lake-database-1\]$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-offline$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-tls$$" \
+		|| { echo "chart-check FAILED: the lake's second database does not archive into its own stanza, lake-database-1, with its own certificates and offline act" >&2; exit 1; }; \
+	ext="$$($(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set lake.writerGroups=2 --set lake.databases=2 --set 'lake.database.groupSecrets[0]=lake-two' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases somebody else runs did not render with their Secret named" >&2; exit 1; }; \
+	echo "$$ext" | grep -A4 "name: MERIDIAN_LAKE_DATABASE_URL_1$$" | grep -q 'name: "lake-two"' \
+		&& ! echo "$$ext" | grep -q "check-meridian-runtime-lake-database-1" \
+		|| { echo "chart-check FAILED: a database somebody else runs is not read from the Secret lake.database.groupSecrets names, or one is brought" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set lake.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: lake.databases=2 rendered with one writer group; at most one database for each" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set bor.writerGroups=2 --set bor.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=2 rendered on a database somebody else runs with no group Secret named" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.databases=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=0 rendered; one database at least" >&2; exit 1; }; true
+	@# Step 3d, stage M (section 6.8; MERIDIAN_MOVES_HOLD_SECONDS approved
+	@# 2026-11-14): the book's members told moves.holdSeconds, the hold an
+	@# act waits while its account moves.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for hold in 5 8; do \
+		set="$$( [ $$hold = 5 ] || echo --set moves.holdSeconds=$$hold )"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_HOLD_SECONDS$$" | grep -q "value: \"$$hold\"" \
+			|| { echo "chart-check FAILED: the book's members are not told moves.holdSeconds, $$hold, as MERIDIAN_MOVES_HOLD_SECONDS (step 3d)" >&2; exit 1; }; \
+	done
+	@# MERIDIAN_MOVES_SWITCH_SECONDS (approved 2026-11-14): the lake's and the
+	@# book's members each told moves.switchSeconds and moves.holdSeconds,
+	@# and a switch shorter than its hold, or of no seconds, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for switch in 30 45; do \
+		set="$$( [ $$switch = 30 ] || echo --set moves.switchSeconds=$$switch )"; \
+		told=$$($(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_SWITCH_SECONDS$$" | grep -c "value: \"$$switch\""); \
+		[ "$$told" = 2 ] \
+			|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.switchSeconds, $$switch, as MERIDIAN_MOVES_SWITCH_SECONDS (told $$told) (step 3d)" >&2; exit 1; }; \
+	done; \
+	told=$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -c "name: MERIDIAN_MOVES_HOLD_SECONDS$$"); \
+	[ "$$told" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.holdSeconds (told $$told) (step 3d)" >&2; exit 1; }; \
+	for bad in moves.switchSeconds=0 moves.switchSeconds=4 moves.holdSeconds=0; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set $$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$bad rendered; a switch is at least as long as its hold, each of a second at least" >&2; exit 1; }; \
+	done; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and

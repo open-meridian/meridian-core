@@ -230,6 +230,16 @@ def opened(key, plugin, name, sealed):
 
 # ── What the deployment holds, read the same way before and after ────────────
 
+def book_as_held(lines):
+    """The book's lines, less the records its control journal keeps of its
+    own takeovers, findings and assignments (step 3d; section 6.3, option
+    (c)): a restore is followed by its writer's takeover, journalled as its
+    own record after it, as every change is (decisions/031) -- not a change
+    to what the book held."""
+    return "\n".join(line for line in lines.splitlines()
+                     if not line.startswith("entry|~control|meridian.v1."))
+
+
 def held():
     """Everything the run compares, as hashes and stable lines."""
     sealed_hex = psql(
@@ -253,7 +263,7 @@ def held():
         ),
         "secret opens to its value": value is not None
         and hashlib.sha256(value.encode()).hexdigest() == hashlib.sha256(SECRET_VALUE.encode()).hexdigest(),
-        "book": psql(open(BOOK_SQL).read()),
+        "book": book_as_held(psql(open(BOOK_SQL).read())),
         "settings key": digest(secret(f"{FULL}-settings-key")),
         "dashboard signing key": digest(secret(f"{FULL}-dashboard-signing")),
         "dashboard public keys": digest(keys),

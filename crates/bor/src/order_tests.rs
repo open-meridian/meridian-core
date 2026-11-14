@@ -61,10 +61,15 @@ struct Wired {
 }
 
 fn wired() -> Wired {
+    wired_with(MemoryStore::new())
+}
+
+/// [`wired`] over a store of the test's own: one of several partitions.
+fn wired_with(store: MemoryStore) -> Wired {
     let backend = Arc::new(MemoryBackend::new());
     let clock = Arc::new(meridian_clock::ManualClock::at(NOW));
     let bus = Arc::new(Bus::single(ME, backend, clock.clone()));
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(store);
     serve(bus.clone(), store.clone(), bus.clock());
     bus.serve(RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();

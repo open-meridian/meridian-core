@@ -424,98 +424,45 @@ impl Backend for NatsBackend {
     /// different problems to whoever is holding a pager: one is a deployment
     /// missing a component, the other is a component that is too slow or gone.
     fn request<'a>(&'a self, topic: &'a str, envelope: Envelope, timeout: Duration) -> Answer<'a> {
-        let client = self.client.clone();
-        let subject = topic.to_string();
-
-        Box::pin(async move {
-            if !topic::is_publishable(&subject) {
-                return Err(BusError::NotPublishable(subject));
-            }
-
-            // A question past what the broker carries is refused here,
-            // naming its size, rather than by the client's own words.
-            let question = envelope.encode_to_vec();
-            let most = client.server_info().max_payload;
-            if most > 0 && question.len() > most {
-                return Err(BusError::TooLarge {
-                    topic: subject,
-                    size: question.len(),
-                    most,
-                });
-            }
-
-            // The caller's timeout, on the request itself. The client has one
-            // of its own, ten seconds unless told otherwise, and it fired
-            // first and was reported as this one: every call on this bus was
-            // ten seconds at most whatever it asked for, which a first-run
-            // Apply on a fresh cluster outlasts.
-            let asked = tokio::time::timeout(
-                timeout,
-                client.send_request(
-                    subject.clone(),
-                    async_nats::Request::new()
-                        .payload(question.into())
-                        .headers({
-                            let mut headers = async_nats::HeaderMap::new();
-                            headers
-                                .insert(TIMEOUT_HEADER, timeout.as_millis().to_string().as_str());
-                            headers
-                        })
-                        .timeout(Some(timeout)),
-                ),
-            )
-            .await;
-
-            let message = match asked {
-                Err(_) => {
-                    return Err(BusError::Timeout {
-                        topic: subject,
-                        timeout_ms: timeout.as_millis() as u64,
-                    })
-                }
-                Ok(Err(failed)) => {
-                    return Err(match failed.kind() {
-                        async_nats::RequestErrorKind::NoResponders => BusError::NoHandler(subject),
-                        async_nats::RequestErrorKind::TimedOut => BusError::Timeout {
-                            topic: subject,
-                            timeout_ms: timeout.as_millis() as u64,
-                        },
-                        _ => BusError::HandlerFailed {
-                            topic: subject,
-                            detail: failed.to_string(),
-                        },
-                    })
-                }
-                Ok(Ok(message)) => message,
-            };
-
-            // A handler that refused says so in a header rather than in the
-            // payload: the payload is the answer's shape, and an error is not
-            // an answer of that shape.
-            if let Some(headers) = &message.headers {
-                if let Some(detail) = headers.get(REFUSAL_HEADER) {
-                    return Err(BusError::HandlerFailed {
-                        topic: subject,
-                        detail: detail.to_string(),
-                    });
-                }
-            }
-
-            Envelope::decode(message.payload).map_err(|failed| BusError::HandlerFailed {
-                topic: subject,
-                detail: format!("the answer was not an envelope: {failed}"),
-            })
-        })
+        self.ask(topic, envelope, timeout, None)
     }
 
+    /// The same, addressed to writer group `group` (step 3d, approved
+    /// 2026-11-12): [`crate::owners::WRITER_GROUP_HEADER`] beside the
+    /// timeout, so every other group's member leaves it unanswered.
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: u32,
+    ) -> Answer<'a> {
+        self.ask(topic, envelope, timeout, Some(group))
+    }
+
+    /// Offer a local handler's answer to writer group `group` alone.
+    fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
+        self.offer(topic, queue, handler, None, Some(group), None);
+    }
     /// Offer a local handler's answer to callers in other processes.
     fn serve(&self, topic: &str, group: &str, handler: Handler) {
-        self.offer(topic, group, handler, None);
+        self.offer(topic, group, handler, None, None, None);
+    }
+
+    /// The same, each request another writer group owns passed to it first.
+    fn serve_routed(
+        &self,
+        topic: &str,
+        group: &str,
+        handler: Handler,
+        route: crate::backend::PreRoute,
+    ) {
+        self.offer(topic, group, handler, None, None, Some(route));
     }
 
     /// The same, signalling once each answer is on the wire.
     fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
-        self.offer(topic, group, handler, Some(delivered));
+        self.offer(topic, group, handler, Some(delivered), None, None);
     }
 
     /// One of a queue group at the broker (contract v25): each message to one
@@ -597,7 +544,114 @@ impl NatsBackend {
 }
 
 impl NatsBackend {
-    fn offer(&self, topic: &str, group: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
+    /// Ask whoever serves `topic`, addressed to a writer group where
+    /// `group` names one.
+    fn ask<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: Option<u32>,
+    ) -> Answer<'a> {
+        let client = self.client.clone();
+        let subject = topic.to_string();
+
+        Box::pin(async move {
+            if !topic::is_publishable(&subject) {
+                return Err(BusError::NotPublishable(subject));
+            }
+
+            // A question past what the broker carries is refused here,
+            // naming its size, rather than by the client's own words.
+            let question = envelope.encode_to_vec();
+            let most = client.server_info().max_payload;
+            if most > 0 && question.len() > most {
+                return Err(BusError::TooLarge {
+                    topic: subject,
+                    size: question.len(),
+                    most,
+                });
+            }
+
+            // The caller's timeout, on the request itself. The client has one
+            // of its own, ten seconds unless told otherwise, and it fired
+            // first and was reported as this one: every call on this bus was
+            // ten seconds at most whatever it asked for, which a first-run
+            // Apply on a fresh cluster outlasts.
+            let asked = tokio::time::timeout(
+                timeout,
+                client.send_request(
+                    subject.clone(),
+                    async_nats::Request::new()
+                        .payload(question.into())
+                        .headers({
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers
+                                .insert(TIMEOUT_HEADER, timeout.as_millis().to_string().as_str());
+                            if let Some(group) = group {
+                                headers.insert(
+                                    crate::owners::WRITER_GROUP_HEADER,
+                                    group.to_string().as_str(),
+                                );
+                            }
+                            headers
+                        })
+                        .timeout(Some(timeout)),
+                ),
+            )
+            .await;
+
+            let message = match asked {
+                Err(_) => {
+                    return Err(BusError::Timeout {
+                        topic: subject,
+                        timeout_ms: timeout.as_millis() as u64,
+                    })
+                }
+                Ok(Err(failed)) => {
+                    return Err(match failed.kind() {
+                        async_nats::RequestErrorKind::NoResponders => BusError::NoHandler(subject),
+                        async_nats::RequestErrorKind::TimedOut => BusError::Timeout {
+                            topic: subject,
+                            timeout_ms: timeout.as_millis() as u64,
+                        },
+                        _ => BusError::HandlerFailed {
+                            topic: subject,
+                            detail: failed.to_string(),
+                        },
+                    })
+                }
+                Ok(Ok(message)) => message,
+            };
+
+            // A handler that refused says so in a header rather than in the
+            // payload: the payload is the answer's shape, and an error is not
+            // an answer of that shape.
+            if let Some(headers) = &message.headers {
+                if let Some(detail) = headers.get(REFUSAL_HEADER) {
+                    return Err(BusError::HandlerFailed {
+                        topic: subject,
+                        detail: detail.to_string(),
+                    });
+                }
+            }
+
+            Envelope::decode(message.payload).map_err(|failed| BusError::HandlerFailed {
+                topic: subject,
+                detail: format!("the answer was not an envelope: {failed}"),
+            })
+        })
+    }
+
+    fn offer(
+        &self,
+        topic: &str,
+        group: &str,
+        handler: Handler,
+        delivered: Option<Arc<Notify>>,
+        writer_group: Option<u32>,
+        route: Option<crate::backend::PreRoute>,
+    ) {
         let client = self.client.clone();
         let subject = topic.to_string();
         let group = group.to_string();
@@ -620,6 +674,19 @@ impl NatsBackend {
                     continue;
                 };
 
+                // A hand-off addressed to another writer group (step 3d):
+                // its own member answers it, so this one leaves it be.
+                if let Some(mine) = writer_group {
+                    let addressed = message
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get(crate::owners::WRITER_GROUP_HEADER))
+                        .and_then(|said| said.to_string().parse::<u32>().ok());
+                    if addressed != Some(mine) {
+                        continue;
+                    }
+                }
+
                 // When its caller stops waiting, from what it said as it
                 // asked, counted from now (contract v30, ruled 2026-11-10).
                 let deadline = message
@@ -629,6 +696,7 @@ impl NatsBackend {
                     .and_then(|said| said.to_string().parse::<u64>().ok())
                     .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
 
+                let passed = message.payload.clone();
                 let asked = match Envelope::decode(message.payload) {
                     Ok(envelope) => envelope,
                     Err(failed) => {
@@ -641,6 +709,7 @@ impl NatsBackend {
                 let client = client.clone();
                 let topic = subject.clone();
                 let delivered = delivered.clone();
+                let route = route.clone();
 
                 // Each request on its own task, so one slow handler does not
                 // hold up the next, and on a blocking pool, because a handler
@@ -650,6 +719,59 @@ impl NatsBackend {
                 // HANDLERS_AT_ONCE answering at once -- and its working memory
                 // reserved; or refused for load with a retry-after.
                 tokio::spawn(async move {
+                    // Another writer group's write, as the request says (step
+                    // 3d; section 6.7): passed to its owner as it came, its
+                    // caller's reply address kept and what is left of its
+                    // wait, so the owner answers the caller; nothing held or
+                    // waited on here. Decided off the runtime: the owner's
+                    // record may be read.
+                    if let Some(route) = route {
+                        let started = std::time::Instant::now();
+                        let looked = asked.clone();
+                        let owner = tokio::task::spawn_blocking(move || route(&looked))
+                            .await
+                            .ok()
+                            .flatten();
+                        // A wait spent while it was decided: dropped here,
+                        // below, as any request whose caller stopped waiting
+                        // -- never passed on to be run late.
+                        let spent = deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                        if let Some((internal, group)) = owner.filter(|_| !spent) {
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers.insert(
+                                crate::owners::WRITER_GROUP_HEADER,
+                                group.to_string().as_str(),
+                            );
+                            if let Some(deadline) = deadline {
+                                let left = deadline
+                                    .saturating_duration_since(std::time::Instant::now())
+                                    .as_millis()
+                                    .max(1);
+                                // What is left of it, the owner's to keep.
+                                headers.insert(TIMEOUT_HEADER, left.to_string().as_str());
+                            }
+                            match client
+                                .publish_with_reply_and_headers(
+                                    internal,
+                                    reply_to.clone(),
+                                    headers,
+                                    passed,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    crate::owners::note_passed(started.elapsed());
+                                    return;
+                                }
+                                Err(failed) => {
+                                    // Answered here instead: its handler
+                                    // hands it on as before.
+                                    tracing::warn!(topic, %failed, "a write could not be passed to its owner");
+                                }
+                            }
+                        }
+                    }
                     let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
 
                     let (payload_type, payload, refusal) = match answered {

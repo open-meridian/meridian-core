@@ -47,13 +47,53 @@ use prost::Message;
 
 use crate::decide::{self, Context, Made, RecordSays};
 use crate::store::{
-    mark_of, page_limit, watermark_of, Acted, AttributesRead, BreaksRead, Decided, FiguresRead,
-    PositionsRead, Scope, Store, StoreError,
+    mark_of, page_limit, Acted, AttributesRead, BreaksRead, Decided, FiguresRead, PositionsRead,
+    Scope, Store, StoreError,
 };
 
 pub use meridian_clock::Clock;
 
 pub const RECORD_OPENING_BALANCE: &str = "platform.book.command.record-opening-balance";
+
+/// A request whose first field is the account it acts in: what the
+/// ownership pre-check reads, and nothing more of it.
+#[derive(Clone, PartialEq, prost::Message)]
+struct AccountFirst {
+    #[prost(string, tag = "1")]
+    account_id: String,
+}
+
+/// The commands whose request names its account as its first field, read
+/// by [`account_of_write`].
+const ACCOUNT_FIRST: &[&str] = &[
+    crate::order_service::PROPOSE_ORDER,
+    crate::order_service::RECORD_ORDER,
+    "platform.book.command.set-account-attribute",
+    "platform.book.command.record-account-figures",
+    RECORD_OPENING_BALANCE,
+    "platform.book.command.record-break",
+    "platform.book.command.record-encumbrances",
+    "platform.book.command.raise-alert",
+    "platform.book.command.record-locate",
+    "platform.book.command.handle-break",
+    "platform.book.command.close-breaks-as-cleared",
+    // Its close is the account's partition's writer's (step 3d).
+    crate::moves::MOVE_ACCOUNT,
+];
+
+/// The account a command acts in, read from its request's first field
+/// alone, where its request names it there (step 3d; the ownership
+/// pre-check decided 2026-11-13): what decides its writer group before its
+/// handler runs. None for any other command, whose handler finds out.
+pub fn account_of_write(topic: &str, payload: &[u8]) -> Option<String> {
+    if !ACCOUNT_FIRST.contains(&topic) {
+        return None;
+    }
+    AccountFirst::decode(payload)
+        .ok()
+        .map(|first| first.account_id)
+        .filter(|account| !account.is_empty())
+}
 pub const RECORD_BREAK: &str = "platform.book.command.record-break";
 pub const RECORD_ACCOUNT_FIGURES: &str = "platform.book.command.record-account-figures";
 pub const RECORD_ENCUMBRANCES: &str = "platform.book.command.record-encumbrances";
@@ -277,6 +317,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         factor_taken: None,
         factor_row: Default::default(),
         factors_unavailable: false,
+        clearing: None,
     }
 }
 
@@ -1081,6 +1122,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         });
     }
     serve_lifecycle(&bus, &store, &clock);
+    // An account moved between partitions (step 3d; the resilience spec's
+    // section 6.8; W6.39).
+    crate::moves::serve(&bus, &store, &clock);
     {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(HANDLE_BREAK, move |envelope| {
@@ -1238,7 +1282,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListPositionsReply {
                 positions: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1273,7 +1321,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListBreaksReply {
                 breaks: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1307,7 +1359,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let mut reply = ListAccountFiguresReply {
                 figures: page.records,
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             };
             meridian_domain::money::fill_known(&mut reply);
             reply.encode_to_vec()
@@ -1354,7 +1410,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     })
                     .collect(),
                 next_cursor: page.next_cursor,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
             }
             .encode_to_vec(),
         ))
@@ -1548,6 +1608,8 @@ async fn move_accounts(
                 }
                 Ok(Acted::Duplicate(_)) => {}
                 Err(StoreError::Invalid(said)) if said == NOTHING_HELD => {}
+                // Another writer group's account (step 3d): its own writer does it.
+                Err(StoreError::NotOwned { .. }) => {}
                 Err(failed) => return Err(failed.to_string()),
             }
         }
@@ -1560,3 +1622,39 @@ async fn move_accounts(
 /// An account found holding a replaced record that no longer does, by the time
 /// its lock is held: nothing to move, and nothing wrong.
 const NOTHING_HELD: &str = "the account holds nothing under the replaced record";
+
+#[cfg(test)]
+mod pre_check {
+    use super::*;
+
+    /// The ownership pre-check (step 3d, decided 2026-11-13): a command
+    /// naming its account first is read for it alone; any other is left to
+    /// its handler.
+    #[test]
+    fn a_commands_account_is_read_from_its_first_field_alone() {
+        let proposal = meridian_domain::v1::ProposeOrderRequest {
+            account_id: "ACC-1".into(),
+            instrument_id: "INS-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_of_write(
+                crate::order_service::PROPOSE_ORDER,
+                &proposal.encode_to_vec()
+            ),
+            Some("ACC-1".into())
+        );
+        assert_eq!(
+            account_of_write(
+                "platform.book.command.book-order",
+                &proposal.encode_to_vec()
+            ),
+            None,
+            "a command naming its account by a record is its handler's to place"
+        );
+        assert_eq!(
+            account_of_write(crate::order_service::PROPOSE_ORDER, &[]),
+            None
+        );
+    }
+}

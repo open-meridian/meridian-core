@@ -45,6 +45,10 @@ pub const CONNECTIONS: u32 = 2;
 /// The most writes taken in one batch.
 pub const MOST_WRITES: usize = 256;
 
+/// The most bytes of writes taken in one batch, its last write's taken
+/// whole: the change log's page (step 3d, group commit; section 6.5).
+pub const BATCH_MOST_BYTES: usize = meridian_changes::group_commit::BATCH_MOST_BYTES;
+
 /// How long the writer waits before it asks again, after a batch the store
 /// could not take.
 const AGAIN_AFTER: Duration = Duration::from_millis(500);
@@ -65,6 +69,78 @@ pub struct Taken {
     pub after: Option<u64>,
     /// The request as its sidecar stamped it.
     pub envelope: Envelope,
+    /// The dataset its subject names; empty where it names none.
+    pub dataset: String,
+}
+
+/// Where a writer group keeps its position in the stream (step 3d; section
+/// 6.1): group 0 under the stream's own name, as every lake before groups
+/// kept it; each group past the first under `<stream>.group-<g>`, as its
+/// queue group is named.
+pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> String {
+    group_key(stream, groups.mine())
+}
+
+/// Writer group `group`'s position's key in `stream`.
+fn group_key(stream: &str, group: u32) -> String {
+    match group {
+        0 => stream.to_string(),
+        group => format!("{stream}.group-{group}"),
+    }
+}
+
+/// An answer this group gives once other groups have committed their own
+/// parts of its write (step 3d; spec 6.7): the answer's place in its batch,
+/// the write's stream sequence, and the groups whose positions must reach
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wait {
+    pub at: usize,
+    pub sequence: u64,
+    pub groups: Vec<u32>,
+}
+
+/// The groups besides this one owning an open range of `dataset`, as this
+/// member last read them: those whose parts of a write of it an answer
+/// waits for.
+fn other_groups(groups: meridian_changes::groups::Groups, dataset: &str) -> Vec<u32> {
+    let mut others: Vec<u32> = crate::range::leaves(&groups.ranges_of(dataset))
+        .into_iter()
+        .map(|(_, group)| group)
+        .filter(|group| *group != groups.mine())
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    others
+}
+
+/// Whether a write taken from the stream is this writer group's to commit:
+/// its dataset's owner is the group; one naming no dataset is group 0's.
+///
+/// A dataset whose ranges span groups (step 3d; ruling 2 of 2026-11-14) is
+/// every such group's: each commits its own ranges' rows of the write and
+/// skips the rest, which their owner's consumer commits from the same
+/// stream. The group owning the dataset's own partition answers it.
+fn ours(groups: meridian_changes::groups::Groups, write: &Taken) -> bool {
+    if write.dataset.is_empty() {
+        groups.holds_control()
+    } else {
+        groups.owns(&write.dataset)
+            || crate::range::leaves(&groups.ranges_of(&write.dataset))
+                .iter()
+                .any(|(_, group)| *group == groups.mine())
+    }
+}
+
+/// Whether this group answers a write it took: the group owning the
+/// write's dataset's own partition (its full range, split or not), or
+/// group 0 for one naming none.
+fn answers(groups: meridian_changes::groups::Groups, write: &Taken) -> bool {
+    if write.dataset.is_empty() {
+        groups.holds_control()
+    } else {
+        groups.owns(&write.dataset)
+    }
 }
 
 /// What a batch did: each write's answer, to where it is sent.
@@ -92,6 +168,10 @@ pub struct Recorded {
 /// each batch moves, and what the stream dropped that the lake has found.
 pub struct Writer {
     lake: Arc<Lake>,
+    /// The stream's name, as every group's position is kept by.
+    base: String,
+    /// The waits of the answers of the batch taken last (step 3d).
+    waits: Vec<Wait>,
     stream: String,
     position: Option<WriteAheadPosition>,
     /// The sequence to take from next where it is not the one after the
@@ -105,11 +185,16 @@ impl Writer {
     /// The writer of `lake`, at the position its store holds in `stream`,
     /// with what it found the stream dropped.
     pub fn start(lake: Arc<Lake>, stream: &str) -> Result<Writer, StoreError> {
-        let position = lake.write_ahead_position(stream)?;
-        let (dropped, valid) = lake.write_ahead_found(stream)?;
+        // Each writer group's own position (step 3d; section 6.1).
+        let base = stream.to_string();
+        let stream = position_key(stream, lake.groups());
+        let position = lake.write_ahead_position(&stream)?;
+        let (dropped, valid) = lake.write_ahead_found(&stream)?;
         Ok(Writer {
             lake,
-            stream: stream.to_string(),
+            base,
+            waits: Vec::new(),
+            stream,
             position,
             from: None,
             dropped,
@@ -152,6 +237,7 @@ impl Writer {
     /// Refused whole where the store refused it: the writer reads its
     /// position again before it takes another.
     pub fn take(&mut self, taken: Vec<Taken>) -> Result<Answers, StoreError> {
+        self.waits.clear();
         let Some(last) = taken.last() else {
             return Ok(Vec::new());
         };
@@ -159,7 +245,22 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
-        let mut expected = self.next();
+        // A writer group past the first that has never committed -- no
+        // position of its own in any of the lake's databases (a position is
+        // committed with its batch's rows), so its first start after
+        // `writerGroups` was raised (step 3d; section 6.1; CI 43615034712)
+        // -- takes from the first write the stream still holds: the writes
+        // before it were group 0's to take, and were taken, so none is
+        // counted dropped. Its datasets' writes in the stream are taken
+        // again, and each row is recorded once. A group that has committed
+        // goes on from its position, and a run the stream dropped past it
+        // is a gap, as for group 0.
+        let fresh = self.position.is_none() && self.from.is_none() && self.lake.groups().mine() > 0;
+        let mut expected = if fresh {
+            taken[0].sequence
+        } else {
+            self.next()
+        };
         let mut before_at = self.position.map_or(0, |at| at.at_ns);
         let mut dropped = Vec::new();
         for write in &taken {
@@ -187,6 +288,15 @@ impl Writer {
                  datasets named as each writes next"
             );
         }
+        // Every group reads the whole stream, so each dataset's chain and
+        // every run it dropped are seen whole; each commits its own
+        // datasets' writes alone, and moves its own position past the rest
+        // (step 3d; section 6.1). The rest are their owners' to answer.
+        let groups = self.lake.groups();
+        let taken: Vec<Taken> = taken
+            .into_iter()
+            .filter(|write| ours(groups, write))
+            .collect();
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
         for write in taken {
@@ -197,7 +307,20 @@ impl Writer {
                     .find(|run| run.holds(after))
                     .cloned()
             });
-            sent_to.push(write.reply_to);
+            let answering = answers(groups, &write);
+            // An answer of a write whose dataset's ranges span groups waits
+            // until each other group's part has committed (spec 6.7).
+            if answering && write.reply_to.is_some() && !write.dataset.is_empty() {
+                let others = other_groups(groups, &write.dataset);
+                if !others.is_empty() {
+                    self.waits.push(Wait {
+                        at: sent_to.len(),
+                        sequence: write.sequence,
+                        groups: others,
+                    });
+                }
+            }
+            sent_to.push(write.reply_to.filter(|_| answering));
             writes.push(Written {
                 topic: write.topic,
                 envelope: write.envelope,
@@ -269,7 +392,71 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         reply_to: header(REPLY_HEADER).filter(|to| !to.is_empty()),
         after: header(AFTER_HEADER).and_then(|said| said.parse().ok()),
         envelope: Envelope::decode(message.payload.clone()).unwrap_or_default(),
+        dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)
+            .unwrap_or_default(),
     })
+}
+
+impl Writer {
+    /// The waits of the batch taken last, taken out (step 3d).
+    pub fn take_waits(&mut self) -> Vec<Wait> {
+        std::mem::take(&mut self.waits)
+    }
+
+    /// The stream's name every group's position is kept by.
+    pub fn stream_name(&self) -> &str {
+        &self.base
+    }
+}
+
+/// A batch's answers once each wait is over (step 3d; spec 6.7): an answer
+/// of a write split across groups given once every other group's position
+/// has reached the write -- its part committed -- its watermark read again
+/// so it names each part's partitions at their heads; past
+/// `moves.holdSeconds`, refused OVERLOADED with a retry-after, its rows
+/// committed all the same and kept by the stream.
+pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec<Wait>) -> Answers {
+    let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
+    for wait in waits {
+        let Some((_, answer)) = answers.get_mut(wait.at) else {
+            continue;
+        };
+        let Ok((_, payload)) = answer else {
+            continue;
+        };
+        let reached = loop {
+            let all = tokio::task::block_in_place(|| {
+                wait.groups.iter().all(|group| {
+                    lake.group_position(&group_key(stream, *group), *group)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|at| at.sequence >= wait.sequence)
+                })
+            });
+            if all {
+                break true;
+            }
+            if tokio::time::Instant::now() >= until {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        *answer = if reached {
+            tokio::task::block_in_place(|| lake.watermark_again(payload))
+                .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
+        } else {
+            Err(meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                meridian_changes::moves::HELD_RETRY_SECONDS,
+                format!(
+                    "writer group(s) {:?} had not committed their part of this write within the \
+                     hold: its rows are kept and committed in turn; ask again",
+                    wait.groups
+                ),
+            ))
+        };
+    }
+    answers
 }
 
 /// Each answer sent to the inbox its write named, as the broker's request
@@ -396,14 +583,42 @@ fn bytes(said: &str) -> Option<i64> {
 /// this member writes: from the position the store holds, and back to it
 /// whenever a batch is refused. Ends only with an error the writer cannot
 /// go on from.
+/// A batch's answers sent: at once where none waits; else once its waits
+/// are over, on a task of its own, so the writer takes its next batch
+/// meanwhile -- another group's part it waits on may be in that group's
+/// next batch, which may wait on this one's (step 3d).
+async fn answer_when_settled(
+    lake: &Arc<Lake>,
+    client: &async_nats::Client,
+    writer: &mut Writer,
+    answers: Answers,
+) {
+    let waits = writer.take_waits();
+    if waits.is_empty() {
+        return answer(client, answers).await;
+    }
+    let (lake, client, stream) = (
+        lake.clone(),
+        client.clone(),
+        writer.stream_name().to_string(),
+    );
+    tokio::spawn(async move {
+        let answers = settled(&lake, &stream, answers, waits).await;
+        answer(&client, answers).await;
+    });
+}
+
 pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
     bounds: Bounds,
+    waiting: impl Fn(Option<String>),
 ) -> Result<(), String> {
     let context = jetstream::new(client.clone());
     let config = stream_config(&bounds);
-    // Made, or brought to the bounds this release sets.
+    // Made, or brought to the bounds this release sets: never with fewer
+    // replicas than set, to get past a broker not yet ready (step 3d). Until
+    // then the lake takes no write, and says why in its report.
     loop {
         let made = match context.get_stream(STREAM).await {
             Ok(_) => context
@@ -418,9 +633,17 @@ pub async fn write_forever(
                 .map_err(|f| f.to_string()),
         };
         match made {
-            Ok(()) => break,
+            Ok(()) => {
+                waiting(None);
+                break;
+            }
             Err(failed) => {
                 tracing::warn!(%failed, "the lake's write-ahead stream could not be made yet");
+                waiting(Some(format!(
+                    "taking no write: its write-ahead stream, kept on {} servers, could not be \
+                     made yet ({failed})",
+                    config.num_replicas
+                )));
                 tokio::time::sleep(AGAIN_AFTER * 4).await;
             }
         }
@@ -437,7 +660,13 @@ pub async fn write_forever(
     };
     // The gaps the last writer was asking for again, asked again by this
     // one (W10.14): their wants were in its memory.
-    match tokio::task::block_in_place(|| lake.resume_gaps()) {
+    // Group 0's, which holds the lake's wants (step 3d).
+    let resumed = if lake.groups().holds_control() {
+        tokio::task::block_in_place(|| lake.resume_gaps())
+    } else {
+        Ok(0)
+    };
+    match resumed {
         Ok(0) => {}
         Ok(asked) => tracing::info!(asked, "gaps still refetching asked again"),
         Err(failed) => tracing::warn!(%failed, "the gaps still refetching could not be read"),
@@ -449,66 +678,90 @@ pub async fn write_forever(
         "the lake takes its writes from the write-ahead stream"
     );
     loop {
-        let consumer = match context.get_stream(STREAM).await {
-            Ok(mut stream) => {
-                // A stream made again -- its volume lost, or JetStream off and
-                // on again -- numbers from its own first: the position was
-                // taken in another, and what that one held past it is gone.
-                if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
-                    let state = &info.state;
-                    if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
-                        tracing::error!(
-                            position = at.sequence,
-                            last = state.last_sequence,
-                            "the lake's write-ahead stream is not the one its position was taken \
-                             in: going on from its first write; what the stream held past the \
-                             position before it was made again is not recorded"
-                        );
-                        writer.begin_at(state.first_sequence.max(1));
-                    }
-                }
-                let from = writer.next();
-                stream
-                    .create_consumer(consumer::pull::OrderedConfig {
-                        deliver_policy: consumer::DeliverPolicy::ByStartSequence {
-                            start_sequence: from,
-                        },
-                        ..Default::default()
-                    })
-                    .await
-            }
+        let mut stream = match context.get_stream(STREAM).await {
+            Ok(stream) => stream,
             Err(failed) => {
                 tracing::warn!(%failed, "the write-ahead stream could not be read");
                 tokio::time::sleep(AGAIN_AFTER).await;
                 continue;
             }
         };
-        let mut messages = match consumer {
-            Ok(consumer) => match consumer.messages().await {
-                Ok(messages) => messages,
-                Err(failed) => {
-                    tracing::warn!(%failed, "the write-ahead stream could not be followed");
-                    tokio::time::sleep(AGAIN_AFTER).await;
-                    continue;
-                }
-            },
+        // A stream made again -- its volume lost, or JetStream off and on
+        // again -- numbers from its own first: the position was taken in
+        // another, and what that one held past it is gone.
+        if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
+            let state = &info.state;
+            if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
+                tracing::error!(
+                    position = at.sequence,
+                    last = state.last_sequence,
+                    "the lake's write-ahead stream is not the one its position was taken \
+                     in: going on from its first write; what the stream held past the \
+                     position before it was made again is not recorded"
+                );
+                writer.begin_at(state.first_sequence.max(1));
+            }
+        }
+        let mut messages = match follow(&mut stream, writer.next()).await {
+            Ok((messages, _)) => messages,
             Err(failed) => {
                 tracing::warn!(%failed, "the write-ahead stream's reader could not be made");
                 tokio::time::sleep(AGAIN_AFTER).await;
                 continue;
             }
         };
+        let mut stall = Stall::new(STALL_AFTER);
         loop {
-            let batch = match gather(&mut messages).await {
-                Ok(batch) => batch,
-                Err(failed) => {
+            let batch = match read(&mut messages, &mut stall, writer.next(), &mut stream).await {
+                Read::Batch(batch) => batch,
+                Read::Stopped(failed) => {
                     tracing::warn!(%failed, "the write-ahead stream stopped; following it again");
                     break;
                 }
+                Read::Stalled { last } => {
+                    tracing::warn!(
+                        next = writer.next(),
+                        last,
+                        quiet_s = STALL_AFTER.as_secs(),
+                        "the write-ahead stream holds writes past the lake's position and its \
+                         reader delivered none: the reader is made again from the position"
+                    );
+                    break;
+                }
             };
+            // Kept to be tried again one write at a time (step 3d, group
+            // commit; section 6.5): a batch is at most 512 KiB.
+            let each = (batch.len() > 1).then(|| batch.clone());
             let took = tokio::task::block_in_place(|| writer.take(batch));
+            let took = match (took, each) {
+                // An unexpected database error: each write tried alone, in
+                // the stream's order, so the batch is held up only by the
+                // write it was. One that fails alone too stops here, and the
+                // writer goes on from the position the lake holds, as ever.
+                (Err(StoreError::Unavailable(failed)), Some(each)) => {
+                    tracing::warn!(
+                        failed,
+                        writes = each.len(),
+                        "a batch from the write-ahead stream failed: each of its writes is tried alone"
+                    );
+                    let mut alone = Ok(Vec::new());
+                    for write in each {
+                        match tokio::task::block_in_place(|| writer.take(vec![write])) {
+                            Ok(answers) => {
+                                answer_when_settled(&lake, &client, &mut writer, answers).await
+                            }
+                            Err(failed) => {
+                                alone = Err(failed);
+                                break;
+                            }
+                        }
+                    }
+                    alone
+                }
+                (took, _) => took,
+            };
             match took {
-                Ok(answers) => answer(&client, answers).await,
+                Ok(answers) => answer_when_settled(&lake, &client, &mut writer, answers).await,
                 Err(StoreError::Fenced(fenced)) => {
                     return Err(format!("the lake's writer was fenced: {fenced}"));
                 }
@@ -530,9 +783,202 @@ pub async fn write_forever(
     }
 }
 
+/// How often the writer, delivered nothing, asks the stream's leader how far
+/// the stream has reached.
+pub const STALL_LOOK_EVERY: Duration = Duration::from_secs(5);
+
+/// How long the stream may hold writes past the writer's position, its
+/// reader delivering none, before the reader is made again from the
+/// position: a reader is never left silent (PR #113's failover-repeat
+/// 43340543897, ha run 2: the reader placed on a replica 400 writes behind
+/// delivered nothing for five minutes).
+pub const STALL_AFTER: Duration = Duration::from_secs(15);
+
+/// How many times the reader is made again to be placed on the stream's
+/// leader before it is followed where it was placed, the stall check its
+/// safety: NATS places an ephemeral consumer on any of the stream's peers
+/// (a cluster of three placed one off the leader two times in three), so
+/// 24 tries miss it about once in 17,000.
+pub const PLACEMENT_TRIES: usize = 24;
+
+/// The stream's reader, stopped or not: told each delivery, and each look
+/// at how far the stream has reached.
+#[derive(Debug)]
+pub struct Stall {
+    after: Duration,
+    /// Since when the stream has held writes past the position with none
+    /// delivered.
+    since: Option<tokio::time::Instant>,
+}
+
+impl Stall {
+    pub fn new(after: Duration) -> Self {
+        Self { after, since: None }
+    }
+
+    /// A batch delivered: the reader reads.
+    pub fn delivered(&mut self) {
+        self.since = None;
+    }
+
+    /// The stream's last sequence `last`, as its leader says at `now`, and
+    /// the writer's next `next`: whether its reader has delivered none of
+    /// the writes past the position for [`Stall`]'s bound.
+    pub fn looked(&mut self, now: tokio::time::Instant, last: u64, next: u64) -> bool {
+        if last < next {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= self.after
+    }
+}
+
+/// Where the stream's last sequence is asked: its leader, which answers a
+/// stream's info.
+pub trait Leader {
+    fn last(&mut self) -> impl std::future::Future<Output = Result<u64, String>> + Send;
+}
+
+impl Leader for stream::Stream {
+    async fn last(&mut self) -> Result<u64, String> {
+        self.info()
+            .await
+            .map(|info| info.state.last_sequence)
+            .map_err(|failed| failed.to_string())
+    }
+}
+
+/// What the reader gave.
+#[derive(Debug)]
+pub enum Read {
+    Batch(Vec<Taken>),
+    /// It ended, or failed.
+    Stopped(String),
+    /// The stream holds writes past the position, and it delivered none of
+    /// them for [`STALL_AFTER`]: `last` is the stream's last sequence.
+    Stalled {
+        last: u64,
+    },
+}
+
+/// The next batch the reader `messages` delivers; or, delivered none for
+/// [`STALL_LOOK_EVERY`], the stream's `leader` asked how far it has reached,
+/// and a reader that has delivered none of the writes past `next` for
+/// `stall`'s bound said to have stalled -- placed on a replica left behind,
+/// or lost -- never a quiet stream.
+pub async fn read<S, E, L>(messages: &mut S, stall: &mut Stall, next: u64, leader: &mut L) -> Read
+where
+    S: futures_util::Stream<Item = Result<jetstream::Message, E>> + Unpin,
+    E: std::fmt::Display,
+    L: Leader,
+{
+    loop {
+        match tokio::time::timeout(STALL_LOOK_EVERY, gather(messages)).await {
+            Ok(Ok(batch)) => {
+                stall.delivered();
+                return Read::Batch(batch);
+            }
+            Ok(Err(failed)) => return Read::Stopped(failed),
+            Err(_) => match leader.last().await {
+                Ok(last) if stall.looked(tokio::time::Instant::now(), last, next) => {
+                    return Read::Stalled { last };
+                }
+                Ok(_) => {}
+                Err(failed) => {
+                    tracing::debug!(%failed, "the write-ahead stream's leader did not say how far it is");
+                }
+            },
+        }
+    }
+}
+
+/// Whether a reader placed on `placed` reads from the stream's leader
+/// `leader`; with no cluster (one server), there is no other.
+pub fn on_leader(leader: Option<&str>, placed: Option<&str>) -> bool {
+    match (leader, placed) {
+        (Some(leader), Some(placed)) => leader == placed,
+        _ => true,
+    }
+}
+
+/// The stream's reader from `from` (NATS's consumers read from the copy of
+/// the stream on the server their leader is on, and an ephemeral one is R1,
+/// placed on one of the stream's peers): a pull consumer as an ordered one
+/// is -- ephemeral, in memory, no acknowledgements, gone 30 s after it is
+/// let go -- made again until it is placed on the stream's leader, which
+/// holds every write the stream has acknowledged. A follower left behind
+/// would hold back what it has not caught up. After [`PLACEMENT_TRIES`] it
+/// is followed where it is, the stall check its safety.
+async fn follow(
+    stream: &mut stream::Stream,
+    from: u64,
+) -> Result<(consumer::pull::Stream, bool), String> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let leader = stream
+            .info()
+            .await
+            .map_err(|failed| failed.to_string())?
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.leader.clone());
+        let mut made = stream
+            .create_consumer(consumer::pull::Config {
+                deliver_policy: consumer::DeliverPolicy::ByStartSequence {
+                    start_sequence: from,
+                },
+                ack_policy: consumer::AckPolicy::None,
+                inactive_threshold: Duration::from_secs(30),
+                num_replicas: 1,
+                memory_storage: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|failed| failed.to_string())?;
+        let info = made.info().await.map_err(|failed| failed.to_string())?;
+        let placed = info
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.leader.clone());
+        let on = on_leader(leader.as_deref(), placed.as_deref());
+        if on || tries >= PLACEMENT_TRIES {
+            if !on {
+                tracing::warn!(
+                    tries,
+                    ?leader,
+                    ?placed,
+                    "the write-ahead stream's reader was not placed on its leader: followed \
+                     where it is, the stall check its safety"
+                );
+            }
+            return made
+                .messages()
+                .await
+                .map(|messages| (messages, on))
+                .map_err(|failed| failed.to_string());
+        }
+        let name = info.name.clone();
+        if let Err(failed) = stream.delete_consumer(&name).await {
+            tracing::debug!(%failed, "a reader placed off the leader was not let go: it lapses");
+        }
+        tracing::info!(
+            tries,
+            ?leader,
+            ?placed,
+            "the write-ahead stream's reader was placed off its leader: made again"
+        );
+    }
+}
+
 /// The writes the stream has sent, up to [`MOST_WRITES`]: waits for the
 /// first, then takes what has come with it.
-async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, String> {
+async fn gather<S, E>(messages: &mut S) -> Result<Vec<Taken>, String>
+where
+    S: futures_util::Stream<Item = Result<jetstream::Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
     use futures_util::StreamExt as _;
     let mut batch = Vec::new();
     let first = messages
@@ -540,13 +986,19 @@ async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, St
         .await
         .ok_or("the stream's reader ended")?
         .map_err(|failed| failed.to_string())?;
+    let mut bytes = first.payload.len();
     batch.push(taken(&first)?);
     // What has already come, and no wait for more: a write alone is
     // recorded at once, and under load the writes that came while the last
-    // batch was recorded go together.
-    while batch.len() < MOST_WRITES {
+    // batch was recorded go together, until they reach 512 KiB (step 3d,
+    // group commit; section 6.5): the stream hands a write over whole, so
+    // the last one taken may carry the batch past it.
+    while batch.len() < MOST_WRITES && bytes < BATCH_MOST_BYTES {
         match futures_util::FutureExt::now_or_never(messages.next()) {
-            Some(Some(Ok(message))) => batch.push(taken(&message)?),
+            Some(Some(Ok(message))) => {
+                bytes += message.payload.len();
+                batch.push(taken(&message)?);
+            }
             Some(Some(Err(failed))) => return Err(failed.to_string()),
             Some(None) => return Err("the stream's reader ended".into()),
             None => break,
@@ -558,6 +1010,192 @@ async fn gather(messages: &mut consumer::pull::Ordered) -> Result<Vec<Taken>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dataset whose ranges span groups is taken by each group owning one
+    /// of its open ranges, each committing its own rows; the group of its
+    /// own partition answers (step 3d; spec 6.1).
+    #[test]
+    fn a_dataset_split_across_groups_is_taken_by_each_and_answered_by_one() {
+        use meridian_changes::groups::{owner, Groups};
+        let dataset = (0..)
+            .map(|n| format!("kraken-1:w{n}"))
+            .find(|dataset| owner(dataset, 2) == 0)
+            .unwrap();
+        let write = Taken {
+            sequence: 1,
+            at_ns: 0,
+            topic: String::new(),
+            reply_to: Some("_INBOX.1".into()),
+            after: None,
+            envelope: Envelope::default(),
+            dataset: dataset.clone(),
+        };
+        let (zero, one) = (Groups::new(0, 2).unwrap(), Groups::new(1, 2).unwrap());
+        assert!(
+            ours(zero, &write) && !ours(one, &write),
+            "whole: its owner's"
+        );
+        for groups in [zero, one] {
+            groups.assign(&dataset, Some(0));
+            groups.assign(&format!("{dataset}/0000-7fff"), Some(1));
+            groups.assign(&format!("{dataset}/8000-ffff"), Some(0));
+        }
+        assert!(
+            ours(zero, &write) && ours(one, &write),
+            "split: each group's"
+        );
+        assert!(
+            answers(zero, &write) && !answers(one, &write),
+            "answered once"
+        );
+    }
+
+    /// The stream's leader, stood in: how far it says the stream reached.
+    struct Says(u64);
+
+    impl Leader for Says {
+        async fn last(&mut self) -> Result<u64, String> {
+            Ok(self.0)
+        }
+    }
+
+    type Delivered = futures_util::stream::Pending<Result<jetstream::Message, String>>;
+
+    #[test]
+    fn a_reader_is_on_the_leader_only_where_it_was_placed_there() {
+        assert!(on_leader(Some("js-0"), Some("js-0")));
+        assert!(
+            !on_leader(Some("js-0"), Some("js-2")),
+            "a follower, maybe left behind"
+        );
+        assert!(on_leader(None, None), "one server: no other");
+    }
+
+    #[test]
+    fn a_stall_is_writes_past_the_position_with_none_delivered_for_its_bound() {
+        let at = tokio::time::Instant::now();
+        let mut stall = Stall::new(Duration::from_secs(15));
+        // A quiet stream: nothing past the position, never a stall.
+        assert!(!stall.looked(at, 4, 5));
+        assert!(!stall.looked(at + Duration::from_secs(60), 4, 5));
+        // Writes past it, none delivered: a stall once the bound has passed.
+        assert!(!stall.looked(at + Duration::from_secs(61), 9, 5));
+        assert!(!stall.looked(at + Duration::from_secs(70), 9, 5));
+        assert!(stall.looked(at + Duration::from_secs(76), 9, 5));
+        // A delivery starts it again.
+        stall.delivered();
+        assert!(!stall.looked(at + Duration::from_secs(80), 12, 10));
+    }
+
+    /// A reader that stops delivering -- placed on a replica left behind,
+    /// as failover-repeat 43340543897 found -- is said to have stalled once
+    /// the leader says writes are past the position, within its bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_delivering_nothing_past_the_position_is_said_to_have_stalled() {
+        let mut stopped: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let began = tokio::time::Instant::now();
+        match read(&mut stopped, &mut stall, 593, &mut Says(609)).await {
+            Read::Stalled { last } => assert_eq!(last, 609),
+            other => panic!("not said to have stalled: {other:?}"),
+        }
+        let took = began.elapsed();
+        assert!(
+            took >= STALL_AFTER && took <= STALL_AFTER + STALL_LOOK_EVERY * 2,
+            "{took:?}"
+        );
+        // A quiet stream -- nothing past the position -- is never a stall.
+        let mut quiet: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let waited = tokio::time::timeout(
+            STALL_AFTER * 10,
+            read(&mut quiet, &mut stall, 610, &mut Says(609)),
+        )
+        .await;
+        assert!(waited.is_err(), "a quiet stream's reader kept reading");
+    }
+
+    /// The reader against a real JetStream (by hand: a broker with
+    /// JetStream at MERIDIAN_TEST_JETSTREAM_URL): made from a position, it
+    /// delivers the writes after it in the stream's order.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+    async fn the_reader_delivers_a_real_stream_from_its_position_in_order() {
+        let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+        let client = async_nats::connect(&url).await.unwrap();
+        let context = jetstream::new(client);
+        let name = format!("FOLLOW_TEST_{}", std::process::id());
+        let mut stream = context
+            .create_stream(stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("follow-test.{}.>", std::process::id())],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for n in 1..=5 {
+            context
+                .publish(
+                    format!("follow-test.{}.{n}", std::process::id()),
+                    vec![n as u8].into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let (mut messages, on) = follow(&mut stream, 2).await.unwrap();
+        assert!(on, "one server: its leader");
+        let mut seen = Vec::new();
+        while seen.len() < 4 {
+            let message = futures_util::StreamExt::next(&mut messages)
+                .await
+                .unwrap()
+                .unwrap();
+            seen.push(message.info().unwrap().stream_sequence);
+        }
+        assert_eq!(seen, vec![2, 3, 4, 5]);
+        let mut stall = Stall::new(STALL_AFTER);
+        assert!(!stall.looked(tokio::time::Instant::now(), stream.last().await.unwrap(), 6));
+        context.delete_stream(&name).await.unwrap();
+    }
+
+    /// The reader on a stream of three replicas (by hand: a JetStream
+    /// cluster of three at MERIDIAN_TEST_JETSTREAM_CLUSTER_URL): placed on
+    /// the stream's leader each time it is made, never on a follower that
+    /// may be left behind.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a JetStream cluster of three: MERIDIAN_TEST_JETSTREAM_CLUSTER_URL"]
+    async fn the_reader_is_placed_on_the_streams_leader() {
+        let url = std::env::var("MERIDIAN_TEST_JETSTREAM_CLUSTER_URL").unwrap();
+        let client = async_nats::connect(&url).await.unwrap();
+        let context = jetstream::new(client);
+        let name = format!("PLACED_TEST_{}", std::process::id());
+        let mut stream = context
+            .create_stream(stream::Config {
+                name: name.clone(),
+                subjects: vec![format!("placed-test.{}.>", std::process::id())],
+                num_replicas: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..12 {
+            let (_, on) = follow(&mut stream, 1).await.unwrap();
+            assert!(on, "placed off the stream's leader");
+        }
+        context.delete_stream(&name).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_ended_is_said_to_have_stopped() {
+        let mut ended = futures_util::stream::empty::<Result<jetstream::Message, String>>();
+        let mut stall = Stall::new(STALL_AFTER);
+        assert!(matches!(
+            read(&mut ended, &mut stall, 1, &mut Says(0)).await,
+            Read::Stopped(_)
+        ));
+    }
 
     #[test]
     fn the_stream_refuses_a_write_when_full_never_dropping_its_oldest() {

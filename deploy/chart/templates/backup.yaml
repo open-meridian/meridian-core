@@ -204,6 +204,12 @@ spec:
                 - name: archive-tls
                   mountPath: /etc/archive-tls
                   readOnly: true
+                {{- /* Each database's past the first, by its stanza (step 3d). */}}
+                {{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+                - name: {{ printf "archive-tls-%s-database-%d" $extra.component (int $extra.d) }}
+                  mountPath: {{ printf "/etc/archive-tls-%s-database-%d" $extra.component (int $extra.d) }}
+                  readOnly: true
+                {{- end }}
                 - name: archive-database
                   mountPath: /in/database
                   readOnly: true
@@ -321,6 +327,11 @@ spec:
             - name: archive-tls
               secret:
                 secretName: {{ $full }}-database-tls
+            {{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+            - name: {{ printf "archive-tls-%s-database-%d" $extra.component (int $extra.d) }}
+              secret:
+                secretName: {{ printf "%s-tls" $extra.name }}
+            {{- end }}
             # Whether first run has written the database's URL yet.
             - name: archive-database
               secret:

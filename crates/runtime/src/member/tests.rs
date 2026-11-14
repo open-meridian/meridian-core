@@ -656,3 +656,24 @@ fn a_lease_holder_names_its_pod() {
     assert_eq!(super::holder_member("om-bor-0"), "om-bor-0");
     assert_eq!(super::holder_member(""), "");
 }
+
+/// Step 3d: a member waiting on what it needs to do its whole job -- the
+/// lake on its write-ahead stream, kept on three servers, while the broker's
+/// JetStream is not ready -- reports itself degraded, saying why, until it
+/// is done waiting.
+#[test]
+fn a_member_waiting_reports_itself_degraded_and_why() {
+    use meridian_domain::v1::ComponentHealth;
+    said().set_waiting("taking no write: its write-ahead stream could not be made yet");
+    let report = member_report("lake", 0, 0);
+    assert_eq!(report.health, ComponentHealth::Degraded as i32);
+    assert!(
+        report.detail.contains("write-ahead stream"),
+        "{}",
+        report.detail
+    );
+    said().done_waiting();
+    let report = member_report("lake", 0, 0);
+    assert_eq!(report.health, ComponentHealth::Serving as i32);
+    assert!(report.detail.is_empty());
+}

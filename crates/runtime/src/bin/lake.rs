@@ -66,6 +66,12 @@ fn run() -> Result<(), String> {
 
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
+            // A database past the first the chart brings (step 3d; section
+            // 6.4): made, with its roles and each component's login, by its
+            // superuser before its schema is applied.
+            if let Some(serving) = var("MERIDIAN_SERVING_DATABASE_URL") {
+                meridian_runtime::provision::provision_brought(&serving, &url)?;
+            }
             meridian_runtime::migrate_once_it_answers(
                 "the lake's database",
                 &url,
@@ -112,6 +118,11 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
+    // Its writer group and the lake's count (step 3d; section 6.1): the
+    // datasets it writes, and those it hands to their owners.
+    // In ha each group's writer reads the write-ahead stream with its own
+    // position, and commits its own datasets' writes (stage H).
+    let groups = meridian_changes::groups::Groups::from_env()?;
     // Its pool of 8, and in ha 2 more for the write-ahead stream's writer --
     // its batch's transaction and its position -- so its commits never wait
     // behind the lake's reads (the chart's databaseConnections counts them).
@@ -122,17 +133,66 @@ fn run() -> Result<(), String> {
     };
     // Its own database login and its sessions' bounds (section 10a).
     meridian_runtime::serve_database_as("lake");
-    let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
-        "the lake's database",
-        &url,
-        |url| PostgresStore::connect(url, pool).map_err(|failed| failed.to_string()),
-        |store| {
-            store.verify().map_err(|failed| match failed {
-                StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
-                other => Wait::NotYet(other.to_string()),
-            })
-        },
-    )?);
+    // Its databases (step 3d; section 6.4; `lake.databases`): its group
+    // writes to database `group mod count`, and reads fan out over them all.
+    let databases = meridian_changes::databases::Databases::from_env("lake", &url)?;
+    let own = databases.of_group(groups.mine());
+    let connect = |d: u32, url: &str| {
+        let what = if d == 0 {
+            "the lake's database".to_string()
+        } else {
+            format!("the lake's database {d}")
+        };
+        wait_for_store(
+            &what,
+            url,
+            |url| {
+                // Its own database's pool, with the write-ahead writer's;
+                // every other's for its reads.
+                PostgresStore::connect(url, if d == own { pool } else { 8 })
+                    .map(|store| {
+                        store
+                            .with_groups(groups)
+                            .with_databases(databases.count())
+                            .in_database(d)
+                    })
+                    .map_err(|failed| failed.to_string())
+            },
+            |store| {
+                store.verify().map_err(|failed| match failed {
+                    StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),
+                    other => Wait::NotYet(other.to_string()),
+                })
+            },
+        )
+    };
+    // Every database's store, database 0 first: what the lake writes and
+    // reads through, and what a move warms and switches (step 3d).
+    let mut every_database: Vec<Arc<PostgresStore>> = Vec::new();
+    if databases.several() {
+        for (d, url) in databases.urls().iter().enumerate() {
+            every_database.push(Arc::new(connect(d as u32, url)?));
+        }
+    } else {
+        every_database.push(Arc::new(connect(0, &url)?));
+    }
+    let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
+        tracing::info!(
+            databases = databases.count(),
+            own,
+            "the lake writes its group's database and reads every one"
+        );
+        Some(Arc::new(meridian_lake::spread::Spread::new(
+            every_database.clone(),
+            groups,
+        )))
+    } else {
+        None
+    };
+    let record: Arc<dyn meridian_lake::Store> = match &spread {
+        Some(spread) => spread.clone(),
+        None => every_database[0].clone(),
+    };
 
     // The hot layer in front of the record (step 3a), each layer bounded by
     // its chart value: lake.hotLayer.latestMiB, lake.hotLayer.listingsMiB.
@@ -157,18 +217,8 @@ fn run() -> Result<(), String> {
     // a reader made it inside the runtime from stage C2, connecting in
     // block_in_place after PR CI 43014977978's "Cannot start a runtime from
     // within a runtime").
-    let replica: Option<Arc<PostgresStore>> = if member.is_reader() {
-        meridian_runtime::read_replica(
-            "the lake's read replica",
-            "MERIDIAN_LAKE_READ_DATABASE_URL",
-            |url| PostgresStore::connect(url, 4).map_err(|failed| failed.to_string()),
-            |store| {
-                store
-                    .verify()
-                    .map_err(|failed| Wait::NotYet(failed.to_string()))
-            },
-        )?
-        .map(Arc::new)
+    let replica: Option<Arc<dyn meridian_lake::Store>> = if member.is_reader() {
+        lake_replica(&databases, groups)?
     } else {
         None
     };
@@ -198,9 +248,7 @@ fn run() -> Result<(), String> {
             bus.serve_only(meridian_bus::read_after::is_read);
             // Made before the runtime and held outside it (stage D): its
             // connections close after the runtime has stopped.
-            let replica = replica
-                .clone()
-                .map(|replica| replica as Arc<dyn meridian_lake::Store>);
+            let replica = replica.clone();
             // Where it starts following from: the primary's heads before its
             // hot layer holds anything.
             let start = tokio::task::block_in_place(|| record.heads())
@@ -245,6 +293,27 @@ fn run() -> Result<(), String> {
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
         let holding = member.wait_to_write(&bus).await?;
+        // Each range's writer group (step 3d; `writer_group` ruled
+        // 2026-11-14): the control partition's group names every one not
+        // named yet, by its dataset's owner at the count now, so a later
+        // change of the count moves nothing until a move moves it; every
+        // member reads them at start and every few seconds, and again
+        // wherever a write found them changed. Read before the epoch is
+        // adopted, which goes by them.
+        if groups.several() {
+            tokio::task::block_in_place(|| -> Result<(), String> {
+                for store in &every_database {
+                    if groups.holds_control() {
+                        let pinned = store.pin_owners().map_err(|failed| failed.to_string())?;
+                        if pinned > 0 {
+                            tracing::info!(pinned, "each range named its writer group");
+                        }
+                    }
+                    store.read_owners().map_err(|failed| failed.to_string())?;
+                }
+                Ok(())
+            })?;
+        }
         let epoch = tokio::task::block_in_place(|| {
             holding.epoch(
                 || {
@@ -274,25 +343,139 @@ fn run() -> Result<(), String> {
                 .follow_timeline()
                 .map_err(|failed| failed.to_string())
         });
-        // The scrub, under the lease (step 3b, integrity at rest).
-        let scrubbing = url.clone();
-        meridian_runtime::scrub::forever("lake", move || {
-            meridian_runtime::scrub::run_once(
-                "lake",
-                || {
-                    let store = PostgresStore::connect(&scrubbing, 1)
-                        .map_err(|failed| failed.to_string())?;
-                    store.scrub().map_err(|failed| failed.to_string())
-                },
-                |scrubbed, member, started, finished| {
-                    PostgresStore::connect(&scrubbing, 1)
-                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
-                        .map_err(|failed| failed.to_string())
-                },
-            )
-        });
+        // Several writer groups (step 3d; section 6.7): each write's
+        // datasets of another group handed to it, and the writes handed to
+        // this group answered here; a group past the first serves its
+        // writes and the change log alone, and does none of the lake's own
+        // work. Before the lake's handlers.
+        if groups.several() {
+            hot.for_group(groups);
+            bus.hand_writes_on(
+                meridian_lake::service::INTERNAL_RECORD,
+                groups.mine(),
+                meridian_lake::service::is_record_write,
+            );
+            // Its owner decided from the request first (the ownership
+            // pre-check decided 2026-11-13): a write wholly another group's
+            // handed to it before any of its rows is checked.
+            bus.route_writes_by(move |topic, envelope| {
+                meridian_lake::service::owner_of_write(groups, topic, envelope)
+            });
+            let reading = every_database.clone();
+            meridian_runtime::background(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let stores = reading.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for store in &stores {
+                            if let Err(failed) = store.read_owners() {
+                                tracing::debug!(%failed, "the ranges' writer groups were not read again");
+                            }
+                        }
+                    })
+                    .await;
+                }
+            });
+            if !groups.holds_control() {
+                let changes = meridian_changes::read_changes_topic("lake");
+                bus.serve_only(move |topic| {
+                    meridian_lake::service::is_record_write(topic) || topic == changes
+                });
+            }
+            tracing::info!(
+                group = groups.mine(),
+                groups = groups.count(),
+                "the lake writes its writer group's datasets, and hands every other's to their owners"
+            );
+        }
+        // Several databases (step 3d; section 6.4): group 0's writer copies
+        // what database 0 keeps about rows elsewhere into their databases
+        // and relays each database's own control journal into database 0's,
+        // as it starts and at each sweep, under its lease.
+        if let (Some(spread), true) = (&spread, groups.holds_control()) {
+            let sweeping = Arc::clone(spread);
+            std::thread::spawn(move || loop {
+                sweeping.reconcile_and_say();
+                match sweeping.relay() {
+                    Ok(0) => {}
+                    Ok(relayed) => tracing::info!(
+                        relayed,
+                        "the lake's databases' own records relayed into database 0's"
+                    ),
+                    Err(failed) => {
+                        tracing::warn!(%failed, "the lake's databases' own records were not relayed; again at the next sweep")
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(SWEEP_SECONDS));
+            });
+        }
+        // The scrub, under the lease (step 3b, integrity at rest): the
+        // control partition's group's, which reads every dataset, in every
+        // database (each database's findings in its own journal).
+        for scrubbing in databases.urls().to_vec() {
+            if !groups.holds_control() {
+                break;
+            }
+            meridian_runtime::scrub::forever("lake", move || {
+                meridian_runtime::scrub::run_once(
+                    "lake",
+                    || {
+                        let store = PostgresStore::connect(&scrubbing, 1)
+                            .map_err(|failed| failed.to_string())?;
+                        store.scrub().map_err(|failed| failed.to_string())
+                    },
+                    |scrubbed, member, started, finished| {
+                        PostgresStore::connect(&scrubbing, 1)
+                            .and_then(|store| {
+                                store.record_scrub(scrubbed, member, started, finished)
+                            })
+                            .map_err(|failed| failed.to_string())
+                    },
+                )
+            });
+        }
+        // `lake_row` partitioned online (step 3d; section 6.2): the rows
+        // kept before it copied behind into their ranges' months, a page at
+        // a time, by the control partition's group's writer, under its lease;
+        // nothing once none is left. The rows move inside Postgres: the
+        // lake holds a page's row places, never its rows.
+        if groups.holds_control() {
+            let converting = url.clone();
+            std::thread::spawn(move || convert_forever(&converting));
+        }
+        // A range's move (step 3d; section 6.8): the control partition's
+        // group runs each, one at a time, over every database; and, with
+        // several groups, those a changed count calls for, at start and
+        // each minute after.
+        if groups.holds_control() {
+            let mover = Arc::new(meridian_lake::partition_moves::Mover::new(
+                every_database.clone(),
+                groups,
+                meridian_lake::partition_moves::Settings::from_env(),
+                clock(),
+            ));
+            meridian_lake::partition_moves::serve(&bus, &mover);
+            if groups.several() {
+                meridian_runtime::background(async move {
+                    loop {
+                        let mover = Arc::clone(&mover);
+                        let moved = tokio::task::spawn_blocking(move || mover.rebalance().len())
+                            .await
+                            .unwrap_or(0);
+                        if moved > 0 {
+                            tracing::info!(
+                                moved,
+                                "ranges moved by the changed count of writer groups"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
+        }
         // Every handler and subscription in place before this returns.
-        let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
+        let lake =
+            meridian_lake::service::serve_grouped(bus.clone(), Arc::clone(&store), clock(), groups);
         lake.build_at_most(answers_at_once);
 
         // The write-ahead stream in `ha` (the resilience spec's section 4;
@@ -309,7 +492,13 @@ fn run() -> Result<(), String> {
             let writing = Arc::clone(&lake);
             meridian_runtime::background(async move {
                 if let Err(failed) =
-                    meridian_lake::write_ahead::write_forever(writing, client, bounds).await
+                    meridian_lake::write_ahead::write_forever(writing, client, bounds, |why| {
+                        match why {
+                            Some(why) => meridian_runtime::member::said().set_waiting(why),
+                            None => meridian_runtime::member::said().done_waiting(),
+                        }
+                    })
+                    .await
                 {
                     meridian_runtime::member::step_down("lake", &failed);
                 }
@@ -340,6 +529,46 @@ fn run() -> Result<(), String> {
     })
 }
 
+/// Copy the rows kept before the lake's ranges into their months until none
+/// is left (step 3d; section 6.2): a page, then a pause, so the writer's own
+/// work goes first; a page that fails tried again shortly.
+fn convert_forever(url: &str) {
+    let store = loop {
+        match PostgresStore::connect(url, 1) {
+            Ok(store) => break store,
+            Err(failed) => {
+                tracing::warn!(%failed, "the lake's rows could not be converted yet");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    };
+    let mut moved: u64 = 0;
+    loop {
+        match store.convert_page() {
+            Ok(0) => {
+                if moved > 0 {
+                    tracing::info!(
+                        moved,
+                        "the lake's rows kept before its ranges are converted"
+                    );
+                }
+                return;
+            }
+            Ok(rows) => {
+                moved += rows;
+                if moved % 100_000 < rows {
+                    tracing::info!(moved, "the lake's rows kept before its ranges, converting");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(failed) => {
+                tracing::warn!(%failed, "a page of the lake's rows was not converted; again shortly");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 /// Whether this deployment's data plugins write ahead to the stream: the
 /// chart says so in `ha`, where the broker keeps JetStream at three.
 fn write_ahead_on() -> bool {
@@ -357,4 +586,60 @@ fn write_ahead_bounds() -> Result<meridian_lake::write_ahead::Bounds, String> {
         var("MERIDIAN_LAKE_WRITE_AHEAD_MAX_BYTES").as_deref(),
         3,
     )
+}
+
+/// How often group 0's writer reconciles the lake's databases and relays
+/// their own records (step 3d; section 6.4).
+const SWEEP_SECONDS: u64 = 30;
+
+/// A reader's record-read replicas (contract v30, stage B; step 3d): one
+/// database's where the lake has one, else every database's, each read from
+/// its own replica where the chart names one -- database 0's from
+/// `MERIDIAN_LAKE_READ_DATABASE_URL`, each past it from
+/// `MERIDIAN_LAKE_READ_DATABASE_URL_<d>` -- and from the database itself
+/// where it names none.
+fn lake_replica(
+    databases: &meridian_changes::databases::Databases,
+    groups: meridian_changes::groups::Groups,
+) -> Result<Option<Arc<dyn meridian_lake::Store>>, String> {
+    let verify = |store: &PostgresStore| {
+        store
+            .verify()
+            .map_err(|failed| Wait::NotYet(failed.to_string()))
+    };
+    let connect = |url: &str| {
+        PostgresStore::connect(url, 4)
+            .map(|store| store.with_groups(groups).with_databases(databases.count()))
+            .map_err(|failed| failed.to_string())
+    };
+    let first = meridian_runtime::read_replica(
+        "the lake's read replica",
+        &meridian_changes::databases::read_url_var("lake", 0),
+        connect,
+        verify,
+    )?;
+    if !databases.several() {
+        return Ok(first.map(|store| Arc::new(store) as Arc<dyn meridian_lake::Store>));
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let mut stores = vec![Arc::new(first)];
+    for (d, url) in databases.urls().iter().enumerate().skip(1) {
+        let replica = var(&meridian_changes::databases::read_url_var("lake", d as u32))
+            .unwrap_or_else(|| url.clone());
+        // Each answering the ranges its database's groups write (step 3d).
+        stores.push(Arc::new(
+            wait_for_store(
+                &format!("the lake's read replica of database {d}"),
+                &replica,
+                connect,
+                verify,
+            )?
+            .in_database(d as u32),
+        ));
+    }
+    Ok(Some(Arc::new(meridian_lake::spread::Spread::new(
+        stores, groups,
+    ))))
 }

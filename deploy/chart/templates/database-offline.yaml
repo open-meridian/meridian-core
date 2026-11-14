@@ -1,50 +1,9 @@
-{{- include "meridian-runtime.require" . -}}
-{{- if .Values.database.brought.enabled }}
-{{/*
-  What is done to the brought database's volume while it is stopped (step
-  3b; spec/a-deployment-scales-out-and-fails-over-by-configuration sections 4
-  and 9, ruling 1058): a restore from the WAL archive to a point in time,
-  for `meridian restore --to-time`, or to the archive's end, for `meridian
-  restore --to-archive-end` (step 3c), each along the timeline the archive's
-  history says, and page checksums turned on in an existing database, for
-  `meridian upgrade-deployment --enable-checksums`.
-
-  A CronJob that never runs on its own, as the backup's is without a
-  schedule: the CLI makes a Job from it with the act named
-  (MERIDIAN_DATABASE_ACT, and MERIDIAN_RESTORE_TO_TIME for a restore), once
-  it has stopped every component and scaled the database to none, and
-  starts them again after. The act is files/database-offline.sh, in the
-  database's image under Patroni, which holds pgBackRest and pg_checksums.
-  It holds no RBAC and changes nothing in the cluster: what changes the
-  cluster is the person's, with their own rights (decisions/016).
-
-  On member 0's volume. Under Patroni the CLI makes member 0 the primary
-  first for enable-checksums; a restore does not switch the primary
-  first, since every member is stopped and the archive is restored from,
-  not a member. After either act it deletes the standbys' volumes, which
-  Patroni makes again from member 0, and after a restore it clears
-  Patroni's leader, sync and failover records, which name the primary and
-  the position from before it. The act starts the database on its socket
-  alone, without TLS and without hot standby (files/database-offline.sh):
-  the configuration a base backup restores can name internal TLS's
-  certificates, which only the database's own pods hold, and the WAL after
-  it can raise a setting past its own, which pauses a hot standby's
-  recovery. A start that fails or stops prints Postgres's last lines.
-*/}}
+{{- define "meridian-runtime.databaseOffline" }}
 {{- $full := include "meridian-runtime.fullname" . }}
-{{- $name := printf "%s-database" $full }}
+{{- $name := dig "brought" "name" "" . | default (printf "%s-database" $full) }}
+{{- $stanza := "meridian" }}
+{{- with dig "brought" "component" "" . }}{{ $stanza = printf "%s-database-%d" . (int (dig "brought" "d" 0 $)) }}{{ end }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ $name }}-offline
-  labels:
-    meridian.dev/component: database-offline
-    {{- include "meridian-runtime.labels" . | nindent 4 }}
-data:
-  database-offline.sh: |
-    {{- .Files.Get "files/database-offline.sh" | nindent 4 }}
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -96,6 +55,10 @@ spec:
                   value: ""
                 - name: PGDATA
                   value: /var/lib/postgresql/data/pgdata
+                # Its stanza of the archive (step 3d): meridian, or a
+                # database's past the first, by its own name.
+                - name: PGBACKREST_STANZA
+                  value: {{ $stanza | quote }}
                 {{- if $archive }}
                 {{- include "meridian-runtime.walArchiveEnv" . | nindent 16 }}
                 {{- end }}
@@ -116,8 +79,64 @@ spec:
                 claimName: data-{{ $name }}-0
             - name: script
               configMap:
-                name: {{ $name }}-offline
+                name: {{ printf "%s-database-offline" $full }}
             {{- if $archive }}
             {{- include "meridian-runtime.walArchiveVolumes" (dict "top" . "role" "offline") | nindent 12 }}
             {{- end }}
+{{- end }}
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.database.brought.enabled }}
+{{/*
+  What is done to the brought database's volume while it is stopped (step
+  3b; spec/a-deployment-scales-out-and-fails-over-by-configuration sections 4
+  and 9, ruling 1058): a restore from the WAL archive to a point in time,
+  for `meridian restore --to-time`, or to the archive's end, for `meridian
+  restore --to-archive-end` (step 3c), each along the timeline the archive's
+  history says, and page checksums turned on in an existing database, for
+  `meridian upgrade-deployment --enable-checksums`.
+
+  A CronJob that never runs on its own, as the backup's is without a
+  schedule: the CLI makes a Job from it with the act named
+  (MERIDIAN_DATABASE_ACT, and MERIDIAN_RESTORE_TO_TIME for a restore), once
+  it has stopped every component and scaled the database to none, and
+  starts them again after. The act is files/database-offline.sh, in the
+  database's image under Patroni, which holds pgBackRest and pg_checksums.
+  It holds no RBAC and changes nothing in the cluster: what changes the
+  cluster is the person's, with their own rights (decisions/016).
+
+  On member 0's volume. Under Patroni the CLI makes member 0 the primary
+  first for enable-checksums; a restore does not switch the primary
+  first, since every member is stopped and the archive is restored from,
+  not a member. After either act it deletes the standbys' volumes, which
+  Patroni makes again from member 0, and after a restore it clears
+  Patroni's leader, sync and failover records, which name the primary and
+  the position from before it. The act starts the database on its socket
+  alone, without TLS and without hot standby (files/database-offline.sh):
+  the configuration a base backup restores can name internal TLS's
+  certificates, which only the database's own pods hold, and the WAL after
+  it can raise a setting past its own, which pauses a hot standby's
+  recovery. A start that fails or stops prints Postgres's last lines.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-database" $full }}
+{{- $archive := include "meridian-runtime.walArchive" . }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-offline
+  labels:
+    meridian.dev/component: database-offline
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  database-offline.sh: |
+    {{- .Files.Get "files/database-offline.sh" | nindent 4 }}
+{{- $root := dict "Values" .Values "Release" .Release "Chart" .Chart "Capabilities" .Capabilities "Template" .Template "Files" .Files }}
+{{- include "meridian-runtime.databaseOffline" $root }}
+{{- /* Each database past the first the chart brings (step 3d; section 6.4):
+       its own, on its own member 0's volume and its own stanza, for the CLI
+       to restore each database to the time. */}}
+{{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+{{- include "meridian-runtime.databaseOffline" (merge (dict "brought" $extra) $root) }}
+{{- end }}
 {{- end }}

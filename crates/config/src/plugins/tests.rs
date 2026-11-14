@@ -37,8 +37,14 @@ fn harness() -> (Arc<Bus>, Arc<Launcher>) {
 }
 
 fn harness_with(archive: ArchiveGrant) -> (Arc<Bus>, Arc<Launcher>) {
+    harness_as("conductor-1", archive)
+}
+
+/// The plugins' service on a conductor named `conductor`, as the chart
+/// names it `<release>-conductor`.
+fn harness_as(conductor: &str, archive: ArchiveGrant) -> (Arc<Bus>, Arc<Launcher>) {
     let bus = Arc::new(Bus::single(
-        "conductor-1",
+        conductor,
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
@@ -661,6 +667,54 @@ async fn an_archive_allowed_through_a_delegation_records_it_and_the_client() {
     assert_eq!(withdrawn.client_name, "meridian on ada-laptop");
 }
 
+/// Step 3d (decided under the approvals agreement, 2026-11-13): a core
+/// component's instance as this deployment's chart names it,
+/// `<release>-<component>`, is no plugin's -- its sidecar would stamp the
+/// book's or the analytics component's instance as the publisher, which the
+/// conductor's and the lake's checks trust. Refused INVALID_ARGUMENT naming
+/// the instance; `*-<component>` stays a plugin's to take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_core_components_chart_name_is_reserved_in_its_own_release() {
+    assert_eq!(
+        super::release_of("meridian-runtime-conductor"),
+        Some("meridian-runtime")
+    );
+    assert_eq!(super::release_of("conductor-1"), None);
+    assert_eq!(super::release_of("-conductor"), None);
+    let (bus, _launcher) = harness_as("meridian-runtime-conductor", ArchiveGrant::default());
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    for name in [
+        "meridian-runtime-bor",
+        "meridian-runtime-analytics",
+        "meridian-runtime-lake",
+        "meridian-runtime-conductor",
+    ] {
+        let refused = launch(&bus, launching(name, &["custody"]))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("core's own names"), "{name}: {refused}");
+        assert!(refused.contains("invalid-argument"), "{name}: {refused}");
+        assert!(refused.contains("instance_id"), "{name}: {refused}");
+    }
+    // Exactly the release's: another release's chart name, and a plugin
+    // named for what it does, launch.
+    for name in ["sample-analytics", "other-runtime-bor"] {
+        launch(&bus, launching(name, &["custody"]))
+            .await
+            .unwrap_or_else(|refused| panic!("{name}: {refused}"));
+    }
+    assert!(!super::is_reserved(
+        Contract::embedded(),
+        Some("meridian-runtime"),
+        "meridian-runtime-bors"
+    ));
+    assert!(super::is_reserved(
+        Contract::embedded(),
+        Some("meridian-runtime"),
+        "meridian-runtime-street"
+    ));
+}
+
 /// v17's security review, Nit 3 (contract v18): core's own names are no
 /// instance's, and a stopped instance's ID is never relaunched as another
 /// plugin, whose code its settings, secrets and access would then reach.
@@ -681,8 +735,16 @@ async fn core_names_are_reserved_and_an_instance_id_names_one_plugin() {
             .unwrap_err();
         assert!(refused.contains("core's own names"), "{name}: {refused}");
     }
-    assert!(!super::is_reserved(Contract::embedded(), "dashboards"));
-    assert!(!super::is_reserved(Contract::embedded(), "snaptrade-1"));
+    assert!(!super::is_reserved(
+        Contract::embedded(),
+        None,
+        "dashboards"
+    ));
+    assert!(!super::is_reserved(
+        Contract::embedded(),
+        None,
+        "snaptrade-1"
+    ));
 
     launch(&bus, launching("broker-1", &["custody"]))
         .await

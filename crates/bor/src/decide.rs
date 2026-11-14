@@ -120,6 +120,12 @@ pub struct Context {
     /// The lake did not answer that read in time: the fill is refused to
     /// be tried again, never priced at a factor nobody read.
     pub factors_unavailable: bool,
+    /// Step 3d (section 6.3): with more than one partition, the partition
+    /// of each account a booking allocates to, as the service read it
+    /// before the lock (empty where not placed yet); its legs then balance
+    /// through each partition's clearing account. `None` with one partition:
+    /// a booking is as it always was.
+    pub clearing: Option<BTreeMap<String, String>>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract

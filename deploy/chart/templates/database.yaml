@@ -1,5 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
-{{- if .Values.database.brought.enabled }}
+{{- define "meridian-runtime.broughtDatabase" }}
 {{/*
   A Postgres the deployment can bring, for a firm evaluating this and for a
   developer on a laptop.
@@ -32,10 +32,22 @@
   whoever remembers. `database.brought.enabled=false` renders none of it.
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
-{{- $name := printf "%s-database" $full }}
+{{- /* A database past the first a store's writer groups write to (step
+       3d; the resilience spec's section 6.4, `<store>.databases`): the
+       same, as `<release>-<store>-database-<d>` (approved 2026-11-12), its
+       pods labelled with that name, its WAL in its own stanza of the same
+       archive, and a Secret of its URLs beside its passwords. */}}
+{{- $extra := dig "brought" "name" "" . }}
+{{- $name := $extra | default (printf "%s-database" $full) }}
+{{- $component := "database" }}
+{{- if $extra }}
+{{- $component = printf "%s-database-%d" (dig "brought" "component" "" .) (int (dig "brought" "d" 0 .)) }}
+{{- end }}
+{{- $stanza := ternary $component "meridian" (ne $extra "") }}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace (printf "%s-passwords" $name) }}
 {{- $held := dict }}
 {{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
+{{- $passwords := dict "superuser" (index $held "superuser" | default (randAlphaNum 32 | b64enc)) "serving" (index $held "serving" | default (randAlphaNum 32 | b64enc)) "migrating" (index $held "migrating" | default (randAlphaNum 32 | b64enc)) "patroni" (index $held "patroni" | default (randAlphaNum 32 | b64enc)) "archive" (index $held "archive" | default (randAlphaNum 64 | b64enc)) }}
 {{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
 {{- /* Its record-read replicas (contract v30, stage C): members past the
        primary and its standbys, asynchronous, tagged nosync and nofailover. */}}
@@ -63,6 +75,10 @@
        for a synchronous standby it does not have yet -- strict, every
        commit would wait, and the connections waiting filled the server. */}}
 {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
+{{- /* One past the first starts with the first: running once it runs. */}}
+{{- if and $extra (not $live) }}
+{{- $running = dig "spec" "replicas" 0 (default (dict) (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-database" $full))) }}
+{{- end }}
 {{- $converting := and (gt (int $running) 0) (gt (add $standbys $readReplicas) 0) (not $wasPatroni) }}
 {{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
@@ -102,18 +118,18 @@ metadata:
     helm.sh/resource-policy: keep
 type: Opaque
 data:
-  superuser: {{ index $held "superuser" | default (randAlphaNum 32 | b64enc) }}
-  serving: {{ index $held "serving" | default (randAlphaNum 32 | b64enc) }}
-  migrating: {{ index $held "migrating" | default (randAlphaNum 32 | b64enc) }}
+  superuser: {{ $passwords.superuser }}
+  serving: {{ $passwords.serving }}
+  migrating: {{ $passwords.migrating }}
   # Patroni's REST API's, which members ask each other for their positions
   # and the chart's start-up asks to hold the dynamic settings to the
   # chart's. Made beside the others on any install, used under Patroni.
-  patroni: {{ index $held "patroni" | default (randAlphaNum 32 | b64enc) }}
+  patroni: {{ $passwords.patroni }}
   # The WAL archive's passphrase (backup.walArchive, ruling 1084), unless
   # backup.walArchive.cipherSecret names the administrator's own. Made on
   # any install, used where the archive is on, and carried sealed in every
   # backup with the rest of this Secret.
-  archive: {{ index $held "archive" | default (randAlphaNum 64 | b64enc) }}
+  archive: {{ $passwords.archive }}
 ---
 apiVersion: v1
 kind: Service
@@ -125,7 +141,7 @@ spec:
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
-    meridian.dev/component: database
+    meridian.dev/component: {{ $component }}
     {{- if $patroni }}
     # The primary alone: Patroni labels each member with its role, and moves
     # the label with a failover, so every store's next connection reaches
@@ -159,7 +175,7 @@ spec:
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
-    meridian.dev/component: database
+    meridian.dev/component: {{ $component }}
   ports:
     - name: postgres
       port: 5432
@@ -195,7 +211,7 @@ spec:
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" $ }}
     app.kubernetes.io/instance: {{ $.Release.Name }}
-    meridian.dev/component: database
+    meridian.dev/component: {{ $component }}
     statefulset.kubernetes.io/pod-name: {{ $name }}-{{ $i }}
   ports:
     {{- if $named }}
@@ -285,7 +301,7 @@ data:
       standby_leader_label_value: primary
       labels:
         app.kubernetes.io/instance: {{ .Release.Name }}
-        meridian.dev/component: database
+        meridian.dev/component: {{ $component }}
     bootstrap:
       dcs:
         {{- include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $synchronous) | nindent 8 }}
@@ -317,7 +333,7 @@ data:
         # (step 3b, section 4): local settings, which Patroni lays over its
         # dynamic ones.
         archive_mode: "on"
-        archive_command: pgbackrest --stanza=meridian archive-push %p
+        archive_command: pgbackrest --stanza={{ $stanza }} archive-push %p
         archive_timeout: {{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
         {{- end }}
         {{- if $tls }}
@@ -426,7 +442,7 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      meridian.dev/component: database
+      meridian.dev/component: {{ $component }}
   template:
     metadata:
       {{- if $archive }}
@@ -438,7 +454,7 @@ spec:
       # release this is, and a label that changes restarts it (see _helpers).
       labels:
         {{- include "meridian-runtime.unversionedLabels" . | nindent 8 }}
-        meridian.dev/component: database
+        meridian.dev/component: {{ $component }}
         {{- if $patroni }}
         meridian.dev/database-manager: patroni
         meridian.dev/database-scope: {{ $scope }}
@@ -451,7 +467,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if gt (add $standbys $readReplicas) 0 }}
-      {{- include "meridian-runtime.spread" (dict "top" . "component" "database") | nindent 6 }}
+      {{- include "meridian-runtime.spread" (dict "top" . "component" $component) | nindent 6 }}
       {{- end }}
       {{- else }}
       {{- with .Values.podSecurityContext }}
@@ -620,7 +636,7 @@ spec:
             - -c
             - archive_mode=on
             - -c
-            - archive_command=pgbackrest --stanza=meridian archive-push %p
+            - archive_command=pgbackrest --stanza={{ $stanza }} archive-push %p
             - -c
             - archive_timeout={{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
             {{- end }}
@@ -706,6 +722,10 @@ spec:
           env:
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            # Its stanza of the archive: meridian, or a database's past the
+            # first by its own name (step 3d).
+            - name: PGBACKREST_STANZA
+              value: {{ $stanza | quote }}
             {{- if eq .Values.backup.walArchive.store "volume" }}
             - name: MERIDIAN_ARCHIVE_DIRECTORY
               value: /backups{{ .Values.backup.walArchive.path }}
@@ -785,7 +805,7 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      meridian.dev/component: database
+      meridian.dev/component: {{ $component }}
   policyTypes: [Ingress]
   ingress:
     - from:
@@ -812,7 +832,7 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
-              meridian.dev/component: database
+              meridian.dev/component: {{ $component }}
         - podSelector:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
@@ -821,6 +841,36 @@ spec:
         - port: 8008
     {{- end }}
 {{- if gt $standbys 0 }}
-{{ include "meridian-runtime.budget" (dict "top" . "component" "database") }}
+{{ include "meridian-runtime.budget" (dict "top" . "component" $component) }}
+{{- end }}
+{{- if $extra }}
+{{- $host := printf "%s.%s.svc.cluster.local" $name .Release.Namespace }}
+{{- $url := "postgres://%s:%s@%s:5432/meridian?sslmode=disable" }}
+---
+# What the store's members connect to database {{ dig "brought" "d" 0 . | int }} by (step 3d; section
+# 6.4): its serving and migrating roles' URLs, made here from the passwords
+# beside them, as first run writes the first database's. The migrate Job
+# makes the database and its roles by its superuser before its schema.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/component: {{ $component }}
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+type: Opaque
+data:
+  url: {{ printf $url "meridian_app" ($passwords.serving | b64dec) $host | b64enc | quote }}
+  migrate-url: {{ printf $url "meridian_migrate" ($passwords.migrating | b64dec) $host | b64enc | quote }}
+  {{- if gt $readReplicas 0 }}
+  read-url: {{ printf $url "meridian_app" ($passwords.serving | b64dec) (printf "%s-%d.%s.svc.cluster.local" $name (add 1 $standbys) .Release.Namespace) | b64enc | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.database.brought.enabled }}
+{{- $root := dict "Values" .Values "Release" .Release "Chart" .Chart "Capabilities" .Capabilities "Template" .Template "Files" .Files }}
+{{- include "meridian-runtime.broughtDatabase" $root }}
+{{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+{{- include "meridian-runtime.broughtDatabase" (merge (dict "brought" $extra) $root) }}
 {{- end }}
 {{- end }}

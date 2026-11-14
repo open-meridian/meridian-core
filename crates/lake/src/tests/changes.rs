@@ -243,6 +243,7 @@ async fn the_control_partition_carries_assessments_amendments_priorities_and_ali
         .amend_closed_day(&[crate::store::ClosedDayAmendment {
             dataset: "coinbase-1:live".into(),
             sequence: 1,
+            row_key: String::new(),
             closed_day: None,
             why: "calendar 2 applied".into(),
             at_ns: NOW + 2,

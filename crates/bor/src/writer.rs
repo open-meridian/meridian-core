@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use meridian_bus::Bus;
+use prost::Message as _;
 
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break};
 
@@ -33,6 +34,18 @@ use crate::store::{
 
 /// The book's change log's domain in its component topics.
 pub const DOMAIN: &str = "book";
+
+/// The topic a command is handed to its partition's writer group on (step
+/// 3d; the resilience spec's section 6.7): the public command, unchanged.
+pub const INTERNAL_COMMAND: &str = "platform.book.internal.command";
+
+/// Whether `topic` is one of the book's commands, which a member hands to
+/// the writer group owning its account's partition.
+pub fn is_command(topic: &str) -> bool {
+    topic
+        .strip_prefix("platform.book.")
+        .is_some_and(|rest| rest.starts_with("command."))
+}
 
 /// The default bound: 128 MiB of books, within the book's 512 MiB.
 pub const DEFAULT_BOOKS_BYTES: usize = 128 * 1024 * 1024;
@@ -138,20 +151,84 @@ pub struct Writer {
     bus: Arc<Bus>,
     books: Mutex<Books>,
     bound: usize,
+    /// Whether the store tells each batch's commits itself (step 3d, group
+    /// commit): then they are published as the batch's one page, in order,
+    /// and not again as each act returns.
+    batched: bool,
+}
+
+/// An account's placement key: its owner label when one is set, else its
+/// ID (step 3d; section 6.3).
+pub fn placement_key_of(account_id: &str, owner: &str) -> String {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        account_id.to_string()
+    } else {
+        owner.to_string()
+    }
 }
 
 impl Writer {
+    /// The key `account_id` is placed by (step 3d; section 6.3, the source
+    /// ruled 2026-11-13): its owner label as the conductor holds it, else
+    /// its ID where none is set. Refused UNAVAILABLE, with a retry-after,
+    /// where the conductor does not answer or holds no such account yet:
+    /// never placed by its ID instead.
+    fn placement_key(&self, account_id: &str) -> Result<String> {
+        let not_placed = |why: String| {
+            crate::store::StoreError::NotPlaced(format!(
+                "account {account_id} cannot be placed now: {why}; ask again"
+            ))
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| not_placed("no runtime to ask the conductor on".into()))?;
+        let asked = handle.block_on(self.bus.call(
+            crate::store::READ_ACCOUNTS,
+            "meridian.v1.AccountsRequest",
+            meridian_domain::v1::AccountsRequest {}.encode_to_vec(),
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        ));
+        let (_, body) = asked
+            .map_err(|failed| not_placed(format!("the conductor did not answer ({failed})")))?;
+        let accounts =
+            meridian_domain::v1::Accounts::decode(body.as_slice()).map_err(|failed| {
+                not_placed(format!("the conductor's answer did not read ({failed})"))
+            })?;
+        // Not in the answer yet: refused, never placed by its ID instead,
+        // since its placement is fixed at its creation.
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.account_id == account_id)
+            .ok_or_else(|| not_placed("the conductor holds no such account yet".into()))?;
+        Ok(placement_key_of(account_id, &account.owner))
+    }
+
     pub fn new(inner: Arc<dyn Store>, bus: Arc<Bus>) -> Self {
         Self::bounded(inner, bus, DEFAULT_BOOKS_BYTES)
     }
 
     /// The same, its books bounded by `bound` bytes.
     pub fn bounded(inner: Arc<dyn Store>, bus: Arc<Bus>, bound: usize) -> Self {
+        let telling = Arc::clone(&bus);
+        let batched = inner.on_commit(Box::new(move |epoch, decided| {
+            let Some(first) = decided.first() else {
+                return;
+            };
+            let changes: Vec<meridian_changes::Change> = decided
+                .iter()
+                .map(|decided| decided.entry.to_change(epoch, meridian_changes::origin()))
+                .collect();
+            let after = first.entry.first_sequence.saturating_sub(1);
+            meridian_changes::publish(&telling, DOMAIN, after, &changes);
+        }));
         Self {
             inner,
             bus,
             books: Mutex::new(Books::default()),
             bound,
+            batched,
         }
     }
 
@@ -175,11 +252,26 @@ impl Store for Writer {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        // Placed first where it never was (step 3d; section 6.3): by its
+        // owner label, read from the conductor once, at its creation.
+        if self.inner.placement_needed(account_id)? {
+            let key = self.placement_key(account_id)?;
+            self.inner.place_first(account_id, &key)?;
+        }
         let acted = self
             .inner
             .act(account_id, message_id, idempotency_key, request, decide)?;
         if let Acted::Committed(decided) = &acted {
-            self.books().put(decided.book.clone(), self.bound);
+            // An account moving away is not held here: its next acts are
+            // another partition's, perhaps another group's (step 3d).
+            if crate::journal::closes(&decided.entry).is_some() {
+                self.books().forget(account_id);
+            } else {
+                self.books().put(decided.book.clone(), self.bound);
+            }
+            if self.batched {
+                return Ok(acted);
+            }
             let change = decided
                 .entry
                 .to_change(self.inner.epoch(), meridian_changes::origin());
@@ -187,6 +279,54 @@ impl Store for Writer {
             meridian_changes::publish(&self.bus, DOMAIN, after, &[change]);
         }
         Ok(acted)
+    }
+
+    fn writes(&self, account_id: &str) -> bool {
+        self.inner.writes(account_id)
+    }
+
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        self.inner.writer_group_of(account_id)
+    }
+
+    fn settle_move(&self, account_id: &str) -> Result<()> {
+        self.inner.settle_move(account_id)
+    }
+
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        self.inner.group_of_partition(partition)
+    }
+
+    fn warm_account(
+        &self,
+        account_id: &str,
+        target_partition: &str,
+    ) -> Result<Option<crate::store::Warmed>> {
+        self.inner.warm_account(account_id, target_partition)
+    }
+
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        self.inner.control_records_owed()
+    }
+
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        self.inner.owe_control(record, kept_at_ns)
+    }
+
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        self.inner.placement_needed(account_id)
+    }
+
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        self.inner.place_first(account_id, key)
+    }
+
+    fn partition_count(&self) -> u32 {
+        self.inner.partition_count()
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        self.inner.partition_of(account_id)
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
@@ -237,6 +377,11 @@ impl Store for Writer {
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
+        // Another writer group's account (step 3d): read from the record,
+        // never held, since its commits are never this member's.
+        if !self.inner.writes(account_id) {
+            return self.inner.book(account_id);
+        }
         if let Some(held) = self.books().get(account_id) {
             return Ok(held);
         }

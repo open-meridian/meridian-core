@@ -35,6 +35,64 @@ struct State {
 pub struct MemoryStore {
     state: Mutex<State>,
     fence: meridian_changes::Fence,
+    /// Its partitions (step 3d): a new account placed over them by its ID,
+    /// as a test double places it; the owner label is the writer's to read.
+    partitions: u32,
+    /// A test's crash (step 3d's property test): an act it names, by its
+    /// account and idempotency key, fails as a writer gone mid-way would.
+    #[cfg(test)]
+    crash: Mutex<Option<Crash>>,
+}
+
+/// Which acts a test's crash fails: by account and idempotency key.
+#[cfg(test)]
+pub(crate) type Crash = Box<dyn Fn(&str, &str) -> bool + Send>;
+
+#[cfg(test)]
+impl MemoryStore {
+    /// Fail each act `crash` names until it is lifted with `None`.
+    pub(crate) fn crash_when(&self, crash: Option<Crash>) {
+        *self.crash.lock().expect("unpoisoned") = crash;
+    }
+
+    /// `partition` as a restore to a time leaves it (step 3d; section 6.4):
+    /// every entry numbered past `sequence` gone, with what it answered and
+    /// the keys it held, and each account it touched replayed from what is
+    /// left. Another partition is as it was: a restore across databases
+    /// takes each database to its own time.
+    pub(crate) fn restore_partition_to(&self, partition: &str, sequence: u64) {
+        let mut state = self.state();
+        let mut gone: Vec<Entry> = Vec::new();
+        for journal in state.journals.values_mut() {
+            let (kept, lost): (Vec<Entry>, Vec<Entry>) = journal.drain(..).partition(|entry| {
+                entry.partition != partition || entry.first_sequence <= sequence
+            });
+            *journal = kept;
+            gone.extend(lost);
+        }
+        for entry in &gone {
+            state.replies.remove(&entry.entry_id);
+            state.requests.remove(&entry.entry_id);
+            state.by_message.retain(|_, id| *id != entry.entry_id);
+            state.by_key.retain(|_, id| *id != entry.entry_id);
+        }
+        let touched: std::collections::BTreeSet<String> =
+            gone.iter().map(|entry| entry.account_id.clone()).collect();
+        for account in touched {
+            let journal = state.journals.get(&account).cloned().unwrap_or_default();
+            match journal.first() {
+                Some(first) => {
+                    let book = Book::replay(&account, &first.partition.clone(), &journal)
+                        .expect("a journal replays");
+                    state.books.insert(account, book);
+                }
+                None => {
+                    state.books.remove(&account);
+                }
+            }
+        }
+        state.heads.insert(partition.to_string(), sequence);
+    }
 }
 
 impl Default for MemoryStore {
@@ -52,6 +110,33 @@ impl MemoryStore {
         MemoryStore {
             state: Mutex::new(state),
             fence: meridian_changes::Fence::new(),
+            partitions: 1,
+            #[cfg(test)]
+            crash: Mutex::new(None),
+        }
+    }
+
+    /// The same store over `count` partitions (step 3d), each new account
+    /// placed by rendezvous hashing of its ID.
+    pub fn with_partitions(mut self, count: u32) -> Self {
+        self.partitions = count.max(1);
+        let mut state = self.state();
+        for n in 0..self.partitions {
+            state
+                .heads
+                .entry(crate::store::partition_named(n))
+                .or_insert(0);
+        }
+        drop(state);
+        self
+    }
+
+    /// Where a new key starts: an account placed over the partitions.
+    fn starts_in(&self, key: &str) -> String {
+        if self.partitions > 1 && is_account(key) {
+            crate::store::placement_of(key, self.partitions)
+        } else {
+            first_partition_of(key).to_string()
         }
     }
 
@@ -60,8 +145,9 @@ impl MemoryStore {
     }
 }
 
-impl Store for MemoryStore {
-    fn act(
+impl MemoryStore {
+    /// One try of [`Store::act`].
+    fn act_once(
         &self,
         account_id: &str,
         message_id: &str,
@@ -69,6 +155,18 @@ impl Store for MemoryStore {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        #[cfg(test)]
+        if self
+            .crash
+            .lock()
+            .expect("unpoisoned")
+            .as_ref()
+            .is_some_and(|crash| crash(account_id, idempotency_key))
+        {
+            return Err(StoreError::Unavailable(format!(
+                "the writer stopped before {account_id}'s act {idempotency_key}"
+            )));
+        }
         let mut state = self.state();
         if let Some(entry_id) = (!message_id.is_empty())
             .then(|| state.by_message.get(message_id))
@@ -93,10 +191,21 @@ impl Store for MemoryStore {
             .books
             .get(account_id)
             .cloned()
-            .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id)));
+            .unwrap_or_else(|| Book::new(account_id, &self.starts_in(account_id)));
         let epoch = self.fence.adopt_once(state.epoch);
         self.fence.admits(state.epoch)?;
-        let head = state.heads.get(&book.partition).copied().unwrap_or(0);
+        // An account between its move's close and its open is held, but for
+        // the open, which is numbered in its new partition (step 3d).
+        let acting_in = match moving_to(&book) {
+            Some(to) if crate::moves::is_open_key(idempotency_key) => to,
+            Some(to) => {
+                return Err(StoreError::Held(format!(
+                    "account {account_id} is moving to {to}: ask again in a moment"
+                )))
+            }
+            None => book.partition.clone(),
+        };
+        let head = state.heads.get(&acting_in).copied().unwrap_or(0);
         // The book holds no entry's body, as a store's never does (contract
         // v26, W9.10): each one a decision asks for is read from the journal,
         // so every test drives the bodies-on-demand path.
@@ -150,6 +259,34 @@ impl Store for MemoryStore {
         state.books.insert(account_id.to_string(), kept);
         Ok(Acted::Committed(Box::new(decided)))
     }
+}
+
+impl Store for MemoryStore {
+    fn partition_count(&self) -> u32 {
+        self.partitions
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        let state = self.state();
+        let book = state.books.get(account_id)?;
+        // Between a move's close and its open: its new partition's (step 3d).
+        Some(moving_to(book).unwrap_or_else(|| book.partition.clone()))
+    }
+
+    fn act(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // Held while its move is between its close and its open (step 3d;
+        // section 6.8): tried again for at most the hold.
+        crate::moves::holding(crate::moves::hold(), || {
+            self.act_once(account_id, message_id, idempotency_key, request, decide)
+        })
+    }
 
     fn book(&self, account_id: &str) -> Result<Book> {
         // Every entry's book is kept, which is a snapshot at every entry.
@@ -158,16 +295,17 @@ impl Store for MemoryStore {
             .books
             .get(account_id)
             .cloned()
-            .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id))))
+            .unwrap_or_else(|| Book::new(account_id, &self.starts_in(account_id))))
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
-        Ok(self
-            .state()
-            .journals
-            .get(account_id)
-            .cloned()
-            .unwrap_or_default())
+        Ok(crate::journal::in_order(
+            self.state()
+                .journals
+                .get(account_id)
+                .cloned()
+                .unwrap_or_default(),
+        ))
     }
 
     fn adopt(&self) -> Result<u64> {
@@ -426,7 +564,7 @@ impl Store for MemoryStore {
             let partition = entries
                 .first()
                 .map(|entry| entry.partition.clone())
-                .unwrap_or_else(|| first_partition_of(account).to_string());
+                .unwrap_or_else(|| self.starts_in(account));
             books.insert(account.clone(), Book::replay(account, &partition, entries)?);
             replayed += entries.len();
         }
@@ -638,4 +776,10 @@ pub(crate) fn open_break_instrument(record: &Break) -> Option<&str> {
 
 fn names(record: &Break, instrument_id: &str) -> bool {
     open_break_instrument(record) == Some(instrument_id)
+}
+
+/// Where `book`'s account is moving, where its last entry is a move's close
+/// not yet opened (step 3d; the resilience spec's section 6.8).
+fn moving_to(book: &Book) -> Option<String> {
+    book.moved_to.clone()
 }

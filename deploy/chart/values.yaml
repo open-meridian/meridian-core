@@ -350,8 +350,35 @@ street:
 # so an upgrade never runs two writers. Its tables are prefixed book_, so it
 # may share a schema with the others; its own database is supported and
 # kept apart from the street's by the credential.
+
+# Moves (step 3d; the resilience spec's section 6.8): a partition's or an
+# account's move holds new writes to it for at most holdSeconds, never past
+# the caller's deadline, then answers OVERLOADED with a retry-after; a move
+# whose target has not caught up within switchSeconds, or whose switch has
+# not finished in that time, aborts and the source keeps owning.
+moves:
+  holdSeconds: 5
+  switchSeconds: 30
+
 bor:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its partitions: `control` group 0's, each account partition by rendezvous hashing; each group past
+  # the first is a writer Deployment of its own, <release>-bor-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
+  # A database per writer group (step 3d; the resilience spec's section
+  # 6.4): 1, as by default, every group on the one database. Above it,
+  # writer group g writes to database g mod the count, at most one per
+  # group; database 0 keeps the store's control partition and its
+  # assignments, and reads across databases fan out and merge. With the
+  # database this chart brings, it brings one more for each past the first,
+  # <release>-bor-database-<d>, each with the brought database's
+  # standbys, read replicas and WAL archive; with one somebody else runs,
+  # bor.database.groupSecrets names each past the first.
+  databases: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.
@@ -371,6 +398,10 @@ bor:
   database:
     existingSecret: ""
     key: ""
+    # A database somebody else runs, past the first (step 3d; section
+    # 6.4): one Secret name for each, in order, each read with this store's
+    # key, else database.key. Empty with the database this chart brings.
+    groupSecrets: []
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's
@@ -398,6 +429,12 @@ bor:
   # book's start for every account past it with none current. The default is
   # from core's replay benchmark; 10 to 100000.
   snapshotInterval: 1000
+  # The book's partitions (step 3d; the resilience spec's section 6.3): P0
+  # to P<n-1>, 1 to 64. A new account is placed by rendezvous hashing of its
+  # owner label, else its ID, at its creation and for good; raising the
+  # count places new accounts only. The upgrade preflight refuses lowering
+  # it while a partition past the new count holds accounts.
+  partitions: 1
   # The hot layer (step 3a): each account's book at its head, answered from
   # the book's memory, bounded in MiB, the least recently read evicted
   # first, within its 512 MiB.
@@ -411,6 +448,23 @@ bor:
 # credential.
 lake:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its datasets by rendezvous hashing, `control` group 0's; each group past
+  # the first is a writer Deployment of its own, <release>-lake-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
+  # A database per writer group (step 3d; the resilience spec's section
+  # 6.4): 1, as by default, every group on the one database. Above it,
+  # writer group g writes to database g mod the count, at most one per
+  # group; database 0 keeps the store's control partition and its
+  # assignments, and reads across databases fan out and merge. With the
+  # database this chart brings, it brings one more for each past the first,
+  # <release>-lake-database-<d>, each with the brought database's
+  # standbys, read replicas and WAL archive; with one somebody else runs,
+  # lake.database.groupSecrets names each past the first.
+  databases: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.
@@ -465,6 +519,10 @@ lake:
   database:
     existingSecret: ""
     key: ""
+    # A database somebody else runs, past the first (step 3d; section
+    # 6.4): one Secret name for each, in order, each read with this store's
+    # key, else database.key. Empty with the database this chart brings.
+    groupSecrets: []
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's

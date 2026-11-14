@@ -93,15 +93,15 @@ impl Placed {
     /// What it holds in memory: each row's place, a row held as
     /// [`Whole::held_bytes`] counts a row, and each dataset's name once.
     pub fn held_bytes(&self) -> usize {
-        let mut names: Vec<*const u8> = Vec::new();
+        let mut names: Vec<u32> = Vec::new();
         let mut bytes = self.rows.capacity() * std::mem::size_of::<Place>()
             + self.not_served.capacity() * std::mem::size_of::<NotServed>();
         for place in &self.rows {
             match place {
-                Place::Kept(name, _) => {
-                    if !names.contains(&name.as_ptr()) {
-                        names.push(name.as_ptr());
-                        bytes += name.len() + 16;
+                Place::Kept(name, _, _) => {
+                    if !names.contains(name) {
+                        names.push(*name);
+                        bytes += crate::read::dataset_named(*name).len() + 16;
                     }
                 }
                 Place::Held(row) => bytes += row_bytes(row),
@@ -352,7 +352,7 @@ mod tests {
         let dataset: Arc<str> = Arc::from("tradier:options");
         Arc::new(Placed {
             rows: (0..rows)
-                .map(|i| Place::Kept(Arc::clone(&dataset), i as u64 + 1))
+                .map(|i| Place::Kept(crate::read::dataset_id(&dataset), 0, i as u64 + 1))
                 .collect(),
             not_served: Vec::new(),
         })

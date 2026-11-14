@@ -77,7 +77,7 @@ chown postgres:postgres /tmp/pgbackrest /var/run/postgresql
 # them and replays on. Nothing is read while it replays, so nothing is lost.
 options="-c listen_addresses='' -c unix_socket_directories=/var/run/postgresql -c ssl=off -c hot_standby=off"
 if [ -n "$archive" ]; then
-	options="$options -c archive_mode=on -c archive_command='pgbackrest --stanza=meridian archive-push %p'"
+	options="$options -c archive_mode=on -c archive_command='pgbackrest --stanza=${PGBACKREST_STANZA:-meridian} archive-push %p'"
 fi
 # Started, and waited for until it accepts connections: without hot
 # standby, only once its recovery has ended (for a restore, promoted at the
@@ -141,13 +141,18 @@ def fail(text):
     sys.exit(1)
 
 
+# Its stanza (step 3d): meridian, or a database's past the first, by its own
+# name, which its Job names (PGBACKREST_STANZA).
+STANZA = os.environ.get("PGBACKREST_STANZA") or "meridian"
+
+
 def as_postgres(*command):
     return subprocess.run(["su-exec", "postgres", *command], capture_output=True, text=True,
                           env={**os.environ, "TZ": "UTC"})
 
 
 def pgbackrest(*args):
-    done = as_postgres("pgbackrest", "--stanza=meridian", *args)
+    done = as_postgres("pgbackrest", "--stanza=" + STANZA, *args)
     if done.returncode != 0:
         said = (done.stderr + done.stdout).strip()
         said = said[said.find("ERROR"):] if "ERROR" in said else said or "it said nothing"
@@ -185,7 +190,7 @@ def lsn(text):
 
 
 info = json.loads(pgbackrest("info", "--output=json") or "[]")
-stanza = next((s for s in info if s.get("name") == "meridian"), None)
+stanza = next((s for s in info if s.get("name") == STANZA), None)
 if not stanza or not stanza.get("db"):
     fail("the archive holds no stanza yet: the database's archive container makes it once the database is primary")
 current = max(d["id"] for d in stanza["db"])
@@ -328,7 +333,7 @@ restored() {
 		set --
 		reached="the archive's end"
 	fi
-	as_postgres pgbackrest --stanza=meridian restore --delta "--set=$backup_set" "--target-timeline=$along" "$@" \
+	as_postgres pgbackrest "--stanza=${PGBACKREST_STANZA:-meridian}" restore --delta "--set=$backup_set" "--target-timeline=$along" "$@" \
 		>/tmp/pgbackrest/restore.log 2>&1 \
 		|| fail "the restore did not finish: $(grep -m1 ERROR /tmp/pgbackrest/restore.log || tail -1 /tmp/pgbackrest/restore.log)"
 	say "the base backup restored; the archive replays to $reached, and nothing answers until it is there"
