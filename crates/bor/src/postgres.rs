@@ -51,6 +51,43 @@ thread_local! {
     /// The heads its snapshots read, the lowest of each where it took more
     /// than one.
     static SNAPSHOT_HEADS: std::cell::RefCell<Option<Mark>> = const { std::cell::RefCell::new(None) };
+    /// The partitions this database writes, where a read of every account
+    /// fans out over several databases ([`answering_for`]).
+    static WRITTEN_HERE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `read` on this thread answering only the accounts placed in
+/// `partitions` -- those this database writes -- in a read of every account
+/// over several databases (step 3d; the review's C5): each partition's
+/// accounts from the database writing it, so none is read twice, a move's
+/// copy in another database included, even for the moment of a switch.
+pub fn answering_for<T>(partitions: &[String], read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            WRITTEN_HERE.with(|written| *written.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(WRITTEN_HERE.with(|written| written.replace(Some(partitions.to_vec()))));
+    read()
+}
+
+/// A read's condition on `column`, an account: placed in a partition this
+/// database writes, under [`answering_for`]; nothing otherwise. In the
+/// read's own statement, so its rows and their placements are one snapshot.
+fn written_here(column: &str) -> String {
+    WRITTEN_HERE.with(|written| match &*written.borrow() {
+        None => String::new(),
+        Some(partitions) => format!(
+            "AND {column} IN (SELECT account_id FROM book_account WHERE partition = ANY(ARRAY[{}]::text[]))",
+            partitions
+                .iter()
+                .map(|partition| format!("'{}'", partition.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    })
 }
 
 /// The next reads on this thread each answer from one repeatable-read
@@ -919,10 +956,13 @@ fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64)
 
 /// The accounts the book holds, in order.
 fn accounts_of(client: &mut impl GenericClient) -> Result<Vec<String>> {
+    let written = written_here("account_id");
     Ok(client
         .query(
-            "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
-              ORDER BY account_id COLLATE \"C\"",
+            &format!(
+                "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%' {written}
+                  ORDER BY account_id COLLATE \"C\""
+            ),
             &[],
         )
         .map_err(unavailable)?
@@ -2574,10 +2614,12 @@ impl Store for PostgresStore {
     ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
         // Each account's journal and its latest snapshot of this format, in
         // the order accounts are listed.
+        let written = written_here("a.account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT a.account_id,
+                &format!(
+                    "SELECT a.account_id,
                         (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id),
                         (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id
                             AND e.first_sequence > COALESCE(s.last_sequence, -1)),
@@ -2590,8 +2632,10 @@ impl Store for PostgresStore {
                   WHERE a.account_id NOT LIKE '~%'
                     AND a.account_id COLLATE \"C\" > $1
                     AND ($4::text IS NULL OR a.account_id = $4)
+                    {written}
                   ORDER BY a.account_id COLLATE \"C\"
-                  LIMIT $2",
+                  LIMIT $2"
+                ),
                 &[&after, &(limit as i64), &crate::snapshot::FORMAT, &only],
             )
             .map_err(unavailable)?
@@ -2658,13 +2702,16 @@ impl Store for PostgresStore {
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {
+        let written = written_here("account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT account_id FROM book_position WHERE instrument_id = $1 AND NOT removed
-                 UNION
-                 SELECT account_id FROM book_break WHERE instrument_id = $1 AND state = $2
-                 ORDER BY 1",
+                &format!(
+                    "SELECT account_id FROM book_position WHERE instrument_id = $1 AND NOT removed {written}
+                     UNION
+                     SELECT account_id FROM book_break WHERE instrument_id = $1 AND state = $2 {written}
+                     ORDER BY 1"
+                ),
                 &[&instrument_id, &(BreakState::Open as i32)],
             )
             .map_err(unavailable)?
@@ -2674,13 +2721,16 @@ impl Store for PostgresStore {
     }
 
     fn instruments_held(&self) -> Result<Vec<String>> {
+        let written = written_here("account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id FROM book_position WHERE NOT removed
-                 UNION
-                 SELECT instrument_id FROM book_break WHERE instrument_id <> '' AND state = $1
-                 ORDER BY 1",
+                &format!(
+                    "SELECT instrument_id FROM book_position WHERE NOT removed {written}
+                     UNION
+                     SELECT instrument_id FROM book_break WHERE instrument_id <> '' AND state = $1 {written}
+                     ORDER BY 1"
+                ),
                 &[&(BreakState::Open as i32)],
             )
             .map_err(unavailable)?
@@ -2705,12 +2755,13 @@ impl Store for PostgresStore {
         } else {
             UNUSED_MARK_AND_NOT_REMOVED
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_position
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND (account_id COLLATE \"C\", instrument_id COLLATE \"C\", side,
@@ -2758,12 +2809,13 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let states: Vec<i32> = read.states.iter().map(|state| *state as i32).collect();
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_break
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND (cardinality($5::integer[]) = 0 OR state = ANY($5))
@@ -2812,12 +2864,13 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let agreement = agreement_key(read.agreement.as_ref());
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_figures
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND ($5 = '' OR agreement_key = $5)
@@ -2868,12 +2921,13 @@ impl Store for PostgresStore {
         } else {
             UNUSED_MARK
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_attributes
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND account_id COLLATE \"C\" > $5 COLLATE \"C\"
@@ -3055,6 +3109,7 @@ impl Store for PostgresStore {
                 .to_string(),
             state => format!("AND state = {state}"),
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let mut items = Vec::new();
             for (kind, (table, id)) in tables.iter().enumerate() {
@@ -3074,7 +3129,7 @@ impl Store for PostgresStore {
                     .query(
                         &format!(
                             "SELECT account_id, {id}, record FROM {table}
-                              WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                              WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                                 AND ($2 = '' OR account_id = $2)
                                 AND {filter}
                                 {state_filter}
@@ -3131,13 +3186,17 @@ impl Store for PostgresStore {
     fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>> {
         read.scope.admit(&read.account_id)?;
         let scope = scope_param(&read.scope);
+        let written = written_here("o.account_id");
         let entries = self.reading(|tx| {
             tx.query(
-                "SELECT e.meta FROM book_order_entry o JOIN book_entry e USING (entry_id)
-                  WHERE o.order_id = $1
-                    AND ($2::text[] IS NULL OR o.account_id = ANY($2))
-                    AND ($3 = '' OR o.account_id = $3)
-                  ORDER BY e.first_sequence",
+                &format!(
+                    "SELECT e.meta FROM book_order_entry o JOIN book_entry e USING (entry_id)
+                      WHERE o.order_id = $1
+                        AND ($2::text[] IS NULL OR o.account_id = ANY($2))
+                        AND ($3 = '' OR o.account_id = $3)
+                        {written}
+                      ORDER BY e.first_sequence"
+                ),
                 &[&read.order_id, &scope, &read.account_id],
             )
             .map_err(unavailable)
@@ -3159,12 +3218,13 @@ impl Store for PostgresStore {
         // decoded and sorted for one page.
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, locate_record_id, record FROM book_locate
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND {filter}
@@ -3202,12 +3262,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT instruction_key, record FROM book_instruction
-                          WHERE {filter}
+                          WHERE {filter} {written}
                             AND ($3 = '' OR instruction_key COLLATE \"C\" > $3)
                           ORDER BY instruction_key COLLATE \"C\"
                           LIMIT $4"
@@ -3233,9 +3294,13 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT account_id, order_id FROM book_order
-                  WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 AND state = ANY($2)
-                  ORDER BY expires_at_ns, order_id",
+                &format!(
+                    "SELECT account_id, order_id FROM book_order
+                      WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 AND state = ANY($2)
+                        {}
+                      ORDER BY expires_at_ns, order_id",
+                    written_here("account_id")
+                ),
                 &[
                     &now_ns,
                     &vec![
@@ -3266,12 +3331,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, booking_id, record FROM book_booking
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
@@ -3317,12 +3383,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, alert_id, record FROM book_alert
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
@@ -3362,11 +3429,14 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT m.account_id, m.block_order_id
+                &format!(
+                    "SELECT m.account_id, m.block_order_id
                    FROM book_block_member m
                    JOIN book_order o ON o.order_id = m.block_order_id
-                  WHERE m.member_order_id = $1 AND o.state = ANY($2)
+                  WHERE m.member_order_id = $1 AND o.state = ANY($2) {}
                   ORDER BY 2",
+                    written_here("m.account_id")
+                ),
                 &[
                     &member_order_id,
                     &vec![
@@ -3386,8 +3456,11 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id FROM book_order
-                  WHERE account_id NOT LIKE '~%' AND state = ANY($1)",
+                &format!(
+                    "SELECT instrument_id FROM book_order
+                      WHERE account_id NOT LIKE '~%' AND state = ANY($1) {}",
+                    written_here("account_id")
+                ),
                 &[&vec![
                     meridian_domain::v1::OrderState::Proposed as i32,
                     meridian_domain::v1::OrderState::Released as i32,
@@ -4113,6 +4186,8 @@ impl PostgresStore {
         for account in self.accounts_in(partition)? {
             to.replace_account_from(self, &account)?;
         }
+        meridian_changes::moves::points::reached("book.switch.copied", partition)
+            .map_err(StoreError::Unavailable)?;
         if left(began).is_zero() {
             return Ok(Switched::TimedOut);
         }

@@ -279,6 +279,32 @@ impl Spread {
             .retain(|(held, _)| held != partition);
     }
 
+    /// Each database's partitions, those it writes: each partition at the
+    /// database [`Self::of`] names, `control` at database 0.
+    fn written(&self) -> Vec<Vec<String>> {
+        let mut written: Vec<Vec<String>> = vec![Vec::new(); self.stores.len()];
+        let partitions = (0..self.partition_count())
+            .map(crate::store::partition_named)
+            .chain([crate::store::CONTROL_PARTITION.to_string()]);
+        for partition in partitions {
+            written[self.of(&partition) as usize].push(partition);
+        }
+        written
+    }
+
+    /// `read` of each database in turn, each answering only the accounts
+    /// placed in the partitions it writes (the review's C5): an account a
+    /// move copied into another database -- warming, switching, or let go
+    /// and not yet forgotten -- is read once, from the database writing it.
+    fn each_written<T>(&self, mut read: impl FnMut(&PostgresStore) -> Result<T>) -> Result<Vec<T>> {
+        let written = self.written();
+        self.stores
+            .iter()
+            .zip(&written)
+            .map(|(store, partitions)| crate::postgres::answering_for(partitions, || read(store)))
+            .collect()
+    }
+
     /// The store holding `account_id`'s partition: where it is placed, else
     /// the database its first partition is in.
     fn holding(&self, account_id: &str) -> &Arc<PostgresStore> {
@@ -316,10 +342,15 @@ impl Spread {
             return read(self.holding(account_id), cursor, limit);
         }
         let (mut d, mut inner) = split_cursor(cursor)?;
+        // Each database answering the accounts of the partitions it writes
+        // (the review's C5): never one read twice.
+        let written = self.written();
         let mut page = P::default();
         while d < self.stores.len() {
             let room = limit.saturating_sub(page.len()).max(1);
-            let part = read(&self.stores[d], &inner, room)?;
+            let part = crate::postgres::answering_for(&written[d], || {
+                read(&self.stores[d], &inner, room)
+            })?;
             let next = part.cursor().to_string();
             page.take(part);
             if !next.is_empty() {
@@ -524,13 +555,7 @@ impl Store for Spread {
         if self.stores.len() == 1 {
             return self.home().journal(account_id);
         }
-        let mut written: Vec<Vec<String>> = vec![Vec::new(); self.stores.len()];
-        let partitions = (0..self.partition_count())
-            .map(crate::store::partition_named)
-            .chain([crate::store::CONTROL_PARTITION.to_string()]);
-        for partition in partitions {
-            written[self.of(&partition) as usize].push(partition);
-        }
+        let written = self.written();
         let mut entries = Vec::new();
         for (store, partitions) in self.stores.iter().zip(&written) {
             entries.extend(store.journal_written_in(account_id, partitions)?);
@@ -612,11 +637,13 @@ impl Store for Spread {
         if let Some(only) = only {
             return self.holding(only).book_health(Some(only), after, limit);
         }
-        // In account order across every database.
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.book_health(None, after, limit)?);
-        }
+        // In account order across every database, each account from the
+        // database writing it.
+        let mut out: Vec<_> = self
+            .each_written(|store| store.book_health(None, after, limit))?
+            .into_iter()
+            .flatten()
+            .collect();
         out.sort_by(|a, b| a.account_id.cmp(&b.account_id));
         out.truncate(limit);
         Ok(out)
@@ -632,10 +659,11 @@ impl Store for Spread {
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.accounts()?);
-        }
+        let mut out: Vec<String> = self
+            .each_written(|store| store.accounts())?
+            .into_iter()
+            .flatten()
+            .collect();
         out.sort();
         out.dedup();
         Ok(out)
@@ -650,20 +678,22 @@ impl Store for Spread {
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.accounts_holding(instrument_id)?);
-        }
+        let mut out: Vec<String> = self
+            .each_written(|store| store.accounts_holding(instrument_id))?
+            .into_iter()
+            .flatten()
+            .collect();
         out.sort();
         out.dedup();
         Ok(out)
     }
 
     fn instruments_held(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.instruments_held()?);
-        }
+        let mut out: Vec<String> = self
+            .each_written(|store| store.instruments_held())?
+            .into_iter()
+            .flatten()
+            .collect();
         out.sort();
         out.dedup();
         Ok(out)
@@ -809,11 +839,11 @@ impl Store for Spread {
     }
 
     fn expiring(&self, now_ns: i64) -> Result<Vec<(String, String)>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.expiring(now_ns)?);
-        }
-        Ok(out)
+        Ok(self
+            .each_written(|store| store.expiring(now_ns))?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn bookings(
@@ -848,18 +878,19 @@ impl Store for Spread {
     }
 
     fn blocks_naming(&self, member_order_id: &str) -> Result<Vec<(String, String)>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.blocks_naming(member_order_id)?);
-        }
-        Ok(out)
+        Ok(self
+            .each_written(|store| store.blocks_naming(member_order_id))?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn live_order_instruments(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for store in &self.stores {
-            out.extend(store.live_order_instruments()?);
-        }
+        let mut out: Vec<String> = self
+            .each_written(|store| store.live_order_instruments())?
+            .into_iter()
+            .flatten()
+            .collect();
         out.sort();
         out.dedup();
         Ok(out)

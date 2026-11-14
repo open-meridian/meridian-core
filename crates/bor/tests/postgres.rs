@@ -5593,6 +5593,92 @@ async fn review_c5_a_warming_or_aborted_move_reads_each_position_once() {
     blocking(move || drop((h, mover)));
 }
 
+/// C5's remainder: a read of every account while a partition switches
+/// between databases -- its accounts copied into the target, the source let
+/// go, the target not yet opened, then opened with the source's copies not
+/// yet let go -- reads each account once, from the database writing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn review_c5_a_read_during_the_switch_reads_each_account_once() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 2);
+    let accounts = accounts_in("ACC-C5S", &partition, 2, &h.one.0, h.one.1.as_ref()).await;
+    let read = PositionsRead {
+        scope: Scope::Everything,
+        account_id: String::new(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 500,
+        cursor: String::new(),
+    };
+    let counted = {
+        let reader = Arc::clone(&h.zero.1);
+        let accounts = accounts.clone();
+        move |read: &PositionsRead| -> Result<Vec<usize>, String> {
+            let everyone = reader
+                .positions(read)
+                .map_err(|failed| failed.to_string())?
+                .records;
+            Ok(accounts
+                .iter()
+                .map(|account| everyone.iter().filter(|p| p.account_id == *account).count())
+                .collect())
+        }
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let steps = [
+        "book.switch.copied",
+        "book.switch.committed",
+        "book.switch.between",
+    ];
+    for step in steps {
+        let (counted, read, seen) = (counted.clone(), read.clone(), Arc::clone(&seen));
+        points::arm(
+            step,
+            &partition,
+            Arc::new(move |_| {
+                let counts = counted(&read)?;
+                seen.lock().unwrap().push((step, counts));
+                Ok(())
+            }),
+        );
+    }
+    let mover = meridian_bor::partition_moves::Mover::new(
+        vec![h.zero.1.database(0).clone(), h.zero.1.database(1).clone()],
+        h.zero.1.database(0).groups(),
+        meridian_bor::partition_moves::Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let ended = blocking(|| {
+        mover.begin(&partition);
+        mover.run(&partition, 0, &Asked::default())
+    });
+    for step in steps {
+        points::disarm(step, &partition);
+    }
+    assert!(matches!(ended, Ok(Ended::Moved(..))), "{ended:?}");
+    // Opened in the target, the source's copies not yet let go.
+    let opened = blocking(|| counted(&read)).unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+        steps,
+        "every step of the switch read at"
+    );
+    for (step, counts) in seen.iter().chain([&("opened", opened)]) {
+        assert!(
+            counts.iter().all(|n| *n == 1),
+            "{step}: the accounts read {counts:?} times"
+        );
+    }
+    blocking(move || drop((h, mover)));
+}
+
 /// C8: a partition moved by hand back and forth is recorded each time, and
 /// the sweep never undoes the last.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
