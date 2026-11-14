@@ -86,6 +86,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "writer_group",
         sql: include_str!("../migrations/0012_writer_group.sql"),
     },
+    // Each writer group's epoch (step 3d; `book_writer_group` approved
+    // 2026-11-14): kept while the group owns no partition.
+    Migration {
+        version: 13,
+        name: "writer_group_epoch",
+        sql: include_str!("../migrations/0013_writer_group_epoch.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

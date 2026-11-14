@@ -2300,15 +2300,31 @@ impl Store for PostgresStore {
             return Ok(self.fence.epoch());
         }
         let (mine, others) = epochs_of(&mut *conn, self.groups)?;
-        drop(conn);
-        if mine.is_empty() {
-            // It owns no partition: it hands every act on, and commits none.
-            return Ok(0);
-        }
+        // The group's own epoch (`book_writer_group`, step 3d): the control
+        // partition's for group 0; a later group's row, kept while it owns
+        // nothing, so a partition moved back to it carries its epoch.
+        let anchor = own_epoch(&mut *conn, self.groups.mine())?;
         let shared = mine.iter().min() == mine.iter().max();
-        match mine.first() {
-            Some(epoch) if shared && !others.contains(epoch) => Ok(self.fence.adopt_once(*epoch)),
-            _ => self.take_over(&meridian_changes::TookOver::unnamed(
+        let adopted = match (anchor, mine.first()) {
+            // Its row, and every partition it owns under it.
+            (Some(epoch), _) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                Some(epoch)
+            }
+            // No row yet (a group writing before `book_writer_group`): its
+            // partitions' shared epoch, recorded as its own.
+            (None, Some(epoch)) if shared && !others.contains(epoch) => {
+                keep_own_epoch(&mut *conn, self.groups.mine(), *epoch)?;
+                Some(*epoch)
+            }
+            _ => None,
+        };
+        drop(conn);
+        match adopted {
+            Some(epoch) => Ok(self.fence.adopt_once(epoch)),
+            // Its partitions were assigned to it -- the count changed -- or
+            // it has no epoch of its own yet: it takes them over, and its
+            // row records the epoch.
+            None => self.take_over(&meridian_changes::TookOver::unnamed(
                 meridian_changes::groups::ASSIGNED,
             )),
         }
@@ -2343,6 +2359,10 @@ impl Store for PostgresStore {
 
     fn head_epoch(&self) -> Result<u64> {
         let mut conn = self.conn()?;
+        if self.groups.several() && !self.groups.holds_control() {
+            // A group past the first: its own row's (step 3d).
+            return Ok(own_epoch(&mut *conn, self.groups.mine())?.unwrap_or(0));
+        }
         let anchor = anchor_of(&mut *conn, self.groups)?;
         let Some(anchor) = anchor else {
             return Ok(0);
@@ -3394,16 +3414,29 @@ fn raise(
         .collect();
     let epoch: i64 = tx
         .query_one(
-            "WITH raised AS (
+            "WITH next AS (
+                SELECT greatest((SELECT max(epoch) FROM book_partition_head),
+                                (SELECT coalesce(max(epoch), 0) FROM book_writer_group)) + 1
+                       AS epoch),
+             raised AS (
                 UPDATE book_partition_head
-                   SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
+                   SET epoch = (SELECT epoch FROM next)
                  WHERE partition = ANY($1)
                 RETURNING epoch)
-             SELECT coalesce(max(epoch), (SELECT max(epoch) + 1 FROM book_partition_head))
+             SELECT coalesce(max(epoch), (SELECT epoch FROM next))
                FROM raised",
             &[&owned],
         )?
         .get(0);
+    // A group past the first keeps its epoch in its own row (step 3d;
+    // `book_writer_group`), raised with its partitions'.
+    if groups.several() && !groups.holds_control() {
+        tx.execute(
+            "INSERT INTO book_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+             ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
+            &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+        )?;
+    }
     // Who raised it and why, in the same transaction (step 3b).
     tx.execute(
         "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
@@ -3473,6 +3506,16 @@ fn epochs_of(
         } else {
             others.insert(epoch as u64);
         }
+    }
+    // Every other group's own epoch, kept while it owns nothing (step 3d).
+    for row in client
+        .query(
+            "SELECT writer_group, epoch FROM book_writer_group WHERE writer_group <> $1",
+            &[&(groups.mine() as i32)],
+        )
+        .map_err(unavailable)?
+    {
+        others.insert(row.get::<_, i64>(1) as u64);
     }
     mine.sort_unstable();
     Ok((mine, others))
@@ -3571,34 +3614,65 @@ fn tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Option<Tip
     }))
 }
 
-/// The epoch writer group `group` commits under in this database: that of
-/// a partition its head names it the owner of (`control` for group 0), else
-/// one no partition holds, which a group owning nothing here adopts.
-fn group_epoch(client: &mut impl GenericClient, groups: Groups, group: u32) -> Result<u64> {
-    let mut fresh = 0;
-    let mut found = None;
-    for row in client
-        .query(
-            "SELECT partition, epoch, writer_group FROM book_partition_head ORDER BY partition",
+/// The epoch writer group `group` commits under in this database (step
+/// 3d): the control partition's for group 0; a later group's own row
+/// (`book_writer_group`), kept while it owns nothing, so a partition moved
+/// back to it carries the epoch its writer holds. A group with no row yet
+/// -- its writer never started -- is given one past every epoch, which its
+/// writer adopts at its start.
+fn group_epoch(client: &mut impl GenericClient, group: u32) -> Result<u64> {
+    if let Some(epoch) = own_epoch(client, group)? {
+        return Ok(epoch);
+    }
+    let fresh: i64 = client
+        .query_one(
+            "SELECT greatest((SELECT max(epoch) FROM book_partition_head),
+                             (SELECT coalesce(max(epoch), 0) FROM book_writer_group)) + 1",
             &[],
         )
         .map_err(unavailable)?
-    {
-        let (partition, epoch): (String, i64) = (row.get(0), row.get(1));
-        fresh = fresh.max(epoch + 1);
-        let owner = if partition == CONTROL_PARTITION {
-            0
-        } else {
-            row.get::<_, Option<i32>>(2)
-                .map(|g| g as u32)
-                .filter(|g| *g < groups.count())
-                .unwrap_or_else(|| meridian_changes::groups::owner(&partition, groups.count()))
-        };
-        if owner == group && (found.is_none() || partition == CONTROL_PARTITION) {
-            found = Some(epoch as u64);
-        }
+        .get(0);
+    keep_own_epoch(client, group, fresh as u64)?;
+    Ok(own_epoch(client, group)?.unwrap_or(fresh as u64))
+}
+
+/// Writer group `group`'s own epoch in this database: the control
+/// partition's for group 0, its `book_writer_group` row's past it; none
+/// where it has no row yet.
+fn own_epoch(client: &mut impl GenericClient, group: u32) -> Result<Option<u64>> {
+    let row = if group == 0 {
+        client.query_opt(
+            "SELECT epoch FROM book_partition_head WHERE partition = $1",
+            &[&CONTROL_PARTITION],
+        )
+    } else {
+        client.query_opt(
+            "SELECT epoch FROM book_writer_group WHERE writer_group = $1",
+            &[&(group as i32)],
+        )
     }
-    Ok(found.unwrap_or(fresh.max(1) as u64))
+    .map_err(unavailable)?;
+    Ok(row.map(|row| row.get::<_, i64>(0) as u64))
+}
+
+/// `epoch` recorded as writer group `group`'s own where it has none yet (a
+/// group past the first; group 0's is the control partition's).
+fn keep_own_epoch(client: &mut impl GenericClient, group: u32, epoch: u64) -> Result<()> {
+    if group == 0 {
+        return Ok(());
+    }
+    client
+        .execute(
+            "INSERT INTO book_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+             ON CONFLICT (writer_group) DO NOTHING",
+            &[
+                &(group as i32),
+                &(epoch as i64),
+                &meridian_changes::origin(),
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
 }
 
 /// How a move's switch ended (step 3d; section 6.8).
@@ -3812,10 +3886,10 @@ impl PostgresStore {
         }
         let group = target as i32;
         let epoch = if same {
-            group_epoch(&mut tx, self.groups, target)?
+            group_epoch(&mut tx, target)?
         } else {
             let mut theirs = to.conn()?;
-            let epoch = group_epoch(&mut *theirs, self.groups, target)?;
+            let epoch = group_epoch(&mut *theirs, target)?;
             // The target's head at the source's close, under its group's
             // epoch, named its own -- before the source lets go, so no
             // write finds neither owning.

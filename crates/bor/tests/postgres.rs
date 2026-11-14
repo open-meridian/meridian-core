@@ -4093,6 +4093,97 @@ async fn a_changed_count_of_writer_groups_moves_each_partition_once() {
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// A partition moved back to a writer group that owned nothing meanwhile
+/// (step 3d; `book_writer_group`, approved 2026-11-14): every partition of
+/// group 1 moved to group 0, then P4 moved back. It carries group 1's own
+/// epoch, kept in its row while it owned nothing, so group 1's same member
+/// commits to it at the epoch it held all along: never fenced, never
+/// stepping down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_partition_moved_away_and_back_is_written_by_the_same_member_unfenced() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::groups::owner;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (one, one_store)], mover) = blocking(|| two_members(&url));
+    let accounts: Vec<String> = (0..)
+        .map(|n| unique(&format!("ACC-PBACK-{n}")))
+        .filter(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .take(2)
+        .collect();
+    for account in &accounts {
+        blocking(|| one_store.place_first(account, account)).unwrap();
+        open(&one, account, "INS-AAPL").await;
+    }
+    // Group 1's member writes under its epoch: its row's, from its heads.
+    let held = blocking(|| Store::epoch(one_store.as_ref()));
+    assert!(held > 0);
+    let write = |n: u64| SetAccountAttributeRequest {
+        account_id: accounts[0].clone(),
+        attribute: Some(
+            set_account_attribute_request::Attribute::WaitsForCompliance(n.is_multiple_of(2)),
+        ),
+        reason: format!("write {n}"),
+    };
+    let asked = Asked {
+        by_hand: true,
+        moved_by: PERSON.into(),
+        reason: "moved away and back".into(),
+    };
+    // Every partition of group 1 moved to group 0: it owns nothing.
+    let ones: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| owner(p, 2) == 1)
+        .collect();
+    assert!(ones.contains(&"P4".to_string()));
+    for partition in &ones {
+        let ended = blocking(|| {
+            assert!(mover.begin(partition));
+            mover.run(partition, 0, &asked)
+        })
+        .unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    }
+    send(&one, SET_ACCOUNT_ATTRIBUTE, &write(1), Some(PERSON))
+        .await
+        .expect("handed to group 0 while group 1 owns nothing");
+    // P4 moved back: group 1's own epoch, the one its member holds.
+    let ended = blocking(|| {
+        assert!(mover.begin("P4"));
+        mover.run("P4", 1, &asked)
+    })
+    .unwrap();
+    let Ended::Moved(moved) = &ended else {
+        panic!("{ended:?}");
+    };
+    assert_eq!(
+        moved.epoch, held,
+        "the group's own epoch, kept while it owned nothing"
+    );
+    // Written by group 1's same member, from either member: never fenced.
+    send(&one, SET_ACCOUNT_ATTRIBUTE, &write(2), Some(PERSON))
+        .await
+        .expect("group 1's member commits to the partition moved back");
+    send(&zero, SET_ACCOUNT_ATTRIBUTE, &write(3), Some(PERSON))
+        .await
+        .expect("handed to group 1");
+    blocking(|| {
+        assert_eq!(
+            Store::epoch(one_store.as_ref()),
+            held,
+            "never took over again"
+        );
+        let tip = zero_store.tip("P4").unwrap().unwrap();
+        assert_eq!((tip.writer_group, tip.epoch), (Some(1), held));
+        let rows = numbered(&url, "P4");
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.2 as u64, held,
+            "the last entries committed at group 1's epoch"
+        );
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, migrated)));
+}
+
 /// A deployment installed at two writer groups starts each partition with
 /// its rendezvous owner, pinned at the control partition's group's start:
 /// no partition moves and no PartitionMoved is recorded, as no owner
