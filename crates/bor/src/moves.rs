@@ -256,7 +256,7 @@ fn aborted(
     placed: &str,
     target: &str,
     cause: meridian_domain::v1::MoveAbortCause,
-    digests: Option<(Vec<u8>, Vec<u8>)>,
+    warmed: Option<crate::store::Warmed>,
 ) -> StoreError {
     use meridian_domain::v1::MoveAbortCause;
     let at_ns = ctx.received_at_ns.max(ctx.event_time_ns);
@@ -269,7 +269,12 @@ fn aborted(
         cause: cause as i32,
         aborted_at_ns: at_ns,
     };
-    let finding = digests.as_ref().map(|(source, target_digest)| {
+    let finding = warmed.as_ref().map(|warmed| {
+        let at = warmed
+            .differs_at
+            .as_ref()
+            .map(|entry| format!(" from entry {entry}"))
+            .unwrap_or_default();
         meridian_changes::records::finding(
             "bor",
             meridian_domain::v1::IntegrityCheck::MemberDigest,
@@ -278,10 +283,10 @@ fn aborted(
                 sequence: 0,
                 committed_at_ns: at_ns,
                 what: format!(
-                    "a move of account {account} to {target}: its copy's last digest differs \
-                     from the source's ({} against {})",
-                    meridian_changes::moves::short(target_digest),
-                    meridian_changes::moves::short(source)
+                    "a move of account {account} to {target}: its copy's digest differs from \
+                     the source's{at} ({} against {})",
+                    meridian_changes::moves::short(&warmed.copy),
+                    meridian_changes::moves::short(&warmed.source)
                 ),
             },
             at_ns,
@@ -400,39 +405,34 @@ pub fn move_account_with(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            // Warm, and the digests compared before the close: across
-            // databases, the account copied to its target's first.
-            let digests = store.warm_account(account, target)?;
-            let differs = settings.digest_differs()
-                || digests
-                    .as_ref()
-                    .is_some_and(|(source, copy)| source != copy);
-            if differs {
-                let (source, mut copy) = digests.unwrap_or_default();
-                if settings.digest_differs() {
-                    copy.push(0xff);
-                }
-                return Err(aborted(
+            // Warm, compare, close, within switchSeconds: across databases
+            // the account's entries are copied to its target's and compared
+            // there, and the close commits only where the account's last
+            // entry is the one the copy was compared at -- the digest at the
+            // close. An act since is copied and compared again; its
+            // partition held past the bound aborts the move, nothing closed.
+            let key = close_key(account, &placed, target);
+            let switch = std::time::Instant::now();
+            let timed_out = || {
+                aborted(
                     bus,
                     store,
                     ctx,
                     account,
                     &placed,
                     target,
-                    MoveAbortCause::Digest,
-                    Some((source, copy)),
-                ));
-            }
-            // The close, within switchSeconds: its partition held past it
-            // aborts the move, nothing closed.
-            let key = close_key(account, &placed, target);
-            let acted = match holding(settings.switch, || {
-                store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
-                    close(book, head, ctx, target, &request.reason)
-                        .map(|made| crate::service::decided(made, Vec::new()))
-                })
-            }) {
-                Err(StoreError::Held(_)) => {
+                    MoveAbortCause::Timeout,
+                    None,
+                )
+            };
+            let acted = loop {
+                let warmed = store.warm_account(account, target)?;
+                if settings.digest_differs() || warmed.as_ref().is_some_and(|w| w.source != w.copy)
+                {
+                    let mut warmed = warmed.unwrap_or_default();
+                    if settings.digest_differs() {
+                        warmed.copy.push(0xff);
+                    }
                     return Err(aborted(
                         bus,
                         store,
@@ -440,11 +440,36 @@ pub fn move_account_with(
                         account,
                         &placed,
                         target,
-                        MoveAbortCause::Timeout,
-                        None,
-                    ))
+                        MoveAbortCause::Digest,
+                        Some(warmed),
+                    ));
                 }
-                other => other?,
+                let changed = std::cell::Cell::new(false);
+                let left = settings.switch.saturating_sub(switch.elapsed());
+                let acted = holding(left, || {
+                    store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
+                        if let Some(warmed) = &warmed {
+                            let last = book.entries.last().map(|entry| entry.entry_id.as_str());
+                            if last != Some(warmed.last_entry.as_str()) {
+                                changed.set(true);
+                                return Err(StoreError::Precondition {
+                                    field: "account_id",
+                                    words: format!(
+                                        "account {account} changed since its copy was compared"
+                                    ),
+                                });
+                            }
+                        }
+                        close(book, head, ctx, target, &request.reason)
+                            .map(|made| crate::service::decided(made, Vec::new()))
+                    })
+                });
+                match acted {
+                    Err(_) if changed.get() && switch.elapsed() < settings.switch => continue,
+                    Err(_) if changed.get() => return Err(timed_out()),
+                    Err(StoreError::Held(_)) => return Err(timed_out()),
+                    other => break other?,
+                }
             };
             let entry = match acted {
                 crate::store::Acted::Committed(decided) => {

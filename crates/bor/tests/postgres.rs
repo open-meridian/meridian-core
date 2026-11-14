@@ -3441,6 +3441,149 @@ async fn an_account_moved_between_databases_is_copied_and_replays_the_same() {
     blocking(move || drop((zero, one, bus_zero, bus_one)));
 }
 
+/// An account's move between databases compares its copy with the source
+/// before the close (step 3d; section 6.8, "the target compares its digest
+/// at N with the source's"): a warm copies its entries, and only its
+/// entries, so it is in one database until the open. A copy changed beneath
+/// the target's book -- a real mismatch, no injected file -- aborts the
+/// move DIGEST: nothing closed, the account where it was, and
+/// PartitionMoveAborted and its IntegrityFinding, naming the changed entry,
+/// journalled on `~control`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_whose_copy_differs_from_its_source_is_not_moved_and_its_finding_kept() {
+    use meridian_changes::groups::Groups;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    let zero = blocking(|| spread(0));
+    let groups = Groups::new(0, 2).unwrap();
+    // Group 0's account, in database 0, moving to group 1's partition in
+    // database 1: group 0 writes `~control` and journals the abort itself.
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-VDIFF-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 0)
+        .unwrap();
+    let from = blocking(|| zero.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 1)
+        .unwrap();
+    let bus = Arc::new(Bus::single(
+        "vdiff-0",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    serve(bus.clone(), zero.clone(), bus.clock());
+    resolving_equities(&bus);
+    open(&bus, &account, &unique("INS-VDIFF")).await;
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    // A warm: its entries in database 1, compared equal, and nothing else
+    // of it there.
+    let warmed = blocking(|| zero.warm_account(&account, &to))
+        .unwrap()
+        .expect("across databases");
+    assert_eq!(warmed.source, warmed.copy);
+    assert_eq!(warmed.differs_at, None);
+    let before = blocking(|| zero.journal(&account)).unwrap();
+    assert_eq!(warmed.last_entry, before.last().unwrap().entry_id);
+    blocking(|| {
+        assert_eq!(fresh(1).account_row(&account).unwrap(), None);
+        assert_eq!(fresh(1).journal(&account).unwrap().len(), before.len());
+        assert_eq!(fresh(0).account_row(&account).unwrap(), Some(from.clone()));
+    });
+    // Its copy changed beneath database 1's book.
+    let changed = before[0].entry_id.clone();
+    blocking(|| {
+        let mut client = postgres::Client::connect(&urls[1], postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE book_entry DISABLE TRIGGER book_entry_append_only;
+                 UPDATE book_entry SET message_id = message_id || '-altered'
+                  WHERE entry_id = '{changed}';
+                 ALTER TABLE book_entry ENABLE TRIGGER book_entry_append_only;"
+            ))
+            .unwrap();
+    });
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 0 is busy".into(),
+    };
+    let refused = send(
+        &bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("account_id") && refused.contains("digest"),
+        "{refused}"
+    );
+    blocking(|| {
+        // Nothing closed: where it was, its journal as it was.
+        assert_eq!(zero.journal(&account).unwrap(), before);
+        assert_eq!(fresh(0).account_row(&account).unwrap(), Some(from.clone()));
+        assert_eq!(fresh(1).account_row(&account).unwrap(), None);
+        let control = zero.journal(meridian_bor::store::CONTROL_ACCOUNT).unwrap();
+        let ours = |prefix: &str| {
+            control
+                .iter()
+                .filter(|e| {
+                    e.idempotency_key
+                        .starts_with(&format!("control-record:{prefix}:{from}:"))
+                })
+                .filter_map(|e| e.body.record.clone())
+                .collect::<Vec<_>>()
+        };
+        let aborted = ours("partition-move-aborted");
+        assert_eq!(aborted.len(), 1, "one abort");
+        let aborted = PartitionMoveAborted::decode(&aborted[0].1[..]).unwrap();
+        assert_eq!(
+            (
+                aborted.account_id.as_str(),
+                aborted.target_partition.as_str(),
+                aborted.target_group,
+                aborted.cause
+            ),
+            (
+                account.as_str(),
+                to.as_str(),
+                1,
+                MoveAbortCause::Digest as i32
+            )
+        );
+        let found = ours("finding:move");
+        assert_eq!(found.len(), 1, "one finding");
+        let found = IntegrityFinding::decode(&found[0].1[..]).unwrap();
+        assert_eq!(found.check, IntegrityCheck::MemberDigest as i32);
+        assert!(found.detail.contains(&changed), "{}", found.detail);
+    });
+    blocking(move || drop((zero, bus)));
+}
+
 fn read_position(position: &BookPosition) -> String {
     read(&position.trade_date_quantity)
 }

@@ -301,7 +301,7 @@ impl Store for Writer {
         &self,
         account_id: &str,
         target_partition: &str,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Option<crate::store::Warmed>> {
         self.inner.warm_account(account_id, target_partition)
     }
 

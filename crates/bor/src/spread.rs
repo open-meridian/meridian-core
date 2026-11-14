@@ -256,6 +256,23 @@ impl Store for Spread {
         self.groups.owner(partition)
     }
 
+    fn warm_account(
+        &self,
+        account_id: &str,
+        target_partition: &str,
+    ) -> Result<Option<crate::store::Warmed>> {
+        // Across databases: its entries copied to the target's before the
+        // close, and the copy compared there (step 3d; section 6.8). Its row
+        // and projections wait for the open, so the account is in one
+        // database until then.
+        let from = self.holding(account_id);
+        let to = self.database(self.of(target_partition));
+        if Arc::ptr_eq(from, to) {
+            return Ok(None);
+        }
+        to.warm_account_from(from, account_id).map(Some)
+    }
+
     fn settle_move(&self, account_id: &str) -> Result<()> {
         // Its database: where its row names a partition placed in the
         // database holding that row, and holds its open.
@@ -335,10 +352,23 @@ impl Store for Spread {
 
     fn journal(&self, account_id: &str) -> Result<Vec<crate::journal::Entry>> {
         // An account moved between databases has entries in each, in the
-        // order written across its move (step 3d; W9.8).
+        // order written across its move (step 3d; W9.8): each read from the
+        // database that writes its partition, never from a copy a move
+        // brought another -- so a copy that differs, its move aborted, is
+        // never read as the account's.
+        if self.stores.len() == 1 {
+            return self.home().journal(account_id);
+        }
+        let mut written: Vec<Vec<String>> = vec![Vec::new(); self.stores.len()];
+        let partitions = (0..self.partition_count())
+            .map(crate::store::partition_named)
+            .chain([crate::store::CONTROL_PARTITION.to_string()]);
+        for partition in partitions {
+            written[self.of(&partition) as usize].push(partition);
+        }
         let mut entries = Vec::new();
-        for store in &self.stores {
-            entries.extend(store.journal(account_id)?);
+        for (store, partitions) in self.stores.iter().zip(&written) {
+            entries.extend(store.journal_written_in(account_id, partitions)?);
         }
         Ok(crate::journal::in_order(entries))
     }

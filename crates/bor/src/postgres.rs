@@ -638,23 +638,25 @@ fn journal_rows(client: &mut impl GenericClient, account_id: &str) -> Result<Vec
         )
         .map_err(unavailable)?
         .iter()
-        // Each entry replayed is the one its digest was taken of (step 3b):
-        // a record changed beneath the book fails the replay loudly.
-        .map(|row| {
-            if !stored_verifies(row) {
-                let (_, _, digest) = stored_of(row);
-                return Err(StoreError::Unavailable(format!(
-                    "entry {} of partition {} (account {}) does not match its digest {}: the \
-                     record changed beneath the book, and it is not replayed from it",
-                    row.get::<_, i64>(4),
-                    row.get::<_, String>(2),
-                    row.get::<_, String>(1),
-                    meridian_changes::integrity::short(&digest)
-                )));
-            }
-            entry_of(row)
-        })
+        .map(verified_entry)
         .collect()
+}
+
+/// Each entry replayed is the one its digest was taken of (step 3b): a
+/// record changed beneath the book fails the replay loudly.
+fn verified_entry(row: &Row) -> Result<Entry> {
+    if !stored_verifies(row) {
+        let (_, _, digest) = stored_of(row);
+        return Err(StoreError::Unavailable(format!(
+            "entry {} of partition {} (account {}) does not match its digest {}: the \
+             record changed beneath the book, and it is not replayed from it",
+            row.get::<_, i64>(4),
+            row.get::<_, String>(2),
+            row.get::<_, String>(1),
+            meridian_changes::integrity::short(&digest)
+        )));
+    }
+    entry_of(row)
 }
 
 /// The entries of an account's journal numbered above `after`, in order.
@@ -4061,6 +4063,156 @@ impl PostgresStore {
             )
             .map_err(unavailable)?
             .map(|row| row.get(0)))
+    }
+
+    /// `account_id`'s entries of `partitions` alone, by sequence, each
+    /// verified (step 3d; section 6.4): the entries this database writes,
+    /// never the copies a move brought it of another database's.
+    pub fn journal_written_in(
+        &self,
+        account_id: &str,
+        partitions: &[String],
+    ) -> Result<Vec<Entry>> {
+        fn read(
+            client: &mut impl GenericClient,
+            account_id: &str,
+            partitions: &[String],
+        ) -> Result<Vec<Entry>> {
+            client
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS} FROM book_entry
+                          WHERE account_id = $1 AND partition = ANY($2)
+                          ORDER BY first_sequence"
+                    ),
+                    &[&account_id, &partitions],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(verified_entry)
+                .collect()
+        }
+        if stamping() {
+            // A read replica's: one snapshot, its heads beside (stage C2).
+            return self.reading(|tx| read(tx, account_id, partitions));
+        }
+        read(&mut *self.conn()?, account_id, partitions)
+    }
+
+    /// An account's move warmed into this database from `from`'s (step 3d;
+    /// section 6.8): its entries copied here by their own keys, so a copy
+    /// made again adds only what is new, then compared with the source as
+    /// one snapshot of it read them. Only its entries: its row and its
+    /// projections come with its open, so the account is in one database
+    /// until then. An entry already here is kept as it is, never replaced,
+    /// so a copy that changed here differs.
+    pub fn warm_account_from(
+        &self,
+        from: &PostgresStore,
+        account_id: &str,
+    ) -> Result<crate::store::Warmed> {
+        use std::io::{Read, Write};
+        let quoted = format!("'{}'", account_id.replace('\'', "''"));
+        let mut source = from.conn()?;
+        let mut snapshot = source
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let theirs: Vec<(String, Vec<u8>)> = snapshot
+            .query(
+                "SELECT entry_id, digest FROM book_entry WHERE account_id = $1
+                  ORDER BY partition, first_sequence",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get::<_, Option<Vec<u8>>>(1).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let last_entry: String = snapshot
+            .query_opt(
+                "SELECT e.entry_id FROM book_entry e
+                   JOIN book_account a ON a.account_id = e.account_id AND a.partition = e.partition
+                  WHERE e.account_id = $1
+                  ORDER BY e.first_sequence DESC LIMIT 1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        snapshot
+            .copy_out(&format!(
+                "COPY (SELECT * FROM book_entry WHERE account_id = {quoted}) TO STDOUT (FORMAT binary)"
+            ))
+            .map_err(unavailable)?
+            .read_to_end(&mut rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        snapshot.commit().map_err(unavailable)?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(
+            "CREATE TEMP TABLE IF NOT EXISTS warming_book_entry (LIKE book_entry) ON COMMIT DROP",
+        )
+        .map_err(unavailable)?;
+        let mut writer = tx
+            .copy_in("COPY warming_book_entry FROM STDIN (FORMAT binary)")
+            .map_err(unavailable)?;
+        writer
+            .write_all(&rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        writer.finish().map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO book_entry SELECT * FROM warming_book_entry ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .map_err(unavailable)?;
+        // The copy's digest of each entry, taken again of what it holds.
+        let ours: Vec<(String, Vec<u8>)> = tx
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1
+                      ORDER BY partition, first_sequence"
+                ),
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let (canonical, previous, digest) = stored_of(row);
+                let taken = if digest.is_empty() {
+                    digest
+                } else {
+                    meridian_changes::integrity::chained(&previous, &canonical)
+                };
+                (row.get(0), taken)
+            })
+            .collect();
+        tx.commit().map_err(unavailable)?;
+        let fold = |entries: &[(String, Vec<u8>)]| {
+            entries.iter().fold(Vec::new(), |sum, (id, digest)| {
+                let mut named = id.as_bytes().to_vec();
+                named.push(0x1f);
+                named.extend_from_slice(digest);
+                meridian_changes::integrity::chained(&sum, &named)
+            })
+        };
+        let differs_at = (0..theirs.len().max(ours.len()))
+            .find(|n| theirs.get(*n) != ours.get(*n))
+            .and_then(|n| theirs.get(n).or(ours.get(n)))
+            .map(|(id, _)| id.clone());
+        Ok(crate::store::Warmed {
+            last_entry,
+            source: fold(&theirs),
+            copy: fold(&ours),
+            differs_at,
+        })
     }
 
     /// Everything `from`'s database holds of `account_id` copied into this

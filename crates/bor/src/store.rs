@@ -262,6 +262,25 @@ pub const CONTROL_ACCOUNT: &str = "~control";
 /// the accounts, and read by no plugin's scope.
 pub const NO_ACCOUNT: &str = "~unplaced";
 
+/// An account's copy in its move's target database, compared with its
+/// source (step 3d; section 6.8, "the target compares its digest at N with
+/// the source's"): each digest is taken over the account's entries in
+/// order, each named by its ID -- the source's as its own chain committed
+/// them, the copy's taken again of what the copy holds -- so a changed,
+/// missing or extra entry in the copy differs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Warmed {
+    /// The account's last entry the copy holds: its close follows it, or
+    /// the copy is brought up to date and compared again.
+    pub last_entry: String,
+    /// The source's digest of the account's entries.
+    pub source: Vec<u8>,
+    /// The copy's digest of the same, taken again of its rows.
+    pub copy: Vec<u8>,
+    /// The entry whose copy differs first, where one does.
+    pub differs_at: Option<String>,
+}
+
 /// Whether a key the store holds a book under is an account's.
 pub fn is_account(key: &str) -> bool {
     !key.starts_with('~')
@@ -650,15 +669,10 @@ pub trait Store: Send + Sync {
     }
 
     /// An account's move warmed (step 3d; section 6.8): where its target
-    /// partition is in another database, everything the account's database
-    /// holds of it copied there before the close, and the digest of its
-    /// last entry in each answered -- (source, target). None within one
-    /// database, where the target reads the same rows.
-    fn warm_account(
-        &self,
-        account_id: &str,
-        target_partition: &str,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// partition is in another database, the account's entries copied there
+    /// before the close, and the copy compared with the source (VDiff). None
+    /// within one database, where the target reads the same rows.
+    fn warm_account(&self, account_id: &str, target_partition: &str) -> Result<Option<Warmed>> {
         let _ = (account_id, target_partition);
         Ok(None)
     }
