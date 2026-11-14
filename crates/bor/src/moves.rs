@@ -28,30 +28,7 @@ use crate::decide::{Context, Draft, Made};
 use crate::journal::{Body, ACCOUNT_MOVED};
 use crate::store::{Result, StoreError};
 
-/// The retry-after an act held past the hold is answered with.
-pub const HELD_RETRY_SECONDS: u32 = 1;
-
-/// The hold's default, `moves.holdSeconds` (section 6.8).
-pub const HOLD_SECONDS: u64 = 5;
-
-/// The variable the chart sets from `moves.holdSeconds` (approved
-/// 2026-11-14).
-pub const HOLD_SECONDS_VAR: &str = "MERIDIAN_MOVES_HOLD_SECONDS";
-
-/// How long an act on an account between its move's close and its open
-/// waits for the open (section 6.8, the hold): `moves.holdSeconds` as the
-/// chart sets it, else its default.
-pub fn hold() -> std::time::Duration {
-    static HOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *HOLD.get_or_init(|| {
-        std::time::Duration::from_secs(
-            std::env::var(HOLD_SECONDS_VAR)
-                .ok()
-                .and_then(|said| said.trim().parse().ok())
-                .unwrap_or(HOLD_SECONDS),
-        )
-    })
-}
+pub use meridian_changes::moves::{hold, HELD_RETRY_SECONDS, HOLD_SECONDS, HOLD_SECONDS_VAR};
 
 /// An act tried again while its account is held, for at most `limit`
 /// (section 6.8, the hold): its writes wait for the move's open, never

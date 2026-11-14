@@ -43,6 +43,7 @@ pub mod databases;
 pub mod group_commit;
 pub mod groups;
 pub mod integrity;
+pub mod moves;
 pub mod records;
 pub mod serving;
 pub mod timeline;

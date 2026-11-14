@@ -28,7 +28,6 @@
 //! book's own act on `~control`, keyed by the move.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,107 +44,19 @@ use crate::store::{Result, Store, StoreError};
 /// The act's topic (W6.39; approved 2026-11-09).
 pub const MOVE_PARTITION: &str = "platform.book.command.move-partition";
 
-/// `moves.switchSeconds`'s default (section 6.8, Vitess's `--timeout`).
-pub const SWITCH_SECONDS: u64 = 30;
-
-/// The variable the chart sets from `moves.switchSeconds` (approved
-/// 2026-11-14).
-pub const SWITCH_SECONDS_VAR: &str = "MERIDIAN_MOVES_SWITCH_SECONDS";
-
-/// CI's injected lag (approved 2026-11-14, CI only): a file whose presence
-/// is a lag -- its number of milliseconds, else one past every bound.
-pub const LAG_FILE_VAR: &str = "MERIDIAN_MOVE_LAG_FILE";
-
-/// CI's injected digest mismatch (approved 2026-11-14, CI only): a file
-/// whose presence makes the target's digest at the switch differ.
-pub const DIGEST_FILE_VAR: &str = "MERIDIAN_MOVE_DIGEST_FILE";
+pub use meridian_changes::moves::{
+    Asked, Settings, DIGEST_FILE_VAR, LAG_FILE_VAR, SWITCH_SECONDS, SWITCH_SECONDS_VAR,
+};
 
 /// The record kinds a move journals on `~control`.
 pub const MOVED: &str = "meridian.v1.PartitionMoved";
 pub const ABORTED: &str = "meridian.v1.PartitionMoveAborted";
-
-/// A move's bounds, from the chart.
-#[derive(Debug, Clone)]
-pub struct Settings {
-    /// `moves.switchSeconds`: the gate's and the switch's bound each.
-    pub switch: Duration,
-    /// `<store>.readyLagMs`: the lag the gate opens under.
-    pub ready_lag: Duration,
-    /// CI's injected lag, where set.
-    pub lag_file: Option<PathBuf>,
-    /// CI's injected digest mismatch, where set.
-    pub digest_file: Option<PathBuf>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            switch: Duration::from_secs(SWITCH_SECONDS),
-            ready_lag: Duration::from_millis(5_000),
-            lag_file: None,
-            digest_file: None,
-        }
-    }
-}
-
-impl Settings {
-    /// As the chart sets them; each default where unset.
-    pub fn from_env() -> Self {
-        let number = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|said| said.trim().parse::<u64>().ok())
-        };
-        let file = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .filter(|said| !said.trim().is_empty())
-                .map(PathBuf::from)
-        };
-        let fallback = Self::default();
-        Self {
-            switch: number(SWITCH_SECONDS_VAR)
-                .map(Duration::from_secs)
-                .unwrap_or(fallback.switch),
-            ready_lag: number("MERIDIAN_READY_LAG_MS")
-                .map(Duration::from_millis)
-                .unwrap_or(fallback.ready_lag),
-            lag_file: file(LAG_FILE_VAR),
-            digest_file: file(DIGEST_FILE_VAR),
-        }
-    }
-
-    /// The lag CI injects, where its file is there.
-    fn injected_lag(&self) -> Option<Duration> {
-        let path = self.lag_file.as_ref()?;
-        let said = std::fs::read_to_string(path).ok()?;
-        Some(
-            said.trim()
-                .parse::<u64>()
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::MAX),
-        )
-    }
-
-    /// Whether CI makes the digests differ.
-    fn digest_differs(&self) -> bool {
-        self.digest_file.as_ref().is_some_and(|path| path.exists())
-    }
-}
 
 /// How a move ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ended {
     Moved(PartitionMoved),
     Aborted(PartitionMoveAborted, Option<IntegrityFinding>),
-}
-
-/// Who asked, and why: empty for a move by a changed count.
-#[derive(Debug, Clone, Default)]
-pub struct Asked {
-    pub by_hand: bool,
-    pub moved_by: String,
-    pub reason: String,
 }
 
 /// The book's moves, run by the control partition's group over every
@@ -377,8 +288,8 @@ impl Mover {
                     what: format!(
                         "a move of {partition} to writer group {target}: the target's digest at \
                          sequence {closing} differs from the source's ({} against {})",
-                        short(&ours),
-                        short(&theirs)
+                        meridian_changes::moves::short(&ours),
+                        meridian_changes::moves::short(&theirs)
                     ),
                 };
                 let mut finding = meridian_changes::records::finding(
@@ -392,10 +303,6 @@ impl Mover {
             }
         }
     }
-}
-
-fn short(digest: &[u8]) -> String {
-    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 fn invalid(field: &str, words: String) -> StoreError {
