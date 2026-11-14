@@ -90,6 +90,9 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/data-sources", get(data_sources_page))
         // Contract v30 (W6.39): the Resilience page, a deployment admin's.
         .route(resilience::PATH, get(resilience_page))
+        .route(resilience::MOVE_PARTITION, post(move_partition))
+        .route(resilience::SPLIT_PARTITION, post(split_partition))
+        .route(resilience::MOVE_ACCOUNT, post(move_account))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
             "/admin/data-sources/entitlement",
@@ -4284,7 +4287,8 @@ const DATA_SOURCES: &str = "/admin/data-sources";
 // ── The Resilience page ─────────────────────────────────────────────────────
 
 /// W6.39 (contract v30, stage D): the Resilience page, for a deployment
-/// admin: the profile, the members, the partitions and the history.
+/// admin: the profile, the members, the partitions and the history, and
+/// the Partitions tab's dialogs (step 3d, stage M).
 async fn resilience_page(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -4299,7 +4303,7 @@ async fn resilience_page(
         resilience::profile(&app.bus, &session.subject),
         resilience::resilience(&app.bus, &session.subject, resilience::HISTORY_PAGE, cursor),
     );
-    let body = resilience::page(&profile, &read, cursor);
+    let body = resilience::page(&profile, &read, cursor, &token_input(&session));
     let chrome = Chrome {
         crumbs: format!(
             "{}{}",
@@ -4309,6 +4313,132 @@ async fn resilience_page(
         ..admin_chrome(&session)
     };
     Html(page_with("Resilience", &body, &chrome)).into_response()
+}
+
+/// Where the Resilience page's dialogs return to: its Partitions tab.
+const PARTITIONS_TAB: &str = "/admin/resilience#partitions";
+
+/// A Resilience dialog's act (W6.39; step 3d, stage M): prepared where it
+/// asked, refused where its second pair of eyes says so, otherwise sent.
+#[allow(clippy::too_many_arguments)]
+async fn resilience_act<Rep: Message + Default>(
+    app: &App,
+    headers: &HeaderMap,
+    fields: &Fields,
+    tool: &str,
+    arguments: serde_json::Value,
+    topic: &str,
+    request_type: &str,
+    request: impl Message,
+) -> Response {
+    let (session, _) = match gate(app, headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, fields) {
+        return *response;
+    }
+    let posted = prepare_or_gate(app, &session, fields, tool, || Ok(arguments)).await;
+    if let Some(response) = posted_to(posted, PARTITIONS_TAB) {
+        return response;
+    }
+    let outcome = command::<Rep>(app, &session, topic, request_type, request)
+        .await
+        .map(|_| ())
+        .map_err(refusal_words);
+    after_to(outcome, PARTITIONS_TAB, PARTITIONS_TAB)
+}
+
+/// The Move dialog (section 6.8): a partition to another writer group.
+async fn move_partition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let partition = field(&fields, "partition").to_string();
+    let group = field(&fields, "target_group");
+    let arguments = serde_json::json!({
+        "partition": partition,
+        "target_group": group.parse::<i64>().map_or(serde_json::Value::from(group), Into::into),
+        "note": field(&fields, "note"),
+    });
+    let Ok(target_group) = group.parse::<u32>() else {
+        return not_done("the writer group is a number, from 0", PARTITIONS_TAB);
+    };
+    let request = meridian_domain::v1::MovePartitionRequest {
+        partition: partition.clone(),
+        target_group,
+        reason: field(&fields, "note").to_string(),
+    };
+    resilience_act::<meridian_domain::v1::MovePartitionReply>(
+        &app,
+        &headers,
+        &fields,
+        "dashboard__move_partition",
+        arguments,
+        crate::mcp::resilience::move_topic(&partition),
+        "meridian.v1.MovePartitionRequest",
+        request,
+    )
+    .await
+}
+
+/// The Split dialog (section 6.1): a lake range halved, the act
+/// `dashboard__split_partition` sends.
+async fn split_partition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let request = meridian_domain::v1::SplitPartitionRequest {
+        partition: field(&fields, "partition").to_string(),
+        reason: field(&fields, "note").to_string(),
+    };
+    let arguments = serde_json::json!({
+        "partition": request.partition,
+        "note": request.reason,
+    });
+    resilience_act::<meridian_domain::v1::SplitPartitionReply>(
+        &app,
+        &headers,
+        &fields,
+        "dashboard__split_partition",
+        arguments,
+        crate::mcp::resilience::SPLIT_PARTITION,
+        "meridian.v1.SplitPartitionRequest",
+        request,
+    )
+    .await
+}
+
+/// The Move account dialog (section 6.8; W9.8): an account continued in
+/// another book partition.
+async fn move_account(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let request = meridian_domain::v1::MoveAccountRequest {
+        account_id: field(&fields, "account_id").trim().to_string(),
+        target_partition: field(&fields, "target_partition").trim().to_string(),
+        reason: field(&fields, "note").to_string(),
+    };
+    let arguments = serde_json::json!({
+        "account_id": request.account_id,
+        "target_partition": request.target_partition,
+        "note": request.reason,
+    });
+    resilience_act::<meridian_domain::v1::MoveAccountReply>(
+        &app,
+        &headers,
+        &fields,
+        "dashboard__move_account",
+        arguments,
+        crate::mcp::resilience::MOVE_ACCOUNT,
+        "meridian.v1.MoveAccountRequest",
+        request,
+    )
+    .await
 }
 
 /// A list typed as words between commas, blanks dropped.

@@ -10,16 +10,19 @@
 //!   per live data type (`ReadResilienceProfile`, the conductor's).
 //! - **Members**: each member of each component, its mode, zone, lag and
 //!   restarts, as it reported last (`ReadResilience`).
-//! - **Partitions**: each partition of the lake and the book, its writer and
-//!   epoch.
-//! - **History**: the takeovers, integrity findings and source switches,
-//!   newest first, a page at a time.
+//!   The profile's advice -- partitions to add, a range to split, a writer
+//!   group to add -- is its own lines, in the same shape.
+//! - **Partitions**: each partition of the lake and the book, its writer
+//!   group, writer and epoch; a partition's Move, a lake range's Split, and
+//!   Move account, each a dialog with a note saying why and Cancel (step 3d,
+//!   stage M; section 6.8), each preparable.
+//! - **History**: the takeovers, moves, splits, integrity findings and
+//!   source switches, newest first, a page at a time.
 //!
-//! Both reads change nothing; the counts that add members stay chart values
-//! (`meridian upgrade-deployment --set`), never set here. Moves of a
-//! partition or an account are step 3d's and are not drawn. Every tab has
-//! its tool ([`crate::mcp::resilience`]), and a tool's answer is what this
-//! page shows.
+//! The counts that add members stay chart values (`meridian
+//! upgrade-deployment --set`), never set here. Every tab and dialog has its
+//! tool ([`crate::mcp::resilience`]), and a tool's answer is what this page
+//! shows.
 
 use std::time::Duration;
 
@@ -40,10 +43,22 @@ pub const READ_RESILIENCE_PROFILE: &str = "platform.deployment.query.read-resili
 /// Where the page is.
 pub const PATH: &str = "/admin/resilience";
 
+/// Where its dialogs post: a partition's move, a lake range's split, an
+/// account's move.
+pub const MOVE_PARTITION: &str = "/admin/resilience/move-partition";
+pub const SPLIT_PARTITION: &str = "/admin/resilience/split-partition";
+pub const MOVE_ACCOUNT: &str = "/admin/resilience/move-account";
+
 /// A page of the history, as the page asks it.
 pub const HISTORY_PAGE: u32 = 50;
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// The Partitions table's columns, carried by this page alone: on a phone
+/// its writer and epoch give way to the Move and Split buttons.
+const PARTITIONS_STYLE: &str = "table.partitions th.num{width:4rem}table.partitions th.actions{width:9rem}\
+@media (max-width:640px){table.partitions .wide{display:none}table.partitions th:first-child{width:3.5rem}\
+table.partitions th.num{width:3rem}table.partitions th.actions{width:10rem}}";
 
 /// The page's tabs.
 pub const TABS: [(&str, &str); 4] = [
@@ -330,10 +345,10 @@ fn ms_of(ns: i64) -> (String, String) {
 
 // ── The tabs ──────────────────────────────────────────────────────────────────
 
-fn section(id: &str, title: &str, about: &str, body: &str) -> String {
+fn section(id: &str, title: &str, about: &str, action: &str, body: &str) -> String {
     format!(
         "<section class=\"admin-section\" id=\"{id}\">\
-         <div class=\"section-head\"><div><h2>{title}</h2><p class=\"hint\">{about}</p></div></div>\
+         <div class=\"section-head\"><div><h2>{title}</h2><p class=\"hint\">{about}</p></div>{action}</div>\
          {body}</section>"
     )
 }
@@ -398,6 +413,13 @@ fn profile_tab(said: &Result<ReadResilienceProfileReply, String>) -> String {
         .collect();
     rows.push_str(
         &profile
+            .advice
+            .iter()
+            .map(|l| line_row("advice", l))
+            .collect::<String>(),
+    );
+    rows.push_str(
+        &profile
             .tiers
             .iter()
             .map(|l| line_row("tier", l))
@@ -427,10 +449,13 @@ fn profile_tab(said: &Result<ReadResilienceProfileReply, String>) -> String {
     }
     format!(
         "{head}<om-pager search=\"Search the profile\"><table class=\"list one-line profile\" \
-         data-profile-lines=\"{n}\"><thead><tr><th>Failure or tier</th><th>State</th>\
+         data-profile-lines=\"{n}\"><thead><tr><th>Failure, tier or advice</th><th>State</th>\
          <th class=\"wide\">Why</th><th>What would meet it</th></tr></thead><tbody>{rows}</tbody>\
          </table></om-pager>",
-        n = profile.failures.len() + profile.tiers.len() + profile.never_blind.len()
+        n = profile.failures.len()
+            + profile.advice.len()
+            + profile.tiers.len()
+            + profile.never_blind.len()
     )
 }
 
@@ -478,6 +503,16 @@ fn members_tab(members: &[ComponentReport]) -> String {
     )
 }
 
+/// Whether a partition can be moved: every one but a store's `control`.
+fn movable(p: &PartitionOwner) -> bool {
+    p.partition != "control"
+}
+
+/// Whether a partition can be split: a lake range, never `control`.
+fn splittable(p: &PartitionOwner) -> bool {
+    p.component == "lake" && movable(p)
+}
+
 fn partitions_tab(partitions: &[PartitionOwner]) -> String {
     if partitions.is_empty() {
         return "<p class=\"empty\" data-partitions=\"0\">No partition answered: the lake's and the \
@@ -487,11 +522,43 @@ fn partitions_tab(partitions: &[PartitionOwner]) -> String {
     let rows: String = partitions
         .iter()
         .map(|p| {
+            let fill = |dialog: &str, title: String| {
+                format!(
+                    "<button type=\"button\" data-dialog-open=\"{dialog}\" data-title=\"{title}\" \
+                     data-fill=\"{fill}\">{label}</button>",
+                    title = escape(&title),
+                    fill = escape(
+                        &serde_json::json!({"fields": {
+                            "partition": p.partition,
+                            "target_group": "",
+                            "note": "",
+                        }})
+                        .to_string()
+                    ),
+                    label = if dialog == "move-partition" { "Move" } else { "Split" },
+                )
+            };
+            let actions = format!(
+                "{}{}",
+                if movable(p) {
+                    fill("move-partition", format!("Move {}", p.partition))
+                } else {
+                    String::new()
+                },
+                if splittable(p) {
+                    fill("split-partition", format!("Split {}", p.partition))
+                } else {
+                    String::new()
+                },
+            );
             format!(
                 "<tr data-partition=\"{partition}\"><td title=\"{component}\">{component}</td><td title=\"{partition}\">{partition}</td>\
-                 <td title=\"{writer_or}\">{writer_or}</td><td class=\"num\" title=\"{epoch}\">{epoch}</td></tr>",
+                 <td class=\"num\" title=\"writer group {group}\">{group}</td>\
+                 <td class=\"wide\" title=\"{writer_or}\">{writer_or}</td><td class=\"wide num\" title=\"{epoch}\">{epoch}</td>\
+                 <td class=\"actions\">{actions}</td></tr>",
                 component = escape(&p.component),
                 partition = escape(&p.partition),
+                group = p.group,
                 writer_or = if p.writer.is_empty() {
                     "no member holds its lease".to_string()
                 } else {
@@ -503,9 +570,64 @@ fn partitions_tab(partitions: &[PartitionOwner]) -> String {
         .collect();
     format!(
         "<om-pager search=\"Search partitions\"><table class=\"list one-line partitions\" data-partitions=\"{n}\">\
-         <thead><tr><th>Store</th><th>Partition</th><th>Writer</th><th class=\"num\">Epoch</th></tr></thead>\
+         <thead><tr><th>Store</th><th>Partition</th><th class=\"num\" title=\"Writer group\">Group</th>\
+         <th class=\"wide\">Writer</th><th class=\"wide num\">Epoch</th><th class=\"actions\"></th></tr></thead>\
          <tbody>{rows}</tbody></table></om-pager>",
         n = partitions.len()
+    )
+}
+
+/// The Partitions tab's three dialogs, each with a note saying why, Cancel,
+/// and Prepare beside the act (W6.39; section 6.8).
+fn dialogs(partitions: &[PartitionOwner], token: &str) -> String {
+    let book: Vec<&str> = partitions
+        .iter()
+        .filter(|p| p.component == "bor" && movable(p))
+        .map(|p| p.partition.as_str())
+        .collect();
+    let foot = |label: &str| {
+        format!(
+            "<div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
+             <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+             <button type=\"submit\" class=\"primary\">{label}</button></div>"
+        )
+    };
+    let note =
+        "<label>Note <input name=\"note\" maxlength=\"2000\" required placeholder=\"Why\"></label>";
+    format!(
+        "<dialog id=\"move-partition\" aria-labelledby=\"move-partition-title\"><form method=\"post\" \
+         action=\"{MOVE_PARTITION}\">{token}\
+         <div class=\"dialog-head\"><h2 id=\"move-partition-title\">Move a partition</h2></div>\
+         <div class=\"dialog-body\"><input type=\"hidden\" name=\"partition\">\
+         <label>Writer group <input name=\"target_group\" type=\"number\" min=\"0\" step=\"1\" \
+         inputmode=\"numeric\" required></label>{note}\
+         <p class=\"hint\">The group follows its log first, then writes to it wait at most \
+         moves.holdSeconds while it switches. A move that does not switch leaves it where it is, \
+         its cause in the history.</p></div>{move_foot}</form></dialog>\
+         <dialog id=\"split-partition\" aria-labelledby=\"split-partition-title\"><form method=\"post\" \
+         action=\"{SPLIT_PARTITION}\">{token}\
+         <div class=\"dialog-head\"><h2 id=\"split-partition-title\">Split a range</h2></div>\
+         <div class=\"dialog-body\"><input type=\"hidden\" name=\"partition\">{note}\
+         <p class=\"hint\">Halved at its midpoint in one commit of its writer, its halves \
+         numbered on from where it closes and staying with its group. Nothing is copied.</p></div>\
+         {split_foot}</form></dialog>\
+         <dialog id=\"move-account\" aria-labelledby=\"move-account-title\"><form method=\"post\" \
+         action=\"{MOVE_ACCOUNT}\">{token}\
+         <div class=\"dialog-head\"><h2 id=\"move-account-title\">Move an account</h2></div>\
+         <div class=\"dialog-body\"><label>Account <input name=\"account_id\" required \
+         autocomplete=\"off\" placeholder=\"ACC-...\"></label>\
+         <label>To partition <input name=\"target_partition\" list=\"book-partitions\" required \
+         autocomplete=\"off\" placeholder=\"P1\"></label>\
+         <datalist id=\"book-partitions\">{book}</datalist>{note}\
+         <p class=\"hint\">Its chain closes where it is and continues there, so it reads the same; \
+         acts on it wait between the two.</p></div>{account_foot}</form></dialog>",
+        move_foot = foot("Move"),
+        split_foot = foot("Split"),
+        account_foot = foot("Move"),
+        book = book
+            .iter()
+            .map(|p| format!("<option value=\"{}\">", escape(p)))
+            .collect::<String>(),
     )
 }
 
@@ -555,12 +677,13 @@ fn history_tab(history: &[ResilienceHistoryItem], next_cursor: &str, cursor: &st
     )
 }
 
-/// The page whole: its tabs, their tables, and the script that shows one
-/// tab at a time.
+/// The page whole: its tabs, their tables and dialogs, and the script that
+/// shows one tab at a time.
 pub fn page(
     profile: &Result<ReadResilienceProfileReply, String>,
     read: &Result<ReadResilienceReply, String>,
     cursor: &str,
+    token: &str,
 ) -> String {
     let unread = |why: &str| {
         format!(
@@ -568,29 +691,33 @@ pub fn page(
             escape(why)
         )
     };
-    let (members, partitions, history) = match read {
+    let (members, partitions, history, dialogs) = match read {
         Ok(reply) => (
             members_tab(&reply.members),
             partitions_tab(&reply.partitions),
             history_tab(&reply.history, &reply.next_cursor, cursor),
+            dialogs(&reply.partitions, token),
         ),
-        Err(why) => (unread(why), unread(why), unread(why)),
+        Err(why) => (unread(why), unread(why), unread(why), dialogs(&[], token)),
     };
+    let move_account =
+        "<button type=\"button\" data-dialog-open=\"move-account\">Move account</button>";
     let tabs: String = TABS
         .iter()
         .map(|(id, title)| format!("<a href=\"#{id}\" data-tab=\"{id}\">{title}</a>"))
         .collect();
     format!(
-        "<div class=\"admin\"><div class=\"page-head\"><h1>Resilience</h1></div>\
-         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}</div>\
+        "<style>{PARTITIONS_STYLE}</style><div class=\"admin\"><div class=\"page-head\"><h1>Resilience</h1></div>\
+         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{dialogs}</div>\
          <script>{}{}{}</script>",
         section(
             "profile",
             "Profile",
             "What the configuration survives, from its chart values, its members, nodes and \
              Leases and the source priorities: met only where CI tests it. It changes nothing; \
-             each change it names is made by meridian upgrade-deployment --set or at Plugins and \
-             Data sources.",
+             each change it names is made by meridian upgrade-deployment --set, at Plugins and \
+             Data sources, or on Partitions.",
+            "",
             &profile_tab(profile)
         ),
         section(
@@ -598,20 +725,24 @@ pub fn page(
             "Members",
             "Each member of each component as it reported last: its mode, zone, how far behind \
              its writer, and its restarts.",
+            "",
             &members
         ),
         section(
             "partitions",
             "Partitions",
-            "Each partition of the lake and the book, the member writing it and the epoch it \
-             writes under.",
+            "Each partition of the lake and the book, its writer group, the member writing it \
+             and the epoch it writes under. Moved to another group, or a lake range split, one at \
+             a time.",
+            move_account,
             &partitions
         ),
         section(
             "history",
             "History",
-            "Each takeover of a writer, integrity finding and switch of a default read's source, \
-             newest first.",
+            "Each takeover of a writer, move, split, integrity finding and switch of a default \
+             read's source, newest first.",
+            "",
             &history
         ),
         super::overview::SCRIPT_START,
@@ -635,13 +766,29 @@ mod tests {
                 lag_ms: 12,
                 ..Default::default()
             }],
-            partitions: vec![PartitionOwner {
-                component: "lake".into(),
-                partition: "control".into(),
-                writer: "om-lake-0".into(),
-                epoch: 3,
-                ..Default::default()
-            }],
+            partitions: vec![
+                PartitionOwner {
+                    component: "lake".into(),
+                    partition: "control".into(),
+                    writer: "om-lake-0".into(),
+                    epoch: 3,
+                    ..Default::default()
+                },
+                PartitionOwner {
+                    component: "lake".into(),
+                    partition: "kraken-1:quotes".into(),
+                    group: 1,
+                    writer: "om-lake-1".into(),
+                    epoch: 2,
+                },
+                PartitionOwner {
+                    component: "bor".into(),
+                    partition: "P1".into(),
+                    group: 1,
+                    writer: "om-bor-1".into(),
+                    epoch: 1,
+                },
+            ],
             history: vec![
                 ResilienceHistoryItem {
                     item: Some(Item::SourceSwitched(SourceSwitched {
@@ -685,6 +832,15 @@ mod tests {
                     cost: "one pod".into(),
                 }],
             }],
+            advice: vec![ResilienceLine {
+                subject: "the book's partitions".into(),
+                state: ResilienceState::NotMet as i32,
+                reason: "bor.partitions is 1 and bor.writerGroups 1".into(),
+                changes: vec![ResilienceChange {
+                    change: "bor.partitions: 2".into(),
+                    cost: "none now".into(),
+                }],
+            }],
             never_blind: vec![NeverBlindLine {
                 data_type: "meridian.v1.Quote".into(),
                 second_source: true,
@@ -697,10 +853,11 @@ mod tests {
 
     /// Every tab is drawn, one-line rows on the kit's pager; the level and
     /// what the next lacks; a line's change and cost; the history's older
-    /// page and what it does not list yet; no move is drawn (step 3d).
+    /// page; the advice in the profile's shape; the Partitions tab's three
+    /// dialogs, each with a note and Cancel (step 3d, stage M).
     #[test]
-    fn the_page_draws_every_tab_and_no_move() {
-        let body = page(&Ok(profile()), &Ok(reply()), "");
+    fn the_page_draws_every_tab_its_advice_and_its_dialogs() {
+        let body = page(&Ok(profile()), &Ok(reply()), "", "");
         for (id, _) in TABS {
             assert!(body.contains(&format!("id=\"{id}\"")), "{id}");
         }
@@ -710,7 +867,7 @@ mod tests {
         assert!(body.contains("never blind: Quote"));
         assert!(body.contains("its sources run no standby pod"));
         assert!(body.contains("data-members=\"1\"") && body.contains("12 ms"));
-        assert!(body.contains("data-partitions=\"1\"") && body.contains("om-lake-0"));
+        assert!(body.contains("data-partitions=\"3\"") && body.contains("om-lake-0"));
         assert!(body.contains("street: om-street-1 took over from om-street-0, epoch 4"));
         assert!(body.contains("Quote: kraken-1:ticker to coinbase-1:ticker, stalled"));
         assert!(body.contains("?cursor=50#history"));
@@ -719,9 +876,33 @@ mod tests {
             "the book's records are listed from step 3d"
         );
         assert_eq!(body.matches("<om-pager").count(), 4);
-        assert!(!body.to_lowercase().contains("move partition"));
-        assert!(!body.to_lowercase().contains("move account"));
-        assert!(!body.contains("<dialog"));
+        assert!(body.contains("data-line=\"advice\""));
+        assert!(body.contains("bor.partitions: 2 (none now)"));
+        assert!(body.contains("data-profile-lines=\"3\""));
+        // control is neither moved nor split; a lake range is both, a book
+        // partition moved only.
+        assert!(!body.contains("data-title=\"Move control\""));
+        assert!(body.contains("data-title=\"Move kraken-1:quotes\""));
+        assert!(body.contains("data-title=\"Split kraken-1:quotes\""));
+        assert!(body.contains("data-title=\"Move P1\""));
+        assert!(!body.contains("data-title=\"Split P1\""));
+        assert!(body.contains("<option value=\"P1\">"));
+        for (id, action) in [
+            ("move-partition", MOVE_PARTITION),
+            ("split-partition", SPLIT_PARTITION),
+            ("move-account", MOVE_ACCOUNT),
+        ] {
+            let at = body.find(&format!("<dialog id=\"{id}\"")).expect(id);
+            let dialog = &body[at..at + body[at..].find("</dialog>").expect(id)];
+            assert!(dialog.contains(&format!("action=\"{action}\"")), "{id}");
+            assert!(
+                dialog.contains("name=\"note\" maxlength=\"2000\" required"),
+                "{id}"
+            );
+            assert!(dialog.contains("data-dialog-close>Cancel"), "{id}");
+            assert!(dialog.contains("data-prepare>Prepare"), "{id}");
+        }
+        assert!(body.contains("data-dialog-open=\"move-account\">Move account"));
     }
 
     /// Contract v30's 3d records (approved 2026-11-12), said once 3d records
@@ -790,7 +971,7 @@ mod tests {
     /// Where the conductor does not answer, each tab says so in place.
     #[test]
     fn a_read_not_answered_is_said_in_place() {
-        let body = page(&Err("timed out".into()), &Err("timed out".into()), "");
+        let body = page(&Err("timed out".into()), &Err("timed out".into()), "", "");
         assert_eq!(
             body.matches("The conductor did not answer: timed out")
                 .count(),

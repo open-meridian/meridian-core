@@ -2055,6 +2055,95 @@ def spy_is_picked_in_a_settings_tables_instrument_cell(browser, prefix):
             ctx.close()
 
 
+RESILIENCE = f"{BASE}/admin/resilience"
+
+
+def the_resilience_page(browser, prefix):
+    """Contract v30 (W6.39; step 3d, stage M): the Resilience page's four
+    tabs, the profile's advice among its lines, and the Partitions tab's
+    Move, Split and Move account dialogs, each with a note and Cancel -- at
+    375, 582 and 1280 px, light and dark, one screen with no sideways
+    scroll, each dialog within the viewport; Move account posted, and back
+    on the Partitions tab."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            for tab in ("profile", "members", "partitions", "history"):
+                page.goto(f"{RESILIENCE}#{tab}")
+                settled(page)
+                label = f"resilience {tab} at {size} ({scheme})"
+                m = page.evaluate(MEASURE)
+                problems = measured(page, label, f"v30-{prefix}-resilience-{tab}-{size}-{scheme}.png")
+                check(not problems, f"{label} fits one screen by the kit's check"
+                      f"{': ' + '; '.join(problems) if problems else ''}")
+                check(m["tall"] <= 0, f"{label} fits one screen: {m['tall']}px taller")
+            page.goto(f"{RESILIENCE}#profile")
+            settled(page)
+            check(page.locator("tr[data-line=advice]").count() == 2,
+                  f"at {size} ({scheme}) the profile carries its two lines of advice")
+            page.goto(f"{RESILIENCE}#partitions")
+            settled(page)
+            check(page.locator("#partitions button[data-title='Move control']").count() == 0,
+                  f"at {size} ({scheme}) control has no Move")
+            check(page.locator("#partitions button[data-title='Split P1']").count() == 0,
+                  f"at {size} ({scheme}) a book partition has no Split")
+            for dialog, opener in [
+                ("move-partition", "#partitions tr[data-partition='P1'] button[data-dialog-open=move-partition]"),
+                ("split-partition", "#partitions tr[data-partition='kraken-1:daily'] button[data-dialog-open=split-partition]"),
+                ("move-account", "#partitions button[data-dialog-open=move-account]"),
+            ]:
+                # Each from the tab's first page: the pager turns forward only.
+                page.goto(f"{RESILIENCE}#partitions")
+                settled(page)
+                row = opener.rsplit(" button", 1)[0]
+                if "tr[" in row:
+                    on_its_page(page, row)
+                page.click(opener)
+                page.wait_for_timeout(300)
+                boxed = inside_the_viewport(page)
+                check(not boxed, f"at {size} ({scheme}) the {dialog} dialog stays within the viewport"
+                      f"{': ' + boxed if boxed else ''}")
+                inside = page.evaluate(INSIDE)
+                check(not inside, f"at {size} ({scheme}) nothing in the {dialog} dialog reaches past it: {inside}")
+                held = page.evaluate("""d => {
+                  const box = document.getElementById(d);
+                  return {
+                    note: !!box.querySelector('input[name=note][required]'),
+                    cancel: !!box.querySelector('[data-dialog-close]'),
+                    prepare: !!box.querySelector('[data-prepare]'),
+                    partition: (box.querySelector('input[name=partition]') || {}).value || '',
+                  };
+                }""", dialog)
+                check(held["note"] and held["cancel"] and held["prepare"],
+                      f"at {size} ({scheme}) the {dialog} dialog asks a note, with Cancel and Prepare: {held}")
+                if dialog == "move-partition":
+                    check(held["partition"] == "P1", f"at {size} ({scheme}) Move is filled with its row's partition: {held}")
+                page.screenshot(path=os.path.join(OUT, f"v30-{prefix}-resilience-{dialog}-{size}-{scheme}.png"))
+                page.click(f"#{dialog} [data-dialog-close]")
+                page.wait_for_timeout(200)
+            check(not errors, f"the Resilience page at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+    if PASS == "fit":
+        return
+    # Move account, posted: back on the Partitions tab.
+    ctx = context(browser)
+    page = ctx.new_page()
+    page.goto(f"{RESILIENCE}#partitions")
+    settled(page)
+    page.click("#partitions button[data-dialog-open=move-account]")
+    page.fill("#move-account input[name=account_id]", "ACC-7")
+    page.fill("#move-account input[name=target_partition]", "P1")
+    page.fill("#move-account input[name=note]", "P0 holds the firm's busiest accounts")
+    page.click("#move-account button.primary")
+    settled(page)
+    check(page.url.endswith("/admin/resilience#partitions"),
+          f"Move account posted returns to the Partitions tab: {page.url}")
+    ctx.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
@@ -2095,6 +2184,7 @@ with sync_playwright() as playwright:
     the_portal_overview(browser, prefix)
     the_sources_page(browser, prefix)
     the_v29_bond_page(browser, prefix)
+    the_resilience_page(browser, prefix)
     browser.close()
 
 if failures:
