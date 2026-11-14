@@ -293,6 +293,18 @@ impl Store for Writer {
         self.inner.settle_move(account_id)
     }
 
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        self.inner.group_of_partition(partition)
+    }
+
+    fn warm_account(
+        &self,
+        account_id: &str,
+        target_partition: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.inner.warm_account(account_id, target_partition)
+    }
+
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
         self.inner.control_records_owed()
     }

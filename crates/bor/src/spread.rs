@@ -252,6 +252,10 @@ impl Store for Spread {
             .act(account_id, message_id, idempotency_key, request, decide)
     }
 
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        self.groups.owner(partition)
+    }
+
     fn settle_move(&self, account_id: &str) -> Result<()> {
         // Its database: where its row names a partition placed in the
         // database holding that row, and holds its open.

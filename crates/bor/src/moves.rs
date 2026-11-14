@@ -232,6 +232,94 @@ pub fn move_account(
     ctx: &Context,
     request: &meridian_domain::v1::MoveAccountRequest,
 ) -> Result<meridian_domain::v1::AccountMoved> {
+    move_account_with(
+        bus,
+        store,
+        ctx,
+        request,
+        &meridian_changes::moves::Settings::from_env(),
+    )
+}
+
+/// An account's move aborted before its close (step 3d; section 6.8;
+/// ruled 2026-11-14): nothing changed, the account where it was, and
+/// PartitionMoveAborted journalled on `~control` naming the account and its
+/// target partition -- with an IntegrityFinding for a digest. Answered
+/// OVERLOADED with a retry-after for lag and timeout, FAILED_PRECONDITION
+/// naming `account_id` for a digest; the move may be asked again.
+#[allow(clippy::too_many_arguments)]
+fn aborted(
+    bus: &meridian_bus::Bus,
+    store: &dyn crate::store::Store,
+    ctx: &Context,
+    account: &str,
+    placed: &str,
+    target: &str,
+    cause: meridian_domain::v1::MoveAbortCause,
+    digests: Option<(Vec<u8>, Vec<u8>)>,
+) -> StoreError {
+    use meridian_domain::v1::MoveAbortCause;
+    let at_ns = ctx.received_at_ns.max(ctx.event_time_ns);
+    let record = meridian_domain::v1::PartitionMoveAborted {
+        component: "bor".into(),
+        partition: placed.to_string(),
+        target_group: store.group_of_partition(target),
+        account_id: account.to_string(),
+        target_partition: target.to_string(),
+        cause: cause as i32,
+        aborted_at_ns: at_ns,
+    };
+    let finding = digests.as_ref().map(|(source, target_digest)| {
+        meridian_changes::records::finding(
+            "bor",
+            meridian_domain::v1::IntegrityCheck::MemberDigest,
+            &meridian_changes::integrity::Finding {
+                partition: placed.to_string(),
+                sequence: 0,
+                committed_at_ns: at_ns,
+                what: format!(
+                    "a move of account {account} to {target}: its copy's last digest differs \
+                     from the source's ({} against {})",
+                    meridian_changes::moves::short(target_digest),
+                    meridian_changes::moves::short(source)
+                ),
+            },
+            at_ns,
+        )
+    });
+    crate::partition_moves::journal(
+        bus,
+        store,
+        &crate::partition_moves::Ended::Aborted(record, finding),
+    );
+    let why = match cause {
+        MoveAbortCause::Lag => "its target's lag stayed above readyLagMs",
+        MoveAbortCause::Timeout => "its close did not finish within moves.switchSeconds",
+        _ => "the target's digest differs from the source's",
+    };
+    let words = format!(
+        "the move of account {account} to {target} was aborted: {why}; the account stays in \
+         {placed}; ask again"
+    );
+    match cause {
+        MoveAbortCause::Digest => StoreError::Precondition {
+            field: "account_id",
+            words,
+        },
+        _ => StoreError::Held(words),
+    }
+}
+
+/// [`move_account`] under `settings` (`moves.switchSeconds`, readyLagMs,
+/// CI's lag and digest files).
+pub fn move_account_with(
+    bus: &meridian_bus::Bus,
+    store: &dyn crate::store::Store,
+    ctx: &Context,
+    request: &meridian_domain::v1::MoveAccountRequest,
+    settings: &meridian_changes::moves::Settings,
+) -> Result<meridian_domain::v1::AccountMoved> {
+    use meridian_domain::v1::MoveAbortCause;
     let account = request.account_id.as_str();
     let target = request.target_partition.as_str();
     if !crate::store::is_account(account) {
@@ -291,11 +379,73 @@ pub fn move_account(
             ));
         }
         Standing::In(_) => {
+            // Gate: the target's lag under readyLagMs within switchSeconds
+            // (section 6.8); else aborted before anything is held.
+            let gate = std::time::Instant::now();
+            while settings
+                .injected_lag()
+                .is_some_and(|lag| lag >= settings.ready_lag)
+            {
+                if gate.elapsed() >= settings.switch {
+                    return Err(aborted(
+                        bus,
+                        store,
+                        ctx,
+                        account,
+                        &placed,
+                        target,
+                        MoveAbortCause::Lag,
+                        None,
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Warm, and the digests compared before the close: across
+            // databases, the account copied to its target's first.
+            let digests = store.warm_account(account, target)?;
+            let differs = settings.digest_differs()
+                || digests
+                    .as_ref()
+                    .is_some_and(|(source, copy)| source != copy);
+            if differs {
+                let (source, mut copy) = digests.unwrap_or_default();
+                if settings.digest_differs() {
+                    copy.push(0xff);
+                }
+                return Err(aborted(
+                    bus,
+                    store,
+                    ctx,
+                    account,
+                    &placed,
+                    target,
+                    MoveAbortCause::Digest,
+                    Some((source, copy)),
+                ));
+            }
+            // The close, within switchSeconds: its partition held past it
+            // aborts the move, nothing closed.
             let key = close_key(account, &placed, target);
-            let acted = store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
-                close(book, head, ctx, target, &request.reason)
-                    .map(|made| crate::service::decided(made, Vec::new()))
-            })?;
+            let acted = match holding(settings.switch, || {
+                store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
+                    close(book, head, ctx, target, &request.reason)
+                        .map(|made| crate::service::decided(made, Vec::new()))
+                })
+            }) {
+                Err(StoreError::Held(_)) => {
+                    return Err(aborted(
+                        bus,
+                        store,
+                        ctx,
+                        account,
+                        &placed,
+                        target,
+                        MoveAbortCause::Timeout,
+                        None,
+                    ))
+                }
+                other => other?,
+            };
             let entry = match acted {
                 crate::store::Acted::Committed(decided) => {
                     crate::service::announce(bus, &decided, None, None);

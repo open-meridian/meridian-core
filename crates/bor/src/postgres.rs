@@ -2334,6 +2334,10 @@ impl Store for PostgresStore {
         self.fence.epoch()
     }
 
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        self.groups.owner(partition)
+    }
+
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;

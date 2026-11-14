@@ -642,6 +642,27 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
+    /// The writer group that owns `partition`, as this store last read it
+    /// (step 3d): 0 with one group.
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        let _ = partition;
+        0
+    }
+
+    /// An account's move warmed (step 3d; section 6.8): where its target
+    /// partition is in another database, everything the account's database
+    /// holds of it copied there before the close, and the digest of its
+    /// last entry in each answered -- (source, target). None within one
+    /// database, where the target reads the same rows.
+    fn warm_account(
+        &self,
+        account_id: &str,
+        target_partition: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let _ = (account_id, target_partition);
+        Ok(None)
+    }
+
     /// The records the `~control` journal owes (step 3d; section 6.3,
     /// option (c)): each takeover and finding kept beside the journal and
     /// not yet in it, and each partition whose writer group is not the one

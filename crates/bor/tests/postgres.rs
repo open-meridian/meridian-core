@@ -4093,6 +4093,143 @@ async fn a_changed_count_of_writer_groups_moves_each_partition_once() {
     blocking(move || drop((zero, one, zero_store, one_store, migrated)));
 }
 
+/// Every cause an account's move aborts for (step 3d; section 6.8; ruled
+/// 2026-11-14), each before its close: the injected lag, a close its
+/// partition holds past moves.switchSeconds, and the injected digest
+/// mismatch. Each leaves the account where it was, its journal unchanged,
+/// journals PartitionMoveAborted naming the account and its target on
+/// ~control (an IntegrityFinding beside the digest's), and is answered
+/// OVERLOADED with a retry-after (lag, timeout) or FAILED_PRECONDITION
+/// naming account_id (digest); asked again after, it moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_account_move_aborts_for_lag_timeout_and_digest_and_stays() {
+    use meridian_bor::decide::Context;
+    use meridian_bor::moves::move_account_with;
+    use meridian_changes::moves::Settings;
+    use meridian_domain::v1::MoveAccountRequest;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(one, one_store), (_one, _one_store)], _mover) = blocking(|| two_members(&url));
+    // Group 0's -- the control partition's -- account and target: its
+    // writer journals the records on ~control itself.
+    let zeros: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| meridian_changes::groups::owner(p, 2) == 0)
+        .collect();
+    let (from, target) = (zeros[0].clone(), zeros[1].clone());
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-AMOVE-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == from)
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    let dir = std::env::temp_dir().join(unique("amove"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (lag, digest) = (dir.join("lag"), dir.join("digest"));
+    std::fs::write(&lag, "60000").unwrap();
+    std::fs::write(&digest, "").unwrap();
+    let settings = |lag_file, digest_file| Settings {
+        switch: std::time::Duration::from_secs(1),
+        lag_file,
+        digest_file,
+        ..Default::default()
+    };
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: target.clone(),
+        reason: "an abort per cause".into(),
+    };
+    let before = blocking(|| Store::journal(one_store.as_ref(), &account)).unwrap();
+    let attempt = |n: i64, settings: Settings| {
+        let ctx = Context {
+            acting_for: PERSON.into(),
+            received_at_ns: 1_000 + n,
+            ..Default::default()
+        };
+        move_account_with(&one, one_store.as_ref(), &ctx, &request, &settings)
+            .unwrap_err()
+            .on_the_bus()
+    };
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    let lagged = blocking(|| attempt(1, settings(Some(lag.clone()), None)));
+    assert!(
+        lagged.contains(&overloaded) && lagged.contains("lag"),
+        "{lagged}"
+    );
+    // Timeout: the partition's lock held past the switch's bound.
+    let timed_out = blocking(|| {
+        let mut holder = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let mut held = holder.transaction().unwrap();
+        held.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&meridian_bor::postgres::partition_lock_key(&from)],
+        )
+        .unwrap();
+        let answered = attempt(2, settings(None, None));
+        held.rollback().unwrap();
+        answered
+    });
+    assert!(
+        timed_out.contains(&overloaded) && timed_out.contains("switchSeconds"),
+        "{timed_out}"
+    );
+    let differs = blocking(|| attempt(3, settings(None, Some(digest.clone()))));
+    assert!(differs.contains("account_id"), "{differs}");
+    blocking(|| {
+        // Where it was, its journal unchanged.
+        assert_eq!(
+            one_store.partition_of(&account).as_deref(),
+            Some(from.as_str())
+        );
+        assert_eq!(
+            Store::journal(one_store.as_ref(), &account).unwrap(),
+            before
+        );
+        let control = one_store
+            .journal(meridian_bor::store::CONTROL_ACCOUNT)
+            .unwrap();
+        // One record a cause, each keyed by when it was asked (lag 1001,
+        // timeout 1002, digest 1003), and the digest's finding beside it.
+        let keys: Vec<String> = control
+            .iter()
+            .map(|e| e.idempotency_key.clone())
+            .filter(|k| {
+                k.contains(&format!(":{from}:")) && (k.contains("abort") || k.contains("finding"))
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                format!("control-record:partition-move-aborted:{from}:1001"),
+                format!("control-record:partition-move-aborted:{from}:1002"),
+                format!("control-record:partition-move-aborted:{from}:1003"),
+                format!("control-record:finding:move:{from}:1003"),
+            ]
+        );
+    });
+    // Asked again, with nothing in the way: it moves.
+    let ctx = Context {
+        acting_for: PERSON.into(),
+        received_at_ns: 2_000,
+        ..Default::default()
+    };
+    let moved = blocking(|| {
+        move_account_with(
+            &one,
+            one_store.as_ref(),
+            &ctx,
+            &request,
+            &settings(None, None),
+        )
+    })
+    .unwrap();
+    assert_eq!(moved.to_partition, target);
+    std::fs::remove_dir_all(&dir).unwrap();
+    blocking(move || drop((one, one_store, _one, _one_store, migrated)));
+}
+
 /// A partition moved back to a writer group that owned nothing meanwhile
 /// (step 3d; `book_writer_group`, approved 2026-11-14): every partition of
 /// group 1 moved to group 0, then P4 moved back. It carries group 1's own
