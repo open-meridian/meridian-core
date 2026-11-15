@@ -713,7 +713,6 @@ mod tests {
         assert!((held.as_secs_f64() - 0.25).abs() < 0.01, "{held:?}");
     }
 
-    #[test]
     /// Review finding 5: a caller naming an hour's deadline is refused
     /// nothing, and sends no faster for it: each write is sent when the
     /// share has covered it, so by any moment no more than the share's
