@@ -396,7 +396,7 @@ fn run() -> Result<(), String> {
                 .start(Arc::clone(&bus)),
             );
         }
-        meridian_config::serve_plugins_and_registries(
+        meridian_config::serve_plugins_on(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
@@ -404,6 +404,12 @@ fn run() -> Result<(), String> {
             archive,
             local_registry,
             registries,
+            // Whether an instance of several pods has a lease right to run
+            // under (step 3d): as the chart's values state it; unsaid
+            // where the chart handed none.
+            meridian_runtime::resilience::values_from_env()
+                .filter(|values| values.stated)
+                .map(|values| values.lease_right()),
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing

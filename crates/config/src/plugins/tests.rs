@@ -43,17 +43,34 @@ fn harness_with(archive: ArchiveGrant) -> (Arc<Bus>, Arc<Launcher>) {
 /// The plugins' service on a conductor named `conductor`, as the chart
 /// names it `<release>-conductor`.
 fn harness_as(conductor: &str, archive: ArchiveGrant) -> (Arc<Bus>, Arc<Launcher>) {
+    harness_on(conductor, archive, None)
+}
+
+/// The plugins' service on a deployment that says whether it renders the
+/// lease right an instance of several pods runs under.
+fn harness_leased(lease_right: Option<bool>) -> (Arc<Bus>, Arc<Launcher>) {
+    harness_on("conductor-1", ArchiveGrant::default(), lease_right)
+}
+
+fn harness_on(
+    conductor: &str,
+    archive: ArchiveGrant,
+    lease_right: Option<bool>,
+) -> (Arc<Bus>, Arc<Launcher>) {
     let bus = Arc::new(Bus::single(
         conductor,
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    serve_plugins_with(
+    crate::plugins::serve_plugins_on(
         Arc::clone(&bus),
         Arc::new(MemoryStore::new()),
         Arc::new(At(1_790_380_800_000_000_000)),
         "localhost:5000".into(),
         archive,
+        None,
+        None,
+        lease_right,
     );
     let launcher = Arc::new(Launcher::default());
     let creating = Arc::clone(&launcher);
@@ -108,6 +125,18 @@ fn snaptrade(version: &str) -> RecordPluginUploadRequest {
         documentation: Vec::new(),
         ..Default::default()
     }
+}
+
+/// A version of `roles` whose vendor allows two pods of one instance.
+fn shardable(version: &str, roles: &[&str]) -> RecordPluginUploadRequest {
+    let mut upload = snaptrade(version);
+    let metadata = upload.metadata.as_mut().unwrap();
+    metadata.roles = roles.iter().map(|role| role.to_string()).collect();
+    metadata.declaration = Some(meridian_pb::v1::PluginDeclaration {
+        most_shards: 2,
+        ..Default::default()
+    });
+    upload
 }
 
 async fn upload(bus: &Bus, request: RecordPluginUploadRequest) -> Result<PluginVersion, String> {
@@ -1005,17 +1034,12 @@ async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards()
     // (step 3d; CreatePluginRequest.shards and .standby, approved
     // 2026-11-15), which makes the pods.
     let (bus, launcher) = harness();
-    let mut shardable = snaptrade("0.1.0");
-    shardable.metadata.as_mut().unwrap().declaration = Some(meridian_pb::v1::PluginDeclaration {
-        most_shards: 2,
-        ..Default::default()
-    });
-    upload(&bus, shardable).await.unwrap();
+    upload(&bus, shardable("0.1.0", &["data"])).await.unwrap();
     let refused = launch(
         &bus,
         LaunchPluginRequest {
             shards: 3,
-            ..launching("snaptrade-1", &["custody"])
+            ..launching("snaptrade-1", &["data"])
         },
     )
     .await
@@ -1030,7 +1054,7 @@ async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards()
         LaunchPluginRequest {
             shards: 2,
             standby: true,
-            ..launching("snaptrade-1", &["custody"])
+            ..launching("snaptrade-1", &["data"])
         },
     )
     .await
@@ -1054,11 +1078,13 @@ async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards()
         );
     }
     // A version declaring none is one pod: 1 is admitted, 2 refused.
-    upload(&bus, snaptrade("0.1.1")).await.unwrap();
+    let mut plain = snaptrade("0.1.1");
+    plain.metadata.as_mut().unwrap().roles = vec!["data".into()];
+    upload(&bus, plain).await.unwrap();
     let one = LaunchPluginRequest {
         version: "0.1.1".into(),
         shards: 1,
-        ..launching("snaptrade-2", &["custody"])
+        ..launching("snaptrade-2", &["data"])
     };
     launch(&bus, one.clone()).await.unwrap();
     let refused = launch(
@@ -1333,6 +1359,111 @@ async fn an_uploads_texts_are_held_to_what_its_declaration_names() {
                 ("terms", &big),
             ],
         ),
+    )
+    .await
+    .unwrap();
+}
+
+/// Review finding 3 (ruled 2026-11-15): shards split a role's work by
+/// subject, and only a data plugin's is (the lake's wants). Any other role
+/// asking shards above 1 is refused naming `shards`, whatever its version's
+/// most_shards: each of its shards would hear and act on every row. Such a
+/// role takes a standby pod.
+#[tokio::test(flavor = "multi_thread")]
+async fn shards_above_one_are_refused_for_any_role_but_data_and_a_standby_is_not() {
+    let (bus, launcher) = harness();
+    for (version, roles) in [
+        ("0.1.0", vec!["connectivity"]),
+        ("0.1.1", vec!["oms"]),
+        ("0.1.2", vec!["data", "signal"]),
+    ] {
+        upload(&bus, shardable(version, &roles)).await.unwrap();
+        let asked = LaunchPluginRequest {
+            version: version.into(),
+            shards: 2,
+            ..launching("snaptrade-1", &roles)
+        };
+        let refused = launch(&bus, asked.clone()).await.unwrap_err();
+        assert!(
+            refused.contains("[refusal-status invalid-argument")
+                && refused.contains("shards")
+                && refused.contains("standby"),
+            "{roles:?}: {refused}"
+        );
+        assert!(
+            launcher.created.lock().unwrap().is_empty(),
+            "nothing was asked of the launcher"
+        );
+        assert!(
+            catalogue(&bus).await.launches.is_empty(),
+            "and no launch was recorded"
+        );
+    }
+    // The same role with a standby pod and one shard is launched.
+    let launched = launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 1,
+            standby: true,
+            ..launching("snaptrade-1", &["connectivity"])
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((launched.shards, launched.standby), (1, true));
+}
+
+/// Review finding S4 (ruled 2026-11-15): where the deployment renders no
+/// lease right -- no store runs a standby -- a launch asking shards or a
+/// standby pod is refused before it is recorded, FAILED_PRECONDITION naming
+/// the field asked, as the refusal past most_shards names `shards`.
+#[tokio::test(flavor = "multi_thread")]
+async fn shards_or_a_standby_are_refused_before_the_record_where_no_lease_right_is_rendered() {
+    let (bus, launcher) = harness_leased(Some(false));
+    upload(&bus, shardable("0.1.0", &["data"])).await.unwrap();
+    for (shards, standby, field) in [
+        (2, false, "shards"),
+        (0, true, "standby"),
+        (2, true, "shards"),
+    ] {
+        let refused = launch(
+            &bus,
+            LaunchPluginRequest {
+                shards,
+                standby,
+                ..launching("snaptrade-1", &["data"])
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.contains("[refusal-status failed-precondition") && refused.contains(field),
+            "{field}: {refused}"
+        );
+        assert!(
+            refused.contains("standby"),
+            "it says what to set: {refused}"
+        );
+    }
+    assert!(launcher.created.lock().unwrap().is_empty());
+    assert!(
+        catalogue(&bus).await.launches.is_empty(),
+        "no launch was recorded, failed or otherwise"
+    );
+    // One pod is launched there as ever; and where the right is rendered,
+    // the same asks are admitted.
+    launch(&bus, launching("snaptrade-1", &["data"]))
+        .await
+        .unwrap();
+    let (bus, _launcher) = harness_leased(Some(true));
+    upload(&bus, shardable("0.1.0", &["data"])).await.unwrap();
+    launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 2,
+            standby: true,
+            ..launching("snaptrade-1", &["data"])
+        },
     )
     .await
     .unwrap();

@@ -186,6 +186,16 @@ pub struct Values {
 }
 
 impl Values {
+    /// Whether the chart renders the members' lease right, which a plugin
+    /// instance of several pods -- shards, or a standby pod -- takes its
+    /// shards' Leases under (step 3d; section 7): where a store runs a
+    /// standby, as members.yaml and the launcher's shards shape render.
+    pub fn lease_right(&self) -> bool {
+        ["lake", "bor", "instrument", "street", "conductor"]
+            .iter()
+            .any(|store| self.standby.get(*store).copied().unwrap_or(0) > 0)
+    }
+
     /// `component`'s writer groups: 1 where the values say none.
     pub fn writer_groups(&self, component: &str) -> u32 {
         self.writer_groups

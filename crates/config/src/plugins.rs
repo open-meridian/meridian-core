@@ -103,6 +103,11 @@ struct Plugins {
     registries: Option<Arc<crate::registries::Hold>>,
     /// The starter packs whose install is under way (W8.18, v28).
     packs: packs::Jobs,
+    /// Whether the deployment renders the lease right an instance of
+    /// several pods runs under (step 3d; the resilience spec's section 7):
+    /// where a store runs a standby. None where the deployment does not
+    /// say, and the launcher's own refusal stands.
+    lease_right: Option<bool>,
 }
 
 mod catalogue;
@@ -624,7 +629,49 @@ pub fn launch<'a>(
             ),
         ));
     }
+    // Shards split a role's work by subject, and only a data plugin's is
+    // (the resilience spec's section 7: the lake's wants, shared by
+    // rendezvous hashing; ruled 2026-11-15). Each shard of any other role
+    // would hear every row of its instance and act on it.
+    if request.shards > 1 && declared != set(&["data".to_string()]) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["shards".to_string()],
+            format!(
+                "shards is {}, and {} {} declares roles {}: shards split a data plugin's                  subjects among its pods, and nothing splits another role's work; such a                  plugin takes a standby pod (standby), not shards",
+                request.shards,
+                request.name,
+                request.version,
+                listed(&declared)
+            ),
+        ));
+    }
     Ok(version)
+}
+
+/// A launch asking several pods of its instance -- shards above 1, or a
+/// standby pod -- refused where the deployment renders no lease right for
+/// them (step 3d; ruled 2026-11-15): before anything is recorded, naming
+/// the field asked.
+fn several_refused(request: &LaunchPluginRequest, lease_right: Option<bool>) -> Option<String> {
+    if lease_right != Some(false) {
+        return None;
+    }
+    let field = if request.shards > 1 {
+        "shards"
+    } else if request.standby {
+        "standby"
+    } else {
+        return None;
+    };
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        format!(
+            "{field} was asked for {}, and this deployment runs no store standby: an instance              of several pods takes its shards' leases under the members' lease right, which              the chart renders where a store runs a standby (lake.standby, bor.standby,              instrument.standby, street.standby or conductor.standby at 1; the ha profile              sets each)",
+            request.instance_id
+        ),
+    ))
 }
 
 // ── Serving them ────────────────────────────────────────────────────────────
@@ -722,6 +769,9 @@ impl Plugins {
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
         }
+        if let Some(refusal) = several_refused(&request, self.lease_right) {
+            return Err(refusal);
+        }
         // A registry version is verified again at launch (W8.3; the spec's
         // requirement 24): its kept listing statement, the referrers in the
         // deployment's own registry and the newest key status held.
@@ -762,7 +812,7 @@ impl Plugins {
             // Its own share at its sidecar (contract v30; ruled 2026-11-11).
             limits: request.limits,
             // Its shards and standby pod as asked (contract v30; W8.3),
-            // kept on its record; the launcher still runs one pod (3d).
+            // kept on its record; the launcher makes the pods (step 3d).
             shards: request.shards,
             standby: request.standby,
             ..Default::default()
@@ -1325,6 +1375,25 @@ pub fn serve_plugins_and_registries(
     local: Option<Arc<dyn LocalRegistry>>,
     registries: Option<Arc<crate::registries::Hold>>,
 ) {
+    serve_plugins_on(
+        bus, store, clock, registry, archive, local, registries, None,
+    )
+}
+
+/// [`serve_plugins_and_registries`], on a deployment that says whether it
+/// renders the lease right an instance of several pods runs under (step
+/// 3d): `lease_right`, none where the deployment does not say.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_plugins_on(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+    local: Option<Arc<dyn LocalRegistry>>,
+    registries: Option<Arc<crate::registries::Hold>>,
+    lease_right: Option<bool>,
+) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
         store,
@@ -1334,6 +1403,7 @@ pub fn serve_plugins_and_registries(
         local,
         registries,
         packs: packs::Jobs::default(),
+        lease_right,
     });
     // A pack install a restart interrupted, carried on (616).
     plugins.resume_pack_jobs();
