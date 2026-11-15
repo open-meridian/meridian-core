@@ -4184,6 +4184,23 @@ def moves(s, dash):
         rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
                      f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
         s.check(rolled.returncode == 0, f"rebalance: {component}'s database 1 brought and ready")
+    # Each store's members rolled to the new count before anything is timed:
+    # a partition is moved home only once every member seen runs the
+    # sweep's revision (`lake_member`, `book_member`), so the moves home
+    # begin when the rollout ends, and the rollout's own writer changes are
+    # an upgrade's, not a move's. Timed from "every component ready" alone,
+    # the window to the moves home took in the rest of the roll (PR CI
+    # 43675491409, ha: four orders timed out at 04:43:28 and 04:43:51, as
+    # group 1's and then group 0's book writer changed hands; the first
+    # partition moved home at 04:44:52).
+    for component in ("lake", "bor"):
+        for deployment in (f"{FULL}-{component}", f"{FULL}-{component}-group-1"):
+            rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
+                         "--timeout=420s", check=False)
+            s.check(rolled.returncode == 0, f"rebalance: {deployment} rolled out at two databases")
+        # Its readers too, where the profile has any.
+        run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{FULL}-{component}-reader",
+            "--timeout=420s", check=False)
     ready = happens(all_ready, 600, every=5)
     s.check(ready, "rebalance: every component ready at two databases")
     since_ms = int(time.time() * 1000)
