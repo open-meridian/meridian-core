@@ -73,49 +73,94 @@ trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit $?' TERM INT
         # then restarts as a standby itself; a leader with no standby to
         # hand over to restarts in place. Each member decides for itself
         # from the cluster's own view (`decide`), so no two act at once.
+        #
+        # Whether a restart is pending here is asked of Postgres itself as
+        # well as of Patroni (PR CI 43669650813, ha: the member the roll
+        # restarted first took the PATCH while it was still starting,
+        # "restarting after failure in progress", and became the leader;
+        # Postgres said "max_connections cannot be changed without
+        # restarting the server" at each reload from then on, and this loop
+        # did nothing for the twelve minutes the run went on -- the
+        # migrations gave up waiting for 303 again, so no P1 head and no
+        # database 1). And a member that waits says why, once for each
+        # reason, where it said nothing.
         decide='
 import json, sys
 me = sys.argv[1]
 members = json.load(sys.stdin).get("members", [])
+here = len(sys.argv) > 2 and sys.argv[2] not in ("", "0")
 mine = next((m for m in members if m.get("name") == me), None)
-if not mine or not mine.get("pending_restart"):
+if not mine or not (mine.get("pending_restart") or here):
     print("none"); sys.exit()
+# Asked of Patroni where it says so itself; where only Postgres does, a
+# restart Patroni is asked for whatever it holds pending.
+restart = "restart" if mine.get("pending_restart") else "restart-whatever"
+switchover = "switchover" if mine.get("pending_restart") else "switchover-whatever"
 others = [m for m in members if m.get("name") != me]
 def healthy(m):
     return m.get("state") in ("running", "streaming")
+def named(some):
+    return ", ".join("%s (%s)" % (m.get("name"), m.get("state")) for m in some)
 if mine.get("role") in ("leader", "standby_leader"):
     standbys = [m for m in others if m.get("role") not in ("leader", "standby_leader")]
-    if any(m.get("pending_restart") for m in standbys):
-        print("wait")
+    pending = [m for m in standbys if m.get("pending_restart")]
+    if pending:
+        print("wait: the leader, after each standby still pending its own: " + named(pending))
     elif any(healthy(m) and not (m.get("tags") or {}).get("nofailover") for m in standbys):
-        print("switchover")
+        print(switchover)
     elif not any(not (m.get("tags") or {}).get("nofailover") for m in standbys):
-        print("restart")
+        print(restart)
     else:
-        print("wait")
+        print("wait: the leader, with no standby running to hand over to: " + named(standbys))
 elif not all(healthy(m) for m in others):
-    print("wait")
+    print("wait: a standby, until every other member runs: "
+          + named([m for m in others if not healthy(m)]))
 elif any(m.get("pending_restart") and m.get("role") not in ("leader", "standby_leader")
          and m.get("name", "") < me for m in others):
-    print("wait")
+    print("wait: a standby, after the standbys named before it")
 else:
-    print("restart")
+    print(restart)
 '
+        # Where only Postgres says so, once for as long as this member
+        # runs: a setting it can never take (one lowered below its
+        # primary's) stays pending whatever is restarted, and is never
+        # restarted for, or handed over for, again and again.
+        waited=""
+        whatever=""
         while sleep 10; do
-          said=$(api cluster 2>/dev/null | python3 -c "$decide" "${PATRONI_NAME}" 2>/dev/null) || continue
+          # As this member's own server says it: the settings it holds
+          # pending a restart, none where it does not answer.
+          here=$(psql -X -At -h /var/run/postgresql -U postgres -d postgres \
+            -c 'select count(*) from pg_settings where pending_restart' 2>/dev/null || echo 0)
+          said=$(api cluster 2>/dev/null | python3 -c "$decide" "${PATRONI_NAME}" "${here:-0}" 2>/dev/null) || continue
           case "$said" in
-          restart)
+          *-whatever)
+            if [ -n "$whatever" ]; then continue; fi
+            ;;
+          esac
+          case "$said" in
+          wait*)
+            if [ "$said" != "$waited" ]; then
+              echo "database.sh: a setting read only at start is pending here; ${said}"
+              waited=$said
+            fi
+            ;;
+          restart|restart-whatever)
+            pending='{"restart_pending": true}'
+            if [ "$said" = restart-whatever ]; then pending='{}'; fi
             if api restart -o /dev/null -u "patroni:${PATRONI_RESTAPI_PASSWORD}" -X POST \
-                -H 'Content-Type: application/json' --data '{"restart_pending": true}' 2>/dev/null; then
+                -H 'Content-Type: application/json' --data "$pending" 2>/dev/null; then
               echo "database.sh: restarted for a setting read only at start"
+              if [ "$said" = restart-whatever ]; then whatever=asked; fi
             else
               echo "database.sh: a setting read only at start is pending and the restart was refused; asked again" >&2
             fi
             ;;
-          switchover)
+          switchover|switchover-whatever)
             if api switchover -o /dev/null -u "patroni:${PATRONI_RESTAPI_PASSWORD}" -X POST \
                 -H 'Content-Type: application/json' --data "{\"leader\": \"${PATRONI_NAME}\"}" 2>/dev/null; then
               echo "database.sh: handed the leader to a standby already restarted, to restart for a setting read only at start"
+              if [ "$said" = switchover-whatever ]; then whatever=asked; fi
             else
               echo "database.sh: a setting read only at start is pending and the switchover was refused; asked again" >&2
             fi
