@@ -183,6 +183,76 @@ fn a_released_lease_is_taken_at_the_standbys_next_look() {
     });
 }
 
+/// A member that gave its lease up is stopping: it never takes it back,
+/// though a released lease is free to the first member that looks and it
+/// may look before its standby does. Its standby takes it.
+#[test]
+fn a_member_that_released_its_lease_never_takes_it_back() {
+    run(async {
+        let api = Memory::default();
+        let mut a = Elector::new(api.clone(), settings("lake-a"));
+        let mut b = Elector::new(api.clone(), settings("lake-b"));
+        let t0 = Instant::now();
+        assert_eq!(a.look(t0, 0).await.unwrap(), Standing::Held);
+        assert!(matches!(b.look(t0, 0).await.unwrap(), Standing::HeldBy(_)));
+        assert!(!a.gave_up());
+        a.release(1_000_000_000).await;
+        assert!(a.gave_up());
+        // Its own next look, before its standby's: nothing taken.
+        assert_eq!(
+            a.look(t0 + Duration::from_secs(2), 2_000_000_000)
+                .await
+                .unwrap(),
+            Standing::HeldBy(String::new())
+        );
+        assert_eq!(api.0.lock().unwrap().as_ref().unwrap().holder, "");
+        assert_eq!(
+            b.look(t0 + Duration::from_secs(2), 2_000_000_000)
+                .await
+                .unwrap(),
+            Standing::Held
+        );
+        // Nor once that one lapses, however long this member lingers.
+        assert_eq!(
+            a.look(t0 + Duration::from_secs(60), 60_000_000_000)
+                .await
+                .unwrap(),
+            Standing::HeldBy("lake-b".into())
+        );
+        assert_eq!(api.0.lock().unwrap().as_ref().unwrap().holder, "lake-b");
+    });
+}
+
+/// The same where the release itself could not be written -- the member
+/// had seen no record to release, its last look having failed: it still
+/// renews nothing, and the lease lapses to its standby.
+#[test]
+fn a_member_whose_release_was_not_written_still_renews_nothing() {
+    run(async {
+        let api = Memory::default();
+        let mut a = Elector::new(api.clone(), settings("lake-a"));
+        let mut b = Elector::new(api.clone(), settings("lake-b"));
+        let t0 = Instant::now();
+        assert_eq!(a.look(t0, 0).await.unwrap(), Standing::Held);
+        assert!(matches!(b.look(t0, 0).await.unwrap(), Standing::HeldBy(_)));
+        a.observed = None;
+        a.release(1_000_000_000).await;
+        assert_eq!(api.0.lock().unwrap().as_ref().unwrap().holder, "lake-a");
+        assert_eq!(
+            a.look(t0 + Duration::from_secs(2), 2_000_000_000)
+                .await
+                .unwrap(),
+            Standing::HeldBy("lake-a".into())
+        );
+        assert_eq!(
+            b.look(t0 + Duration::from_secs(7), 7_000_000_000)
+                .await
+                .unwrap(),
+            Standing::Held
+        );
+    });
+}
+
 #[test]
 fn the_renew_deadline_falls_before_the_lease_ends() {
     let s = settings("x");

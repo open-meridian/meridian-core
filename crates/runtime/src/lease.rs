@@ -140,6 +140,9 @@ pub struct Elector<L: Leases> {
     /// Whom it took the lease from, the last time it took it: `Some("")`
     /// where it was released, `None` where nobody had ever held it.
     took_from: Option<Option<String>>,
+    /// Whether this member gave the lease up ([`Elector::release`]): it is
+    /// stopping, and never takes or renews it again.
+    gave_up: bool,
 }
 
 impl<L: Leases> Elector<L> {
@@ -150,7 +153,14 @@ impl<L: Leases> Elector<L> {
             observed: None,
             renewed_at: None,
             took_from: None,
+            gave_up: false,
         }
+    }
+
+    /// Whether this member gave the lease up: its looks take nothing from
+    /// then on.
+    pub fn gave_up(&self) -> bool {
+        self.gave_up
     }
 
     /// Whom this member took the lease from: `Some(Some(holder))` from a
@@ -214,6 +224,15 @@ impl<L: Leases> Elector<L> {
         if changed {
             self.observed = Some((current.clone(), now));
         }
+        // Given up: whoever holds it, never this member again. A released
+        // lease's holder is empty, free to the first member that looks, and
+        // the member that released it went on looking while it stopped: it
+        // took its own lease back, wrote on until it was killed, and left
+        // the lease to lapse with nobody serving (failover-repeat
+        // 43705797988, ha run 3: the book's writer, twice).
+        if self.gave_up {
+            return Ok(Standing::HeldBy(current.holder));
+        }
         let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
         let lapse = Duration::from_secs(current.duration_seconds.max(1));
         let mine = current.holder == me;
@@ -259,7 +278,11 @@ impl<L: Leases> Elector<L> {
 
     /// Give the lease up, where this member holds it: a planned stop hands
     /// over at once rather than after the lease lapses. Best effort.
+    ///
+    /// From here this member neither takes nor renews it, released or not:
+    /// where the release was not written, the lease lapses on its own.
     pub async fn release(&mut self, wall_ns: i64) {
+        self.gave_up = true;
         let Some((seen, _)) = self.observed.clone() else {
             return;
         };

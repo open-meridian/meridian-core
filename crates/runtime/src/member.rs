@@ -595,6 +595,12 @@ impl Holding {
                         "a commit of this writer was refused by a newer epoch",
                     );
                 }
+                // Given up on a planned stop: not looked at again, so a
+                // member still stopping is never told another holds it, and
+                // steps down only once a commit of its own is refused.
+                if elector.lock().await.gave_up() {
+                    continue;
+                }
                 let looked = tokio::time::timeout(renew, async {
                     elector.lock().await.look(Instant::now(), now_ns()).await
                 })
