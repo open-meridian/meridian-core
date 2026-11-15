@@ -29,8 +29,10 @@ use std::sync::{Mutex, RwLock};
 use meridian_domain::v1::{ObservationsWantedEvent, WantWithdrawnEvent};
 use tokio::sync::watch;
 
-/// The most wants a shard keeps to share again when the live shards change:
-/// the oldest forgotten first, and shared again at the lake's redelivery.
+/// The most standing wants a shard keeps to share again when the live
+/// shards change: the oldest forgotten first, and shared again at the
+/// lake's redelivery. As many one-off wants are kept beside them, for what
+/// of each was handed on, and never in their place.
 const WANTS_KEPT: usize = 4_096;
 
 /// One shard's view of its instance's shards.
@@ -40,13 +42,20 @@ pub struct Shards {
     live: RwLock<BTreeSet<u32>>,
     changed: watch::Sender<u64>,
     wants: Mutex<Wants>,
+    /// Called once a want's part is worked out and before it is kept.
+    #[cfg(test)]
+    between: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 #[derive(Default)]
 struct Wants {
     /// Each want heard, whole, and the subjects of it handed to the plugin.
     kept: HashMap<String, (ObservationsWantedEvent, BTreeSet<String>)>,
-    order: VecDeque<String>,
+    /// The standing wants in the order heard, and the one-off wants: each
+    /// forgets its own oldest, so a burst of one-off reads pushes no
+    /// standing want out.
+    standing: VecDeque<String>,
+    once: VecDeque<String>,
 }
 
 /// What a shard's plugin is handed of a want heard.
@@ -97,6 +106,8 @@ impl Shards {
             live: RwLock::new(BTreeSet::from([mine])),
             changed: watch::channel(0).0,
             wants: Mutex::default(),
+            #[cfg(test)]
+            between: Mutex::default(),
         }
     }
 
@@ -152,17 +163,34 @@ impl Shards {
     }
 
     /// A want heard: kept whole, and its part here to hand on.
+    ///
+    /// Its part is worked out and kept under the one lock a reshare takes
+    /// ([`Shards::shared_again`]): a change of the live shards between the
+    /// two would else be shared over every want but this one, kept after
+    /// with its part as the shards were.
     pub fn heard(&self, want: ObservationsWantedEvent) -> Handed {
-        let (part, subjects) = self.part(&want);
         let mut wants = self.wants.lock().expect("wants poisoned");
+        let (part, subjects) = self.part(&want);
+        #[cfg(test)]
+        if let Some(between) = self.between.lock().unwrap().as_ref() {
+            between();
+        }
         let before = wants
             .kept
             .get(&want.want_id)
-            .map(|(_, handed)| !handed.is_empty());
-        if before.is_none() {
-            wants.order.push_back(want.want_id.clone());
-            while wants.order.len() > WANTS_KEPT {
-                if let Some(oldest) = wants.order.pop_front() {
+            .map(|(was, handed)| (was.standing, !handed.is_empty()));
+        let wants = &mut *wants;
+        if before.map(|(standing, _)| standing) != Some(want.standing) {
+            wants.standing.retain(|held| held != &want.want_id);
+            wants.once.retain(|held| held != &want.want_id);
+            let order = if want.standing {
+                &mut wants.standing
+            } else {
+                &mut wants.once
+            };
+            order.push_back(want.want_id.clone());
+            while order.len() > WANTS_KEPT {
+                if let Some(oldest) = order.pop_front() {
                     wants.kept.remove(&oldest);
                 }
             }
@@ -171,7 +199,7 @@ impl Shards {
         wants.kept.insert(want_id.clone(), (want, subjects.clone()));
         if !subjects.is_empty() {
             Handed::Part(Box::new(part))
-        } else if before == Some(true) {
+        } else if before.is_some_and(|(_, handed)| handed) {
             Handed::Withdrawn(WantWithdrawnEvent { want_id, dataset })
         } else {
             Handed::Nothing
@@ -182,7 +210,8 @@ impl Shards {
     /// of it was this shard's.
     pub fn withdrawn(&self, want_id: &str) -> bool {
         let mut wants = self.wants.lock().expect("wants poisoned");
-        wants.order.retain(|held| held != want_id);
+        wants.standing.retain(|held| held != want_id);
+        wants.once.retain(|held| held != want_id);
         wants
             .kept
             .remove(want_id)
@@ -194,7 +223,7 @@ impl Shards {
     pub fn shared_again(&self) -> Vec<Handed> {
         let mut again = Vec::new();
         let mut wants = self.wants.lock().expect("wants poisoned");
-        let ids: Vec<String> = wants.order.iter().cloned().collect();
+        let ids: Vec<String> = wants.standing.iter().cloned().collect();
         for id in ids {
             let Some((want, handed)) = wants.kept.get(&id) else {
                 continue;
@@ -405,5 +434,64 @@ mod tests {
         }
         assert!(!a.withdrawn("w0"), "the oldest was forgotten");
         assert!(a.withdrawn("w1"));
+    }
+
+    /// Review finding 8: the live shards change, and every want kept is
+    /// shared again, between a want's part being worked out and its being
+    /// kept. Whatever the order, the want ends whole: what the lost shard
+    /// kept of it is handed on here.
+    #[test]
+    fn a_want_heard_while_the_live_shards_change_is_still_shared_whole() {
+        let all = subjects(64);
+        let names: Vec<&str> = all.iter().map(String::as_str).collect();
+        let shards = std::sync::Arc::new(Shards::new(0));
+        shards.set_live([1]);
+        let (told, again) = std::sync::mpsc::channel();
+        let racing = std::sync::Arc::clone(&shards);
+        *shards.between.lock().unwrap() = Some(Box::new(move || {
+            let (racing, told) = (std::sync::Arc::clone(&racing), told.clone());
+            let (done, ended) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // Shard 1 is gone, and the reshare runs.
+                racing.set_live([]);
+                let _ = told.send(racing.shared_again());
+                let _ = done.send(());
+            });
+            // Ended before the want is kept, where nothing holds it back.
+            let _ = ended.recv_timeout(std::time::Duration::from_millis(300));
+        }));
+        let first = shards.heard(want("w", &names, true));
+        *shards.between.lock().unwrap() = None;
+        let mut handed: BTreeSet<String> = named(&first).into_iter().collect();
+        for more in again
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reshare ended")
+        {
+            handed.extend(named(&more));
+        }
+        assert_eq!(
+            handed.len(),
+            all.len(),
+            "subjects of the want kept by no shard"
+        );
+    }
+
+    /// Review finding 9: one-off wants, however many, push no standing want
+    /// out of those kept to share again.
+    #[test]
+    fn a_burst_of_one_off_wants_forgets_no_standing_want() {
+        let all = subjects(64);
+        let names: Vec<&str> = all.iter().map(String::as_str).collect();
+        let shards = Shards::new(0);
+        shards.set_live([1]);
+        let first = named(&shards.heard(want("standing", &names, true)));
+        assert!(first.len() < all.len());
+        for n in 0..=WANTS_KEPT {
+            shards.heard(want(&format!("once-{n}"), &names[..2], false));
+        }
+        shards.set_live([]);
+        let again = shards.shared_again();
+        assert_eq!(again.len(), 1, "the standing want is shared again");
+        assert_eq!(named(&again[0]).len(), all.len());
     }
 }

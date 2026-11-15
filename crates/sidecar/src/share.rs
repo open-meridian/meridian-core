@@ -181,12 +181,15 @@ impl Limits {
 
 /// A data plugin's lake write share (step 3d; the resilience spec's section
 /// 6.9): `sidecar.limits.writeMiBPerSecond`, in bytes a second with a burst
-/// of a second's worth. Past it the sidecar holds the write's
-/// acknowledgement -- the write itself is sent, in its order -- for as long
-/// as the share takes to cover it, as Kafka's quotas delay a response; a
-/// write whose hold would outlast its caller's deadline is not sent, and is
-/// refused `RATE_LIMITED` with a retry-after. Other plugins' writes are
-/// other sidecars', and untouched.
+/// of a second's worth. Past it the sidecar holds the write, and so its
+/// acknowledgement, for as long as the share takes to cover it, as Kafka's
+/// quotas delay a response: then it is sent, in its order. A write whose
+/// hold would outlast its caller's deadline is not sent, and is refused
+/// `RATE_LIMITED` with a retry-after. A write's bytes are taken when it is
+/// asked and never given back, so one whose caller stopped waiting while it
+/// was held was not sent and still counts: what reaches the lake's stream
+/// stays within the share whatever deadline a caller names or abandons.
+/// Other plugins' writes are other sidecars', and untouched.
 pub struct WriteShare {
     bytes_per_second: f64,
     /// What is left of the share, below 0 while writes sent are still being
@@ -239,8 +242,8 @@ impl WriteShare {
         self.refused.load(Ordering::Relaxed)
     }
 
-    /// A write of `bytes` taken from the share at `now`: how long its
-    /// acknowledgement is held, nothing within the share; or, where that
+    /// A write of `bytes` taken from the share at `now`: how long it is
+    /// held before it is sent, nothing within the share; or, where that
     /// is longer than `within`, the write refused and nothing taken.
     pub fn take(&self, bytes: usize, now: Instant, within: Duration) -> Result<Duration, Refused> {
         let rate = self.bytes_per_second;
@@ -658,13 +661,13 @@ mod tests {
         let within = Duration::from_secs(5);
         // A second's worth at once: its burst.
         assert_eq!(share.take(mib, start, within), Ok(Duration::ZERO));
-        // Half a second's worth more is held half a second, and sent.
+        // Half a second's worth more is held half a second, then sent.
         let held = share.take(mib / 2, start, within).unwrap();
         assert!(
             (held.as_secs_f64() - 0.5).abs() < 0.01,
             "held {held:?} for half a second's bytes"
         );
-        // What was sent is still being covered: the next waits behind it.
+        // What was taken is still being covered: the next waits behind it.
         let next = share.take(mib / 2, start, within).unwrap();
         assert!((next.as_secs_f64() - 1.0).abs() < 0.01, "{next:?}");
         // Time covers it: two seconds on, the share is whole again.
@@ -696,6 +699,28 @@ mod tests {
         // for itself.
         let held = share.take(mib / 4, start, Duration::from_secs(1)).unwrap();
         assert!((held.as_secs_f64() - 0.25).abs() < 0.01, "{held:?}");
+    }
+
+    #[test]
+    /// Review finding 5: a caller naming an hour's deadline is refused
+    /// nothing, and sends no faster for it: each write is sent when the
+    /// share has covered it, so by any moment no more than the share's
+    /// bytes for the time gone, and its burst, have been.
+    #[test]
+    fn writes_with_a_long_deadline_are_each_sent_only_when_the_share_has_covered_them() {
+        let share = WriteShare::new(1, 1);
+        let mib = 1024 * 1024;
+        let start = Instant::now();
+        let hour = Duration::from_secs(3600);
+        for sent in 1..=10u32 {
+            let held = share.take(mib, start, hour).unwrap();
+            // The burst and a MiB a second: the n-th MiB at n - 1 seconds.
+            assert!(
+                (held.as_secs_f64() - f64::from(sent - 1)).abs() < 0.01,
+                "write {sent} held {held:?}"
+            );
+        }
+        assert_eq!(share.refused(), 0);
     }
 
     #[test]

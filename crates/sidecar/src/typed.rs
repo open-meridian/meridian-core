@@ -804,10 +804,13 @@ impl Sidecar {
         };
         let unmapped = account.is_none();
         // A data plugin's lake write share (step 3d; the resilience spec's
-        // section 6.9): a write past it is sent, in its order, and its
-        // acknowledgement held until the share covers it; one whose hold
-        // would outlast its caller's deadline is refused RATE_LIMITED with
-        // a retry-after, and never sent.
+        // section 6.9): a write past it is acknowledged late, once the
+        // share covers it; one whose hold would outlast its caller's
+        // deadline is refused RATE_LIMITED with a retry-after, and never
+        // sent. It is held before it is sent, in its order: a caller that
+        // stops waiting mid-hold has then sent nothing past the share,
+        // whatever deadline it named (review finding 5). Its bytes are
+        // taken when it is asked, so the next waits behind it either way.
         let held = match &self.write_share {
             Some(share) if meridian_bus::write_ahead::TOPICS.contains(&&*topic) => {
                 let now = std::time::Instant::now();
@@ -833,12 +836,12 @@ impl Sidecar {
             }
             _ => std::time::Duration::ZERO,
         };
-        let reply: Response<R> = self
-            .ask_routed_demo(&topic, payload_type, message, &claims, scope, routed, demo)
-            .await?;
         if !held.is_zero() {
             tokio::time::sleep(held).await;
         }
+        let reply: Response<R> = self
+            .ask_routed_demo(&topic, payload_type, message, &claims, scope, routed, demo)
+            .await?;
         self.count_unplaced(payload_type, unmapped, &reply.get_ref().encode_to_vec());
         Ok(reply)
     }

@@ -2918,4 +2918,26 @@ async fn a_write_past_the_plugin_s_share_is_held_and_one_past_its_deadline_is_re
         .await
         .unwrap();
     assert!(began.elapsed() < std::time::Duration::from_millis(50));
+
+    // Review finding 5: a write past the share is held before it is sent,
+    // so a caller that stops waiting mid-hold -- an RPC reset -- has sent
+    // nothing past the share; and what it asked still counts, so the write
+    // after it waits behind it.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let before = sent();
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), record(1_500)).await;
+    assert!(
+        dropped.is_err(),
+        "the write was held past the caller's stop"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(sent(), before, "a write dropped while held was never sent");
+    let began = tokio::time::Instant::now();
+    record(100).await.unwrap();
+    assert!(
+        began.elapsed() >= std::time::Duration::from_millis(300),
+        "the next write waited {:?} behind the dropped one",
+        began.elapsed()
+    );
+    assert_eq!(sent(), before + 1);
 }
