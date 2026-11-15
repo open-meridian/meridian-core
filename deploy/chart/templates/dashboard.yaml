@@ -86,12 +86,6 @@ spec:
               value: {{ .Values.dashboard.instanceId | quote }}
             - name: MERIDIAN_DASHBOARD_LISTEN
               value: "0.0.0.0:8080"
-            # The chart's values as the release states them, as the
-            # conductor is handed them (no secret, no address): whether a
-            # store runs a standby, and so whether the Launch sheet offers
-            # shards and a standby pod (step 3d).
-            - name: MERIDIAN_RESILIENCE_VALUES
-              value: {{ include "meridian-runtime.resilienceValues" . | quote }}
             {{- $addresses := .Values.firstRun.addressesSecretName }}
             {{- if .Values.development }}
             - name: MERIDIAN_DEVELOPMENT
