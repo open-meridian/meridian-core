@@ -5037,6 +5037,7 @@ fn a_gap_found_by_a_batch_commits_with_it_and_each_state_is_its_own_record() {
                 dropped: vec![dropped.clone()],
                 valid: vec![(dataset.clone(), 100)],
                 gaps: vec![gap.clone()],
+                ..Default::default()
             },
             5_000,
         )
@@ -6995,6 +6996,113 @@ fn a_group_leading_its_own_database_follows_its_timeline_under_its_own_epoch() {
     }
 }
 
+/// A lake of `store`'s writer group as it runs in ha, `dataset` kept and
+/// its trades' instruments and currency resolved.
+fn ha_lake(
+    store: &Arc<PostgresStore>,
+    instance: &str,
+    dataset: &str,
+) -> Arc<meridian_lake::service::Lake> {
+    ha_lake_over(
+        store.clone() as Arc<dyn Store>,
+        store.groups(),
+        instance,
+        dataset,
+    )
+}
+
+/// [`ha_lake`], over any store of writer group `groups`.
+fn ha_lake_over(
+    store: Arc<dyn Store>,
+    groups: meridian_changes::groups::Groups,
+    instance: &str,
+    dataset: &str,
+) -> Arc<meridian_lake::service::Lake> {
+    use meridian_domain::v1::{
+        DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, InstrumentRecord,
+        ResolveIdentifierReply, ResolveInstrumentReply,
+    };
+    use meridian_lake::service;
+    use meridian_pb::v1::{DatasetDeclaration, ObservationMode};
+    use prost::Message;
+    let dataset = dataset.to_string();
+    let bus = Arc::new(meridian_bus::Bus::single(
+        instance,
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(SystemClock),
+    ));
+    bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
+        let asked =
+            meridian_domain::v1::ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.ResolveInstrumentReply".into(),
+            ResolveInstrumentReply {
+                found: true,
+                instrument: Some(InstrumentRecord {
+                    instrument_id: asked.instrument_id,
+                    ..Default::default()
+                }),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // USD, the trades' currency, by its code.
+    bus.serve(service::RESOLVE_IDENTIFIER, |_| {
+        Ok((
+            "meridian.v1.ResolveIdentifierReply".into(),
+            ResolveIdentifierReply {
+                found: true,
+                instrument_id: "LCL-USD".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(service::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                launches: vec![meridian_domain::v1::PluginLaunch {
+                    instance_id: "coinbase-1".into(),
+                    version: "0.3.1".into(),
+                    state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let lake = meridian_lake::service::serve_grouped(bus, store, Arc::new(SystemClock), groups);
+    let (instance, key) = dataset.split_once(':').unwrap();
+    lake.configured(&EntitlementsChangedEvent {
+        datasets: vec![DatasetRef {
+            dataset: dataset.clone(),
+            instance: instance.into(),
+            vendor: "Coinbase".into(),
+            declaration: Some(DatasetDeclaration {
+                key: key.into(),
+                vendor: "Coinbase".into(),
+                data_types: vec!["meridian.v1.Trade".into()],
+                modes: vec![ObservationMode::Pull as i32],
+                history: 3650,
+                day_time_zone: "Etc/UTC".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        licences: vec![],
+        entitlements: vec![DatasetEntitlement {
+            dataset: dataset.clone(),
+            instance: "reporting-1".into(),
+            allowed: true,
+            ..Default::default()
+        }],
+        changed_at_ns: SystemClock.now_ns(),
+    });
+    lake
+}
+
 /// A lake range moved between writer groups in ha, under load (step 3d;
 /// spec 6.1 and 6.8; ruled 2026-11-14 after CI 43621875619): two groups'
 /// writers take one stream at their own paces, the target ahead of the
@@ -7006,14 +7114,10 @@ fn a_group_leading_its_own_database_follows_its_timeline_under_its_own_epoch() {
 /// siblings' longest pause while the switch held a batch is said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and_refuses_none() {
-    use meridian_domain::v1::{
-        DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, InstrumentRecord,
-        RecordTradesRequest, ResolveIdentifierReply, ResolveInstrumentReply,
-    };
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
     use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
     use meridian_lake::service;
     use meridian_lake::write_ahead::{settled, taken_past_a_switch, Taken, Writer};
-    use meridian_pb::v1::{DatasetDeclaration, ObservationMode};
     use prost::Message;
     const STREAM: &str = "LAKE_WRITE_AHEAD";
     const WRITES: u64 = 240;
@@ -7021,89 +7125,7 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
     // as the driver's dataset in CI 43621875619.
     let (url, zero, one, dataset, _lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-ham", 1));
-    let lake_of = |store: &Arc<PostgresStore>, instance: &str| {
-        let bus = Arc::new(meridian_bus::Bus::single(
-            instance,
-            Arc::new(meridian_bus::MemoryBackend::new()),
-            Arc::new(SystemClock),
-        ));
-        bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
-            let asked =
-                meridian_domain::v1::ResolveInstrumentRequest::decode(&envelope.payload[..])
-                    .unwrap();
-            Ok((
-                "meridian.v1.ResolveInstrumentReply".into(),
-                ResolveInstrumentReply {
-                    found: true,
-                    instrument: Some(InstrumentRecord {
-                        instrument_id: asked.instrument_id,
-                        ..Default::default()
-                    }),
-                }
-                .encode_to_vec(),
-            ))
-        });
-        // USD, the trades' currency, by its code.
-        bus.serve(service::RESOLVE_IDENTIFIER, |_| {
-            Ok((
-                "meridian.v1.ResolveIdentifierReply".into(),
-                ResolveIdentifierReply {
-                    found: true,
-                    instrument_id: "LCL-USD".into(),
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            ))
-        });
-        bus.serve(service::PLUGIN_CATALOGUE, |_| {
-            Ok((
-                "meridian.v1.PluginCatalogue".into(),
-                meridian_domain::v1::PluginCatalogue {
-                    launches: vec![meridian_domain::v1::PluginLaunch {
-                        instance_id: "coinbase-1".into(),
-                        version: "0.3.1".into(),
-                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-            ))
-        });
-        let lake = meridian_lake::service::serve_grouped(
-            bus,
-            store.clone() as Arc<dyn Store>,
-            Arc::new(SystemClock),
-            store.groups(),
-        );
-        let (instance, key) = dataset.split_once(':').unwrap();
-        lake.configured(&EntitlementsChangedEvent {
-            datasets: vec![DatasetRef {
-                dataset: dataset.clone(),
-                instance: instance.into(),
-                vendor: "Coinbase".into(),
-                declaration: Some(DatasetDeclaration {
-                    key: key.into(),
-                    vendor: "Coinbase".into(),
-                    data_types: vec!["meridian.v1.Trade".into()],
-                    modes: vec![ObservationMode::Pull as i32],
-                    history: 3650,
-                    day_time_zone: "Etc/UTC".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            licences: vec![],
-            entitlements: vec![DatasetEntitlement {
-                dataset: dataset.clone(),
-                instance: "reporting-1".into(),
-                allowed: true,
-                ..Default::default()
-            }],
-            changed_at_ns: SystemClock.now_ns(),
-        });
-        lake
-    };
+    let lake_of = |store: &Arc<PostgresStore>, instance: &str| ha_lake(store, instance, &dataset);
     let (lake0, lake1) =
         tokio::task::block_in_place(|| (lake_of(&zero, "lake-0"), lake_of(&one, "lake-1")));
     // The stream: each write a row in each half, each row its own key.
@@ -7243,14 +7265,38 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
         longest[0],
         longest[1]
     );
+    // Each answer counts both its write's rows, whichever group committed
+    // each and whichever take (spec 6.7; CI 43662032539: an answer counted
+    // only its own group's).
+    let mut miscounted: Vec<String> = Vec::new();
+    let mut answers = 0;
     for answered in settling {
         for (to, answer) in answered.await.unwrap() {
-            if let (Some(to), Err(words)) = (to, answer) {
-                refused.push(format!("{to}: {words}"));
+            match (to, answer) {
+                (Some(to), Err(words)) => refused.push(format!("{to}: {words}")),
+                (Some(to), Ok((_, payload))) => {
+                    answers += 1;
+                    let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+                    let counted = reply.recorded + reply.restated + reply.unchanged;
+                    if counted != 2 {
+                        miscounted.push(format!(
+                            "{to}: recorded {} restated {} unchanged {}",
+                            reply.recorded, reply.restated, reply.unchanged
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
     }
     assert!(refused.is_empty(), "nothing refused: {refused:?}");
+    assert!(answers as u64 >= WRITES, "every write answered: {answers}");
+    assert!(
+        miscounted.is_empty(),
+        "each answer counts both its rows: {} of {answers} did not: {:?}",
+        miscounted.len(),
+        &miscounted[..miscounted.len().min(12)]
+    );
     assert!(taken_back >= 1, "the target's position was taken back");
     assert!(
         owed >= 1,
@@ -7280,6 +7326,356 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
         assert!(missed.is_empty(), "missed: {missed:?}");
     });
     tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, zero, one)));
+}
+
+/// A lake range moved between writer groups across databases in ha, under
+/// load, there and back (step 3d; spec 6.4, 6.7 and 6.8; CI 43662032539's
+/// ha rebalance): two groups' writers, each over both databases, take one
+/// stream while the lower half moves from group 0, which answers, in
+/// database 0 to group 1 in database 1, and later home again. Every write
+/// is answered, none refused, and every answer counts both its rows --
+/// the part each group committed, whichever take committed it -- so none
+/// is acknowledged with a row of it uncounted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_every_part() {
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
+    use meridian_lake::partition_moves::{Asked, Ended};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{settled, taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    const WRITES: u64 = 360;
+    let a = tokio::task::block_in_place(|| across("ham2", true));
+    let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
+    let (_, high) = halves_of("ham2");
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake_over(
+                a.zero.clone() as Arc<dyn Store>,
+                a.zeros[0].groups(),
+                "lake-0",
+                &dataset,
+            ),
+            ha_lake_over(
+                a.one.clone() as Arc<dyn Store>,
+                a.ones[0].groups(),
+                "lake-1",
+                &dataset,
+            ),
+        )
+    });
+    let stream: Vec<Taken> = (1..=WRITES)
+        .map(|n| {
+            let row = |half: &str, subject: &str| match trade(
+                &dataset,
+                &format!("x{n}-{half}"),
+                subject,
+                1_000 + n as i64,
+            ) {
+                Observation::Trade(trade) => *trade,
+                _ => unreachable!(),
+            };
+            Taken {
+                sequence: n,
+                at_ns: 1_000 + n as i64,
+                topic: service::RECORD_TRADES.into(),
+                reply_to: Some(format!("_INBOX.ham2.{n}")),
+                after: None,
+                envelope: meridian_bus::Envelope {
+                    meta: Some(meridian_bus::MessageMeta {
+                        publisher_instance_id: "coinbase-1".into(),
+                        account_scope_applies: true,
+                        published_at_ns: SystemClock.now_ns(),
+                        message_id: format!("ham2-{n}"),
+                        ..Default::default()
+                    }),
+                    payload_type: "meridian.v1.RecordTradesRequest".into(),
+                    payload: RecordTradesRequest {
+                        trades: vec![row("l", &low), row("h", &high)],
+                        want_id: String::new(),
+                    }
+                    .encode_to_vec(),
+                },
+                dataset: dataset.clone(),
+            }
+        })
+        .collect();
+    let mut writers = [
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM)).unwrap(),
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap(),
+    ];
+    let lakes = [lake0.clone(), lake1.clone()];
+    let mover = Arc::new(a.mover());
+    let mut settling = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    let mut taken_back = 0;
+    let mut moves: Vec<tokio::task::JoinHandle<Ended>> = Vec::new();
+    let mut step = 0;
+    while writers.iter().any(|writer| writer.next() <= WRITES) {
+        step += 1;
+        // Out at step 20, its target ahead of its source; home at step 60,
+        // once the first has ended, its target ahead again.
+        let target = match step {
+            20 => Some(1),
+            60 => Some(0),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if let Some(first) = moves.pop() {
+                let ended = first.await.unwrap();
+                assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+            }
+            let (mover, moved) = (mover.clone(), lower.clone());
+            moves.push(tokio::task::spawn_blocking(move || {
+                assert!(mover.begin(&moved));
+                mover
+                    .run(
+                        &moved,
+                        target,
+                        &Asked {
+                            by_hand: true,
+                            moved_by: "admin-1".into(),
+                            reason: "moved across databases under load in ha".into(),
+                        },
+                    )
+                    .unwrap()
+            }));
+        }
+        let paces = if step < 60 { [1usize, 4] } else { [4, 1] };
+        for (g, writer) in writers.iter_mut().enumerate() {
+            let from = writer.next();
+            if from > WRITES {
+                continue;
+            }
+            let batch: Vec<Taken> = stream
+                .iter()
+                .filter(|write| write.sequence >= from)
+                .take(paces[g])
+                .cloned()
+                .collect();
+            match taken_past_a_switch(writer, batch).await {
+                Ok(answers) => {
+                    let waits = writer.take_waits();
+                    let lake = lakes[g].clone();
+                    settling.push(tokio::spawn(async move {
+                        settled(&lake, STREAM, answers, waits).await
+                    }));
+                }
+                Err(meridian_lake::store::StoreError::PositionMoved(_)) => {
+                    taken_back += 1;
+                    tokio::task::block_in_place(|| writer.reread()).unwrap();
+                }
+                Err(failed) => panic!("group {g}'s batch from {from}: {failed}"),
+            }
+        }
+    }
+    for ended in moves {
+        let ended = ended.await.unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    }
+    let mut miscounted: Vec<String> = Vec::new();
+    let mut answers = 0;
+    for answered in settling {
+        for (to, answer) in answered.await.unwrap() {
+            match (to, answer) {
+                (Some(to), Err(words)) => refused.push(format!("{to}: {words}")),
+                (Some(to), Ok((_, payload))) => {
+                    answers += 1;
+                    let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+                    if reply.recorded + reply.restated + reply.unchanged != 2 {
+                        miscounted.push(format!(
+                            "{to}: recorded {} restated {} unchanged {}",
+                            reply.recorded, reply.restated, reply.unchanged
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    eprintln!("ham2: positions taken back {taken_back}; answers {answers}");
+    // What each group kept of a miscounted write, said with the failure.
+    let kept: Vec<String> = tokio::task::block_in_place(|| {
+        let mut kept = Vec::new();
+        for (d, url) in a.urls.iter().enumerate() {
+            let mut client = postgres::Client::connect(url, postgres::NoTls).unwrap();
+            for said in &miscounted {
+                let sequence: i64 = said
+                    .split([':', '.'])
+                    .nth(2)
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                for row in client
+                    .query(
+                        "SELECT stream, recorded, restated, unchanged FROM lake_write_ahead_part
+                          WHERE sequence = $1",
+                        &[&sequence],
+                    )
+                    .unwrap()
+                {
+                    kept.push(format!(
+                        "db{d} {} {sequence}: {} {} {}",
+                        row.get::<_, String>(0),
+                        row.get::<_, i32>(1),
+                        row.get::<_, i32>(2),
+                        row.get::<_, i32>(3)
+                    ));
+                }
+            }
+        }
+        kept
+    });
+    assert!(refused.is_empty(), "nothing refused: {refused:?}");
+    assert!(taken_back >= 2, "each move took its target's position back");
+    assert!(answers as u64 >= WRITES, "every write answered: {answers}");
+    assert!(
+        miscounted.is_empty(),
+        "each answer counts both its rows: {} of {answers} did not: {:?}; kept {kept:?}",
+        miscounted.len(),
+        &miscounted[..miscounted.len().min(12)]
+    );
+    // None missed: each key held in one database or the other.
+    tokio::task::block_in_place(|| {
+        let mut held = std::collections::BTreeSet::new();
+        for url in a.urls.iter() {
+            let mut client = postgres::Client::connect(url, postgres::NoTls).unwrap();
+            for row in client
+                .query(
+                    "SELECT DISTINCT row_key FROM lake_row WHERE dataset = $1",
+                    &[&dataset],
+                )
+                .unwrap()
+            {
+                held.insert(row.get::<_, String>(0));
+            }
+        }
+        let missed: Vec<String> = (1..=WRITES)
+            .flat_map(|n| [format!("x{n}-l"), format!("x{n}-h")])
+            .filter(|key| !held.contains(key))
+            .collect();
+        assert!(missed.is_empty(), "missed: {missed:?}");
+    });
+    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, mover, a)));
+}
+
+/// A write split across two writer groups, in ha, is answered counting
+/// every group's part (step 3d; spec 6.7; `lake_write_ahead_part`, ruled
+/// 2026-11-15 after CI 43656183991 and 43662032539): the group answering
+/// adds what the other group's rows did, as that group kept it with its
+/// rows and its position. A write none of whose rows are the answering
+/// group's -- the failover driver's price, once its range had moved -- is
+/// answered with its row counted and its range named in the watermark,
+/// never OK with nothing counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
+    use meridian_lake::partition_moves::{Asked, Mover, Settings};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{settled, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // The dataset group 1's, which answers its writes; its upper half moved
+    // to group 0.
+    let (_url, zero, one, dataset, _lower, upper, low, high) =
+        tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-parts", 1));
+    tokio::task::block_in_place(|| {
+        let mover = Mover::new(
+            vec![one.clone()],
+            one.groups(),
+            Settings::default(),
+            Arc::new(SystemClock),
+        );
+        assert!(mover.begin(&upper));
+        mover.run(&upper, 0, &Asked::default()).unwrap();
+        zero.read_owners().unwrap();
+        one.read_owners().unwrap();
+    });
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake(&zero, "lake-0", &dataset),
+            ha_lake(&one, "lake-1", &dataset),
+        )
+    });
+    let write = |n: u64, rows: Vec<(&str, &String)>| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.parts.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("parts-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: rows
+                    .into_iter()
+                    .map(|(key, subject)| {
+                        match trade(&dataset, &format!("p{n}-{key}"), subject, 2_000 + n as i64) {
+                            Observation::Trade(trade) => *trade,
+                            _ => unreachable!(),
+                        }
+                    })
+                    .collect(),
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+    };
+    // A row in each half; then one in the upper half alone, group 0's.
+    let stream = vec![
+        write(1, vec![("l", &low), ("h", &high)]),
+        write(2, vec![("h", &high)]),
+    ];
+    let mut writer0 = tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM)).unwrap();
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    // Group 1, answering, takes both first; group 0 commits its parts after.
+    let answers = tokio::task::block_in_place(|| writer1.take(stream.clone())).unwrap();
+    let waits = writer1.take_waits();
+    assert_eq!(waits.len(), 2, "both answers wait for group 0's part");
+    let theirs = tokio::task::block_in_place(|| writer0.take(stream.clone())).unwrap();
+    assert!(
+        theirs.iter().all(|(to, _)| to.is_none()),
+        "group 0 answers neither"
+    );
+    let answered = settled(&lake1, STREAM, answers, waits).await;
+    let reply = |at: usize| {
+        let (_, payload) = answered[at].1.clone().expect("answered");
+        RecordObservationsReply::decode(payload.as_slice()).unwrap()
+    };
+    let (both, theirs_alone) = (reply(0), reply(1));
+    assert_eq!(
+        (both.recorded, both.restated, both.unchanged),
+        (2, 0, 0),
+        "a row in each group's half: both counted"
+    );
+    assert_eq!(
+        (
+            theirs_alone.recorded,
+            theirs_alone.restated,
+            theirs_alone.unchanged
+        ),
+        (1, 0, 0),
+        "a row in group 0's half alone: counted by group 1's answer"
+    );
+    let named: Vec<String> = theirs_alone
+        .watermark
+        .unwrap_or_default()
+        .partitions
+        .into_iter()
+        .filter(|at| at.sequence > 0)
+        .map(|at| at.partition)
+        .collect();
+    assert!(
+        named.contains(&upper),
+        "its range named at its head: {named:?}"
+    );
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, zero, one)));
 }
 
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the

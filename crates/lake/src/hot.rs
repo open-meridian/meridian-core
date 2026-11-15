@@ -808,6 +808,15 @@ impl Store for HotStore {
         self.inner.group_position(key, group)
     }
 
+    fn write_ahead_part(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<crate::store::Counts>> {
+        self.inner.write_ahead_part(key, group, sequence)
+    }
+
     fn record_write_ahead(
         &self,
         batch: crate::store::WriteAheadBatch,

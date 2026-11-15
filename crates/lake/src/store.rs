@@ -157,7 +157,63 @@ pub struct WriteAheadBatch {
     /// Each gap the batch found, as first recorded (W10.14): its own record,
     /// in the same transaction, so no gap found is lost with its batch.
     pub gaps: Vec<meridian_domain::v1::DatasetGap>,
+    /// Each write of a dataset whose ranges span writer groups (step 3d;
+    /// spec 6.7, ruled 2026-11-15): what this group's rows of it did, kept
+    /// under the batch's stream and the write's sequence in the same
+    /// transaction as the rows and the position, for the group answering
+    /// the write to add.
+    pub counted: Vec<Counted>,
 }
+
+/// One write's parts in a [`WriteAheadBatch`] whose counts are kept.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Counted {
+    /// The write's sequence in the stream.
+    pub sequence: u64,
+    /// Its parts' places in the batch's `parts`.
+    pub parts: Vec<usize>,
+    /// What its parts committed in another database, before this batch,
+    /// did.
+    pub already: Counts,
+    /// Taken again after the group's position was taken back: its rows
+    /// found unchanged were counted when they were first committed, by this
+    /// group or by the group a range of it moved from, and are not counted
+    /// again.
+    pub again: bool,
+}
+
+/// What a group's rows of one write did (`lake_write_ahead_part`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub recorded: u32,
+    pub restated: u32,
+    pub unchanged: u32,
+}
+
+impl Counts {
+    pub fn of(done: &Recorded) -> Counts {
+        Counts {
+            recorded: done.recorded,
+            restated: done.restated,
+            unchanged: done.unchanged,
+        }
+    }
+
+    pub fn add(&mut self, more: Counts) {
+        self.recorded += more.recorded;
+        self.restated += more.restated;
+        self.unchanged += more.unchanged;
+    }
+
+    pub fn none(&self) -> bool {
+        self.recorded + self.restated + self.unchanged == 0
+    }
+}
+
+/// How long a group's part of a write is kept (`lake_write_ahead_part`):
+/// the stream's own default bound on a write's age. The group answering
+/// reads it within the hold; none waits for an answer this long.
+pub const PART_KEPT_NS: i64 = 10 * 60 * 1_000_000_000;
 
 /// A run of the write-ahead stream's sequences it dropped at its bound
 /// before the lake took them (W10.14): the first and last, the stream's
@@ -866,6 +922,14 @@ pub trait Store: Send + Sync {
     fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
         let _ = group;
         self.write_ahead_position(key)
+    }
+
+    /// What writer group `group`'s rows of the stream's write `sequence`
+    /// did, as it kept them under `key` with its position (step 3d; spec
+    /// 6.7): none where it committed no row of the write.
+    fn write_ahead_part(&self, key: &str, group: u32, sequence: u64) -> Result<Option<Counts>> {
+        let _ = (key, group, sequence);
+        Ok(None)
     }
 
     /// The data configuration as last heard.

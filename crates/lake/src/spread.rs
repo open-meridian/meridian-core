@@ -611,10 +611,34 @@ impl Store for Spread {
         Ok(())
     }
 
-    fn group_position(&self, key: &str, _group: u32) -> Result<Option<WriteAheadPosition>> {
-        // Wherever the group keeps it: home, or where it was before the
-        // count was raised (step 3d).
+    fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
+        // Where the group keeps it: at its home, else where it was before
+        // the count was raised (step 3d). Its home's first, never the
+        // furthest: a range's switch between databases keeps, beside the
+        // source's pointer, the place its target takes the range's rows
+        // from under the target's own key, which is the source's place and
+        // not one the target has committed to.
+        let home = meridian_changes::databases::of_group(group, self.count());
+        if let Some(at) = self.database(home).write_ahead_position(key)? {
+            return Ok(Some(at));
+        }
         self.furthest_position(key)
+    }
+
+    fn write_ahead_part(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<crate::store::Counts>> {
+        // Kept with the group's position, wherever that was at each take.
+        let mut all: Option<crate::store::Counts> = None;
+        for store in &self.stores {
+            if let Some(part) = store.write_ahead_part(key, group, sequence)? {
+                all.get_or_insert_with(Default::default).add(part);
+            }
+        }
+        Ok(all)
     }
 
     fn record_write_ahead(
@@ -654,6 +678,22 @@ impl Store for Spread {
             self.groups.mine(),
         ) {
             return Err(refused);
+        }
+        // Each counted write's parts by their places here; what its parts
+        // committed elsewhere did, counted with them (spec 6.7).
+        for counted in &mut batch.counted {
+            let mut kept = Vec::new();
+            for place in std::mem::take(&mut counted.parts) {
+                match places.iter().position(|at| *at == place) {
+                    Some(here) => kept.push(here),
+                    None => {
+                        if let Some(Some(Ok(done))) = answers.get(place) {
+                            counted.already.add(crate::store::Counts::of(done));
+                        }
+                    }
+                }
+            }
+            counted.parts = kept;
         }
         let again = here.clone();
         batch.parts = here;

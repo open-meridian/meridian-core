@@ -159,6 +159,10 @@ pub struct Written {
     pub topic: String,
     pub envelope: Envelope,
     pub after_gap: Option<Dropped>,
+    /// Its sequence in the stream, and whether it is taken again, where its
+    /// dataset's ranges span writer groups (step 3d; spec 6.7): what this
+    /// group's rows of it do is kept with them, for its answer.
+    pub counted: Option<(u64, bool)>,
 }
 
 /// What [`crate::service::Lake::record_written`] did, once committed: each
@@ -183,6 +187,18 @@ pub struct Writer {
     from: Option<u64>,
     dropped: Vec<Dropped>,
     valid: BTreeMap<String, i64>,
+    /// The sequence the writer had committed through when its position was
+    /// last taken back (a move's switch; spec 6.1): a write at or before it
+    /// is taken again.
+    again_through: u64,
+}
+
+/// Whether `dataset`'s ranges span writer groups as this member last read
+/// them, or may by its answer: another group owns one, or it is split.
+fn spans(groups: meridian_changes::groups::Groups, dataset: &str) -> bool {
+    !dataset.is_empty()
+        && (!other_groups(groups, dataset).is_empty()
+            || crate::range::leaves(&groups.ranges_of(dataset)).len() > 1)
 }
 
 impl Writer {
@@ -203,6 +219,7 @@ impl Writer {
             from: None,
             dropped,
             valid,
+            again_through: 0,
         })
     }
 
@@ -234,7 +251,29 @@ impl Writer {
         // position back so that it takes the range's rows as its own from
         // there (step 3d; spec 6.1).
         self.lake.read_owners_again()?;
+        let before = self.position.map_or(0, |at| at.sequence);
         self.position = self.lake.write_ahead_position(&self.stream)?;
+        // Taken back: what it committed past the new position is taken
+        // again, and counted as such (spec 6.7).
+        // Up to the furthest any group has committed: a range moved in
+        // brought its rows of the writes its source had passed, which this
+        // group finds unchanged and its source counted. (The source's place
+        // at the switch itself is not kept: a row sent again unchanged in a
+        // write between that and its place now is not counted either.)
+        if self.position.map_or(0, |at| at.sequence) < before {
+            let groups = self.lake.groups();
+            let furthest = (0..groups.count())
+                .filter_map(|group| {
+                    self.lake
+                        .group_position(&group_key(&self.base, group), group)
+                        .ok()
+                        .flatten()
+                })
+                .map(|at| at.sequence)
+                .max()
+                .unwrap_or(0);
+            self.again_through = self.again_through.max(before).max(furthest);
+        }
         let (dropped, valid) = self.lake.write_ahead_found(&self.stream)?;
         self.dropped = dropped;
         self.valid = valid;
@@ -325,24 +364,24 @@ impl Writer {
             // until each other group's part has committed (spec 6.7).
             // A split dataset's answer waits even where every range was this
             // group's at the take: one may move before the answer (C4).
-            if answering && write.reply_to.is_some() && !write.dataset.is_empty() {
-                let others = other_groups(groups, &write.dataset);
-                if !others.is_empty()
-                    || crate::range::leaves(&groups.ranges_of(&write.dataset)).len() > 1
-                {
-                    self.waits.push(Wait {
-                        at: sent_to.len(),
-                        sequence: write.sequence,
-                        groups: others,
-                        dataset: write.dataset.clone(),
-                    });
-                }
+            let spans = spans(groups, &write.dataset);
+            if answering && write.reply_to.is_some() && spans {
+                self.waits.push(Wait {
+                    at: sent_to.len(),
+                    sequence: write.sequence,
+                    groups: other_groups(groups, &write.dataset),
+                    dataset: write.dataset.clone(),
+                });
             }
             sent_to.push(write.reply_to.filter(|_| answering));
             writes.push(Written {
                 topic: write.topic,
                 envelope: write.envelope,
                 after_gap,
+                // Every group's part of such a write is kept, the answering
+                // group's too: an answer counts each part as committed,
+                // whichever take committed it (spec 6.7).
+                counted: spans.then_some((write.sequence, write.sequence <= self.again_through)),
             });
         }
         let batch = WriteAheadBatch {
@@ -428,11 +467,20 @@ impl Writer {
 }
 
 /// A batch's answers once each wait is over (step 3d; spec 6.7): an answer
-/// of a write split across groups given once every other group's position
-/// has reached the write -- its part committed -- its watermark read again
-/// so it names each part's partitions at their heads; past
+/// of a write split across groups given once every group's position has
+/// reached the write -- its part committed -- counting every group's part
+/// as each kept it with its rows (`lake_write_ahead_part`), its watermark
+/// read again so it names each part's partitions at their heads; past
 /// `moves.holdSeconds`, refused OVERLOADED with a retry-after, its rows
 /// committed all the same and kept by the stream.
+///
+/// This group's own position is waited on too, and every position is read
+/// twice: a move's switch takes its target's position back before its
+/// source passes a write whose rows it no longer commits, so a write every
+/// group has passed on two readings is one whose every row is committed --
+/// by the range's source before the switch, or by its target taking the
+/// write again -- never one its source skipped and its target has yet to
+/// take again.
 pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec<Wait>) -> Answers {
     let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
     for wait in waits {
@@ -443,6 +491,8 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
             continue;
         };
         let mut groups = wait.groups.clone();
+        let mine = lake.groups().mine();
+        groups.retain(|group| *group != mine);
         // The dataset's ranges' owners now: read at once, again now and then
         // while the answer waits, and once more after every group waited on
         // has passed the write. A range moved to another group since the
@@ -472,15 +522,17 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                 looked = tokio::time::Instant::now();
                 more(&mut groups);
             }
-            let all = tokio::task::block_in_place(|| {
-                groups.iter().all(|group| {
-                    lake.group_position(&group_key(stream, *group), *group)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|at| at.sequence >= wait.sequence)
+            let passed = |groups: &[u32]| {
+                tokio::task::block_in_place(|| {
+                    groups.iter().chain([&mine]).all(|group| {
+                        lake.group_position(&group_key(stream, *group), *group)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|at| at.sequence >= wait.sequence)
+                    })
                 })
-            });
-            if all && !more(&mut groups) {
+            };
+            if passed(&groups) && !more(&mut groups) && passed(&groups) {
                 break true;
             }
             if tokio::time::Instant::now() >= until {
@@ -489,8 +541,26 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         *answer = if reached {
-            tokio::task::block_in_place(|| lake.watermark_again(payload))
-                .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
+            tokio::task::block_in_place(|| {
+                // Each group's part as it kept it: this group's own in place
+                // of what this take alone did, where it kept one.
+                let part = |group: u32| {
+                    lake.write_ahead_part(&group_key(stream, group), group, wait.sequence)
+                        .map_err(|failed| failed.to_string())
+                };
+                let own = part(mine)?;
+                // Every other group's, not only those owning a range of it
+                // now: one that committed a part and has since moved its
+                // range away kept it all the same.
+                let mut others = crate::store::Counts::default();
+                for group in (0..lake.groups().count()).filter(|group| *group != mine) {
+                    if let Some(theirs) = part(group)? {
+                        others.add(theirs);
+                    }
+                }
+                lake.answer_again(payload, own, others, &wait.dataset)
+            })
+            .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
         } else {
             Err(meridian_bus::refusal_retrying(
                 meridian_pb::v1::RefusalReason::Overloaded as i32,

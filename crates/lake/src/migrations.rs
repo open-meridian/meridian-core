@@ -175,6 +175,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "writer_group",
         sql: include_str!("../migrations/0025_writer_group.sql"),
     },
+    // A group's part of a write split across groups (step 3d; spec 6.7,
+    // ruled 2026-11-15): what its rows did, for the answering group to add.
+    Migration {
+        version: 26,
+        name: "write_ahead_part",
+        sql: include_str!("../migrations/0026_write_ahead_part.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

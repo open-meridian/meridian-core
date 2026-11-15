@@ -2554,18 +2554,49 @@ impl Lake {
         self.store.group_position(key, group)
     }
 
-    /// An answer's watermark read again (step 3d; spec 6.7): once every
-    /// group's part of the write has committed, each partition of its
-    /// datasets at its head now, the other groups' among them.
-    pub fn watermark_again(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+    /// What writer group `group`'s rows of the stream's write `sequence`
+    /// did, as it kept them under `key` (step 3d; spec 6.7).
+    pub fn write_ahead_part(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<crate::store::Counts>, crate::store::StoreError> {
+        self.store.write_ahead_part(key, group, sequence)
+    }
+
+    /// An answer made again once every group's part of its write has
+    /// committed (step 3d; spec 6.7): counting each part -- this group's
+    /// `own` as it kept it, in place of what the take that made the answer
+    /// did alone, and the `others`' -- and its watermark read again, each
+    /// partition of its datasets at its head now, the other groups' among
+    /// them; `dataset` named where only another group committed rows of it.
+    pub fn answer_again(
+        &self,
+        payload: &[u8],
+        own: Option<crate::store::Counts>,
+        others: crate::store::Counts,
+        dataset: &str,
+    ) -> Result<Vec<u8>, String> {
         let mut reply = RecordObservationsReply::decode(payload)
             .map_err(|failed| format!("an answer did not read: {failed}"))?;
-        let datasets: BTreeSet<String> = reply
+        if let Some(own) = own {
+            reply.recorded = own.recorded;
+            reply.restated = own.restated;
+            reply.unchanged = own.unchanged;
+        }
+        reply.recorded += others.recorded;
+        reply.restated += others.restated;
+        reply.unchanged += others.unchanged;
+        let mut datasets: BTreeSet<String> = reply
             .watermark
             .iter()
             .flat_map(|watermark| watermark.partitions.iter())
             .map(|at| crate::range::dataset_of(&at.partition).to_string())
             .collect();
+        if !dataset.is_empty() && reply.recorded + reply.restated + reply.unchanged > 0 {
+            datasets.insert(dataset.to_string());
+        }
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         reply.watermark = Some(watermark(&heads, &datasets));
         Ok(reply.encode_to_vec())
@@ -2699,6 +2730,19 @@ impl Lake {
                     if let Some(latest) = latest {
                         let at = valid.entry(dataset.clone()).or_insert(latest);
                         *at = (*at).max(latest);
+                    }
+                    if let Some((sequence, again)) = write.counted {
+                        match batch.counted.last_mut() {
+                            Some(counted) if counted.sequence == sequence => {
+                                counted.parts.push(batch.parts.len())
+                            }
+                            _ => batch.counted.push(crate::store::Counted {
+                                sequence,
+                                parts: vec![batch.parts.len()],
+                                again,
+                                ..Default::default()
+                            }),
+                        }
                     }
                     kept.kept.push((dataset.clone(), batch.parts.len()));
                     batch.parts.push((dataset, rows));

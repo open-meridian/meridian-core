@@ -137,6 +137,9 @@ pub struct PostgresStore {
     /// The month tables this store's batches first wrote, to be analysed
     /// once their batch commits (migration 24; step 3d).
     unanalysed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// When this store last let go of its group's parts of writes kept
+    /// past their time (`lake_write_ahead_part`): once a minute at most.
+    parts_let_go_at: std::sync::atomic::AtomicI64,
     /// The datasets whose open ranges' tables this store has seen made:
     /// their ranges are not read again before a batch, as a split makes its
     /// children's tables itself. Let go likewise.
@@ -389,6 +392,7 @@ impl PostgresStore {
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             latest_all: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2030,6 +2034,18 @@ impl PostgresStore {
         }
     }
 
+    /// Whether a batch at `now_ns` lets go of the parts kept past their
+    /// time: once a minute.
+    fn parts_let_go(&self, now_ns: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.parts_let_go_at.load(Ordering::Relaxed);
+        now_ns - last >= 60_000_000_000
+            && self
+                .parts_let_go_at
+                .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+
     /// Let go of the tables this store has seen made: a batch failed.
     fn forget_made(&self) {
         self.made.lock().expect("made poisoned").clear();
@@ -2512,6 +2528,50 @@ impl PostgresStore {
         ) {
             return Err(refused);
         }
+        // What this group's rows of each write split across groups did
+        // (step 3d; spec 6.7): with its rows and its position, for the
+        // group answering the write to add. A write taken again adds what
+        // it committed anew; its rows found unchanged were counted when
+        // they were first committed.
+        for counted in &batch.counted {
+            let mut did = counted.already;
+            for place in &counted.parts {
+                if let Some(Ok(part)) = answered.get(*place) {
+                    did.add(crate::store::Counts::of(part));
+                }
+            }
+            if counted.again {
+                did.unchanged = 0;
+            }
+            if did.none() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO lake_write_ahead_part
+                        (stream, sequence, recorded, restated, unchanged, committed_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (stream, sequence) DO UPDATE
+                    SET recorded = lake_write_ahead_part.recorded + EXCLUDED.recorded,
+                        restated = lake_write_ahead_part.restated + EXCLUDED.restated,
+                        committed_at_ns = EXCLUDED.committed_at_ns",
+                &[
+                    &batch.stream,
+                    &(counted.sequence as i64),
+                    &(did.recorded as i32),
+                    &(did.restated as i32),
+                    &(did.unchanged as i32),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        if !batch.counted.is_empty() && self.parts_let_go(now_ns) {
+            tx.execute(
+                "DELETE FROM lake_write_ahead_part WHERE stream = $1 AND committed_at_ns < $2",
+                &[&batch.stream, &(now_ns - crate::store::PART_KEPT_NS)],
+            )
+            .map_err(unavailable)?;
+        }
         // What the batch found the stream dropped, each dataset's latest
         // valid time it recorded, and each gap it found: with its rows and
         // its position, or not at all (W10.14).
@@ -2631,6 +2691,27 @@ impl Store for PostgresStore {
             .map(|row| WriteAheadPosition {
                 sequence: row.get::<_, i64>(0) as u64,
                 at_ns: row.get(1),
+            }))
+    }
+
+    fn write_ahead_part(
+        &self,
+        key: &str,
+        _group: u32,
+        sequence: u64,
+    ) -> Result<Option<crate::store::Counts>> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT recorded, restated, unchanged FROM lake_write_ahead_part
+                  WHERE stream = $1 AND sequence = $2",
+                &[&key, &(sequence as i64)],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::Counts {
+                recorded: row.get::<_, i32>(0) as u32,
+                restated: row.get::<_, i32>(1) as u32,
+                unchanged: row.get::<_, i32>(2) as u32,
             }))
     }
 
