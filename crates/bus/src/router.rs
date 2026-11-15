@@ -719,13 +719,10 @@ impl Bus {
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
             crate::read_after::begin_read();
-            let answered = match envelope.meta.as_ref().and_then(|m| m.read_after.clone()) {
+            match envelope.meta.as_ref().and_then(|m| m.read_after.clone()) {
                 Some(asked) => reads.answer(&topic, &asked, || handler(envelope)),
                 None => handler(envelope),
-            };
-            // Never answered from what this member's databases no longer
-            // hold (step 3d).
-            reads.held_whole(answered)
+            }
         })
     }
 

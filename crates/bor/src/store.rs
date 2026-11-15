@@ -746,18 +746,6 @@ pub trait Store: Send + Sync {
     /// writer steps down once it moves past its own.
     fn head_epoch(&self) -> Result<u64>;
 
-    /// Whether a move has let a partition go from this member's databases
-    /// to one it does not read (step 3d; the resilience spec's sections 6.4
-    /// and 6.8): a member started before the database count was raised
-    /// reads one database, and a partition moved home to a new one leaves
-    /// that database's head of it a pointer and none of its accounts'
-    /// projections. Such a member answers no read from then on
-    /// ([`crate::service::serve`]): what it would read is no longer whole.
-    /// Never so for a member that reads every database.
-    fn moved_elsewhere(&self) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Follow the database's timeline (contract v30, stage C; the
     /// resilience spec's section 3): on a new one every partition's epoch
     /// raised as a takeover raises it and adopted, the takeover recorded

@@ -1002,25 +1002,6 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         crate::writer::DOMAIN,
         Arc::new(crate::writer::Log(Arc::clone(&store))),
     );
-    // No read answered by a member whose databases no longer hold the book
-    // whole (step 3d; sections 6.4 and 6.8): one started before the database
-    // count was raised reads one database, and a partition moved home to a
-    // new one leaves nothing of its accounts there to read. Asked after
-    // each read; where the look itself fails, the read is refused too.
-    let whole = Arc::clone(&store);
-    bus.reads_after()
-        .hold_whole(Arc::new(move || match whole.moved_elsewhere() {
-            Ok(false) => None,
-            Ok(true) => Some(
-                "a partition of the book has moved to a database this member does not read; \
-                 ask again: a member started since the database count was raised answers"
-                    .to_string(),
-            ),
-            Err(failed) => Some(format!(
-                "whether the book is whole in this member's database could not be read \
-                 ({failed}); ask again"
-            )),
-        }));
     // Its reads held to their `read_after` by every partition's head in one
     // look (contract v30, stage B), not one look a partition.
     let heads = Arc::clone(&store);

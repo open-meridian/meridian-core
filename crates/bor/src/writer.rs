@@ -349,10 +349,6 @@ impl Store for Writer {
         self.inner.head_epoch()
     }
 
-    fn moved_elsewhere(&self) -> Result<bool> {
-        self.inner.moved_elsewhere()
-    }
-
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
         let found = self.inner.follow_timeline()?;
         // The record lost what a book held may hold (contract v30, stage
