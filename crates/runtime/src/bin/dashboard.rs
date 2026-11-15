@@ -552,6 +552,14 @@ fn run() -> Result<(), String> {
             );
         }
 
+        // Whether an instance of several pods has a lease right to run
+        // under (step 3d): the Launch sheet and the launch tool offer
+        // shards and a standby pod only where it has.
+        meridian_dashboard::registry::set_lease_right(
+            meridian_runtime::resilience::values_from_env()
+                .filter(|values| values.stated)
+                .map(|values| values.lease_right()),
+        );
         let app = Arc::new(App {
             first_run,
             wizard: Arc::new(WizardSession::suggesting(

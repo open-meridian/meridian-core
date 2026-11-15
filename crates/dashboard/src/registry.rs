@@ -124,6 +124,22 @@ async fn ask<R: Message + Default>(
         .map_err(|(_, words)| words)
 }
 
+/// Whether the deployment renders the lease right an instance of several
+/// pods runs under (step 3d): where a store runs a standby, as the chart's
+/// values state it (MERIDIAN_RESILIENCE_VALUES). Unsaid -- an older chart,
+/// a harness -- is none, and shards and a standby pod are offered as
+/// before; the conductor refuses what cannot run.
+static LEASE_RIGHT: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+
+/// Said once, as the dashboard starts.
+pub fn set_lease_right(rendered: Option<bool>) {
+    let _ = LEASE_RIGHT.set(rendered);
+}
+
+pub(crate) fn lease_right() -> Option<bool> {
+    LEASE_RIGHT.get().copied().flatten()
+}
+
 /// As [`ask`], a refusal with the fields it names too (the Launch sheet
 /// shows a refusal naming shards at its field, contract v30).
 async fn ask_naming<R: Message + Default>(

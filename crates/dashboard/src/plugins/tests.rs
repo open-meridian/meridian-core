@@ -3261,11 +3261,13 @@ async fn the_launch_sheet_sends_shards_and_standby_and_shows_a_shards_refusal_at
     held.access_groups[0].entries[0].level = AccessLevel::Admin as i32;
     held.permissions.extend(records(&[INSTANCE]).permissions);
     h.app.records.store(held, h.app.clock.now_ns());
+    // The version declaring shards is a data plugin's: nothing splits
+    // another role's work among shards (ruled 2026-11-15).
     let version = |v: &str, most_shards: u32| meridian_domain::v1::PluginVersion {
         metadata: Some(meridian_domain::v1::PluginMetadata {
             name: "snaptrade".into(),
             version: v.into(),
-            roles: vec!["custody".into()],
+            roles: vec![if most_shards > 1 { "data" } else { "custody" }.into()],
             declaration: Some(meridian_pb::v1::PluginDeclaration {
                 most_shards,
                 ..Default::default()
