@@ -535,7 +535,9 @@ class Book:
                     account_id=account, page_size=500, cursor=cursor)))
                 for order in listed.orders:
                     if order.venue_order_id.isdigit() and order.origin == ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED:
-                        numbered.append((order.last_change.sequence, int(order.venue_order_id)))
+                        at = order.last_change
+                        numbered.append((at.partition, at.sequence, at.previous_sequence,
+                                         int(order.venue_order_id)))
                 cursor = listed.next_cursor
                 if not cursor:
                     break
@@ -544,9 +546,47 @@ class Book:
             self.history.write("fail", process, read_edn(key, None))
             say(f"UNREAD {key}: {words(failed)}")
             return "fail"
-        numbered.sort()
-        self.history.write("ok", process, read_edn(key, [n for _, n in numbered]))
+        self.history.write("ok", process, read_edn(key, as_recorded(numbered)))
         return "ok"
+
+
+def as_recorded(numbered):
+    """An account's orders in the order the book recorded them, across the
+    account's moves: `numbered` holds each order's last change -- its
+    partition, its sequence there, the sequence of the account's order
+    change before it -- and its number.
+
+    A partition numbers its own sequences, so after a move an order may
+    carry a lower one than an order recorded before it: sorted by sequence
+    alone, a read after ACC-DRIVE-00's move to P1 put its new orders first,
+    and Elle read eight incompatible orders (PR CI 43662032539, ha). The
+    book says the order itself: within a partition its sequence does, and
+    each change names the one before it, in whichever partition that was
+    (crates/bor/tests/postgres.rs,
+    m11_an_accounts_orders_chain_in_order_across_its_move). So each stay in
+    a partition is in sequence order, and a stay follows the one whose last
+    order its first names. These orders change once, when recorded, so the
+    chain is theirs alone."""
+    stays = {}
+    for partition, sequence, previous, number in sorted(numbered):
+        stays.setdefault(partition, []).append((sequence, previous, number))
+    # Each stay by the order its first names, where that is in another
+    # partition; the first stay of all names none (0), or one not listed.
+    last = {rows[-1][0]: partition for partition, rows in stays.items()}
+    follows = {}
+    first = []
+    for partition, rows in stays.items():
+        before = last.get(rows[0][1])
+        if before is None or before == partition or before in follows:
+            first.append(partition)
+        else:
+            follows[before] = partition
+    ordered = []
+    for partition in sorted(first):
+        while partition is not None and stays.get(partition) is not None:
+            ordered.extend(number for _, _, number in stays.pop(partition))
+            partition = follows.get(partition)
+    return ordered
 
 
 async def worker(book, slot, gen):

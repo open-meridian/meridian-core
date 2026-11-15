@@ -2402,6 +2402,142 @@ async fn m11_an_accounts_move_between_groups_is_opened_whichever_member_was_aske
     });
 }
 
+/// An account's orders read in the order they were recorded across its
+/// move (step 3d; section 6.8, "an account's move is a continuation"; CI
+/// 43662032539, ha: Elle's incompatible orders on ACC-DRIVE-00). A
+/// partition numbers its own sequences, so an order recorded after the move
+/// may carry a lower one than an order recorded before it: `sequence` alone
+/// orders nothing across a move. Each order's `last_change` names its
+/// partition and the account's previous change of an order, and that chain
+/// crosses the move unbroken: the first order in the new partition names
+/// the last one's sequence in the old. What the failover driver sorts by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_an_accounts_orders_chain_in_order_across_its_move() {
+    use meridian_bor::order_service::*;
+    use meridian_domain::v1::MoveAccountRequest;
+    let (_url, migrated) = blocking(isolated);
+    blocking(|| migrated.make_partitions(4).unwrap());
+    let (bus, store) = wired_with(Arc::clone(&migrated));
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let account = unique("ACC-CHAIN");
+    send_order(
+        &bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        &SetAccountAttributeRequest {
+            account_id: account.clone(),
+            attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+            reason: "no compliance plugin in this test".into(),
+        },
+        Some(PERSON),
+        None,
+    )
+    .await
+    .unwrap();
+    let propose = || ProposeOrderRequest {
+        account_id: account.clone(),
+        instrument_id: "INS-AAPL".into(),
+        sleeve: "core".into(),
+        side: Side::Buy as i32,
+        quantity: d("10"),
+        order_type: OrderType::Limit as i32,
+        limit_price: usd("227.50"),
+        time_in_force: TimeInForce::GoodTillCancelled as i32,
+        idempotency_key: unique("chain"),
+        ..Default::default()
+    };
+    // Each order's ID, in the order they were recorded.
+    let mut recorded: Vec<String> = Vec::new();
+    for _ in 1..=2 {
+        let made = send_order(&bus, PROPOSE_ORDER, &propose(), Some(PERSON), None)
+            .await
+            .unwrap();
+        recorded.push(
+            OrderReply::decode(&made[..])
+                .unwrap()
+                .order
+                .unwrap()
+                .order_id,
+        );
+    }
+    let from = blocking(|| Store::partition_of(store.as_ref(), &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| *partition != from)
+        .unwrap();
+    send(
+        &bus,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &MoveAccountRequest {
+            account_id: account.clone(),
+            target_partition: to.clone(),
+            reason: "its partition is busy".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    for _ in 3..=4 {
+        let made = send_order(&bus, PROPOSE_ORDER, &propose(), Some(PERSON), None)
+            .await
+            .unwrap();
+        recorded.push(
+            OrderReply::decode(&made[..])
+                .unwrap()
+                .order
+                .unwrap()
+                .order_id,
+        );
+    }
+    let orders = blocking(|| {
+        store
+            .orders(&meridian_bor::store::OrdersRead {
+                scope: Scope::Within([account.clone()].into_iter().collect()),
+                account_id: account.clone(),
+                since: None,
+                limit: 100,
+                cursor: String::new(),
+                execution_state: 0,
+            })
+            .unwrap()
+    })
+    .orders;
+    // (its number, its partition, its sequence, the one before it).
+    let mut refs: Vec<(usize, String, u64, u64)> = orders
+        .iter()
+        .map(|order| {
+            let at = order.last_change.clone().unwrap();
+            (
+                recorded
+                    .iter()
+                    .position(|id| *id == order.order_id)
+                    .unwrap(),
+                at.partition,
+                at.sequence,
+                at.previous_sequence,
+            )
+        })
+        .collect();
+    refs.sort();
+    assert_eq!(refs.len(), 4, "{refs:?}");
+    assert_eq!(
+        refs.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+        [from.as_str(), from.as_str(), to.as_str(), to.as_str()],
+        "{refs:?}"
+    );
+    assert!(
+        refs[2].2 < refs[1].2,
+        "the new partition numbers from its own head: sequence alone would read the third          order before the second ({refs:?})"
+    );
+    assert_eq!(refs[0].3, 0, "the first names none before it: {refs:?}");
+    for (before, after) in refs.iter().zip(refs.iter().skip(1)) {
+        assert_eq!(
+            after.3, before.2,
+            "each names the one recorded before it, across the move: {refs:?}"
+        );
+    }
+    blocking(move || drop((store, migrated)));
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the
