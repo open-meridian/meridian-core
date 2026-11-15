@@ -29,14 +29,24 @@ struct GroupsBroker {
     handed: Mutex<Vec<u32>>,
 }
 
-fn answered(topic: &str, handler: Option<Handler>, envelope: Envelope) -> Answer<'_> {
+fn answered(
+    topic: &str,
+    handler: Option<Handler>,
+    envelope: Envelope,
+    timeout: Duration,
+) -> Answer<'_> {
     Box::pin(async move {
         let Some(handler) = handler else {
             return Err(BusError::NoHandler(topic.to_string()));
         };
-        match tokio::task::spawn_blocking(move || handler(envelope))
-            .await
-            .unwrap()
+        // Its caller's deadline known to the handler, as the broker's path
+        // makes it.
+        let deadline = std::time::Instant::now() + timeout;
+        match tokio::task::spawn_blocking(move || {
+            meridian_bus::read_after::within_deadline(Some(deadline), || handler(envelope))
+        })
+        .await
+        .unwrap()
         {
             Ok((payload_type, payload)) => Ok(Envelope {
                 meta: None,
@@ -84,19 +94,19 @@ impl Backend for GroupsBroker {
             .insert((topic.to_string(), group), handler);
     }
 
-    fn request<'a>(&'a self, topic: &'a str, envelope: Envelope, _: Duration) -> Answer<'a> {
+    fn request<'a>(&'a self, topic: &'a str, envelope: Envelope, timeout: Duration) -> Answer<'a> {
         let handler = self.offered.lock().unwrap().get(topic).map(|offered| {
             let to = self.to.load(Ordering::SeqCst).min(offered.len() - 1);
             Arc::clone(&offered[to])
         });
-        answered(topic, handler, envelope)
+        answered(topic, handler, envelope, timeout)
     }
 
     fn request_to_group<'a>(
         &'a self,
         topic: &'a str,
         envelope: Envelope,
-        _: Duration,
+        timeout: Duration,
         group: u32,
     ) -> Answer<'a> {
         self.handed.lock().unwrap().push(group);
@@ -106,7 +116,7 @@ impl Backend for GroupsBroker {
             .unwrap()
             .get(&(topic.to_string(), group))
             .cloned();
-        answered(topic, handler, envelope)
+        answered(topic, handler, envelope, timeout)
     }
 }
 
@@ -287,6 +297,59 @@ async fn a_write_routed_again_while_its_range_moved_is_answered_with_its_own_cou
         "never handed on after it was answered: {:?}",
         g.broker.handed.lock().unwrap()
     );
+}
+
+/// A write whose range a move's switch holds longer than its caller waits
+/// is answered OVERLOADED with a retry-after while the caller still waits
+/// (step 3d; section 6.8, the hold: "at most moves.holdSeconds, never past
+/// the caller's Meridian-Timeout-Ms"). The record loop held it for the
+/// whole of moves.holdSeconds whatever its caller's deadline, as the book
+/// did (PR CI 43675491409), and the caller timed out, answered nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_held_by_a_switch_is_answered_before_its_callers_deadline() {
+    let g = two_groups();
+    // Group 1's dataset, held as a switch holds it, for three seconds.
+    g.store
+        .hold_for("coinbase-1:hourly", Duration::from_secs(3));
+    g.broker.to.store(1, Ordering::SeqCst);
+    // A caller that waits a second and a half.
+    let began = std::time::Instant::now();
+    let said = g
+        .client
+        .call_stamped(
+            service::RECORD_PRICES,
+            "meridian.v1.RecordPricesRequest",
+            RecordPricesRequest {
+                prices: vec![price("coinbase-1:hourly", "held", "7")],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_millis(1_500)),
+            &Stamp::default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failed| failed.to_string());
+    let took = began.elapsed();
+    let refused = said.expect_err("held past its caller's wait: refused");
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded) && refused.contains("retry="),
+        "answered OVERLOADED with a retry-after, never left to time out: {refused}"
+    );
+    assert!(
+        took < Duration::from_millis(1_500),
+        "answered while its caller still waited: {took:?}"
+    );
+    // A caller that waits longer than the switch is answered its row.
+    let reply = write(&g, 1, vec![price("coinbase-1:hourly", "held", "7")], "")
+        .await
+        .unwrap();
+    assert_eq!(reply.recorded, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -55,6 +55,10 @@ pub struct MemoryStore {
     /// once, as a store whose view of a range was stale refuses it.
     #[cfg(test)]
     said_moved: Mutex<Option<(String, u32)>>,
+    /// A dataset whose writes are refused as held until a time, as a store
+    /// refuses a range a move is switching.
+    #[cfg(test)]
+    held_until: Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl MemoryStore {
@@ -64,6 +68,14 @@ impl MemoryStore {
     #[cfg(test)]
     pub(crate) fn say_moved_once(&self, dataset: &str, group: u32) {
         *self.said_moved.lock().unwrap() = Some((dataset.to_string(), group));
+    }
+
+    /// Refuse `dataset`'s writes as held for `long` from now: what a store
+    /// does while a move switches a range of it.
+    #[cfg(test)]
+    pub(crate) fn hold_for(&self, dataset: &str, long: std::time::Duration) {
+        *self.held_until.lock().unwrap() =
+            Some((dataset.to_string(), std::time::Instant::now() + long));
     }
 
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
@@ -311,6 +323,14 @@ impl Store for MemoryStore {
                 let (partition, group) = said.take().unwrap();
                 meridian_bus::owners::hand_to(group);
                 return Err(StoreError::NotOwned { partition, group });
+            }
+            let held = self.held_until.lock().unwrap();
+            if held.as_ref().is_some_and(|(moving, until)| {
+                moving == dataset && std::time::Instant::now() < *until
+            }) {
+                return Err(StoreError::Held(format!(
+                    "range {dataset} is switching to another writer group: ask again in a moment"
+                )));
             }
         }
         let mut held = self.lock();

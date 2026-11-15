@@ -31,6 +31,30 @@ pub fn hold() -> Duration {
     })
 }
 
+/// How long before its caller stops waiting a held write is answered: its
+/// refusal has to reach the caller, which otherwise hears nothing.
+pub const ANSWERED_BEFORE: Duration = Duration::from_millis(500);
+
+/// How long a write held by a move waits, as of now (section 6.8, the
+/// hold): `moves.holdSeconds`, and never past its caller's
+/// `Meridian-Timeout-Ms` -- it is answered OVERLOADED with a retry-after
+/// [`ANSWERED_BEFORE`] the caller's deadline, where that comes first (PR CI
+/// 43675491409, ha: a partition's switch between databases held its writes
+/// 5.4 s; an order whose caller waited 5 s was held the hold's 5 s, and
+/// its caller timed out with no answer). Every store's hold is this one:
+/// the book's and the lake's.
+pub fn hold_now() -> Duration {
+    let hold = hold();
+    match meridian_bus::read_after::deadline() {
+        Some(deadline) => hold.min(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(ANSWERED_BEFORE),
+        ),
+        None => hold,
+    }
+}
+
 /// `moves.switchSeconds`'s default (section 6.8, Vitess's `--timeout`).
 pub const SWITCH_SECONDS: u64 = 30;
 

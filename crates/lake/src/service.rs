@@ -2161,8 +2161,10 @@ impl Lake {
         // A range a move is switching holds its rows -- its siblings'
         // commit -- until the switch ends, at most `moves.holdSeconds`;
         // they are then routed again, to the group it moved to (step 3d;
-        // section 6.8, the hold).
-        let until = std::time::Instant::now() + meridian_changes::moves::hold();
+        // section 6.8, the hold) -- and never past the caller's deadline:
+        // answered OVERLOADED with a retry-after while the caller still
+        // waits, as the book's held write is.
+        let until = std::time::Instant::now() + meridian_changes::moves::hold_now();
         let mut again = false;
         loop {
             let mine = if self.groups.several() {
@@ -2256,8 +2258,9 @@ impl Lake {
         // A part a group did not take whole -- its view of the ranges
         // differs from this member's: a range moved between -- is routed
         // again by the owners read again, within the hold, never refused
-        // inside it (CI 43636763392; section 6.8, the hold).
-        let until = std::time::Instant::now() + meridian_changes::moves::hold();
+        // inside it (CI 43636763392; section 6.8, the hold), which ends
+        // before the caller's deadline.
+        let until = std::time::Instant::now() + meridian_changes::moves::hold_now();
         let mut queue: Vec<(u32, Parts)> = theirs.into_iter().collect();
         while let Some((group, parts)) = queue.pop() {
             let topic = envelope

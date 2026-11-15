@@ -519,8 +519,10 @@ impl Store for Spread {
         // account of another group's on, never placing it again here.
         let placed = self.partition_of(account_id);
         // A write that finds its partition moving between databases waits
-        // for the target's open within the hold (step 3d; the review's C3).
-        let deadline = std::time::Instant::now() + crate::moves::hold();
+        // for the target's open within the hold (step 3d; the review's C3),
+        // and never past its caller's deadline (section 6.8): each
+        // database's store holds it that long, and so does this.
+        let deadline = std::time::Instant::now() + crate::moves::hold_now();
         let mut routed = 0;
         while routed < ROUTED_AGAIN {
             // Its partition's head's database (step 3d; ruled 2026-11-14):

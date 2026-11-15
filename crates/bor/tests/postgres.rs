@@ -2112,7 +2112,7 @@ impl meridian_bus::Backend for GroupsBroker {
         &'a self,
         topic: &'a str,
         envelope: Envelope,
-        _: std::time::Duration,
+        timeout: std::time::Duration,
         group: u32,
     ) -> meridian_bus::Answer<'a> {
         self.handed.fetch_add(1, Ordering::SeqCst);
@@ -2126,9 +2126,14 @@ impl meridian_bus::Backend for GroupsBroker {
             let Some(handler) = handler else {
                 return Err(meridian_bus::BusError::NoHandler(topic.to_string()));
             };
-            match tokio::task::spawn_blocking(move || handler(envelope))
-                .await
-                .unwrap()
+            // Its caller's deadline known to the handler, as the broker's
+            // path makes it.
+            let deadline = std::time::Instant::now() + timeout;
+            match tokio::task::spawn_blocking(move || {
+                meridian_bus::read_after::within_deadline(Some(deadline), || handler(envelope))
+            })
+            .await
+            .unwrap()
             {
                 Ok((payload_type, payload)) => Ok(Envelope {
                     meta: None,
@@ -7358,4 +7363,97 @@ async fn m12_a_partition_the_size_ci_moves_switches_between_databases_inside_a_s
         "a write waited {longest:?}, past moves.holdSeconds"
     );
     blocking(move || drop(h));
+}
+
+/// A write that finds its partition between two databases -- its source
+/// let go, its target not yet opened -- longer than its caller waits is
+/// answered OVERLOADED with a retry-after while the caller still waits
+/// (step 3d; section 6.8, the hold: "never past the caller's
+/// Meridian-Timeout-Ms"). Each database's store held it no longer than its
+/// caller's deadline (m11), but the book over several databases then asked
+/// again for the whole of moves.holdSeconds, and the caller timed out,
+/// answered nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m12_a_write_held_between_two_databases_is_answered_before_its_callers_deadline() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::moves::points;
+    let h = blocking(two_databases);
+    let partition = partition_of(1, 0);
+    let accounts = accounts_in("ACC-M12-HELD", &partition, 1, &h.one.0, h.one.1.as_ref()).await;
+    write_once(&h.one.0, &accounts[0], 1).await.unwrap();
+    // The switch stopped between its two databases for three seconds.
+    let between = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let between = Arc::clone(&between);
+        points::arm(
+            "book.switch.between",
+            &partition,
+            Arc::new(move |_| {
+                between.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(())
+            }),
+        );
+    }
+    let TwoDatabases {
+        urls: _urls,
+        zero,
+        one,
+        mover,
+    } = h;
+    let moving = {
+        let partition = partition.clone();
+        tokio::task::spawn_blocking(move || {
+            mover.begin(&partition);
+            let ended = mover.run(&partition, 0, &Asked::default());
+            (mover, ended)
+        })
+    };
+    while !between.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // A caller that waits a second and a half.
+    let began = std::time::Instant::now();
+    let said = zero
+        .0
+        .call_stamped(
+            SET_ACCOUNT_ATTRIBUTE,
+            "meridian.v1.SetAccountAttributeRequest",
+            SetAccountAttributeRequest {
+                account_id: accounts[0].clone(),
+                attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(true)),
+                reason: "held between two databases".into(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(std::time::Duration::from_millis(1_500)),
+            &Stamp {
+                acting_for_subject: PERSON.to_string(),
+                account_scope: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failed| failed.to_string());
+    let took = began.elapsed();
+    let refused = said.expect_err("held past its caller's wait: refused");
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded) && refused.contains("retry="),
+        "answered OVERLOADED with a retry-after, never left to time out: {refused}"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "answered while its caller still waited: {took:?}"
+    );
+    let (mover, ended) = moving.await.unwrap();
+    points::disarm("book.switch.between", &partition);
+    assert!(matches!(ended, Ok(Ended::Moved(_))), "{ended:?}");
+    // Asked again once it is opened: written in its new database.
+    write_once(&one.0, &accounts[0], 2).await.unwrap();
+    blocking(move || drop((zero, one, mover)));
 }
