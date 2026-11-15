@@ -377,6 +377,15 @@ async def drive_data(plugin, gen):
             took("price", began)
             if done.recorded + done.restated + done.unchanged == 1:
                 acked("price", key)
+            else:
+                # Answered, and its one row not counted (CI 43656183991, ha:
+                # every price after its range moved to another writer group
+                # was answered 0, 0, 0): never acknowledged, and kept as a
+                # refusal is, so a move's window holds it to none.
+                words = (f"UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
+                         f"unchanged {done.unchanged} for one row")
+                say(f"REFUSED price {key}: {words}")
+                kept("/tmp/refused", f"REFUSED price {key} {int(time.time() * 1000)} {words}")
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
             say(f"REFUSED price {key}: {words(failed)}")
             refused("price", key, failed)
@@ -456,6 +465,7 @@ class Book:
         self.history = history
         self.counts = {a: 0 for a in ACCOUNTS}
         self.next = 0
+        self.full = False
         self.lock = asyncio.Lock()
 
     def key_now(self):
@@ -472,6 +482,13 @@ class Book:
         async with self.lock:
             account = self.key_now()
             if account is None:
+                # Said once and kept: the run holds that it never happens
+                # (e2e/failover/run.py, driver_history), since from here no
+                # order is appended and nothing after is under its load.
+                if not self.full:
+                    self.full = True
+                    say(f"FULL: every key holds {PER_KEY} appends; no order is appended from here")
+                    kept("/tmp/full", f"FULL {int(time.time() * 1000)} after {self.next} appends")
                 return "full"
             self.next += 1
             self.counts[account] += 1

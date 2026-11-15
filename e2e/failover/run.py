@@ -179,7 +179,12 @@ DRIVER_ROLES = {"data": ["data", "reporting"], "oms": ["oms"], "desk": ["oms", "
 FLOOD_IN_FLIGHT = 32
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
-DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
+# Enough keys that the oms instance appends to the run's end (driver.py: a
+# key takes PER_KEY appends, 400): at its 5 appends a second, 36 last 48
+# minutes. Twelve lasted 17 (CI 43656183991, ha: full at 1,047 s, before
+# rebalance began, so no order was appended through any move and Elle saw
+# none). e2e/failover/driver.sql opens the same accounts.
+DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(36)]
 DESK_ACCOUNT = "ACC-DRIVE-DESK"
 DRIVER_INSTRUMENT = "LCL-01J8XQ4M7K00000000E2EAAPL"
 DRIVER_CASH = "LCL-01J8XQ4M7K000000000E2EUSD"
@@ -1125,6 +1130,12 @@ def driver_history(s):
             kubectl("exec", pod, "-c", "plugin", "--", "touch", "/tmp/stop", check=False)
     stopped = happens(lambda: all("DONE" in driver_file(i, "/tmp/done") for i in DRIVERS), 60, every=2)
     s.check(stopped, "the write driver stopped when told, within a minute")
+    # Section 15 asks every class under the driver's load: an oms instance
+    # whose keys all filled wrote no order from then on (driver.py keeps
+    # when in /tmp/full), and what ran after it was not under load.
+    full = driver_file("drive-oms", "/tmp/full").strip()
+    s.check(not full, "the oms driver appended to the run's end: its keys never all filled"
+            + (f" ({full.splitlines()[0]})" if full else ""))
     history = driver_file("drive-oms", "/tmp/history.edn")
     with open(HISTORY, "w", encoding="utf-8") as kept:
         kept.write(history)
