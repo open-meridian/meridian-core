@@ -826,6 +826,10 @@ impl Store for HotStore {
         self.inner.write_ahead_part(key, group, sequence)
     }
 
+    fn write_ahead_refused(&self, key: &str, group: u32, sequence: u64) -> Result<Option<String>> {
+        self.inner.write_ahead_refused(key, group, sequence)
+    }
+
     fn range_between(&self, dataset: &str) -> Result<bool> {
         self.inner.range_between(dataset)
     }

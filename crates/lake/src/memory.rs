@@ -327,6 +327,11 @@ pub(crate) fn as_of(
 }
 
 impl Store for MemoryStore {
+    /// One group's store: no part of a write is another group's.
+    fn write_ahead_refused(&self, _: &str, _: u32, _: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn read_owners_again(&self) -> Result<()> {
         // One store, no ranges' rows to read: a test's stand-in for them.
         #[cfg(test)]

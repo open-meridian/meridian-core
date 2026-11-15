@@ -7429,6 +7429,273 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
     tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, zero, one)));
 }
 
+/// A write is answered a success only when its answer accounts for every
+/// row it sent (ruled 2026-11-15; step 3d; spec 6.7; "lake loss is re-sent,
+/// never silent"), in ha, two writer groups taking one stream. Counted are
+/// the rows of datasets the lake keeps, whichever group committed each.
+///
+/// - A write on its first dataset's subject holding a row of another
+///   dataset, whose group has no range of the first: that group passes the
+///   write, and the row is committed by nobody. Answered OVERLOADED with a
+///   retry-after (it was a success counting one row of two).
+/// - A write whose rows every group commits: a success counting both.
+/// - A part no group took, each taking it for the other's: OVERLOADED, and
+///   sent again it is a success counting both.
+/// - A row a group that does not answer the write refuses by the lake's
+///   rule 5: the write is answered refused by name, as for the answering
+///   group's own part (it was a success counting the rest), its other row
+///   committed all the same.
+/// - A write of a dataset served and not kept: a success, held to no count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sent() {
+    use meridian_bus::HandlerReply;
+    use meridian_domain::v1::{
+        DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, RecordObservationsReply,
+        RecordTradesRequest,
+    };
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_lake::service;
+    use meridian_lake::store::StoreError;
+    use meridian_lake::write_ahead::{settled, taken_past_a_switch, Taken, Writer};
+    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, ObservationMode};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // Group 1's dataset, split, both halves its own; another kept dataset
+    // of group 0's; and one served and not kept.
+    let (url, zero, one, dataset, _lower, upper, low, high) =
+        tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-rule", 1));
+    let named = |tag: &str, owner: u32| {
+        (0..)
+            .map(|n| unique(&format!("coinbase-1:{tag}{n}")))
+            .find(|dataset| meridian_changes::groups::owner(dataset, 2) == owner)
+            .unwrap()
+    };
+    let (other, served) = (named("oth", 0), named("srv", 1));
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake(&zero, "lake-0", &dataset),
+            ha_lake(&one, "lake-1", &dataset),
+        )
+    });
+    let configured = EntitlementsChangedEvent {
+        datasets: [&dataset, &other, &served]
+            .iter()
+            .map(|dataset| {
+                let (instance, key) = dataset.split_once(':').unwrap();
+                DatasetRef {
+                    dataset: dataset.to_string(),
+                    instance: instance.into(),
+                    vendor: "Coinbase".into(),
+                    declaration: Some(DatasetDeclaration {
+                        key: key.into(),
+                        vendor: "Coinbase".into(),
+                        data_types: vec!["meridian.v1.Trade".into()],
+                        modes: vec![ObservationMode::Pull as i32],
+                        history: 3650,
+                        day_time_zone: "Etc/UTC".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect(),
+        licences: vec![DatasetLicence {
+            dataset: served.clone(),
+            kept: false,
+            ..Default::default()
+        }],
+        entitlements: [&dataset, &other, &served]
+            .iter()
+            .map(|dataset| DatasetEntitlement {
+                dataset: dataset.to_string(),
+                instance: "reporting-1".into(),
+                allowed: true,
+                ..Default::default()
+            })
+            .collect(),
+        changed_at_ns: SystemClock.now_ns(),
+    };
+    tokio::task::block_in_place(|| {
+        lake0.configured(&configured);
+        lake1.configured(&configured);
+    });
+    let lakes = [lake0.clone(), lake1.clone()];
+    let mut writers = [
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM)).unwrap(),
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap(),
+    ];
+    let mut stream: Vec<Taken> = Vec::new();
+    let row = |dataset: &str, key: &str, subject: &str, valid: i64| match trade(
+        dataset, key, subject, valid,
+    ) {
+        Observation::Trade(trade) => *trade,
+        _ => unreachable!(),
+    };
+    // A write on `subject`'s dataset's subject, taken by both groups, a
+    // write a batch, and answered once both have: its answer.
+    macro_rules! ask {
+        ($subject:expr, $rows:expr) => {{
+            let n = stream.len() as u64 + 1;
+            stream.push(Taken {
+                sequence: n,
+                at_ns: 1_000 + n as i64,
+                topic: service::RECORD_TRADES.into(),
+                reply_to: Some(format!("_INBOX.rule.{n}")),
+                after: None,
+                envelope: meridian_bus::Envelope {
+                    meta: Some(meridian_bus::MessageMeta {
+                        publisher_instance_id: "coinbase-1".into(),
+                        account_scope_applies: true,
+                        published_at_ns: SystemClock.now_ns(),
+                        message_id: format!("rule-{n}"),
+                        ..Default::default()
+                    }),
+                    payload_type: "meridian.v1.RecordTradesRequest".into(),
+                    payload: RecordTradesRequest {
+                        trades: $rows,
+                        want_id: String::new(),
+                    }
+                    .encode_to_vec(),
+                },
+                dataset: $subject.to_string(),
+            });
+            let mut settling = Vec::new();
+            for (g, writer) in writers.iter_mut().enumerate() {
+                while writer.next() <= n {
+                    let from = writer.next();
+                    let batch: Vec<Taken> = stream
+                        .iter()
+                        .filter(|write| write.sequence == from)
+                        .cloned()
+                        .collect();
+                    match taken_past_a_switch(writer, batch).await {
+                        Ok(answers) => settling.push((g, answers, writer.take_waits())),
+                        Err(StoreError::PositionMoved(_)) => {
+                            tokio::task::block_in_place(|| writer.reread()).unwrap();
+                        }
+                        Err(failed) => panic!("group {g}'s batch from {from}: {failed}"),
+                    }
+                }
+            }
+            let mut answer: Option<HandlerReply> = None;
+            for (g, answers, waits) in settling {
+                for (to, said) in settled(&lakes[g], STREAM, answers, waits).await {
+                    if to.as_deref() == Some(format!("_INBOX.rule.{n}").as_str()) {
+                        answer = Some(said);
+                    }
+                }
+            }
+            answer.expect("answered")
+        }};
+    }
+    let counts = |answer: HandlerReply| {
+        let (_, payload) = answer.expect("a success");
+        let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+        (reply.recorded, reply.restated, reply.unchanged)
+    };
+    let overloaded = |answer: HandlerReply, what: &str| {
+        let refused = answer.expect_err(what);
+        let reason = format!(
+            "refusal-reason {}",
+            meridian_pb::v1::RefusalReason::Overloaded as i32
+        );
+        assert!(
+            refused.contains(&reason) && refused.contains("retry="),
+            "{what}: OVERLOADED with a retry-after: {refused}"
+        );
+    };
+    let held = |key: &str| -> i64 {
+        tokio::task::block_in_place(|| {
+            postgres::Client::connect(&url, postgres::NoTls)
+                .unwrap()
+                .query_one("SELECT count(*) FROM lake_row WHERE row_key = $1", &[&key])
+                .unwrap()
+                .get(0)
+        })
+    };
+
+    // A row of another dataset on this one's subject, its group holding no
+    // range of this one: committed by nobody, so never a success.
+    let answer = ask!(
+        dataset,
+        vec![row(&dataset, "m-d", &low, 10), row(&other, "m-o", &low, 10)]
+    );
+    assert_eq!(held("m-o"), 0, "the other dataset's row is nobody's");
+    overloaded(answer, "a row committed by nobody");
+
+    // The upper half to group 0: the dataset's ranges span both groups.
+    tokio::task::block_in_place(|| {
+        let mover = Mover::new(
+            vec![zero.clone()],
+            zero.groups(),
+            Settings::default(),
+            Arc::new(SystemClock),
+        );
+        assert!(mover.begin(&upper));
+        let ended = mover
+            .run(
+                &upper,
+                0,
+                &Asked {
+                    by_hand: true,
+                    moved_by: "admin-1".into(),
+                    reason: "its ranges across both groups".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+        zero.read_owners().unwrap();
+        one.read_owners().unwrap();
+    });
+
+    // Each group commits its own row: a success counting both.
+    let both = |tag: &str| {
+        vec![
+            row(&dataset, &format!("{tag}-l"), &low, 20),
+            row(&dataset, &format!("{tag}-h"), &high, 20),
+        ]
+    };
+    assert_eq!(counts(ask!(dataset, both("b"))), (2, 0, 0));
+
+    // A part no group takes: group 0's member takes its half for group
+    // 1's, group 1's for group 0's.
+    zero.groups().assign(&upper, Some(1));
+    let answer = ask!(dataset, both("s"));
+    assert_eq!((held("s-l"), held("s-h")), (1, 0));
+    overloaded(answer, "a part no group took");
+    // Sent again, its route read: a success counting both.
+    tokio::task::block_in_place(|| zero.read_owners()).unwrap();
+    assert_eq!(counts(ask!(dataset, both("s"))), (1, 0, 1));
+
+    // A row the group that does not answer refuses by rule 5: the write is
+    // answered refused, naming it; its other row committed all the same.
+    assert_eq!(
+        counts(ask!(dataset, vec![row(&dataset, "k", &high, 30)])),
+        (1, 0, 0)
+    );
+    let refused = ask!(
+        dataset,
+        vec![
+            row(&dataset, "r-l", &low, 40),
+            row(&dataset, "k", &high, 41)
+        ]
+    )
+    .expect_err("a restated key's valid time: refused");
+    assert!(
+        refused.contains("trades[1].meta.valid_from_ns")
+            && refused.contains("fixes its valid time"),
+        "refused by name: {refused}"
+    );
+    assert_eq!(held("r-l"), 1, "its other row committed");
+
+    // A dataset served and not kept: a success, its row served.
+    assert_eq!(
+        counts(ask!(served, vec![row(&served, "u", &low, 50)])),
+        (1, 0, 0)
+    );
+    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, zero, one)));
+}
+
 /// A lake range moved to the group that answers its dataset, across
 /// databases in ha, under writes of one row each into the moved half, its
 /// sibling half that group's already -- and each member's store the hot
@@ -8419,6 +8686,7 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
         sequence: 7,
         groups: vec![1],
         dataset: String::new(),
+        ..Default::default()
     };
     // Group 1's part commits a moment later: the answer waits for it.
     let committing = {
@@ -9375,6 +9643,7 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
             sequence: 7,
             groups: Vec::new(),
             dataset: dataset.clone(),
+            ..Default::default()
         }],
     )
     .await;

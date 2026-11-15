@@ -390,6 +390,54 @@ async fn a_write_handed_to_a_group_behind_the_hot_layer_that_has_not_seen_its_ra
     );
 }
 
+/// A part handed to its group and taken short is answered OVERLOADED with
+/// a retry-after once the hold is over (ruled 2026-11-15): the same answer
+/// as every write whose rows are not all accounted for, so its plugin
+/// sends it again. It was UNAVAILABLE, "ask again", with no retry-after.
+/// Never a success counting fewer rows than were sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_handed_on_and_taken_short_is_answered_overloaded_with_a_retry_after() {
+    let g = two_groups();
+    // Group 1's member answers every hand-off as though it took no row.
+    g.broker.groups.lock().unwrap().insert(
+        (service::INTERNAL_RECORD.to_string(), 1),
+        Arc::new(|_| {
+            Ok((
+                "meridian.v1.RecordObservationsReply".to_string(),
+                RecordObservationsReply::default().encode_to_vec(),
+            ))
+        }),
+    );
+    g.broker.to.store(0, Ordering::SeqCst);
+    let said = g
+        .client
+        .call_stamped(
+            service::RECORD_PRICES,
+            "meridian.v1.RecordPricesRequest",
+            RecordPricesRequest {
+                prices: vec![price("coinbase-1:hourly", "short", "7")],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_millis(1_500)),
+            &Stamp::default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failed| failed.to_string());
+    let refused = said.expect_err("its row taken by nobody: refused, never a success");
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded) && refused.contains("retry="),
+        "answered OVERLOADED with a retry-after: {refused}"
+    );
+    assert!(refused.contains("took 0 of the 1 rows"), "{refused}");
+}
+
 /// A write whose range a move's switch holds longer than its caller waits
 /// is answered OVERLOADED with a retry-after while the caller still waits
 /// (step 3d; section 6.8, the hold: "at most moves.holdSeconds, never past

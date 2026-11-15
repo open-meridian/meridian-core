@@ -196,6 +196,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "taken_from",
         sql: include_str!("../migrations/0028_taken_from.sql"),
     },
+    // A part's rows refused by the lake's rule 5, and the refusal (step 3d;
+    // `refused` and `refused_detail` ruled 2026-11-15): what the group
+    // answering the write answers it with.
+    Migration {
+        version: 29,
+        name: "part_refused",
+        sql: include_str!("../migrations/0029_part_refused.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

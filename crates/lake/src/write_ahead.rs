@@ -93,7 +93,7 @@ pub fn group_key(stream: &str, group: u32) -> String {
 /// parts of its write (step 3d; spec 6.7): the answer's place in its batch,
 /// the write's stream sequence, and the groups whose positions must reach
 /// it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Wait {
     pub at: usize,
     pub sequence: u64,
@@ -102,6 +102,36 @@ pub struct Wait {
     /// waits are waited on too, never only those its taker saw (the
     /// review's C4). None named, only `groups`.
     pub dataset: String,
+    /// The rows the write sent, which its answer accounts for (ruled
+    /// 2026-11-15); none said, and the answer is held to none.
+    pub sent: Sent,
+}
+
+/// What a write sent, as the take that answers it saw it (ruled
+/// 2026-11-15): the rows of datasets the lake keeps, every writer group's
+/// among them, which its answer's counts account for; and the rows of
+/// datasets served and not kept this take served, which are in the take's
+/// own answer and in no group's part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sent {
+    pub kept: u32,
+    pub served: u32,
+}
+
+/// The refusal of a write whose answer does not account for every row it
+/// sent (ruled 2026-11-15): OVERLOADED with a retry-after, so its plugin
+/// sends it again -- a row is recorded once by its key, and a row some
+/// group did commit is found unchanged. Never a success: a row no group
+/// committed would be lost in silence.
+pub fn unaccounted(counted: u32, sent: u32) -> String {
+    meridian_bus::refusal_retrying(
+        meridian_pb::v1::RefusalReason::Overloaded as i32,
+        meridian_changes::moves::HELD_RETRY_SECONDS,
+        format!(
+            "{counted} of this write's {sent} rows are accounted for: the rest are not \
+             committed yet, or their route has changed; ask again"
+        ),
+    )
 }
 
 /// The groups besides this one owning an open range of `dataset`, as this
@@ -170,6 +200,8 @@ pub struct Written {
 pub struct Recorded {
     pub answers: Vec<HandlerReply>,
     pub valid: Vec<(String, i64)>,
+    /// What each write sent, in step with `answers`.
+    pub sent: Vec<Sent>,
 }
 
 /// The writer's place in the stream: the position the store holds, which
@@ -344,6 +376,7 @@ impl Writer {
                     sequence: write.sequence,
                     groups: other_groups(groups, &write.dataset),
                     dataset: write.dataset.clone(),
+                    sent: Sent::default(),
                 });
             }
             sent_to.push(write.reply_to.filter(|_| answering));
@@ -365,6 +398,9 @@ impl Writer {
             ..Default::default()
         };
         let recorded = self.lake.record_written(writes, batch, &self.valid)?;
+        for wait in &mut self.waits {
+            wait.sent = recorded.sent.get(wait.at).copied().unwrap_or_default();
+        }
         self.position = Some(through);
         self.from = None;
         self.dropped.extend(dropped);
@@ -535,9 +571,39 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                 // range away kept it all the same.
                 let mut others = crate::store::Counts::default();
                 for group in (0..lake.groups().count()).filter(|group| *group != mine) {
+                    // Rows of it that group refused by the lake's rule 5:
+                    // the write's answer, by name, as this group's own
+                    // part's refusal is (ruled 2026-11-15). Its other
+                    // parts committed all the same.
+                    if let Some(refused) = lake
+                        .write_ahead_refused(&group_key(stream, group), group, wait.sequence)
+                        .map_err(|failed| failed.to_string())?
+                    {
+                        return Err(refused);
+                    }
                     if let Some(theirs) = part(group)? {
                         others.add(theirs);
                     }
+                }
+                // Every row of a kept dataset accounted for, by this
+                // group's part or its take and by every other group's part
+                // (ruled 2026-11-15): else refused, to be sent again.
+                let counted = match own {
+                    Some(own) => own.all(),
+                    None => crate::service::counted(payload).saturating_sub(wait.sent.served),
+                } + others.all();
+                if counted < wait.sent.kept {
+                    tracing::warn!(
+                        sequence = wait.sequence,
+                        dataset = %wait.dataset,
+                        group = mine,
+                        waited_on = ?groups,
+                        own_part = own.is_some(),
+                        counted,
+                        sent = wait.sent.kept,
+                        "a write of the stream is refused: its answer does not account for every row it sent"
+                    );
+                    return Err(unaccounted(counted, wait.sent.kept));
                 }
                 let again = lake.answer_again(payload, own, others, &wait.dataset)?;
                 // Answered counting no row at all -- neither a part any

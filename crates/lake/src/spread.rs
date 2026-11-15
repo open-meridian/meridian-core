@@ -661,6 +661,16 @@ impl Store for Spread {
         Ok(all)
     }
 
+    fn write_ahead_refused(&self, key: &str, group: u32, sequence: u64) -> Result<Option<String>> {
+        // Kept with the group's part, wherever its position was then.
+        for store in &self.stores {
+            if let Some(refused) = store.write_ahead_refused(key, group, sequence)? {
+                return Ok(Some(refused));
+            }
+        }
+        Ok(None)
+    }
+
     fn record_write_ahead(
         &self,
         mut batch: WriteAheadBatch,
@@ -681,6 +691,7 @@ impl Store for Spread {
             .iter()
             .map(|(dataset, _)| dataset.clone())
             .collect();
+        let sizes: Vec<usize> = batch.parts.iter().map(|(_, rows)| rows.len()).collect();
         for (at, (dataset, rows)) in std::mem::take(&mut batch.parts).into_iter().enumerate() {
             if self.write_dbs(&dataset, &rows).iter().all(|d| *d == own) {
                 places.push(at);
@@ -719,14 +730,19 @@ impl Store for Spread {
             for place in std::mem::take(&mut counted.parts) {
                 match places.iter().position(|at| *at == place) {
                     Some(here) => kept.push(here),
-                    None => {
-                        if let (Some(Some(Ok(done))), Some(dataset)) =
-                            (answers.get_mut(place), datasets.get(place))
-                        {
+                    None => match (answers.get_mut(place), datasets.get(place)) {
+                        (Some(Some(Ok(done))), Some(dataset)) => {
                             let did = counted.did_and_answers(dataset, done, &taken_from);
                             counted.already.add(did);
                         }
-                    }
+                        // Refused there by the lake's rule 5: kept with
+                        // the part, for the group answering the write.
+                        (Some(Some(Err(failed))), _) => {
+                            let rows = sizes.get(place).copied().unwrap_or(0);
+                            counted.refuse(failed, rows);
+                        }
+                        _ => {}
+                    },
                 }
             }
             counted.parts = kept;

@@ -2460,7 +2460,7 @@ impl PostgresStore {
     /// [`Store::record_write_ahead`]'s batch, in one transaction.
     fn record_write_ahead_batch(
         &self,
-        batch: WriteAheadBatch,
+        mut batch: WriteAheadBatch,
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
         self.epoch_now()?;
@@ -2509,6 +2509,7 @@ impl PostgresStore {
             .iter()
             .map(|(dataset, _)| dataset.clone())
             .collect();
+        let part_sizes: Vec<usize> = batch.parts.iter().map(|(_, rows)| rows.len()).collect();
         for (place, (dataset, rows)) in batch.parts.into_iter().enumerate() {
             by_dataset.entry(dataset).or_default().push((place, rows));
         }
@@ -2551,20 +2552,24 @@ impl PostgresStore {
                 .collect();
             moves::taken_from_of(&mut tx, &ranges)?
         };
-        for counted in &batch.counted {
+        for counted in &mut batch.counted {
             let mut did = counted.already;
-            for place in &counted.parts {
-                if let (Some(Ok(part)), Some(dataset)) =
-                    (answered.get_mut(*place), part_datasets.get(*place))
-                {
-                    did.add(
-                        counted.did_and_answers(dataset, part, &|range| {
+            for place in counted.parts.clone() {
+                match (answered.get_mut(place), part_datasets.get(place)) {
+                    (Some(Ok(part)), Some(dataset)) => {
+                        did.add(counted.did_and_answers(dataset, part, &|range| {
                             taken_from.get(range).copied()
-                        }),
-                    );
+                        }));
+                    }
+                    // Refused by the lake's rule 5: kept with the part, for
+                    // the group answering the write (ruled 2026-11-15).
+                    (Some(Err(failed)), _) => {
+                        counted.refuse(failed, part_sizes.get(place).copied().unwrap_or(0));
+                    }
+                    _ => {}
                 }
             }
-            if did.none() {
+            if did.none() && counted.refused == 0 {
                 continue;
             }
             let held: i64 = tx
@@ -2576,18 +2581,22 @@ impl PostgresStore {
                 .map_err(unavailable)?
                 .map_or(0, |row| row.get(0));
             did.unchanged = did.unchanged.saturating_sub(held.max(0) as u32);
-            if did.none() {
+            if did.none() && counted.refused == 0 {
                 continue;
             }
+            // A part taken again refuses the same rows again: said once.
             tx.execute(
                 "INSERT INTO lake_write_ahead_part
-                        (stream, sequence, recorded, restated, unchanged, committed_at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                        (stream, sequence, recorded, restated, unchanged, committed_at_ns,
+                         refused, refused_detail)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (stream, sequence) DO UPDATE
                     SET recorded = lake_write_ahead_part.recorded + EXCLUDED.recorded,
                         restated = lake_write_ahead_part.restated + EXCLUDED.restated,
                         unchanged = lake_write_ahead_part.unchanged + EXCLUDED.unchanged,
-                        committed_at_ns = EXCLUDED.committed_at_ns",
+                        committed_at_ns = EXCLUDED.committed_at_ns,
+                        refused = EXCLUDED.refused,
+                        refused_detail = EXCLUDED.refused_detail",
                 &[
                     &batch.stream,
                     &(counted.sequence as i64),
@@ -2595,6 +2604,8 @@ impl PostgresStore {
                     &(did.restated as i32),
                     &(did.unchanged as i32),
                     &now_ns,
+                    &(counted.refused as i32),
+                    &counted.refused_detail,
                 ],
             )
             .map_err(unavailable)?;
@@ -2747,6 +2758,18 @@ impl Store for PostgresStore {
                 restated: row.get::<_, i32>(1) as u32,
                 unchanged: row.get::<_, i32>(2) as u32,
             }))
+    }
+
+    fn write_ahead_refused(&self, key: &str, _group: u32, sequence: u64) -> Result<Option<String>> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT refused_detail FROM lake_write_ahead_part
+                  WHERE stream = $1 AND sequence = $2 AND refused > 0",
+                &[&key, &(sequence as i64)],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0)))
     }
 
     fn record_write_ahead(

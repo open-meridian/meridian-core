@@ -193,6 +193,11 @@ fn written() -> StoreError {
 }
 
 impl Store for ReaderStore {
+    /// A reader takes no write, and keeps no part of one.
+    fn write_ahead_refused(&self, _: &str, _: u32, _: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// A reader takes no write, so it holds no view of who writes a range.
     fn read_owners_again(&self) -> Result<()> {
         Ok(())

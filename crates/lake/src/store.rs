@@ -175,9 +175,61 @@ pub struct Counted {
     /// What its parts committed in another database, before this batch,
     /// did.
     pub already: Counts,
+    /// The field its request names its rows by, and every row's key in the
+    /// write's order: what a refusal of a part names its row with.
+    pub field: String,
+    pub keys: Vec<(i16, String)>,
+    /// The rows of its parts refused in another database, before this
+    /// batch, by the lake's rule 5, and the first such refusal as the
+    /// write's plugin hears it (`lake_write_ahead_part.refused` and
+    /// `refused_detail`; ruled 2026-11-15).
+    pub refused: u32,
+    pub refused_detail: String,
+}
+
+/// A row key restated against the lake's rule 5, as the write's plugin
+/// hears it: INVALID_ARGUMENT naming the field at the first row of the
+/// write under that key (`series[3].meta.valid_from_ns`), `keys` every
+/// row's key in the write's order. None for any other failure.
+pub fn key_fixed_refusal(
+    failed: &StoreError,
+    field: &str,
+    keys: &[(i16, String)],
+) -> Option<String> {
+    let StoreError::KeyFixed {
+        data_type,
+        row_key,
+        field: path,
+        words,
+    } = failed
+    else {
+        return None;
+    };
+    let at = keys
+        .iter()
+        .position(|(code, key)| *code == data_type.code() && key == row_key)
+        .unwrap_or(0);
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::InvalidArgument,
+        &[format!("{field}[{at}].{path}")],
+        words,
+    ))
 }
 
 impl Counted {
+    /// A part of this write refused by the lake's rule 5, its `rows` kept
+    /// as refused with the first such refusal's words: what the group
+    /// answering the write answers it with (ruled 2026-11-15). Nothing for
+    /// any other failure.
+    pub fn refuse(&mut self, failed: &StoreError, rows: usize) {
+        if let Some(detail) = key_fixed_refusal(failed, &self.field, &self.keys) {
+            self.refused += rows as u32;
+            if self.refused_detail.is_empty() {
+                self.refused_detail = detail;
+            }
+        }
+    }
+
     /// Whether a row of this write found unchanged in a range is counted,
     /// `taken_from` the stream sequence the range's source had committed
     /// through when the range last moved to this group
@@ -264,7 +316,12 @@ impl Counts {
     }
 
     pub fn none(&self) -> bool {
-        self.recorded + self.restated + self.unchanged == 0
+        self.all() == 0
+    }
+
+    /// Every row counted.
+    pub fn all(&self) -> u32 {
+        self.recorded + self.restated + self.unchanged
     }
 }
 
@@ -1010,6 +1067,13 @@ pub trait Store: Send + Sync {
         let _ = (key, group, sequence);
         Ok(None)
     }
+
+    /// The refusal writer group `group` kept with its part of the stream's
+    /// write `sequence` under `key`, as the write's plugin hears it (step
+    /// 3d; spec 6.7; ruled 2026-11-15): rows of the write it refused by the
+    /// lake's rule 5. None where it refused none. Every store says its
+    /// own, a layer in front of another asking the one behind it.
+    fn write_ahead_refused(&self, key: &str, group: u32, sequence: u64) -> Result<Option<String>>;
 
     /// The data configuration as last heard.
     fn keep_configuration(&self, event: &EntitlementsChangedEvent) -> Result<()>;

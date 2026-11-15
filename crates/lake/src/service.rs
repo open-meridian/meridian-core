@@ -679,23 +679,10 @@ fn row_keys(rows: &[Observation]) -> Vec<(i16, String)> {
 /// row of the write under that key (`series[3].meta.valid_from_ns`); every
 /// other failure as the store said it.
 fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, String)]) -> String {
+    if let Some(refused) = crate::store::key_fixed_refusal(&failed, field, keys) {
+        return refused;
+    }
     match failed {
-        crate::store::StoreError::KeyFixed {
-            data_type,
-            row_key,
-            field: path,
-            words,
-        } => {
-            let at = keys
-                .iter()
-                .position(|(code, key)| *code == data_type.code() && *key == row_key)
-                .unwrap_or(0);
-            refusal_with_status(
-                RefusalStatus::InvalidArgument,
-                &[format!("{field}[{at}].{path}")],
-                words,
-            )
-        }
         // Held past the hold (section 6.8): OVERLOADED, its retry-after.
         crate::store::StoreError::Held(words) => meridian_bus::refusal_retrying(
             meridian_pb::v1::RefusalReason::Overloaded as i32,
@@ -722,8 +709,13 @@ pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
 /// Whether `answer`, a write's `RecordObservationsReply`, counts no row:
 /// none recorded, restated or found unchanged.
 pub fn counts_nothing(answer: &[u8]) -> bool {
+    RecordObservationsReply::decode(answer).is_ok() && counted(answer) == 0
+}
+
+/// The rows `answer`, a write's `RecordObservationsReply`, counts.
+pub fn counted(answer: &[u8]) -> u32 {
     RecordObservationsReply::decode(answer)
-        .is_ok_and(|reply| reply.recorded + reply.restated + reply.unchanged == 0)
+        .map_or(0, |reply| reply.recorded + reply.restated + reply.unchanged)
 }
 
 /// A write's rows as the lake records them, by the topic it was asked on
@@ -2214,12 +2206,33 @@ impl Lake {
         // meant, and seen right after a range's move between databases (PR
         // CI 43680214054). Said here with how it was routed, so the member
         // that answered it names the path.
+        //
+        // And never answered a success (ruled 2026-11-15): a write whose
+        // counts do not account for every row it sent is refused OVERLOADED
+        // with a retry-after, and its plugin sends it again -- a row is
+        // recorded once by its key. Every row is counted here: one kept,
+        // one served and not kept, one a group it was handed to took. A
+        // write handed here is held to it by the member that handed it,
+        // which this group's part alone answers.
         let counted = said.reply.recorded + said.reply.restated + said.reply.unchanged;
+        let handed = self.groups.several() && meridian_bus::owners::handed();
+        if (counted as usize) < keys.len() && (!handed || again) {
+            tracing::warn!(
+                rows = keys.len(),
+                counted,
+                group = self.groups.mine(),
+                handed,
+                routed_again = again,
+                datasets = ?said.datasets,
+                "a write is refused: its answer does not account for every row it sent"
+            );
+            return Err(crate::write_ahead::unaccounted(counted, keys.len() as u32));
+        }
         if counted == 0 && !keys.is_empty() {
             tracing::warn!(
                 rows = keys.len(),
                 group = self.groups.mine(),
-                handed = meridian_bus::owners::handed(),
+                handed,
                 routed_again = again,
                 datasets = ?said.datasets,
                 "a write's rows were answered with none of them counted"
@@ -2376,10 +2389,13 @@ impl Lake {
                 queue.extend(again);
                 continue;
             }
+            // Past the hold: OVERLOADED with a retry-after, as every
+            // write whose rows are not all accounted for (ruled
+            // 2026-11-15), so its plugin sends it again.
             if taken < handed_rows {
-                return Err(meridian_bus::refusal_with_status(
-                    RefusalStatus::Unavailable,
-                    &[],
+                return Err(meridian_bus::refusal_retrying(
+                    meridian_pb::v1::RefusalReason::Overloaded as i32,
+                    meridian_changes::moves::HELD_RETRY_SECONDS,
                     format!(
                         "writer group {group} took {taken} of the {handed_rows} rows handed to \
                          it: their ranges' route has changed; ask again"
@@ -2654,6 +2670,17 @@ impl Lake {
         self.store.write_ahead_part(key, group, sequence)
     }
 
+    /// The refusal writer group `group` kept with its part of the stream's
+    /// write `sequence` (step 3d; spec 6.7; ruled 2026-11-15).
+    pub fn write_ahead_refused(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<String>, crate::store::StoreError> {
+        self.store.write_ahead_refused(key, group, sequence)
+    }
+
     /// An answer made again once every group's part of its write has
     /// committed (step 3d; spec 6.7): counting each part -- this group's
     /// `own` as it kept it, in place of what the take that made the answer
@@ -2732,6 +2759,10 @@ impl Lake {
             unkept: Vec<(String, Vec<Observation>)>,
             field: &'static str,
             keys: Vec<(i16, String)>,
+            /// What it sent, and whether its answer waits on other groups'
+            /// parts and is held to it there.
+            sent: crate::write_ahead::Sent,
+            spans: bool,
         }
         let now = self.clock.now_ns();
         let config = self.config();
@@ -2778,8 +2809,14 @@ impl Lake {
                 unkept: Vec::new(),
                 field,
                 keys,
+                sent: crate::write_ahead::Sent::default(),
+                spans: write.counted.is_some(),
             };
             for (dataset, rows) in by_dataset {
+                // Every row of a dataset the lake keeps, whichever group's.
+                if config.licence(&dataset).kept {
+                    kept.sent.kept += rows.len() as u32;
+                }
                 if let Some(dropped) = write.after_gap.as_ref() {
                     batch.gaps.push(
                         self.gap_found(
@@ -2828,6 +2865,8 @@ impl Lake {
                             _ => batch.counted.push(crate::store::Counted {
                                 sequence,
                                 parts: vec![batch.parts.len()],
+                                field: field.to_string(),
+                                keys: kept.keys.clone(),
                                 ..Default::default()
                             }),
                         }
@@ -2835,6 +2874,7 @@ impl Lake {
                     kept.kept.push((dataset.clone(), batch.parts.len()));
                     batch.parts.push((dataset, rows));
                 } else {
+                    kept.sent.served += rows.len() as u32;
                     kept.unkept.push((dataset, rows));
                 }
             }
@@ -2848,6 +2888,10 @@ impl Lake {
             .record_write_ahead(batch, now)?
             .into_iter()
             .map(Some)
+            .collect();
+        let sent: Vec<crate::write_ahead::Sent> = written
+            .iter()
+            .map(|write| write.as_ref().map(|write| write.sent).unwrap_or_default())
             .collect();
         let answers = written
             .into_iter()
@@ -2873,6 +2917,20 @@ impl Lake {
                 if let Some(refused) = refused {
                     return Err(refused);
                 }
+                // Every row of a kept dataset accounted for (ruled
+                // 2026-11-15); a write whose ranges span groups is held to
+                // it once every group's part is in, where it is answered.
+                let counted = said.reply.recorded + said.reply.restated + said.reply.unchanged;
+                if !write.spans && counted < write.sent.kept {
+                    tracing::warn!(
+                        counted,
+                        sent = write.sent.kept,
+                        group = self.groups.mine(),
+                        datasets = ?said.datasets,
+                        "a write of the stream is refused: its answer does not account for every row it sent"
+                    );
+                    return Err(crate::write_ahead::unaccounted(counted, write.sent.kept));
+                }
                 for (dataset, rows) in write.unkept {
                     let served = self
                         .write_one(&dataset, rows, &write.want_id, now)
@@ -2891,7 +2949,11 @@ impl Lake {
         for gap in gaps {
             self.gap_recorded(gap);
         }
-        Ok(crate::write_ahead::Recorded { answers, valid })
+        Ok(crate::write_ahead::Recorded {
+            answers,
+            valid,
+            sent,
+        })
     }
 
     /// A new gap's ID, at the lake's time.
