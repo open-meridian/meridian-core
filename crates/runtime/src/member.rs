@@ -1133,7 +1133,13 @@ async fn follow(
                             unchecked.extend(at.keys().cloned());
                         }
                         control_epoch = Some(epoch);
-                        if !unchecked.is_empty() {
+                        // A partition left to read back took nothing from
+                        // the tail meanwhile, and a writer whose epoch rose
+                        // -- a new writer -- published none of what it
+                        // committed before this follower first asked it: a
+                        // reader reconciles once they are read back.
+                        let read_back = !unchecked.is_empty();
+                        if read_back {
                             unchecked_since.get_or_insert_with(Instant::now);
                             let check = Lineage { bus: &bus, domain, following: following.as_ref() };
                             check
@@ -1145,8 +1151,15 @@ async fn follow(
                         }
                         let again = unanswered_since.take().is_some() || !answered;
                         answered = true;
-                        if let (true, Some(following)) = (again, &following) {
-                            reconcile(&bus, domain, following, &mut at, &mut chains).await;
+                        if let Some(following) = &following {
+                            // Held behind on purpose (TEST ONLY): what it
+                            // lacks is read once it is let go.
+                            let held = held_on_purpose();
+                            let left_behind = !held && bus.reads_after().left_behind(domain);
+                            if again || (!held && read_back) || left_behind {
+                                reconcile(&bus, domain, following, &unchecked, &mut at, &mut chains)
+                                    .await;
+                            }
                         }
                     }
                     Err(failed) => {
@@ -1178,10 +1191,29 @@ async fn follow(
 /// the writer, as any gap is. Without this a partition written only then
 /// was never followed, and every read naming it waited out its bound and
 /// was answered from the primary (CI 42868480584, the book's reader).
+///
+/// And twice more, since a page missed is otherwise learnt only from the
+/// partition's next page, which a partition seldom written -- a store's
+/// `control` -- may not send for hours (failover-repeat 43697279874, ha run
+/// 2, the book's reader):
+///
+/// - **once a new writer is read back** (its epoch rose): a writer that took
+///   over cleanly answered every ask, so nothing above ran, and what it
+///   committed before this follower first asked it -- its own takeover,
+///   journalled on `control` as it starts -- was published to nobody;
+/// - **once a read was answered from the primary past its wait**
+///   ([`Reads::left_behind`]): proof the reader is behind there, whatever
+///   lost the page.
+///
+/// A partition still to be read back (`unchecked`) is left: what the reader
+/// holds of it is not yet known to be the record's.
+///
+/// [`Reads::left_behind`]: meridian_bus::read_after::Reads::left_behind
 async fn reconcile(
     bus: &Bus,
     domain: &'static str,
     following: &Following,
+    unchecked: &std::collections::BTreeSet<String>,
     at: &mut HashMap<String, u64>,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
 ) {
@@ -1205,6 +1237,9 @@ async fn reconcile(
         }
     };
     for (partition, head) in heads {
+        if unchecked.contains(&partition) {
+            continue;
+        }
         let reached = match at.get(&partition).copied() {
             Some(held) if held >= head => continue,
             Some(held) => {

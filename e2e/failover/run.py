@@ -3040,6 +3040,14 @@ def reader_log(pod_name, said, since="10m", container="bor"):
     return logs.stdout.decode(errors="replace").count(said) if logs.returncode == 0 else 0
 
 
+def reader_said(pod_name, said, since="10m", container="bor"):
+    """The lines of the reader's log that say `said`, in the last `since`."""
+    logs = kubectl("logs", pod_name, "-c", container, f"--since={since}", check=False, quiet=True)
+    if logs.returncode != 0:
+        return []
+    return [line for line in logs.stdout.decode(errors="replace").splitlines() if said in line]
+
+
 FROM_PRIMARY = "answered from the primary"
 
 
@@ -3070,13 +3078,19 @@ def reader_held(s):
                 "reader held: the reader stayed ready, serving")
     finally:
         kubectl("exec", reader, "-c", "bor", "--", "rm", "-f", HOLD_FILE, check=False)
-    # Let go: the next page heard is a gap, read from the writer; the reads
-    # after it are its own again.
-    time.sleep(5)
-    settled = reader_log(reader, FROM_PRIMARY, since="1m")
-    time.sleep(15)
-    s.check(reader_log(reader, FROM_PRIMARY, since="1m") <= settled,
-            "reader held: let go, it caught up and answers from its own record again")
+    # Let go: what it lacks is read from the writer as the writer next
+    # answers it, a partition not written since among them; the reads after
+    # are its own again. Five seconds to settle, then none answered from the
+    # primary in the fifteen after. Counted over those seconds alone: the
+    # count over a sliding minute, compared before and after, fell as older
+    # lines left the minute, so a reader behind throughout passed or failed
+    # by where its lines fell (failover-repeat 43697279874, ha run 2).
+    time.sleep(20)
+    behind = reader_said(reader, FROM_PRIMARY, since="14s")
+    s.check(not behind, "reader held: let go, it caught up and answers from its own record again")
+    if behind:
+        s.note(f"reader held: {len(behind)} read(s) answered from the primary after it was let go, the last "
+               f"{behind[-1][-160:]}")
     probe_said = (probe(reader, "bor") or {}).get("member", {})
     s.check(probe_said.get("mode") == "reader", f"reader held: still a reader ({probe_said.get('mode')})")
 

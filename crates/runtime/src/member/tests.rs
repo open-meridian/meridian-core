@@ -553,6 +553,132 @@ async fn a_reader_drops_nothing_when_the_epoch_rises_over_a_record_that_lost_not
     assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5]);
 }
 
+/// A writer hands over cleanly: the new writer answers every ask, so the
+/// reader never finds its writer unanswering, and what the new writer
+/// committed before this reader first asked it was published to nobody (the
+/// tail goes only to a follower that has asked, ruling 1062) -- its own
+/// takeover, journalled on `control` as it starts. The reader reads it from
+/// the writer once the new writer's epoch is read back, with no page after
+/// it to say one was missed (failover-repeat 43697279874, ha run 2: the
+/// book's reader stayed one behind on `control` for a minute, every read
+/// naming it answered from the primary).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_reads_what_a_new_writer_committed_before_it_was_first_asked() {
+    let bus = Arc::new(Bus::single(
+        "member-test-hand-over",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Failing {
+        state: Mutex::new((2, u64::MAX, 2)),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    let record = log.clone();
+    let primary = meridian_bus::read_after::AllHeads(move || {
+        let head = record.state.lock().unwrap().0;
+        Ok(std::collections::BTreeMap::from([("P0".to_string(), head)]))
+    });
+    let member = Member::reader_of("bor", "book", Duration::from_secs(5));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(primary))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.state.lock().unwrap().0 = 3;
+    meridian_changes::publish(&bus, "book", 2, &[log.change(3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+
+    // The new writer, at a raised epoch: 4 committed and told to nobody,
+    // and nothing written after it.
+    *log.state.lock().unwrap() = (4, 4, 3);
+    until("4 read from the new writer", || {
+        followed.heads().get("P0") == Some(&4)
+    })
+    .await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4]);
+    assert!(applied.resets.lock().unwrap().is_empty());
+}
+
+/// A page lost on the way -- the tail is at most once -- of a partition not
+/// written again: no later page says one was missed, and the reader's
+/// writer never stopped answering. The first read naming it waits out its
+/// bound and is answered from the primary, which proves the reader behind;
+/// its follower then reads what it lacks from the writer, and the next read
+/// is its own record's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_a_read_proved_behind_its_primary_reads_what_it_lacks() {
+    let bus = Arc::new(Bus::single(
+        "member-test-left-behind",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Failing {
+        state: Mutex::new((2, u64::MAX, 2)),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    let record = log.clone();
+    let primary = meridian_bus::read_after::AllHeads(move || {
+        let head = record.state.lock().unwrap().0;
+        Ok(std::collections::BTreeMap::from([("P0".to_string(), head)]))
+    });
+    let member = Member::reader_of("bor", "book", Duration::from_millis(300));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(primary))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    // Reconciled with its primary as its writer first answered: nothing
+    // lacking then.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 3 committed, its page lost; the epoch as it was, every ask answered.
+    log.state.lock().unwrap().0 = 3;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        followed.heads().get("P0"),
+        Some(&2),
+        "nothing tells the reader of the page it missed"
+    );
+    let naming = |sequence| meridian_pb::v1::Watermark {
+        partitions: vec![meridian_pb::v1::PartitionSequence {
+            partition: "P0".into(),
+            sequence,
+        }],
+    };
+    let reads = bus.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming(3))
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::FromPrimary));
+    until("3 read from the writer", || {
+        followed.heads().get("P0") == Some(&3)
+    })
+    .await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3]);
+    assert!(applied.resets.lock().unwrap().is_empty());
+    let reads = bus.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming(3))
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::Here));
+}
+
 /// A writer's log one change of which no longer matches its digest (bit
 /// rot): read for it, refused; asked for its head, answered.
 struct Rotten {
