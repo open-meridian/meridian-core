@@ -17,6 +17,15 @@ junit = { path = "junit.xml", store-success-output = false, store-failure-output
 failure-output = "immediate-final"
 fail-fast = true
 
+# A unit test that hangs fails its run in two minutes: said slow at one,
+# ended at two. Without it a test spinning for good held the pre-push gate
+# for over two hours, saying only SLOW (2026-11-15: meridian-changes,
+# a_leader_that_panics_hands_the_lead_on). Unit tests alone: the Postgres
+# tests keep their own time.
+[[profile.default.overrides]]
+filter = 'kind(lib)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # The book's snapshot tests share one process's lock under libtest
 # (crates/bor/tests/postgres.rs, REBUILDS): under nextest each test is its
 # own process, so its binary's tests run one at a time instead.

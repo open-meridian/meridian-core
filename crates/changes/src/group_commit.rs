@@ -241,16 +241,26 @@ mod tests {
         assert!(!lane.state().leading);
     }
 
+    /// The leader's transaction panics with a write waiting behind it: the
+    /// lead is handed to that write, which commits.
+    ///
+    /// The second write joins only once the first's transaction runs, so it
+    /// waits behind it. Told only that the lane had a leader, it could join
+    /// before the leader took its batch, be taken into that batch, and
+    /// leave the leader's transaction waiting for a write that never came:
+    /// the test spun for good (a pre-push gate, 2026-11-15, over two hours).
     #[test]
     fn a_leader_that_panics_hands_the_lead_on() {
         let lane: Arc<Lane<u32, u32>> = Arc::new(Lane::default());
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = {
-            let lane = Arc::clone(&lane);
+            let (lane, running) = (Arc::clone(&lane), Arc::clone(&running));
             std::thread::spawn(move || {
                 lane.commit(
                     1,
                     1,
                     |_| {
+                        running.store(true, std::sync::atomic::Ordering::SeqCst);
                         while lane.waiting() < 1 {
                             std::thread::yield_now();
                         }
@@ -260,7 +270,7 @@ mod tests {
                 )
             })
         };
-        while !lane.state().leading {
+        while !running.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::yield_now();
         }
         let second = {
@@ -269,5 +279,54 @@ mod tests {
         };
         assert!(first.join().is_err());
         assert_eq!(second.join().unwrap(), 2, "the next write still commits");
+        assert!(!lane.state().leading);
+    }
+
+    /// A write taken into the batch whose transaction panics is answered
+    /// `gone`, never left waiting, and the lane leads again after it.
+    #[test]
+    fn a_write_in_a_batch_whose_leader_panics_is_answered_gone() {
+        let lane: Arc<Lane<u32, u32>> = Arc::new(Lane::default());
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The first write's transaction runs until two more wait: they are
+        // the next batch, led by the second.
+        let first = {
+            let (lane, running) = (Arc::clone(&lane), Arc::clone(&running));
+            std::thread::spawn(move || {
+                lane.commit(
+                    1,
+                    1,
+                    |batch| {
+                        running.store(true, std::sync::atomic::Ordering::SeqCst);
+                        while lane.waiting() < 2 {
+                            std::thread::yield_now();
+                        }
+                        batch
+                    },
+                    || 0,
+                )
+            })
+        };
+        while !running.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let second = {
+            let lane = Arc::clone(&lane);
+            std::thread::spawn(move || {
+                lane.commit(2, 1, |_| panic!("the batch's transaction panicked"), || 0)
+            })
+        };
+        while lane.waiting() < 1 {
+            std::thread::yield_now();
+        }
+        let third = {
+            let lane = Arc::clone(&lane);
+            std::thread::spawn(move || lane.commit(3, 1, |b| b, || 99))
+        };
+        assert_eq!(first.join().unwrap(), 1);
+        assert!(second.join().is_err());
+        assert_eq!(third.join().unwrap(), 99, "answered gone, not left waiting");
+        assert!(!lane.state().leading);
+        assert_eq!(lane.commit(4, 1, |b| b, || 0), 4, "the lane leads again");
     }
 }
