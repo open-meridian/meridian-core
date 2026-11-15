@@ -3767,13 +3767,35 @@ class Dashboard:
             "redirect_uri": self.CALLBACK, "client_id": client_id, "resource": resource})
         if status != 200:
             raise SystemExit(f"the code was not exchanged: {status}")
-        self.access = json.loads(said)["access_token"]
+        granted = json.loads(said)
+        self.access = granted["access_token"]
+        self.refresh, self.client_id, self.resource = granted.get("refresh_token"), client_id, resource
+
+    def refreshed(self):
+        """Her client's access token refreshed, as a client does when it is
+        told its token has expired: by its refresh token, or, given none or
+        refused, authorised again. The ha run outlasts an access token's
+        life (PR CI 43669650813: "/mcp answered 401 ... the access token has
+        expired; refresh it", 29 minutes in)."""
+        if getattr(self, "refresh", None):
+            status, said, _ = self.send("POST", "/oauth/token", fields={
+                "grant_type": "refresh_token", "refresh_token": self.refresh,
+                "client_id": self.client_id, "resource": self.resource})
+            if status == 200:
+                granted = json.loads(said)
+                self.access = granted["access_token"]
+                self.refresh = granted.get("refresh_token") or self.refresh
+                return
+        self.connect()
 
     def call(self, tool, arguments):
         """A tool called as her client: its structured answer."""
-        status, said, _ = self.send("POST", "/mcp", body={
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}},
-            bearer=self.access)
+        asked = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": tool, "arguments": arguments}}
+        status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
+        if status == 401 and "expired" in said:
+            self.refreshed()
+            status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
         if status != 200:
             raise SystemExit(f"{tool}: /mcp answered {status}: {said[:400]}")
         return (json.loads(said).get("result") or {}).get("structuredContent") or {}
