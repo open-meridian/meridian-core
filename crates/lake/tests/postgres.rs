@@ -8271,6 +8271,60 @@ fn m11_a_range_is_moved_home_only_once_every_member_seen_runs_the_sweeps_revisio
     assert!(tip(1).is_some_and(|home| home.head >= 1));
 }
 
+/// A range's move by hand to another database waits for the lake's rollout
+/// too (step 3d; sections 6.4 and 6.8; ruled 2026-11-15): its reply said it
+/// had begun, and it runs in the background once every member seen runs
+/// the mover's revision. The count alone raised, a member reading one
+/// database still seen: the move waits; that member gone, it runs.
+#[test]
+fn m11_a_ranges_move_by_hand_to_another_database_waits_for_the_rollout() {
+    use meridian_changes::members::revision;
+    use meridian_lake::partition_moves::{Asked, Ended};
+    let a = across("m11-hand", true);
+    let lower = a.lower();
+    let (before, after) = (
+        revision("0.1.540", 1, 2, None),
+        revision("0.1.540", 2, 2, None),
+    );
+    let within = std::time::Duration::from_secs(6);
+    let old_member = |seen_at: i64| {
+        a.zeros[0]
+            .member_seen("lake-group-1-old", &before, 1, seen_at)
+            .unwrap()
+    };
+    old_member(SystemClock.now_ns());
+    let mover = Arc::new(a.mover().waiting_for_rollout(after, within));
+    let moving = {
+        let (mover, lower) = (mover.clone(), lower.clone());
+        std::thread::spawn(move || {
+            assert!(mover.begin(&lower));
+            mover.run(
+                &lower,
+                1,
+                &Asked {
+                    by_hand: true,
+                    moved_by: "admin-1".into(),
+                    reason: "moved by hand during a rollout".into(),
+                },
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !moving.is_finished(),
+        "the range's move waits while a member reads one database"
+    );
+    assert!(
+        a.heads(&lower)[1].is_none(),
+        "nothing of it in the other database yet"
+    );
+    // That member gone: its row last seen before the interval.
+    old_member(SystemClock.now_ns() - within.as_nanos() as i64 - 1_000_000_000);
+    let ended = moving.join().unwrap().unwrap();
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    assert!(a.heads(&lower)[1].is_some(), "moved to database 1");
+}
+
 /// A writer group's place in the write-ahead stream, committed in the
 /// first database before the lake's database count was raised (step 3d;
 /// "lake loss is re-sent, never silent"): its member over two databases

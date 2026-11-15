@@ -2797,6 +2797,229 @@ async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_swee
     blocking(move || drop((zero, bus_zero)));
 }
 
+/// A move by hand to another database waits for the book's rollout too
+/// (step 3d; sections 6.4 and 6.8; ruled 2026-11-15): during one it would
+/// cause the read Elle caught, as the sweep's move home did. The count
+/// alone raised, a member reading one database still seen:
+/// - a partition's move, whose reply said it had begun, waits in the
+///   background and runs once that member is gone;
+/// - an account's move, answered when done, is refused OVERLOADED with a
+///   retry-after saying a rollout is in progress, nothing closed, and made
+///   once that member is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m11_a_move_by_hand_to_another_database_waits_for_the_rollout() {
+    use meridian_bor::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_bor::spread::Spread;
+    use meridian_changes::groups::Groups;
+    use meridian_changes::members::revision;
+    use meridian_domain::v1::{MoveAccountReply, MoveAccountRequest};
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    // The same release, the count alone raised: one database against two.
+    let (before, after) = (
+        revision("0.1.540", 1, 2, Some(4)),
+        revision("0.1.540", 2, 2, Some(4)),
+    );
+    let within = std::time::Duration::from_secs(6);
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(Spread::new(stores, groups).waiting_for_rollout(
+            after.clone(),
+            within,
+            Arc::new(meridian_clock::SystemClock),
+        ))
+    };
+    let (zero, one) = blocking(|| (spread(0), spread(1)));
+    let groups = Groups::new(0, 2).unwrap();
+    // Two accounts of group 1's, in database 1, in two of its partitions
+    // where it has two; a partition of group 0's, in database 0.
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-M11-HAND-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    blocking(|| one.place_first(&account, &account)).unwrap();
+    let from = blocking(|| Store::partition_of(one.as_ref(), &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (
+        bus("m11-hand-0", zero.clone()),
+        bus("m11-hand-1", one.clone()),
+    );
+    open(&bus_one, &account, &unique("INS-M11")).await;
+    let now = || meridian_clock::Clock::now_ns(&meridian_clock::SystemClock);
+    // A member started before the raise, seen: and then not.
+    let old_member = |seen_at: i64| {
+        blocking(|| {
+            zero.database(0)
+                .member_seen("bor-group-1-old", &before, 1, seen_at)
+                .unwrap()
+        })
+    };
+    let gone = || old_member(now() - within.as_nanos() as i64 - 1_000_000_000);
+    old_member(now());
+
+    // The account's move to group 0's partition, in database 0: refused.
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: to.clone(),
+        reason: "group 1 is busy".into(),
+    };
+    let refused = send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded)
+            && refused.contains("retry=")
+            && refused.contains("a rollout in progress"),
+        "{refused}"
+    );
+    blocking(|| {
+        assert!(
+            !one.journal(&account)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.idempotency_key.starts_with("account-move:")),
+            "nothing closed"
+        );
+    });
+
+    // Its partition's move to group 0, in database 0: begun, and waiting.
+    let mover = Arc::new(
+        Mover::new(
+            vec![zero.database(0).clone(), zero.database(1).clone()],
+            zero.database(0).groups(),
+            Settings {
+                switch: std::time::Duration::from_secs(10),
+                ..Default::default()
+            },
+            Arc::new(meridian_clock::SystemClock),
+        )
+        .waiting_for_rollout(after.clone(), within),
+    );
+    let moving = {
+        let (mover, partition) = (mover.clone(), from.clone());
+        std::thread::spawn(move || {
+            assert!(mover.begin(&partition));
+            mover.run(
+                &partition,
+                0,
+                &Asked {
+                    by_hand: true,
+                    moved_by: "admin-1".into(),
+                    reason: "moved by hand during a rollout".into(),
+                },
+            )
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        !moving.is_finished(),
+        "the partition's move waits while a member reads one database"
+    );
+    // The account's move, while that member is seen again and again: still
+    // refused, the same way.
+    old_member(now());
+    assert!(send(
+        &bus_one,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &request,
+        Some(PERSON),
+    )
+    .await
+    .is_err_and(|refused| refused.contains("a rollout in progress")));
+    // That member gone: the partition's move runs.
+    gone();
+    let ended = blocking(|| moving.join().unwrap()).unwrap();
+    match &ended {
+        Ended::Moved(moved) => assert_eq!((moved.from_group, moved.to_group), (1, 0), "{moved:?}"),
+        other => panic!("{other:?}"),
+    }
+    // And an account's move across databases is made: back to a partition
+    // of group 1's, in database 1, from where its partition now is.
+    let back = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 1 && *partition != from)
+        .or_else(|| Some(to.clone()))
+        .unwrap();
+    blocking(|| {
+        for member in [&zero, &one] {
+            PostgresStore::read_owners_from(&[
+                member.database(0).clone(),
+                member.database(1).clone(),
+            ])
+            .unwrap();
+        }
+    });
+    let request = MoveAccountRequest {
+        account_id: account.clone(),
+        target_partition: back.clone(),
+        reason: "the rollout is done".into(),
+    };
+    // Closed by the group that writes it now, opened by the other.
+    let mut moved = None;
+    let mut said = Vec::new();
+    for bus in [&bus_zero, &bus_one, &bus_zero, &bus_one] {
+        match send(
+            bus,
+            meridian_bor::moves::MOVE_ACCOUNT,
+            &request,
+            Some(PERSON),
+        )
+        .await
+        {
+            Ok(reply) => {
+                moved = MoveAccountReply::decode(reply.as_slice()).unwrap().moved;
+                break;
+            }
+            Err(refused) => said.push(refused),
+        }
+    }
+    let moved = moved.unwrap_or_else(|| panic!("moved once the rollout was complete: {said:?}"));
+    assert_eq!(moved.to_partition, back);
+    assert!(moved.opening_sequence > 0);
+    blocking(move || drop((zero, one, mover)));
+    drop((bus_zero, bus_one));
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the

@@ -305,6 +305,10 @@ impl Store for Writer {
         self.inner.warm_account(account_id, target_partition)
     }
 
+    fn rollout_holds(&self, account_id: &str, target_partition: &str) -> Result<Option<String>> {
+        self.inner.rollout_holds(account_id, target_partition)
+    }
+
     fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
         self.inner.control_records_owed()
     }

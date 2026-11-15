@@ -668,6 +668,17 @@ pub trait Store: Send + Sync {
         0
     }
 
+    /// Why an account's move to `target_partition` must wait for the book's
+    /// rollout (step 3d; ruled 2026-11-15): the member seen lately that
+    /// runs another revision than this one, where the move would take the
+    /// account to another database -- a member reading fewer databases
+    /// would answer the account where it was as empty. None where nothing
+    /// holds it: within one database, or every member seen has rolled.
+    fn rollout_holds(&self, account_id: &str, target_partition: &str) -> Result<Option<String>> {
+        let _ = (account_id, target_partition);
+        Ok(None)
+    }
+
     /// An account's move warmed (step 3d; section 6.8): where its target
     /// partition is in another database, the account's entries copied there
     /// before the close, and the copy compared with the source (VDiff). None

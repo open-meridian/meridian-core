@@ -41,6 +41,11 @@ pub struct Spread {
     /// there from then on, as only a move takes it away -- to another
     /// group, so another owner (step 3d; ruled 2026-11-14).
     settled: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
+    /// The revision this member runs and how recently a member must have
+    /// been seen to be waited on (step 3d; ruled 2026-11-15): an account's
+    /// move to another database waits until every member seen within that
+    /// long runs it. None set, nothing is waited on.
+    rollout: Option<(String, std::time::Duration, Arc<dyn meridian_clock::Clock>)>,
 }
 
 /// How many times an act is routed again to the database its partition's
@@ -128,7 +133,21 @@ impl Spread {
             stores,
             groups,
             settled: Default::default(),
+            rollout: None,
         }
+    }
+
+    /// An account is moved to another database only once every member of
+    /// the book seen within `within`, by `clock`, runs `revision`, this
+    /// member's own (step 3d; ruled 2026-11-15).
+    pub fn waiting_for_rollout(
+        mut self,
+        revision: String,
+        within: std::time::Duration,
+        clock: Arc<dyn meridian_clock::Clock>,
+    ) -> Self {
+        self.rollout = Some((revision, within, clock));
+        self
     }
 
     /// How many databases.
@@ -546,6 +565,25 @@ impl Store for Spread {
 
     fn group_of_partition(&self, partition: &str) -> u32 {
         self.groups.owner(partition)
+    }
+
+    fn rollout_holds(&self, account_id: &str, target_partition: &str) -> Result<Option<String>> {
+        let Some((revision, within, clock)) = &self.rollout else {
+            return Ok(None);
+        };
+        let from = self.holding(account_id);
+        let to = self.database(self.of(target_partition));
+        if Arc::ptr_eq(from, to) {
+            return Ok(None);
+        }
+        let behind =
+            self.stores[0].members_behind(revision, clock.now_ns(), within.as_nanos() as i64)?;
+        Ok(behind.first().map(|member| {
+            format!(
+                "member {} runs revision {}, and this one {revision}",
+                member.member, member.revision
+            )
+        }))
     }
 
     fn warm_account(

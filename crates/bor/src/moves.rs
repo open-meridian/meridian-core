@@ -399,6 +399,16 @@ pub fn move_account_with(
             ));
         }
         Standing::In(_) => {
+            // To another database, only once the book's rollout is
+            // complete (ruled 2026-11-15): until then nothing is closed,
+            // and it is answered OVERLOADED with a retry-after, as a move
+            // aborted for lag is.
+            if let Some(behind) = store.rollout_holds(account, target)? {
+                return Err(StoreError::Held(format!(
+                    "the move of account {account} to {target} waits for a rollout in \
+                     progress: {behind}; the account stays in {placed}; ask again"
+                )));
+            }
             // Gate: the target's lag under readyLagMs within switchSeconds
             // (section 6.8); else aborted before anything is held.
             let gate = std::time::Instant::now();

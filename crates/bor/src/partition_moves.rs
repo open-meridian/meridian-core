@@ -146,6 +146,44 @@ impl Mover {
         }
     }
 
+    /// A partition's move by hand to another database waits here until the
+    /// book's rollout is complete (step 3d; ruled 2026-11-15): its reply
+    /// said the move had begun, and it runs once no member seen lately runs
+    /// another revision -- one that reads fewer databases would answer for
+    /// the partition where it was as though it held nothing. Said once.
+    fn wait_for_rollout(&self, partition: &str) {
+        let Some((revision, within)) = &self.rollout else {
+            return;
+        };
+        let mut said = false;
+        loop {
+            let behind = self.stores[0].members_behind(
+                revision,
+                self.clock.now_ns(),
+                within.as_nanos() as i64,
+            );
+            match behind {
+                Ok(behind) if behind.is_empty() => return,
+                Ok(behind) if !said => tracing::info!(
+                    partition,
+                    revision,
+                    member = behind[0].member,
+                    runs = behind[0].revision,
+                    "a partition's move to another database waits for the rollout: a member \
+                     seen lately runs another revision"
+                ),
+                Err(failed) if !said => tracing::warn!(
+                    partition,
+                    %failed,
+                    "a partition's move to another database waits: the members were not read"
+                ),
+                _ => {}
+            }
+            said = true;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
     fn database_of(&self, group: u32) -> &Arc<PostgresStore> {
         &self.stores
             [meridian_changes::databases::of_group(group, self.stores.len() as u32) as usize]
@@ -282,6 +320,18 @@ impl Mover {
     /// The move, start to end, after [`Mover::check`] and [`Mover::begin`]:
     /// how it ended, its record made, not yet journalled.
     pub fn run(&self, partition: &str, target: u32, asked: &Asked) -> Result<Ended> {
+        // To another database than the one it is written in: once every
+        // member reads both.
+        if self.rollout.is_some() && self.stores.len() > 1 {
+            let from = self.owner_now(partition)?;
+            let written = match self.misplaced(partition, from)? {
+                Some(d) => &self.stores[d],
+                None => self.database_of(from),
+            };
+            if !Arc::ptr_eq(written, self.database_of(target)) {
+                self.wait_for_rollout(partition);
+            }
+        }
         self.run_from(partition, target, asked, None)
     }
 

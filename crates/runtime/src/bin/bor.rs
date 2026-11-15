@@ -186,6 +186,15 @@ fn run() -> Result<(), String> {
         )
         .map(Arc::new)
     };
+    // The revision this member runs (step 3d; ruled 2026-11-15): the
+    // release's version and each count that changes where it reads or
+    // writes.
+    let revision = meridian_changes::members::revision(
+        meridian_runtime::VERSION,
+        databases.count(),
+        groups.count(),
+        Some(partitions),
+    );
     let mut stores = Vec::new();
     for (d, url) in databases.urls().iter().enumerate() {
         stores.push(connect(d, url)?);
@@ -199,7 +208,15 @@ fn run() -> Result<(), String> {
             own,
             "the book writes its group's database and reads every one"
         );
-        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+        // An account moved by hand to another database waits for the
+        // rollout, as the sweep's moves home do.
+        Arc::new(
+            meridian_bor::spread::Spread::new(stores, groups).waiting_for_rollout(
+                revision.clone(),
+                meridian_runtime::member::seen_every_and_within().1,
+                clock(),
+            ),
+        )
     } else {
         postgres.clone()
     };
@@ -236,12 +253,6 @@ fn run() -> Result<(), String> {
         // as long as it runs, whatever its mode (step 3d; `book_member`,
         // ruled 2026-11-15): what the control group's sweep waits on before
         // it moves a partition home to another database.
-        let revision = meridian_changes::members::revision(
-            meridian_runtime::VERSION,
-            databases.count(),
-            groups.count(),
-            Some(partitions),
-        );
         {
             let home = Arc::clone(&every_database[0]);
             meridian_runtime::member::keep_seen(
