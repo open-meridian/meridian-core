@@ -175,11 +175,50 @@ pub struct Counted {
     /// What its parts committed in another database, before this batch,
     /// did.
     pub already: Counts,
-    /// Taken again after the group's position was taken back: its rows
-    /// found unchanged were counted when they were first committed, by this
-    /// group or by the group a range of it moved from, and are not counted
-    /// again.
-    pub again: bool,
+}
+
+impl Counted {
+    /// Whether a row of this write found unchanged in a range is counted,
+    /// `taken_from` the stream sequence the range's source had committed
+    /// through when the range last moved to this group
+    /// (`lake_partition.taken_from`; none where it never moved): its row in
+    /// a write at or before that was committed, and counted, by the source,
+    /// and the copy the move brought is what this group finds unchanged; in
+    /// a later write it is a row sent again unchanged, which nobody has
+    /// counted.
+    pub fn counts_unchanged(&self, taken_from: Option<u64>) -> bool {
+        taken_from.is_none_or(|taken| self.sequence > taken)
+    }
+
+    /// What `done`, a part of this write in `dataset`, did, as its group
+    /// keeps it: every row recorded or restated, and each row found
+    /// unchanged that [`Counted::counts_unchanged`]. A write this group
+    /// takes again finds the rows its first take counted unchanged too:
+    /// those are taken off where the part is kept, by what it holds
+    /// already.
+    pub fn did(
+        &self,
+        dataset: &str,
+        done: &Recorded,
+        taken_from: &dyn Fn(&str) -> Option<u64>,
+    ) -> Counts {
+        let named: u32 = done.unchanged_in.iter().map(|(_, rows)| *rows).sum();
+        // Rows found unchanged that no range was named for: the dataset's
+        // own full range.
+        let whole = (dataset.to_string(), done.unchanged.saturating_sub(named));
+        let unchanged = done
+            .unchanged_in
+            .iter()
+            .chain(std::iter::once(&whole))
+            .filter(|(range, _)| self.counts_unchanged(taken_from(range)))
+            .map(|(_, rows)| *rows)
+            .sum();
+        Counts {
+            recorded: done.recorded,
+            restated: done.restated,
+            unchanged,
+        }
+    }
 }
 
 /// What a group's rows of one write did (`lake_write_ahead_part`).
@@ -270,6 +309,10 @@ pub struct Recorded {
     /// Each row's partition, in step with `rows` (step 3d; section 6.1):
     /// empty where every row is in the dataset's own full range.
     pub partitions: Vec<String>,
+    /// How many rows were found unchanged in each range, where its ranges
+    /// were written apart (step 3d; spec 6.7): what a write's part counts
+    /// by the range ([`Counted::did`]).
+    pub unchanged_in: Vec<(String, u32)>,
 }
 
 impl Recorded {
@@ -287,6 +330,11 @@ impl Recorded {
             self.partitions
                 .extend(std::iter::repeat_n(partition.to_string(), more.rows.len()));
         }
+        if more.unchanged > 0 {
+            self.unchanged_in
+                .push((partition.to_string(), more.unchanged));
+        }
+        self.unchanged_in.extend(more.unchanged_in);
         self.rows.extend(more.rows);
         self.recorded += more.recorded;
         self.restated += more.restated;

@@ -159,10 +159,10 @@ pub struct Written {
     pub topic: String,
     pub envelope: Envelope,
     pub after_gap: Option<Dropped>,
-    /// Its sequence in the stream, and whether it is taken again, where its
-    /// dataset's ranges span writer groups (step 3d; spec 6.7): what this
-    /// group's rows of it do is kept with them, for its answer.
-    pub counted: Option<(u64, bool)>,
+    /// Its sequence in the stream, where its dataset's ranges span writer
+    /// groups (step 3d; spec 6.7): what this group's rows of it do is kept
+    /// with them, for its answer.
+    pub counted: Option<u64>,
 }
 
 /// What [`crate::service::Lake::record_written`] did, once committed: each
@@ -187,10 +187,6 @@ pub struct Writer {
     from: Option<u64>,
     dropped: Vec<Dropped>,
     valid: BTreeMap<String, i64>,
-    /// The sequence the writer had committed through when its position was
-    /// last taken back (a move's switch; spec 6.1): a write at or before it
-    /// is taken again.
-    again_through: u64,
 }
 
 /// Whether `dataset`'s ranges span writer groups as this member last read
@@ -219,7 +215,6 @@ impl Writer {
             from: None,
             dropped,
             valid,
-            again_through: 0,
         })
     }
 
@@ -251,29 +246,7 @@ impl Writer {
         // position back so that it takes the range's rows as its own from
         // there (step 3d; spec 6.1).
         self.lake.read_owners_again()?;
-        let before = self.position.map_or(0, |at| at.sequence);
         self.position = self.lake.write_ahead_position(&self.stream)?;
-        // Taken back: what it committed past the new position is taken
-        // again, and counted as such (spec 6.7).
-        // Up to the furthest any group has committed: a range moved in
-        // brought its rows of the writes its source had passed, which this
-        // group finds unchanged and its source counted. (The source's place
-        // at the switch itself is not kept: a row sent again unchanged in a
-        // write between that and its place now is not counted either.)
-        if self.position.map_or(0, |at| at.sequence) < before {
-            let groups = self.lake.groups();
-            let furthest = (0..groups.count())
-                .filter_map(|group| {
-                    self.lake
-                        .group_position(&group_key(&self.base, group), group)
-                        .ok()
-                        .flatten()
-                })
-                .map(|at| at.sequence)
-                .max()
-                .unwrap_or(0);
-            self.again_through = self.again_through.max(before).max(furthest);
-        }
         let (dropped, valid) = self.lake.write_ahead_found(&self.stream)?;
         self.dropped = dropped;
         self.valid = valid;
@@ -381,7 +354,7 @@ impl Writer {
                 // Every group's part of such a write is kept, the answering
                 // group's too: an answer counts each part as committed,
                 // whichever take committed it (spec 6.7).
-                counted: spans.then_some((write.sequence, write.sequence <= self.again_through)),
+                counted: spans.then_some(write.sequence),
             });
         }
         let batch = WriteAheadBatch {

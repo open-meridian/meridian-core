@@ -189,6 +189,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "member",
         sql: include_str!("../migrations/0027_member.sql"),
     },
+    // Where a range's source stood in the stream at its last move (step
+    // 3d; `taken_from` ruled 2026-11-15): what its target leaves uncounted.
+    Migration {
+        version: 28,
+        name: "taken_from",
+        sql: include_str!("../migrations/0028_taken_from.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

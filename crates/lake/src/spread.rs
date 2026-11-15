@@ -62,6 +62,7 @@ fn merged(dataset: &str, into: &mut Recorded, more: Recorded) {
         named.resize(more.rows.len(), dataset.to_string());
         into.partitions.extend(named);
     }
+    into.unchanged_in.extend(more.unchanged_in);
     into.rows.extend(more.rows);
     into.recorded += more.recorded;
     into.restated += more.restated;
@@ -656,6 +657,11 @@ impl Store for Spread {
             (0..batch.parts.len()).map(|_| None).collect();
         let mut places = Vec::new();
         let mut here = Vec::new();
+        let datasets: Vec<String> = batch
+            .parts
+            .iter()
+            .map(|(dataset, _)| dataset.clone())
+            .collect();
         for (at, (dataset, rows)) in std::mem::take(&mut batch.parts).into_iter().enumerate() {
             if self.write_dbs(&dataset, &rows).iter().all(|d| *d == own) {
                 places.push(at);
@@ -680,15 +686,26 @@ impl Store for Spread {
             return Err(refused);
         }
         // Each counted write's parts by their places here; what its parts
-        // committed elsewhere did, counted with them (spec 6.7).
+        // committed elsewhere did, counted with them (spec 6.7), each range
+        // by where its source stood when it last moved to this group.
+        let taken_from = |range: &str| {
+            self.stores
+                .iter()
+                .filter_map(|store| store.taken_from(&[range.to_string()]).ok())
+                .filter_map(|taken| taken.get(range).copied())
+                .max()
+        };
         for counted in &mut batch.counted {
             let mut kept = Vec::new();
             for place in std::mem::take(&mut counted.parts) {
                 match places.iter().position(|at| *at == place) {
                     Some(here) => kept.push(here),
                     None => {
-                        if let Some(Some(Ok(done))) = answers.get(place) {
-                            counted.already.add(crate::store::Counts::of(done));
+                        if let (Some(Some(Ok(done))), Some(dataset)) =
+                            (answers.get(place), datasets.get(place))
+                        {
+                            let did = counted.did(dataset, done, &taken_from);
+                            counted.already.add(did);
                         }
                     }
                 }

@@ -2504,6 +2504,11 @@ impl PostgresStore {
         // Each dataset's parts as one batch of it, the datasets taken in
         // their names' order: every batch takes the heads' locks in one order.
         let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
+        let part_datasets: Vec<String> = batch
+            .parts
+            .iter()
+            .map(|(dataset, _)| dataset.clone())
+            .collect();
         for (place, (dataset, rows)) in batch.parts.into_iter().enumerate() {
             by_dataset.entry(dataset).or_default().push((place, rows));
         }
@@ -2530,19 +2535,43 @@ impl PostgresStore {
         }
         // What this group's rows of each write split across groups did
         // (step 3d; spec 6.7): with its rows and its position, for the
-        // group answering the write to add. A write taken again adds what
-        // it committed anew; its rows found unchanged were counted when
-        // they were first committed.
+        // group answering the write to add. A row found unchanged is
+        // counted but where another take counted it already: the source of
+        // a range moved in (`taken_from`), or this group's own earlier take
+        // of a write taken again -- as many rows as its part holds
+        // already, each of which this take found unchanged.
+        let taken_from = if batch.counted.is_empty() {
+            BTreeMap::new()
+        } else {
+            let ranges: Vec<String> = answered
+                .iter()
+                .flatten()
+                .flat_map(|part| part.unchanged_in.iter().map(|(range, _)| range.clone()))
+                .chain(part_datasets.iter().cloned())
+                .collect();
+            moves::taken_from_of(&mut tx, &ranges)?
+        };
         for counted in &batch.counted {
             let mut did = counted.already;
             for place in &counted.parts {
-                if let Some(Ok(part)) = answered.get(*place) {
-                    did.add(crate::store::Counts::of(part));
+                if let (Some(Ok(part)), Some(dataset)) =
+                    (answered.get(*place), part_datasets.get(*place))
+                {
+                    did.add(counted.did(dataset, part, &|range| taken_from.get(range).copied()));
                 }
             }
-            if counted.again {
-                did.unchanged = 0;
+            if did.none() {
+                continue;
             }
+            let held: i64 = tx
+                .query_opt(
+                    "SELECT (recorded + restated + unchanged)::bigint FROM lake_write_ahead_part
+                      WHERE stream = $1 AND sequence = $2",
+                    &[&batch.stream, &(counted.sequence as i64)],
+                )
+                .map_err(unavailable)?
+                .map_or(0, |row| row.get(0));
+            did.unchanged = did.unchanged.saturating_sub(held.max(0) as u32);
             if did.none() {
                 continue;
             }
@@ -2553,6 +2582,7 @@ impl PostgresStore {
                  ON CONFLICT (stream, sequence) DO UPDATE
                     SET recorded = lake_write_ahead_part.recorded + EXCLUDED.recorded,
                         restated = lake_write_ahead_part.restated + EXCLUDED.restated,
+                        unchanged = lake_write_ahead_part.unchanged + EXCLUDED.unchanged,
                         committed_at_ns = EXCLUDED.committed_at_ns",
                 &[
                     &batch.stream,

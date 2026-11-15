@@ -1,0 +1,15 @@
+-- Where a range's source stood in the write-ahead stream when the range
+-- last moved to its group (step 3d; spec/a-deployment-scales-out-and-
+-- fails-over-by-configuration sections 6.1, 6.7 and 6.8; `taken_from
+-- bigint` ruled 2026-11-15): the stream sequence the source had committed
+-- through at the switch, written in the switch's own transaction where the
+-- range stays in one database, or in the target's open where it crosses
+-- two. NULL where the range never moved between groups.
+--
+-- A switch takes the target's position back, and the target takes the
+-- stream's writes again from there. A row of the range it finds unchanged
+-- in a write at or before this sequence was committed, and counted, by the
+-- source; one in a later write is a row sent again unchanged, which nobody
+-- has counted. The target's part of the write's answer
+-- (`lake_write_ahead_part`) leaves out the first and counts the second.
+ALTER TABLE lake_partition ADD COLUMN IF NOT EXISTS taken_from bigint;

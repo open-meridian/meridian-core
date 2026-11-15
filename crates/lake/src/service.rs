@@ -2737,7 +2737,7 @@ impl Lake {
                         let at = valid.entry(dataset.clone()).or_insert(latest);
                         *at = (*at).max(latest);
                     }
-                    if let Some((sequence, again)) = write.counted {
+                    if let Some(sequence) = write.counted {
                         match batch.counted.last_mut() {
                             Some(counted) if counted.sequence == sequence => {
                                 counted.parts.push(batch.parts.len())
@@ -2745,7 +2745,6 @@ impl Lake {
                             _ => batch.counted.push(crate::store::Counted {
                                 sequence,
                                 parts: vec![batch.parts.len()],
-                                again,
                                 ..Default::default()
                             }),
                         }

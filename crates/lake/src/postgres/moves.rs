@@ -362,10 +362,15 @@ impl PostgresStore {
             if from != target {
                 take_back(&mut tx, &ours_key, at)?;
             }
+            // Where the source stood, kept with the range (`taken_from`):
+            // what the target leaves uncounted of the writes it takes again.
+            let taken_from = at.filter(|_| from != target).map(|at| at.sequence as i64);
             let switched = tx
                 .execute(
-                    "UPDATE lake_partition SET writer_group = $2, epoch = $3 WHERE dataset = $1",
-                    &[&partition, &(target as i32), &(epoch as i64)],
+                    "UPDATE lake_partition
+                        SET writer_group = $2, epoch = $3, taken_from = coalesce($4, taken_from)
+                      WHERE dataset = $1",
+                    &[&partition, &(target as i32), &(epoch as i64), &taken_from],
                 )
                 .and_then(|_| tx.commit());
             return match switched {
@@ -558,6 +563,25 @@ fn range_digest(
     Ok((row.get(0), row.get(1)))
 }
 
+/// Each of `ranges` that last moved to its group from another, with the
+/// stream sequence its source had committed through then
+/// (`lake_partition.taken_from`).
+pub(crate) fn taken_from_of(
+    client: &mut impl GenericClient,
+    ranges: &[String],
+) -> Result<BTreeMap<String, u64>> {
+    Ok(client
+        .query(
+            "SELECT dataset, taken_from FROM lake_partition
+              WHERE dataset = ANY($1) AND taken_from IS NOT NULL",
+            &[&ranges],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| (row.get(0), row.get::<_, i64>(1) as u64))
+        .collect())
+}
+
 /// A writer group's committed place in the write-ahead stream, under `key`.
 fn stream_position(
     client: &mut impl GenericClient,
@@ -654,6 +678,11 @@ impl PostgresStore {
     /// `partition` and every range it was split from, itself first.
     pub fn lineage_of(&self, partition: &str) -> Result<Vec<String>> {
         lineage(&mut *self.conn()?, partition)
+    }
+
+    /// [`taken_from_of`], in this database.
+    pub fn taken_from(&self, ranges: &[String]) -> Result<BTreeMap<String, u64>> {
+        taken_from_of(&mut *self.conn()?, ranges)
     }
 
     pub fn moved_by_hand(&self) -> Result<BTreeMap<String, u32>> {
@@ -965,6 +994,14 @@ impl PostgresStore {
         .map_err(unavailable)?;
         if let Some((key, at)) = taken_back {
             take_back(&mut tx, key, at)?;
+            // Where the source stood, kept with the range (`taken_from`).
+            if let Some(at) = at {
+                tx.execute(
+                    "UPDATE lake_partition SET taken_from = $2 WHERE dataset = $1",
+                    &[&partition, &(at.sequence as i64)],
+                )
+                .map_err(unavailable)?;
+            }
         }
         tx.commit().map_err(unavailable)?;
         Ok(epoch.max(0) as u64)
