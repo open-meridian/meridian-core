@@ -2555,9 +2555,13 @@ impl PostgresStore {
             let mut did = counted.already;
             for place in &counted.parts {
                 if let (Some(Ok(part)), Some(dataset)) =
-                    (answered.get(*place), part_datasets.get(*place))
+                    (answered.get_mut(*place), part_datasets.get(*place))
                 {
-                    did.add(counted.did(dataset, part, &|range| taken_from.get(range).copied()));
+                    did.add(
+                        counted.did_and_answers(dataset, part, &|range| {
+                            taken_from.get(range).copied()
+                        }),
+                    );
                 }
             }
             if did.none() {

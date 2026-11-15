@@ -539,21 +539,26 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                         others.add(theirs);
                     }
                 }
-                // No group kept a part of it: said with what was waited on
-                // (PR CI 43680214054, ha: prices answered recorded 0,
-                // restated 0, unchanged 0 after a range's move between
-                // databases), so the member that answered names the path.
-                if own.is_none_or(|own| own.none()) && others.none() {
+                let again = lake.answer_again(payload, own, others, &wait.dataset)?;
+                // Answered counting no row at all -- neither a part any
+                // group kept nor what this take did itself: said with what
+                // was waited on, so the member that answered names the path
+                // (PR CI 43680214054 and 43684440785, ha: prices answered
+                // recorded 0, restated 0, unchanged 0 after a range's move
+                // between databases). Not said only because this group kept
+                // no part: it keeps none where its rows of the write did
+                // nothing it counts, and another group's part may count them.
+                if crate::service::counts_nothing(&again) {
                     tracing::warn!(
                         sequence = wait.sequence,
                         dataset = %wait.dataset,
                         group = mine,
                         waited_on = ?groups,
                         own_part = own.is_some(),
-                        "a write of the stream is answered with no group's part of it kept"
+                        "a write of the stream is answered counting none of its rows"
                     );
                 }
-                lake.answer_again(payload, own, others, &wait.dataset)
+                Ok::<_, String>(again)
             })
             .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
         } else {

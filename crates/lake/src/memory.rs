@@ -327,8 +327,9 @@ pub(crate) fn as_of(
 }
 
 impl Store for MemoryStore {
-    #[cfg(test)]
     fn read_owners_again(&self) -> Result<()> {
+        // One store, no ranges' rows to read: a test's stand-in for them.
+        #[cfg(test)]
         if let Some(read) = self.owners_read.lock().unwrap().as_ref() {
             read();
         }

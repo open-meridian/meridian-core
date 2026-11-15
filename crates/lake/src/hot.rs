@@ -800,6 +800,15 @@ impl Store for HotStore {
         self.inner.write_ahead_position(stream)
     }
 
+    /// The record's: the layer holds no view of the ranges' owners. Left to
+    /// the trait's nothing-to-read, a member behind the layer -- every one
+    /// the lake's binary builds -- never read a move it had not seen, and
+    /// took none of a range's rows that were now its own (PR CI
+    /// 43684440785, ha).
+    fn read_owners_again(&self) -> Result<()> {
+        self.inner.read_owners_again()
+    }
+
     fn group_position(
         &self,
         key: &str,

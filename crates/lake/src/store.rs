@@ -219,6 +219,25 @@ impl Counted {
             unchanged,
         }
     }
+
+    /// [`Counted::did`], and `done` left counting the same: a row found
+    /// unchanged that another take counted is not in the take's own answer
+    /// either. A group keeps no part where its rows of a write did nothing
+    /// it counts, and its answer is then the take's own: left as taken, the
+    /// group answering a write it took again after its range moved in
+    /// counted the row its source had counted (PR CI 43684440785's shape,
+    /// its answering group the move's target: recorded 1, unchanged 1 for
+    /// one row).
+    pub fn did_and_answers(
+        &self,
+        dataset: &str,
+        done: &mut Recorded,
+        taken_from: &dyn Fn(&str) -> Option<u64>,
+    ) -> Counts {
+        let did = self.did(dataset, done, taken_from);
+        done.unchanged = did.unchanged;
+        did
+    }
 }
 
 /// What a group's rows of one write did (`lake_write_ahead_part`).
@@ -959,10 +978,11 @@ pub trait Store: Send + Sync {
 
     /// The ranges' writer groups read again into the member's view (step
     /// 3d): by a write-ahead writer whose position a move took back, before
-    /// it takes the stream again. Nothing with one group.
-    fn read_owners_again(&self) -> Result<()> {
-        Ok(())
-    }
+    /// it takes the stream again. Nothing with one group. Every store says
+    /// its own, a layer in front of another asking the one behind it: with
+    /// a default here, the hot layer answered for the record and a member
+    /// behind it never read a move (PR CI 43684440785).
+    fn read_owners_again(&self) -> Result<()>;
 
     /// Writer group `group`'s position in the write-ahead stream, kept as
     /// `key` in the database it writes (step 3d): how far that group has

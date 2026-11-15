@@ -719,6 +719,13 @@ pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
     superseded
 }
 
+/// Whether `answer`, a write's `RecordObservationsReply`, counts no row:
+/// none recorded, restated or found unchanged.
+pub fn counts_nothing(answer: &[u8]) -> bool {
+    RecordObservationsReply::decode(answer)
+        .is_ok_and(|reply| reply.recorded + reply.restated + reply.unchanged == 0)
+}
+
 /// A write's rows as the lake records them, by the topic it was asked on
 /// (W10.4): the field its request names them by, each row as a row of its
 /// kind, and the want it answers. Every topic of

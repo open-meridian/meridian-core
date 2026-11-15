@@ -721,9 +721,9 @@ impl Store for Spread {
                     Some(here) => kept.push(here),
                     None => {
                         if let (Some(Some(Ok(done))), Some(dataset)) =
-                            (answers.get(place), datasets.get(place))
+                            (answers.get_mut(place), datasets.get(place))
                         {
-                            let did = counted.did(dataset, done, &taken_from);
+                            let did = counted.did_and_answers(dataset, done, &taken_from);
                             counted.already.add(did);
                         }
                     }

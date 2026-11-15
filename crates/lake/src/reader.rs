@@ -193,6 +193,11 @@ fn written() -> StoreError {
 }
 
 impl Store for ReaderStore {
+    /// A reader takes no write, so it holds no view of who writes a range.
+    fn read_owners_again(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn record(&self, _: &str, _: Vec<Observation>, _: i64) -> Result<Recorded> {
         Err(written())
     }

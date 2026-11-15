@@ -154,6 +154,12 @@ fn two_groups() -> Groups2 {
 /// before its handler runs, as the lake's binary sets it (the ownership
 /// pre-check decided 2026-11-13).
 fn two_groups_routing(pre_check: bool) -> Groups2 {
+    two_groups_built(pre_check, false)
+}
+
+/// [`two_groups_routing`]; with `hot`, each member's store is the hot
+/// layer in front of the record, as the lake's binary builds it.
+fn two_groups_built(pre_check: bool, hot: bool) -> Groups2 {
     let clock = Arc::new(ManualClock::at(NOW));
     let broker = Arc::new(GroupsBroker {
         inner: MemoryBackend::new(),
@@ -178,7 +184,14 @@ fn two_groups_routing(pre_check: bool) -> Groups2 {
                 service::owner_of_write(view, topic, envelope)
             });
         }
-        let lake = service::serve_grouped(bus, store.clone(), clock.clone(), view);
+        let serving: Arc<dyn Store> = if hot {
+            let layer = crate::hot::HotStore::new(store.clone(), crate::hot::Bounds::DEFAULT);
+            layer.for_group(view);
+            layer
+        } else {
+            store.clone()
+        };
+        let lake = service::serve_grouped(bus, serving, clock.clone(), view);
         lake.configured(&two_datasets());
     }
     let client = Arc::new(Bus::single("coinbase-1", broker.clone(), clock));
@@ -345,6 +358,36 @@ async fn a_write_handed_to_a_group_that_has_not_seen_its_range_move_is_counted()
     assert_eq!(named(&reply), ["coinbase-1:hourly"]);
     assert_eq!(g.store.heads().unwrap().get("coinbase-1:hourly"), Some(&1));
     assert_eq!(*g.broker.handed.lock().unwrap(), vec![1], "handed once");
+}
+
+/// The same behind the hot layer, as the lake's binary builds its store
+/// (PR CI 43684440785, ha: three prices answered recorded 0, restated 0,
+/// unchanged 0 after their range moved to group 1 in another database, and
+/// committed by neither group). The hot layer answered "read the ranges'
+/// owners again" itself, with the store trait's nothing-to-read, and never
+/// asked the record: a member behind it kept its stale view until its
+/// sweep, and took none of the rows that were now its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_handed_to_a_group_behind_the_hot_layer_that_has_not_seen_its_range_move_is_counted(
+) {
+    let g = two_groups_built(true, true);
+    let stale = g.views[1];
+    stale.assign("coinbase-1:hourly", Some(0));
+    g.store
+        .on_owners_read(move || stale.assign("coinbase-1:hourly", Some(1)));
+    let reply = write(&g, 0, vec![price("coinbase-1:hourly", "moved", "7")], "")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.recorded, reply.restated, reply.unchanged),
+        (1, 0, 0),
+        "its row counted"
+    );
+    assert_eq!(
+        g.store.heads().unwrap().get("coinbase-1:hourly"),
+        Some(&1),
+        "its row kept"
+    );
 }
 
 /// A write whose range a move's switch holds longer than its caller waits
