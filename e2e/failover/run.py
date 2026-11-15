@@ -4348,31 +4348,61 @@ def writer_groups(s):
                                   for kind in ("price", "order")), 300, every=3)
     s.check(writing, "writer groups: the driver's prices and orders acknowledged again at two groups")
     since_ns = since_ms * 1_000_000
-    # The lake: each group's datasets under its own epoch.
-    lake_one = psql("select epoch from lake_writer_group where writer_group = 1").strip()
-    control = psql("select epoch from lake_change_head where partition = 'control'").strip()
-    drive = psql("select epoch from lake_partition where dataset = 'drive-data:drive'").strip()
-    flood = psql("select epoch from lake_partition where dataset = 'drive-flood:drive'").strip()
+    # The lake: each group's datasets under its own epoch. Read in one
+    # statement, and once group 1 has settled: the upgrade rolls the
+    # database's members too, each new timeline has group 0's writer raise
+    # every group's epoch, and group 1's writer, fenced, takes over again.
+    # Between the two, group 1's row names an epoch nothing was ever written
+    # under, and three reads apart straddled that takeover's commit (PR CI
+    # 43684440785: "group 1 19, the dataset 20, control 19", 0 rows under
+    # 19, six seconds after the roll's third timeline).
+    def lake_groups():
+        own = "(select epoch from lake_writer_group where writer_group = 1)"
+        said = psql(
+            f"select coalesce({own}::text, ''), "
+            "coalesce((select epoch from lake_change_head where partition = 'control')::text, ''), "
+            "coalesce((select epoch from lake_partition where dataset = 'drive-data:drive')::text, ''), "
+            "coalesce((select epoch from lake_partition where dataset = 'drive-flood:drive')::text, ''), "
+            "(select count(*) from lake_row where dataset = 'drive-data:drive' "
+            f"and recorded_at_ns >= {since_ns} and epoch = {own})")
+        return (said.strip().split("|") + [""] * 5)[:5]
+
+    def lake_settled():
+        lake_one, control, drive, _, by_one = lake_groups()
+        return bool(lake_one) and drive == lake_one and control != lake_one and by_one.isdigit() and int(by_one) > 0
+
+    happens(lake_settled, 60)
+    lake_one, control, drive, flood, by_one = lake_groups()
     s.check(lake_one and drive == lake_one and control != lake_one,
             f"writer groups: the lake's group 1 owns drive-data:drive under its own epoch "
             f"(group 1 {lake_one or 'none'}, the dataset {drive}, control {control})")
     s.check(flood == control, f"writer groups: the lake's group 0 keeps drive-flood:drive under control's epoch "
             f"({flood} and {control})")
-    by_one = psql("select count(*) from lake_row where dataset = 'drive-data:drive' "
-                  f"and recorded_at_ns >= {since_ns} and epoch = {lake_one or 0}").strip()
     s.check(by_one.isdigit() and int(by_one) > 0,
             f"writer groups: the driver's prices committed by the lake's group 1 since ({by_one} rows)")
     owners = psql("select count(*) from lake_control_change where kind = 'meridian.v1.PartitionOwner'").strip()
     s.check(owners.isdigit() and int(owners) > 0,
             f"writer groups: the lake's datasets' groups recorded in its control partition ({owners} records)")
-    # The book: P0 group 1's, control group 0's, each its own epoch.
-    p0 = psql("select epoch from book_partition_head where partition = 'P0'").strip()
-    book_control = psql("select epoch from book_partition_head where partition = 'control'").strip()
+    # The book: P0 group 1's, control group 0's, each its own epoch. Read
+    # in one statement and once settled, as the lake's.
+    def book_groups():
+        p0 = "(select epoch from book_partition_head where partition = 'P0')"
+        said = psql(
+            f"select coalesce({p0}::text, ''), "
+            "coalesce((select epoch from book_partition_head where partition = 'control')::text, ''), "
+            "(select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
+            f"and committed_at_ns >= {since_ns} and partition = 'P0' and epoch = {p0})")
+        return (said.strip().split("|") + [""] * 3)[:3]
+
+    def book_settled():
+        p0, book_control, acted = book_groups()
+        return bool(p0) and bool(book_control) and p0 != book_control and acted.isdigit() and int(acted) > 0
+
+    happens(book_settled, 60)
+    p0, book_control, acted = book_groups()
     s.check(p0 and book_control and p0 != book_control,
             f"writer groups: the book's P0 (group 1's) and control (group 0's) under their own epochs "
             f"({p0} and {book_control})")
-    acted = psql("select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
-                 f"and committed_at_ns >= {since_ns} and partition = 'P0' and epoch = {p0 or 0}").strip()
     s.check(acted.isdigit() and int(acted) > 0,
             f"writer groups: the driver's orders committed in P0 by the book's group 1 since ({acted} entries)")
     # Handed on: each internal topic's messages to its group-1 queue group.

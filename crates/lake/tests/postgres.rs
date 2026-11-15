@@ -5227,6 +5227,107 @@ fn a_record_read_says_the_heads_of_the_snapshot_it_answered_from() {
     assert!(meridian_lake::postgres::snapshot_heads().is_none());
 }
 
+/// A new database timeline at two writer groups (contract v30, stage C;
+/// step 3d; PR CI 43684440785, ha, the writer groups phase: "the lake's
+/// group 1 owns drive-data:drive under its own epoch (group 1 19, the
+/// dataset 20, control 19)" and 0 rows under 19). Group 0's writer raises
+/// every group's epoch to one -- the control partition's, each dataset's
+/// and group 1's row alike -- and group 1's writer is fenced: nothing is
+/// ever committed under that epoch for group 1. Its takeover then raises
+/// its row and its datasets together, in one transaction, past it, and it
+/// commits under that. So the three epochs read in one statement are never
+/// apart, and what the failover run read -- apart, each side of that
+/// takeover's commit -- was two states, not one.
+#[test]
+fn a_new_database_timeline_at_two_writer_groups_fences_the_second_until_it_takes_over_again() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::timeline::Timeline;
+    use meridian_lake::store::StoreError;
+    let (url, migrated) = isolated("lake-groups-timeline");
+    drop(migrated);
+    let of_group = |group: u32| {
+        (0..)
+            .map(|n| unique(&format!("coinbase-1:t{n}")))
+            .find(|dataset| meridian_changes::groups::owner(dataset, 2) == group)
+            .unwrap()
+    };
+    let (zeros, ones) = (of_group(0), of_group(1));
+    let member = |group: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, 2).unwrap())
+    };
+    let (zero, one) = (member(0), member(1));
+    let subject = unique("LCL-BTC");
+    let row = |dataset: &str, key: &str| vec![close(dataset, key, &subject, "2026-10-01", 1)];
+    zero.adopt().unwrap();
+    let one_epoch = one.adopt().unwrap();
+    zero.record(&zeros, row(&zeros, "a"), 10).unwrap();
+    one.record(&ones, row(&ones, "a"), 10).unwrap();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As the failover run reads them, in one statement: group 1's row, the
+    // control partition, group 1's dataset, group 0's, and group 1's
+    // dataset's rows under group 1's row's epoch.
+    let mut read = || -> (i64, i64, i64, i64, i64) {
+        let row = admin
+            .query_one(
+                "SELECT (SELECT epoch FROM lake_writer_group WHERE writer_group = 1),
+                        (SELECT epoch FROM lake_change_head WHERE partition = 'control'),
+                        (SELECT epoch FROM lake_partition WHERE dataset = $1),
+                        (SELECT epoch FROM lake_partition WHERE dataset = $2),
+                        (SELECT count(*) FROM lake_row WHERE dataset = $1 AND epoch =
+                            (SELECT epoch FROM lake_writer_group WHERE writer_group = 1))",
+                &[&ones, &zeros],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+    };
+    let (own, control, theirs, _, under) = read();
+    assert_eq!(
+        (own, theirs, under),
+        (one_epoch as i64, one_epoch as i64, 1)
+    );
+    assert_ne!(control, own, "each group its own epoch");
+    assert_eq!(zero.follow_timeline().unwrap(), Timeline::First);
+    // A failover or a restore: group 0's writer, which holds the control
+    // partition, raises every group's. Group 1's own look raises nothing.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(one.follow_timeline().unwrap(), Timeline::Same);
+    let Timeline::Moved(raised) = zero.follow_timeline().unwrap() else {
+        panic!("the epoch raised on the new timeline");
+    };
+    let raised = raised as i64;
+    assert_eq!(
+        read(),
+        (raised, raised, raised, raised, 0),
+        "one epoch for every group, and nothing of group 1's under it"
+    );
+    // Group 1's writer is fenced, so nothing ever is.
+    assert!(matches!(
+        one.record(&ones, row(&ones, "b"), 20),
+        Err(StoreError::Fenced(_))
+    ));
+    assert_eq!(read().4, 0);
+    // It takes over again: its row and its dataset together, past it.
+    let standby = member(1);
+    let again = standby
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap() as i64;
+    assert!(again > raised);
+    assert_eq!(read(), (again, raised, again, raised, 0));
+    standby.record(&ones, row(&ones, "b"), 30).unwrap();
+    zero.record(&zeros, row(&zeros, "b"), 30)
+        .expect("group 0 writes on");
+    assert_eq!(read(), (again, raised, again, raised, 1));
+}
+
 /// Two writer groups of one lake (step 3d; the resilience spec's sections
 /// 6.1 and 6.7): each commits to its own datasets alone, under its own
 /// epoch -- group 0's the control partition's, a group past it its own row
