@@ -68,12 +68,27 @@ metadata:
 spec:
   replicas: {{ if $several }}{{ add $shards (ternary 1 0 (.standby | default false)) }}{{ else }}1{{ end }}
   revisionHistoryLimit: {{ $top.Values.revisionHistoryLimit }}
+  {{- if $several }}
+  # Several pods of the instance (step 3d), each fenced by its shard's
+  # Lease: a new pod starts beside the old as a standby, an old pod gives
+  # its Lease up as it stops, and the new one takes it -- a shard at a time,
+  # the rest serving throughout. Recreate would stop every shard and the
+  # standby together. A standby pod is never ready, by design, so it is one
+  # more that may be unavailable: with none allowed the rollout could never
+  # stop an old pod.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: {{ add 1 (ternary 1 0 (.standby | default false)) }}
+  {{- else }}
   # One copy of an instance at a time, always: a rolling update would start the
   # new pod beside the old, two plugins under one instance's name, hostname
   # and credential. The old stops first, and the page is away for the moment
   # between.
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
@@ -96,7 +111,12 @@ spec:
         Named for its instance under the one Service every plugin shares
         (sidecars.yaml), so `{instance}.{release}-sidecars` resolves to this
         pod and nothing else: how the dashboard reaches its front door, with
-        no Service made per plugin (the registry spec, decision 4).
+        no Service made per plugin (the registry spec, decision 4). An
+        instance of several pods (step 3d) resolves to each of its shards
+        that is ready -- never its standby, whose front door is closed --
+        and a page request reaches any one of them: the instance's page is
+        its settings and its own state, the same at each; what a shard
+        keeps of the instance's subjects is its sidecar's, not its page's.
       */}}
       hostname: {{ .instance }}
       subdomain: {{ include "meridian-runtime.fullname" $top }}-sidecars

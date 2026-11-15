@@ -520,7 +520,7 @@ test-store: network tests-image
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: serving:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
@@ -3053,35 +3053,32 @@ chart-check:
 	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
 		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
 	@# Step 3d (the resilience spec's section 7): a plugin instance as
-	@# shards with a standby pod. The default renders the launcher no shape
-	@# for them (standbys are configuration, ruling 1052); `ha` renders it,
-	@# under the members' account with its token kept from the plugin's
-	@# container. A sidecars[] entry given shards and a standby is a pod
-	@# each, told the count; with storage of its own it is refused, saying
-	@# why.
+	@# shards with a standby pod. The default renders no lease right and the
+	@# launcher no shape for them (standbys are configuration, ruling 1052);
+	@# `ha` renders the shape, under the members' account with its token
+	@# mounted in the sidecar's container alone, rolled a shard at a time.
+	@# A sidecars[] entry given shards and a standby is a pod each, told the
+	@# count; with storage of its own it is refused, saying why. The shapes
+	@# are read, not grepped (tools/chart_shards.py; the review of 95d68904,
+	@# S6): a word in a render says nothing of which container holds it.
+	@# Where the cluster can, the launcher's admission policy pins the
+	@# account its Deployments run under (S2).
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
-	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	echo "$$plain" | grep -q "plugin.json:" \
-		|| { echo "chart-check FAILED: the default profile renders no launcher template to hold the shards check to" >&2; exit 1; }; \
-	echo "$$plain" | grep -E -q "plugin-shards.json|MERIDIAN_LAUNCHER_SHARDS_TEMPLATE|MERIDIAN_PLUGIN_SHARDS" \
-		&& { echo "chart-check FAILED: the default profile renders a shape for shards and standby pods; standbys are configuration (ruling 1052)" >&2; exit 1; }; \
-	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>&1)" \
+	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | $(PY) tools/chart_shards.py default || exit 1; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
 		|| { echo "chart-check FAILED: the ha profile did not render: $$ha" >&2; exit 1; }; \
-	echo "$$ha" | grep -q "plugin-shards.json:" && echo "$$ha" | grep -q "MERIDIAN_LAUNCHER_SHARDS_TEMPLATE" \
-		|| { echo "chart-check FAILED: the ha profile gives the launcher no shape for shards and standby pods (step 3d)" >&2; exit 1; }; \
-	shape="$$(echo "$$ha" | grep "plugin-shards.json:")"; \
-	echo "$$shape" | grep -q "check-meridian-runtime-member" \
-		&& echo "$$shape" | grep -q "automountServiceAccountToken" \
-		&& echo "$$shape" | grep -q "MERIDIAN_PLUGIN_SHARDS" \
-		|| { echo "chart-check FAILED: the launcher's shards shape lacks the members' account, its token kept from the plugin, or the shard count (step 3d)" >&2; exit 1; }; \
+	echo "$$ha" | $(PY) tools/chart_shards.py ha || exit 1; \
+	echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName in' \
+		&& echo "$$ha" | grep -q '\["", "default", "check-meridian-runtime-member"\]' \
+		&& echo "$$ha" | grep -q "the token is mounted in the sidecar's container alone" \
+		|| { echo "chart-check FAILED: the launcher's admission policy does not pin the account a launched plugin runs under, or its token to the sidecar (step 3d, S2)" >&2; exit 1; }; \
 	sharded="--set sidecars[0].instanceId=feed-1 --set sidecars[0].roles={data} --set sidecars[0].plugin.image=example/plugin:1 --set sidecars[0].shards=2 --set sidecars[0].standby=true"; \
 	made="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false 2>&1)" \
 		|| { echo "chart-check FAILED: a sidecars[] entry with shards and a standby did not render: $$made" >&2; exit 1; }; \
-	echo "$$made" | grep -q "replicas: 3" \
-		&& echo "$$made" | grep -A1 "name: MERIDIAN_PLUGIN_SHARDS" | grep -q 'value: "2"' \
-		&& echo "$$made" | grep -q "name: check-meridian-runtime-member$$" \
-		&& [ "$$(echo "$$made" | grep -c 'mountPath: /var/run/secrets/kubernetes.io/serviceaccount')" = 1 ] \
-		|| { echo "chart-check FAILED: two shards and a standby are not three pods told the count under the members' account, its token mounted once (step 3d)" >&2; exit 1; }; \
+	echo "$$made" | $(PY) tools/chart_shards.py sharded feed-1 3 2 || exit 1; \
+	echo "$$made" | grep -q "name: check-meridian-runtime-member$$" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry renders no members' account to run under (step 3d)" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=true 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: a sharded instance rendered with storage of its own, which is one pod's" >&2; exit 1; }; \
 	echo "$$said" | grep -q "storage is one pod's" \

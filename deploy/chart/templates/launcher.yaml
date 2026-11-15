@@ -312,6 +312,11 @@ spec:
           configMap:
             name: {{ $name }}-template
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+{{- $member := printf "%s-member" $full }}
+{{- $accounts := list (quote "") (quote "default") (quote $member) }}
+{{- with .Values.pluginArchive.serviceAccount }}
+{{- $accounts = append $accounts (quote .) }}
+{{- end }}
 ---
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
 # the launcher's account does to a Deployment, or a claim it makes, it is one
@@ -347,6 +352,41 @@ spec:
         : has(object.metadata.labels) &&
           object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
       message: the launcher touches only the Deployments it launched and the storage it made
+    # Which account a launched plugin's pods run as (step 3d; review of
+    # 95d68904, S2): Kubernetes asks nobody whether a pod may use an
+    # account, so the launcher's Deployments are held to the ones the chart
+    # gives it -- none (the namespace's default, which holds no right), the
+    # members' lease right for an instance of several pods, and the
+    # archive's where one is set.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "deployments" ||
+        !has(object.spec.template.spec.serviceAccountName) ||
+        object.spec.template.spec.serviceAccountName in
+        [{{ $accounts | join ", " }}]
+      message: a launched plugin runs under no account, the members' lease account or the archive's
+    # Under the members' account the lease right is the sidecar's alone,
+    # never the plugin's: nothing mounts the token by default, and no
+    # container but the sidecar mounts a volume that carries one.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "deployments" ||
+        !has(object.spec.template.spec.serviceAccountName) ||
+        object.spec.template.spec.serviceAccountName != {{ $member | quote }} ||
+        (
+          has(object.spec.template.spec.automountServiceAccountToken) &&
+          object.spec.template.spec.automountServiceAccountToken == false &&
+          !has(object.spec.template.spec.initContainers) &&
+          !has(object.spec.template.spec.ephemeralContainers) &&
+          object.spec.template.spec.containers.all(c,
+            c.name == "sidecar" || !has(c.volumeMounts) ||
+            c.volumeMounts.all(m,
+              !has(object.spec.template.spec.volumes) ||
+              !object.spec.template.spec.volumes.exists(v,
+                v.name == m.name && has(v.projected) && has(v.projected.sources) &&
+                v.projected.sources.exists(s, has(s.serviceAccountToken)))))
+        )
+      message: under the members' lease account the token is mounted in the sidecar's container alone
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

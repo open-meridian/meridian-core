@@ -477,7 +477,9 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
 
 /// The chart's shards shape, as far as the launcher reads it.
 fn several_pods() -> serde_json::Value {
-    serde_json::json!({"spec": {"replicas": 2, "template": {"spec": {
+    serde_json::json!({"spec": {"replicas": 2,
+        "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 2}},
+        "template": {"spec": {
         "serviceAccountName": "check-meridian-runtime-member",
         "containers": [
             {"name": "sidecar", "env": [
@@ -558,6 +560,13 @@ fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the
             "{shards} shards, standby {standby}"
         );
         assert_eq!(said(&made), [told], "told once");
+        // Rolled a shard at a time: one pod may be away, and one more for
+        // a standby pod, which is never ready (review finding 6).
+        assert_eq!(
+            made["spec"]["strategy"]["rollingUpdate"],
+            serde_json::json!({"maxSurge": 1, "maxUnavailable": 1 + u32::from(standby)}),
+            "{shards} shards, standby {standby}"
+        );
         // The plugin's container is told nothing.
         assert_eq!(
             made["spec"]["template"]["spec"]["containers"][1]["env"],

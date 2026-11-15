@@ -529,6 +529,16 @@ pub fn with_shards(
     }
     let shards = request.shards.max(1);
     manifest["spec"]["replicas"] = serde_json::json!(shards + u32::from(request.standby));
+    // Rolled a shard at a time, where the shape rolls: one pod may be
+    // away, and one more for a standby pod, which is never ready -- with
+    // fewer the rollout could stop no old pod, and with more it stops
+    // shards it need not.
+    if let Some(rolling) = manifest["spec"]["strategy"]["rollingUpdate"].as_object_mut() {
+        rolling.insert(
+            "maxUnavailable".into(),
+            serde_json::json!(1 + u32::from(request.standby)),
+        );
+    }
     let env = manifest["spec"]["template"]["spec"]["containers"]
         .as_array_mut()
         .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "sidecar"))
