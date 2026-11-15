@@ -260,6 +260,35 @@ async fn a_write_spanning_two_groups_is_split_one_hand_off_per_owner_and_answere
     assert!(g.broker.handed.lock().unwrap().is_empty());
 }
 
+/// A write whose rows its store said another group's while it was written
+/// -- its range was moving -- and that the lake then routed again and
+/// committed, is answered with what it committed (step 3d; section 6.7; CI
+/// 43662032539, tolerant: "answered recorded 0, restated 0, unchanged 0 for
+/// one row"). It was handed on whole all the same, to the group the store
+/// had said, whose answer of none of its rows replaced the write's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_routed_again_while_its_range_moved_is_answered_with_its_own_count() {
+    assert_eq!(owner("coinbase-1:hourly", 2), 1);
+    let g = two_groups();
+    // Group 1's store, its view stale for one write, says the dataset group
+    // 0's; the lake routes the rows again, and they are group 1's.
+    g.store.say_moved_once("coinbase-1:hourly", 0);
+    let reply = write(&g, 1, vec![price("coinbase-1:hourly", "moving", "7")], "")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.recorded, reply.restated, reply.unchanged),
+        (1, 0, 0),
+        "its row counted"
+    );
+    assert_eq!(named(&reply), ["coinbase-1:hourly"]);
+    assert!(
+        g.broker.handed.lock().unwrap().is_empty(),
+        "never handed on after it was answered: {:?}",
+        g.broker.handed.lock().unwrap()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_answering_a_want_is_group_zeros_to_answer() {
     let g = two_groups();

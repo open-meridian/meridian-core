@@ -55,6 +55,17 @@ pub fn hand_to_named(group: u32) {
     NAMED.with(|named| named.set(true));
 }
 
+/// The request this thread answers is answered here after all: its store
+/// said a part of it another group's, and its handler has since routed
+/// that part to where it belongs and counted it (step 3d; CI 43662032539,
+/// tolerant: a lake write whose range moved while it was written was
+/// answered whole, then handed on to the group last said, whose own answer
+/// -- none of its rows -- replaced it). Its own answer stands.
+pub fn answered_here() {
+    HAND_TO.with(|to| to.set(None));
+    NAMED.with(|named| named.set(false));
+}
+
 /// Whether the group said is the one the record names now, cleared.
 pub(crate) fn take_named() -> bool {
     NAMED.with(Cell::take)

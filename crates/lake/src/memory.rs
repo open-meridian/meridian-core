@@ -51,9 +51,21 @@ struct Held {
 pub struct MemoryStore {
     held: Mutex<Held>,
     fence: meridian_changes::Fence,
+    /// A dataset whose next write is refused as another writer group's,
+    /// once, as a store whose view of a range was stale refuses it.
+    #[cfg(test)]
+    said_moved: Mutex<Option<(String, u32)>>,
 }
 
 impl MemoryStore {
+    /// Refuse `dataset`'s next write, once, as writer group `group`'s: what
+    /// a store does that finds its view of a range stale under the range's
+    /// lock, the request marked to be handed to that group.
+    #[cfg(test)]
+    pub(crate) fn say_moved_once(&self, dataset: &str, group: u32) {
+        *self.said_moved.lock().unwrap() = Some((dataset.to_string(), group));
+    }
+
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
     /// one it had: what a test of the fence does.
     #[cfg(test)]
@@ -292,6 +304,15 @@ pub(crate) fn as_of(
 
 impl Store for MemoryStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        #[cfg(test)]
+        {
+            let mut said = self.said_moved.lock().unwrap();
+            if said.as_ref().is_some_and(|(moved, _)| moved == dataset) {
+                let (partition, group) = said.take().unwrap();
+                meridian_bus::owners::hand_to(group);
+                return Err(StoreError::NotOwned { partition, group });
+            }
+        }
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);

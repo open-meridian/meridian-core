@@ -2195,6 +2195,12 @@ impl Lake {
             pending = held;
             again = true;
         }
+        // Every part written here or by its owner, and counted: a part the
+        // store said another group's on the way was routed there since, so
+        // the write is never handed on whole after it (section 6.7).
+        if again {
+            meridian_bus::owners::answered_here();
+        }
         self.answered(said, want_id, envelope, now)
     }
 
