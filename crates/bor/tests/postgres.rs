@@ -3020,6 +3020,74 @@ async fn m11_a_move_by_hand_to_another_database_waits_for_the_rollout() {
     drop((bus_zero, bus_one));
 }
 
+/// A write held by a move's switch is answered before its caller stops
+/// waiting (step 3d; section 6.8, the hold: "at most moves.holdSeconds,
+/// never past the caller's Meridian-Timeout-Ms"; PR CI 43675491409, ha).
+/// The switch holds the partition's lock. A write whose caller waits less
+/// than the hold was held the whole hold all the same, and its caller
+/// timed out having heard nothing. It is now refused OVERLOADED with a
+/// retry-after while its caller still listens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_a_write_held_by_a_switch_is_answered_before_its_callers_deadline() {
+    let (bus, store) = wired();
+    let account = unique("ACC-M11-HELD");
+    write_once(&bus, &account, 1).await.unwrap();
+    let partition = blocking(|| Store::partition_of(store.as_ref(), &account))
+        .unwrap_or_else(|| "P0".to_string());
+    // The partition's lock held, as a switch holds it, for three seconds.
+    let holding = {
+        let key = meridian_bor::postgres::partition_lock_key(&partition);
+        std::thread::spawn(move || {
+            let mut held = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+            let mut tx = held.transaction().unwrap();
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&key])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            tx.commit().unwrap();
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // A caller that waits a second and a half.
+    let began = std::time::Instant::now();
+    let said = bus
+        .call_stamped(
+            SET_ACCOUNT_ATTRIBUTE,
+            "meridian.v1.SetAccountAttributeRequest",
+            SetAccountAttributeRequest {
+                account_id: account.clone(),
+                attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(true)),
+                reason: "held by a switch".into(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(std::time::Duration::from_millis(1_500)),
+            &Stamp {
+                acting_for_subject: PERSON.to_string(),
+                account_scope: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failed| failed.to_string());
+    let took = began.elapsed();
+    let refused = said.expect_err("held past its caller's wait: refused");
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded) && refused.contains("retry="),
+        "answered OVERLOADED with a retry-after, never left to time out: {refused}"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "answered while its caller still waited: {took:?}"
+    );
+    blocking(move || holding.join().unwrap());
+    blocking(move || drop(store));
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the

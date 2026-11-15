@@ -30,6 +30,29 @@ use crate::store::{Result, StoreError};
 
 pub use meridian_changes::moves::{hold, HELD_RETRY_SECONDS, HOLD_SECONDS, HOLD_SECONDS_VAR};
 
+/// How long before its caller stops waiting a held write is answered: its
+/// refusal has to reach the caller, which otherwise hears nothing.
+pub const ANSWERED_BEFORE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a write held by a move waits, as of now (section 6.8, the
+/// hold): `moves.holdSeconds`, and never past its caller's
+/// `Meridian-Timeout-Ms` -- it is answered OVERLOADED with a retry-after
+/// [`ANSWERED_BEFORE`] the caller's deadline, where that comes first (PR CI
+/// 43675491409, ha: a partition's switch between databases held its writes
+/// 5.4 s; an order whose caller waited 5 s was held the hold's 5 s, and
+/// its caller timed out with no answer).
+pub fn hold_now() -> std::time::Duration {
+    let hold = hold();
+    match meridian_bus::read_after::deadline() {
+        Some(deadline) => hold.min(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .saturating_sub(ANSWERED_BEFORE),
+        ),
+        None => hold,
+    }
+}
+
 /// An act tried again while its account is held, for at most `limit`
 /// (section 6.8, the hold): its writes wait for the move's open, never
 /// refused inside the hold; past it, refused OVERLOADED with a retry-after.

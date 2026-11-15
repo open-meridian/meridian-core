@@ -1842,7 +1842,8 @@ impl PostgresStore {
         // retry-after.
         // The bound set in the same statement as the lock, so a batch takes
         // no more round trips than it did.
-        let hold_ms = crate::moves::hold().as_millis().max(1).to_string();
+        // Never past the caller's deadline (section 6.8).
+        let hold_ms = crate::moves::hold_now().as_millis().max(1).to_string();
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)
                FROM (SELECT set_config('lock_timeout', $2, true)) AS bounded",
@@ -2240,7 +2241,7 @@ impl Store for PostgresStore {
     ) -> Result<Acted> {
         // Held while its move is between its close and its open (step 3d;
         // section 6.8): tried again for at most the hold.
-        crate::moves::holding(crate::moves::hold(), || {
+        crate::moves::holding(crate::moves::hold_now(), || {
             self.act_once(account_id, message_id, idempotency_key, request, decide)
         })
     }
