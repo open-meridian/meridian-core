@@ -141,9 +141,19 @@ struct Groups2 {
     broker: Arc<GroupsBroker>,
     store: Arc<MemoryStore>,
     client: Arc<Bus>,
+    /// Each member's view of the ranges' owners, by its group.
+    views: Vec<Groups>,
 }
 
 fn two_groups() -> Groups2 {
+    two_groups_routing(false)
+}
+
+/// [`two_groups`]; with `pre_check`, each member decides a write's owner
+/// from its request first and hands a write wholly another group's on
+/// before its handler runs, as the lake's binary sets it (the ownership
+/// pre-check decided 2026-11-13).
+fn two_groups_routing(pre_check: bool) -> Groups2 {
     let clock = Arc::new(ManualClock::at(NOW));
     let broker = Arc::new(GroupsBroker {
         inner: MemoryBackend::new(),
@@ -153,6 +163,7 @@ fn two_groups() -> Groups2 {
         handed: Mutex::new(Vec::new()),
     });
     let store = Arc::new(MemoryStore::new());
+    let mut views = Vec::new();
     for group in 0..2 {
         let bus = Arc::new(Bus::single("lake-1", broker.clone(), clock.clone()));
         stand_ins(&bus);
@@ -160,12 +171,14 @@ fn two_groups() -> Groups2 {
         if group > 0 {
             bus.serve_only(service::is_record_write);
         }
-        let lake = service::serve_grouped(
-            bus,
-            store.clone(),
-            clock.clone(),
-            Groups::new(group, 2).unwrap(),
-        );
+        let view = Groups::new(group, 2).unwrap();
+        views.push(view);
+        if pre_check {
+            bus.route_writes_by(move |topic, envelope| {
+                service::owner_of_write(view, topic, envelope)
+            });
+        }
+        let lake = service::serve_grouped(bus, store.clone(), clock.clone(), view);
         lake.configured(&two_datasets());
     }
     let client = Arc::new(Bus::single("coinbase-1", broker.clone(), clock));
@@ -173,6 +186,7 @@ fn two_groups() -> Groups2 {
         broker,
         store,
         client,
+        views,
     }
 }
 
@@ -297,6 +311,40 @@ async fn a_write_routed_again_while_its_range_moved_is_answered_with_its_own_cou
         "never handed on after it was answered: {:?}",
         g.broker.handed.lock().unwrap()
     );
+}
+
+/// A write handed to a group whose member has not yet seen the move that
+/// made its rows that group's is answered with its rows counted (step 3d;
+/// sections 6.7 and 6.8; PR CI 43680214054, tolerant: two prices "answered
+/// recorded 0, restated 0, unchanged 0 for one row" in the half second
+/// after their range moved to group 1 in another database). The member
+/// asked had read the move and handed the write on whole; the member it was
+/// handed to still took the range for the other group's, kept none of the
+/// rows, and answered as though the write had none -- and a write handed
+/// on by the pre-check is answered by the group it went to, nobody
+/// checking what it took. It now reads the ranges' owners again and takes
+/// what the record says is its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_handed_to_a_group_that_has_not_seen_its_range_move_is_counted() {
+    let g = two_groups_routing(true);
+    // The range moved to group 1: group 0's member has read it (its view is
+    // the constant's), group 1's still takes it for group 0's until it
+    // reads the owners again.
+    let stale = g.views[1];
+    stale.assign("coinbase-1:hourly", Some(0));
+    g.store
+        .on_owners_read(move || stale.assign("coinbase-1:hourly", Some(1)));
+    let reply = write(&g, 0, vec![price("coinbase-1:hourly", "moved", "7")], "")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.recorded, reply.restated, reply.unchanged),
+        (1, 0, 0),
+        "its row counted"
+    );
+    assert_eq!(named(&reply), ["coinbase-1:hourly"]);
+    assert_eq!(g.store.heads().unwrap().get("coinbase-1:hourly"), Some(&1));
+    assert_eq!(*g.broker.handed.lock().unwrap(), vec![1], "handed once");
 }
 
 /// A write whose range a move's switch holds longer than its caller waits

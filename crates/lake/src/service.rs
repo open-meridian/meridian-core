@@ -2203,6 +2203,21 @@ impl Lake {
         if again {
             meridian_bus::owners::answered_here();
         }
+        // A write with rows answered with none of them counted: never
+        // meant, and seen right after a range's move between databases (PR
+        // CI 43680214054). Said here with how it was routed, so the member
+        // that answered it names the path.
+        let counted = said.reply.recorded + said.reply.restated + said.reply.unchanged;
+        if counted == 0 && !keys.is_empty() {
+            tracing::warn!(
+                rows = keys.len(),
+                group = self.groups.mine(),
+                handed = meridian_bus::owners::handed(),
+                routed_again = again,
+                datasets = ?said.datasets,
+                "a write's rows were answered with none of them counted"
+            );
+        }
         self.answered(said, want_id, envelope, now)
     }
 
@@ -2221,6 +2236,20 @@ impl Lake {
         envelope: &Envelope,
         said: &mut Said,
         again: bool,
+    ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
+        self.routed_by(by_dataset, want_id, envelope, said, again, false)
+    }
+
+    /// [`Self::routed`]; `stale` once the ranges' owners were read again
+    /// for this write, handed here with none of its rows this group's.
+    fn routed_by(
+        &self,
+        by_dataset: BTreeMap<String, Vec<Observation>>,
+        want_id: &str,
+        envelope: &Envelope,
+        said: &mut Said,
+        again: bool,
+        stale: bool,
     ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
         let handed = meridian_bus::owners::handed();
         if !again && !handed && !want_id.is_empty() && !self.groups.holds_control() {
@@ -2252,6 +2281,44 @@ impl Lake {
             }
         }
         if !coordinates {
+            // Handed here, and by this member's view none of it is this
+            // group's: the member that handed it read the ranges' owners
+            // after a move this one has not seen (PR CI 43680214054,
+            // tolerant: two prices answered recorded 0, restated 0,
+            // unchanged 0 in the half second after their range moved to
+            // group 1 in another database). Never answered as though it
+            // had no rows: the owners are read again and the write routed
+            // by them -- this group's taken here; another's, as the record
+            // names it now, handed on to it.
+            if handed && mine.is_empty() && !theirs.is_empty() {
+                if stale {
+                    let named: BTreeSet<u32> = theirs.keys().copied().collect();
+                    return match (named.len(), named.first()) {
+                        (1, Some(group)) => {
+                            meridian_bus::owners::hand_to_named(*group);
+                            Err(format!("handed to the lake's writer group {group}"))
+                        }
+                        _ => Err(meridian_bus::refusal_with_status(
+                            RefusalStatus::Unavailable,
+                            &[],
+                            "none of this write's rows are this writer group's: their ranges' \
+                             route has changed; ask again"
+                                .to_string(),
+                        )),
+                    };
+                }
+                if let Err(failed) = self.read_owners_again() {
+                    tracing::debug!(%failed, "the ranges' owners were not read again");
+                }
+                let again: BTreeMap<String, Vec<Observation>> = theirs
+                    .into_values()
+                    .flatten()
+                    .fold(BTreeMap::new(), |mut all, (dataset, rows)| {
+                        all.entry(dataset).or_default().extend(rows);
+                        all
+                    });
+                return self.routed_by(again, want_id, envelope, said, false, true);
+            }
             return Ok(Some(mine));
         }
         let config = self.config();

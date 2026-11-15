@@ -539,6 +539,20 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
                         others.add(theirs);
                     }
                 }
+                // No group kept a part of it: said with what was waited on
+                // (PR CI 43680214054, ha: prices answered recorded 0,
+                // restated 0, unchanged 0 after a range's move between
+                // databases), so the member that answered names the path.
+                if own.is_none_or(|own| own.none()) && others.none() {
+                    tracing::warn!(
+                        sequence = wait.sequence,
+                        dataset = %wait.dataset,
+                        group = mine,
+                        waited_on = ?groups,
+                        own_part = own.is_some(),
+                        "a write of the stream is answered with no group's part of it kept"
+                    );
+                }
                 lake.answer_again(payload, own, others, &wait.dataset)
             })
             .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))

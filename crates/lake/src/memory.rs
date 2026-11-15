@@ -59,6 +59,11 @@ pub struct MemoryStore {
     /// refuses a range a move is switching.
     #[cfg(test)]
     held_until: Mutex<Option<(String, std::time::Instant)>>,
+    /// What reading the ranges' owners again does, as a store's record
+    /// corrects a member's view.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    owners_read: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl MemoryStore {
@@ -76,6 +81,13 @@ impl MemoryStore {
     pub(crate) fn hold_for(&self, dataset: &str, long: std::time::Duration) {
         *self.held_until.lock().unwrap() =
             Some((dataset.to_string(), std::time::Instant::now() + long));
+    }
+
+    /// `read` run whenever the ranges' owners are read again: the record
+    /// correcting a member's stale view.
+    #[cfg(test)]
+    pub(crate) fn on_owners_read(&self, read: impl Fn() + Send + 'static) {
+        *self.owners_read.lock().unwrap() = Some(Box::new(read));
     }
 
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
@@ -315,6 +327,14 @@ pub(crate) fn as_of(
 }
 
 impl Store for MemoryStore {
+    #[cfg(test)]
+    fn read_owners_again(&self) -> Result<()> {
+        if let Some(read) = self.owners_read.lock().unwrap().as_ref() {
+            read();
+        }
+        Ok(())
+    }
+
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         #[cfg(test)]
         {
