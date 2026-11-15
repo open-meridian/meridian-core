@@ -179,6 +179,177 @@ pub fn dataset_of(envelope: &Envelope) -> Option<String> {
     (!dataset.is_empty()).then_some(dataset)
 }
 
+/// One dataset's rows of a write sent apart: its subject, the write with
+/// those rows alone, and where each was among the rows the plugin sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    pub subject: String,
+    pub envelope: Envelope,
+    pub places: Vec<usize>,
+}
+
+/// A varint read from `bytes` at `at`, and where the next byte is.
+fn varint(bytes: &[u8], mut at: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(at)?;
+        at += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, at));
+        }
+    }
+    None
+}
+
+/// A write's rows by their dataset, where it holds rows of more than one
+/// and every one is a dataset of `instance`'s own that a subject can name:
+/// each dataset's rows as a write of their own, in the plugin's order, with
+/// everything else the request says (the want it answers). None for a
+/// write of one dataset, which goes whole as it always has, and for one
+/// that does not read so or names another instance's dataset, which the
+/// lake refuses whole.
+///
+/// Read from the bytes, as [`dataset_of`] reads a first row: every record
+/// request holds its rows as its field 1, whichever request it is.
+pub fn apart(instance: &str, envelope: &Envelope) -> Option<Vec<Part>> {
+    let payload = &envelope.payload[..];
+    let mut rows: Vec<(&[u8], String)> = Vec::new();
+    let mut rest: Vec<u8> = Vec::new();
+    let mut at = 0;
+    while at < payload.len() {
+        let (key, after_key) = varint(payload, at)?;
+        // Where the field's value begins and the field ends.
+        let (value, end) = match key & 7 {
+            0 => (after_key, varint(payload, after_key)?.1),
+            1 => (after_key, after_key.checked_add(8)?),
+            2 => {
+                let (length, begins) = varint(payload, after_key)?;
+                (begins, begins.checked_add(usize::try_from(length).ok()?)?)
+            }
+            5 => (after_key, after_key.checked_add(4)?),
+            _ => return None,
+        };
+        let field = payload.get(at..end)?;
+        if key >> 3 == 1 && key & 7 == 2 {
+            let dataset = Row::decode(payload.get(value..end)?)
+                .ok()?
+                .meta?
+                .source?
+                .dataset;
+            rows.push((field, dataset));
+        } else {
+            rest.extend_from_slice(field);
+        }
+        at = end;
+    }
+    let mut parts: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+    for (place, (field, dataset)) in rows.iter().enumerate() {
+        match parts.iter_mut().find(|(held, _, _)| held == dataset) {
+            Some((_, bytes, places)) => {
+                bytes.extend_from_slice(field);
+                places.push(place);
+            }
+            None => parts.push((dataset.clone(), field.to_vec(), vec![place])),
+        }
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+    parts
+        .into_iter()
+        .map(|(dataset, mut bytes, places)| {
+            let own = dataset
+                .split_once(':')
+                .is_some_and(|(owner, _)| !owner.is_empty() && owner == instance);
+            let subject = own.then(|| subject_of(&dataset)).flatten()?;
+            bytes.extend_from_slice(&rest);
+            Some(Part {
+                subject,
+                envelope: Envelope {
+                    meta: envelope.meta.clone(),
+                    payload_type: envelope.payload_type.clone(),
+                    payload: bytes,
+                },
+                places,
+            })
+        })
+        .collect()
+}
+
+/// The answers of a write's parts as its one answer: every part's counts
+/// added and its watermark's partitions joined; or the first part's
+/// refusal, each row it names (`prices[1]`) named by its place among the
+/// rows the plugin sent.
+fn joined<'a>(
+    answers: impl Iterator<Item = (&'a Part, Result<Envelope, BusError>)>,
+) -> Result<Envelope, BusError> {
+    use meridian_domain::v1::RecordObservationsReply;
+    let mut all = RecordObservationsReply::default();
+    let mut answer: Option<Envelope> = None;
+    for (part, answered) in answers {
+        let said = match answered {
+            Ok(said) => said,
+            Err(BusError::HandlerFailed { topic, detail }) => {
+                return Err(BusError::HandlerFailed {
+                    topic,
+                    detail: placed(&detail, &part.places),
+                })
+            }
+            Err(failed) => return Err(failed),
+        };
+        let reply = RecordObservationsReply::decode(&said.payload[..]).map_err(|failed| {
+            BusError::HandlerFailed {
+                topic: part.subject.clone(),
+                detail: format!("a part's answer did not read: {failed}"),
+            }
+        })?;
+        all.recorded += reply.recorded;
+        all.restated += reply.restated;
+        all.unchanged += reply.unchanged;
+        if let Some(watermark) = reply.watermark {
+            all.watermark
+                .get_or_insert_with(Default::default)
+                .partitions
+                .extend(watermark.partitions);
+        }
+        answer.get_or_insert(said);
+    }
+    let mut answer = answer.unwrap_or_default();
+    answer.payload = all.encode_to_vec();
+    Ok(answer)
+}
+
+/// A part's refusal with each row it names by its place in the part
+/// (`<field>[<n>]`) named by its place among the rows the plugin sent.
+fn placed(detail: &str, places: &[usize]) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(open) = rest.find('[') {
+        let (before, from) = rest.split_at(open);
+        out.push_str(before);
+        let digits = from[1..].bytes().take_while(u8::is_ascii_digit).count();
+        let named = before
+            .bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_');
+        let closes = from[1 + digits..].starts_with(']');
+        match from[1..1 + digits].parse::<usize>() {
+            Ok(n) if named && closes && digits > 0 => {
+                let place = places.get(n).copied().unwrap_or(n);
+                out.push_str(&format!("[{place}]"));
+                rest = &from[2 + digits..];
+            }
+            _ => {
+                out.push('[');
+                rest = &from[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Writes dropped here, never sent, because their caller had stopped
 /// waiting or the broker could not take them now, since the process
 /// started: counted apart from refusals.
@@ -270,12 +441,42 @@ impl WriteAhead {
         })
     }
 
+    /// A write holding rows of several of its instance's datasets (step
+    /// 3d; spec 6.1: one subject a dataset; ruled 2026-11-15): each
+    /// dataset's rows held on its own subject, a write of their own, and
+    /// the write answered once every part is -- each part's counts added
+    /// and its watermark's partitions joined, or the first part refused,
+    /// naming its row as the plugin sent it. A part answered commits
+    /// whatever another part's answer: sent again, its rows are found
+    /// unchanged.
+    async fn written_apart(
+        &self,
+        topic: &str,
+        parts: Vec<Part>,
+        timeout: Duration,
+    ) -> Result<Envelope, BusError> {
+        let answers = futures_util::future::join_all(parts.iter().map(|part| {
+            self.written(
+                topic,
+                part.subject.clone(),
+                part.envelope.clone(),
+                timeout,
+                Some(&part.subject),
+            )
+        }))
+        .await;
+        joined(parts.iter().zip(answers))
+    }
+
     async fn written(
         &self,
         topic: &str,
         subject: String,
         envelope: Envelope,
         timeout: Duration,
+        // The part's own subject, where the write was sent apart: beside
+        // its message's ID, so the stream holds each part once.
+        apart: Option<&str>,
     ) -> Result<Envelope, BusError> {
         let deadline = Instant::now() + timeout;
         let timed_out = || BusError::Timeout {
@@ -301,10 +502,11 @@ impl WriteAhead {
             timeout.as_millis().to_string().as_str(),
         );
         if let Some(meta) = envelope.meta.as_ref().filter(|m| !m.message_id.is_empty()) {
-            headers.insert(
-                MESSAGE_ID_HEADER,
-                crate::nats::header_words(&meta.message_id).as_str(),
-            );
+            let id = match apart {
+                Some(part) => format!("{}/{part}", meta.message_id),
+                None => meta.message_id.clone(),
+            };
+            headers.insert(MESSAGE_ID_HEADER, crate::nats::header_words(&id).as_str());
         }
         if let Some(after) = self.after_of(&subject, deadline).await {
             headers.insert(AFTER_HEADER, after.to_string().as_str());
@@ -494,6 +696,15 @@ impl Backend for WriteAhead {
             .as_ref()
             .map(|meta| meta.publisher_instance_id.as_str())
             .unwrap_or_default();
+        // Rows of several of its datasets: each dataset's on its own
+        // subject (spec 6.1). Sent on the first row's alone, the rows of a
+        // dataset whose writer group holds no range of the first were
+        // committed by nobody.
+        if TOPICS.contains(&topic) {
+            if let Some(parts) = apart(instance, &envelope) {
+                return Box::pin(self.written_apart(topic, parts, timeout));
+            }
+        }
         let subject = TOPICS
             .contains(&topic)
             .then(|| dataset_of(&envelope))
@@ -505,7 +716,7 @@ impl Backend for WriteAhead {
             })
             .and_then(|dataset| subject_of(&dataset));
         match subject {
-            Some(subject) => Box::pin(self.written(topic, subject, envelope, timeout)),
+            Some(subject) => Box::pin(self.written(topic, subject, envelope, timeout, None)),
             None => self.fallback.request(topic, envelope, timeout),
         }
     }
@@ -563,6 +774,165 @@ mod tests {
             payload: Vec::new(),
         };
         assert_eq!(dataset_of(&empty), None);
+    }
+
+    /// A write of rows of `datasets`, in that order, answering `want_id`.
+    fn priced_each(datasets: &[&str], want_id: &str) -> Envelope {
+        let rows = datasets
+            .iter()
+            .enumerate()
+            .map(|(n, dataset)| meridian_domain::v1::Price {
+                meta: Some(meridian_domain::v1::ObservationMeta {
+                    row_key: format!("k{n}"),
+                    source: Some(meridian_domain::v1::Source {
+                        dataset: dataset.to_string(),
+                        instance: "truefx".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        Envelope {
+            meta: None,
+            payload_type: "meridian.v1.RecordPricesRequest".into(),
+            payload: meridian_domain::v1::RecordPricesRequest {
+                prices: rows,
+                want_id: want_id.into(),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    /// A write of rows of several datasets goes to the stream as one write
+    /// a dataset, each on its own subject (step 3d; spec 6.1; ruled
+    /// 2026-11-15). On its first row's subject alone, the rows of a dataset
+    /// whose writer group held no range of the first were committed by
+    /// nobody (the lake's a_write_is_a_success_only_when_its_answer_
+    /// accounts_for_every_row_it_sent).
+    #[test]
+    fn a_write_of_several_datasets_is_sent_apart_each_dataset_on_its_own_subject() {
+        let write = priced_each(&["truefx:live", "truefx:daily", "truefx:live"], "want-1");
+        let parts = apart("truefx", &write).expect("sent apart");
+        let said: Vec<(String, Vec<String>, String, Vec<usize>)> = parts
+            .iter()
+            .map(|part| {
+                let request =
+                    meridian_domain::v1::RecordPricesRequest::decode(&part.envelope.payload[..])
+                        .unwrap();
+                (
+                    part.subject.clone(),
+                    request
+                        .prices
+                        .iter()
+                        .map(|row| row.meta.as_ref().unwrap().row_key.clone())
+                        .collect(),
+                    request.want_id,
+                    part.places.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                (
+                    subject("truefx", "live"),
+                    vec!["k0".to_string(), "k2".to_string()],
+                    "want-1".to_string(),
+                    vec![0, 2]
+                ),
+                (
+                    subject("truefx", "daily"),
+                    vec!["k1".to_string()],
+                    "want-1".to_string(),
+                    vec![1]
+                ),
+            ]
+        );
+        // Every part's rows are its subject's dataset's.
+        for part in &parts {
+            assert_eq!(
+                dataset_of(&part.envelope).and_then(|dataset| subject_of(&dataset)),
+                Some(part.subject.clone())
+            );
+        }
+        // One dataset: whole, as ever. Another instance's dataset among
+        // them: whole, for the lake to refuse.
+        assert_eq!(
+            apart("truefx", &priced_each(&["truefx:live", "truefx:live"], "")),
+            None
+        );
+        assert_eq!(
+            apart("truefx", &priced_each(&["truefx:live", "oanda:live"], "")),
+            None
+        );
+        assert_eq!(apart("truefx", &priced("truefx:live")), None);
+    }
+
+    /// The parts' answers are the write's one answer: counts added and
+    /// partitions joined; a part refused is the write's refusal, its row
+    /// named by its place among the rows the plugin sent.
+    #[test]
+    fn a_write_sent_apart_is_answered_once_counting_every_part_or_refused_by_its_own_row() {
+        use meridian_domain::v1::{PartitionSequence, RecordObservationsReply, Watermark};
+        let parts = apart(
+            "truefx",
+            &priced_each(
+                &["truefx:live", "truefx:daily", "truefx:live", "truefx:daily"],
+                "",
+            ),
+        )
+        .unwrap();
+        let answer = |recorded: u32, partition: &str| {
+            Ok(Envelope {
+                meta: None,
+                payload_type: "meridian.v1.RecordObservationsReply".into(),
+                payload: RecordObservationsReply {
+                    recorded,
+                    watermark: Some(Watermark {
+                        partitions: vec![PartitionSequence {
+                            partition: partition.into(),
+                            sequence: 7,
+                        }],
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            })
+        };
+        let whole = joined(
+            parts
+                .iter()
+                .zip([answer(2, "truefx:live"), answer(2, "truefx:daily")]),
+        )
+        .unwrap();
+        let reply = RecordObservationsReply::decode(&whole.payload[..]).unwrap();
+        assert_eq!(reply.recorded, 4);
+        let named: Vec<String> = reply
+            .watermark
+            .unwrap()
+            .partitions
+            .into_iter()
+            .map(|at| at.partition)
+            .collect();
+        assert_eq!(named, ["truefx:live", "truefx:daily"]);
+        // The second part's second row is the fourth the plugin sent.
+        let refused = joined(parts.iter().zip([
+            answer(2, "truefx:live"),
+            Err(BusError::HandlerFailed {
+                topic: "t".into(),
+                detail: "[refusal-status invalid_argument] [refusal-fields prices[1].meta.valid_from_ns] row key \"k\" [sic] fixes its valid time".into(),
+            }),
+        ]))
+        .unwrap_err();
+        match refused {
+            BusError::HandlerFailed { detail, .. } => assert_eq!(
+                detail,
+                "[refusal-status invalid_argument] [refusal-fields prices[3].meta.valid_from_ns] row key \"k\" [sic] fixes its valid time"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
