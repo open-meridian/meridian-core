@@ -203,6 +203,9 @@ pub struct PostgresStore {
     /// several (step 3d; section 6.4): where an account placed in another
     /// database is found.
     databases: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
+    /// A move's pointer found in this database by a member that reads no
+    /// other ([`Store::moved_elsewhere`]): kept once found.
+    moved_elsewhere: std::sync::atomic::AtomicBool,
     /// The partitions this store, its group's home database, found no other
     /// database holding further on under its group (step 3d; ruled
     /// 2026-11-14): written here from then on, never asked again.
@@ -236,6 +239,7 @@ impl PostgresStore {
             adopting: Mutex::new(()),
             partitions: 1,
             databases: std::sync::OnceLock::new(),
+            moved_elsewhere: std::sync::atomic::AtomicBool::new(false),
             home_settled: Mutex::default(),
         })
     }
@@ -2544,6 +2548,40 @@ impl Store for PostgresStore {
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
         let mut conn = self.pool.get().map_err(unavailable)?;
         self.follow_on(&mut conn)
+    }
+
+    fn moved_elsewhere(&self) -> Result<bool> {
+        // A member over every database reads each partition where it is
+        // written ([`crate::spread::Spread`]).
+        if self.databases.get().is_some_and(|linked| linked.len() > 1) {
+            return Ok(false);
+        }
+        // Found once, it stays: a pointer here is undone only by a move
+        // back, which a member of this configuration cannot be told of.
+        if self
+            .moved_elsewhere
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(true);
+        }
+        let moved: bool = self
+            .conn()?
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM book_partition_head WHERE epoch = $1)",
+                &[&meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        if moved {
+            self.moved_elsewhere
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "a partition of the book has moved to a database this member does not read \
+                 (the database count was raised after it started): it answers no read from \
+                 here on, and each is asked again of a member started since"
+            );
+        }
+        Ok(moved)
     }
 
     fn head_epoch(&self) -> Result<u64> {

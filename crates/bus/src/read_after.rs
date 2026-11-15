@@ -281,7 +281,14 @@ pub struct Reads {
     bound_ms: AtomicU64,
     waiting: AtomicUsize,
     session: RwLock<Option<Arc<dyn Session>>>,
+    /// Whether this member's store can answer a read whole, asked after each
+    /// read it answered ([`Reads::hold_whole`]).
+    whole: RwLock<Option<Whole>>,
 }
+
+/// Why a read this member just answered cannot be given, where it cannot:
+/// asked once the read's handler has answered ([`Reads::hold_whole`]).
+pub type Whole = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 impl Default for Reads {
     fn default() -> Self {
@@ -293,11 +300,44 @@ impl Default for Reads {
             bound_ms: AtomicU64::new(BOUND_DEFAULT.as_millis() as u64),
             waiting: AtomicUsize::new(0),
             session: RwLock::new(None),
+            whole: RwLock::new(None),
         }
     }
 }
 
 impl Reads {
+    /// Every read this process answers is held to `whole` from now on (step
+    /// 3d; the resilience spec's sections 6.4 and 6.8): asked after the
+    /// read's handler answered, and where it gives a reason the answer is
+    /// withheld and the read refused UNAVAILABLE with that reason, to be
+    /// asked again. A store's member whose configuration no longer covers
+    /// the store -- it reads one database, and a move has let a partition go
+    /// from it to one it does not read -- says so here, so no read is
+    /// answered from what that database no longer holds.
+    ///
+    /// After the answer, never before: what a move lets go of a database it
+    /// lets go only once that database's head is its pointer, so a read that
+    /// saw any of it gone finds the pointer after.
+    pub fn hold_whole(&self, whole: Whole) {
+        *self.whole.write().expect("whole poisoned") = Some(whole);
+    }
+
+    /// `answered`, or its refusal where this member cannot have answered
+    /// the read whole ([`Reads::hold_whole`]). A read refused already stays
+    /// as it was.
+    pub fn held_whole(&self, answered: crate::HandlerReply) -> crate::HandlerReply {
+        let answer = answered?;
+        let whole = self.whole.read().expect("whole poisoned").clone();
+        match whole.and_then(|whole| whole()) {
+            Some(why) => Err(crate::backend::refusal_with_status(
+                crate::backend::RefusalStatus::Unavailable,
+                &[],
+                why,
+            )),
+            None => Ok(answer),
+        }
+    }
+
     /// Keep `domain`'s reads from being answered behind their `read_after`,
     /// by `position`.
     pub fn keep(&self, domain: &str, position: Arc<dyn Position>) {

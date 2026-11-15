@@ -216,6 +216,11 @@ impl Store for ReaderStore {
         self.primary.head_epoch()
     }
 
+    fn moved_elsewhere(&self) -> Result<bool> {
+        // The primary's word: the replica follows it.
+        self.primary.moved_elsewhere()
+    }
+
     fn read_changes(
         &self,
         partition: &str,

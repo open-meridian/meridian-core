@@ -636,6 +636,10 @@ impl Store for Spread {
         self.own().head_epoch()
     }
 
+    fn moved_elsewhere(&self) -> Result<bool> {
+        self.own().moved_elsewhere()
+    }
+
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
         use meridian_changes::timeline::Timeline;
         let mut found = self.own().follow_timeline()?;
