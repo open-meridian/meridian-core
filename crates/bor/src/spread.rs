@@ -47,6 +47,10 @@ pub struct Spread {
 /// head is in: once moved home, it is there.
 const ROUTED_AGAIN: usize = 3;
 
+/// How many times a read naming an account is made again where the
+/// account went while it was read.
+const READ_AGAIN: usize = 3;
+
 /// A page some read answers, filled from one database after another.
 trait Filled: Default {
     fn len(&self) -> usize;
@@ -374,6 +378,63 @@ impl Spread {
         placed
     }
 
+    /// A read naming `account_id`, from the database holding it, and from
+    /// the one it went to where it left that database while it was read
+    /// (step 3d; sections 6.4 and 6.8). Where it is held is looked up, and
+    /// then read: a move across databases that opened and let go between
+    /// the two left the read with a database that holds nothing of the
+    /// account any more, answered as though the account were empty. So the
+    /// database is asked again after the read, and a read of one the
+    /// account has left since is made again where it is now.
+    fn read_held<T>(
+        &self,
+        account_id: &str,
+        read: impl Fn(&PostgresStore) -> Result<T>,
+    ) -> Result<T> {
+        let mut store = self.holding(account_id);
+        if self.stores.len() == 1 {
+            return read(store);
+        }
+        for _ in 0..READ_AGAIN {
+            // What a test arms to move the account between the two.
+            if let Err(stopped) =
+                meridian_changes::moves::points::reached("book.read.held", account_id)
+            {
+                return Err(StoreError::Unavailable(stopped));
+            }
+            let answer = read(store)?;
+            // Where it is now: the database of the partition its row names
+            // where that database has opened it; else any that holds a row
+            // of it. Its row here still naming a partition of this
+            // database, or its move's open not yet made, or the account
+            // held nowhere (not yet written): the answer is its own.
+            let now = match store.account_row(account_id) {
+                Err(_) => return Ok(answer),
+                Ok(Some(partition)) => {
+                    let placed = self.database(self.of(&partition));
+                    if Arc::ptr_eq(placed, store)
+                        || !matches!(placed.account_row(account_id), Ok(Some(_)))
+                    {
+                        return Ok(answer);
+                    }
+                    placed
+                }
+                Ok(None) => {
+                    let Some(held) = self
+                        .stores
+                        .iter()
+                        .find(|other| matches!(other.account_row(account_id), Ok(Some(_))))
+                    else {
+                        return Ok(answer);
+                    };
+                    held
+                }
+            };
+            store = now;
+        }
+        read(store)
+    }
+
     /// A read naming an account from its database; one of every account
     /// from each database in turn, `limit` at most, its cursor naming the
     /// database it reached.
@@ -385,7 +446,7 @@ impl Spread {
         read: impl Fn(&PostgresStore, &str, usize) -> Result<P>,
     ) -> Result<P> {
         if !account_id.is_empty() {
-            return read(self.holding(account_id), cursor, limit);
+            return self.read_held(account_id, |store| read(store, cursor, limit));
         }
         let (mut d, mut inner) = split_cursor(cursor)?;
         // Each database answering its share of the accounts (the review's
@@ -671,11 +732,11 @@ impl Store for Spread {
         account_id: &str,
         entry_ids: &[String],
     ) -> Result<Vec<(String, crate::journal::Body)>> {
-        self.holding(account_id).bodies(account_id, entry_ids)
+        self.read_held(account_id, |store| store.bodies(account_id, entry_ids))
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
-        self.holding(account_id).book(account_id)
+        self.read_held(account_id, |store| store.book(account_id))
     }
 
     fn book_health(
@@ -685,7 +746,7 @@ impl Store for Spread {
         limit: usize,
     ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
         if let Some(only) = only {
-            return self.holding(only).book_health(Some(only), after, limit);
+            return self.read_held(only, |store| store.book_health(Some(only), after, limit));
         }
         // In account order across every database, each account from the
         // database writing it.
@@ -705,7 +766,7 @@ impl Store for Spread {
         at: &Mark,
         until: Option<&str>,
     ) -> Result<crate::book::Book> {
-        self.holding(account_id).book_as_of(account_id, at, until)
+        self.read_held(account_id, |store| store.book_as_of(account_id, at, until))
     }
 
     fn accounts(&self) -> Result<Vec<String>> {

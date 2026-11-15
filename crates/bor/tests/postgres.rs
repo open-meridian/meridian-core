@@ -2538,6 +2538,133 @@ async fn m11_an_accounts_orders_chain_in_order_across_its_move() {
     blocking(move || drop((store, migrated)));
 }
 
+/// A read naming an account is answered whole though the account moves to
+/// another database while it is read (step 3d; sections 6.4 and 6.8; the
+/// latent race part 10 named in Spread's named-account reads): the member
+/// looked up the database holding the account, and the move opened it in
+/// the other and let go of the first before the read was made there. The
+/// read is made again where the account went, never answered empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m11_a_named_read_follows_its_account_to_the_database_it_moved_to_meanwhile() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::points;
+    use meridian_domain::v1::MoveAccountRequest;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(4).unwrap();
+                url
+            })
+            .collect()
+    });
+    let spread = |group: u32| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores = urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(4),
+                )
+            })
+            .collect();
+        Arc::new(meridian_bor::spread::Spread::new(stores, groups))
+    };
+    // Each group's writer, and a third member that only reads.
+    let (zero, one, reading) = blocking(|| (spread(0), spread(1), spread(0)));
+    let groups = Groups::new(0, 2).unwrap();
+    // An account of group 1's, in database 1; a partition of group 0's, in
+    // database 0, to move it to.
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-M11-READ-{n}")))
+        .find(|account| groups.owner(&meridian_bor::store::placement_of(account, 4)) == 1)
+        .unwrap();
+    blocking(|| one.place_first(&account, &account)).unwrap();
+    let to = (0..4)
+        .map(meridian_bor::store::partition_named)
+        .find(|partition| groups.owner(partition) == 0)
+        .unwrap();
+    let bus = |name: &str, store: Arc<meridian_bor::spread::Spread>| {
+        let bus = Arc::new(Bus::single(
+            name,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), store, bus.clock());
+        resolving_equities(&bus);
+        bus
+    };
+    let (bus_zero, bus_one) = (
+        bus("m11-read-0", zero.clone()),
+        bus("m11-read-1", one.clone()),
+    );
+    open(&bus_one, &account, &unique("INS-M11")).await;
+    let read = PositionsRead {
+        scope: Scope::Everything,
+        account_id: account.clone(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 10,
+        cursor: String::new(),
+    };
+    assert_eq!(
+        blocking(|| reading.positions(&read)).unwrap().records.len(),
+        1,
+        "its opening balance, before the move"
+    );
+    // The move made between the member's look and its read, once.
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (moved, account, to) = (moved.clone(), account.clone(), to.clone());
+        let (bus_zero, bus_one) = (bus_zero.clone(), bus_one.clone());
+        let runtime = tokio::runtime::Handle::current();
+        points::arm(
+            "book.read.held",
+            &account.clone(),
+            Arc::new(move |_| {
+                if !moved.swap(true, Ordering::SeqCst) {
+                    let request = MoveAccountRequest {
+                        account_id: account.clone(),
+                        target_partition: to.clone(),
+                        reason: "moved while it was read".into(),
+                    };
+                    // Closed by group 1 in database 1; opened by group 0 in
+                    // database 0, which then lets database 1 go of it.
+                    let _ = runtime.block_on(send(
+                        &bus_one,
+                        meridian_bor::moves::MOVE_ACCOUNT,
+                        &request,
+                        Some(PERSON),
+                    ));
+                    runtime
+                        .block_on(send(
+                            &bus_zero,
+                            meridian_bor::moves::MOVE_ACCOUNT,
+                            &request,
+                            Some(PERSON),
+                        ))
+                        .map_err(|failed| format!("the move failed: {failed}"))?;
+                }
+                Ok(())
+            }),
+        );
+    }
+    let after = blocking(|| reading.positions(&read));
+    points::disarm("book.read.held", &account);
+    assert!(moved.load(Ordering::SeqCst), "the account moved meanwhile");
+    assert_eq!(
+        after.unwrap().records.len(),
+        1,
+        "read where it went, never as empty where it was"
+    );
+    blocking(move || drop((zero, one, reading)));
+    drop((bus_zero, bus_one));
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the
