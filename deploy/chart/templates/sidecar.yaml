@@ -24,6 +24,8 @@
       "plugin" .plugin
       "imageTag" .imageTag
       "limits" .limits
+      "shards" .shards
+      "standby" .standby
       "launched" false
       "storage" $storage) }}
 ---

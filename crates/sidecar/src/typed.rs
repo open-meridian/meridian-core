@@ -803,9 +803,42 @@ impl Sidecar {
             _ => false,
         };
         let unmapped = account.is_none();
+        // A data plugin's lake write share (step 3d; the resilience spec's
+        // section 6.9): a write past it is sent, in its order, and its
+        // acknowledgement held until the share covers it; one whose hold
+        // would outlast its caller's deadline is refused RATE_LIMITED with
+        // a retry-after, and never sent.
+        let held = match &self.write_share {
+            Some(share) if meridian_bus::write_ahead::TOPICS.contains(&&*topic) => {
+                let now = std::time::Instant::now();
+                let bytes = message.encode_to_vec().len();
+                match share.take(bytes, now, crate::share::call_within(now)) {
+                    Ok(held) => held,
+                    Err(refused) => {
+                        tracing::info!(
+                            instance = self.instance_id(),
+                            topic = &*topic,
+                            bytes,
+                            retry_after_seconds = refused.retry_after_seconds,
+                            "{}",
+                            refused.words
+                        );
+                        return Err(refused_for_load(
+                            RefusalReason::RateLimited,
+                            refused.retry_after_seconds,
+                            refused.words,
+                        ));
+                    }
+                }
+            }
+            _ => std::time::Duration::ZERO,
+        };
         let reply: Response<R> = self
             .ask_routed_demo(&topic, payload_type, message, &claims, scope, routed, demo)
             .await?;
+        if !held.is_zero() {
+            tokio::time::sleep(held).await;
+        }
         self.count_unplaced(payload_type, unmapped, &reply.get_ref().encode_to_vec());
         Ok(reply)
     }

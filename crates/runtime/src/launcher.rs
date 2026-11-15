@@ -91,6 +91,9 @@ pub struct Shapes {
     /// What an allowed instance is given beside its storage, where the
     /// chart keeps archives (contract v16).
     pub archive: Option<String>,
+    /// The plugin shape as several pods of one instance, each sidecar given
+    /// the members' lease right (step 3d; the resilience spec's section 7).
+    pub shards: Option<String>,
 }
 
 /// An edge plugin's shapes (decisions/028), and which roles are the edge's.
@@ -390,6 +393,12 @@ pub fn with_limits(
             "limits.answer_mib",
             limits.answer_mib,
         ),
+        // A data plugin's lake write share (step 3d; section 6.9).
+        (
+            "MERIDIAN_SIDECAR_WRITE_MIB_PER_SECOND",
+            "limits.write_mib_per_second",
+            limits.write_mib_per_second,
+        ),
     ];
     if said.iter().all(|(_, _, value)| *value == 0) {
         return Ok(manifest);
@@ -438,6 +447,99 @@ pub fn with_limits(
         env.retain(|e| e["name"] != name);
         env.push(serde_json::json!({"name": name, "value": value.to_string()}));
     }
+    Ok(manifest)
+}
+
+/// The shard count the launcher tells each sidecar of an instance run as
+/// several pods (approved 2026-11-15).
+pub const SHARDS_ENV: &str = crate::shards::SHARDS_ENV;
+
+/// Whether a request asks for several pods of its instance: shards above
+/// one, or a standby pod.
+pub fn several(request: &CreatePluginRequest) -> bool {
+    request.shards > 1 || request.standby
+}
+
+/// The template an instance launched with shards or a standby pod is made
+/// from (step 3d; the resilience spec's section 7): the chart's shards
+/// shape in place of `chosen`, which is kept for any other request. Refused
+/// where the chart renders none, for more shards than a declaration may
+/// name, for a live instance, and for one given storage of its own: a
+/// claim is one pod's.
+pub fn shards_template<'a>(
+    chosen: Chosen<'a>,
+    request: &CreatePluginRequest,
+    shapes: &'a Shapes,
+) -> Result<Chosen<'a>, String> {
+    if !several(request) {
+        return Ok(chosen);
+    }
+    let id = &request.instance_id;
+    if request.shards > crate::shards::MOST {
+        return Err(format!(
+            "shards: {id} was asked {} shards; at most {}",
+            request.shards,
+            crate::shards::MOST
+        ));
+    }
+    if request.live {
+        return Err(format!(
+            "{id} was asked for live with shards or a standby pod: a live instance is one pod"
+        ));
+    }
+    if chosen.claim.is_some() {
+        return Err(format!(
+            "{id} was asked shards or a standby pod, and its plugin keeps storage of its own: \
+             an instance's storage is one pod's, so it runs as one pod"
+        ));
+    }
+    let workload = shapes.shards.as_deref().ok_or_else(|| {
+        format!(
+            "{id} was asked shards or a standby pod, and this deployment's chart renders no \
+             shape for them"
+        )
+    })?;
+    Ok(Chosen {
+        workload,
+        claim: None,
+    })
+}
+
+/// The Deployment of an instance launched with shards or a standby pod: a
+/// pod per shard and one more for a standby, and each sidecar told the
+/// shard count ([`SHARDS_ENV`]), 1 for a standby alone. Unchanged for any
+/// other request. Refused where the manifest runs its pods under an
+/// account of the archive's: the sidecar's lease right is the members'.
+pub fn with_shards(
+    mut manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+    archive_account: bool,
+) -> Result<serde_json::Value, String> {
+    if !several(request) {
+        return Ok(manifest);
+    }
+    if archive_account {
+        return Err(format!(
+            "{} was asked shards or a standby pod, and its archive runs it under an account of \
+             its own: its sidecar takes its shard's lease under the members' account, so it \
+             runs as one pod",
+            request.instance_id
+        ));
+    }
+    let shards = request.shards.max(1);
+    manifest["spec"]["replicas"] = serde_json::json!(shards + u32::from(request.standby));
+    let env = manifest["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "sidecar"))
+        .and_then(|sidecar| sidecar["env"].as_array_mut())
+        .ok_or("the shards template has no sidecar container to tell the shard count")?;
+    if !env.iter().any(|e| e["name"] == SHARDS_ENV) {
+        return Err(format!(
+            "the shards template does not tell its sidecar {SHARDS_ENV}"
+        ));
+    }
+    env.retain(|e| e["name"] != SHARDS_ENV);
+    env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
     Ok(manifest)
 }
 

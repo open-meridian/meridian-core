@@ -60,6 +60,24 @@
   when the conductor's CreatePlugin carries one allowed.
 */}}
 {{- $archive := include "meridian-runtime.archiveShape" . }}
+{{/*
+  The shape of an instance launched with shards or a standby pod (step 3d;
+  the resilience spec's section 7): the same definition as several pods,
+  each sidecar given the shard count and the members' lease right. Rendered
+  for one shard; the launcher sets the pods and the count the launch asked.
+*/}}
+{{- $shards := include "meridian-runtime.plugin" (dict
+      "top" .
+      "name" (printf "%s-plugin-__INSTANCE__" $full)
+      "instance" "__INSTANCE__"
+      "roles" "__ROLES__"
+      "brokerSecret" (printf "%s-launched" $broker)
+      "brokerKey" "__INSTANCE__.url"
+      "plugin" (dict "image" "__IMAGE__")
+      "imageTag" ""
+      "launched" true
+      "shards" 1
+      "standby" true) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -68,6 +86,7 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 data:
   plugin.json: {{ $shape | fromYaml | toJson | quote }}
+  plugin-shards.json: {{ $shards | fromYaml | toJson | quote }}
   {{- if .Values.pluginStorage.enabled }}
   plugin-storage.json: {{ $storage | fromYaml | toJson | quote }}
   claim.json: {{ $claim | fromYaml | toJson | quote }}
@@ -212,6 +231,9 @@ spec:
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "launcher" "values" $.Values.launcher "account" true) | nindent 12 }}
             - name: MERIDIAN_LAUNCHER_TEMPLATE
               value: /etc/meridian/launcher/plugin.json
+            # An instance launched with shards or a standby pod (step 3d).
+            - name: MERIDIAN_LAUNCHER_SHARDS_TEMPLATE
+              value: /etc/meridian/launcher/plugin-shards.json
             {{- if .Values.development }}
             # A development deployment: the launcher makes the live shape
             # when asked, and refuses it anywhere else

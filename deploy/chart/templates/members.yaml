@@ -5,11 +5,24 @@
   to say which of them writes, under this account. Its one right is its
   Leases: read, make and renew them, in this namespace only, never a
   cluster-wide one. The launcher holds the same right under its own account.
-  With no standby anywhere, as by default, none of this renders.
+  A plugin instance run as several pods -- shards, or a standby pod (step
+  3d; section 7) -- takes its shards' Leases under the same account, its
+  token in the sidecar's container alone: so it renders too wherever the
+  launcher runs, which may be asked for such an instance at any time, and
+  where a sidecars[] entry is one. With no standby anywhere and no launcher,
+  none of this renders.
 */}}
 {{- $leased := false -}}
 {{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
 {{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) -}}
+{{- $leased = true -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.launcher.enabled .Values.registry.enabled (not .Values.broker.existingSecret) -}}
+{{- $leased = true -}}
+{{- end -}}
+{{- range .Values.sidecars -}}
+{{- if or (gt (int (.shards | default 1)) 1) .standby -}}
 {{- $leased = true -}}
 {{- end -}}
 {{- end -}}

@@ -190,6 +190,15 @@ pub struct Sidecar {
     /// The plugin's open subscriptions and the stream they deliver on
     /// (W4.3; contract v28, amended 2026-10-30).
     pub(crate) subscriptions: Arc<crate::subscriptions::Registry>,
+
+    /// The instance's shards, where it was launched with several or with a
+    /// standby pod (step 3d; the resilience spec's section 7): which this
+    /// sidecar is, and which live. None: the instance's one pod.
+    pub(crate) shards: Option<Arc<crate::shards::Shards>>,
+
+    /// A data plugin's lake write share (step 3d; section 6.9). None: no
+    /// share set, and nothing held.
+    pub(crate) write_share: Option<Arc<crate::share::WriteShare>>,
 }
 
 impl Sidecar {
@@ -261,7 +270,23 @@ impl Sidecar {
             daily: Arc::default(),
             calls,
             subscriptions: Arc::default(),
+            shards: None,
+            write_share: None,
         }
+    }
+
+    /// As one shard of its instance: its plugin is handed its own share of
+    /// what the lake wants ([`crate::shards`]).
+    pub fn as_shard(mut self, shards: Arc<crate::shards::Shards>) -> Self {
+        self.shards = Some(shards);
+        self
+    }
+
+    /// Holding its plugin's lake writes to a share
+    /// ([`crate::share::WriteShare`]).
+    pub fn with_write_share(mut self, share: Arc<crate::share::WriteShare>) -> Self {
+        self.write_share = Some(share);
+        self
     }
 
     /// Hold registration to `declaration` where no launch is known

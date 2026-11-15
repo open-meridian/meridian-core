@@ -1001,9 +1001,10 @@ async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards()
     // Contract v30 (W8.3; the launch settings and the refusal approved by
     // 1057): shards past the version's most_shards refused INVALID_ARGUMENT
     // naming shards, 0 and 1 each one pod; within it, the shards and the
-    // standby pod kept on the launch's record. The launcher still runs one
-    // pod (3d).
-    let (bus, _) = harness();
+    // standby pod kept on the launch's record, and asked of the launcher
+    // (step 3d; CreatePluginRequest.shards and .standby, approved
+    // 2026-11-15), which makes the pods.
+    let (bus, launcher) = harness();
     let mut shardable = snaptrade("0.1.0");
     shardable.metadata.as_mut().unwrap().declaration = Some(meridian_pb::v1::PluginDeclaration {
         most_shards: 2,
@@ -1042,6 +1043,16 @@ async fn a_launchs_shards_and_standby_are_kept_within_its_versions_most_shards()
         .find(|l| l.instance_id == "snaptrade-1")
         .unwrap();
     assert_eq!((held.shards, held.standby), (2, true));
+    {
+        let created = launcher.created.lock().unwrap();
+        let asked = created.last().unwrap();
+        assert_eq!(asked.instance_id, "snaptrade-1");
+        assert_eq!(
+            (asked.shards, asked.standby),
+            (2, true),
+            "the launcher is asked for the launch's shards and standby pod"
+        );
+    }
     // A version declaring none is one pod: 1 is admitted, 2 refused.
     upload(&bus, snaptrade("0.1.1")).await.unwrap();
     let one = LaunchPluginRequest {

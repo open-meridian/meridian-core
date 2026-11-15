@@ -18,8 +18,8 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    checked, claim, manifest, reusable, template_for, with_archive, with_limits, Shapes,
-    StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
+    checked, claim, manifest, reusable, shards_template, template_for, with_archive, with_limits,
+    with_shards, Shapes, StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -74,6 +74,9 @@ impl Launcher {
             ));
         }
         let chosen = template_for(&request, self.development, &self.shapes)?;
+        // Several pods of the instance, where its launch asked shards or a
+        // standby pod (step 3d): the chart's shape for them.
+        let chosen = shards_template(chosen, &request, &self.shapes)?;
         // Its archive beside its storage, where a deployment admin allowed
         // it one (W8.7, contract v16).
         let edge = self
@@ -90,6 +93,14 @@ impl Launcher {
         )?;
         // Its own share at its sidecar, over the chart's (contract v30).
         let made = with_limits(made, &request)?;
+        // A pod per shard and one more for a standby, each sidecar told the
+        // count; never under an archive's own account.
+        let own_account = meridian_runtime::launcher::archive_allowed(&request)
+            && self.shapes.archive.as_deref().is_some_and(|shape| {
+                serde_json::from_str::<serde_json::Value>(shape)
+                    .is_ok_and(|shape| shape["serviceAccountName"].is_string())
+            });
+        let made = with_shards(made, &request, own_account)?;
         if let Some(template) = chosen.claim {
             self.storage(template, &request)?;
         }
@@ -102,6 +113,8 @@ impl Launcher {
             image = request.image,
             live = request.live,
             archive = meridian_runtime::launcher::archive_allowed(&request),
+            shards = request.shards,
+            standby = request.standby,
             "a plugin created"
         );
         Ok(CreatePluginReply { workload })
@@ -255,6 +268,8 @@ fn run() -> Result<(), String> {
             // What an allowed instance is given beside its storage, where
             // the chart keeps archives (pluginArchive, contract v16).
             archive: optional("MERIDIAN_LAUNCHER_ARCHIVE_TEMPLATE")?,
+            // The plugin shape as several pods of one instance (step 3d).
+            shards: optional("MERIDIAN_LAUNCHER_SHARDS_TEMPLATE")?,
         },
         development,
         registry,

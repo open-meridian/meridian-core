@@ -1509,7 +1509,7 @@ A plugin's share at its sidecar (stage M; section 10a): the chart's
 {{- define "meridian-runtime.sidecarLimitsEnv" -}}
 {{- $chart := .top.Values.sidecar.limits | default dict -}}
 {{- $own := .limits | default dict -}}
-{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" }}
+{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" "writeMiBPerSecond" "MERIDIAN_SIDECAR_WRITE_MIB_PER_SECOND" }}
 {{- range $said := list (dict "where" "sidecar.limits" "from" $chart) (dict "where" "a plugin's limits" "from" $own) }}
 {{- if hasKey $said.from $name }}
 {{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $said.from $name))) }}

@@ -131,11 +131,34 @@ fn run() -> Result<(), String> {
     // set it to something that is not one.
     let limits = Limits::from_env()?;
 
+    // Its instance's shards (step 3d; the resilience spec's section 7): set
+    // by the launcher on a launch with several shards or a standby pod.
+    // Each shard holds the instance's share divided by the count.
+    let shard_count =
+        meridian_runtime::shards::count(var(meridian_runtime::shards::SHARDS_ENV).as_deref())?;
+    let limits = limits.per_shard(shard_count.unwrap_or(1));
+    // A data plugin's lake write share (section 6.9), refused at start
+    // where it is not one; no other role writes the lake's rows.
+    let write_share = meridian_sidecar::share::WriteShare::from_env(shard_count.unwrap_or(1))?
+        .filter(|_| writes_rows);
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            // One pod of several: nothing is served -- no plugin surface,
+            // no front door, nothing on the bus -- until a shard's Lease is
+            // this pod's. A standby waits here, and its plugin's
+            // registration waits with it.
+            let mut shard = None;
+            if let Some(count) = shard_count {
+                let Some(held) = take_a_shard(&identity.instance_id, count).await? else {
+                    tracing::info!("stopping");
+                    return Ok(());
+                };
+                shard = Some(held);
+            }
             // Its own budget (stage M), inside the desktop footprint's +15 %
             // (1058): the plugin's share keeps a flood off it. The plugin's
             // answers in flight (answerMiB) and its read_after session are
@@ -162,6 +185,20 @@ fn run() -> Result<(), String> {
             let mut sidecar = Sidecar::new(bus, &deployment_id, identity);
             if let Some(verifier) = verifier {
                 sidecar = sidecar.with_verifier(verifier);
+            }
+            if let Some(share) = write_share {
+                tracing::info!(
+                    bytes_per_second = share.bytes_per_second(),
+                    "the plugin's lake write share at its sidecar"
+                );
+                sidecar = sidecar.with_write_share(share);
+            }
+            // Kept while it serves: its own Lease renewed, the others read.
+            let (stop_keeping, stopping) = tokio::sync::oneshot::channel();
+            let mut keeping = None;
+            if let Some((set, shards)) = shard {
+                sidecar = sidecar.as_shard(Arc::clone(&shards));
+                keeping = Some(tokio::spawn(keep_shard(set, shards, stopping)));
             }
             // A harness's sidecar, which no launch made, holds its plugin's
             // registration to the declaration an upload would carry (W4.1,
@@ -244,10 +281,122 @@ fn run() -> Result<(), String> {
                 stopped = front_door => stopped,
                 _ = shutdown() => {
                     tracing::info!("stopping");
+                    // Its shard given up, so the standby takes it at once.
+                    let _ = stop_keeping.send(());
+                    if let Some(keeping) = keeping {
+                        let _ = keeping.await;
+                    }
                     Ok(())
                 }
             }
         })
+}
+
+type ShardSet = meridian_runtime::shards::ShardSet<meridian_runtime::lease::KubeLeases>;
+
+/// Wait until one of the instance's shard Leases is this pod's (step 3d;
+/// the resilience spec's section 7): at once where one is free, else as its
+/// standby until one lapses or is released. None where the pod was told to
+/// stop while it waited.
+async fn take_a_shard(
+    instance: &str,
+    count: u32,
+) -> Result<Option<(ShardSet, Arc<meridian_sidecar::shards::Shards>)>, String> {
+    use meridian_runtime::shards::Stand;
+    if instance.is_empty() {
+        return Err(format!(
+            "{} needs MERIDIAN_PLUGIN_INSTANCE_ID: a shard is a pod of an instance",
+            meridian_runtime::shards::SHARDS_ENV
+        ));
+    }
+    let whole = |name: &str, default: u64| -> Result<u64, String> {
+        match var(name) {
+            None => Ok(default),
+            Some(said) => said
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{name} is {said:?}; a whole number")),
+        }
+    };
+    let renew = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_RENEW_SECONDS", 2)?);
+    let duration = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_DURATION_SECONDS", 6)?);
+    // This process, not only its pod, as a store's member names itself: a
+    // sidecar restarted in its pod comes back as the standby.
+    let holder = format!(
+        "{}_{:x}",
+        meridian_runtime::member::member_name(),
+        meridian_runtime::now_ns()
+    );
+    let api = Arc::new(meridian_runtime::lease::KubeLeases::in_cluster(renew)?);
+    let mut set = ShardSet::new(api, instance, count, &holder, renew, duration)?;
+    let mut said = false;
+    loop {
+        match set
+            .look(std::time::Instant::now(), meridian_runtime::now_ns())
+            .await
+        {
+            Stand::Shard { mine, others } => {
+                tracing::info!(
+                    instance,
+                    shard = mine,
+                    of = count,
+                    "this pod holds a shard's lease"
+                );
+                let shards = Arc::new(meridian_sidecar::shards::Shards::new(mine));
+                shards.set_live(others);
+                return Ok(Some((set, shards)));
+            }
+            Stand::Standby if !said => {
+                said = true;
+                tracing::info!(
+                    instance,
+                    shards = count,
+                    "every shard's lease is held: standing by, serving nothing until one is this pod's"
+                );
+            }
+            Stand::Standby => {}
+            Stand::Lost(why) => return Err(why),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(set.look_every()) => {}
+            _ = shutdown() => return Ok(None),
+        }
+    }
+}
+
+/// Its shard kept: the Lease renewed every renewal and the other shards'
+/// read, so the sidecar shares its instance's subjects over those that
+/// live. A shard lost ends the process: no epoch fences a plugin, so it
+/// stops serving at once and its pod comes back as the standby.
+async fn keep_shard(
+    mut set: ShardSet,
+    shards: Arc<meridian_sidecar::shards::Shards>,
+    mut stopping: tokio::sync::oneshot::Receiver<()>,
+) {
+    use meridian_runtime::shards::Stand;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(set.look_every()) => {}
+            _ = &mut stopping => {
+                set.release(meridian_runtime::now_ns()).await;
+                return;
+            }
+        }
+        match set
+            .look(std::time::Instant::now(), meridian_runtime::now_ns())
+            .await
+        {
+            Stand::Shard { others, .. } => shards.set_live(others),
+            Stand::Standby => {}
+            Stand::Lost(why) => {
+                tracing::error!(
+                    shard = shards.mine(),
+                    "the shard's lease is lost: {why}; stopping"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 /// The front door served: over TLS where the deployment's internal TLS is

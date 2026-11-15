@@ -455,3 +455,176 @@ fn a_conflated_rows_later_value_replaces_the_one_waiting() {
     assert_eq!(waiting.pop().unwrap().meta.unwrap().row, "other");
     assert!(waiting.pop().is_none());
 }
+
+/// A registered data plugin `feed-1`, as shard `mine` of its instance.
+async fn shard(bus: &Arc<Bus>, mine: u32) -> (Sidecar, Arc<crate::shards::Shards>) {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.event.observations-wanted\tevent\tlake\tdata\n\
+         platform.lake.event.want-withdrawn\tevent\tlake\tdata\n\
+         platform.config.event.entitlements-changed\tevent\tconductor\tlake,sidecar\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\ndata\trole\nlake\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
+    )
+    .unwrap();
+    let shards = Arc::new(crate::shards::Shards::new(mine));
+    let sidecar = Sidecar::under(
+        &contract,
+        Arc::clone(bus),
+        "DEP-test",
+        Identity::new("feed-1", vec!["data".into()]),
+    )
+    .as_shard(Arc::clone(&shards));
+    let reply = sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v7".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    (sidecar, shards)
+}
+
+fn wanted_subjects(delivery: &plugin::Delivery) -> (String, Vec<String>) {
+    match delivery.item.as_ref().expect("an item") {
+        plugin::delivery::Item::ObservationsWanted(want) => (
+            want.want_id.clone(),
+            want.subjects.iter().map(|s| s.entity_id.clone()).collect(),
+        ),
+        other => panic!("not a want: {other:?}"),
+    }
+}
+
+/// Step 3d (the resilience spec's section 7): two shards of one instance
+/// hear the same want, and each hands its plugin its own subjects alone;
+/// when one's Lease lapses the other hands its plugin the rest at once, and
+/// gives them back when it returns.
+#[tokio::test]
+async fn two_shards_share_a_want_s_subjects_and_a_lost_shard_s_are_handed_on_at_once() {
+    use meridian_domain::v1::{ObservationsWantedEvent, SubjectRef, WantWithdrawnEvent};
+    let bus = Arc::new(Bus::single(
+        "feed-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    let (first, at_first) = shard(&bus, 0).await;
+    let (second, at_second) = shard(&bus, 1).await;
+    at_first.set_live([1]);
+    at_second.set_live([0]);
+    let mut to_first = first
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut to_second = second
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let want = ObservationsWantedEvent {
+        want_id: "want-1".into(),
+        dataset: "feed-1:prices".into(),
+        data_type: "meridian.v1.Price".into(),
+        subjects: names
+            .iter()
+            .map(|entity| SubjectRef {
+                entity_id: entity.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        standing: true,
+        ..Default::default()
+    };
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        want.encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    let (id, mut held_first) = wanted_subjects(&next(&mut to_first).await);
+    let (_, held_second) = wanted_subjects(&next(&mut to_second).await);
+    assert_eq!(id, "want-1", "the want's own ID at each shard");
+    assert!(!held_first.is_empty() && !held_second.is_empty());
+    let mut both: Vec<String> = held_first.iter().chain(&held_second).cloned().collect();
+    both.sort();
+    assert_eq!(both, names, "each subject handed to exactly one shard");
+
+    // The second shard's Lease lapsed: the first is handed every subject,
+    // without the lake saying anything again.
+    at_first.set_live([]);
+    let (id, all) = wanted_subjects(&next(&mut to_first).await);
+    assert_eq!((id.as_str(), &all), ("want-1", &names));
+
+    // It returned: the first holds its own again.
+    at_first.set_live([1]);
+    let (_, mut again) = wanted_subjects(&next(&mut to_first).await);
+    again.sort();
+    held_first.sort();
+    assert_eq!(again, held_first);
+
+    // The lake withdraws it: each shard's plugin hears it, having held some.
+    bus.publish(
+        "platform.lake.event.want-withdrawn",
+        "meridian.v1.WantWithdrawnEvent",
+        WantWithdrawnEvent {
+            want_id: "want-1".into(),
+            dataset: "feed-1:prices".into(),
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    for stream in [&mut to_first, &mut to_second] {
+        match next(stream).await.item.unwrap() {
+            plugin::delivery::Item::WantWithdrawn(gone) => assert_eq!(gone.want_id, "want-1"),
+            other => panic!("not a withdrawal: {other:?}"),
+        }
+    }
+
+    // A want none of whose subjects is the first shard's is the second's
+    // alone: the first's plugin hears nothing of it.
+    let theirs = names
+        .iter()
+        .find(|name| !at_first.keeps(name))
+        .unwrap()
+        .clone();
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        ObservationsWantedEvent {
+            want_id: "want-2".into(),
+            subjects: vec![SubjectRef {
+                entity_id: theirs.clone(),
+                ..Default::default()
+            }],
+            ..want.clone()
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        wanted_subjects(&next(&mut to_second).await),
+        ("want-2".to_string(), vec![theirs])
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), to_first.next())
+            .await
+            .is_err(),
+        "the first shard's plugin was handed a want that is not its own"
+    );
+}

@@ -21184,6 +21184,17 @@ pub struct CreatePluginRequest {
     /// the sidecar's MERIDIAN_SIDECAR_* over the chart's sidecar.limits.
     #[prost(message, optional, tag = "9")]
     pub limits: ::core::option::Option<SidecarLimits>,
+    /// Contract v30, built with 3d (W8.3;
+    /// spec/a-deployment-scales-out-and-fails-over-by-configuration section 7;
+    /// approved 2026-11-15): the launch's shards and standby pod, as
+    /// LaunchPluginRequest carries them. The launcher makes one pod per shard
+    /// and one more for a standby, pods of the one instance, and tells each
+    /// sidecar the shard count; each takes a Lease `<instance>-shard-<n>`. 0
+    /// or 1 with no standby: the instance's one pod, as before.
+    #[prost(uint32, tag = "10")]
+    pub shards: u32,
+    #[prost(bool, tag = "11")]
+    pub standby: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreatePluginReply {

@@ -1030,10 +1030,21 @@ sidecar:
   # climbs, and takes more a second than 200 across many accounts; a page
   # is at most 1 MiB, so 32 MiB holds every request in flight's answer
   # twice over.
+  #
+  # writeMiBPerSecond (step 3d; section 6.9; approved 2026-11-12) is a data
+  # plugin's lake write share, in MiB a second with a burst of a second's
+  # worth. Past it the sidecar holds the write's acknowledgement until the
+  # share covers it, and refuses RATE_LIMITED with a retry-after a write
+  # whose hold would outlast its caller's deadline; other plugins' writes
+  # are untouched. Set above what one lake writer group records, so it
+  # bounds a plugin that floods and never one that does not.
+  #
+  # An instance run as several shards holds each limit divided among them.
   limits:
     inFlight: 16
     requestsPerSecond: 400
     answerMiB: 32
+    writeMiBPerSecond: 8
 
 nameOverride: ""
 fullnameOverride: ""

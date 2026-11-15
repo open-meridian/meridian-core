@@ -115,6 +115,7 @@ fn a_placeholder_this_launcher_does_not_know_is_refused_rather_than_left_in() {
 
 fn shapes(storage: bool) -> Shapes {
     Shapes {
+        shards: Some("several".into()),
         plain: "plain".into(),
         live: Some("live".into()),
         storage: storage.then(|| StorageShapes {
@@ -452,7 +453,7 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
             in_flight: 4,
             requests_per_second: 0,
             answer_mib: 8,
-            // The lake write share is 3d's: carried, written nowhere yet.
+            // The lake write share (step 3d; section 6.9).
             write_mib_per_second: 2,
         }),
         ..request()
@@ -461,6 +462,7 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
     assert_eq!(said(&made, "MERIDIAN_SIDECAR_IN_FLIGHT"), ["4"]);
     assert_eq!(said(&made, "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND"), ["400"]);
     assert_eq!(said(&made, "MERIDIAN_SIDECAR_ANSWER_MIB"), ["8"]);
+    assert_eq!(said(&made, "MERIDIAN_SIDECAR_WRITE_MIB_PER_SECOND"), ["2"]);
     // Answers in flight that leave the sidecar nothing: refused, naming it.
     let greedy = CreatePluginRequest {
         limits: Some(meridian_domain::v1::SidecarLimits {
@@ -471,4 +473,141 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
     };
     let refused = with_limits(shape(), &greedy).unwrap_err();
     assert!(refused.contains("limits.answer_mib 200"), "{refused}");
+}
+
+/// The chart's shards shape, as far as the launcher reads it.
+fn several_pods() -> serde_json::Value {
+    serde_json::json!({"spec": {"replicas": 2, "template": {"spec": {
+        "serviceAccountName": "check-meridian-runtime-member",
+        "containers": [
+            {"name": "sidecar", "env": [
+                {"name": "MERIDIAN_PLUGIN_SHARDS", "value": "1"},
+                {"name": "MERIDIAN_LEASE_RENEW_SECONDS", "value": "2"}
+            ]},
+            {"name": "plugin", "env": []}
+        ]
+    }}}})
+}
+
+/// Step 3d (the resilience spec's section 7; approved 2026-11-15): a launch
+/// with shards or a standby pod is made from the chart's shards shape, a
+/// pod per shard and one more for a standby, each sidecar told the count;
+/// any other launch is the instance's one pod, as before.
+#[test]
+fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the_count() {
+    let shapes = shapes(false);
+    let plain = template_for(&request(), false, &shapes).unwrap();
+    // None asked, and one shard with no standby: the plain shape, one pod.
+    for (shards, standby) in [(0, false), (1, false)] {
+        let asked = CreatePluginRequest {
+            shards,
+            standby,
+            ..request()
+        };
+        assert!(!several(&asked));
+        let chosen = shards_template(
+            template_for(&asked, false, &shapes).unwrap(),
+            &asked,
+            &shapes,
+        )
+        .unwrap();
+        assert_eq!(chosen, plain);
+        assert_eq!(
+            with_shards(several_pods(), &asked, false).unwrap(),
+            several_pods(),
+            "untouched"
+        );
+    }
+    let said = |made: &serde_json::Value| -> Vec<String> {
+        made["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "MERIDIAN_PLUGIN_SHARDS")
+            .map(|e| e["value"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for (shards, standby, pods, told) in [
+        (2, false, 2, "2"),
+        (2, true, 3, "2"),
+        (0, true, 2, "1"),
+        (1, true, 2, "1"),
+        (64, true, 65, "64"),
+    ] {
+        let asked = CreatePluginRequest {
+            shards,
+            standby,
+            ..request()
+        };
+        let chosen = shards_template(
+            template_for(&asked, false, &shapes).unwrap(),
+            &asked,
+            &shapes,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen,
+            Chosen {
+                workload: "several",
+                claim: None
+            }
+        );
+        let made = with_shards(several_pods(), &asked, false).unwrap();
+        assert_eq!(
+            made["spec"]["replicas"], pods,
+            "{shards} shards, standby {standby}"
+        );
+        assert_eq!(said(&made), [told], "told once");
+        // The plugin's container is told nothing.
+        assert_eq!(
+            made["spec"]["template"]["spec"]["containers"][1]["env"],
+            serde_json::json!([])
+        );
+    }
+}
+
+#[test]
+fn shards_are_refused_where_the_instance_cannot_be_several_pods() {
+    let asked = CreatePluginRequest {
+        shards: 2,
+        ..request()
+    };
+    // A chart that renders no shape for them.
+    let none = Shapes {
+        shards: None,
+        ..shapes(false)
+    };
+    let refused =
+        shards_template(template_for(&asked, false, &none).unwrap(), &asked, &none).unwrap_err();
+    assert!(refused.contains("renders no shape"), "{refused}");
+    // Storage of its own: a claim is one pod's.
+    let stored = shapes(true);
+    let chosen = template_for(&asked, false, &stored).unwrap();
+    assert!(chosen.claim.is_some(), "the request's plugin keeps storage");
+    let refused = shards_template(chosen, &asked, &stored).unwrap_err();
+    assert!(refused.contains("storage is one pod's"), "{refused}");
+    // Live.
+    let live = CreatePluginRequest {
+        live: true,
+        standby: true,
+        ..request()
+    };
+    let shapes = shapes(false);
+    let refused =
+        shards_template(template_for(&live, true, &shapes).unwrap(), &live, &shapes).unwrap_err();
+    assert!(refused.contains("a live instance is one pod"), "{refused}");
+    // More than a declaration may name.
+    let many = CreatePluginRequest {
+        shards: 65,
+        ..request()
+    };
+    let refused =
+        shards_template(template_for(&many, false, &shapes).unwrap(), &many, &shapes).unwrap_err();
+    assert!(refused.starts_with("shards:"), "{refused}");
+    // An archive's own account: the lease right is the members'.
+    let refused = with_shards(several_pods(), &asked, true).unwrap_err();
+    assert!(refused.contains("under the members' account"), "{refused}");
+    // A template that tells its sidecar no count is not the shards shape.
+    let refused = with_shards(pod(), &asked, false).unwrap_err();
+    assert!(refused.contains("MERIDIAN_PLUGIN_SHARDS"), "{refused}");
 }

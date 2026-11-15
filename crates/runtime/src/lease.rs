@@ -120,6 +120,19 @@ pub trait Leases: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Wrote, String>> + Send;
 }
 
+/// A shared API is one too: several leases read through one client.
+impl<L: Leases> Leases for std::sync::Arc<L> {
+    async fn get(&self, name: &str) -> Result<Option<Record>, String> {
+        (**self).get(name).await
+    }
+    async fn create(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+        (**self).create(name, record).await
+    }
+    async fn update(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+        (**self).update(name, record).await
+    }
+}
+
 /// Where a member stands after a look at its lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Standing {
@@ -194,6 +207,39 @@ impl<L: Leases> Elector<L> {
             self.observed = None;
         }
         looked
+    }
+
+    /// Who holds the lease now, by looking alone: nothing is written, so a
+    /// member that watches never takes it (step 3d: a plugin's shard reads
+    /// which of its instance's other shards live). None where nobody holds
+    /// it, it was released, or its holder has not renewed for its duration
+    /// as this member observed it.
+    pub async fn watch(&mut self, now: Instant) -> Result<Option<String>, String> {
+        let current = match self.api.get(&self.settings.name).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                self.observed = None;
+                return Ok(None);
+            }
+            Err(failed) => {
+                // Unobserved, as in [`Elector::look`].
+                self.observed = None;
+                return Err(failed);
+            }
+        };
+        let changed = self
+            .observed
+            .as_ref()
+            .is_none_or(|(seen, _)| !same_spec(seen, &current));
+        if changed {
+            self.observed = Some((current.clone(), now));
+        }
+        let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
+        let lapse = Duration::from_secs(current.duration_seconds.max(1));
+        if current.holder.is_empty() || now.duration_since(seen_at) >= lapse {
+            return Ok(None);
+        }
+        Ok(Some(current.holder))
     }
 
     async fn look_once(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {

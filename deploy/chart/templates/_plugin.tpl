@@ -16,7 +16,13 @@
   since its image, from a folder it shares with its sidecar; and storage: an
   edge plugin's shape (decisions/028), which mounts its instance's claim,
   `<fullname>-storage-<instance>`, in the plugin's container alone, at the
-  path MERIDIAN_STORAGE_DIR names.
+  path MERIDIAN_STORAGE_DIR names; and shards and standby (step 3d; the
+  resilience spec's section 7): the instance as several pods of this one
+  Deployment, one per shard and one more for a standby, each sidecar told
+  the shard count and given the members' lease right -- in its own
+  container alone, never the plugin's -- to take a Lease
+  `<instance>-shard-<n>`. Unset, or one shard and no standby, the
+  instance's one pod as ever, with no lease.
 
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -28,6 +34,17 @@
 */}}
 {{- define "meridian-runtime.plugin" -}}
 {{- $top := .top -}}
+{{- $shards := max 1 (int (.shards | default 1)) -}}
+{{- $several := or (gt $shards 1) .standby -}}
+{{- if gt $shards 64 -}}
+{{- fail (printf "%s is given %d shards; at most 64 (PluginDeclaration.most_shards)" .instance $shards) -}}
+{{- end -}}
+{{- if and $several .storage -}}
+{{- fail (printf "%s is given shards or a standby pod and its own storage: an instance's storage is one pod's" .instance) -}}
+{{- end -}}
+{{- if and $several .live -}}
+{{- fail (printf "%s is given shards or a standby pod and the live shape: a live instance is one pod" .instance) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,7 +66,7 @@ metadata:
     meridian.dev/roles: {{ .roles | quote }}
   {{- end }}
 spec:
-  replicas: 1
+  replicas: {{ if $several }}{{ add $shards (ternary 1 0 (.standby | default false)) }}{{ else }}1{{ end }}
   revisionHistoryLimit: {{ $top.Values.revisionHistoryLimit }}
   # One copy of an instance at a time, always: a rolling update would start the
   # new pod beside the old, two plugins under one instance's name, hostname
@@ -83,6 +100,15 @@ spec:
       */}}
       hostname: {{ .instance }}
       subdomain: {{ include "meridian-runtime.fullname" $top }}-sidecars
+      {{- if $several }}
+      {{- /*
+        Several pods of the instance (step 3d): each sidecar takes a shard's
+        Lease under the members' account. Its token is mounted in the
+        sidecar's container alone, below; the plugin's holds none.
+      */}}
+      serviceAccountName: {{ include "meridian-runtime.fullname" $top }}-member
+      automountServiceAccountToken: false
+      {{- end }}
       {{- /*
         Live: the plugin (65532) and its sidecar share the live folder, each
         replacing what the other wrote, so the pod shares a group they both
@@ -172,6 +198,22 @@ spec:
               value: {{ .roles | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
+            {{- if $several }}
+            {{- /* Its instance's shard count, this pod's name and the
+                   leases' timing (step 3d; approved 2026-11-15): it serves
+                   its plugin once a shard's Lease is its own. */}}
+            {{- include "meridian-runtime.leaseTiming" $top }}
+            - name: MERIDIAN_PLUGIN_SHARDS
+              value: {{ $shards | quote }}
+            - name: MERIDIAN_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MERIDIAN_LEASE_RENEW_SECONDS
+              value: {{ $top.Values.leases.renewSeconds | quote }}
+            - name: MERIDIAN_LEASE_DURATION_SECONDS
+              value: {{ $top.Values.leases.durationSeconds | quote }}
+            {{- end }}
             {{- /* In `ha`, a data plugin's lake writes held by the lake's
                    write-ahead stream before they are recorded (contract v30,
                    stage E); the sidecar of any other role ignores it. */}}
@@ -232,9 +274,22 @@ spec:
           ports:
             - name: front-door
               containerPort: {{ $top.Values.sidecar.frontDoorPort }}
+          {{- if $several }}
+          {{- /* A standby's front door is closed until it holds a shard:
+                 not ready, so the sidecars' Service never names it. */}}
+          readinessProbe:
+            tcpSocket:
+              port: front-door
+            periodSeconds: 2
           {{- end }}
-          {{- if or $top.Values.dashboard.enabled .live $top.Values.tls.internal.enabled }}
+          {{- end }}
+          {{- if or $top.Values.dashboard.enabled .live $top.Values.tls.internal.enabled $several }}
           volumeMounts:
+            {{- if $several }}
+            - name: member-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
             {{- if $top.Values.dashboard.enabled }}
             - name: dashboard-keys
               mountPath: /etc/meridian/dashboard-keys
@@ -339,8 +394,27 @@ spec:
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
-      {{- if or .plugin $top.Values.dashboard.enabled $top.Values.tls.internal.enabled }}
+      {{- if or .plugin $top.Values.dashboard.enabled $top.Values.tls.internal.enabled $several }}
       volumes:
+        {{- if $several }}
+        - name: member-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- end }}
         {{- with (include "meridian-runtime.internalTlsVolume" $top) }}{{ . | nindent 8 }}{{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" $top "server" "sidecars")) }}{{ . | nindent 8 }}{{- end }}

@@ -785,6 +785,7 @@ impl Plugins {
             request.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
             request.limits,
+            (request.shards, request.standby),
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
@@ -827,6 +828,7 @@ impl Plugins {
         live: bool,
         archive: Option<PluginArchive>,
         limits: Option<SidecarLimits>,
+        (shards, standby): (u32, bool),
     ) -> CreatePluginRequest {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
@@ -853,6 +855,11 @@ impl Plugins {
             // Its own share at its sidecar, as its launch asked (contract
             // v30; ruled 2026-11-11); the chart's otherwise.
             limits,
+            // Its shards and standby pod, as its launch asked (contract
+            // v30, built with 3d; approved 2026-11-15): the launcher makes
+            // a pod per shard and one more for a standby.
+            shards,
+            standby,
         }
     }
 
@@ -1031,7 +1038,14 @@ impl Plugins {
             .map_err(|failed| {
                 format!("recorded; the launcher did not stop {instance} to restart it: {failed}")
             })?;
-        let create = self.create_request(instance, version, launch.live, archive, launch.limits);
+        let create = self.create_request(
+            instance,
+            version,
+            launch.live,
+            archive,
+            launch.limits,
+            (launch.shards, launch.standby),
+        );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",

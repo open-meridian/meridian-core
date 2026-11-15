@@ -21,6 +21,7 @@ pub mod provision;
 pub mod replicas;
 pub mod resilience;
 pub mod scrub;
+pub mod shards;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};

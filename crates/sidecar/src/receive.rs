@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use meridian_bus::Delivery as Heard;
 use meridian_pb::plugin::v1 as plugin;
+use prost::Message as _;
 use tokio::sync::{watch, Notify};
 use tokio_stream::Stream;
 use tonic::{Response, Status};
@@ -270,6 +271,9 @@ impl Sidecar {
             subscriptions: Arc::clone(&self.subscriptions),
             chosen: Arc::new(chosen_names),
             generation,
+            shards: self.shards.clone(),
+            wanted: rows.iter().find(|row| row.name == WANTED),
+            withdrawn: rows.iter().find(|row| row.name == WITHDRAWN),
         };
         self.entitled.watch(&self.bus);
 
@@ -315,6 +319,18 @@ impl Sidecar {
         for row in chosen {
             start(row);
         }
+        // A shard's wants shared again whenever the live shards change
+        // (step 3d): a lost shard's subjects handed to its plugin at once.
+        if let Some(shards) = lake.shards.clone() {
+            if lake.chosen.contains(WANTED) {
+                tokio::spawn(share_again(
+                    shards,
+                    lake.clone(),
+                    Arc::clone(&waiting),
+                    closed.clone(),
+                ));
+            }
+        }
         let registry = Arc::clone(&self.subscriptions);
 
         // The stream: whatever waits, in order, until the plugin stops
@@ -344,6 +360,63 @@ impl Sidecar {
     }
 }
 
+/// The rows a data plugin hears what the lake wants of it by (W10.7).
+const WANTED: &str = "ObservationsWanted";
+const WITHDRAWN: &str = "WantWithdrawn";
+
+/// What a shard hands its plugin of a want, queued as the row it is: the
+/// want naming its own subjects, or its withdrawal here; under the want's
+/// key, so a later one replaces one not yet delivered.
+fn hand_on(handed: crate::shards::Handed, lake: &Lake, waiting: &Waiting) {
+    use crate::shards::Handed;
+    let (row, want_id, payload) = match handed {
+        Handed::Nothing => return,
+        Handed::Part(part) => (lake.wanted, part.want_id.clone(), part.encode_to_vec()),
+        Handed::Withdrawn(gone) => (
+            // Heard only by a stream that hears withdrawals.
+            lake.withdrawn.filter(|row| lake.chosen.contains(row.name)),
+            gone.want_id.clone(),
+            gone.encode_to_vec(),
+        ),
+    };
+    let Some(row) = row else { return };
+    let Ok(read) = (row.read)(&payload) else {
+        waiting.lose(Some(1), Some(row.name));
+        return;
+    };
+    waiting.push_keyed(
+        plugin::Delivery {
+            meta: Some(plugin::DeliveryMeta {
+                row: row.name.to_string(),
+                ..Default::default()
+            }),
+            item: Some(read.item),
+        },
+        row.name,
+        Some(format!("want|{want_id}")),
+    );
+}
+
+/// Each standing want shared again when the live shards change, until the
+/// stream ends.
+async fn share_again(
+    shards: Arc<crate::shards::Shards>,
+    lake: Lake,
+    waiting: Arc<Waiting>,
+    mut closed: watch::Receiver<()>,
+) {
+    let mut changes = shards.changes();
+    loop {
+        tokio::select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            _ = closed.changed() => return,
+        }
+        for handed in shards.shared_again() {
+            hand_on(handed, &lake, &waiting);
+        }
+    }
+}
+
 /// Who hears: this plugin's instance and the roles it was launched with,
 /// what a directed row is held to (contract v22).
 #[derive(Clone)]
@@ -364,6 +437,12 @@ struct Lake {
     /// generation, which its subscriptions are delivered on.
     chosen: Arc<BTreeSet<&'static str>>,
     generation: u64,
+    /// The instance's shards, where it runs as several (step 3d): a want is
+    /// handed on naming this shard's subjects alone.
+    shards: Option<Arc<crate::shards::Shards>>,
+    /// The rows a want and its withdrawal are handed on as.
+    wanted: Option<&'static Row>,
+    withdrawn: Option<&'static Row>,
 }
 
 /// One row's forwarding started on the stream: a row naming its dataset in
@@ -578,6 +657,36 @@ async fn deliver(
         if said.is_want {
             if !by_stream || meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
                 return;
+            }
+            // One shard of several (step 3d; the resilience spec's section
+            // 7): its own subjects of the want alone, by rendezvous hashing
+            // over the live shards; none of them, nothing.
+            if let Some(shards) = &lake.shards {
+                if row.name == WANTED {
+                    let Ok(want) =
+                        meridian_domain::v1::ObservationsWantedEvent::decode(&envelope.payload[..])
+                    else {
+                        waiting.lose(Some(1), Some(row.name));
+                        return;
+                    };
+                    match shards.heard(want) {
+                        crate::shards::Handed::Part(part) => {
+                            envelope.payload = part.encode_to_vec();
+                        }
+                        other => {
+                            hand_on(other, lake, waiting);
+                            return;
+                        }
+                    }
+                } else if row.name == WITHDRAWN {
+                    let withdrawn =
+                        meridian_domain::v1::WantWithdrawnEvent::decode(&envelope.payload[..])
+                            .map(|gone| gone.want_id)
+                            .unwrap_or_default();
+                    if !shards.withdrawn(&withdrawn) {
+                        return;
+                    }
+                }
             }
         } else {
             let Some(fields) = lake.entitled.fields(&said.dataset) else {

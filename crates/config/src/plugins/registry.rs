@@ -437,6 +437,7 @@ impl Plugins {
             running.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
             running.limits,
+            (running.shards, running.standby),
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
