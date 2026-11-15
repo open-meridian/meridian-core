@@ -520,9 +520,23 @@ pub fn move_account_with(
         message_id: String::new(),
         ..ctx.clone()
     };
-    let acted = store.act(account, "", &key, key.as_bytes(), &mut |book, head| {
-        open(book, head, &opening, &closed).map(|made| crate::service::decided(made, Vec::new()))
-    })?;
+    let acted = store
+        .act(account, "", &key, key.as_bytes(), &mut |book, head| {
+            open(book, head, &opening, &closed)
+                .map(|made| crate::service::decided(made, Vec::new()))
+        })
+        .inspect_err(|failed| {
+            // Another group's partition: the request goes on to its writer
+            // whether or not it was handed here for its close -- the close
+            // names where the account goes, so this is the record's word,
+            // never a stale route (CI 43662032539, tolerant: asked of the
+            // other group's member, handed here, closed, and then refused
+            // "handed to this writer group, which does not own its
+            // partition"; the account stayed closed and never opened).
+            if matches!(failed, StoreError::NotOwned { .. }) {
+                meridian_bus::owners::named_by_the_record();
+            }
+        })?;
     let opened = match acted {
         crate::store::Acted::Committed(decided) => {
             crate::service::announce(bus, &decided, None, None);
@@ -612,8 +626,34 @@ pub fn finish_opens(
                 target_partition: moved.to_partition.clone(),
                 reason: moved.reason.clone(),
             };
-            match move_account_with(bus, store, &ctx, &request, settings) {
-                Ok(_) => {
+            let asked = match move_account_with(bus, store, &ctx, &request, settings) {
+                // Its new partition another group's: asked of that group's
+                // writer, as the request itself is handed on from a member
+                // answering it. The sweep answers no request, so nothing
+                // hands it on for it (CI 43662032539: such an open stayed
+                // owed, and the account unwritable).
+                Err(StoreError::NotOwned { group, .. }) => {
+                    use prost::Message;
+                    let envelope = meridian_bus::Envelope {
+                        meta: Some(meridian_bus::MessageMeta {
+                            topic: MOVE_ACCOUNT.into(),
+                            acting_for_subject: moved.moved_by.clone(),
+                            publisher_instance_id: bus.instance_id().to_string(),
+                            message_id: format!("{key}:sweep:{}", ctx.received_at_ns),
+                            published_at_ns: ctx.received_at_ns,
+                            ..Default::default()
+                        }),
+                        payload_type: "meridian.v1.MoveAccountRequest".into(),
+                        payload: request.encode_to_vec(),
+                    };
+                    bus.hand_to_owner(group, MOVE_ACCOUNT, envelope)
+                        .map(|_| ())
+                        .map_err(StoreError::Unavailable)
+                }
+                other => other.map(|_| ()),
+            };
+            match asked {
+                Ok(()) => {
                     opened += 1;
                     tracing::info!(
                         account_id = moved.account_id,

@@ -66,6 +66,17 @@ pub fn answered_here() {
     NAMED.with(|named| named.set(false));
 }
 
+/// The group this thread's request was said to be is the one the record
+/// names (step 3d; section 6.8): an account's move, closed here, whose open
+/// is its new partition's writer's -- the close names the partition. Handed
+/// on even where the request was handed here, as [`hand_to_named`]; nothing
+/// where no group was said.
+pub fn named_by_the_record() {
+    if HAND_TO.with(Cell::get).is_some() {
+        NAMED.with(|named| named.set(true));
+    }
+}
+
 /// Whether the group said is the one the record names now, cleared.
 pub(crate) fn take_named() -> bool {
     NAMED.with(Cell::take)

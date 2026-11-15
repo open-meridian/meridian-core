@@ -2268,6 +2268,140 @@ async fn writer_groups_hand_a_command_to_its_partitions_owner_and_follow_a_move(
     });
 }
 
+/// An account's move between two writer groups' partitions is opened by
+/// the new partition's writer whichever member was asked, and a close left
+/// without its open is opened by the control group's sweep there too (step
+/// 3d; sections 6.7 and 6.8; CI 43662032539, tolerant: ACC-DRIVE-00's move
+/// was asked of the member whose group did not write its partition, handed
+/// to the one that did, closed there, and its open -- the other group's --
+/// refused "handed to this writer group, which does not own its
+/// partition". The account stayed closed and never opened, every order on
+/// it refused "found in another partition 4 times", and the sweep, which
+/// answers no request, had nothing to hand its open on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_an_accounts_move_between_groups_is_opened_whichever_member_was_asked() {
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_domain::v1::{MoveAccountReply, MoveAccountRequest};
+    // At two groups: control and P3 group 0's, P0 group 1's.
+    assert_eq!((owner("P0", 2), owner("P3", 2)), (1, 0));
+    let (url, migrated) = blocking(isolated);
+    let mut admin = blocking(|| postgres::Client::connect(&url, postgres::NoTls).unwrap());
+    blocking(|| {
+        admin
+            .batch_execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch, origin)
+                 SELECT 'P3', 0, epoch, origin FROM book_partition_head WHERE partition = 'P0'",
+            )
+            .unwrap()
+    });
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let member = |group: u32| {
+        let store = blocking(|| {
+            Arc::new(
+                PostgresStore::connect(&url, 4)
+                    .unwrap()
+                    .with_groups(Groups::new(group, 2).unwrap()),
+            )
+        });
+        let bus = Arc::new(Bus::single(
+            "bor-m11-test",
+            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+        let writer: Arc<dyn Store> = Arc::new(Writer::new(
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::clone(&bus),
+        ));
+        serve(bus.clone(), writer.clone(), bus.clock());
+        (bus, store, writer)
+    };
+    let (zero, zero_store, zero_writer) = member(0);
+    let (one, one_store, _one_writer) = member(1);
+    let account = unique("M11-MOVED");
+    let set = |reason: &str| SetAccountAttributeRequest {
+        account_id: account.clone(),
+        attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+        reason: reason.into(),
+    };
+    // The account begins in P0, group 1's.
+    send(&one, SET_ACCOUNT_ATTRIBUTE, &set("first"), Some(PERSON))
+        .await
+        .unwrap();
+    // Its move to P3, group 0's, asked of group 0's member: handed to group
+    // 1 for the close, and on from there to group 0 for the open.
+    let moved = send(
+        &zero,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &MoveAccountRequest {
+            account_id: account.clone(),
+            target_partition: "P3".into(),
+            reason: "group 1 is busy".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .expect("moved, asked of the member whose group does not write its partition");
+    let moved = MoveAccountReply::decode(moved.as_slice())
+        .unwrap()
+        .moved
+        .unwrap();
+    assert_eq!(moved.to_partition, "P3");
+    assert!(moved.opening_sequence > 0, "opened: {moved:?}");
+    // Written where it is now, asked of either member.
+    send(&one, SET_ACCOUNT_ATTRIBUTE, &set("second"), Some(PERSON))
+        .await
+        .expect("written after its move");
+    // Home again, its member stopped between the close and the open.
+    meridian_changes::moves::points::arm(
+        "book.account.closed",
+        &account,
+        Arc::new(|_| Err("stopped after the close".to_string())),
+    );
+    let stopped = send(
+        &zero,
+        meridian_bor::moves::MOVE_ACCOUNT,
+        &MoveAccountRequest {
+            account_id: account.clone(),
+            target_partition: "P0".into(),
+            reason: "home again".into(),
+        },
+        Some(PERSON),
+    )
+    .await;
+    meridian_changes::moves::points::disarm("book.account.closed", &account);
+    assert!(stopped.is_err(), "stopped between its close and its open");
+    // The control group's sweep: the open is group 1's, and asked of it.
+    let opened = blocking(|| {
+        meridian_bor::moves::finish_opens(
+            &zero,
+            zero_writer.as_ref(),
+            std::slice::from_ref(&zero_store),
+            &meridian_changes::moves::Settings::default(),
+            meridian_clock::Clock::now_ns(&meridian_clock::SystemClock) + 1_000_000_000,
+        )
+    });
+    assert_eq!(opened, 1, "the sweep had its open made by group 1's writer");
+    send(&zero, SET_ACCOUNT_ATTRIBUTE, &set("third"), Some(PERSON))
+        .await
+        .expect("written once the sweep opened it");
+    let journal = blocking(|| one_store.journal(&account)).unwrap();
+    assert_eq!(
+        journal.last().map(|entry| entry.partition.as_str()),
+        Some("P0"),
+        "numbered in P0 again"
+    );
+    blocking(move || {
+        drop(admin);
+        drop((zero_store, one_store, migrated));
+    });
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the
