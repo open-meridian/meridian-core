@@ -8263,7 +8263,11 @@ fn m11_a_range_is_moved_home_only_once_every_member_seen_runs_the_sweeps_revisio
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(moved, [dataset.clone()], "moved home once it was gone");
+    assert_eq!(
+        moved,
+        std::slice::from_ref(&dataset),
+        "moved home once it was gone"
+    );
     assert!(tip(1).is_some_and(|home| home.head >= 1));
 }
 

@@ -2784,8 +2784,8 @@ async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_swee
     let ended = blocking(|| rebalance(&bus_zero, zero.as_ref(), &mover));
     let moved: Vec<String> = ended
         .iter()
-        .filter_map(|e| match e {
-            Ended::Moved(m) => Some(m.partition.clone()),
+        .map(|e| match e {
+            Ended::Moved(m) => m.partition.clone(),
             other => panic!("{other:?}"),
         })
         .collect();
