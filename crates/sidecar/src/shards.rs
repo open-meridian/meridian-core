@@ -53,7 +53,7 @@ struct Wants {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Handed {
     /// The want, naming this shard's subjects alone.
-    Part(ObservationsWantedEvent),
+    Part(Box<ObservationsWantedEvent>),
     /// Nothing of it is this shard's any longer, and some was.
     Withdrawn(WantWithdrawnEvent),
     /// Nothing to hand on: none of it is this shard's, and none was.
@@ -170,7 +170,7 @@ impl Shards {
         let (want_id, dataset) = (want.want_id.clone(), want.dataset.clone());
         wants.kept.insert(want_id.clone(), (want, subjects.clone()));
         if !subjects.is_empty() {
-            Handed::Part(part)
+            Handed::Part(Box::new(part))
         } else if before == Some(true) {
             Handed::Withdrawn(WantWithdrawnEvent { want_id, dataset })
         } else {
@@ -216,7 +216,7 @@ impl Shards {
                     dataset,
                 })
             } else {
-                Handed::Part(part)
+                Handed::Part(Box::new(part))
             });
         }
         again

@@ -496,7 +496,8 @@ pub fn shards_template<'a>(
     let workload = shapes.shards.as_deref().ok_or_else(|| {
         format!(
             "{id} was asked shards or a standby pod, and this deployment's chart renders no \
-             shape for them"
+             shape for them: its sidecars take their shards' leases under the members' lease \
+             right, which the chart renders where a store runs a standby (the ha profile)"
         )
     })?;
     Ok(Chosen {

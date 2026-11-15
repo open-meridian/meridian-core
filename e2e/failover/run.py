@@ -194,6 +194,15 @@ DRIVER_CASH = "LCL-01J8XQ4M7K000000000E2EUSD"
 DRIVER_SIGNER = "e2e-drive-signer"
 DRIVER_SIGNER_KEY_ID = "e2e-drive"
 INTEROP_IMAGE = os.environ.get("E2E_INTEROP_IMAGE", "meridian-python-interop")
+# A plugin instance run as two shards with a standby pod (step 3d; the
+# resilience spec's sections 7 and 15), in the scaled shape: a sidecars[]
+# entry with no plugin beside it, so what is held is the pods, their Leases
+# and the standby's takeover. Its subjects' sharing is the sidecar crate's
+# own tests' (receive::tests, shards::tests).
+SHARDED = "shard-proof"
+SHARDS = 2
+# A standby holds a lapsed shard within this (ruling 1056, question 12).
+SHARD_TAKEOVER = 10
 # The classes that read RPO through the stores themselves, and say it in
 # their claims; after every other, the driver's rows are held all the same.
 RPO_IN_CLASS = {"db-primary", "torn-write", "zone"}
@@ -491,6 +500,9 @@ def install(s):
     if DRIVEN:
         public = driver_signer()
         values += driver_values()
+    if PROFILE == "scaled":
+        values += ["--set", f"sidecars[0].instanceId={SHARDED}", "--set", "sidecars[0].roles={data}",
+                   "--set", f"sidecars[0].shards={SHARDS}", "--set", "sidecars[0].standby=true"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
     if PROFILE == "ha":
@@ -884,6 +896,85 @@ def shape(s):
                 f"the cluster's own services on the server node, apart from the classes "
                 f"({', '.join(f'{k}: {sorted(v)}' for k, v in sorted(where.items()))})")
     jetstream_rolled(s)
+
+
+# ── A plugin instance's shards and its standby pod (step 3d) ───────────────
+
+def shard_pods():
+    """The sharded instance's pods, running and not going."""
+    return [p for p in pods("sidecar") if p["metadata"]["labels"].get("meridian.dev/instance") == SHARDED]
+
+
+def shard_holder(shard):
+    """The pod holding a shard's Lease, and its holder as written (a
+    process: the pod's name, `_`, its start); empty where none does."""
+    done = kubectl("get", "lease", f"{SHARDED}-shard-{shard}", "-o", "json", check=False)
+    if done.returncode != 0:
+        return "", ""
+    held = json.loads(done.stdout).get("spec", {}).get("holderIdentity") or ""
+    return held.split("_", 1)[0], held
+
+
+def shard_log(pod_name):
+    return kubectl("logs", pod_name, "-c", "sidecar", check=False).stdout.decode(errors="replace")
+
+
+def shards(s):
+    """Two shards and a standby pod of one instance: three pods of its one
+    Deployment, each shard's Lease held by a pod of its own, the pod holding
+    none standing by and not ready -- its front door closed, so nothing
+    reaches it -- and, when a shard's pod is killed outright, its Lease the
+    standby's within the bound, the other shard never taken."""
+    print("S: a plugin instance at two shards with a standby pod", flush=True)
+
+    def settled():
+        names = {p["metadata"]["name"] for p in shard_pods()}
+        holders = [shard_holder(n)[0] for n in range(SHARDS)]
+        return len(names) == SHARDS + 1 and all(h in names for h in holders) and len(set(holders)) == SHARDS
+    there = happens(settled, 240)
+    live = shard_pods()
+    names = sorted(p["metadata"]["name"] for p in live)
+    holders = [shard_holder(n)[0] for n in range(SHARDS)]
+    s.check(there, f"shards: {SHARDS + 1} pods of the one instance, each shard's lease held by a pod of its own "
+                   f"({len(names)} pods; holders {holders})")
+    if not there:
+        return
+    standby = next(n for n in names if n not in holders)
+    waited = happens(lambda: sorted(p["metadata"]["name"] for p in shard_pods() if ready(p)) == sorted(holders), 60)
+    ready_now = sorted(p["metadata"]["name"] for p in shard_pods() if ready(p))
+    s.check(waited, f"shards: the two shards ready, the standby not: it serves nothing ({ready_now}; "
+                    f"standby {standby})")
+    s.check("standing by" in shard_log(standby) and "the sidecar is serving" not in shard_log(standby),
+            "shards: the standby says it stands by, and serves nothing")
+    s.check(all("this pod holds a shard's lease" in shard_log(h) for h in holders),
+            "shards: each shard's sidecar says it holds its lease")
+    spec = live[0]["spec"]
+    mounted = [c["name"] for c in spec["containers"]
+               if any(m["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+                      for m in c.get("volumeMounts", []))]
+    s.check(spec.get("automountServiceAccountToken") is False and mounted == ["sidecar"],
+            f"shards: the lease right's token is mounted in the sidecar's container alone ({mounted})")
+    # Shard 1's pod killed outright: no release, so its Lease lapses.
+    lost, other = holders[1], holders[0]
+    other_held = shard_holder(0)[1]
+    began = time.time()
+    kubectl("delete", "pod", lost, "--grace-period=0", "--force", "--wait=false", quiet=True)
+    taken = happens(lambda: shard_holder(1)[0] not in ("", lost), SHARD_TAKEOVER + 20, every=0.5)
+    took = time.time() - began
+    now = shard_holder(1)[0]
+    s.check(taken and now == standby, f"shards: the standby holds the lost shard's lease ({now}, was {lost})")
+    s.check(taken and took <= SHARD_TAKEOVER,
+            f"shards: within {SHARD_TAKEOVER}s of the pod's kill ({took:.1f}s)")
+    s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
+    served = happens(lambda: "the sidecar is serving" in shard_log(standby), 30)
+    s.check(served, "shards: the standby serves once the lease is its own")
+    told = happens(lambda: shard_log(other).count("the instance's live shards changed") >= 2, 60)
+    s.check(told, "shards: the live shard read its neighbour gone and back, and shared its subjects again")
+    # The pod made in its place is the standby now.
+    again = happens(lambda: len(shard_pods()) == SHARDS + 1
+                    and sorted(p["metadata"]["name"] for p in shard_pods() if ready(p)) == sorted([other, standby]),
+                    180)
+    s.check(again, f"shards: the pod made in its place stands by ({len(shard_pods())} pods)")
 
 
 # What analytics says once it has its stream, and where it could not make one.
@@ -4467,6 +4558,11 @@ def main():
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
+    if PROFILE == "scaled":
+        try:
+            shards(s)
+        except SystemExit as stopped:
+            s.check(False, f"shards: {stopped}")
     properties(s, "the install")
     if PROFILE == "ha" and DRIVEN:
         try:

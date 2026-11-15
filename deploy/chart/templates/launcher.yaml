@@ -65,8 +65,20 @@
   the resilience spec's section 7): the same definition as several pods,
   each sidecar given the shard count and the members' lease right. Rendered
   for one shard; the launcher sets the pods and the count the launch asked.
+  Only where a store runs a standby, and so the members' lease right is
+  rendered (members.yaml): shards and standby pods are configuration, as
+  every standby is (ruling 1052). Elsewhere the launcher has no shape for
+  them, and refuses such a launch saying so.
 */}}
-{{- $shards := include "meridian-runtime.plugin" (dict
+{{- $leased := false -}}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
+{{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) -}}
+{{- $leased = true -}}
+{{- end -}}
+{{- end -}}
+{{- $shards := "" -}}
+{{- if $leased -}}
+{{- $shards = include "meridian-runtime.plugin" (dict
       "top" .
       "name" (printf "%s-plugin-__INSTANCE__" $full)
       "instance" "__INSTANCE__"
@@ -77,7 +89,8 @@
       "imageTag" ""
       "launched" true
       "shards" 1
-      "standby" true) }}
+      "standby" true) -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -86,7 +99,9 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 data:
   plugin.json: {{ $shape | fromYaml | toJson | quote }}
+  {{- if $shards }}
   plugin-shards.json: {{ $shards | fromYaml | toJson | quote }}
+  {{- end }}
   {{- if .Values.pluginStorage.enabled }}
   plugin-storage.json: {{ $storage | fromYaml | toJson | quote }}
   claim.json: {{ $claim | fromYaml | toJson | quote }}
@@ -231,9 +246,12 @@ spec:
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "launcher" "values" $.Values.launcher "account" true) | nindent 12 }}
             - name: MERIDIAN_LAUNCHER_TEMPLATE
               value: /etc/meridian/launcher/plugin.json
-            # An instance launched with shards or a standby pod (step 3d).
+            {{- if $shards }}
+            # An instance launched with shards or a standby pod (step 3d),
+            # where the deployment runs standbys.
             - name: MERIDIAN_LAUNCHER_SHARDS_TEMPLATE
               value: /etc/meridian/launcher/plugin-shards.json
+            {{- end }}
             {{- if .Values.development }}
             # A development deployment: the launcher makes the live shape
             # when asked, and refuses it anywhere else

@@ -7,19 +7,17 @@
   cluster-wide one. The launcher holds the same right under its own account.
   A plugin instance run as several pods -- shards, or a standby pod (step
   3d; section 7) -- takes its shards' Leases under the same account, its
-  token in the sidecar's container alone: so it renders too wherever the
-  launcher runs, which may be asked for such an instance at any time, and
-  where a sidecars[] entry is one. With no standby anywhere and no launcher,
-  none of this renders.
+  token in the sidecar's container alone: so it renders too where a
+  sidecars[] entry is one. The launcher makes such an instance only where
+  this account is rendered (launcher.yaml): shards and standby pods are
+  configuration, as every standby is (ruling 1052). With no standby
+  anywhere, as by default, none of this renders.
 */}}
 {{- $leased := false -}}
 {{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
 {{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) -}}
 {{- $leased = true -}}
 {{- end -}}
-{{- end -}}
-{{- if and .Values.launcher.enabled .Values.registry.enabled (not .Values.broker.existingSecret) -}}
-{{- $leased = true -}}
 {{- end -}}
 {{- range .Values.sidecars -}}
 {{- if or (gt (int (.shards | default 1)) 1) .standby -}}
