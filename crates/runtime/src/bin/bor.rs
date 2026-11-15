@@ -232,6 +232,28 @@ fn run() -> Result<(), String> {
         // Its working budget (stage M), less the hot layer's bound.
         meridian_runtime::install_budget("bor", books_bound as u64)?;
         let bus = bus_from_env(&instance_id).await?;
+        // The revision this member runs, said in the book's database 0 for
+        // as long as it runs, whatever its mode (step 3d; `book_member`,
+        // ruled 2026-11-15): what the control group's sweep waits on before
+        // it moves a partition home to another database.
+        let revision = meridian_changes::members::revision(
+            meridian_runtime::VERSION,
+            databases.count(),
+            groups.count(),
+            Some(partitions),
+        );
+        {
+            let home = Arc::clone(&every_database[0]);
+            meridian_runtime::member::keep_seen(
+                "bor",
+                &instance_id,
+                revision.clone(),
+                move |member, revision, started, now| {
+                    home.member_seen(member, revision, started, now)
+                        .map_err(|failed| failed.to_string())
+                },
+            );
+        }
         // A reader member (contract v30, stage B): the book's reads alone,
         // its books kept by the writer's change log, never acting.
         if member.is_reader() {
@@ -436,6 +458,10 @@ fn run() -> Result<(), String> {
                     groups,
                     meridian_bor::partition_moves::Settings::from_env(),
                     clock(),
+                )
+                .waiting_for_rollout(
+                    revision.clone(),
+                    meridian_runtime::member::seen_every_and_within().1,
                 )
                 .journalling(bus.clone(), Arc::clone(&store)),
             );

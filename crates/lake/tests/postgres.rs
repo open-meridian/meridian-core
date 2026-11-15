@@ -8001,6 +8001,118 @@ fn a_raised_lake_database_count_writes_where_each_head_is_and_moves_each_range_h
     }
 }
 
+/// A range is moved home by a raised database count only once the lake's
+/// rollout is complete (step 3d; sections 6.4 and 6.8; `lake_member`, ruled
+/// 2026-11-15, item 9; PR CI 43656183991). The count alone was raised, the
+/// release the same: a member started before it, reading one database, is
+/// still seen. While it is, the control group's sweep moves nothing home --
+/// that member would answer for a range that left its database as though
+/// it held none of it. Once it is no longer seen within the interval, the
+/// sweep moves each range home.
+#[test]
+fn m11_a_range_is_moved_home_only_once_every_member_seen_runs_the_sweeps_revision() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::members::revision;
+    use meridian_lake::partition_moves::{Ended, Mover, Settings};
+    let urls = two_databases();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:rollout{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-ROLLOUT");
+    // One database: group 1 writes its dataset there.
+    {
+        let member = |group: u32| {
+            let store = PostgresStore::connect(&urls[0], 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap());
+            store.adopt().unwrap();
+            store
+        };
+        let (zero, one) = (member(0), member(1));
+        zero.pin_owners().unwrap();
+        one.record(
+            &dataset,
+            vec![trade(&dataset, "before", &subject, 10)],
+            1_000,
+        )
+        .unwrap();
+    }
+    // Two databases: group 1's home is the second.
+    let groups = Groups::new(0, 2).unwrap();
+    let zeros: Vec<Arc<PostgresStore>> = urls
+        .iter()
+        .enumerate()
+        .map(|(d, url)| {
+            Arc::new(
+                PostgresStore::connect(url, 4)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_databases(2)
+                    .in_database(d as u32),
+            )
+        })
+        .collect();
+    zeros[0].adopt().unwrap();
+    for store in &zeros {
+        store.read_owners().unwrap();
+    }
+    // The same release, the count alone raised: one database against two.
+    let (before, after) = (
+        revision("0.1.540", 1, 2, None),
+        revision("0.1.540", 2, 2, None),
+    );
+    let within = std::time::Duration::from_secs(6);
+    let now = SystemClock.now_ns();
+    // The sweep's own member, and one started before the raise, both seen.
+    zeros[0]
+        .member_seen("lake-0-new", &after, now, now)
+        .unwrap();
+    zeros[0]
+        .member_seen("lake-group-1-old", &before, now - 60_000_000_000, now)
+        .unwrap();
+    let mover = Mover::new(
+        zeros.clone(),
+        groups,
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    )
+    .waiting_for_rollout(after.clone(), within);
+    let tip = |d: usize| {
+        PostgresStore::connect(&urls[d], 1)
+            .unwrap()
+            .range_tip(&dataset)
+            .unwrap()
+    };
+    assert!(
+        mover.rebalance().is_empty(),
+        "held: a member seen lately reads one database"
+    );
+    assert_eq!(tip(1), None, "nothing of it moved to its home");
+    // That member gone: its row last seen before the interval.
+    zeros[0]
+        .member_seen(
+            "lake-group-1-old",
+            &before,
+            now - 60_000_000_000,
+            SystemClock.now_ns() - within.as_nanos() as i64 - 1_000_000_000,
+        )
+        .unwrap();
+    let ended = mover.rebalance();
+    let moved: Vec<String> = ended
+        .iter()
+        .map(|e| match e {
+            Ended::Moved(m) => m.partition.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(moved, [dataset.clone()], "moved home once it was gone");
+    assert!(tip(1).is_some_and(|home| home.head >= 1));
+}
+
 /// A writer group's place in the write-ahead stream, committed in the
 /// first database before the lake's database count was raised (step 3d;
 /// "lake loss is re-sent, never silent"): its member over two databases

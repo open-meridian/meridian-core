@@ -620,6 +620,34 @@ fn take_back(
 }
 
 impl PostgresStore {
+    /// This member seen in the lake's members (step 3d; ruled 2026-11-15):
+    /// its row in this database, the lake's database 0, made or brought up
+    /// to date.
+    pub fn member_seen(
+        &self,
+        member: &str,
+        revision: &str,
+        started_at_ns: i64,
+        now_ns: i64,
+    ) -> Result<()> {
+        meridian_changes::members::LAKE
+            .seen(&mut *self.conn()?, member, revision, started_at_ns, now_ns)
+            .map_err(unavailable)
+    }
+
+    /// The members seen within `within_ns` of `now_ns` running another
+    /// revision than `revision`: none once the lake's rollout is complete.
+    pub fn members_behind(
+        &self,
+        revision: &str,
+        now_ns: i64,
+        within_ns: i64,
+    ) -> Result<Vec<meridian_changes::members::Behind>> {
+        meridian_changes::members::LAKE
+            .behind(&mut *self.conn()?, revision, now_ns, within_ns)
+            .map_err(unavailable)
+    }
+
     /// Each range's last move logged in this database's control that was by
     /// hand (step 3d; section 6.8): the group the admin moved it to. A range
     /// whose last move was by a changed count is not named.

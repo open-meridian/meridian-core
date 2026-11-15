@@ -2665,6 +2665,138 @@ async fn m11_a_named_read_follows_its_account_to_the_database_it_moved_to_meanwh
     drop((bus_zero, bus_one));
 }
 
+/// A partition is moved home by a raised database count only once the
+/// book's rollout is complete (step 3d; sections 6.4 and 6.8; `book_member`,
+/// ruled 2026-11-15, item 9; PR CI 43656183991, ha: ACC-DRIVE-00 read as
+/// empty twice). The count alone was raised, the release the same: a member
+/// started before it, reading one database, is still seen. While it is, the
+/// control group's sweep moves nothing home -- that member would answer an
+/// account whose partition left its database as empty. Once it is no longer
+/// seen within the interval, the sweep moves the partition home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_sweeps_revision() {
+    use meridian_bor::partition_moves::{rebalance, Ended, Mover, Settings};
+    use meridian_bor::spread::Spread;
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_changes::members::revision;
+    let urls: Vec<String> = blocking(|| {
+        (0..2)
+            .map(|_| {
+                let (url, migrated) = isolated();
+                migrated.make_partitions(8).unwrap();
+                apart(&url);
+                url
+            })
+            .collect()
+    });
+    // A member of `group` over the first `databases` databases.
+    let member = |group: u32, databases: usize| {
+        let groups = Groups::new(group, 2).unwrap();
+        let stores: Vec<Arc<PostgresStore>> = urls[..databases]
+            .iter()
+            .map(|url| {
+                let store = PostgresStore::connect(url, 6)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_partitions(8);
+                store.pin_owners().unwrap();
+                Arc::new(store)
+            })
+            .collect();
+        let spread = Arc::new(Spread::new(stores, groups));
+        let bus = Arc::new(Bus::single(
+            "bor-m11-rollout-test",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        serve(bus.clone(), spread.clone(), bus.clock());
+        resolving_equities(&bus);
+        (bus, spread)
+    };
+    let partition = ["P4", "P5", "P6", "P7"]
+        .into_iter()
+        .find(|p| owner(p, 2) == 1)
+        .unwrap()
+        .to_string();
+    let account = (0..)
+        .map(|k| unique(&format!("ACC-ROLLOUT-{k}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == partition)
+        .unwrap();
+    // One database: group 1 writes its partition there.
+    {
+        let (bus_one, one) = blocking(|| member(1, 1));
+        blocking(|| one.place_first(&account, &account)).unwrap();
+        open(&bus_one, &account, "INS-AAPL").await;
+        blocking(move || drop((one, bus_one)));
+    }
+    // The count raised to two databases: group 1's home is the second.
+    let (bus_zero, zero) = blocking(|| member(0, 2));
+    let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
+    let head = |d: usize| {
+        blocking(|| fresh(d).tip(&partition))
+            .unwrap()
+            .map_or(0, |tip| tip.head)
+    };
+    assert!(head(0) > 0 && head(1) == 0);
+    // The same release, the count alone raised: one database against two.
+    let (before, after) = (
+        revision("0.1.540", 1, 2, Some(8)),
+        revision("0.1.540", 2, 2, Some(8)),
+    );
+    let within = std::time::Duration::from_secs(6);
+    let now = meridian_clock::Clock::now_ns(&meridian_clock::SystemClock);
+    // The sweep's own member, and one started before the raise, both seen.
+    blocking(|| {
+        let home = zero.database(0);
+        home.member_seen("bor-0-new", &after, now, now).unwrap();
+        home.member_seen("bor-group-1-old", &before, now - 60_000_000_000, now)
+            .unwrap();
+    });
+    let mover = Mover::new(
+        vec![zero.database(0).clone(), zero.database(1).clone()],
+        zero.database(0).groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    )
+    .waiting_for_rollout(after.clone(), within);
+    let held = blocking(|| rebalance(&bus_zero, zero.as_ref(), &mover));
+    assert!(
+        held.is_empty(),
+        "held: a member seen lately reads one database ({held:?})"
+    );
+    assert_eq!(head(1), 0, "nothing of it moved to its home");
+    // That member gone: its row last seen before the interval.
+    blocking(|| {
+        zero.database(0)
+            .member_seen(
+                "bor-group-1-old",
+                &before,
+                now - 60_000_000_000,
+                meridian_clock::Clock::now_ns(&meridian_clock::SystemClock)
+                    - within.as_nanos() as i64
+                    - 1_000_000_000,
+            )
+            .unwrap()
+    });
+    let ended = blocking(|| rebalance(&bus_zero, zero.as_ref(), &mover));
+    let moved: Vec<String> = ended
+        .iter()
+        .filter_map(|e| match e {
+            Ended::Moved(m) => Some(m.partition.clone()),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        moved.contains(&partition),
+        "moved home once it was gone: {moved:?}"
+    );
+    assert!(head(1) >= head(0), "at home, level with where it was");
+    blocking(move || drop((zero, bus_zero)));
+}
+
 /// The book's proposals at a wealth platform's volume (stage M2;
 /// kernel/throughput-at-wealth-platform-scale: a 10,000- and a
 /// 100,000-order proposal end to end through the book), against the

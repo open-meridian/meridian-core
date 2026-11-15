@@ -80,6 +80,11 @@ pub struct Mover {
     /// Whether each move's record is logged as it ends, before its dataset
     /// is free to move again (the review's C8).
     logs: bool,
+    /// The revision this member runs and how recently a member must have
+    /// been seen to be waited on (step 3d; ruled 2026-11-15): a move home
+    /// by a raised database count waits until every member seen within
+    /// that long runs it. None set, nothing is waited on.
+    rollout: Option<(String, std::time::Duration)>,
 }
 
 impl Mover {
@@ -105,6 +110,44 @@ impl Mover {
             one: Mutex::new(()),
             clock,
             logs: false,
+            rollout: None,
+        }
+    }
+
+    /// A range is moved home to another database by a raised count only
+    /// once every member of the lake seen within `within` runs `revision`,
+    /// this member's own (step 3d; ruled 2026-11-15, item 9).
+    pub fn waiting_for_rollout(mut self, revision: String, within: std::time::Duration) -> Self {
+        self.rollout = Some((revision, within));
+        self
+    }
+
+    /// Whether the lake's rollout is complete: no member seen lately runs
+    /// another revision than this one. Not known -- its members not read --
+    /// it is not.
+    fn rolled_out(&self, partition: &str) -> bool {
+        let Some((revision, within)) = &self.rollout else {
+            return true;
+        };
+        match self.stores[0].members_behind(revision, self.clock.now_ns(), within.as_nanos() as i64)
+        {
+            Ok(behind) if behind.is_empty() => true,
+            Ok(behind) => {
+                tracing::info!(
+                    partition,
+                    revision,
+                    behind = behind.len(),
+                    member = behind[0].member,
+                    runs = behind[0].revision,
+                    "a range is not moved home yet: a member seen lately runs another \
+                     revision, and reads where the range is now"
+                );
+                false
+            }
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "the members were not read: no range moved home");
+                false
+            }
         }
     }
 
@@ -482,6 +525,18 @@ impl Mover {
         // Its owner's database holds it behind another, or a move's open is
         // owed there: moved there, its group kept.
         if let Some(away) = away {
+            // Home from a database it is still written in -- the count of
+            // databases raised -- only once every member reads both (ruled
+            // 2026-11-15). A move that let it go there already, its open
+            // owed, is finished.
+            let written_there = self.stores[away.1]
+                .range_tip(partition)
+                .ok()
+                .flatten()
+                .is_some_and(|tip| tip.epoch != meridian_changes::moves::POINTER);
+            if written_there && !self.rolled_out(partition) {
+                return None;
+            }
             return Some(self.run_alone(partition, away.0, &Asked::default(), Some(away)));
         }
         let now = match self.owner_now(partition) {

@@ -74,6 +74,11 @@ pub struct Mover {
     /// Where each move's record is journalled before the move is let go of
     /// (the review's C8), where set.
     journalling: Option<(Arc<meridian_bus::Bus>, Arc<dyn Store>)>,
+    /// The revision this member runs and how recently a member must have
+    /// been seen to be waited on (step 3d; ruled 2026-11-15): a move home
+    /// by a raised database count waits until every member seen within
+    /// that long runs it. None set, nothing is waited on.
+    rollout: Option<(String, std::time::Duration)>,
 }
 
 impl Mover {
@@ -92,6 +97,7 @@ impl Mover {
             one: Mutex::new(()),
             clock,
             journalling: None,
+            rollout: None,
         }
     }
 
@@ -101,6 +107,43 @@ impl Mover {
     pub fn journalling(mut self, bus: Arc<meridian_bus::Bus>, store: Arc<dyn Store>) -> Self {
         self.journalling = Some((bus, store));
         self
+    }
+
+    /// A partition is moved home to another database by a raised count only
+    /// once every member of the book seen within `within` runs `revision`,
+    /// this member's own (step 3d; ruled 2026-11-15, item 9).
+    pub fn waiting_for_rollout(mut self, revision: String, within: std::time::Duration) -> Self {
+        self.rollout = Some((revision, within));
+        self
+    }
+
+    /// Whether the book's rollout is complete: no member seen lately runs
+    /// another revision than this one. Not known -- its members not read --
+    /// it is not.
+    fn rolled_out(&self, partition: &str) -> bool {
+        let Some((revision, within)) = &self.rollout else {
+            return true;
+        };
+        match self.stores[0].members_behind(revision, self.clock.now_ns(), within.as_nanos() as i64)
+        {
+            Ok(behind) if behind.is_empty() => true,
+            Ok(behind) => {
+                tracing::info!(
+                    partition,
+                    revision,
+                    behind = behind.len(),
+                    member = behind[0].member,
+                    runs = behind[0].revision,
+                    "a partition is not moved home yet: a member seen lately runs another \
+                     revision, and reads where the partition is now"
+                );
+                false
+            }
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "the members were not read: no partition moved home");
+                false
+            }
+        }
     }
 
     fn database_of(&self, group: u32) -> &Arc<PostgresStore> {
@@ -676,6 +719,19 @@ fn rebalance_one(mover: &Mover, partition: &str) -> Option<Result<Ended>> {
     };
     if (now == wanted || placed) && away.is_none() {
         return None;
+    }
+    // Home from a database it is still written in -- the count of databases
+    // raised -- only once every member reads both (ruled 2026-11-15). A
+    // move that let it go there already, its open owed, is finished.
+    if let Some(d) = away {
+        let written_there = mover.stores[d]
+            .tip(partition)
+            .ok()
+            .flatten()
+            .is_some_and(|tip| tip.epoch != meridian_changes::moves::POINTER);
+        if written_there && !mover.rolled_out(partition) {
+            return None;
+        }
     }
     let target = if away.is_some() { now } else { wanted };
     Some(mover.run_alone(partition, target, &Asked::default(), away))

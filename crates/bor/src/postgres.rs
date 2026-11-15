@@ -5010,6 +5010,34 @@ impl PostgresStore {
         Ok(home_head.is_some_and(|head| head >= here))
     }
 
+    /// This member seen in the book's members (step 3d; ruled 2026-11-15):
+    /// its row in this database, the book's database 0, made or brought up
+    /// to date.
+    pub fn member_seen(
+        &self,
+        member: &str,
+        revision: &str,
+        started_at_ns: i64,
+        now_ns: i64,
+    ) -> Result<()> {
+        meridian_changes::members::BOOK
+            .seen(&mut *self.conn()?, member, revision, started_at_ns, now_ns)
+            .map_err(unavailable)
+    }
+
+    /// The members seen within `within_ns` of `now_ns` running another
+    /// revision than `revision`: none once the book's rollout is complete.
+    pub fn members_behind(
+        &self,
+        revision: &str,
+        now_ns: i64,
+        within_ns: i64,
+    ) -> Result<Vec<meridian_changes::members::Behind>> {
+        meridian_changes::members::BOOK
+            .behind(&mut *self.conn()?, revision, now_ns, within_ns)
+            .map_err(unavailable)
+    }
+
     /// Each partition's last move journalled on this store's `~control`
     /// that was by hand (step 3d; section 6.8): the group the admin moved it
     /// to. A partition whose last move was by a changed count is not named.

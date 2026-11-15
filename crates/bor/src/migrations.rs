@@ -100,6 +100,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "control_owed",
         sql: include_str!("../migrations/0014_control_owed.sql"),
     },
+    // The book's members and the revision each runs (step 3d;
+    // `book_member` ruled 2026-11-15, item 9): what a move home waits on.
+    Migration {
+        version: 15,
+        name: "member",
+        sql: include_str!("../migrations/0015_member.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

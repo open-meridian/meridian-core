@@ -242,6 +242,28 @@ fn run() -> Result<(), String> {
             (bounds.latest_bytes + bounds.listings_bytes + meridian_lake::pages::MOST_BYTES) as u64,
         )?;
         let bus = bus_from_env(&instance_id).await?;
+        // The revision this member runs, said in the lake's database 0 for
+        // as long as it runs, whatever its mode (step 3d; `lake_member`,
+        // ruled 2026-11-15): what the control group's sweep waits on before
+        // it moves a range home to another database.
+        let revision = meridian_changes::members::revision(
+            meridian_runtime::VERSION,
+            databases.count(),
+            groups.count(),
+            None,
+        );
+        {
+            let home = Arc::clone(&every_database[0]);
+            meridian_runtime::member::keep_seen(
+                "lake",
+                &instance_id,
+                revision.clone(),
+                move |member, revision, started, now| {
+                    home.member_seen(member, revision, started, now)
+                        .map_err(|failed| failed.to_string())
+                },
+            );
+        }
         // A reader member (contract v30, stage B): the lake's reads alone,
         // its hot layer kept by the writer's change log, never writing.
         if member.is_reader() {
@@ -479,6 +501,10 @@ fn run() -> Result<(), String> {
                     groups,
                     meridian_lake::partition_moves::Settings::from_env(),
                     clock(),
+                )
+                .waiting_for_rollout(
+                    revision.clone(),
+                    meridian_runtime::member::seen_every_and_within().1,
                 )
                 .logging(),
             );

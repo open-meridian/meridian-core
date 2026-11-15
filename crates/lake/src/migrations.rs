@@ -182,6 +182,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "write_ahead_part",
         sql: include_str!("../migrations/0026_write_ahead_part.sql"),
     },
+    // The lake's members and the revision each runs (step 3d; ruled
+    // 2026-11-15, item 9): what a move home waits on.
+    Migration {
+        version: 27,
+        name: "member",
+        sql: include_str!("../migrations/0027_member.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

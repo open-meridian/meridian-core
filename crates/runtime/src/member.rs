@@ -131,6 +131,59 @@ pub fn zone() -> String {
     var("MERIDIAN_ZONE").unwrap_or_default()
 }
 
+/// How often a store's member says it is serving, and how recently one must
+/// have said so to be waited on by a move home (step 3d; ruled 2026-11-15,
+/// item 9): the lease's renewal and its duration as the chart sets them
+/// (`MERIDIAN_LEASE_RENEW_SECONDS`, `MERIDIAN_LEASE_DURATION_SECONDS`; 2 and
+/// 6), with or without a lease.
+pub fn seen_every_and_within() -> (Duration, Duration) {
+    let whole = |name: &str, default: u64| {
+        var(name)
+            .and_then(|said| said.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(default)
+    };
+    let every = whole("MERIDIAN_LEASE_RENEW_SECONDS", 2);
+    let within = whole("MERIDIAN_LEASE_DURATION_SECONDS", 6).max(every + 1);
+    (Duration::from_secs(every), Duration::from_secs(within))
+}
+
+/// This member kept in its store's members for as long as it runs (step 3d;
+/// `lake_member`, `book_member`; ruled 2026-11-15, item 9): a writer, a
+/// standby or a reader alike, `seen` -- its own row in the store's database
+/// 0, with the `revision` it runs -- now and every few seconds after. A
+/// member that cannot say so is not waited on, and is told why in its log.
+pub fn keep_seen<F>(store: &'static str, instance_id: &str, revision: String, seen: F)
+where
+    F: Fn(&str, &str, i64, i64) -> Result<(), String> + Send + Sync + 'static,
+{
+    let name = match member_name() {
+        name if name.is_empty() => instance_id.to_string(),
+        name => name,
+    };
+    let started = now_ns();
+    let (every, _) = seen_every_and_within();
+    let seen = Arc::new(seen);
+    tracing::info!(
+        store,
+        member = name,
+        revision,
+        "this member says the revision it runs"
+    );
+    crate::background(async move {
+        loop {
+            let (seen, name, revision) = (Arc::clone(&seen), name.clone(), revision.clone());
+            let said =
+                tokio::task::spawn_blocking(move || seen(&name, &revision, started, now_ns()))
+                    .await;
+            if let Ok(Err(failed)) = said {
+                tracing::debug!(store, %failed, "this member's row was not brought up to date");
+            }
+            tokio::time::sleep(every).await;
+        }
+    });
+}
+
 /// A member's settings, from what the chart sets.
 pub struct Member {
     component: &'static str,
