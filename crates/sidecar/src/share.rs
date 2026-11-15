@@ -167,14 +167,15 @@ impl Limits {
 
     /// One shard's part of the instance's share (step 3d; the resilience
     /// spec's section 7): each limit divided by the shard count, rounded
-    /// up, so the shards together hold the instance to about its share and
-    /// none is left with nothing.
+    /// down, so the shards together never hold more than the instance's
+    /// share; and none is left with nothing, so a limit below the shard
+    /// count is one each, the only case the shards together pass it.
     pub fn per_shard(self, shards: u32) -> Self {
         let shards = shards.max(1);
         Self {
-            in_flight: self.in_flight.div_ceil(shards as usize).max(1),
-            requests_per_second: self.requests_per_second.div_ceil(shards).max(1),
-            answer_mib: self.answer_mib.div_ceil(u64::from(shards)).max(1),
+            in_flight: (self.in_flight / shards as usize).max(1),
+            requests_per_second: (self.requests_per_second / shards).max(1),
+            answer_mib: (self.answer_mib / u64::from(shards)).max(1),
         }
     }
 }
@@ -637,14 +638,25 @@ mod tests {
         };
         assert_eq!(whole.per_shard(1), whole);
         assert_eq!(whole.per_shard(0), whole);
+        // Rounded down: three shards hold 15, 399 and 30 between them,
+        // never more than the instance's share (review finding 11).
         assert_eq!(
             whole.per_shard(3),
             Limits {
-                in_flight: 6,
-                requests_per_second: 134,
-                answer_mib: 11
+                in_flight: 5,
+                requests_per_second: 133,
+                answer_mib: 10
             }
         );
+        for shards in 1..=16u32 {
+            let part = whole.per_shard(shards);
+            assert!(
+                part.in_flight * shards as usize <= whole.in_flight,
+                "{shards}"
+            );
+            assert!(part.requests_per_second * shards <= whole.requests_per_second);
+            assert!(part.answer_mib * u64::from(shards) <= whole.answer_mib);
+        }
         let small = Limits {
             in_flight: 1,
             requests_per_second: 1,

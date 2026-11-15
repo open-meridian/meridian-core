@@ -198,8 +198,6 @@ pub fn check_word(check: i32) -> &'static str {
     }
 }
 
-/// A history item's when, kind and words, as the page and the tool both
-/// say them.
 /// The store and the partition a history item's record names, where it
 /// names them: what a caller follows a move or a split by, rather than by
 /// the item's words (2026-11-15). A split's partition is its parent; an
@@ -220,6 +218,8 @@ pub fn history_names(item: &ResilienceHistoryItem) -> (Option<&str>, Option<&str
     )
 }
 
+/// A history item's when, kind and words, as the page and the tool both
+/// say them.
 pub fn history_words(item: &ResilienceHistoryItem) -> (i64, &'static str, String) {
     match &item.item {
         Some(Item::WriterTookOver(r)) => (

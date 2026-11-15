@@ -223,12 +223,14 @@ pub fn account_moved_json(moved: &AccountMoved) -> Value {
     })
 }
 
-/// A note's own checks, as every act's: given, and at most 2,000
-/// characters.
+/// Whether a note is within its length, at most 2,000 characters: the
+/// terminal's routes hold theirs to the same bound.
 pub(crate) fn check_note_len(note: &str) -> bool {
     note.chars().count() <= MOST_NOTE
 }
 
+/// A note's own checks, as every act's: given, and at most 2,000
+/// characters.
 fn check_note(note: &str, problems: &mut Problems) {
     if note.chars().count() > MOST_NOTE {
         problems.add("note", "at most 2,000 characters");

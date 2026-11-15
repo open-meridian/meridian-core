@@ -20,6 +20,7 @@ mod end_to_end;
 mod grants;
 mod outage;
 mod preflight;
+mod probe;
 mod serving;
 mod waiting;
 mod wiring;

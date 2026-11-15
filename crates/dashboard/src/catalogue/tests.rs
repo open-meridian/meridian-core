@@ -1384,6 +1384,60 @@ async fn the_moves_the_split_and_the_resilience_read_are_a_deployment_admins_fro
         StatusCode::UNPROCESSABLE_ENTITY
     );
 
+    // Review finding 12: a body's names are read as the tools read their
+    // own, trimmed: a book partition given with a space or a newline is
+    // still sent to the book, as named; one that is only spaces is refused
+    // naming it, and nothing is sent.
+    for given in [" P1", "P1\n"] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/partitions/move",
+            Some(&h.ada),
+            &serde_json::json!({"partition": given, "target_group": 1, "note": "spread"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given:?}: {body}");
+        assert_eq!(
+            asked.lock().unwrap().last().unwrap(),
+            &("book move".to_string(), "P1 to 1".to_string()),
+            "{given:?}"
+        );
+    }
+    let before = asked.lock().unwrap().len();
+    for (path, body, named) in [
+        (
+            "/terminal/accounts/move",
+            r#"{"account_id":"  ","target_partition":"P1","note":"spread"}"#,
+            "account_id",
+        ),
+        (
+            "/terminal/accounts/move",
+            r#"{"account_id":"ACC-1","target_partition":"\t","note":"spread"}"#,
+            "target_partition",
+        ),
+        (
+            "/terminal/partitions/move",
+            r#"{"partition":" ","target_group":1,"note":"spread"}"#,
+            "partition",
+        ),
+        (
+            "/terminal/partitions/split",
+            r#"{"partition":" ","note":"hot"}"#,
+            "partition",
+        ),
+    ] {
+        let (status, _, answered) = send(&h, "POST", path, Some(&h.ada), body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {answered}"
+        );
+        assert!(answered.contains(named), "{answered}");
+    }
+    assert_eq!(asked.lock().unwrap().len(), before, "nothing was sent");
+
     // Refusals: no note, nothing sent; the store's own words and status;
     // one for load with its retry-after.
     let before = asked.lock().unwrap().len();

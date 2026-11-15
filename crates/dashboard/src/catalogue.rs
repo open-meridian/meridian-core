@@ -905,6 +905,21 @@ fn reasoned(note: &str) -> Result<(), Box<Response>> {
     Ok(())
 }
 
+/// A name in a terminal act's body, read as the tools read their own
+/// (`mcp::instruments::text`): trimmed, and refused naming its field where
+/// nothing is left. An untrimmed partition would else be taken for a lake
+/// range and sent to the wrong store (review finding 12).
+fn named(field: &str, said: &str, hint: &str) -> Result<String, Box<Response>> {
+    let name = said.trim();
+    if name.is_empty() {
+        return Err(Box::new(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{field}: {hint}"),
+        )));
+    }
+    Ok(name.to_string())
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadResilience {
@@ -970,12 +985,10 @@ async fn split_partition(
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
-    if asked.partition.is_empty() {
-        return refused(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "partition: name the range",
-        );
-    }
+    let partition = match named("partition", &asked.partition, "name the range") {
+        Ok(partition) => partition,
+        Err(refusal) => return *refusal,
+    };
     if let Err(refusal) = reasoned(&asked.note) {
         return *refusal;
     }
@@ -985,7 +998,7 @@ async fn split_partition(
         crate::mcp::resilience::SPLIT_PARTITION,
         "meridian.v1.SplitPartitionRequest",
         meridian_domain::v1::SplitPartitionRequest {
-            partition: asked.partition,
+            partition,
             reason: asked.note,
         },
         Duration::from_secs(20),
@@ -1025,23 +1038,20 @@ async fn move_partition(
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
-    if asked.partition.is_empty() {
-        return refused(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "partition: name the partition",
-        );
-    }
+    let partition = match named("partition", &asked.partition, "name the partition") {
+        Ok(partition) => partition,
+        Err(refusal) => return *refusal,
+    };
     if let Err(refusal) = reasoned(&asked.note) {
         return *refusal;
     }
-    let partition = asked.partition.clone();
     let reply: Result<meridian_domain::v1::MovePartitionReply, String> = ask(
         &app,
         &admin,
         crate::mcp::resilience::move_topic(&partition),
         "meridian.v1.MovePartitionRequest",
         meridian_domain::v1::MovePartitionRequest {
-            partition: asked.partition,
+            partition: partition.clone(),
             target_group: asked.target_group,
             reason: asked.note,
         },
@@ -1077,14 +1087,13 @@ async fn move_account(
         Ok(asked) => asked,
         Err(refusal) => return *refusal,
     };
-    for (name, value) in [
-        ("account_id", &asked.account_id),
-        ("target_partition", &asked.target_partition),
-    ] {
-        if value.is_empty() {
-            return refused(StatusCode::UNPROCESSABLE_ENTITY, format!("{name}: name it"));
-        }
-    }
+    let (account_id, target_partition) = match (
+        named("account_id", &asked.account_id, "name it"),
+        named("target_partition", &asked.target_partition, "name it"),
+    ) {
+        (Ok(account), Ok(partition)) => (account, partition),
+        (Err(refusal), _) | (_, Err(refusal)) => return *refusal,
+    };
     if let Err(refusal) = reasoned(&asked.note) {
         return *refusal;
     }
@@ -1094,8 +1103,8 @@ async fn move_account(
         crate::mcp::resilience::MOVE_ACCOUNT,
         "meridian.v1.MoveAccountRequest",
         meridian_domain::v1::MoveAccountRequest {
-            account_id: asked.account_id,
-            target_partition: asked.target_partition,
+            account_id,
+            target_partition,
             reason: asked.note,
         },
         Duration::from_secs(20),

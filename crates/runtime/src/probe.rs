@@ -222,10 +222,15 @@ fn session(
     Ok(said)
 }
 
+/// How long the read of a member's partitions may take, within the
+/// database path's own bound.
+const PARTITIONS_WITHIN: Duration = Duration::from_secs(1);
+
 /// Each partition `record`'s database names with the writer group it names
 /// for it and, for the book, its accounts: none for a store that is neither
 /// the lake nor the book, or whose database does not yet say.
-fn partitions_read(client: &mut postgres::Client, record: &str) -> Option<Value> {
+#[doc(hidden)]
+pub fn partitions_read(client: &mut postgres::Client, record: &str) -> Option<Value> {
     let (store, sql) = match record {
         "lake" => (
             "lake",
@@ -239,7 +244,19 @@ fn partitions_read(client: &mut postgres::Client, record: &str) -> Option<Value>
         ),
         _ => return None,
     };
-    let rows = client.query(sql, &[]).ok()?;
+    // Inside the database path's bound, and given a second of its own: a
+    // count over a large book that ran the bound out would have a healthy
+    // database read as not answering (review finding 13). Past it the
+    // probe says no partitions, and the session's own bound is as it was.
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout = {}",
+            PARTITIONS_WITHIN.as_millis()
+        ))
+        .ok()?;
+    let rows = client.query(sql, &[]);
+    let _ = client.batch_execute("RESET statement_timeout");
+    let rows = rows.ok()?;
     let whole = |name: &str, default: u32| {
         var(name)
             .and_then(|said| said.trim().parse::<u32>().ok())
