@@ -156,6 +156,10 @@ pub struct Elector<L: Leases> {
     /// Whether this member gave the lease up ([`Elector::release`]): it is
     /// stopping, and never takes or renews it again.
     gave_up: bool,
+    /// Set for a holder no epoch fences, which stops once it has gone its
+    /// renew deadline unrenewed ([`Elector::of_a_holder_that_stops`]): the
+    /// monotonic clock, read when a request has answered.
+    answered: Option<fn() -> Instant>,
 }
 
 impl<L: Leases> Elector<L> {
@@ -167,7 +171,32 @@ impl<L: Leases> Elector<L> {
             renewed_at: None,
             took_from: None,
             gave_up: false,
+            answered: None,
         }
+    }
+
+    /// For a lease whose holder stops once it has gone its renew deadline
+    /// unrenewed, since nothing else fences it (step 3d: a plugin's shard,
+    /// which no epoch fences as a store's writer is). Two things follow,
+    /// neither true of a store's member, which writes on:
+    /// - **a record is held seen when its read answered,** by `clock`, not
+    ///   when the look began: the write it shows may have landed anywhere
+    ///   between, and a lapse counted from before it lets a standby take
+    ///   the lease while its holder may still act;
+    /// - **a look that failed leaves what was seen as it was.** A record
+    ///   read unchanged after a stretch unobserved was not renewed in it,
+    ///   and its holder has stopped by its own deadline, so that stretch
+    ///   counts toward its lapse: one failed read costs a standby no
+    ///   second lapse.
+    pub fn of_a_holder_that_stops(mut self, clock: fn() -> Instant) -> Self {
+        self.answered = Some(clock);
+        self
+    }
+
+    /// When a record just read is held to have been seen: when its read
+    /// answered where this lease's holder stops unrenewed, else `now`.
+    fn seen_at(&self, now: Instant) -> Instant {
+        self.answered.map_or(now, |clock| clock().max(now))
     }
 
     /// Whether this member gave the lease up: its looks take nothing from
@@ -198,7 +227,7 @@ impl<L: Leases> Elector<L> {
     /// by an election).
     pub async fn look(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let looked = self.look_once(now, wall_ns).await;
-        if looked.is_err() {
+        if looked.is_err() && self.answered.is_none() {
             // Not watched while the API server did not answer (contract v30,
             // stage C): a lease's expiry is observed, and an unobserved
             // stretch is never counted as its holder's silence -- else a
@@ -223,7 +252,9 @@ impl<L: Leases> Elector<L> {
             }
             Err(failed) => {
                 // Unobserved, as in [`Elector::look`].
-                self.observed = None;
+                if self.answered.is_none() {
+                    self.observed = None;
+                }
                 return Err(failed);
             }
         };
@@ -232,7 +263,7 @@ impl<L: Leases> Elector<L> {
             .as_ref()
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
-            self.observed = Some((current.clone(), now));
+            self.observed = Some((current.clone(), self.seen_at(now)));
         }
         let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
         let lapse = Duration::from_secs(current.duration_seconds.max(1));
@@ -268,7 +299,7 @@ impl<L: Leases> Elector<L> {
             .as_ref()
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
-            self.observed = Some((current.clone(), now));
+            self.observed = Some((current.clone(), self.seen_at(now)));
         }
         // Given up: whoever holds it, never this member again. A released
         // lease's holder is empty, free to the first member that looks, and

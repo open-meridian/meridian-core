@@ -1114,6 +1114,48 @@ pub async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Told to stop, heard from this call on: true once either signal lands.
+///
+/// [`shutdown`] listens from when it is first polled, and each call is a
+/// new listener that has not heard a signal already delivered. A process
+/// that waits in more than one place -- a sidecar for its shard, then
+/// while it serves -- asks once here and passes the answer on, so a signal
+/// landing between two waits, or while neither is polled, is still heard
+/// (step 3d, review finding 6). Call it inside the runtime.
+pub fn stopping() -> tokio::sync::watch::Receiver<bool> {
+    let (tell, told) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // Listening before this returns, not when a task is first run.
+        let listeners = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        );
+        tokio::spawn(async move {
+            match listeners {
+                (Ok(mut term), Ok(mut int)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                }
+                _ => shutdown().await,
+            }
+            let _ = tell.send(true);
+            // Kept, so a waiter that asks later still reads it.
+            tell.closed().await;
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        shutdown().await;
+        let _ = tell.send(true);
+        tell.closed().await;
+    });
+    told
+}
+
 /// The platform, as the configuration store needs it (W5.22, W5.23), over the
 /// conductor's own client and key.
 ///
@@ -1545,6 +1587,38 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// Review finding 6, shown both ways: a SIGTERM that lands while
+    /// nothing waits is heard by [`stopping`], asked once before; a
+    /// [`shutdown`] first asked after it never hears it.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_that_lands_while_nothing_waits_is_heard_by_the_one_listener_asked_before() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stop = super::stopping();
+                assert!(!*stop.borrow());
+                // SAFETY: a signal to this process, which listens for it.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                // The runtime runs on meanwhile, as it does under a look
+                // in flight: the signal is delivered to who listens now.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let late =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), super::shutdown());
+                assert!(
+                    late.await.is_err(),
+                    "a listener made after the signal heard it"
+                );
+                let heard = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    crate::shards::told(&mut stop),
+                );
+                assert!(heard.await.is_ok(), "the listener made before it did not");
+            });
+    }
+
     /// A migration waits for a primary: a server in recovery is waited past,
     /// never migrated (PR CI 43058388339, e2e-cluster-reconfigure).
     #[test]

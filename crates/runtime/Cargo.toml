@@ -108,3 +108,5 @@ rand = { version = "0.8", features = ["small_rng"] }
 # the plugin's scope stream, in the wiring test.
 ed25519-dalek.workspace = true
 tokio-stream.workspace = true
+# The shard loops on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }

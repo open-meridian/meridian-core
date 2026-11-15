@@ -13,7 +13,7 @@
 //! that named its own roles would be choosing its own privileges.
 
 use meridian_runtime::{
-    bus_from_env, bus_from_env_writing_ahead, names_from, required, shutdown, var,
+    bus_from_env, bus_from_env_writing_ahead, names_from, required, stopping, var,
 };
 use std::sync::Arc;
 
@@ -151,9 +151,15 @@ fn run() -> Result<(), String> {
             // no front door, nothing on the bus -- until a shard's Lease is
             // this pod's. A standby waits here, and its plugin's
             // registration waits with it.
+            //
+            // Told to stop once, heard from here on: a SIGTERM that lands
+            // while this pod waits for a shard, or between its shard and
+            // its serving, is not one a later listener would have missed.
+            let mut stop = stopping();
             let mut shard = None;
             if let Some(count) = shard_count {
-                let Some(held) = take_a_shard(&identity.instance_id, count).await? else {
+                let Some(held) = take_a_shard(&identity.instance_id, count, stop.clone()).await?
+                else {
                     tracing::info!("stopping");
                     return Ok(());
                 };
@@ -194,11 +200,10 @@ fn run() -> Result<(), String> {
                 sidecar = sidecar.with_write_share(share);
             }
             // Kept while it serves: its own Lease renewed, the others read.
-            let (stop_keeping, stopping) = tokio::sync::oneshot::channel();
             let mut keeping = None;
             if let Some((set, shards)) = shard {
                 sidecar = sidecar.as_shard(Arc::clone(&shards));
-                keeping = Some(tokio::spawn(keep_shard(set, shards, stopping)));
+                keeping = Some(tokio::spawn(keep_shard(set, shards, stop.clone())));
             }
             // A harness's sidecar, which no launch made, holds its plugin's
             // registration to the declaration an upload would carry (W4.1,
@@ -279,10 +284,10 @@ fn run() -> Result<(), String> {
                 // The page is how a person reaches the plugin, so a door that
                 // stopped is a sidecar to restart, as the surface is.
                 stopped = front_door => stopped,
-                _ = shutdown() => {
+                _ = meridian_runtime::shards::told(&mut stop) => {
                     tracing::info!("stopping");
-                    // Its shard given up, so the standby takes it at once.
-                    let _ = stop_keeping.send(());
+                    // Its shard given up, so the standby takes it at once:
+                    // its keeping heard the same word.
                     if let Some(keeping) = keeping {
                         let _ = keeping.await;
                     }
@@ -301,8 +306,8 @@ type ShardSet = meridian_runtime::shards::ShardSet<meridian_runtime::lease::Kube
 async fn take_a_shard(
     instance: &str,
     count: u32,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<(ShardSet, Arc<meridian_sidecar::shards::Shards>)>, String> {
-    use meridian_runtime::shards::Stand;
     if instance.is_empty() {
         return Err(format!(
             "{} needs MERIDIAN_PLUGIN_INSTANCE_ID: a shard is a pod of an instance",
@@ -327,41 +332,23 @@ async fn take_a_shard(
         meridian_runtime::member::member_name(),
         meridian_runtime::now_ns()
     );
-    let api = Arc::new(meridian_runtime::lease::KubeLeases::in_cluster(renew)?);
-    let mut set = ShardSet::new(api, instance, count, &holder, renew, duration)?;
-    let mut said = false;
-    loop {
-        match set
-            .look(std::time::Instant::now(), meridian_runtime::now_ns())
-            .await
-        {
-            Stand::Shard { mine, others } => {
-                tracing::info!(
-                    instance,
-                    shard = mine,
-                    of = count,
-                    "this pod holds a shard's lease"
-                );
-                let shards = Arc::new(meridian_sidecar::shards::Shards::new(mine));
-                shards.set_live(others);
-                return Ok(Some((set, shards)));
-            }
-            Stand::Standby if !said => {
-                said = true;
-                tracing::info!(
-                    instance,
-                    shards = count,
-                    "every shard's lease is held: standing by, serving nothing until one is this pod's"
-                );
-            }
-            Stand::Standby => {}
-            Stand::Lost(why) => return Err(why),
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(set.look_every()) => {}
-            _ = shutdown() => return Ok(None),
-        }
-    }
+    // Each request gives up within half a renewal: a shard stops at its
+    // renew deadline whatever is in flight, and one request lost leaves it
+    // a second try before that.
+    let api = Arc::new(meridian_runtime::lease::KubeLeases::in_cluster(renew / 2)?);
+    let set = ShardSet::new(api, instance, count, &holder, renew, duration)?;
+    let Some((set, mine, others)) = set.take(stop).await? else {
+        return Ok(None);
+    };
+    tracing::info!(
+        instance,
+        shard = mine,
+        of = count,
+        "this pod holds a shard's lease"
+    );
+    let shards = Arc::new(meridian_sidecar::shards::Shards::new(mine));
+    shards.set_live(others);
+    Ok(Some((set, shards)))
 }
 
 /// Its shard kept: the Lease renewed every renewal and the other shards'
@@ -369,32 +356,20 @@ async fn take_a_shard(
 /// live. A shard lost ends the process: no epoch fences a plugin, so it
 /// stops serving at once and its pod comes back as the standby.
 async fn keep_shard(
-    mut set: ShardSet,
+    set: ShardSet,
     shards: Arc<meridian_sidecar::shards::Shards>,
-    mut stopping: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    use meridian_runtime::shards::Stand;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(set.look_every()) => {}
-            _ = &mut stopping => {
-                set.release(meridian_runtime::now_ns()).await;
-                return;
-            }
-        }
-        match set
-            .look(std::time::Instant::now(), meridian_runtime::now_ns())
-            .await
-        {
-            Stand::Shard { others, .. } => shards.set_live(others),
-            Stand::Standby => {}
-            Stand::Lost(why) => {
-                tracing::error!(
-                    shard = shards.mine(),
-                    "the shard's lease is lost: {why}; stopping"
-                );
-                std::process::exit(1);
-            }
+    use meridian_runtime::shards::Kept;
+    let live = Arc::clone(&shards);
+    match set.keep(move |others| live.set_live(others), stop).await {
+        Kept::Released => {}
+        Kept::Lost(why) => {
+            tracing::error!(
+                shard = shards.mine(),
+                "the shard's lease is lost: {why}; stopping"
+            );
+            std::process::exit(1);
         }
     }
 }
