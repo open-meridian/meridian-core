@@ -82,6 +82,7 @@ nobody gives. No value of a secret, a key or a password is ever printed.
 """
 
 import base64
+import datetime
 import json
 import os
 import queue
@@ -196,11 +197,22 @@ DRIVER_SIGNER_KEY_ID = "e2e-drive"
 INTEROP_IMAGE = os.environ.get("E2E_INTEROP_IMAGE", "meridian-python-interop")
 # A plugin instance run as two shards with a standby pod (step 3d; the
 # resilience spec's sections 7 and 15), in the scaled shape: a sidecars[]
-# entry with no plugin beside it, so what is held is the pods, their Leases
-# and the standby's takeover. Its subjects' sharing is the sidecar crate's
-# own tests' (receive::tests, shards::tests).
+# entry with a stand-in for its plugin beside it, so what is held is the
+# pods, their Leases, the standby's takeover and what a plugin's container
+# is given and reaches. Its subjects' sharing is the sidecar crate's own
+# tests' (receive::tests, shards::tests).
 SHARDED = "shard-proof"
 SHARDS = 2
+# The stand-in: the runtime's image, saying whether the members' token is
+# in its container and when its sidecar first answers on loopback -- where
+# a plugin's Register is answered, and so when its run() may start.
+SHARD_STUB_NO_TOKEN = "stub: no lease token in the plugin's container"
+SHARD_STUB_ANSWERED = "stub: the sidecar answers"
+SHARD_STUB = (
+    "test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && echo '" + SHARD_STUB_NO_TOKEN + "'; "
+    "until (exec 3<>/dev/tcp/127.0.0.1/9191) 2>/dev/null; do sleep 0.2; done; "
+    "echo '" + SHARD_STUB_ANSWERED + "'; while true; do sleep 3600; done"
+)
 # A standby holds a lapsed shard within this (ruling 1056, question 12).
 SHARD_TAKEOVER = 10
 # The classes that read RPO through the stores themselves, and say it in
@@ -501,8 +513,13 @@ def install(s):
         public = driver_signer()
         values += driver_values()
     if PROFILE == "scaled":
-        values += ["--set", f"sidecars[0].instanceId={SHARDED}", "--set", "sidecars[0].roles={data}",
-                   "--set", f"sidecars[0].shards={SHARDS}", "--set", "sidecars[0].standby=true"]
+        sharded = os.path.join(tempfile.mkdtemp(prefix="failover-shards-"), "shards.json")
+        with open(sharded, "w", encoding="utf-8") as kept:
+            json.dump({"sidecars": [{
+                "instanceId": SHARDED, "roles": ["data"], "shards": SHARDS, "standby": True,
+                "plugin": {"image": IMAGE, "pullPolicy": "IfNotPresent", "args": ["bash", "-c", SHARD_STUB]},
+            }]}, kept)
+        values += ["-f", sharded]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
     if PROFILE == "ha":
@@ -915,16 +932,76 @@ def shard_holder(shard):
     return held.split("_", 1)[0], held
 
 
-def shard_log(pod_name):
-    return kubectl("logs", pod_name, "-c", "sidecar", check=False).stdout.decode(errors="replace")
+def shard_log(pod_name, container="sidecar", stamped=False):
+    said = kubectl("logs", pod_name, "-c", container, *(["--timestamps"] if stamped else []), check=False)
+    return said.stdout.decode(errors="replace")
+
+
+def said_at(pod_name, words):
+    """When the pod's sidecar, as it runs now, last said `words`: seconds
+    since the epoch by the cluster's own stamp on the line, or none."""
+    for line in reversed(shard_log(pod_name, stamped=True).splitlines()):
+        if words in line:
+            stamp = line.split(" ", 1)[0]
+            whole, _, rest = stamp.rstrip("Z").partition(".")
+            try:
+                at = datetime.datetime.strptime(whole, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                return None
+            return at.timestamp() + float("0." + (rest or "0"))
+    return None
+
+
+def shard_admission(s, deployment):
+    """The launcher's admission policy (S2), asked of the API server
+    without making anything: the launcher's account may make a Deployment
+    as this instance's is, and not one whose plugin container mounts the
+    members' token, nor one under another account."""
+    policy = kubectl("get", "validatingadmissionpolicy", f"{FULL}-launcher", check=False)
+    if policy.returncode != 0:
+        s.check(False, "shards: the launcher's admission policy is not there to hold")
+        return
+    made = {"apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": f"{FULL}-plugin-admission-proof", "namespace": NAMESPACE,
+                         "labels": {"meridian.dev/launched": "true"}},
+            "spec": json.loads(json.dumps(deployment["spec"]))}
+    made["spec"]["selector"] = {"matchLabels": {"meridian.dev/instance": "admission-proof"}}
+    made["spec"]["template"]["metadata"]["labels"] = {"meridian.dev/instance": "admission-proof",
+                                                      "meridian.dev/launched": "true"}
+
+    def asked(change):
+        tried = json.loads(json.dumps(made))
+        change(tried["spec"]["template"]["spec"])
+        done = kubectl("create", "--dry-run=server", f"--as=system:serviceaccount:{NAMESPACE}:{FULL}-launcher",
+                       "-f", "-", input=json.dumps(tried).encode(), check=False, quiet=True)
+        return done.returncode == 0, (done.stderr or b"").decode(errors="replace").strip()[-300:]
+
+    def to_plugin(pod):
+        plugin = next(c for c in pod["containers"] if c["name"] == "plugin")
+        plugin.setdefault("volumeMounts", []).append({"name": "member-token", "mountPath": "/tmp/token"})
+
+    admitted, why = asked(lambda pod: None)
+    s.check(admitted, f"shards: the launcher may make an instance of several pods as the chart shapes it ({why})")
+    for what, change, says in (
+            ("whose plugin container mounts the members' token", to_plugin, "sidecar's container alone"),
+            ("that mounts the token by default",
+             lambda pod: pod.__setitem__("automountServiceAccountToken", True), "sidecar's container alone"),
+            ("under the conductor's account",
+             lambda pod: pod.__setitem__("serviceAccountName", f"{FULL}-conductor"), "runs under no account")):
+        admitted, why = asked(change)
+        s.check(not admitted and says in why, f"shards: the launcher may not make one {what} ({why})")
 
 
 def shards(s):
     """Two shards and a standby pod of one instance: three pods of its one
     Deployment, each shard's Lease held by a pod of its own, the pod holding
-    none standing by and not ready -- its front door closed, so nothing
-    reaches it -- and, when a shard's pod is killed outright, its Lease the
-    standby's within the bound, the other shard never taken."""
+    none standing by and not ready -- nothing listens in it, so its plugin
+    is not answered -- and the members' token in the sidecar's container
+    alone. A shard's sidecar killed outright (SIGKILL, so nothing is
+    released) is another process's once its Lease has lapsed, never before,
+    and that one serves within the bound, the other shard never taken. Its
+    pods then roll a shard at a time, and a shard gone and back is read by
+    the one that stayed."""
     print("S: a plugin instance at two shards with a standby pod", flush=True)
 
     def settled():
@@ -948,33 +1025,95 @@ def shards(s):
             "shards: the standby says it stands by, and serves nothing")
     s.check(all("this pod holds a shard's lease" in shard_log(h) for h in holders),
             "shards: each shard's sidecar says it holds its lease")
+    # What a plugin's container is given, and reaches: no token in any pod's;
+    # its sidecar answering it in each shard's, and not in the standby's.
     spec = live[0]["spec"]
+    containers = sorted(c["name"] for c in spec["containers"])
     mounted = [c["name"] for c in spec["containers"]
-               if any(m["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+               if any(m["mountPath"].startswith("/var/run/secrets/kubernetes.io") or m["name"] == "member-token"
                       for m in c.get("volumeMounts", []))]
-    s.check(spec.get("automountServiceAccountToken") is False and mounted == ["sidecar"],
-            f"shards: the lease right's token is mounted in the sidecar's container alone ({mounted})")
-    # Shard 1's pod killed outright: no release, so its Lease lapses.
+    s.check(containers == ["plugin", "sidecar"] and spec.get("automountServiceAccountToken") is False
+            and mounted == ["sidecar"],
+            f"shards: the lease right's token is mounted in the sidecar's container alone, a plugin's beside it "
+            f"(containers {containers}; mounted in {mounted})")
+    stubs = {n: shard_log(n, container="plugin") for n in names}
+    s.check(all(SHARD_STUB_NO_TOKEN in said for said in stubs.values()),
+            "shards: no pod's plugin container holds the token")
+    answered = happens(lambda: all(SHARD_STUB_ANSWERED in shard_log(h, container="plugin") for h in holders), 30)
+    s.check(answered and SHARD_STUB_ANSWERED not in shard_log(standby, container="plugin"),
+            "shards: each shard's plugin is answered by its sidecar; the standby's is not, so its run() waits")
+    deployment = json.loads(out("get", "deployment", "-l", f"meridian.dev/instance={SHARDED}", "-o", "json"))["items"][0]
+    shard_admission(s, deployment)
+
+    # Shard 1's sidecar killed outright: no signal it can answer, so nothing
+    # is released and its Lease lapses. Whichever process takes it -- the
+    # standby pod's, or the killed pod's sidecar started again, which comes
+    # back standing by -- does so no sooner than the lapse, and serves
+    # within the bound.
     lost, other = holders[1], holders[0]
-    other_held = shard_holder(0)[1]
+    was, other_held = shard_holder(1)[1], shard_holder(0)[1]
     began = time.time()
-    kubectl("delete", "pod", lost, "--grace-period=0", "--force", "--wait=false", quiet=True)
-    taken = happens(lambda: shard_holder(1)[0] not in ("", lost), SHARD_TAKEOVER + 20, every=0.5)
+    crash(lost, "sidecar")
+    taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 20, every=0.25)
     took = time.time() - began
-    now = shard_holder(1)[0]
-    s.check(taken and now == standby, f"shards: the standby holds the lost shard's lease ({now}, was {lost})")
-    s.check(taken and took <= SHARD_TAKEOVER,
-            f"shards: within {SHARD_TAKEOVER}s of the pod's kill ({took:.1f}s)")
+    now_pod, now = shard_holder(1)
+    s.check(taken, f"shards: another process holds the killed shard's lease ({now}, was {was})")
+    s.check(taken and took >= 3.0,
+            f"shards: no sooner than its lapse: its holder stops unrenewed first ({took:.1f}s after the kill)")
+    served = happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
+    serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
+    s.check(served and serving <= SHARD_TAKEOVER,
+            f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill "
+            f"({'never' if serving is None else f'{serving:.1f}s'}; the lease {took:.1f}s)")
+    print(f"   shards: the lease changed hands {took:.1f}s after the kill; serving "
+          f"{'never' if serving is None else f'{serving:.1f}s'} after it", flush=True)
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
-    served = happens(lambda: "the sidecar is serving" in shard_log(standby), 30)
-    s.check(served, "shards: the standby serves once the lease is its own")
-    told = happens(lambda: shard_log(other).count("the instance's live shards changed") >= 2, 60)
-    s.check(told, "shards: the live shard read its neighbour gone and back, and shared its subjects again")
-    # The pod made in its place is the standby now.
-    again = happens(lambda: len(shard_pods()) == SHARDS + 1
-                    and sorted(p["metadata"]["name"] for p in shard_pods() if ready(p)) == sorted([other, standby]),
-                    180)
-    s.check(again, f"shards: the pod made in its place stands by ({len(shard_pods())} pods)")
+    plugged = happens(lambda: SHARD_STUB_ANSWERED in shard_log(now_pod, container="plugin"), 30)
+    s.check(plugged, "shards: the taker's plugin is answered by its sidecar")
+    back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
+    s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
+
+    # The instance's pods rolled: a shard at a time, a new pod standing by
+    # and taking the Lease an old one gives up as it stops. Never fewer
+    # than one shard ready, and it ends.
+    name = deployment["metadata"]["name"]
+    before = {p["metadata"]["name"] for p in shard_pods()}
+    kubectl("rollout", "restart", f"deployment/{name}")
+    rolling = subprocess.Popen(["kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{name}",
+                                "--timeout=300s"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    least = SHARDS
+    while rolling.poll() is None:
+        try:
+            least = min(least, len([p for p in shard_pods() if ready(p)]))
+        except (Exception, SystemExit):
+            pass
+        time.sleep(0.5)
+    rolled = rolling.returncode == 0 and happens(
+        lambda: settled() and not ({p["metadata"]["name"] for p in shard_pods()} & before)
+        and len([p for p in shard_pods() if ready(p)]) == SHARDS, 120)
+    s.check(rolled, f"shards: its pods rolled to new ones, two shards and a standby "
+                    f"({len(shard_pods())} pods, {len([p for p in shard_pods() if ready(p)])} ready)")
+    s.check(rolled and least >= 1, f"shards: a shard at a time: never fewer than one ready (least {least})")
+    if not rolled:
+        return
+
+    # A shard gone and back, read by the one that stayed: down to one pod
+    # (the standby goes first, being not ready, then a shard, which gives
+    # its Lease up), then back to three.
+    changed = "the instance's live shards changed"
+    kubectl("scale", f"deployment/{name}", "--replicas=1")
+    alone = happens(lambda: len(shard_pods()) == 1 and ready(shard_pods()[0]), 120)
+    stayed = shard_pods()[0]["metadata"]["name"] if alone else ""
+    first = shard_log(stayed).count(changed) if alone else 0
+    gone = alone and happens(lambda: shard_log(stayed).count(changed) >= first + 1 or first >= 2, 30)
+    kubectl("scale", f"deployment/{name}", f"--replicas={SHARDS + 1}")
+    again = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
+    lines = shard_log(stayed).count(changed) if alone else 0
+    told = alone and happens(lambda: shard_log(stayed).count(changed) >= 3, 60)
+    lines = shard_log(stayed).count(changed) if alone else 0
+    s.check(bool(gone) and again and bool(told),
+            f"shards: the shard that stayed read its neighbour live, gone and back, and shared its subjects again "
+            f"each time ({lines} changes said, at least 3)")
 
 
 # What analytics says once it has its stream, and where it could not make one.

@@ -1468,3 +1468,87 @@ async fn shards_or_a_standby_are_refused_before_the_record_where_no_lease_right_
     .await
     .unwrap();
 }
+
+/// Review finding 11 (accepted 2026-11-15): each shard holds at least one
+/// of each limit, so shards above the instance's in-flight or answer limit
+/// would together hold more than its share. A launch naming such limits is
+/// refused naming `shards`, before anything is recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn shards_above_the_launch_s_own_in_flight_or_answer_limit_are_refused_naming_shards() {
+    let (bus, launcher) = harness();
+    upload(&bus, shardable("0.1.0", &["data"])).await.unwrap();
+    for (limits, named) in [
+        (
+            SidecarLimits {
+                in_flight: 1,
+                ..Default::default()
+            },
+            "in_flight",
+        ),
+        (
+            SidecarLimits {
+                answer_mib: 1,
+                ..Default::default()
+            },
+            "answer_mib",
+        ),
+    ] {
+        let refused = launch(
+            &bus,
+            LaunchPluginRequest {
+                shards: 2,
+                limits: Some(limits),
+                ..launching("snaptrade-1", &["data"])
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.contains("[refusal-status invalid-argument")
+                && refused.contains("shards")
+                && refused.contains(named),
+            "{refused}"
+        );
+    }
+    assert!(launcher.created.lock().unwrap().is_empty());
+    assert!(catalogue(&bus).await.launches.is_empty());
+    // At the limit, and with a limit left to the deployment's: launched.
+    launch(
+        &bus,
+        LaunchPluginRequest {
+            shards: 2,
+            limits: Some(SidecarLimits {
+                in_flight: 2,
+                ..Default::default()
+            }),
+            ..launching("snaptrade-1", &["data"])
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A launch kept with shards or a standby pod, made again on a deployment
+/// that has since left its lease right, is refused naming the field it
+/// kept; one pod, or a deployment that does not say, is not.
+#[test]
+fn several_pods_kept_on_a_record_are_refused_by_field_where_no_lease_right_renders() {
+    use super::several_refused;
+    for (pods, field) in [
+        ((2, false), "shards"),
+        ((1, true), "standby"),
+        ((3, true), "shards"),
+    ] {
+        let refused = several_refused("feed-1", pods, Some(false)).unwrap();
+        let (status, fields, _) = meridian_bus::read_refusal_status(&refused).unwrap();
+        assert!(matches!(
+            status,
+            meridian_bus::RefusalStatus::FailedPrecondition
+        ));
+        assert_eq!(fields, [field]);
+        assert_eq!(several_refused("feed-1", pods, Some(true)), None);
+        assert_eq!(several_refused("feed-1", pods, None), None);
+    }
+    assert_eq!(several_refused("feed-1", (1, false), Some(false)), None);
+    assert_eq!(several_refused("feed-1", (0, false), Some(false)), None);
+}

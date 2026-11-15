@@ -1466,6 +1466,13 @@ async fn the_moves_the_split_and_the_resilience_read_are_a_deployment_admins_fro
         read["error"],
         "target_group: the deployment has no writer group 9"
     );
+    // The fields the store named, as the tools' details carry them
+    // (review finding 12; accepted 2026-11-15).
+    assert_eq!(
+        read["fields"],
+        serde_json::json!([{"path": "target_group"}]),
+        "{body}"
+    );
     let (status, headers, body) = send(
         &h,
         "POST",

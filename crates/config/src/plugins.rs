@@ -646,6 +646,29 @@ pub fn launch<'a>(
             ),
         ));
     }
+    // Each shard holds at least one of each limit (a shard's part is the
+    // limit divided by the count, rounded down, and never nothing), so
+    // shards above the in-flight or answer limit the launch names would
+    // together hold more than the instance's share (review finding 11;
+    // accepted 2026-11-15). The deployment's own limits are the
+    // launcher's to hold a launch to.
+    if let Some(limits) = request.limits.as_ref().filter(|_| request.shards > 1) {
+        for (field, limit) in [
+            ("limits.in_flight", limits.in_flight),
+            ("limits.answer_mib", limits.answer_mib),
+        ] {
+            if limit > 0 && request.shards > limit {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["shards".to_string()],
+                    format!(
+                        "shards is {}, and {field} is {limit}: each shard holds at least one,                          so its shards together would hold more than the instance's share; at                          most {limit} shards, or a higher limit",
+                        request.shards
+                    ),
+                ));
+            }
+        }
+    }
     Ok(version)
 }
 
@@ -653,13 +676,17 @@ pub fn launch<'a>(
 /// standby pod -- refused where the deployment renders no lease right for
 /// them (step 3d; ruled 2026-11-15): before anything is recorded, naming
 /// the field asked.
-fn several_refused(request: &LaunchPluginRequest, lease_right: Option<bool>) -> Option<String> {
+fn several_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    lease_right: Option<bool>,
+) -> Option<String> {
     if lease_right != Some(false) {
         return None;
     }
-    let field = if request.shards > 1 {
+    let field = if shards > 1 {
         "shards"
-    } else if request.standby {
+    } else if standby {
         "standby"
     } else {
         return None;
@@ -669,7 +696,7 @@ fn several_refused(request: &LaunchPluginRequest, lease_right: Option<bool>) -> 
         &[field.to_string()],
         format!(
             "{field} was asked for {}, and this deployment runs no store standby: an instance              of several pods takes its shards' leases under the members' lease right, which              the chart renders where a store runs a standby (lake.standby, bor.standby,              instrument.standby, street.standby or conductor.standby at 1; the ha profile              sets each)",
-            request.instance_id
+            instance
         ),
     ))
 }
@@ -769,7 +796,11 @@ impl Plugins {
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
         }
-        if let Some(refusal) = several_refused(&request, self.lease_right) {
+        if let Some(refusal) = several_refused(
+            &request.instance_id,
+            (request.shards, request.standby),
+            self.lease_right,
+        ) {
             return Err(refusal);
         }
         // A registry version is verified again at launch (W8.3; the spec's
@@ -1077,6 +1108,14 @@ impl Plugins {
                     launch.name, launch.version
                 )
             })?;
+        // Several pods it could not be made as again, on a deployment that
+        // has since left its lease right: refused before its running
+        // workload is removed, so it is not stopped to no end.
+        if let Some(refusal) =
+            several_refused(instance, (launch.shards, launch.standby), self.lease_right)
+        {
+            return Err(refusal);
+        }
         let _: RemovePluginReply = self
             .ask_launcher(
                 REMOVE_PLUGIN,

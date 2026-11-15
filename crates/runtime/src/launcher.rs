@@ -549,6 +549,26 @@ pub fn with_shards(
             "the shards template does not tell its sidecar {SHARDS_ENV}"
         ));
     }
+    // Each shard holds at least one of each limit, so shards above the
+    // in-flight or answer limit its sidecars are given -- the chart's, or
+    // the launch's own, written just before -- would together hold more
+    // than the instance's share (review finding 11; accepted 2026-11-15).
+    for (name, said) in [
+        ("MERIDIAN_SIDECAR_IN_FLIGHT", "sidecar.limits.inFlight"),
+        ("MERIDIAN_SIDECAR_ANSWER_MIB", "sidecar.limits.answerMiB"),
+    ] {
+        let limit = env
+            .iter()
+            .find(|e| e["name"] == name)
+            .and_then(|e| e["value"].as_str())
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if let Some(limit) = limit.filter(|limit| shards > *limit) {
+            return Err(format!(
+                "shards: {} was asked {shards} shards, and its {said} is {limit}: each shard                  holds at least one, so its shards together would hold more than the                  instance's share; at most {limit} shards, or a higher limit at its launch",
+                request.instance_id
+            ));
+        }
+    }
     env.retain(|e| e["name"] != SHARDS_ENV);
     env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
     Ok(manifest)

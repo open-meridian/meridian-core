@@ -373,6 +373,16 @@ impl Plugins {
             ));
         }
         let widening = !declared.is_subset(&running.roles.iter().map(String::as_str).collect());
+        // Its shards and standby pod are kept: refused, before anything is
+        // removed, where the deployment has since left the lease right
+        // they run under.
+        if let Some(refusal) = super::several_refused(
+            &request.instance_id,
+            (running.shards, running.standby),
+            self.lease_right,
+        ) {
+            return Err(refusal);
+        }
         // Removed first, then recorded: the old launch ended as stopped,
         // the move noted on it, and the instance begun again on the new
         // version under its own ID.

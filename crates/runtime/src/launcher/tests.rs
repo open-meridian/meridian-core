@@ -575,6 +575,44 @@ fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the
     }
 }
 
+/// Review finding 11 (accepted 2026-11-15): shards above the in-flight or
+/// answer limit its sidecars are given -- the chart's, or the launch's own
+/// -- are refused naming shards: each shard holds at least one of each.
+#[test]
+fn shards_above_a_limit_its_sidecars_are_given_are_refused_naming_shards() {
+    let limited = |name: &str, value: &str| {
+        let mut shape = several_pods();
+        shape["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": name, "value": value}));
+        shape
+    };
+    let asked = CreatePluginRequest {
+        shards: 3,
+        ..request()
+    };
+    for (name, said) in [
+        ("MERIDIAN_SIDECAR_IN_FLIGHT", "sidecar.limits.inFlight"),
+        ("MERIDIAN_SIDECAR_ANSWER_MIB", "sidecar.limits.answerMiB"),
+    ] {
+        let refused = with_shards(limited(name, "2"), &asked, false).unwrap_err();
+        assert!(
+            refused.starts_with("shards:")
+                && refused.contains(said)
+                && refused.contains("at most 2"),
+            "{refused}"
+        );
+        with_shards(limited(name, "3"), &asked, false).unwrap();
+    }
+    // A standby alone is one shard, within any limit.
+    let standby = CreatePluginRequest {
+        standby: true,
+        ..request()
+    };
+    with_shards(limited("MERIDIAN_SIDECAR_IN_FLIGHT", "1"), &standby, false).unwrap();
+}
+
 #[test]
 fn shards_are_refused_where_the_instance_cannot_be_several_pods() {
     let asked = CreatePluginRequest {

@@ -837,15 +837,15 @@ async fn resilience_profile(State(app): State<Arc<App>>, headers: HeaderMap) -> 
     }
 }
 
-/// A store's refusal of an act sent from the terminal, as its status and
-/// its words: a refusal for load 429 with `retry_after_seconds` in the body
+/// A store's refusal of an act sent from the terminal, as its status, its
+/// words and the fields it named: a refusal for load 429 with `retry_after_seconds` in the body
 /// and a Retry-After header; one carrying a status, that status; any other
 /// refusal of the store's own 409; anything else -- nothing serving, a
 /// timeout -- 502.
 fn store_refused(detail: String) -> Response {
     use meridian_bus::RefusalStatus;
     use meridian_pb::v1::RefusalReason;
-    if let Some((status, _, words)) = meridian_bus::read_refusal_status(&detail) {
+    if let Some((status, fields, words)) = meridian_bus::read_refusal_status(&detail) {
         let status = match status {
             RefusalStatus::InvalidArgument => StatusCode::UNPROCESSABLE_ENTITY,
             RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
@@ -853,7 +853,20 @@ fn store_refused(detail: String) -> Response {
             RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
             RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
-        return refused(status, words);
+        // The fields the store named, as a tool's refusal carries them in
+        // its details (`fields: [{path}]`, accepted 2026-11-15; review
+        // finding 12): none named, no key.
+        if fields.is_empty() {
+            return refused(status, words);
+        }
+        let fields: Vec<serde_json::Value> = fields
+            .iter()
+            .map(|path| serde_json::json!({ "path": path }))
+            .collect();
+        return json(
+            status,
+            serde_json::json!({ "error": words, "fields": fields }),
+        );
     }
     match meridian_bus::read_refusal(&detail) {
         Some((reason, words))
