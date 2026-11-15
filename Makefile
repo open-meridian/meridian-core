@@ -2779,13 +2779,27 @@ chart-check:
 		echo "$$said" | grep -q 'serviceAccountName: check-meridian-runtime-conductor$$' \
 			|| { echo "chart-check FAILED: the conductor does not run under its own account ($${profile:-tolerant})" >&2; exit 1; }; \
 	done
-	@# Stage D (W6.39; approved 2026-11-11): the chart's values the resilience
-	@# profile reads reach the conductor alone, as JSON resolved by the
-	@# profile, and carry no secret, credential or address.
+	@# Stage D (W6.39; approved 2026-11-11) and step 3d (item 34, approved
+	@# 2026-11-15): the chart's values the resilience profile reads reach
+	@# the conductor and the dashboard -- which offers shards and a standby
+	@# pod only where a store runs a standby -- and nothing else, as JSON
+	@# resolved by the profile, and carry no secret, credential or address.
+	@# Once in each of the two, and twice in the whole render: so in no
+	@# third component.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	all="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
-		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor, or not at all" >&2; exit 1; }; \
+	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 2 ] \
+		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor and the dashboard, or on one of them not at all" >&2; exit 1; }; \
+	for holder in conductor dashboard; do \
+		[ "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/$$holder.yaml 2>/dev/null \
+			| grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
+			|| { echo "chart-check FAILED: the $$holder is not told the chart's values once" >&2; exit 1; }; \
+	done; \
+	[ "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/conductor.yaml 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')" \
+	  = "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/dashboard.yaml 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')" ] \
+		|| { echo "chart-check FAILED: the dashboard is told other values than the conductor" >&2; exit 1; }; \
 	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
 		value="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null \
 			| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')"; \
