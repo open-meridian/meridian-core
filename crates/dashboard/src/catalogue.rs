@@ -77,6 +77,14 @@ pub fn routes() -> Router<Arc<App>> {
         // --profile` prints, as the Resilience page's Profile tab and
         // `dashboard__read_resilience_profile` read it.
         .route("/terminal/resilience-profile", get(resilience_profile))
+        // The moves, the split and the read behind `meridian partition
+        // split|move` and `meridian account move` (step 3d; approved
+        // 2026-11-15): each a deployment admin's, answered as its
+        // `dashboard__` tool answers it.
+        .route("/terminal/resilience", get(resilience))
+        .route("/terminal/partitions/split", post(split_partition))
+        .route("/terminal/partitions/move", post(move_partition))
+        .route("/terminal/accounts/move", post(move_account))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
         // Contract v26 (the v26 plan's question 237): the registry's acts
@@ -826,6 +834,283 @@ async fn resilience_profile(State(app): State<Arc<App>>, headers: HeaderMap) -> 
     match reply {
         Ok(reply) => json(StatusCode::OK, crate::mcp::resilience::profile_json(&reply)),
         Err(failed) => refused(StatusCode::BAD_GATEWAY, failed),
+    }
+}
+
+/// A store's refusal of an act sent from the terminal, as its status and
+/// its words: a refusal for load 429 with `retry_after_seconds` in the body
+/// and a Retry-After header; one carrying a status, that status; any other
+/// refusal of the store's own 409; anything else -- nothing serving, a
+/// timeout -- 502.
+fn store_refused(detail: String) -> Response {
+    use meridian_bus::RefusalStatus;
+    use meridian_pb::v1::RefusalReason;
+    if let Some((status, _, words)) = meridian_bus::read_refusal_status(&detail) {
+        let status = match status {
+            RefusalStatus::InvalidArgument => StatusCode::UNPROCESSABLE_ENTITY,
+            RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
+            RefusalStatus::NotFound => StatusCode::NOT_FOUND,
+            RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
+            RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        return refused(status, words);
+    }
+    match meridian_bus::read_refusal(&detail) {
+        Some((reason, words))
+            if reason == RefusalReason::Overloaded as i32
+                || reason == RefusalReason::RateLimited as i32 =>
+        {
+            let seconds = meridian_bus::refusal_retry_after(&detail)
+                .unwrap_or(1)
+                .max(1);
+            let named = if reason == RefusalReason::Overloaded as i32 {
+                "overloaded"
+            } else {
+                "rate_limited"
+            };
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (CACHE_CONTROL, "no-store".to_string()),
+                    (axum::http::header::RETRY_AFTER, seconds.to_string()),
+                ],
+                Json(serde_json::json!({
+                    "error": words,
+                    "reason": named,
+                    "retry_after_seconds": seconds,
+                })),
+            )
+                .into_response()
+        }
+        Some((_, words)) => refused(StatusCode::CONFLICT, words),
+        None => refused(StatusCode::BAD_GATEWAY, detail),
+    }
+}
+
+/// A move's or a split's note as every act's: given, and at most 2,000
+/// characters.
+fn reasoned(note: &str) -> Result<(), Box<Response>> {
+    if note.trim().is_empty() {
+        return Err(Box::new(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "note: say why; it is kept with the record as its reason",
+        )));
+    }
+    if !crate::mcp::resilience::check_note_len(note) {
+        return Err(Box::new(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "note: at most 2,000 characters",
+        )));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadResilience {
+    #[serde(default)]
+    page_size: u32,
+    #[serde(default)]
+    cursor: String,
+}
+
+/// `GET /terminal/resilience` (ReadResilienceFromTerminal): the members,
+/// partitions and history, answered as `dashboard__read_resilience`
+/// answers them; `page_size` and `cursor` as the tool takes them.
+async fn resilience(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    asked: Result<axum::extract::Query<ReadResilience>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let admin = match admin(&app, &headers).await {
+        Ok(admin) => admin,
+        Err(refusal) => return *refusal,
+    };
+    let asked = match asked {
+        Ok(axum::extract::Query(asked)) if asked.page_size <= 200 => asked,
+        Ok(_) => return refused(StatusCode::UNPROCESSABLE_ENTITY, "page_size: 0 to 200"),
+        Err(failed) => return refused(StatusCode::UNPROCESSABLE_ENTITY, failed.to_string()),
+    };
+    let reply: Result<meridian_domain::v1::ReadResilienceReply, String> = ask(
+        &app,
+        &admin,
+        crate::admin::resilience::READ_RESILIENCE,
+        "meridian.v1.ReadResilienceRequest",
+        meridian_domain::v1::ReadResilienceRequest {
+            page_size: asked.page_size,
+            cursor: asked.cursor,
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    match reply {
+        Ok(reply) => json(
+            StatusCode::OK,
+            crate::mcp::resilience::resilience_json(&reply),
+        ),
+        Err(failed) => store_refused(failed),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitPartition {
+    partition: String,
+    note: String,
+}
+
+/// `POST /terminal/partitions/split` (SplitPartitionFromTerminal): a lake
+/// range halved, answered as `dashboard__split_partition` answers it.
+async fn split_partition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (admin, asked): (Admin, SplitPartition) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    if asked.partition.is_empty() {
+        return refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "partition: name the range",
+        );
+    }
+    if let Err(refusal) = reasoned(&asked.note) {
+        return *refusal;
+    }
+    let reply: Result<meridian_domain::v1::SplitPartitionReply, String> = ask(
+        &app,
+        &admin,
+        crate::mcp::resilience::SPLIT_PARTITION,
+        "meridian.v1.SplitPartitionRequest",
+        meridian_domain::v1::SplitPartitionRequest {
+            partition: asked.partition,
+            reason: asked.note,
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    match reply {
+        Ok(meridian_domain::v1::SplitPartitionReply { split: Some(split) }) => json(
+            StatusCode::OK,
+            serde_json::json!({ "split": crate::mcp::resilience::split_json(&split) }),
+        ),
+        Ok(_) => refused(
+            StatusCode::BAD_GATEWAY,
+            "the lake answered no split: read the Resilience history before asking again",
+        ),
+        Err(failed) => store_refused(failed),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MovePartition {
+    partition: String,
+    target_group: u32,
+    note: String,
+}
+
+/// `POST /terminal/partitions/move` (MovePartitionFromTerminal): a lake
+/// range or a book partition moved to another writer group, sent to the
+/// store that holds it and answered as `dashboard__move_partition` answers
+/// it: begun.
+async fn move_partition(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (admin, asked): (Admin, MovePartition) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    if asked.partition.is_empty() {
+        return refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "partition: name the partition",
+        );
+    }
+    if let Err(refusal) = reasoned(&asked.note) {
+        return *refusal;
+    }
+    let partition = asked.partition.clone();
+    let reply: Result<meridian_domain::v1::MovePartitionReply, String> = ask(
+        &app,
+        &admin,
+        crate::mcp::resilience::move_topic(&partition),
+        "meridian.v1.MovePartitionRequest",
+        meridian_domain::v1::MovePartitionRequest {
+            partition: asked.partition,
+            target_group: asked.target_group,
+            reason: asked.note,
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    match reply {
+        Ok(reply) => json(
+            StatusCode::OK,
+            serde_json::json!({ "move": crate::mcp::resilience::moving_json(&partition, &reply) }),
+        ),
+        Err(failed) => store_refused(failed),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveAccount {
+    account_id: String,
+    target_partition: String,
+    note: String,
+}
+
+/// `POST /terminal/accounts/move` (MoveAccountFromTerminal): an account
+/// continued in another book partition, answered as
+/// `dashboard__move_account` answers it: the move as recorded.
+async fn move_account(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (admin, asked): (Admin, MoveAccount) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    for (name, value) in [
+        ("account_id", &asked.account_id),
+        ("target_partition", &asked.target_partition),
+    ] {
+        if value.is_empty() {
+            return refused(StatusCode::UNPROCESSABLE_ENTITY, format!("{name}: name it"));
+        }
+    }
+    if let Err(refusal) = reasoned(&asked.note) {
+        return *refusal;
+    }
+    let reply: Result<meridian_domain::v1::MoveAccountReply, String> = ask(
+        &app,
+        &admin,
+        crate::mcp::resilience::MOVE_ACCOUNT,
+        "meridian.v1.MoveAccountRequest",
+        meridian_domain::v1::MoveAccountRequest {
+            account_id: asked.account_id,
+            target_partition: asked.target_partition,
+            reason: asked.note,
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    match reply {
+        Ok(meridian_domain::v1::MoveAccountReply { moved: Some(moved) }) => json(
+            StatusCode::OK,
+            serde_json::json!({ "moved": crate::mcp::resilience::account_moved_json(&moved) }),
+        ),
+        Ok(_) => refused(
+            StatusCode::BAD_GATEWAY,
+            "the book answered no move: read the Resilience history before asking again",
+        ),
+        Err(failed) => store_refused(failed),
     }
 }
 

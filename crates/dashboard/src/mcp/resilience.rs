@@ -225,6 +225,10 @@ pub fn account_moved_json(moved: &AccountMoved) -> Value {
 
 /// A note's own checks, as every act's: given, and at most 2,000
 /// characters.
+pub(crate) fn check_note_len(note: &str) -> bool {
+    note.chars().count() <= MOST_NOTE
+}
+
 fn check_note(note: &str, problems: &mut Problems) {
     if note.chars().count() > MOST_NOTE {
         problems.add("note", "at most 2,000 characters");
@@ -337,7 +341,17 @@ pub fn resilience_json(r: &ReadResilienceReply) -> Value {
         "partitions": r.partitions.iter().map(partition_json).collect::<Vec<_>>(),
         "history": r.history.iter().map(|item| {
             let (at, kind, words) = page::history_words(item);
-            json!({"at_ns": stamp_said(at), "kind": word(kind), "words": words})
+            // The store and partition its record names, where it names
+            // them: what a move or a split is followed by (2026-11-15).
+            let (component, partition) = page::history_names(item);
+            let mut said = json!({"at_ns": stamp_said(at), "kind": word(kind), "words": words});
+            if let Some(component) = component {
+                said["component"] = json!(component);
+            }
+            if let Some(partition) = partition {
+                said["partition"] = json!(partition);
+            }
+            said
         }).collect::<Vec<_>>(),
         "next_cursor": r.next_cursor,
     })
@@ -525,6 +539,12 @@ pub const PARITY: &[(&str, &str)] = &[
     (page::MOVE_ACCOUNT, "move_account"),
     // What `meridian status --profile` reads (contract v30).
     ("/terminal/resilience-profile", "read_resilience_profile"),
+    // The CLI's moves, split and read (step 3d; approved 2026-11-15):
+    // `meridian partition split|move`, `meridian account move`.
+    ("/terminal/resilience", "read_resilience"),
+    ("/terminal/partitions/split", "split_partition"),
+    ("/terminal/partitions/move", "move_partition"),
+    ("/terminal/accounts/move", "move_account"),
 ];
 
 #[cfg(test)]

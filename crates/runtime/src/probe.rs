@@ -13,6 +13,13 @@
 //!   primary, and where it archives its WAL, the archiver's last segment
 //!   and whether it is failing), and the API server where the member holds
 //!   a lease.
+//! - `partitions` (the lake and the book; step 3d, approved 2026-11-15):
+//!   each partition the member's database names, the writer group that
+//!   owns it, the database that group writes to, and for the book how many
+//!   accounts it holds -- `[{partition, group, database, accounts}]`. What
+//!   `meridian partition` and `meridian account move` read before a move;
+//!   group 0's writer holds the store's control assignments, so its probe
+//!   is the one read.
 //! - `answers`: the component's change log asked on the bus, as a follower
 //!   asks it -- answered by whichever member writes -- with the epoch and
 //!   head it answered.
@@ -208,7 +215,75 @@ fn session(
             said.push(("integrity", found));
         }
     }
+    // The lake's and the book's partitions, as this database names them.
+    if let Some(found) = record.and_then(|prefix| partitions_read(&mut client, prefix)) {
+        said.push(("partitions", found));
+    }
     Ok(said)
+}
+
+/// Each partition `record`'s database names with the writer group it names
+/// for it and, for the book, its accounts: none for a store that is neither
+/// the lake nor the book, or whose database does not yet say.
+fn partitions_read(client: &mut postgres::Client, record: &str) -> Option<Value> {
+    let (store, sql) = match record {
+        "lake" => (
+            "lake",
+            "SELECT dataset, writer_group, NULL::bigint FROM lake_partition ORDER BY dataset",
+        ),
+        "book" => (
+            "bor",
+            "SELECT h.partition, h.writer_group, \
+                    (SELECT count(*) FROM book_account a WHERE a.partition = h.partition) \
+               FROM book_partition_head h ORDER BY h.partition",
+        ),
+        _ => return None,
+    };
+    let rows = client.query(sql, &[]).ok()?;
+    let whole = |name: &str, default: u32| {
+        var(name)
+            .and_then(|said| said.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    };
+    let groups = whole(meridian_changes::groups::COUNT_VAR, 1);
+    let databases = whole(&meridian_changes::databases::count_var(store), 1);
+    let named: Vec<(String, Option<u32>, Option<u64>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, Option<i32>>(1).map(|group| group as u32),
+                row.get::<_, Option<i64>>(2).map(|accounts| accounts as u64),
+            )
+        })
+        .collect();
+    Some(partitions(&named, groups, databases))
+}
+
+/// The probe's `partitions`: each partition's writer group -- the one its
+/// database names, else its owner by the store's count of groups -- the
+/// database that group writes to, and its accounts where it holds any (the
+/// book's; the book's `control` holds none, and says none).
+fn partitions(named: &[(String, Option<u32>, Option<u64>)], groups: u32, databases: u32) -> Value {
+    Value::Array(
+        named
+            .iter()
+            .map(|(partition, group, accounts)| {
+                let group =
+                    group.unwrap_or_else(|| meridian_changes::groups::owner(partition, groups));
+                let mut said = json!({
+                    "partition": partition,
+                    "group": group,
+                    "database": meridian_changes::databases::of_group(group, databases),
+                });
+                if let Some(accounts) = accounts.filter(|_| partition != meridian_changes::CONTROL)
+                {
+                    said["accounts"] = json!(accounts);
+                }
+                said
+            })
+            .collect(),
+    )
 }
 
 /// The archiver's own account (`pg_stat_archiver`): its last segment
@@ -338,13 +413,21 @@ pub fn run(paths: &Paths) -> Result<(), String> {
     };
     let held = found.iter().all(|path| path["ok"] == json!(true))
         && answered.as_ref().is_none_or(|a| a["ok"] == json!(true));
-    let said = json!({
+    // The store's partitions, read with the database's session, said at
+    // the top: about the store, not the path.
+    let partitions = found
+        .iter_mut()
+        .find_map(|path| path.as_object_mut()?.remove("partitions"));
+    let mut said = json!({
         "component": paths.component,
         "member": member(),
         "paths": found,
         "answers": answered,
         "ok": held,
     });
+    if let Some(partitions) = partitions {
+        said["partitions"] = partitions;
+    }
     println!("{said}");
     if held {
         Ok(())
@@ -382,6 +465,54 @@ mod tests {
             .unwrap()
             .contains("no-such-name.invalid:4222"));
         assert!(started.elapsed() <= WITHIN + Duration::from_millis(500));
+    }
+
+    /// Step 3d (approved 2026-11-15): the probe's `partitions`.
+    #[test]
+    fn each_partition_says_its_group_its_groups_database_and_the_books_accounts() {
+        // The book over two groups and two databases: P1 named group 1's,
+        // P0 unnamed and so its owner's by the count; control holds no
+        // account.
+        let owner = meridian_changes::groups::owner("P0", 2);
+        let said = partitions(
+            &[
+                ("P0".into(), None, Some(12)),
+                ("P1".into(), Some(1), Some(3)),
+                ("control".into(), Some(0), Some(0)),
+            ],
+            2,
+            2,
+        );
+        assert_eq!(
+            said,
+            json!([
+                {"partition": "P0", "group": owner, "database": owner, "accounts": 12},
+                {"partition": "P1", "group": 1, "database": 1, "accounts": 3},
+                {"partition": "control", "group": 0, "database": 0},
+            ])
+        );
+        // The lake: ranges and datasets, no accounts; three groups on two
+        // databases, group 2 writing to database 0.
+        let said = partitions(
+            &[
+                ("feed:prices/0000-7fff".into(), Some(2), None),
+                ("feed:prices/8000-ffff".into(), Some(1), None),
+            ],
+            3,
+            2,
+        );
+        assert_eq!(
+            said,
+            json!([
+                {"partition": "feed:prices/0000-7fff", "group": 2, "database": 0},
+                {"partition": "feed:prices/8000-ffff", "group": 1, "database": 1},
+            ])
+        );
+        // One group, one database: everything group 0's, database 0.
+        assert_eq!(
+            partitions(&[("P0".into(), None, Some(1))], 1, 1),
+            json!([{"partition": "P0", "group": 0, "database": 0, "accounts": 1}])
+        );
     }
 
     #[test]

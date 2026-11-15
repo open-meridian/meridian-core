@@ -200,6 +200,26 @@ pub fn check_word(check: i32) -> &'static str {
 
 /// A history item's when, kind and words, as the page and the tool both
 /// say them.
+/// The store and the partition a history item's record names, where it
+/// names them: what a caller follows a move or a split by, rather than by
+/// the item's words (2026-11-15). A split's partition is its parent; an
+/// account's move is the book's, its partition the one it left.
+pub fn history_names(item: &ResilienceHistoryItem) -> (Option<&str>, Option<&str>) {
+    let (component, partition) = match &item.item {
+        Some(Item::WriterTookOver(r)) => (r.component.as_str(), ""),
+        Some(Item::PartitionMoved(r)) => (r.component.as_str(), r.partition.as_str()),
+        Some(Item::PartitionSplit(r)) => ("lake", r.parent.as_str()),
+        Some(Item::PartitionMoveAborted(r)) => (r.component.as_str(), r.partition.as_str()),
+        Some(Item::AccountMoved(r)) => ("bor", r.from_partition.as_str()),
+        Some(Item::IntegrityFinding(r)) => (r.component.as_str(), r.partition.as_str()),
+        _ => ("", ""),
+    };
+    (
+        Some(component).filter(|c| !c.is_empty()),
+        Some(partition).filter(|p| !p.is_empty()),
+    )
+}
+
 pub fn history_words(item: &ResilienceHistoryItem) -> (i64, &'static str, String) {
     match &item.item {
         Some(Item::WriterTookOver(r)) => (
