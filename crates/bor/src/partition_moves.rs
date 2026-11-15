@@ -79,9 +79,17 @@ pub struct Mover {
     /// by a raised database count waits until every member seen within
     /// that long runs it. None set, nothing is waited on.
     rollout: Option<(String, std::time::Duration)>,
+    /// How long the last switch took, part by part.
+    switched: Mutex<Option<crate::postgres::SwitchTimes>>,
 }
 
 impl Mover {
+    /// How long this mover's last switch took, part by part: none before
+    /// its first.
+    pub fn last_switch(&self) -> Option<crate::postgres::SwitchTimes> {
+        self.switched.lock().expect("moves poisoned").clone()
+    }
+
     pub fn new(
         stores: Vec<Arc<PostgresStore>>,
         groups: Groups,
@@ -98,6 +106,7 @@ impl Mover {
             clock,
             journalling: None,
             rollout: None,
+            switched: Mutex::default(),
         }
     }
 
@@ -424,7 +433,7 @@ impl Mover {
             std::thread::sleep(Duration::from_millis(100));
         }
         // Hold and switch, under the partition's lock.
-        let switched = source.switch_partition(
+        let switched = source.switch_partition_timed(
             to,
             partition,
             target,
@@ -433,7 +442,10 @@ impl Mover {
             copied,
         );
         let switched = match switched {
-            Ok(switched) => switched,
+            Ok((switched, times)) => {
+                *self.switched.lock().expect("moves poisoned") = Some(times);
+                switched
+            }
             Err(failed) => {
                 if across {
                     self.let_go_aborted(to, partition);

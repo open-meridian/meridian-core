@@ -9017,3 +9017,144 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
     // Their connections closed off the runtime's threads.
     tokio::task::block_in_place(move || drop((lake, zero, one)));
 }
+
+// ---- Part 12 (c30d-m12): the hold of a range's switch between databases --
+
+/// A range holding 20,000 keys switched between databases under write load
+/// (step 3d; section 6.8, "the hold is bounded, and nothing is refused
+/// inside it"): its hold -- from the range's row taken to the switch's
+/// answer -- stays under a second, no write is refused, and each part of
+/// it is said. What was warmed is compared before the row is taken, so
+/// under it only the rows since are copied and compared; the source's
+/// latest versions of the range's keys are let go under it, with the range.
+#[test]
+fn m12_a_large_range_switches_between_databases_inside_a_short_hold() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    const KEYS: usize = 20_000;
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 4)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let zero = Arc::new(meridian_lake::spread::Spread::new(
+        zeros.clone(),
+        zeros[0].groups(),
+    ));
+    let one = Arc::new(meridian_lake::spread::Spread::new(
+        ones.clone(),
+        ones[0].groups(),
+    ));
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:m{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap();
+    let (low, high) = halves_of("lake-m12");
+    zero.record(
+        &dataset,
+        vec![
+            trade(&dataset, "l0", &low, 10),
+            trade(&dataset, "h0", &high, 11),
+        ],
+        1_000,
+    )
+    .unwrap();
+    zero.split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    let built = std::time::Instant::now();
+    for batch in 0..KEYS / 1_000 {
+        let rows = (0..1_000)
+            .map(|n| {
+                trade(
+                    &dataset,
+                    &format!("bulk-{batch}-{n}"),
+                    &low,
+                    20 + (batch * 1_000 + n) as i64,
+                )
+            })
+            .collect();
+        zero.record(&dataset, rows, 1_200 + batch as i64).unwrap();
+    }
+    println!("m12: {KEYS} keys recorded in {:?}", built.elapsed());
+    zeros[0].pin_owners().unwrap();
+    for store in zeros.iter().chain(&ones) {
+        store.read_owners().unwrap();
+    }
+    let lower = format!("{dataset}/0000-7fff");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let moving = writing_range(
+        zero.clone() as Arc<dyn Store>,
+        one.clone() as Arc<dyn Store>,
+        dataset.clone(),
+        low.clone(),
+        "l",
+        stop.clone(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mover = Mover::new(
+        zeros.clone(),
+        zeros[0].groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&lower));
+    let began = std::time::Instant::now();
+    let ended = mover
+        .run(
+            &lower,
+            1,
+            &Asked {
+                by_hand: true,
+                moved_by: "https://directory.example.org|8812".into(),
+                reason: "the lower half to database 1".into(),
+            },
+        )
+        .unwrap();
+    let took = began.elapsed();
+    let times = mover.last_switch().expect("a switch was made");
+    for store in ones.iter() {
+        store.read_owners().unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let (moved_rows, refused, moved_wait) = moving.join().unwrap();
+    println!(
+        "m12: warm and switch {took:?}; its switch {times:?}; the moved range's longest wait \
+         {moved_wait:?}; {moved_rows} rows written under it"
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    assert!(moved_rows > 0);
+    // Every key of the range is the target's, each once.
+    let keys: i64 = postgres::Client::connect(&urls[1], postgres::NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM lake_latest WHERE dataset = $1 AND partition = $2",
+            &[&dataset, &lower],
+        )
+        .unwrap()
+        .get(0);
+    assert!(keys as usize >= KEYS, "{keys} keys in the target");
+    assert!(
+        times.held < std::time::Duration::from_secs(1),
+        "the switch held the range {:?}: {times:?}",
+        times.held
+    );
+}

@@ -3935,6 +3935,34 @@ pub enum Switched {
     LetGo { closing: u64, epoch: u64 },
 }
 
+/// How long a switch between databases took, part by part (step 3d;
+/// section 6.8): what its hold is made of, said in the member's log and
+/// asserted by the crate's tests, so the hold stays short whatever the
+/// partition's size.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwitchTimes {
+    /// Before the hold: the target's chain taken again as far as warmed,
+    /// its accounts' projections copied, and the change log once more.
+    pub before: std::time::Duration,
+    /// Of `before`: the accounts' projections copied.
+    pub warming: std::time::Duration,
+    /// Waiting for the partition's lock: the source's batch in flight.
+    pub waited: std::time::Duration,
+    /// Under the lock: the rest of the change log copied.
+    pub tail: std::time::Duration,
+    /// Under the lock: the target's chain taken again to the close.
+    pub chain: std::time::Duration,
+    /// Under the lock: the accounts' rows and projections.
+    pub accounts: std::time::Duration,
+    /// From the lock taken to the switch's answer: the hold.
+    pub held: std::time::Duration,
+    /// The accounts whose projections were copied under the lock: those
+    /// written since they were copied before it.
+    pub copied: usize,
+    /// The accounts the partition places.
+    pub placed: usize,
+}
+
 impl PostgresStore {
     /// `partition` as this database holds it; none where it has no head.
     pub fn tip(&self, partition: &str) -> Result<Option<Tip>> {
@@ -3962,9 +3990,10 @@ impl PostgresStore {
     /// sequence read first and its entries up to it alone, so the copy is
     /// whole up to the sequence it answers -- never a later entry ahead of
     /// an earlier one missed (the review's C1). Its accounts are the
-    /// switch's to copy, under the partition's lock, so none is copied
-    /// before an entry of it (C5, C6). From 0, the snapshot; after, the
-    /// change log. Answers the last sequence copied.
+    /// switch's to copy ([`Self::switch_partition`]): none is in this
+    /// database before the switch commits it under the partition's lock
+    /// (C5), each as the source holds it then (C6). From 0, the snapshot;
+    /// after, the change log. Answers the last sequence copied.
     pub fn copy_partition_from(
         &self,
         from: &PostgresStore,
@@ -4023,21 +4052,76 @@ impl PostgresStore {
         Ok(copied as u64)
     }
 
-    /// Everything `from`'s database holds of `account_id` copied into this
-    /// one, its projections replaced by `from`'s, in one transaction: a
-    /// partition's move between databases, at its switch.
-    fn replace_account_from(&self, from: &PostgresStore, account_id: &str) -> Result<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        for table in ACCOUNT_TABLES.iter().filter(|t| **t != "book_entry") {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE account_id = $1"),
-                &[&account_id],
-            )
-            .map_err(unavailable)?;
+    /// What `source` reads of `accounts` in each of `tables` copied into
+    /// `target`'s transaction, a table at a time (step 3d; section 6.4): a
+    /// partition's move between databases. What `target` held of them in a
+    /// projection's table is replaced; their rows take the source's
+    /// placement; their entries are added by their own keys, `partition`'s
+    /// left to the change log's copy. `staged` names the transaction's
+    /// temporary tables, one name a call.
+    fn copy_accounts(
+        source: &mut Transaction<'_>,
+        target: &mut Transaction<'_>,
+        accounts: &[String],
+        tables: &[&str],
+        partition: &str,
+        staged: &str,
+    ) -> Result<()> {
+        use std::io::{Read, Write};
+        if accounts.is_empty() {
+            return Ok(());
         }
-        tx.commit().map_err(unavailable)?;
-        self.copy_account_from(from, account_id)?;
+        let theirs = format!("account_id = ANY({})", text_array(accounts));
+        for table in tables {
+            let (kept, on_conflict) = match *table {
+                "book_account" => (
+                    theirs.clone(),
+                    "ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition",
+                ),
+                "book_entry" => (
+                    format!(
+                        "{theirs} AND partition <> '{}'",
+                        partition.replace('\'', "''")
+                    ),
+                    "ON CONFLICT DO NOTHING",
+                ),
+                _ => {
+                    target
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE account_id = ANY($1)"),
+                            &[&accounts],
+                        )
+                        .map_err(unavailable)?;
+                    (theirs.clone(), "ON CONFLICT DO NOTHING")
+                }
+            };
+            let mut rows = Vec::new();
+            source
+                .copy_out(&format!(
+                    "COPY (SELECT * FROM {table} WHERE {kept}) TO STDOUT (FORMAT binary)"
+                ))
+                .map_err(unavailable)?
+                .read_to_end(&mut rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            target
+                .batch_execute(&format!(
+                    "CREATE TEMP TABLE {staged}_{table} (LIKE {table}) ON COMMIT DROP"
+                ))
+                .map_err(unavailable)?;
+            let mut writer = target
+                .copy_in(&format!("COPY {staged}_{table} FROM STDIN (FORMAT binary)"))
+                .map_err(unavailable)?;
+            writer
+                .write_all(&rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            writer.finish().map_err(unavailable)?;
+            target
+                .execute(
+                    &format!("INSERT INTO {table} SELECT * FROM {staged}_{table} {on_conflict}"),
+                    &[],
+                )
+                .map_err(unavailable)?;
+        }
         Ok(())
     }
 
@@ -4107,7 +4191,14 @@ impl PostgresStore {
     /// batch in flight finishes first and the next waits (the hold), the
     /// source's close at its head N; `to` brought to N where it is another
     /// database, its chain taken again to N and compared with the source's
-    /// digest there. Within one database, the head named the target's at
+    /// digest there. What grows with the partition is done before the lock
+    /// -- the chain as far as warmed, and its accounts' projections, copied
+    /// into a transaction of `to`'s that only the switch commits -- and
+    /// under it only what was written since: the rest of the change log,
+    /// the chain on to N, the accounts with an entry since, and each
+    /// account's row. So the hold stays short whatever the partition's
+    /// size (PR CI 43675491409: 35 accounts copied whole under the lock
+    /// held its writes 5.4 s). Within one database, the head named the target's at
     /// its group's epoch. Across two, never two owners (the review's C3):
     /// the target's head first made a pointer to the target (epoch `POINTER_EPOCH`, under
     /// which nothing commits), then the source lets go -- its head named the
@@ -4129,6 +4220,66 @@ impl PostgresStore {
         differ: bool,
         warmed: u64,
     ) -> Result<Switched> {
+        self.switch_partition_timed(to, partition, target, bound, differ, warmed)
+            .map(|(switched, _)| switched)
+    }
+
+    /// [`Self::switch_partition`], and how long each part of it took.
+    pub fn switch_partition_timed(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+    ) -> Result<(Switched, SwitchTimes)> {
+        let mut times = SwitchTimes::default();
+        let mut locked = None;
+        let switched = self.switch_within(
+            to,
+            partition,
+            target,
+            bound,
+            differ,
+            warmed,
+            &mut times,
+            &mut locked,
+        );
+        if let Some(locked) = locked {
+            times.held = locked.elapsed();
+        }
+        if !std::ptr::eq(self, to) {
+            tracing::info!(
+                partition,
+                target,
+                before_ms = times.before.as_millis() as u64,
+                warming_ms = times.warming.as_millis() as u64,
+                waited_ms = times.waited.as_millis() as u64,
+                tail_ms = times.tail.as_millis() as u64,
+                chain_ms = times.chain.as_millis() as u64,
+                accounts_ms = times.accounts.as_millis() as u64,
+                held_ms = times.held.as_millis() as u64,
+                copied = times.copied,
+                placed = times.placed,
+                "a partition's switch between databases: its hold, part by part"
+            );
+        }
+        switched.map(|switched| (switched, times))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn switch_within(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+        times: &mut SwitchTimes,
+        locked: &mut Option<std::time::Instant>,
+    ) -> Result<Switched> {
         let began = std::time::Instant::now();
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
         let same = std::ptr::eq(self, to);
@@ -4141,17 +4292,85 @@ impl PostgresStore {
                     | Some(&postgres::error::SqlState::QUERY_CANCELED)
             )
         };
-        // The target's chain to what was warmed, taken again before the
-        // hold: under it, only the rest.
-        let verified = if same {
-            None
-        } else {
-            let upto = warmed.min(to.tip(partition)?.map_or(0, |tip| tip.held));
-            match to.chain_of(partition, 0, &[], upto)? {
-                Ok(digest) => Some((upto, digest)),
-                Err(_) => None,
-            }
+        // Before the hold, between databases, what grows with the
+        // partition (growth is configuration: the hold stays short whatever
+        // its size): the target's chain taken again as far as warmed; then
+        // its accounts' projections, as one snapshot of the source holds
+        // them at its sequence `at`, copied into a transaction of the
+        // target's left open -- nothing of them is in the target for any
+        // read or any other writer until the switch commits it under the
+        // lock, and a switch that ends any other way leaves nothing (the
+        // review's C5); then the change log again, and the chain on to it,
+        // so the hold begins with a short tail.
+        let mut verified = None;
+        let mut warmed = warmed;
+        let mut at = 0u64;
+        let mut warmed_accounts: Vec<String> = Vec::new();
+        let copied_tables: Vec<&str> = ACCOUNT_TABLES
+            .iter()
+            .copied()
+            .filter(|table| *table != "book_account")
+            .collect();
+        let mut target_conn = if same { None } else { Some(to.conn()?) };
+        let mut warm = match target_conn.as_mut() {
+            Some(conn) => Some(conn.transaction().map_err(unavailable)?),
+            None => None,
         };
+        if let Some(warm) = warm.as_mut() {
+            let upto = warmed.min(to.tip(partition)?.map_or(0, |tip| tip.held));
+            verified = to
+                .chain_of(partition, 0, &[], upto)?
+                .ok()
+                .map(|digest| (upto, digest));
+            let part = std::time::Instant::now();
+            // The whole partition's accounts, however many: without the
+            // serving session's statement_timeout (section 10a).
+            meridian_changes::serving::unbounded(warm).map_err(unavailable)?;
+            let mut reading = self.conn()?;
+            let mut snapshot = reading
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .map_err(unavailable)?;
+            meridian_changes::serving::unbounded(&mut snapshot).map_err(unavailable)?;
+            at = snapshot
+                .query_one(
+                    "SELECT coalesce(max(last_sequence), 0) FROM book_entry WHERE partition = $1",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+                .get::<_, i64>(0) as u64;
+            warmed_accounts = snapshot
+                .query(
+                    "SELECT account_id FROM book_account WHERE partition = $1 ORDER BY account_id",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            Self::copy_accounts(
+                &mut snapshot,
+                warm,
+                &warmed_accounts,
+                &copied_tables,
+                partition,
+                "warmed",
+            )?;
+            snapshot.commit().map_err(unavailable)?;
+            drop(reading);
+            times.warming = part.elapsed();
+            warmed = to.copy_partition_from(self, partition, warmed)?;
+            if let Some((after, previous)) = verified.take() {
+                verified = to
+                    .chain_of(partition, after, &previous, warmed)?
+                    .ok()
+                    .map(|digest| (warmed, digest));
+            }
+        }
+        times.before = began.elapsed();
+        let asked = std::time::Instant::now();
         let bounded = left(began).as_millis().max(1).to_string();
         if let Err(failed) = tx.execute(
             "SELECT pg_advisory_xact_lock($1)
@@ -4165,6 +4384,8 @@ impl PostgresStore {
                 Err(unavailable(failed))
             };
         }
+        times.waited = asked.elapsed();
+        *locked = Some(std::time::Instant::now());
         let source = tip_of(&mut tx, partition)?.ok_or_else(|| {
             StoreError::Unavailable(format!("the book has no partition {partition}"))
         })?;
@@ -4210,9 +4431,14 @@ impl PostgresStore {
         }
         // The target at N: the change log copied up to N while the source
         // is held, its chain taken again from where it was before the hold.
+        let part = std::time::Instant::now();
         to.copy_partition_from(self, partition, warmed)?;
+        times.tail = part.elapsed();
+        let part = std::time::Instant::now();
         let (after, previous) = verified.unwrap_or((0, Vec::new()));
-        let mut target_digest = match to.chain_of(partition, after, &previous, closing)? {
+        let chained = to.chain_of(partition, after, &previous, closing)?;
+        times.chain = part.elapsed();
+        let mut target_digest = match chained {
             Ok(digest) => digest,
             Err(broken) => {
                 tracing::warn!(
@@ -4232,10 +4458,87 @@ impl PostgresStore {
         if left(began).is_zero() {
             return Ok(Switched::TimedOut);
         }
-        // Its accounts, their projections as the source holds them at N.
-        for account in self.accounts_in(partition)? {
-            to.replace_account_from(self, &account)?;
+        // Its accounts as the source holds them at N: those with an entry
+        // since the sequence their projections were copied at, and any
+        // placed in it since, copied again; what was copied of one that
+        // left it since taken out; and each one's row, with which the
+        // target holds the account. Committed here, under the lock: none
+        // stale (the review's C6), and none in the target before.
+        let part = std::time::Instant::now();
+        let mut warm = warm
+            .take()
+            .expect("between databases: the target's transaction");
+        let mut reading = self.conn()?;
+        let mut current = reading
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let placed: Vec<String> = current
+            .query(
+                "SELECT account_id FROM book_account WHERE partition = $1 ORDER BY account_id",
+                &[&partition],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let written: std::collections::BTreeSet<String> = current
+            .query(
+                "SELECT DISTINCT account_id FROM book_entry
+                  WHERE partition = $1 AND first_sequence > $2",
+                &[&partition, &(at as i64)],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let stale: Vec<String> = placed
+            .iter()
+            .filter(|account| written.contains(*account) || !warmed_accounts.contains(account))
+            .cloned()
+            .collect();
+        let gone: Vec<String> = warmed_accounts
+            .iter()
+            .filter(|account| !placed.contains(account))
+            .cloned()
+            .collect();
+        if !gone.is_empty() {
+            // Its entries stay, as an account's warmed for its own move do.
+            for table in copied_tables.iter().filter(|table| **table != "book_entry") {
+                warm.execute(
+                    &format!("DELETE FROM {table} WHERE account_id = ANY($1)"),
+                    &[&gone],
+                )
+                .map_err(unavailable)?;
+            }
         }
+        Self::copy_accounts(
+            &mut current,
+            &mut warm,
+            &stale,
+            &copied_tables,
+            partition,
+            "switched",
+        )?;
+        Self::copy_accounts(
+            &mut current,
+            &mut warm,
+            &placed,
+            &["book_account"],
+            partition,
+            "switched",
+        )?;
+        current.commit().map_err(unavailable)?;
+        drop(reading);
+        warm.commit().map_err(unavailable)?;
+        for account in &placed {
+            to.place(account, partition);
+        }
+        times.accounts = part.elapsed();
+        times.copied = stale.len();
+        times.placed = placed.len();
         meridian_changes::moves::points::reached("book.switch.copied", partition)
             .map_err(StoreError::Unavailable)?;
         if left(began).is_zero() {

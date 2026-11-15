@@ -5987,6 +5987,13 @@ struct TwoDatabases {
 }
 
 fn two_databases() -> TwoDatabases {
+    two_databases_snapshotting(None)
+}
+
+/// [`two_databases`], each member's stores keeping a snapshot every
+/// `interval` entries of an account where one is given: a large partition
+/// built quickly, each act replaying a short tail.
+fn two_databases_snapshotting(interval: Option<u64>) -> TwoDatabases {
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
     let urls: Vec<String> = (0..2)
@@ -6011,6 +6018,10 @@ fn two_databases() -> TwoDatabases {
                     .unwrap()
                     .with_groups(groups)
                     .with_partitions(8);
+                let store = match interval {
+                    Some(interval) => store.with_snapshot_interval(interval),
+                    None => store,
+                };
                 store.pin_owners().unwrap();
                 Arc::new(store)
             })
@@ -7071,4 +7082,280 @@ async fn m9_an_account_between_its_close_and_its_open_is_in_a_read_of_every_acco
     assert_eq!(opened, 1);
     blocking(|| assert_eq!((times(&zero), times(&one)), (1, 1), "after its open"));
     drop((bus_zero, bus_one));
+}
+
+// ---- Part 12 (c30d-m12): a short switch between databases ----------------
+
+/// Every row `url`'s database holds of `accounts` in each table a move
+/// between databases copies beside their entries, as text, in order.
+fn projected(url: &str, accounts: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    const TABLES: &[&str] = &[
+        "book_account",
+        "book_snapshot",
+        "book_position",
+        "book_lot",
+        "book_pending",
+        "book_break",
+        "book_figures",
+        "book_attributes",
+        "book_order",
+        "book_placement",
+        "book_execution",
+        "book_unplaced",
+        "book_locate",
+        "book_instruction",
+        "book_change_request",
+        "book_order_entry",
+        "book_booking",
+        "book_alert",
+        "book_block_member",
+    ];
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    TABLES
+        .iter()
+        .map(|table| {
+            let rows = admin
+                .query(
+                    &format!("SELECT t::text FROM {table} t WHERE account_id = ANY($1) ORDER BY 1"),
+                    &[&accounts],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            (*table, rows)
+        })
+        .collect()
+}
+
+/// Writes to `accounts` through `bus` until `stop`, as [`writing`]: how
+/// many, those refused, and the longest any one waited for its answer.
+fn writing_timed(
+    bus: Arc<Bus>,
+    accounts: Vec<String>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<(u64, Vec<String>, std::time::Duration)> {
+    tokio::spawn(async move {
+        let (mut written, mut refused) = (0, Vec::new());
+        let mut longest = std::time::Duration::ZERO;
+        let mut n = 0u64;
+        while !stop.load(Ordering::SeqCst) {
+            n += 1;
+            let account = &accounts[(n as usize) % accounts.len()];
+            let began = std::time::Instant::now();
+            match write_once(&bus, account, n).await {
+                Ok(_) => written += 1,
+                Err(failed) => refused.push(failed),
+            }
+            longest = longest.max(began.elapsed());
+        }
+        (written, refused, longest)
+    })
+}
+
+/// A partition the size CI's failover run moves (35 accounts, more than
+/// 11,000 entries, orders among them) switched between databases under
+/// write load (step 3d; section 6.8, "the hold is bounded, and nothing is
+/// refused inside it"; CI 43675491409 held P0's writes 5.4 s): its hold --
+/// from the partition's lock taken to the switch's answer -- stays under a
+/// second, because what grows with the partition is copied before the lock
+/// and only what changed since under it; no write is refused; the target's
+/// chain to the close is the source's, digest for digest; and moved back
+/// under the same load, at the switch every account's rows in the target
+/// are the source's, none stale (the review's C6), and a read of every
+/// account reads each once (C5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m12_a_partition_the_size_ci_moves_switches_between_databases_inside_a_short_hold() {
+    use meridian_bor::order_service::*;
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::moves::points;
+    const ACCOUNTS: usize = 35;
+    const ORDERS: u64 = 40;
+    const WRITES: u64 = 285;
+    let h = blocking(|| two_databases_snapshotting(Some(20)));
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let partition = partition_of(1, 1);
+    let accounts = accounts_in("ACC-M12", &partition, ACCOUNTS, &h.one.0, h.one.1.as_ref()).await;
+    let built = std::time::Instant::now();
+    let building: Vec<_> = accounts
+        .iter()
+        .cloned()
+        .map(|account| {
+            let bus = h.one.0.clone();
+            tokio::spawn(async move {
+                write_once(&bus, &account, 1).await.unwrap();
+                for n in 0..ORDERS {
+                    let proposal = ProposeOrderRequest {
+                        account_id: account.clone(),
+                        instrument_id: "INS-AAPL".into(),
+                        sleeve: "core".into(),
+                        side: Side::Buy as i32,
+                        quantity: d("1"),
+                        order_type: OrderType::Limit as i32,
+                        limit_price: usd("227.50"),
+                        time_in_force: TimeInForce::Day as i32,
+                        idempotency_key: unique(&format!("m12-{n}")),
+                        ..Default::default()
+                    };
+                    send_order(&bus, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                        .await
+                        .unwrap();
+                }
+                for n in 0..WRITES {
+                    write_once(&bus, &account, n).await.unwrap();
+                }
+            })
+        })
+        .collect();
+    for task in building {
+        task.await.unwrap();
+    }
+    let entries = blocking(|| numbered(&h.urls[1], &partition)).len();
+    assert!(entries > 11_000, "{entries} entries: the size CI moves");
+    eprintln!(
+        "m12: {ACCOUNTS} accounts, {entries} entries built in {:?}",
+        built.elapsed()
+    );
+    let read = PositionsRead {
+        scope: Scope::Everything,
+        account_id: String::new(),
+        since: None,
+        business_date: String::new(),
+        at: None,
+        limit: 500,
+        cursor: String::new(),
+    };
+    let counted = {
+        let reader = Arc::clone(&h.zero.1);
+        let accounts = accounts.clone();
+        move || -> Result<Vec<usize>, String> {
+            let everyone = reader
+                .positions(&read)
+                .map_err(|failed| failed.to_string())?
+                .records;
+            Ok(accounts
+                .iter()
+                .map(|account| everyone.iter().filter(|p| p.account_id == *account).count())
+                .collect())
+        }
+    };
+    // Written while it moves, as CI's driver writes: a few of its accounts,
+    // through either member.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let written: Vec<String> = accounts[..3].to_vec();
+    let load = [
+        writing_timed(h.one.0.clone(), written.clone(), stop.clone()),
+        writing_timed(h.zero.0.clone(), written.clone(), stop.clone()),
+    ];
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let moved = std::time::Instant::now();
+    let ended = blocking(|| {
+        h.mover.begin(&partition);
+        h.mover.run(&partition, 0, &Asked::default())
+    });
+    let took = moved.elapsed();
+    let times = h.mover.last_switch().expect("a switch was made");
+    eprintln!("m12: moved in {took:?}; its switch {times:?}");
+    assert!(matches!(ended, Ok(Ended::Moved(..))), "{ended:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let once = blocking(&counted).unwrap();
+    assert!(
+        once.iter().all(|n| *n == 1),
+        "moved: the accounts read {once:?} times"
+    );
+    // The target's chain to the close, the source's: each taken again.
+    blocking(|| {
+        let fresh = |d: usize| PostgresStore::connect(&h.urls[d], 1).unwrap();
+        let closing = fresh(1).tip(&partition).unwrap().unwrap().head;
+        assert!(closing as usize >= entries, "closed at {closing}");
+        let ours = fresh(0).chain_of(&partition, 0, &[], closing).unwrap();
+        let theirs = fresh(1).chain_of(&partition, 0, &[], closing).unwrap();
+        assert!(ours.is_ok(), "{ours:?}");
+        assert_eq!(ours, theirs, "the digests at the close");
+        assert!(fresh(0).tip(&partition).unwrap().unwrap().head > closing);
+    });
+    // Back again under the same load: at the switch, the source held, every
+    // account's rows in the target are the source's, and each is read once.
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (urls, accounts, counted, seen) = (
+            h.urls.clone(),
+            accounts.clone(),
+            counted.clone(),
+            Arc::clone(&seen),
+        );
+        points::arm(
+            "book.switch.copied",
+            &partition,
+            Arc::new(move |_| {
+                let source = projected(&urls[0], &accounts);
+                let target = projected(&urls[1], &accounts);
+                *seen.lock().unwrap() = Some((source, target, counted()?));
+                Ok(())
+            }),
+        );
+    }
+    let back = blocking(|| {
+        h.mover.begin(&partition);
+        h.mover.run(
+            &partition,
+            1,
+            &Asked {
+                by_hand: true,
+                moved_by: PERSON.into(),
+                reason: "back again".into(),
+            },
+        )
+    });
+    points::disarm("book.switch.copied", &partition);
+    let back_times = h.mover.last_switch().expect("a switch was made");
+    eprintln!("m12: moved back; its switch {back_times:?}");
+    assert!(matches!(back, Ok(Ended::Moved(..))), "{back:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stop.store(true, Ordering::SeqCst);
+    let (mut count, mut longest) = (0, std::time::Duration::ZERO);
+    for task in load {
+        let (written, refused, waited) = task.await.unwrap();
+        assert!(refused.is_empty(), "refused inside the hold: {refused:?}");
+        count += written;
+        longest = longest.max(waited);
+    }
+    eprintln!("m12: {count} written under the two moves, the longest answered in {longest:?}");
+    assert!(count > 10, "{count} written under the moves");
+    let (source, target, counts) = seen.lock().unwrap().take().expect("read at the switch");
+    for ((table, theirs), (_, ours)) in source.iter().zip(&target) {
+        assert_eq!(
+            ours, theirs,
+            "{table}: the target's rows at the switch are not the source's"
+        );
+    }
+    let orders = &source.iter().find(|(t, _)| *t == "book_order").unwrap().1;
+    assert_eq!(orders.len() as u64, ACCOUNTS as u64 * ORDERS);
+    assert!(
+        counts.iter().all(|n| *n == 1),
+        "at the switch: the accounts read {counts:?} times"
+    );
+    let once = blocking(&counted).unwrap();
+    assert!(
+        once.iter().all(|n| *n == 1),
+        "moved back: the accounts read {once:?} times"
+    );
+    // The hold: what the writers waited, at most.
+    for (which, times) in [("there", &times), ("back", &back_times)] {
+        assert_eq!(times.placed, ACCOUNTS, "{which}: {times:?}");
+        assert!(
+            times.copied < ACCOUNTS,
+            "{which}: only the accounts written since were copied under the lock: {times:?}"
+        );
+    }
+    assert!(
+        times.held < std::time::Duration::from_secs(1),
+        "the switch held the partition {:?}: {times:?}",
+        times.held
+    );
+    assert!(
+        longest < std::time::Duration::from_secs(5),
+        "a write waited {longest:?}, past moves.holdSeconds"
+    );
+    blocking(move || drop(h));
 }

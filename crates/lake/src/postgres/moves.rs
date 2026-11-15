@@ -20,6 +20,26 @@ pub struct RangeTip {
     pub held_at_ns: i64,
 }
 
+/// How long a range's switch between databases took, part by part (step
+/// 3d; section 6.8): what its hold is made of, said in the member's log
+/// and asserted by the crate's tests.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwitchTimes {
+    /// Before the hold: what was warmed compared on both sides.
+    pub before: std::time::Duration,
+    /// Waiting for the range's row: the source's batch in flight.
+    pub waited: std::time::Duration,
+    /// Under the row: the rest of the range's rows copied.
+    pub tail: std::time::Duration,
+    /// Under the row: both sides' digests taken again to the close.
+    pub digest: std::time::Duration,
+    /// Under the row: the target pointed or opened, and the source let go
+    /// -- its latest versions of the range's keys deleted.
+    pub let_go: std::time::Duration,
+    /// From the row taken to the switch's answer: the hold.
+    pub held: std::time::Duration,
+}
+
 /// How a range's switch ended (section 6.8).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Switched {
@@ -290,6 +310,66 @@ impl PostgresStore {
         differ: bool,
         warmed: u64,
     ) -> Result<Switched> {
+        self.switch_range_timed(to, partition, target, bound, differ, warmed)
+            .map(|(switched, _)| switched)
+    }
+
+    /// [`Self::switch_range`], and how long each part of it took.
+    pub fn switch_range_timed(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+    ) -> Result<(Switched, SwitchTimes)> {
+        let mut times = SwitchTimes::default();
+        let mut locked = None;
+        let switched = self.switch_range_within(
+            to,
+            partition,
+            target,
+            bound,
+            differ,
+            warmed,
+            &mut times,
+            &mut locked,
+        );
+        if let Some((locked, let_go)) = locked {
+            times.held = locked.elapsed();
+            if let Some(let_go) = let_go {
+                times.let_go = let_go.elapsed();
+            }
+        }
+        if !std::ptr::eq(self, to) {
+            tracing::info!(
+                partition,
+                target,
+                before_ms = times.before.as_millis() as u64,
+                waited_ms = times.waited.as_millis() as u64,
+                tail_ms = times.tail.as_millis() as u64,
+                digest_ms = times.digest.as_millis() as u64,
+                let_go_ms = times.let_go.as_millis() as u64,
+                held_ms = times.held.as_millis() as u64,
+                "a range's switch between databases: its hold, part by part"
+            );
+        }
+        switched.map(|switched| (switched, times))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn switch_range_within(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+        times: &mut SwitchTimes,
+        locked: &mut Option<(std::time::Instant, Option<std::time::Instant>)>,
+    ) -> Result<Switched> {
         let began = std::time::Instant::now();
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
         let same = std::ptr::eq(self, to);
@@ -312,6 +392,8 @@ impl PostgresStore {
                 0
             }
         };
+        times.before = began.elapsed();
+        let asked = std::time::Instant::now();
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let bounded = left(began).as_millis().max(1).to_string();
@@ -344,6 +426,8 @@ impl PostgresStore {
             }
             Some(_) => {}
         }
+        times.waited = asked.elapsed();
+        *locked = Some((std::time::Instant::now(), None));
         let source = range_tip_of(&mut tx, partition)?.unwrap_or_default();
         let closing = source.head;
         let from = source.writer_group.unwrap_or_else(|| {
@@ -400,9 +484,16 @@ impl PostgresStore {
         }
         // The target at N: the range's rows copied up to N while the source
         // is held, both sides' digests taken again from what was compared.
+        let part = std::time::Instant::now();
         to.copy_range_from(self, partition, warmed)?;
+        times.tail = part.elapsed();
+        let part = std::time::Instant::now();
         let theirs = range_digest(&mut tx, partition, verified, closing)?;
         let mut ours = range_digest(&mut *to.conn()?, partition, verified, closing)?;
+        times.digest = part.elapsed();
+        if let Some((_, let_go)) = locked.as_mut() {
+            *let_go = Some(std::time::Instant::now());
+        }
         if differ {
             ours.1.push(0xff);
         }

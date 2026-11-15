@@ -85,6 +85,8 @@ pub struct Mover {
     /// by a raised database count waits until every member seen within
     /// that long runs it. None set, nothing is waited on.
     rollout: Option<(String, std::time::Duration)>,
+    /// How long the last switch took, part by part.
+    switched: Mutex<Option<crate::postgres::SwitchTimes>>,
 }
 
 impl Mover {
@@ -111,7 +113,14 @@ impl Mover {
             clock,
             logs: false,
             rollout: None,
+            switched: Mutex::default(),
         }
+    }
+
+    /// How long this mover's last switch took, part by part: none before
+    /// its first.
+    pub fn last_switch(&self) -> Option<crate::postgres::SwitchTimes> {
+        self.switched.lock().expect("moves poisoned").clone()
     }
 
     /// A range is moved home to another database by a raised count only
@@ -447,7 +456,7 @@ impl Mover {
             std::thread::sleep(Duration::from_millis(100));
         }
         // Hold and switch, under the range's row.
-        let switched = source.switch_range(
+        let (switched, times) = source.switch_range_timed(
             to,
             partition,
             target,
@@ -455,6 +464,7 @@ impl Mover {
             self.settings.digest_differs(),
             copied,
         )?;
+        *self.switched.lock().expect("moves poisoned") = Some(times);
         match switched {
             Switched::Moved { closing, epoch } | Switched::LetGo { closing, epoch } => {
                 tracing::info!(
