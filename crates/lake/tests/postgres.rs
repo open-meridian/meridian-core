@@ -7832,6 +7832,160 @@ async fn a_row_sent_again_unchanged_just_after_a_switch_is_answered_unchanged() 
     tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, zero, one)));
 }
 
+/// No write is answered while a range of its dataset is between two
+/// databases (step 3d; spec 6.4, 6.7 and 6.8; PR CI 43675491409, ha: two
+/// prices answered recorded 0, restated 0, unchanged 0 just after the
+/// driver's range switched from database 0 to database 1). Across
+/// databases a switch is two commits: the source lets the range go, then
+/// its target opens it, its position in the stream taken back with the
+/// open. Between them the source passes a write whose row it no longer
+/// commits, while the target's position still says it passed the write on
+/// its first take, when the row was not its own. Every position past the
+/// write, the answer was given with the row neither committed nor counted.
+/// It now waits for the open, and for the target to take the write again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
+    use meridian_changes::moves::points;
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{settled, taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // The dataset group 0's, which answers its writes, in database 0; its
+    // lower half moved to group 1, in database 1.
+    let a = tokio::task::block_in_place(|| across("between", true));
+    let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
+    let mover = Arc::new(a.mover());
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+        for store in a.zeros.iter().chain(&a.ones) {
+            store.read_owners().unwrap();
+        }
+    });
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake_over(
+                a.zero.clone() as Arc<dyn Store>,
+                a.zeros[0].groups(),
+                "lake-0",
+                &dataset,
+            ),
+            ha_lake_over(
+                a.one.clone() as Arc<dyn Store>,
+                a.ones[0].groups(),
+                "lake-1",
+                &dataset,
+            ),
+        )
+    });
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.between.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("between-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&dataset, &format!("b{n}"), &low, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+    };
+    let count = |answered: &(Option<String>, meridian_bus::HandlerReply)| {
+        let (_, payload) = answered.1.clone().expect("answered");
+        let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+        (reply.recorded, reply.restated, reply.unchanged)
+    };
+    let mut writer0 = tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM)).unwrap();
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    // A first write, its row group 1's: committed there, answered by group 0.
+    taken_past_a_switch(&mut writer1, vec![write(1)])
+        .await
+        .unwrap();
+    let first = taken_past_a_switch(&mut writer0, vec![write(1)])
+        .await
+        .unwrap();
+    let waits = writer0.take_waits();
+    let first = settled(&lake0, STREAM, first, waits).await;
+    assert_eq!(count(&first[0]), (1, 0, 0), "counted from group 1's part");
+    // A second, taken by group 0 first: its row not group 0's, its answer
+    // waiting for group 1.
+    let answers = taken_past_a_switch(&mut writer0, vec![write(2)])
+        .await
+        .unwrap();
+    let waits = writer0.take_waits();
+    // The lower half moved home to group 0, stopped between its two
+    // commits: let go in database 1, not yet opened in database 0.
+    points::arm(
+        "lake.switch.between",
+        &lower,
+        Arc::new(|_| Err("stopped between the two databases".into())),
+    );
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 0, &Asked::default()).unwrap();
+    });
+    points::disarm("lake.switch.between", &lower);
+    // Group 1, the source, passes the write: its row is no longer its own.
+    taken_past_a_switch(&mut writer1, vec![write(2)])
+        .await
+        .unwrap();
+    // Every position is past the write, and its row is committed nowhere.
+    let settling = {
+        let lake0 = lake0.clone();
+        tokio::spawn(async move { settled(&lake0, STREAM, answers, waits).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        !settling.is_finished(),
+        "answered while its row was neither committed nor counted"
+    );
+    // The sweep opens the half at home, group 0's place taken back with
+    // it; group 0 takes the write again, and commits its row.
+    tokio::task::block_in_place(|| {
+        mover.rebalance();
+    });
+    let took = taken_past_a_switch(&mut writer0, vec![write(3)]).await;
+    assert!(
+        matches!(
+            took,
+            Err(meridian_lake::store::StoreError::PositionMoved(_))
+        ),
+        "its position was taken back: {took:?}"
+    );
+    tokio::task::block_in_place(|| writer0.reread()).unwrap();
+    while writer0.next() <= 2 {
+        let from = writer0.next();
+        taken_past_a_switch(&mut writer0, vec![write(from)])
+            .await
+            .unwrap();
+    }
+    let answered = settling.await.unwrap();
+    assert_eq!(
+        count(&answered[0]),
+        (1, 0, 0),
+        "answered once its row was committed, and counted"
+    );
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
+}
+
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
 /// group answering it waits until the other group's consumer has committed
 /// its part -- its position in the stream past the write -- and answers

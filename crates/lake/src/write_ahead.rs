@@ -453,7 +453,14 @@ impl Writer {
 /// group has passed on two readings is one whose every row is committed --
 /// by the range's source before the switch, or by its target taking the
 /// write again -- never one its source skipped and its target has yet to
-/// take again.
+/// take again. Across two databases the switch is not one transaction: the
+/// source lets the range go first, and its target opens it, its position
+/// taken back with the open, after. Between the two the source passes the
+/// write, its rows nobody's yet, and the target's position still says it
+/// passed (PR CI 43675491409, ha: two prices answered recorded 0, restated
+/// 0, unchanged 0 in the half second after the driver's range switched to
+/// database 1). So no answer is given while a range of its dataset is
+/// between two databases.
 pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec<Wait>) -> Answers {
     let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
     for wait in waits {
@@ -497,12 +504,13 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
             }
             let passed = |groups: &[u32]| {
                 tokio::task::block_in_place(|| {
-                    groups.iter().chain([&mine]).all(|group| {
-                        lake.group_position(&group_key(stream, *group), *group)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|at| at.sequence >= wait.sequence)
-                    })
+                    !lake.range_between(&wait.dataset).unwrap_or(true)
+                        && groups.iter().chain([&mine]).all(|group| {
+                            lake.group_position(&group_key(stream, *group), *group)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|at| at.sequence >= wait.sequence)
+                        })
                 })
             };
             if passed(&groups) && !more(&mut groups) && passed(&groups) {

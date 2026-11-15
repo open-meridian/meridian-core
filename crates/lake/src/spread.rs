@@ -626,6 +626,25 @@ impl Store for Spread {
         self.furthest_position(key)
     }
 
+    fn range_between(&self, dataset: &str) -> Result<bool> {
+        if self.stores.len() == 1 {
+            return Ok(false);
+        }
+        // Each of its ranges by its furthest row, a written one before a
+        // move's pointer at the same head: a range whose furthest is a
+        // pointer was let go and is not opened yet.
+        let mut furthest: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        for store in &self.stores {
+            for (range, head, written) in store.rows_of(dataset)? {
+                let at = (head, written);
+                if furthest.get(&range).is_none_or(|held| *held < at) {
+                    furthest.insert(range, at);
+                }
+            }
+        }
+        Ok(furthest.values().any(|(_, written)| !written))
+    }
+
     fn write_ahead_part(
         &self,
         key: &str,

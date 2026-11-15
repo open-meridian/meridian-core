@@ -817,6 +817,10 @@ impl Store for HotStore {
         self.inner.write_ahead_part(key, group, sequence)
     }
 
+    fn range_between(&self, dataset: &str) -> Result<bool> {
+        self.inner.range_between(dataset)
+    }
+
     fn record_write_ahead(
         &self,
         batch: crate::store::WriteAheadBatch,

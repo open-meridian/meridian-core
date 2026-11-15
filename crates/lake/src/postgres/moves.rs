@@ -188,6 +188,22 @@ impl PostgresStore {
         Ok(rows.len())
     }
 
+    /// `dataset`'s rows here, its own and each range's: its head, and
+    /// whether it is written (not a move's pointer).
+    pub fn rows_of(&self, dataset: &str) -> Result<Vec<(String, u64, bool)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, head, epoch <> $2 FROM lake_partition
+                  WHERE dataset = $1 OR starts_with(dataset, $1 || '/')",
+                &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get::<_, i64>(1).max(0) as u64, row.get(2)))
+            .collect())
+    }
+
     /// Every range's row here: its group as named, its head, and whether
     /// it is written (not a move's pointer).
     #[allow(clippy::type_complexity)]

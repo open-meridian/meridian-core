@@ -2560,6 +2560,12 @@ impl Lake {
         self.store.group_position(key, group)
     }
 
+    /// Whether a range of `dataset` is between two databases, let go by a
+    /// move's switch and not yet opened (step 3d; sections 6.4 and 6.8).
+    pub fn range_between(&self, dataset: &str) -> Result<bool, crate::store::StoreError> {
+        self.store.range_between(dataset)
+    }
+
     /// What writer group `group`'s rows of the stream's write `sequence`
     /// did, as it kept them under `key` (step 3d; spec 6.7).
     pub fn write_ahead_part(

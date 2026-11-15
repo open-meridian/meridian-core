@@ -972,6 +972,17 @@ pub trait Store: Send + Sync {
         self.write_ahead_position(key)
     }
 
+    /// Whether a range of `dataset` is between two databases (step 3d;
+    /// sections 6.4 and 6.8): a move's switch has let it go where it was,
+    /// and its target has not opened it yet. Nobody commits its rows
+    /// meanwhile, and its target's place in the stream is taken back only
+    /// with the open. Never within one database, where a switch is one
+    /// transaction.
+    fn range_between(&self, dataset: &str) -> Result<bool> {
+        let _ = dataset;
+        Ok(false)
+    }
+
     /// What writer group `group`'s rows of the stream's write `sequence`
     /// did, as it kept them under `key` with its position (step 3d; spec
     /// 6.7): none where it committed no row of the write.
