@@ -170,9 +170,7 @@ where
     crate::background(async move {
         loop {
             let (seen, name, revision) = (Arc::clone(&seen), name.clone(), revision.clone());
-            let said =
-                tokio::task::spawn_blocking(move || seen(&name, &revision, started, now_ns()))
-                    .await;
+            let said = one_look_at_a_time(move || seen(&name, &revision, started, now_ns())).await;
             if let Ok(Err(failed)) = said {
                 tracing::debug!(store, %failed, "this member's row was not brought up to date");
             }
@@ -824,7 +822,7 @@ impl Holding {
             let mut said_failing = false;
             loop {
                 let looking = Arc::clone(&look);
-                match tokio::task::spawn_blocking(move || looking()).await {
+                match one_look_at_a_time(move || looking()).await {
                     Ok(Ok(Timeline::NotMine(epoch))) => {
                         if let Some(elector) = &elector {
                             let_go_stepping_down(elector, component).await;
@@ -914,7 +912,7 @@ impl Holding {
                         );
                     }
                     let reading = Arc::clone(&epoch_now);
-                    match tokio::task::spawn_blocking(move || reading()).await {
+                    match one_look_at_a_time(move || reading()).await {
                         Ok(Ok(head)) if head > mine() => {
                             return down(
                                 component,
@@ -1423,6 +1421,21 @@ pub const TIMELINE_LOOK_EVERY: Duration = Duration::from_secs(5);
 /// How often a writer with no lease reads its store's head epoch: as often
 /// as a leased one, at `leases.renewSeconds`' default.
 pub const UNLEASED_EPOCH_LOOK_EVERY: Duration = Duration::from_secs(2);
+
+/// A member's periodic look at its store -- its row among the members every
+/// 2 s, its head epoch every 2 s with no lease, its database's timeline every
+/// 5 s -- made off the runtime's threads one at a time. Made at once, the
+/// looks due together each took a thread of the blocking pool, which kept
+/// two or three of them, and their memory, resident in every writer
+/// (c30d-t7: the cluster's footprint median at its bound). Answers what
+/// `read` answered.
+async fn one_look_at_a_time<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    static LOOKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _alone = LOOKING.lock().await;
+    tokio::task::spawn_blocking(read).await
+}
 
 /// How often a standby asks its writer, which is also its interest in the
 /// tail (ruling 1062).

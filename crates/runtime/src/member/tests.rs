@@ -1366,3 +1366,54 @@ async fn a_writer_with_no_lease_steps_down_once_its_epoch_is_passed() {
         "it stepped down saying {why:?}"
     );
 }
+
+/// A writer's periodic looks at its store -- its row among the members and,
+/// with no lease, its head epoch, each every 2 s -- are made one at a time
+/// (c30d-t7): made at once, the looks due together each took a thread of
+/// the blocking pool, and the pool kept the extra ones and their memory
+/// resident in every writer (the cluster's footprint median at its bound).
+#[tokio::test(start_paused = true)]
+async fn a_writers_periodic_looks_are_made_one_at_a_time() {
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let most = Arc::new(AtomicU64::new(0));
+    let looked = Arc::new(AtomicU64::new(0));
+    let look = {
+        let (in_flight, most, looked) = (in_flight.clone(), most.clone(), looked.clone());
+        move || {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            looked.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let seen = look.clone();
+    keep_seen("lake", "lake-0", "a revision".into(), move |_, _, _, _| {
+        seen();
+        Ok(())
+    });
+    let holding = Holding {
+        elector: None,
+        component: "lake",
+        why: "",
+        previous: String::new(),
+    };
+    holding.keep_or(
+        || 5,
+        move || {
+            look();
+            Ok(5)
+        },
+        |_, why| panic!("stepped down: {why}"),
+    );
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(
+        looked.load(Ordering::SeqCst) >= 10,
+        "both looked, again and again"
+    );
+    assert_eq!(
+        most.load(Ordering::SeqCst),
+        1,
+        "two looks were made at once"
+    );
+}
