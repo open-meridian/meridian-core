@@ -5326,6 +5326,18 @@ fn a_new_database_timeline_at_two_writer_groups_fences_the_second_until_it_takes
     zero.record(&zeros, row(&zeros, "b"), 30)
         .expect("group 0 writes on");
     assert_eq!(read(), (again, raised, again, raised, 1));
+    // Once per timeline (CI 43804841979: in tolerant, the fenced writer
+    // steps down and its pod starts it again): group 0's next looks raise
+    // nothing more, and group 1's writer, taken over again, is never fenced
+    // again until the database moves once more -- no step-down loop.
+    for _ in 0..3 {
+        assert_eq!(zero.follow_timeline().unwrap(), Timeline::Same);
+    }
+    assert_eq!(standby.head_epoch().unwrap(), again as u64);
+    standby
+        .record(&ones, row(&ones, "c"), 40)
+        .expect("group 1's writer, taken over again, writes on");
+    assert_eq!(read(), (again, raised, again, raised, 2));
 }
 
 /// Two writer groups of one lake (step 3d; the resilience spec's sections

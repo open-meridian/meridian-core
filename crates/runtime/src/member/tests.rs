@@ -1324,3 +1324,45 @@ async fn a_stop_after_a_take_whose_answer_was_lost_gives_the_lease_up() {
         "it stopped with the lease naming it: nobody renews it until it lapses"
     );
 }
+
+/// A writer with no lease -- tolerant's, one member a group -- steps down
+/// once its epoch is passed, as a leased one does (spec section 3, "a
+/// frozen writer"; CI 43804841979, reconfigure, groups raised in
+/// tolerant: the database moved to a new timeline as the groups' writers
+/// started, group 0's writer raised every group's epoch, and group 1's,
+/// fenced, refused every write for five minutes, ready all along). Never
+/// while the epoch is its own.
+#[tokio::test(start_paused = true)]
+async fn a_writer_with_no_lease_steps_down_once_its_epoch_is_passed() {
+    let holding = Holding {
+        elector: None,
+        component: "lake",
+        why: "",
+        previous: String::new(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reading = Arc::clone(&head);
+    holding.keep_or(
+        || 5,
+        move || Ok(reading.load(Ordering::SeqCst)),
+        move |_, why| {
+            let _ = said.send(why.to_string());
+        },
+    );
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        heard.try_recv().is_err(),
+        "a writer under its own epoch stepped down"
+    );
+    // Another writer raised it: a new timeline's, its group's takeover.
+    head.store(6, Ordering::SeqCst);
+    let why = tokio::time::timeout(Duration::from_secs(30), heard.recv())
+        .await
+        .expect("a writer with no lease, its epoch passed, never stepped down")
+        .expect("said");
+    assert!(
+        why.contains("past this writer's 5"),
+        "it stepped down saying {why:?}"
+    );
+}

@@ -869,8 +869,9 @@ impl Holding {
     /// the record -- moves past `mine` -- the store's own, which a new
     /// database timeline raises (contract v30, stage C) -- or when a commit
     /// of its own was fenced. A renewal that fails alone never moves it
-    /// (contract v30, stage C: the API server lost). Nothing is kept where
-    /// no lease is held.
+    /// (contract v30, stage C: the API server lost). Where no lease is held,
+    /// the epoch alone is watched: passed, or a commit fenced, the writer
+    /// steps down.
     ///
     /// The epoch is read on a loop of its own: a read waits on the store's
     /// pool, up to its connection timeout while the database's primary is
@@ -882,11 +883,57 @@ impl Holding {
         M: Fn() -> u64 + Send + Sync + 'static,
         E: Fn() -> Result<u64, String> + Send + Sync + 'static,
     {
-        let Some(elector) = self.elector.clone() else {
-            return;
-        };
+        self.keep_or(mine, epoch_now, |component, why| step_down(component, why));
+    }
+
+    /// [`Self::keep`], where a writer with no lease steps down with `down`:
+    /// [`step_down`], or a test's own.
+    fn keep_or<M, E, D>(&self, mine: M, epoch_now: E, down: D)
+    where
+        M: Fn() -> u64 + Send + Sync + 'static,
+        E: Fn() -> Result<u64, String> + Send + Sync + 'static,
+        D: Fn(&'static str, &str) + Send + Sync + 'static,
+    {
         let component = self.component;
         let epoch_now = Arc::new(epoch_now);
+        let Some(elector) = self.elector.clone() else {
+            // No lease -- tolerant's, one member a group -- and the epoch
+            // watched all the same (spec section 3, "a frozen writer"): a
+            // writer whose epoch another raised steps down, and its pod
+            // starts it again under a new one (CI 43804841979, reconfigure,
+            // groups raised in tolerant: group 0's writer raised every
+            // group's epoch on the database's new timeline, and group 1's
+            // writer, fenced, refused every write for five minutes, ready).
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(UNLEASED_EPOCH_LOOK_EVERY).await;
+                    if meridian_changes::fenced_seen() {
+                        return down(
+                            component,
+                            "a commit of this writer was refused by a newer epoch",
+                        );
+                    }
+                    let reading = Arc::clone(&epoch_now);
+                    match tokio::task::spawn_blocking(move || reading()).await {
+                        Ok(Ok(head)) if head > mine() => {
+                            return down(
+                                component,
+                                &format!(
+                                    "the store's epoch is {head}, past this writer's {}",
+                                    mine()
+                                ),
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(failed)) => {
+                            tracing::warn!(component, %failed, "the store's epoch could not be read")
+                        }
+                        Err(failed) => tracing::warn!(component, %failed, "the epoch check failed"),
+                    }
+                }
+            });
+            return;
+        };
         tokio::spawn(async move {
             let renew = elector.lock().await.settings().renew;
             let watching = Arc::clone(&elector);
@@ -1372,6 +1419,10 @@ struct Following {
 /// How often a writer looks at its database's timeline beside what its
 /// pool's connections see (contract v30, stage C).
 pub const TIMELINE_LOOK_EVERY: Duration = Duration::from_secs(5);
+
+/// How often a writer with no lease reads its store's head epoch: as often
+/// as a leased one, at `leases.renewSeconds`' default.
+pub const UNLEASED_EPOCH_LOOK_EVERY: Duration = Duration::from_secs(2);
 
 /// How often a standby asks its writer, which is also its interest in the
 /// tail (ruling 1062).
