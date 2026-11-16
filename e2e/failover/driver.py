@@ -35,6 +35,12 @@ DRIVER_ROLE says which of its instances it is:
   served, and in the `unkept` mode read, so a lake reader that takes the read
   hands it to the writer (contract v30, stage B).
 
+- `scale-data` and `scale-oms`: the write-scale step's load (step 3d,
+  stage T, below), in the scaled run alone: nothing until /tmp/scale is
+  there, then prices recorded into the datasets of DRIVER_SCALE_KEYS, or
+  orders into DRIVER_ACCOUNTS, by DRIVER_SCALE_WORKERS workers at once, as
+  fast as each is answered.
+
 Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
 <id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
 /tmp/history.edn (invoke, ok, fail, info), each order a list-append
@@ -81,8 +87,11 @@ DATASET_KEY = "drive"
 UNKEPT_KEY = "unkept"
 # Every call bounded: a stop is heard within this, whatever the stores do.
 CALL_SECONDS = 10
-# A key takes this many appends at most, so a read of it is one page.
-PER_KEY = 400
+# A key takes this many appends at most, so a read of it is one page: 400,
+# or what DRIVER_PER_KEY says (the reconfigure run's, longer from stage T,
+# takes twice as many a key, so its orders are appended to its end; a
+# key's read is then two pages, which the read follows).
+PER_KEY = int(os.environ.get("DRIVER_PER_KEY", "400"))
 # Appends to a key before the next key is taken.
 RUN_OF = 40
 WORKERS = 2
@@ -1024,7 +1033,131 @@ async def drive_standing(role):
 # ── Start ───────────────────────────────────────────────────────────────────
 
 
+# ── The write-scale step's load (step 3d, stage T; section 15) ─────────────
+#
+# DRIVER_ROLE=scale-data and scale-oms, in e2e-cluster-scaled alone: each
+# store's writes at saturation, so the run can read what one writer group
+# on one database commits a second against two groups on two. Nothing is
+# written until the run makes /tmp/scale, and nothing once it removes it.
+# While it is there SCALE_WORKERS workers each write as fast as they are
+# answered: scale-data a batch of SCALE_BATCH prices into one of the
+# datasets of DRIVER_SCALE_KEYS, taken in turn (several, so they fall to
+# both writer groups); scale-oms a telephoned order into one of
+# DRIVER_ACCOUNTS, taken in turn -- or of those /tmp/scale names, by commas,
+# where it names any (the run names as many of each writer group's). What
+# was committed is read by the run in
+# the stores' own rows, never here; this keeps a count a second in
+# /tmp/scale.log (`SCALE <unix ms> <answered> <refused>`) and the last
+# refusal's words in /tmp/scale-refused, for reading a run that wrote
+# nothing. No figure is printed.
+
+SCALE = "/tmp/scale"
+SCALE_KEYS = [k for k in os.environ.get("DRIVER_SCALE_KEYS", "").split(",") if k]
+SCALE_WORKERS = int(os.environ.get("DRIVER_SCALE_WORKERS", "48"))
+SCALE_BATCH = 20
+
+
+class Scale:
+    def __init__(self):
+        self.answered = 0
+        self.refused = 0
+        self.turn = 0
+        self.named = []
+        self.read_at = None
+
+    def told(self):
+        """Whether to write now, and what /tmp/scale names, read again
+        when the file changes."""
+        try:
+            at = os.stat(SCALE).st_mtime_ns
+        except OSError:
+            self.read_at = None
+            return False
+        if at != self.read_at:
+            with open(SCALE, encoding="utf-8") as held:
+                self.named = [a for a in held.read().strip().split(",") if a]
+            self.read_at = at
+        return True
+
+    def next(self, among):
+        self.turn += 1
+        return among[self.turn % len(among)]
+
+    async def count_forever(self):
+        while not stopped():
+            await asyncio.sleep(1)
+            if self.answered or self.refused:
+                kept("/tmp/scale.log", f"SCALE {int(time.time() * 1000)} {self.answered} {self.refused}")
+                self.answered = self.refused = 0
+
+    async def work(self, write):
+        while not stopped():
+            if not self.told():
+                await asyncio.sleep(0.2)
+                continue
+            try:
+                await bounded(write())
+                self.answered += 1
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                self.refused += 1
+                with open("/tmp/scale-refused", "w", encoding="utf-8") as held:
+                    held.write(f"{int(time.time() * 1000)} {refusal_words(failed)}\n")
+                await asyncio.sleep(0.05)
+
+
+async def drive_scale_data(plugin, gen):
+    stub = plugin._operations()
+    scale = Scale()
+    started = time.time_ns() // 1_000_000
+    numbers = iter(range(1, 1 << 62))
+
+    def write():
+        dataset = f"{plugin.identity.instance_id}:{scale.next(SCALE_KEYS)}"
+        now = time.time_ns()
+        prices = []
+        for at in range(SCALE_BATCH):
+            # A row key of its own, with one valid time (the lake's rule 5).
+            key = f"scale-{gen}-{started}-{next(numbers)}"
+            prices.append(ops.Price(
+                meta=ops.ObservationMeta(
+                    row_key=key, subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+                    source=ops.Source(dataset=dataset), valid_from_ns=now + at,
+                    source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                                 at_ns=now + at)],
+                    raw=plugin.raw_record(f"scale/{key}")),
+                kind=ops.PriceKind.PRICE_KIND_LAST,
+                price=ops.Money(amount=decimal("101.25"), instrument_id=USD),
+                basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT))
+        return stub.RecordPrices(ops.RecordPricesParams(prices=prices))
+
+    await asyncio.gather(scale.count_forever(), *(scale.work(write) for _ in range(SCALE_WORKERS)))
+
+
+async def drive_scale_oms(plugin, gen):
+    stub = plugin._operations()
+    scale = Scale()
+    person = Person(plugin.identity.instance_id)
+    started = time.time_ns() // 1_000_000
+    numbers = iter(range(1, 1 << 62))
+
+    def write():
+        number = next(numbers)
+        return stub.RecordOrder(ops.RecordOrderParams(
+            account_id=scale.next(scale.named or ACCOUNTS), instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
+            quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
+            time_in_force=ops.TimeInForce.TIME_IN_FORCE_GOOD_TILL_CANCELLED,
+            venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
+            idempotency_key=f"scale-{gen}-{started}-{number}", acting_for=person.assertion()))
+
+    await asyncio.gather(scale.count_forever(), *(scale.work(write) for _ in range(SCALE_WORKERS)))
+
+
 def declaration():
+    if ROLE == "scale-data":
+        return Declaration(catalogue=[DatasetDeclaration(
+            key=key, vendor="e2e failover driver", data_types=["meridian.v1.Price"], modes=["push"],
+            terms_and_pricing="A test-only driver's own prices, written for the run and kept by it.",
+            day_time_zone="Etc/UTC") for key in SCALE_KEYS])
     if ROLE in ("data", "flood"):
         catalogue = [DatasetDeclaration(
             key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
@@ -1044,14 +1177,16 @@ def declaration():
 
 
 async def main():
-    if ROLE not in ("data", "oms", "desk", "flood", "standing") or not INSTRUMENT or (
-            ROLE in ("oms", "desk") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
+    if ROLE not in ("data", "oms", "desk", "flood", "standing", "scale-data", "scale-oms") or not INSTRUMENT or (
+            ROLE in ("oms", "desk", "scale-oms") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)) or (
+            ROLE == "scale-data" and not SCALE_KEYS):
         raise SystemExit("driver: DRIVER_ROLE is data, oms or desk, with DRIVER_INSTRUMENT (and, for oms and "
                          "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
     roles = {"data": [Recording(), Reporting()], "oms": [Managing()], "desk": [Desking(), Managing()],
-             "flood": [Recording(), Reporting()], "standing": [Reporting()]}[ROLE]
+             "flood": [Recording(), Reporting()], "standing": [Reporting()],
+             "scale-data": [Recording()], "scale-oms": [Managing()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
     while not stopped():
@@ -1062,7 +1197,9 @@ async def main():
                 await {"data": lambda: asyncio.gather(drive_data(plugin, gen), drive_page(plugin)),
                        "oms": lambda: drive_oms(plugin, gen),
                        "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin),
-                       "standing": lambda: drive_standing(roles[0])}[ROLE]()
+                       "standing": lambda: drive_standing(roles[0]),
+                       "scale-data": lambda: drive_scale_data(plugin, gen),
+                       "scale-oms": lambda: drive_scale_oms(plugin, gen)}[ROLE]()
             break
         except Exception as failed:  # noqa: BLE001 - every start failure is waited out
             say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")

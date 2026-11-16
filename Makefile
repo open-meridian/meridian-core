@@ -1159,6 +1159,7 @@ FAILURE ?=
 # profiles run: built here, as the backup run builds its own.
 E2E_POSTGRES_IMAGE ?= meridian-postgres:local
 e2e-cluster-scaled:
+	@rm -f .e2e-write-scale.json
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
 
 # A live install moved between the profiles (step 3b part 3; spec section
@@ -1180,10 +1181,10 @@ e2e-cluster-scaled:
 e2e-cluster-reconfigure:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=reconfigure FAILURE=
 
-# The write driver's runs (every profile but scaled) run it in the SDK's
-# interop image (e2e/failover/driver.py), loaded into the cluster beside the
-# runtime's.
-E2E_FAILOVER_DRIVEN = $(if $(filter scaled,$(PROFILE)),,yes)
+# The write driver runs in the SDK's interop image (e2e/failover/driver.py),
+# loaded into the cluster beside the runtime's: in every profile, the scaled
+# run's too from stage T (its write-scale step's load).
+E2E_FAILOVER_DRIVEN = yes
 e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image) $(if $(E2E_FAILOVER_DRIVEN),interop-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \

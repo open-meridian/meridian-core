@@ -868,6 +868,17 @@ def main():
 
     if UPGRADE_FROM:
         upgraded(s)
+        # The lake's rows partitioned by the upgrade's own migration (step
+        # 3d, stage T; the resilience spec's section 15, the online
+        # conversions): `lake_row` a partitioned table over what the release
+        # before kept. That every read answers each row once while its
+        # writer copies them behind, under write load, is the lake's own
+        # test against Postgres (lake_rows_are_partitioned_online_under_
+        # write_load_with_equal_answers): this install holds no rows to read.
+        kind = psql("select relkind from pg_class where relname = 'lake_row' "
+                    "and relnamespace = 'public'::regnamespace")
+        s.check(kind.strip() == "p",
+                f"after the upgrade the lake's rows are a partitioned table ({kind.strip() or 'not read'})")
         # And the deployment it upgraded is the same one: the administrator
         # the wizard named signs in to the new version.
         status, session = signed_in(*WAY_IN["administrator"])

@@ -64,8 +64,11 @@ CLUSTERS = [
     {"target": "e2e-cluster", "k3s": "v1.34.12-k3s1"},
     {"target": "e2e-cluster", "k3s": "v1.35.9-k3s1"},
     {"target": "e2e-cluster", "k3s": "v1.37.1-k3s1"},
-    {"target": "e2e-cluster-scaled", "agents": 3},
-    {"target": "e2e-cluster-reconfigure", "agents": 3},
+    # Each longer from stage T: write-scale's three shapes in the scaled run;
+    # the group counts, a database added and the restore across two in
+    # reconfigure.
+    {"target": "e2e-cluster-scaled", "agents": 3, "timeout": 75},
+    {"target": "e2e-cluster-reconfigure", "agents": 3, "timeout": 90},
     {"target": "e2e-cluster-failover", "profile": "tolerant"},
     {"target": "e2e-cluster-failover", "profile": "ha", "agents": 3, "timeout": 70},
 ]

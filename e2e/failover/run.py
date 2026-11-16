@@ -219,6 +219,34 @@ SHARD_STUB = (
 )
 # A standby holds a lapsed shard within this (ruling 1056, question 12).
 SHARD_TAKEOVER = 10
+# The write-scale step's load (step 3d, stage T; section 15), in the scaled
+# run alone: two more test-only instances of driver.py, named as the
+# driver's own are (e2e/failover/driver.sql puts the accounts in drive-oms's
+# write scope), idle until the step tells them to write. Each has its own
+# share at its sidecar raised past what it can offer, as a launch may set
+# it: what is measured is the stores' writers, never a plugin's share.
+SCALE_DRIVERS = {"drive-data": "scale-data", "drive-oms": "scale-oms"}
+SCALE_ROLES = {"scale-data": ["data"], "scale-oms": ["oms"]}
+SCALE_LIMITS = {"inFlight": 64, "requestsPerSecond": 100000, "writeMiBPerSecond": 256}
+SCALE_FILE = "/tmp/scale"
+# The lake's datasets written, `drive-data:<key>`: four that are each writer
+# group's own of two, by rendezvous (chosen in scale_keys).
+SCALE_DATASETS = 8
+# The book's partitions in the scaled run, so its accounts fall to both
+# writer groups: of eight, five are group 1's of two and three group 0's,
+# by rendezvous, so the step writes as many accounts of each (scale_accounts).
+SCALE_PARTITIONS = 8
+# Two writer groups on two databases against one on one: at least this
+# ("about twice", ruled 2026-11-10).
+SCALE_AT_LEAST = 1.8
+SCALE_WARM_S = 15
+SCALE_MEASURED_S = 45
+# Every figure of the step, kept beside the run and never printed: core is
+# public, and so are its CI logs (PO 2026-11-13). Not a log, so no job
+# keeps it as an artifact either: a private run reads it for the claims
+# ledger.
+SCALE_FIGURES = os.environ.get("E2E_WRITE_SCALE_FIGURES", ".e2e-write-scale.json")
+
 # The classes that read RPO through the stores themselves, and say it in
 # their claims; after every other, the driver's rows are held all the same.
 RPO_IN_CLASS = {"db-primary", "torn-write", "zone"}
@@ -517,13 +545,29 @@ def install(s):
         public = driver_signer()
         values += driver_values()
     if PROFILE == "scaled":
+        # One list: a values file's sidecars[] replaces another's whole.
+        sidecars = [{
+            "instanceId": SHARDED, "roles": ["data"], "shards": SHARDS, "standby": True,
+            "plugin": {"image": IMAGE, "pullPolicy": "IfNotPresent", "args": ["bash", "-c", SHARD_STUB]},
+        }]
+        # The write-scale step's load (stage T), idle until it is told.
+        public = driver_signer()
+        for instance, role in SCALE_DRIVERS.items():
+            sidecars.append({"instanceId": instance, "roles": SCALE_ROLES[role], "limits": SCALE_LIMITS, "plugin": {
+                "image": INTEROP_IMAGE, "pullPolicy": "IfNotPresent",
+                "args": ["python", "-c",
+                         "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
+                "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
+                        "DRIVER_ACCOUNTS": ",".join(DRIVER_ACCOUNTS), "DRIVER_SCALE_KEYS": ",".join(scale_keys())},
+            }})
+            if role == "scale-oms":
+                sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
         sharded = os.path.join(tempfile.mkdtemp(prefix="failover-shards-"), "shards.json")
         with open(sharded, "w", encoding="utf-8") as kept:
-            json.dump({"sidecars": [{
-                "instanceId": SHARDED, "roles": ["data"], "shards": SHARDS, "standby": True,
-                "plugin": {"image": IMAGE, "pullPolicy": "IfNotPresent", "args": ["bash", "-c", SHARD_STUB]},
-            }]}, kept)
-        values += ["-f", sharded]
+            json.dump({"sidecars": sidecars}, kept)
+        values += ["-f", sharded, "--set", f"bor.partitions={SCALE_PARTITIONS}"]
+        for at in range(1, len(sidecars)):
+            values += ["--set-file", f"sidecars[{at}].plugin.env.MERIDIAN_DRIVER={DRIVER_SCRIPT}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
     if PROFILE == "ha":
@@ -1169,7 +1213,11 @@ def driver_values():
             "args": ["python", "-c",
                      "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
             "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
-                    "DRIVER_ACCOUNTS": DESK_ACCOUNT if role == "desk" else ",".join(DRIVER_ACCOUNTS)},
+                    "DRIVER_ACCOUNTS": DESK_ACCOUNT if role == "desk" else ",".join(DRIVER_ACCOUNTS),
+                    # Appends to the run's end: reconfigure is longer from
+                    # stage T (the group counts, a database added), and at
+                    # 400 a key the oms instance was full in 48 minutes.
+                    "DRIVER_PER_KEY": "800" if PROFILE == "reconfigure" else "400"},
         }})
         if role in ("oms", "desk"):
             sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
@@ -1247,6 +1295,9 @@ def driver_fixtures(s):
                                                             for p in pods("instrument")}),
                         300, every=2)
     s.check(restarted, "the instrument store started again over the records written behind it")
+    if not DRIVEN:
+        # The scaled run's instances write only when write-scale tells them.
+        return
     writing = happens(lambda: all(driver_acked().get(kind) for kind in ("price", "order")), 300, every=3)
     s.check(writing, "the write driver writing through the stores: prices to the lake, orders to the book "
             f"({', '.join(f'{k} {len(v)}' for k, v in sorted(driver_acked().items())) or 'nothing acknowledged'})")
@@ -2781,6 +2832,10 @@ def reconfigure(s):
             kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
             s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
             properties(s, f"reconfigure to {target}")
+            if target == "tolerant" and DRIVEN:
+                # Stage T: the writer-group count raised and lowered, here,
+                # where one member of each group serves and never surges.
+                group_counts(s)
             stopped = False
         finally:
             # What every pod and the namespace said at the move a check
@@ -2790,6 +2845,291 @@ def reconfigure(s):
             # gone by then).
             if stopped or len(s.failures) > failed_before:
                 cluster_said(f"reconfigure to {target}")
+    if DRIVEN and SHAPE == "ha":
+        failed_before = len(s.failures)
+        try:
+            two_groups_two_databases(s)
+        finally:
+            if len(s.failures) > failed_before:
+                cluster_said("reconfigure's two groups on two databases")
+
+
+# ── Stage T (step 3d; the resilience spec's section 15) ───────────────────
+#
+# Rollouts keep every public topic served, and the online conversions of
+# the writer-group count. Every group's writer serves its store's public
+# topics and hands a write on to its owner, so with two groups an upgrade
+# that restarts both leaves a topic unserved only where both are down in
+# the same seconds (PR CI 43636763392: about 2 s, tolerant). A writer of a
+# group past the first, told to stop, serves on until another group's
+# writer serves anew (approved 2026-11-15), and a member says it is ready
+# only once the broker holds its subscriptions. Measured here on every
+# upgrade of this part: the driver's writes refused "nothing serves".
+
+UNSERVED = "nothing serves"
+# What each store's driver writes, and the store's component.
+SERVED_BY = (("price", "lake"), ("order", "bor"))
+# A value that changes nothing a member reads or writes, and restarts every
+# member of both stores: how often its writer re-reads its record.
+SCRUB_DAYS = 8
+
+
+def not_answered(began_ms, ended_ms):
+    """The driver's writes refused or answered by nothing, whatever the
+    cause, from `began_ms` to `ended_ms`: each its time, its kind and its
+    words. A write handed to a writer group whose writer is down is never
+    told "nothing serves": every group's queue is subscribed to the internal
+    topic, so the broker finds a responder, the absent group's member is
+    not there to answer, and the caller is refused at its deadline (stage
+    T's review, finding 7)."""
+    found = []
+    for p in driver_lines("/tmp/refused"):
+        if len(p) >= 5 and p[3].isdigit() and began_ms <= int(p[3]) <= ended_ms:
+            found.append((int(p[3]), p[1], " ".join(p[4:])))
+    return sorted(found)
+
+
+# Two writes not answered this far apart or nearer are one stretch: the
+# driver writes each key about once a second, and a call is bounded by its
+# own deadline.
+STRETCH_APART_MS = 5_000
+
+
+def longest_stretch(times_ms, apart_ms=STRETCH_APART_MS):
+    """The longest stretch of `times_ms`, in seconds, and how many there
+    are: a stretch is a run of times each within `apart_ms` of the one
+    before. One stray refusal is a stretch of no length."""
+    longest, stretches, began, last = 0, 0, None, None
+    for at in sorted(times_ms):
+        if last is None or at - last > apart_ms:
+            stretches += 1
+            began = at
+        last = at
+        longest = max(longest, at - began)
+    return longest / 1000, stretches
+
+
+def rollout_served(s, what, began_ms, groups, held):
+    """An upgrade's rollout, as the driver saw its stores written: measured
+    per store -- the longest stretch of its writes not answered, refused or
+    timed out, whatever the cause, and how many were refused "nothing
+    serves" -- and claimed against the shape's own bound for a member lost
+    (1048, 1056; none is new). A writer group whose one member restarts is
+    not written meanwhile, and its writes are handed on and time out, never
+    told "nothing serves": counted here too (stage T's review, finding 7).
+    With `held`, an upgrade made at two writer groups with one member each:
+    none refused "nothing serves" at all, the public topic served by one
+    group's writer throughout."""
+    every = not_answered(began_ms, int(time.time() * 1000))
+    found = [refused for refused in every if UNSERVED in refused[2]]
+    for kind, component in SERVED_BY:
+        mine = [at for at, said, _ in every if said == kind]
+        span, stretches = longest_stretch(mine)
+        claim(s, f"rollout-{what}", component, span, TOLERANT_POD if SHAPE == "tolerant" else HA[component],
+              {"not_answered": len(mine), "stretches": stretches,
+               "unserved_refusals": len([at for at, said, _ in found if said == kind]),
+               "writer_groups": groups, "shape": SHAPE})
+    if held:
+        for at, kind, words in found[:10]:
+            print(f"      unserved: {kind} at {at}: {words}", flush=True)
+        s.check(not found, f"{what}: no write refused \"{UNSERVED}\" through the rollout: with two writer groups "
+                f"a public topic is always served by one ({len(found)} refused, {len(every)} not answered in all)")
+
+
+def store_databases(store):
+    """Each of a store's databases, as (d, its primary's pod): the first,
+    and each the chart brings past it."""
+    component = {"book": "bor"}.get(store, store)
+    return [(0, primary())] + [(d, database_pod(component, d)) for c, d, _, _ in extra_databases() if c == component]
+
+
+def no_lease_lapsed(s, what, since_ns, groups=1):
+    """A planned rollout hands each lease over: every takeover a store
+    recorded since `since_ns` was of a lease released, or of one nobody
+    held (a new group's first), never of one left to lapse (fixed 66a5cf8b:
+    a lapse is a write gap of up to the lease's duration an upgrade).
+
+    Read in every database of the store (stage T's review, finding 4): a
+    writer group records its takeover in its own database, so with two
+    databases group 1's are in database 1, and the first database says
+    nothing of them. And read to have found something: with `groups`
+    writer groups rolled, at least that many takeovers are there since, one
+    for each group's writer replaced, over the store's databases together."""
+    for store in ("book", "lake"):
+        lapsed, took = [], 0
+        for d, pod in store_databases(store):
+            said = psql(f"select coalesce(string_agg(epoch || ' ' || member || ': ' || why, '; ' order by epoch), '') "
+                        f"from {store}_writer_took_over where at_ns >= {since_ns} and why like '%lapsed%'", pod=pod)
+            if said:
+                lapsed.append(f"database {d}: {said}")
+            took += int(psql(f"select count(*) from {store}_writer_took_over where at_ns >= {since_ns}",
+                             pod=pod) or 0)
+        s.check(not lapsed, f"{what}: the {store}'s writers' leases were released, none left to lapse "
+                f"({took} takeover(s) since, over {len(store_databases(store))} database(s)"
+                f"{': ' + '; '.join(lapsed) if lapsed else ''})")
+        s.check(took >= groups, f"{what}: the {store}'s takeovers since were read: {took} recorded over its "
+                f"database(s), at least one for each of its {groups} writer group(s) rolled")
+
+
+# A partition's head a move between databases let go, in the database it
+# left: its epoch (`meridian_changes::moves::POINTER_EPOCH`).
+POINTER_EPOCH = -1
+# Each store's heads: its table, how a row names its partition, and its head.
+HEADS = {"bor": ("book_partition_head", "partition", "sequence", "partition <> 'control'"),
+         "lake": ("lake_partition", "dataset", "head", "closed_at is null")}
+
+
+def away_from_home(component, group=1):
+    """How many of writer group `group`'s partitions the store's first
+    database still holds written and not let go: each is still to be moved
+    home to the group's own database, or is being moved now. None, and
+    every move of the count's change is done: the first database's head of
+    each is a move's pointer."""
+    table, _, head, live = HEADS[component]
+    return int(psql(f"select count(*) from {table} where writer_group = {group} and {head} > 0 "
+                    f"and epoch <> {POINTER_EPOCH} and {live}") or 0)
+
+
+def moved_home(component, group=1):
+    """Whether every partition of writer group `group` is home in its own
+    database, none still in the first or on its way: database 1 holds some
+    of the store, and the first holds none of the group's that it has not
+    let go (stage T's review, findings 2 and 8: one partition home said
+    nothing of the rest, whose moves ran on)."""
+    table, _, head, live = HEADS[component]
+    there = int(psql(f"select count(*) from {table} where {head} > 0 and epoch <> {POINTER_EPOCH} and {live}",
+                     pod=database_pod(component, 1)) or 0)
+    return there > 0 and away_from_home(component, group) == 0
+
+
+def group_members_ready(groups):
+    """Each store's writer groups' members there and ready, and no member
+    of a group past `groups` left."""
+    want = 2 if SHAPE in ("ha", "scaled") else 1
+    for component in ("lake", "bor"):
+        for group in range(1, 3):
+            live = pods(f"{component}-group-{group}")
+            if group < groups and not (len(live) == want and all(ready(p) for p in live)):
+                return False
+            if group >= groups and (live or kubectl("get", "deployment", f"{FULL}-{component}-group-{group}",
+                                                    check=False).returncode == 0):
+                return False
+    return True
+
+
+def groups_upgraded(s, what, groups, held, *sets):
+    """One upgrade of this part under the driver's load, as `meridian
+    upgrade-deployment --set` makes it: applied, its migration succeeded,
+    every workload rolled out as the CLI waits for it, each group's members
+    ready, the driver acknowledged by both stores again with nothing
+    acknowledged lost, each change log as it was and added to, the record's
+    properties held; and its rollout measured (rollout_served). Says
+    whether it settled."""
+    print(f"T: {what}", flush=True)
+    before = record_now()
+    began = time.time()
+    upgraded = upgrade(*sets)
+    s.check(upgraded.returncode == 0, f"{what}: the upgrade applied"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        return False
+    migrated(s, what)
+    settled = happens(lambda: not rollout_unfinished() and settled_everywhere() and group_members_ready(groups),
+                      900, every=5)
+    s.check(settled, f"{what}: every workload rolled out and ready, {time.time() - began:.0f}s after the upgrade"
+            + ("" if settled else f" ({'; '.join(rollout_unfinished()[:4])})"))
+    if not settled:
+        return False
+    s.check(acks_again(int(time.time() * 1000), seconds=300),
+            f"{what}: the write driver acknowledged by the book and the lake again")
+    driver_rpo_held(s, what, store_rpo(int(began * 1000)))
+    after = record_now()
+    kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
+    s.check(kept, f"{what}: each store's change log as it was before, added to and nothing else")
+    properties(s, what)
+    rollout_served(s, what.split(":")[0].replace(" ", "-"), int(began * 1000), groups, held)
+    return True
+
+
+def group_counts(s):
+    """The writer-group count raised and lowered online (section 15, the
+    online conversions), in tolerant, under the driver's load: to two
+    groups; an upgrade at two groups that restarts every member of both
+    stores, through which neither store's public topics go unserved; and
+    back to one, the second group's partitions written by the first
+    again."""
+    if not groups_upgraded(s, "groups raised: lake.writerGroups and bor.writerGroups set to 2", 2, False,
+                           "lake.writerGroups=2", "bor.writerGroups=2"):
+        return
+    # Both groups' writers restarted by one upgrade, the count as it was:
+    # what CI 43636763392 saw unserved for 2 s.
+    groups_upgraded(s, "two groups rolled: every member of both stores restarted at two writer groups", 2, True,
+                    f"lake.scrub.intervalDays={SCRUB_DAYS}", f"bor.scrub.intervalDays={SCRUB_DAYS}")
+    # Lowered: the second group's members stop for good, its writer serving
+    # on until the first group's serves at the new count.
+    since_ns = time.time_ns()
+    if not groups_upgraded(s, "groups lowered: lake.writerGroups and bor.writerGroups set back to 1", 1, True,
+                           "lake.writerGroups=1", "bor.writerGroups=1"):
+        return
+    # What group 1 wrote is the one group's again: the driver's dataset and
+    # its accounts' partition named no group past the first, and written
+    # since the lowered count settled.
+    settled_ns = time.time_ns()
+
+    def one_group_writes():
+        said = psql(
+            "select (select coalesce(max(writer_group), 0) from lake_partition "
+            "where dataset = 'drive-data:drive' and closed_at is null), "
+            "(select coalesce(max(writer_group), 0) from book_partition_head where partition <> 'control'), "
+            "(select count(*) from lake_row where dataset = 'drive-data:drive' "
+            f"and recorded_at_ns >= {settled_ns}), "
+            "(select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
+            f"and committed_at_ns >= {settled_ns})")
+        return [int(n) for n in said.split("|")] if said else [-1, -1, 0, 0]
+
+    happens(lambda: one_group_writes()[:2] == [0, 0] and all(n > 0 for n in one_group_writes()[2:]), 300, every=5)
+    lake_group, book_group, prices, entries = one_group_writes()
+    s.check(lake_group == 0 and book_group == 0,
+            f"groups lowered: the driver's dataset and the book's partitions are the one group's again "
+            f"(the highest group named: lake {lake_group}, book {book_group})")
+    s.check(prices > 0 and entries > 0, "groups lowered: the driver's prices and orders committed by the one group "
+            f"left ({prices} rows, {entries} entries since)")
+
+
+def two_groups_two_databases(s):
+    """In ha, last before the restore: two writer groups, then a database
+    added to each store (section 15, the online conversions), under the
+    driver's load; each rollout measured, and every lease handed over
+    released. The restore to a time is then across each store's two
+    databases."""
+    since_ns = time.time_ns()
+    if not groups_upgraded(s, "ha groups raised: two writer groups in ha", 2, False,
+                           "lake.writerGroups=2", "bor.writerGroups=2"):
+        return
+    no_lease_lapsed(s, "ha groups raised", since_ns)
+    since_ns = time.time_ns()
+    if not groups_upgraded(s, "ha databases added: a database added to each store in ha", 2, False,
+                           "lake.databases=2", "bor.databases=2"):
+        return
+    for component in ("lake", "bor"):
+        rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
+                     f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
+        s.check(rolled.returncode == 0, f"ha databases added: {component}'s database 1 brought and ready")
+    # Read once each store's second database is there: group 1's takeovers
+    # are recorded in it (finding 4).
+    no_lease_lapsed(s, "ha databases added", since_ns, groups=2)
+    # Every one of group 1's partitions moved home to its database by the
+    # count's change, once every member seen runs the new count: none still
+    # in the first database or on its way, so the restore's time cuts no
+    # move in two (finding 8).
+    in_one = happens(lambda: moved_home("bor"), 600, every=5)
+    s.check(in_one, "ha databases added: every one of group 1's book partitions moved to database 1 by the "
+            f"count's change ({away_from_home('bor')} still in the first)")
+    lake_in_one = happens(lambda: moved_home("lake"), 600, every=5)
+    s.check(lake_in_one, "ha databases added: every one of group 1's lake datasets moved to database 1 by the "
+            f"count's change ({away_from_home('lake')} still in the first)")
+    s.check(acks_again(int(time.time() * 1000), seconds=300),
+            "ha databases added: the write driver acknowledged again once the partitions were home")
 
 
 # ── reconfigure's archive and its last act: a restore to a time in ha ─────
@@ -2813,30 +3153,48 @@ POINT = "e2e_point_in_time"
 RESTORE_START_SECONDS = "300"
 
 
+def extra_databases():
+    """Each database the chart brings past the first for a store's writer
+    groups (step 3d; section 6.4), as (store, d, its StatefulSet's name,
+    its archive's stanza), in order."""
+    found = []
+    for component in ("bor", "lake"):
+        for d in range(1, 3):
+            name = f"{FULL}-{component}-database-{d}"
+            if kubectl("get", "statefulset", name, check=False).returncode == 0:
+                found.append((component, d, name, f"{component}-database-{d}"))
+    return found
+
+
 def stopped_everything():
-    """Every component and the database stopped, as `meridian restore
+    """Every component and every database stopped, as `meridian restore
     --to-time` stops them: their counts, to start them again."""
     running = {d["metadata"]["name"]: d["spec"].get("replicas", 1) for d in json.loads(out(
         "get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]}
     for name in running:
         kubectl("scale", "deployment", name, "--replicas=0")
+    databases = {"database"} | {f"{component}-database-{d}" for component, d, _, _ in extra_databases()}
     kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
+    for _, _, name, _ in extra_databases():
+        kubectl("scale", "statefulset", name, "--replicas=0")
     # Their pods gone: each Deployment's (a ReplicaSet's, by its template
-    # hash) and the database's members.
-    wait_for("every component and the database to stop", lambda: not [
+    # hash) and each database's members.
+    wait_for("every component and every database to stop", lambda: not [
         p for p in json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
         if "pod-template-hash" in p["metadata"].get("labels", {})
-        or p["metadata"].get("labels", {}).get("meridian.dev/component") == "database"], seconds=300)
+        or p["metadata"].get("labels", {}).get("meridian.dev/component") in databases], seconds=300)
     return running
 
 
-def offline_act(act, **env):
-    """A Job from the database's offline CronJob with the act named, as the
+def offline_act(act, database=None, **env):
+    """A Job from a database's offline CronJob with the act named, as the
     CLI makes it (meridian-cli, offline.rs), run to its end: whether it
-    succeeded, and what it said."""
-    cron = json.loads(out("get", "cronjob", f"{FULL}-database-offline", "-o", "json"))
+    succeeded, and what it said. `database` names the StatefulSet of one
+    past the first; the first's by default."""
+    database = database or f"{FULL}-database"
+    cron = json.loads(out("get", "cronjob", f"{database}-offline", "-o", "json"))
     template = cron["spec"]["jobTemplate"]
-    name = f"{FULL}-database-{act}"[:63]
+    name = f"{database}-{act}"[:63].rstrip("-")
     job = {"apiVersion": "batch/v1", "kind": "Job",
            "metadata": {"name": name, "namespace": NAMESPACE, "labels": template["metadata"].get("labels", {})},
            "spec": template["spec"]}
@@ -2937,21 +3295,43 @@ def restored_to_a_time(s):
           flush=True)
     s.check(SHAPE == "ha" and under_patroni(), f"restore: the database under Patroni in ha ({SHAPE})")
     members = database_members()
-    psql(f"create database {POINT}", database="postgres")
-    psql("create table point (n int primary key, said text not null)", database=POINT)
-    for n in (1, 2, 3):
-        psql(f"insert into point values ({n}, 'before')", database=POINT)
+    # Each store's database past the first (stage T; section 15: a restore
+    # across two databases to a time), restored to the same time: its own
+    # stanza of the archive, its own offline Job, its own rows either side.
+    extras = extra_databases()
+    extra_members = {name: int(out("get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+                     for _, _, name, _ in extras}
+    for component, d, name, stanza in extras:
+        member = database_pod(component, d)
+        wait_for(f"{name}'s stanza of the archive", lambda m=member: "the stanza holds this database" in kubectl(
+            "logs", m, "-c", "archive", "--tail=-1", check=False).stdout.decode(errors="replace"), seconds=180)
+        done = kubectl("exec", member, "-c", "archive", "--", "su-exec", "postgres",
+                       "pgbackrest", f"--stanza={stanza}", "backup", "--type=full", check=False)
+        s.check(done.returncode == 0, f"restore: a full base backup of {name} taken into its stanza, {stanza}"
+                + ("" if done.returncode == 0 else f": {done.stdout.decode(errors='replace')[-300:]}"))
+        if done.returncode != 0:
+            return
+    points = [None] + [database_pod(component, d) for component, d, _, _ in extras]
+    for pod in points:
+        psql(f"create database {POINT}", database="postgres", pod=pod)
+        psql("create table point (n int primary key, said text not null)", database=POINT, pod=pod)
+        for n in (1, 2, 3):
+            psql(f"insert into point values ({n}, 'before')", database=POINT, pod=pod)
+    # What the book held committed before the time, in each of its
+    # databases: read again after the restore.
     time.sleep(1.5)
     to = psql("select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'",
               database="postgres")
     time.sleep(1.5)
-    for n in (4, 5, 6):
-        psql(f"insert into point values ({n}, 'after')", database=POINT)
+    for pod in points:
+        for n in (4, 5, 6):
+            psql(f"insert into point values ({n}, 'after')", database=POINT, pod=pod)
     past = psql("select to_char((clock_timestamp() + interval '1 day') at time zone 'UTC', "
                 "'YYYY-MM-DD HH24:MI:SS.US') || '+00'", database="postgres")
-    wal = psql("select pg_walfile_name(pg_switch_wal())", database="postgres")
-    wait_for("the last segment to be archived", lambda: psql(
-        "select last_archived_wal from pg_stat_archiver", database="postgres") >= wal, seconds=180)
+    for pod in points:
+        wal = psql("select pg_walfile_name(pg_switch_wal())", database="postgres", pod=pod)
+        wait_for("the last segment to be archived", lambda w=wal, p=pod: psql(
+            "select last_archived_wal from pg_stat_archiver", database="postgres", pod=p) >= w, seconds=180)
     running = stopped_everything()
     # Past the archive's end: the act refuses it in its own words, naming
     # the archive's first and last times, before the volume is touched
@@ -2967,6 +3347,12 @@ def restored_to_a_time(s):
             "Patroni's configuration names")
     if not ok:
         return
+    for _, _, name, _ in extras:
+        ok, log = offline_act("restore-to-time", database=name, MERIDIAN_RESTORE_TO_TIME=to,
+                              MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
+        s.check(ok and "promoted at" in log, f"restore: {name} restored to the same time, {to}, from its own stanza")
+        if not ok:
+            return
     # The standbys' volumes, which Patroni makes again from member 0, and
     # Patroni's record of the old primary, which member 0's restored
     # position is behind (meridian-cli, offline.rs standbys_to_remake).
@@ -2975,17 +3361,149 @@ def restored_to_a_time(s):
     kubectl("delete", "configmap", "--ignore-not-found",
             *[f"{scope}-{kind}" for kind in ("leader", "sync", "failover")])
     kubectl("scale", "statefulset", f"{FULL}-database", f"--replicas={members}")
+    for _, _, name, _ in extras:
+        kubectl("delete", "pvc", "--ignore-not-found", *[f"data-{name}-{n}" for n in range(1, extra_members[name])])
+        kubectl("delete", "configmap", "--ignore-not-found",
+                *[f"{name[:63].rstrip('-')}-{kind}" for kind in ("leader", "sync", "failover")])
+        kubectl("scale", "statefulset", name, f"--replicas={extra_members[name]}")
     wait_for("the restored database's primary", lambda: psql(
         "select not pg_is_in_recovery()", database="postgres") == "t", seconds=300)
+    for component, d, name, _ in extras:
+        wait_for(f"{name}'s restored primary", lambda c=component, n=d: kubectl(
+            "exec", database_pod(c, n), "-c", "postgres", "--", "psql", "-X", "-q", "-At", "-U", "postgres",
+            "-d", "postgres", "-c", "select not pg_is_in_recovery()", check=False).stdout.decode().strip() == "t",
+            seconds=300)
     for name, replicas in running.items():
         kubectl("scale", "deployment", name, f"--replicas={replicas}")
     s.check(happens(settled_everywhere, 900, every=5),
             f"restore: every component ready again, and the database's {members} members")
     rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT)
     s.check(rows == "1:before,2:before,3:before", f"restore: the rows as they stood at the time ({rows})")
+    for component, d, name, _ in extras:
+        rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT,
+                    pod=database_pod(component, d))
+        s.check(rows == "1:before,2:before,3:before",
+                f"restore: {name}'s rows as they stood at the same time ({rows})")
+    if extras:
+        restored_across(s, to)
     timeline = psql("select timeline_id from pg_control_checkpoint()", database="postgres")
     s.check(timeline not in ("", "1"), f"restore: on a timeline of its own ({timeline})")
     internal_tls(s)
+
+
+# Each store's change log: its table, how a row names its partition, its
+# first and last sequence, and what says which change a row is.
+ACROSS = (("bor", "book_entry", "partition", "first_sequence", "last_sequence", "entry_id"),
+          ("lake", "lake_row", "dataset", "sequence", "sequence", "row_key || ':' || version"))
+
+
+def stretches_held(component, d):
+    """Each partition's change log as `component`'s database `d` holds it:
+    its unbroken stretches of sequences, as {partition: [(first, last)]}.
+    The same change held twice is one; two changes over one sequence are
+    two stretches that overlap."""
+    _, table, partition, first, last, _ = next(row for row in ACROSS if row[0] == component)
+    said = psql(
+        f"with d as (select distinct {partition} as p, {first} as f, {last} as l from {table}), "
+        f"g as (select p, f, l, f - coalesce(sum(l - f + 1) over (partition by p order by f, l "
+        f"rows between unbounded preceding and 1 preceding), 0) as island from d) "
+        f"select p || '|' || min(f) || '|' || max(l) from g group by p, island order by 1",
+        pod=database_pod(component, d))
+    held = {}
+    for line in said.splitlines():
+        name, first_at, last_at = line.rsplit("|", 2)
+        held.setdefault(name, []).append((int(first_at), int(last_at)))
+    return {name: sorted(stretches) for name, stretches in held.items()}
+
+
+def let_go_at(component, d):
+    """Each partition `component`'s database `d` let go to another, and the
+    sequence it let it go at: its head there a move's pointer."""
+    table, partition, head, _ = HEADS[component]
+    said = psql(f"select {partition} || '|' || {head} from {table} where epoch = {POINTER_EPOCH}",
+                pod=database_pod(component, d))
+    return {line.rsplit("|", 1)[0]: int(line.rsplit("|", 1)[1]) for line in said.splitlines()}
+
+
+def whole_across(held, let_go):
+    """What is wrong with one partition's change log over a store's
+    databases together. `held` is each database's unbroken stretches of it
+    ({d: [(first, last)]}), `let_go` each database's sequence it let it go
+    at ({d: sequence}). Whole: every database's stretches laid together
+    leave no sequence out between the first and the last, and reach every
+    sequence a database let it go at -- where one says it moved at N, another
+    holds it to N. Says what is wrong, and each stretch two databases both
+    hold, for their changes to be compared."""
+    wrong, shared = [], []
+    every = sorted((first, last, d) for d, stretches in held.items() for first, last in stretches)
+    for d, stretches in held.items():
+        for (_, last), (first, _) in zip(stretches, stretches[1:]):
+            wrong.append(f"database {d} holds a sequence twice ({first} at or before {last})" if first <= last
+                         else f"database {d} is missing {last + 1} to {first - 1}")
+    reached = None
+    for first, last, d in every:
+        if reached is not None and first > reached + 1:
+            wrong.append(f"no database holds {reached + 1} to {first - 1}")
+        reached = last if reached is None else max(reached, last)
+    for d, at in let_go.items():
+        if at > 0 and (reached is None or reached < at):
+            wrong.append(f"database {d} let it go at {at} and no database holds it past {reached or 0}")
+    for i, (first, last, d) in enumerate(every):
+        for other_first, other_last, other in every[i + 1:]:
+            if other != d and other_first <= last:
+                shared.append((d, other, max(first, other_first), min(last, other_last)))
+    return wrong, shared
+
+
+def restored_across(s, to):
+    """After a restore across each store's two databases to a time (section
+    15; section 6.4). Each database was taken to that time by its own
+    archive, so a booking whose legs are in two partitions may have kept
+    one and lost the other: the book's sweep completes or reverses each,
+    each as its own record. That is the crate's own proof (booking_tests,
+    a_restore_across_databases_completes_what_survives_and_reverses_what_
+    lost_its_parent): this run's driver records orders, which cross no
+    partition, and is stopped by now.
+
+    Held here, over the two databases together (stage T's review, finding
+    8: each database whole on its own says nothing of a partition one let
+    go and the other never opened, or of one sequence holding two changes):
+    each partition's change log is whole across the pair -- no sequence
+    left out between its first and its last, and held at least to where a
+    database let it go -- and where both hold a stretch of it, they hold
+    the same changes. Then both stores answering again over both."""
+    for component, table, partition, first, last, change in ACROSS:
+        held = {d: stretches_held(component, d) for d in (0, 1)}
+        let_go = {d: let_go_at(component, d) for d in (0, 1)}
+        broken, compared = [], 0
+        for name in sorted(set(held[0]) | set(held[1]) | set(let_go[0]) | set(let_go[1])):
+            wrong, shared = whole_across({d: held[d].get(name, []) for d in (0, 1)},
+                                         {d: let_go[d][name] for d in (0, 1) if name in let_go[d]})
+            broken += [f"{name}: {said}" for said in wrong]
+            quoted = name.replace("'", "''")
+            for d, other, low, high in shared:
+                compared += 1
+                digests = [psql(f"select count(*) || ' ' || md5(coalesce(string_agg(c, ',' order by f, c), '')) "
+                                f"from (select distinct {first} as f, {last} as l, {change} as c "
+                                f"from {table} where {partition} = '{quoted}' and {first} between {low} and {high}) "
+                                f"as both_hold", pod=database_pod(component, which)) for which in (d, other)]
+                if digests[0] != digests[1]:
+                    broken.append(f"{name}: sequences {low} to {high} hold other changes in database {d} "
+                                  f"({digests[0].split()[0]}) than in database {other} ({digests[1].split()[0]})")
+        for said in broken[:10]:
+            print(f"      across databases: {component}: {said}", flush=True)
+        s.check(not broken, f"restore across databases: each of {component}'s partitions' change logs whole over "
+                f"its two databases together at {to} ({len(broken)} broken; {len(held[0])} and {len(held[1])} "
+                f"partition(s) held, {sum(len(x) for x in let_go.values())} let go, {compared} stretch(es) "
+                "held by both and compared)")
+        s.check(bool(held[1]), f"restore across databases: {component}'s second database holds some of it, "
+                "so the pair was read")
+    # Each store serving again over both databases, written by both groups.
+    since_ns = time.time_ns()
+    answering_again = happens(lambda: all(answering(c) is not None for c in ("bor", "lake")), 300, every=3)
+    s.check(answering_again, "restore across databases: the book and the lake answer again over both databases")
+    took = psql(f"select count(*) from book_writer_took_over where at_ns >= {since_ns - 600_000_000_000}")
+    s.note(f"restore across databases: the book's takeovers recorded around the restore: {took}")
 
 
 # ── The record's properties, held after every class (ruling 1105) ─────────
@@ -4571,6 +5089,242 @@ def verdict(s):
     return 0
 
 
+# ── write-scale (step 3d, stage T; the resilience spec's section 15) ──────
+#
+# A step of e2e-cluster-scaled: the lake and the book each written at
+# saturation, group commit on, in three shapes -- one writer group on one
+# database (as installed), two groups on one database, two groups on two --
+# and what each commits a second read from the stores' own rows. It holds
+# two groups on two databases to at least SCALE_AT_LEAST times one on one,
+# each change log whole and in order after each shape. It prints whether
+# that held and the threshold, never a figure: those are kept in
+# SCALE_FIGURES for a private run to read into the claims ledger.
+
+def scale_keys():
+    """The lake's datasets' keys for the step: the first SCALE_DATASETS / 2
+    of `scale<n>` that are each writer group's own of two, by the same
+    rendezvous the lake places a dataset by."""
+    mine = {0: [], 1: []}
+    n = 0
+    while any(len(keys) < SCALE_DATASETS // 2 for keys in mine.values()):
+        key = f"scale{n}"
+        group = rendezvous(f"drive-data:{key}")
+        if len(mine[group]) < SCALE_DATASETS // 2:
+            mine[group].append(key)
+        n += 1
+    return sorted(mine[0] + mine[1])
+
+
+def scale_databases(component):
+    """The pods to read a store's rows in: its first database's primary and
+    each one's the chart brings past it."""
+    return [primary()] + [database_pod(component, d) for c, d, _, _ in extra_databases() if c == component]
+
+
+def scale_committed(component, since_ns, until_ns):
+    """What the step's load committed to a store between two times, by the
+    store's own clock on each row: in each of its databases, by partition.
+
+    A move between databases copies a partition's rows as they are, their
+    times kept, and leaves the source's in place: summed over databases, a
+    partition moved since `since_ns` was counted in both (stage T's review,
+    finding 2). So each partition is counted once -- where it is held most
+    whole -- and each partition counted in two databases is named: a move
+    ran in the window. Answers (commits counted once, each database's own
+    count, the partitions counted in more than one)."""
+    if component == "lake":
+        sql = ("select dataset || '|' || count(*) from lake_row where dataset like 'drive-data:scale%' "
+               f"and recorded_at_ns >= {since_ns} and recorded_at_ns < {until_ns} group by dataset")
+    else:
+        sql = ("select partition || '|' || count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
+               f"and committed_at_ns >= {since_ns} and committed_at_ns < {until_ns} group by partition")
+    by_database = []
+    for pod in scale_databases(component):
+        by_database.append({line.rsplit("|", 1)[0]: int(line.rsplit("|", 1)[1])
+                            for line in psql(sql, pod=pod).splitlines()})
+    return counted_once(by_database)
+
+
+def counted_once(by_database):
+    """Each partition's commits counted once over a store's databases:
+    (the sum of each partition's greatest count in any database, each
+    database's own sum, the partitions counted in more than one)."""
+    once, twice = {}, set()
+    for counts in by_database:
+        for name, count in counts.items():
+            if name in once:
+                twice.add(name)
+            once[name] = max(once.get(name, 0), count)
+    return sum(once.values()), [sum(counts.values()) for counts in by_database], sorted(twice)
+
+
+def scale_told(writing, accounts=()):
+    """The step's instances told to write -- the oms instance into
+    `accounts` where any are named -- or to stop."""
+    for instance in SCALE_DRIVERS:
+        pod = driver_pod(instance)
+        if not pod:
+            raise SystemExit(f"{instance} has no pod")
+        kubectl("exec", pod, "-c", "plugin", "--", "sh", "-c",
+                f"printf %s '{','.join(accounts)}' > {SCALE_FILE}" if writing else f"rm -f {SCALE_FILE}")
+
+
+def scale_accounts(s):
+    """As many of the driver's accounts of each writer group, of two: each
+    account placed by a first order, its partition read from the book, and
+    its partition's group by the rendezvous the book places a partition by.
+    Written evenly over them, two groups each take half the load; over all
+    of them the busier group would bound the whole."""
+    scale_told(True)
+    try:
+        placed = {}
+
+        def all_placed():
+            said = psql("select account_id || ' ' || partition from book_account "
+                        "where account_id like 'ACC-DRIVE-%'")
+            placed.update(line.split() for line in said.splitlines() if len(line.split()) == 2)
+            return len(placed) >= len(DRIVER_ACCOUNTS)
+        happens(all_placed, 120, every=3)
+    finally:
+        scale_told(False)
+    time.sleep(12)
+    by_group = {0: [], 1: []}
+    for account, partition in sorted(placed.items()):
+        by_group[rendezvous(partition)].append(account)
+    even = min(len(by_group[0]), len(by_group[1]))
+    s.check(even > 0, f"write-scale: the driver's accounts fall to both writer groups of two "
+            f"({len(by_group[0])} and {len(by_group[1])} of {len(placed)} placed)")
+    return by_group[0][:even] + by_group[1][:even]
+
+
+def logs_whole(s, what):
+    """Each store's change log whole in each database past the first too
+    (properties reads the first): no sequence of a partition missing or
+    taken twice."""
+    properties(s, what)
+    for component, table, partition, first, last in (("bor", "book_entry", "partition", "first_sequence",
+                                                      "last_sequence"),
+                                                     ("lake", "lake_row", "dataset", "sequence", "sequence")):
+        for pod in scale_databases(component)[1:]:
+            said = psql(
+                f"with d as (select distinct {partition} as p, {first} as f, {last} as l from {table}), "
+                f"c as (select p, f, lag(l) over (partition by p order by f, l) as prev_l from d) "
+                f"select count(*) filter (where prev_l is not null and f <> prev_l + 1) from c", pod=pod)
+            s.check(said in ("0", ""), f"{what}: {component}'s change logs whole in {pod} "
+                    f"({said or 0} sequence(s) missing or twice)")
+
+
+def scale_shape(s, shape, figures, accounts):
+    """One shape written at saturation: warmed, then measured for
+    SCALE_MEASURED_S, each store's commits a second kept in `figures` and
+    never said; its instances stopped, and each change log whole after."""
+    print(f"W: write-scale: {shape}", flush=True)
+    scale_told(True, accounts)
+    try:
+        time.sleep(SCALE_WARM_S)
+        since_ns = time.time_ns()
+        time.sleep(SCALE_MEASURED_S)
+        until_ns = time.time_ns()
+    finally:
+        scale_told(False)
+    # Every write in flight answered before the rows are counted.
+    time.sleep(12)
+    seconds = (until_ns - since_ns) / 1e9
+    for component in ("lake", "bor"):
+        name = "lake" if component == "lake" else "book"
+        committed, by_database, twice = scale_committed(component, since_ns, until_ns)
+        figures[shape][component] = {"per_s": committed / seconds, "by_database": by_database,
+                                     "counted_in_two_databases": twice, "seconds": round(seconds, 2)}
+        s.check(committed > 0, f"write-scale: {shape}: the {name} was written through the measured window")
+        # No move ran in the window: a partition's rows of the window are in
+        # one database alone, and none of group 1's is on its way after it.
+        s.check(not twice, f"write-scale: {shape}: no partition of the {name} moved between databases while it "
+                f"was measured ({len(twice)} counted in two databases)")
+        if len(by_database) > 1:
+            away = away_from_home(component)
+            s.check(away == 0, f"write-scale: {shape}: every one of group 1's partitions of the {name} still "
+                    f"home in its own database after the measured window ({away} in the first)")
+    for instance in SCALE_DRIVERS:
+        figures[shape][instance] = {"last_refusal": driver_file(instance, "/tmp/scale-refused").strip()[:400],
+                                    "counted": len(driver_file(instance, "/tmp/scale.log").splitlines())}
+    logs_whole(s, f"write-scale, {shape}")
+
+
+def scale_upgraded(s, what, *sets):
+    """The scaled install moved to the next shape by an upgrade, every
+    workload rolled out and ready; says whether it was."""
+    upgraded = upgrade(*sets)
+    s.check(upgraded.returncode == 0, f"write-scale: {what}: the upgrade applied"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        return False
+    migrated(s, f"write-scale: {what}")
+    # But the sharded instance's: its standby pod is never ready, by design.
+    def unfinished():
+        return [left for left in rollout_unfinished() if SHARDED not in left]
+    settled = happens(lambda: not unfinished() and all_ready() and group_members_ready(2), 900, every=5)
+    s.check(settled, f"write-scale: {what}: every workload rolled out and ready"
+            + ("" if settled else f" ({'; '.join(unfinished()[:4])})"))
+    return settled
+
+
+def write_scale(s):
+    print("W: write-scale: each store written at saturation in three shapes", flush=True)
+    shapes = ["one group on one database", "two groups on one database", "two groups on two databases"]
+    figures = {shape: {} for shape in shapes}
+    registered = happens(lambda: all(driver_file(i, "/tmp/registered") for i in SCALE_DRIVERS), 300, every=3)
+    s.check(registered, "write-scale: its two instances registered, writing nothing until told")
+    if not registered:
+        for instance in SCALE_DRIVERS:
+            said = kubectl("logs", driver_pod(instance), "-c", "plugin", "--tail=15", check=False)
+            s.note(f"{instance} said: {said.stdout.decode(errors='replace')[-1500:]}")
+        return
+    accounts = scale_accounts(s)
+    if not accounts:
+        return
+    try:
+        scale_shape(s, shapes[0], figures, accounts)
+        if not scale_upgraded(s, "two writer groups", "lake.writerGroups=2", "bor.writerGroups=2"):
+            return
+        scale_shape(s, shapes[1], figures, accounts)
+        if not scale_upgraded(s, "two databases", "lake.databases=2", "bor.databases=2"):
+            return
+        for component in ("lake", "bor"):
+            rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
+                         f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
+            s.check(rolled.returncode == 0, f"write-scale: {component}'s database 1 brought and ready")
+        # Group 1's partitions home in its own database before anything is
+        # measured: until then both groups write to the first.
+        # Every one of them (stage T's review, finding 2): one partition home
+        # left the rest moving through the measured window, each move's hold
+        # refusing writes and its copy counted in both databases.
+        home = happens(lambda: moved_home("bor") and moved_home("lake"), 900, every=5)
+        s.check(home, "write-scale: every one of group 1's partitions of each store moved to its database 1 "
+                f"(still in the first: {away_from_home('bor')} of the book's, {away_from_home('lake')} of the lake's)")
+        if not home:
+            return
+        scale_shape(s, shapes[2], figures, accounts)
+        for component in ("lake", "bor"):
+            name = "lake" if component == "lake" else "book"
+            one = figures[shapes[0]][component]["per_s"]
+            two = figures[shapes[2]][component]
+            # Both databases written in the window: else the figure is one
+            # database's, whatever it is.
+            s.check(len(two["by_database"]) == 2 and all(n > 0 for n in two["by_database"]),
+                    f"write-scale: the {name}'s two groups each committed to their own database")
+            held = one > 0 and two["per_s"] >= SCALE_AT_LEAST * one
+            figures[f"{name}_held"] = held
+            s.check(held, f"write-scale: the {name} with two writer groups on two databases commits at least "
+                    f"{SCALE_AT_LEAST} times what one group on one database does "
+                    f"({'held' if held else 'NOT held'}; the figures are kept in {SCALE_FIGURES}, never printed)")
+    finally:
+        figures["threshold"] = SCALE_AT_LEAST
+        figures["run"] = os.environ.get("GITHUB_RUN_ID", "local")
+        figures["kubernetes"] = kubernetes_version()
+        with open(SCALE_FIGURES, "w", encoding="utf-8") as kept:
+            json.dump(figures, kept, indent=1)
+
+
 # ── Two writer groups (step 3d, stage G) ──────────────────────────────────
 
 # The internal topics a write is handed to its owning group on (the
@@ -4738,6 +5492,14 @@ def main():
         except SystemExit as stopped:
             s.check(False, f"shards: {stopped}")
     properties(s, "the install")
+    if PROFILE == "scaled":
+        # Last: it changes the install's shape (two writer groups, then two
+        # databases), which every reading above holds as installed.
+        try:
+            driver_fixtures(s)
+            write_scale(s)
+        except SystemExit as stopped:
+            s.check(False, f"write-scale: {stopped}")
     if PROFILE == "ha" and DRIVEN:
         try:
             reader_held(s)
