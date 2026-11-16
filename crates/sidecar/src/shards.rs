@@ -31,18 +31,25 @@ use tokio::sync::watch;
 
 /// A store refused one of this sidecar's writes as fenced (step 3d,
 /// checkpoint 5, item 32: `REFUSAL_REASON_SHARD_FENCED`): another pod took
-/// its shard. Said once by the refusal's path; the process waits on it and
-/// exits, as on a lost Lease, and its pod comes back as the standby.
+/// its shard. Said once by the refusal's path; the sidecar waits on it and
+/// ends its serving, as on a lost Lease, and stands by again in its process
+/// (item 49, ruled 2026-11-16).
 static FENCED: std::sync::LazyLock<watch::Sender<bool>> =
     std::sync::LazyLock::new(|| watch::channel(false).0);
 
 /// Say this sidecar's shard was fenced: its plugin has its refusal, and
-/// the process ends.
+/// its serving ends.
 pub fn say_fenced(words: &str) {
     if !*FENCED.borrow() {
-        tracing::error!(words, "a store refused a write as fenced: this shard's epoch is no longer the instance's; stopping");
+        tracing::error!(words, "a store refused a write as fenced: this shard's epoch is no longer the instance's; standing by again");
     }
     FENCED.send_replace(true);
+}
+
+/// A new serving begins unfenced: a refusal heard was a shard's this
+/// sidecar has since stood by again for (item 49).
+pub fn clear_fenced() {
+    FENCED.send_replace(false);
 }
 
 /// Whether a store has refused a write as fenced.

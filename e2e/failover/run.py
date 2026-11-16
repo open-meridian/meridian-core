@@ -1131,12 +1131,6 @@ def shard_takes():
     return int(said or 0)
 
 
-def previous_log(pod_name, container="sidecar"):
-    """The log of the container's run before its last restart; empty where none."""
-    said = kubectl("logs", pod_name, "-c", container, "--previous", check=False, quiet=True)
-    return said.stdout.decode(errors="replace") if said.returncode == 0 else ""
-
-
 def sidecar_status(pod):
     """The pod's sidecar container's status, as the kubelet reports it."""
     return next((c for c in pod["status"].get("containerStatuses", []) if c["name"] == "sidecar"), {})
@@ -1205,6 +1199,9 @@ def a_standby_stands_by(s, before):
 # have stopped.
 SHARD_CUT_S = 15
 LOST = "the shard's lease is lost"
+# What a shard's sidecar says as it stands by again in its process, its
+# shard lost (item 49, ruled 2026-11-16): it no longer ends.
+STANDING_AGAIN = "; standing by again"
 
 
 def shards_fenced(s, settled):
@@ -1221,7 +1218,8 @@ def shards_fenced(s, settled):
     Lease once it lapses, within the takeover's bound; the lake records one
     take and raises the shard's epoch by one; the cut holder serves on
     until it hears the API server again, finds another holder, and exits,
-    its pod coming back as the standby."""
+    and stands by again in its process: its container never restarts (item
+    49, ruled 2026-11-16)."""
     names = {p["metadata"]["name"] for p in shard_pods()}
     held = [shard_holder(n)[1] for n in range(SHARDS)]
     epochs = [shard_epochs(n) for n in range(SHARDS)]
@@ -1260,6 +1258,7 @@ def shards_fenced(s, settled):
     lost, was = shard_holder(1)
     epoch, takes = shard_epoch(1), shard_takes()
     before = restarts(lost)
+    sidecar_before = sidecar_status(json.loads(out("get", "pod", lost, "-o", "json")))
     began = time.time()
     cut_api("-I", only={lost})
     try:
@@ -1287,14 +1286,28 @@ def shards_fenced(s, settled):
                serving_s=round(served, 2))
     finally:
         cut_api("-D", only={lost})
-    exited = happens(lambda: restarts(lost) > before, 30, every=0.5)
-    said = previous_log(lost)
-    # By the sidecar's own words as it exits: the lease lost, held by the
-    # pod that took it, and stopping (M5).
-    words = [line for line in said.splitlines() if LOST in line]
-    s.check(exited and any(f"held by {now_pod}" in line and "; stopping" in line for line in words),
-            f"shards: the cut holder, hearing the API server again, found another holder and exited "
-            f"({'exited' if exited else 'did not exit'}; {words[-1:] or 'it said nothing of it'})")
+    # By the sidecar's own words, in the run it was serving in: the lease
+    # lost, held by the pod that took it, standing by again -- and then
+    # standing by -- and its plugin no longer answered. Judged by its log
+    # and its container's last end, never by restartCount, which the
+    # kubelet raises only once a back-off has passed (review c5a5 F1).
+    def stood_by_again():
+        said = shard_log(lost).splitlines()
+        at = next((n for n, line in enumerate(said)
+                   if LOST in line and f"held by {now_pod}" in line and STANDING_AGAIN in line), None)
+        return (at is not None and any("standing by" in line and STANDING_AGAIN not in line for line in said[at + 1:])
+                and not stub_answered(shard_log(lost, container="plugin")))
+    again = happens(stood_by_again, 30, every=0.5)
+    sidecar_after = sidecar_status(json.loads(out("get", "pod", lost, "-o", "json")))
+    kept_on = (sidecar_after.get("restartCount") == sidecar_before.get("restartCount")
+               and sidecar_after.get("lastState") == sidecar_before.get("lastState")
+               and "running" in sidecar_after.get("state", {}))
+    words = [line for line in shard_log(lost).splitlines() if LOST in line]
+    s.check(again and kept_on,
+            f"shards: the cut holder, hearing the API server again, found another holder and stood by again in its "
+            f"process, its plugin no longer answered ({'stood by again' if again else 'did not stand by again'}; "
+            f"{'its container ran on' if kept_on else 'its container ended: ' + json.dumps(sidecar_after.get('lastState'))}"
+            f"; {words[-1:] or 'it said nothing of it'})")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
     return back
@@ -1307,9 +1320,10 @@ def shards(s):
     is not answered -- and the members' token in the sidecar's container
     alone. A shard's sidecar killed outright (SIGKILL, so nothing is
     released) is another process's once its Lease has lapsed, never before,
-    and that one serves within the bound, the other shard never taken. Its
-    pods then roll a shard at a time, and a shard gone and back is read by
-    the one that stayed."""
+    and that one serves within the bound, the other shard never taken; and
+    its taker killed in turn within 60 s, the second taker serves within the
+    bound too (item 49). Its pods then roll a shard at a time, and a shard
+    gone and back is read by the one that stayed."""
     print("S: a plugin instance at two shards with a standby pod", flush=True)
 
     def settled():
@@ -1394,6 +1408,30 @@ def shards(s):
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
     plugged = happens(lambda: stub_answered(shard_log(now_pod, container="plugin")), 30)
     s.check(plugged, "shards: the taker's plugin is answered by its sidecar")
+    back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
+    s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
+
+    # Twice within 60 s (item 49; review c5a5 F3): the taker killed in its
+    # turn once a standby stands by again, and the second taker serves
+    # within the bound. A pod that loses its shard stands by in its process,
+    # so no back-off but the first kill's own stands between.
+    first_kill, lost, was = began, now_pod, now
+    left = max(0.0, 60 - (time.time() - first_kill))
+    stood = happens(lambda: bool(the_standby()) and standing_by(the_standby()), left, every=1.0)
+    s.check(stood, f"shards: within 60 s of the kill, a standby stood by for a lapse again ({the_standby() or 'none'})")
+    if not stood:
+        return
+    began = time.time()
+    crash(lost, "sidecar")
+    taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 20, every=0.25)
+    now_pod, now = shard_holder(1)
+    served = taken and happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
+    serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
+    s.check(served and serving <= SHARD_TAKEOVER,
+            f"shards: shard 1's holder killed twice, {round(began - first_kill, 1)} s apart, its second taker serves "
+            f"within {SHARD_TAKEOVER} s ({'never' if serving is None else round(serving, 2)}; {now}, was {was})")
+    figure("shards: the second kill within 60 s, its taker served",
+           apart_s=round(began - first_kill, 1), serving_s=None if serving is None else round(serving, 2))
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
 

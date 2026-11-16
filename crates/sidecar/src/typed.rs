@@ -1635,7 +1635,8 @@ pub(crate) fn refused(failed: BusError) -> Status {
             }
             // A write under an epoch no longer its shard's (step 3d,
             // checkpoint 5, item 32): FAILED_PRECONDITION to the plugin,
-            // and this sidecar exits, as on a lost Lease.
+            // and this sidecar ends its serving, as on a lost Lease, and
+            // stands by again (item 49).
             Some((RefusalReason::ShardFenced, words)) => {
                 crate::shards::say_fenced(words);
                 refused_naming(

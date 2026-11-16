@@ -28,9 +28,10 @@
 //! so a shard of any other role that cannot renew stops once it has gone
 //! the lease's duration less one renewal unrenewed, before any standby can
 //! see the lease lapse (client-go's renew deadline), and so does one that
-//! finds another holder. Its process ends, its plugin's stream with it, and
-//! its pod comes back as the standby. This is a property of the role, never
-//! a setting.
+//! finds another holder. Its serving ends, its plugin's stream with it, and
+//! it stands by again in its process ([`serve_shards`]; item 49, ruled
+//! 2026-11-16). Which stop applies is a property of the role, never a
+//! setting.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -596,6 +597,73 @@ impl<L: Leases + 'static> ShardSet<L> {
     pub async fn release(&mut self, wall_ns: i64) {
         if let Some(mine) = self.mine {
             self.electors[mine].lock().await.release(wall_ns).await;
+        }
+    }
+}
+
+/// How a pod's serving of the shard it took ended ([`serve_shards`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Served {
+    /// Told to stop: its Lease given up, and the pod stops.
+    Stopped,
+    /// It may no longer serve its shard -- the Lease shows another holder,
+    /// or a store refused a write as fenced: why. It stands by again.
+    Lost(String),
+    /// Its take did not complete -- its epoch not raised, or its bus not
+    /// set up inside the Lease -- and its Lease was given up: why. It
+    /// stands by again once a lapse has passed.
+    NotTaken(String),
+}
+
+/// A pod's shards, served until it is told to stop (step 3d, checkpoint 5,
+/// item 32 as item 49 ruled it, 2026-11-16): it stands by, takes a shard,
+/// and serves it with `serve`. When it loses that shard -- another holder
+/// on its Lease, or a write refused as fenced -- or its take does not
+/// complete, **it stands by again in the same process**, under a new holder
+/// name from `set`. It never ends its process to do so: a container that
+/// ends is started again only after the kubelet's back-off, 10 s doubling
+/// to 5 min, and its pod is no standby for that long (review c5a5 F3).
+///
+/// A take that did not complete waits a lapse before it stands by again,
+/// so a store not yet up is not asked again and again, and another standby
+/// may take the shard meanwhile. An error -- from `set`, or from `serve`
+/// for a fault of the pod's own -- ends it.
+pub async fn serve_shards<L, M, S, F>(
+    mut set: M,
+    mut serve: S,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String>
+where
+    L: Leases + 'static,
+    M: FnMut() -> Result<ShardSet<L>, String>,
+    S: FnMut(ShardSet<L>, u32, Vec<u32>) -> F,
+    F: std::future::Future<Output = Result<Served, String>>,
+{
+    loop {
+        let standing = set()?;
+        let lasts = standing.lasts();
+        let Some((taken, mine, others)) = standing.take(stop.clone()).await? else {
+            return Ok(());
+        };
+        match serve(taken, mine, others).await? {
+            Served::Stopped => return Ok(()),
+            Served::Lost(why) => {
+                tracing::warn!(shard = mine, "{why}; standing by again");
+            }
+            Served::NotTaken(why) => {
+                tracing::warn!(
+                    shard = mine,
+                    "{why}; its lease given up, standing by again after a lapse"
+                );
+                let mut stop = stop.clone();
+                tokio::select! {
+                    _ = tokio::time::sleep(lasts) => {}
+                    _ = told(&mut stop) => return Ok(()),
+                }
+            }
+        }
+        if *stop.borrow() {
+            return Ok(());
         }
     }
 }
@@ -1554,6 +1622,121 @@ mod tests {
             );
             assert_eq!(api.holder("feed-1-shard-0"), "a");
         });
+    }
+
+    /// Item 49 (ruled 2026-11-16; review c5a5 F3): a pod that loses its
+    /// shard stands by again in its own process, under a new holder name,
+    /// and takes the shard at its next look once it is free -- no process
+    /// ended, so no back-off waited out.
+    #[tokio::test(start_paused = true)]
+    async fn a_shard_lost_stands_by_again_in_its_process_and_takes_the_shard_once_it_is_free() {
+        let store = Arc::new(Memory::default());
+        let (to_a, to_b) = (Link::to(&store), Link::to(&store));
+        let (a_stopper, a_stop) = watch::channel(false);
+        let rounds = Arc::new(Mutex::new(Vec::<(String, Served)>::new()));
+        let a = tokio::spawn({
+            let (to_a, rounds, stop) = (Arc::clone(&to_a), Arc::clone(&rounds), a_stop.clone());
+            let mut made = 0;
+            serve_shards(
+                move || {
+                    made += 1;
+                    Ok(on(&to_a, 1, &format!("a{made}")).writing_on())
+                },
+                move |set, _, _| {
+                    let (rounds, stop) = (Arc::clone(&rounds), stop.clone());
+                    async move {
+                        let holder = set.taken().await.expect("taken").holder;
+                        let served = match set.keep(|_| {}, stop).await {
+                            Kept::Released => Served::Stopped,
+                            Kept::Lost(why) => Served::Lost(why),
+                        };
+                        rounds.lock().unwrap().push((holder, served.clone()));
+                        Ok(served)
+                    }
+                },
+                a_stop,
+            )
+        });
+        tokio::time::sleep(secs(0.1)).await;
+        let (b_stopper, b_stop) = watch::channel(false);
+        let b = serving(on(&to_b, 1, "b"), &b_stop);
+        tokio::time::sleep(secs(1.0)).await;
+        assert_eq!(store.holder("feed-1-shard-0"), "a1");
+        // `a` alone cut from the API server: it writes on; `b` takes the
+        // lapsed Lease. The API answering `a` again, it finds `b`.
+        to_a.slow("", secs(3_600.0), true);
+        tokio::time::sleep(secs(10.0)).await;
+        assert_eq!(store.holder("feed-1-shard-0"), "b");
+        to_a.slow.lock().unwrap().clear();
+        tokio::time::sleep(secs(6.0)).await;
+        {
+            let rounds = rounds.lock().unwrap();
+            assert_eq!(rounds.len(), 1, "{rounds:?}");
+            assert_eq!(rounds[0].0, "a1");
+            assert!(
+                matches!(&rounds[0].1, Served::Lost(why) if why.contains("held by b")),
+                "{rounds:?}"
+            );
+        }
+        assert!(!a.is_finished(), "the pod's serving ended: {:?}", a.await);
+        // `b` stops and gives the shard up: `a`, standing by under a new
+        // name, takes it at its next look.
+        b_stopper.send(true).unwrap();
+        assert_eq!(b.await.unwrap().1, Kept::Released);
+        tokio::time::sleep(secs(1.5)).await;
+        assert_eq!(store.holder("feed-1-shard-0"), "a2");
+        a_stopper.send(true).unwrap();
+        assert_eq!(a.await.unwrap(), Ok(()));
+        assert_eq!(
+            rounds.lock().unwrap().last(),
+            Some(&("a2".to_string(), Served::Stopped))
+        );
+        assert_eq!(store.holder("feed-1-shard-0"), "");
+    }
+
+    /// Item 49: a take that did not complete gives its Lease up and stands
+    /// by again after a lapse, in its process.
+    #[tokio::test(start_paused = true)]
+    async fn a_take_not_completed_stands_by_again_after_a_lapse() {
+        let store = Arc::new(Memory::default());
+        let to_a = Link::to(&store);
+        let (a_stopper, a_stop) = watch::channel(false);
+        let taken = Arc::new(Mutex::new(Vec::<(String, At)>::new()));
+        let a = tokio::spawn({
+            let (taken, stop) = (Arc::clone(&taken), a_stop.clone());
+            let mut made = 0;
+            serve_shards(
+                move || {
+                    made += 1;
+                    Ok(on(&to_a, 1, &format!("a{made}")).writing_on())
+                },
+                move |mut set, _, _| {
+                    let (taken, stop) = (Arc::clone(&taken), stop.clone());
+                    async move {
+                        let holder = set.taken().await.expect("taken").holder;
+                        let first = taken.lock().unwrap().is_empty();
+                        taken.lock().unwrap().push((holder, At::now()));
+                        if first {
+                            set.release(0).await;
+                            return Ok(Served::NotTaken("the epoch was not raised".into()));
+                        }
+                        Ok(match set.keep(|_| {}, stop).await {
+                            Kept::Released => Served::Stopped,
+                            Kept::Lost(why) => Served::Lost(why),
+                        })
+                    }
+                },
+                a_stop,
+            )
+        });
+        tokio::time::sleep(secs(10.0)).await;
+        let taken = taken.lock().unwrap().clone();
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        assert_eq!((taken[0].0.as_str(), taken[1].0.as_str()), ("a1", "a2"));
+        assert!(taken[1].1.duration_since(taken[0].1) >= LASTS);
+        assert!(!a.is_finished());
+        a_stopper.send(true).unwrap();
+        assert_eq!(a.await.unwrap(), Ok(()));
     }
 
     /// Another role's shard keeps the 4 s stop (item 32: a property of the
