@@ -1079,7 +1079,7 @@ e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image a
 	@$(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) $(E2E_POSTGRES_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-backup-claims.jsonl
+	@rm -f .e2e-backup-claims.jsonl .e2e-backup-figures.jsonl
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) \
@@ -1105,14 +1105,20 @@ footprint-judge:
 	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
 
 # The claims ledger (366; ruling 1113; spec/a-deployment-scales-out-and-
-# fails-over-by-configuration section 15): each failure class's recovery as
-# CI's green runs measured it, per profile and component, beside its bound
-# and RPO, in deploy/claims-ledger.json (tools/claims.py). claims-check holds
-# the ledger to its bounds in the gate; CI's claims-check job holds it, and
-# every one of the run's measurements, to them, and fails a class the ledger
-# holds that the run did not measure. claims-ledger writes it again from
-# runs' claims files -- CI keeps each as an artifact (failover-claims-<profile>,
-# backup-claims) -- a reviewed change naming the runs:
+# fails-over-by-configuration section 15): each failure class CI's green
+# runs measured, per profile and component, beside its bound and its RPO's,
+# in deploy/claims-ledger.json (tools/claims.py). Limits are public and
+# measured figures are private (PO 2026-11-15): a run's claims lines, and
+# the ledger here, say the class, its bounds and whether they were held;
+# the figures stay beside the run (.e2e-*-figures.jsonl), printed nowhere
+# and kept by no job, and a ledger with them is written outside the
+# checkout by `tools/claims.py figures` from a private run's. claims-check
+# holds the ledger to its bounds in the gate; CI's claims-check job holds
+# it, and every one of the run's lines, to them, and fails a class the
+# ledger holds that the run did not measure. claims-ledger writes it again
+# from runs' claims files -- CI keeps each as an artifact
+# (failover-claims-<profile>, backup-claims) -- a reviewed change naming the
+# runs:
 #
 #   gh run download <run> -p 'failover-claims-*' -p backup-claims -D .claims
 #   make claims-ledger CLAIMS="$(find .claims -name '*.jsonl')"
@@ -1192,7 +1198,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn .e2e-said-*.log
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-said-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \

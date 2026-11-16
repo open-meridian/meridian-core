@@ -40,6 +40,11 @@ import sys
 import tempfile
 import time
 
+# What a claims line says in public, and its verdict: the ledger's own tool,
+# so the run and CI's claims-check judge a line by one rule.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+import claims as claims_tool  # noqa: E402
+
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-backup-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "backup-e2e")
 FULL = f"{RELEASE}-meridian-runtime"
@@ -793,11 +798,18 @@ def claim(s, failure, component, seconds, bound, extra=None):
         "run": os.environ.get("GITHUB_RUN_ID", "local"),
     }
     line.update(extra or {})
-    print(f"CLAIM {json.dumps(line)}", flush=True)
+    # Limits are public and measured figures are private (PO 2026-11-15):
+    # what is printed, and kept for CI, names the class, its bounds and
+    # whether they were held; the line with its figures is kept beside the
+    # run, which nothing prints and no job keeps.
+    said = claims_tool.public(line)
+    print(f"CLAIM {json.dumps(said)}", flush=True)
     with open(os.environ.get("E2E_BACKUP_CLAIMS", ".e2e-backup-claims.jsonl"), "a", encoding="utf-8") as kept:
+        kept.write(json.dumps(said) + "\n")
+    with open(os.environ.get("E2E_BACKUP_FIGURES", ".e2e-backup-figures.jsonl"), "a", encoding="utf-8") as kept:
         kept.write(json.dumps(line) + "\n")
     if bound is not None:
-        s.check(line["held"], f"{failure}: {component} in {seconds:.1f}s, within {bound}s")
+        s.check(line["held"], f"{failure}: {component} within {bound}s")
 
 
 PROBE = "e2e_point_in_time"

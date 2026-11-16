@@ -77,7 +77,11 @@ raised by a takeover the store recorded, one per epoch, none skipped.
 
 Each measurement is printed as a claims line (`CLAIM {json}`) and kept in
 .e2e-failover-claims.jsonl beside the checkout, with the command and the
-cluster's Kubernetes. No platform: the conductor waits for an enrolment
+cluster's Kubernetes: the class, its bound and whether it was held, and
+nothing measured. Limits are public and measured figures are private (PO
+2026-11-15): the line with its figures, and each time a check measured, is
+kept in .e2e-failover-figures.jsonl beside the run, which nothing prints
+and no job keeps. No platform: the conductor waits for an enrolment
 nobody gives. No value of a secret, a key or a password is ever printed.
 """
 
@@ -110,6 +114,16 @@ PROFILE = os.environ.get("PROFILE", "tolerant")
 # e2e-cluster-reconfigure moves a live install from one to the other.
 SHAPE = {"reconfigure": "tolerant"}.get(PROFILE, PROFILE)
 CLAIMS = os.environ.get("E2E_FAILOVER_CLAIMS", ".e2e-failover-claims.jsonl")
+# Every figure of a run, kept beside it and never printed: core is public,
+# and so are its CI logs and artifacts. Not a log and not the claims file,
+# so no job keeps it: a private run reads it for the ledger with figures
+# (tools/claims.py figures).
+FIGURES = os.environ.get("E2E_FAILOVER_FIGURES", ".e2e-failover-figures.jsonl")
+
+# What a claims line says in public, and its verdict: the ledger's own tool,
+# so the run and CI's claims-check judge a line by one rule.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+import claims as claims_tool  # noqa: E402
 CLUSTER = os.environ.get("E2E_K3D_CLUSTER", "meridian-e2e")
 ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
@@ -455,13 +469,23 @@ def claim(s, failure, component, seconds, bound, extra=None):
         "run": os.environ.get("GITHUB_RUN_ID", "local"),
     }
     line.update(extra or {})
-    print(f"CLAIM {json.dumps(line)}", flush=True)
+    said = claims_tool.public(line)
+    print(f"CLAIM {json.dumps(said)}", flush=True)
     with open(CLAIMS, "a", encoding="utf-8") as kept:
+        kept.write(json.dumps(said) + "\n")
+    with open(FIGURES, "a", encoding="utf-8") as kept:
         kept.write(json.dumps(line) + "\n")
     if bound is None:
-        s.check(True, f"{failure}: {component} in {seconds:.1f}s (no bound is set for it yet)")
+        s.check(True, f"{failure}: {component} measured (no bound is set for it yet)")
     else:
-        s.check(line["held"], f"{failure}: {component} answered again in {seconds:.1f}s, within {bound}s")
+        s.check(line["held"], f"{failure}: {component} answered again within {bound}s")
+
+
+def figure(what, **measured):
+    """A time a check measured, kept with the run's figures and never
+    printed: the check's own words say its limit and whether it held."""
+    with open(FIGURES, "a", encoding="utf-8") as kept:
+        kept.write(json.dumps({"note": what, "profile": PROFILE, **measured}) + "\n")
 
 
 def kubernetes_version():
@@ -1107,14 +1131,14 @@ def shards(s):
     now_pod, now = shard_holder(1)
     s.check(taken, f"shards: another process holds the killed shard's lease ({now}, was {was})")
     s.check(taken and took >= 3.0,
-            f"shards: no sooner than its lapse: its holder stops unrenewed first ({took:.1f}s after the kill)")
+            "shards: no sooner than its lapse: its holder stops unrenewed first")
     served = happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
     serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
     s.check(served and serving <= SHARD_TAKEOVER,
-            f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill "
-            f"({'never' if serving is None else f'{serving:.1f}s'}; the lease {took:.1f}s)")
-    print(f"   shards: the lease changed hands {took:.1f}s after the kill; serving "
-          f"{'never' if serving is None else f'{serving:.1f}s'} after it", flush=True)
+            f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill"
+            + ("" if served else " (never)"))
+    figure("shards: the lease changed hands, and its taker served, after the kill",
+           lease_s=round(took, 2), serving_s=None if serving is None else round(serving, 2))
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
     plugged = happens(lambda: SHARD_STUB_ANSWERED in shard_log(now_pod, container="plugin"), 30)
     s.check(plugged, "shards: the taker's plugin is answered by its sidecar")
@@ -1544,7 +1568,7 @@ def order_plugin(s):
                    for line in driver_file(instance, "/tmp/registered").splitlines())
     back = happens(registered, bound + 30, every=0.5)
     recover_s = time.time() - began
-    s.check(detected, f"order-plugin: the pod not ready, found in {detect_s:.1f}s")
+    s.check(detected, "order-plugin: the pod not ready, found")
     if not back:
         s.check(False, f"order-plugin: the stand-in never registered again within {bound + 30}s")
         return
@@ -1571,7 +1595,7 @@ def order_plugin(s):
            "acknowledged_commits": len(acked.get("order", {})) + len(acked.get("placement", {})),
            "rpo_commits_lost": len(lost), "duplicated": len(twice), "unplaced_after": len(unplaced)})
     s.check(detected and detect_s <= ORDER_PLUGIN_DETECT,
-            f"order-plugin: detected within {ORDER_PLUGIN_DETECT}s ({detect_s:.1f}s)")
+            f"order-plugin: detected within {ORDER_PLUGIN_DETECT}s")
     wait_for("the stand-in's pod ready", lambda: ready(json.loads(out("get", "pod", pod, "-o", "json"))), seconds=180)
 
 
@@ -2475,7 +2499,8 @@ def tls_turned_on(s):
             "internal TLS on: the upgrade ran with its preflight, which read the database as it served")
     migrated(s, "internal TLS on")
     settled = happens(settled_everywhere, 900, every=5)
-    s.check(settled, f"internal TLS on: every member ready, {time.time() - began:.0f}s after the upgrade")
+    s.check(settled, "internal TLS on: every member ready after the upgrade")
+    figure("internal TLS on: every member ready after the upgrade", took_s=round(time.time() - began))
     if not settled:
         raise SystemExit("the deployment did not settle with internal TLS on")
     TLS = True
@@ -2796,13 +2821,12 @@ def reconfigure(s):
                 if moved:
                     wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
                              lambda: not rollout_unfinished(), seconds=600)
-                    print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
-                          flush=True)
+                    print("R: the first upgrade rolled out; the second upgrade", flush=True)
+                    figure("reconfigure: the first upgrade rolled out", took_s=round(time.time() - began))
                     member_now("before the second upgrade")
                     with HookLog("preflight") as preflight:
                         again = upgrade(f"resilience.profile={target}")
-                    print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
-                          f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                    print(f"R: the second upgrade's preflight said:\n{preflight.said or '(nothing read)'}", flush=True)
                     print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
                     member_now("after the second upgrade")
                     s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
@@ -2813,7 +2837,7 @@ def reconfigure(s):
                         migrated(s, f"reconfigure to {target}, the second upgrade")
             settled = happens(settled_everywhere, 900, every=5)
             took = time.time() - began
-            s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
+            s.check(settled, f"reconfigure: every member in the {target} shape and ready after the upgrade")
             if not settled:
                 for component in STORES:
                     explain(s, f"reconfigure to {target}", component)
@@ -2933,7 +2957,9 @@ def rollout_served(s, what, began_ms, groups, held):
         for at, kind, words in found[:10]:
             print(f"      unserved: {kind} at {at}: {words}", flush=True)
         s.check(not found, f"{what}: no write refused \"{UNSERVED}\" through the rollout: with two writer groups "
-                f"a public topic is always served by one ({len(found)} refused, {len(every)} not answered in all)")
+                "a public topic is always served by one")
+        figure(f"{what}: writes refused \"{UNSERVED}\" and not answered through the rollout",
+               refused=len(found), not_answered=len(every))
 
 
 def store_databases(store):
@@ -3036,7 +3062,8 @@ def groups_upgraded(s, what, groups, held, *sets):
     migrated(s, what)
     settled = happens(lambda: not rollout_unfinished() and settled_everywhere() and group_members_ready(groups),
                       900, every=5)
-    s.check(settled, f"{what}: every workload rolled out and ready, {time.time() - began:.0f}s after the upgrade"
+    figure(f"{what}: every workload rolled out and ready after the upgrade", took_s=round(time.time() - began))
+    s.check(settled, f"{what}: every workload rolled out and ready after the upgrade"
             + ("" if settled else f" ({'; '.join(rollout_unfinished()[:4])})"))
     if not settled:
         return False
@@ -3260,7 +3287,8 @@ def archived_in_tolerant(s):
         raise SystemExit("the WAL archive could not be turned on")
     migrated(s, "the archive on")
     settled = happens(settled_everywhere, 900, every=5)
-    s.check(settled, f"restore: every member ready with the archive on, {time.time() - began:.0f}s after the upgrades")
+    s.check(settled, "restore: every member ready with the archive on after the upgrades")
+    figure("restore: every member ready with the archive on", took_s=round(time.time() - began))
     if not settled:
         raise SystemExit("the deployment did not settle with the archive on")
     s.check(not under_patroni(), "restore: the base backup is taken from the database alone, as tolerant runs it")
@@ -4163,13 +4191,15 @@ def write_ahead_bound(s):
     found_at = min((at for _, at in first.values()), default=0)
     at_once = (found_at / 1e9 - let_go) if found_at else None
     s.check(unattributed, "write-ahead-bound: a gap recorded the moment the stream skipped, its datasets not "
-            f"yet known ({len(first)} gap(s)"
-            + (f", recorded {at_once:.1f}s after the writer was let go)" if at_once is not None else ")"))
+            f"yet known ({len(first)} gap(s))")
+    figure("write-ahead-bound: a gap recorded after the writer was let go",
+           recorded_s=None if at_once is None else round(at_once, 2))
     found = happens(lambda: gaps_of(dataset, since), 180, every=3)
     took = time.time() - let_go
     gaps = gaps_of(dataset, since)
     s.check(found, f"write-ahead-bound: the gap the stream left in {dataset} recorded "
-            f"({len(gaps)} gap(s), {took:.1f}s after the writer was let go)")
+            f"({len(gaps)} gap(s))")
+    figure(f"write-ahead-bound: the gap in {dataset} recorded after the writer was let go", recorded_s=round(took, 2))
     # Then the dataset's own gap, naming the one found when the stream
     # skipped (found_in_gap_id).
     named = gaps_found_in(dataset, since)
@@ -4338,8 +4368,8 @@ def trust_targets(s, failure, began_ms):
             last = at
     longest = max(longest, ended_ms - last)
     s.check(empty == 0, f"{failure}: never blank: every read the page answered drew a row ({len(reads)} reads, "
-            f"{empty} empty, {failed} failed and left the page as drawn; longest without a fresh answer "
-            f"{longest / 1000:.1f} s)")
+            f"{empty} empty, {failed} failed and left the page as drawn)")
+    figure(f"{failure}: the page's longest stretch without a fresh answer", longest_s=round(longest / 1000, 2))
     newest = lake_newest(began_ms, ended_ms)
     late, live_while_stale, flagged = 0.0, 0, 0
     held_valid = None
@@ -4365,7 +4395,7 @@ def trust_targets(s, failure, began_ms):
     s.check(live_while_stale == 0 or late <= STALE_FLAG_S,
             f"{failure}: stale on time: the page flagged its price stale within {STALE_AFTER_S} s + "
             f"{STALE_FLAG_S} s of it turning stale ({flagged} stale second(s) flagged, "
-            f"{live_while_stale} shown live, at most {late:.1f} s late)")
+            f"{live_while_stale} shown live)")
     claim(s, f"{failure}", "page", late, STALE_FLAG_S,
           {"what": "the buy-side trust targets: the page's stale flag past its threshold, and blank reads",
            "stale_after_s": STALE_AFTER_S, "stale_seconds_flagged": flagged,
@@ -4927,7 +4957,8 @@ def rebalance(s):
         moves(s, dash)
     finally:
         dash.close()
-    print(f"R: rebalance held, {time.time() - began:.0f}s", flush=True)
+    print("R: rebalance held", flush=True)
+    figure("rebalance: the class, start to end", took_s=round(time.time() - began))
 
 
 def moves(s, dash):
@@ -5454,7 +5485,8 @@ def writer_groups(s):
         s.check(to_one > 0, f"writer groups: writes handed to group 1 on {topic} ({to_one} as the broker counts)")
     s.note(f"writer groups: the hand-offs by topic and queue group: {counts}")
     driver_rpo_held(s, "writer groups")
-    print(f"G: two writer groups held, {(time.time() * 1000 - began_ms) / 1000:.0f}s", flush=True)
+    print("G: two writer groups held", flush=True)
+    figure("writer groups: the class, start to end", took_s=round((time.time() * 1000 - began_ms) / 1000))
 
 
 def main():
