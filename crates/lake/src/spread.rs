@@ -593,11 +593,11 @@ impl Store for Spread {
     fn take_shard(
         &self,
         took: meridian_domain::v1::ShardTookOver,
-        lease_transitions: u64,
+        taking: &meridian_changes::shard_fence::Taking,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
         // Numbered at home, where the control partition is; every other
         // database is raised by the group's raise (step 3d, item 32).
-        self.own().take_shard(took, lease_transitions)
+        self.own().take_shard(took, taking)
     }
 
     fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
@@ -621,8 +621,8 @@ impl Store for Spread {
     }
 
     fn reseat_shards(&self) -> Result<usize> {
-        // Every database, each from database 0's records (review c5a H1,
-        // L1): a database added later holds them before it serves.
+        // Every database, each from database 0's rows (review c5a L1,
+        // c5a3 H1): a database added later holds them before it serves.
         let mut raised = 0;
         for store in &self.stores {
             raised += store.reseat_shards()?;

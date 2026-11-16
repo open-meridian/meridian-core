@@ -863,20 +863,20 @@ pub trait Store: Send + Sync {
     }
 
     /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch
-    /// numbered max(the epoch held + 1, the highest its records name + 1,
-    /// `lease_transitions`), at least 1, and answered in `took`. Nothing is
-    /// recorded yet: [`Store::record_shard_take`] records it once every
-    /// writer group raised it (review c5a M4). Refused
-    /// [`StoreError::ShardFenced`] where `lease_transitions` is below the
-    /// highest a take of the shard was numbered with (M2). The control
-    /// writer's (group 0's): its database holds the epoch takes are
-    /// numbered by.
+    /// numbered max(the epoch held + 1, the Lease's transitions), at least
+    /// 1, kept with the stream's place the control writer found (review
+    /// c5a3 M1), and answered in `took`. Nothing is recorded yet:
+    /// [`Store::record_shard_take`] records it once every writer group
+    /// raised it (review c5a M4). Refused [`StoreError::ShardFenced`] where
+    /// the transitions are below the highest a take of the shard was
+    /// numbered with on the same Lease (M2, c5a2 N5). The control writer's
+    /// (group 0's): its database holds the epoch takes are numbered by.
     fn take_shard(
         &self,
         took: meridian_domain::v1::ShardTookOver,
-        lease_transitions: u64,
+        taking: &meridian_changes::shard_fence::Taking,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
-        let _ = (took, lease_transitions);
+        let _ = (took, taking);
         Err(StoreError::Unavailable(
             "this store keeps no shard epochs: the lake's control writer does".into(),
         ))
@@ -911,10 +911,11 @@ pub trait Store: Send + Sync {
         ))
     }
 
-    /// Every plugin shard's epoch raised, in every database this member
-    /// writes, to the highest its `ShardTookOver` records name: as a member
-    /// starts, so a database that lost a raise, or joined later, holds it
-    /// before it serves (review c5a H1, L1). Answers how many were raised.
+    /// Every plugin shard database 0 numbers made, with its epoch and place,
+    /// in every database this member writes that holds none of it: as a
+    /// member starts, so a database added later holds it before it serves
+    /// (review c5a L1). A row a database holds is never raised (c5a3 H1).
+    /// Answers how many were made.
     fn reseat_shards(&self) -> Result<usize> {
         Ok(0)
     }

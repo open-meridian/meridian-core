@@ -1245,6 +1245,10 @@ message TakeShardRequest {
   string previous_holder = 5;
   // LEASE_LAPSED or RELEASED, as the sidecar found the Lease.
   TakeoverReason reason = 6;
+  // The Lease's metadata.uid as the sidecar read it: a take naming another
+  // uid than the one the epoch's floor was seen on -- a Lease made again --
+  // starts the floor afresh.
+  string lease_uid = 7;
 }
 
 message TakeShardReply {

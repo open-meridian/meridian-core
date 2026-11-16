@@ -282,6 +282,7 @@ impl<L: Leases + 'static> ShardSet<L> {
             from: elector.took_from().flatten().unwrap_or_default(),
             holder: elector.settings().holder.clone(),
             free: elector.took_free(),
+            lease_uid: elector.uid().unwrap_or_default(),
         })
     }
 
@@ -588,6 +589,9 @@ pub struct Taken {
     pub holder: String,
     /// Whether the Lease was free: released, or never held.
     pub free: bool,
+    /// The Lease object's uid as it read it: the lake keeps the floor of
+    /// transitions on it (review c5a2 N5).
+    pub lease_uid: String,
 }
 
 /// How long a take waits for the lake: the lake's confirm window and the
@@ -628,10 +632,14 @@ pub async fn raise_epoch<L: Leases + 'static>(
         from: previous_holder,
         holder,
         free,
+        lease_uid,
     } = set
         .taken()
         .await
         .ok_or("this pod holds no shard to raise the epoch of")?;
+    if lease_uid.is_empty() {
+        return Err("the shard's Lease was taken unread: its uid is not known".into());
+    }
     let reason = if free {
         meridian_domain::v1::TakeoverReason::Released
     } else {
@@ -644,6 +652,7 @@ pub async fn raise_epoch<L: Leases + 'static>(
         holder,
         previous_holder,
         reason: reason as i32,
+        lease_uid,
     };
     let (_, body) = bus
         .call(
@@ -672,30 +681,48 @@ pub async fn raise_epoch<L: Leases + 'static>(
 }
 
 /// The book's fences raised to the lake's records, asked again every few
-/// seconds until it is done: as a book writer starts, and on a new database
-/// timeline (review c5a H1). Said once raised, and once failing.
-pub async fn raise_book_until_done<F>(bus: Arc<meridian_bus::Bus>, raise: F)
+/// seconds until it is done or `within` has passed: as a book writer
+/// starts, and on a new database timeline (review c5a H1). Best effort: a
+/// backstop, since every book raise commits on the synchronous standby
+/// (review c5a3 M2). Said once raised, once failing, and once given up.
+/// Answers whether it was done.
+pub async fn raise_book_until_done<F>(
+    bus: Arc<meridian_bus::Bus>,
+    raise: F,
+    within: Duration,
+) -> bool
 where
     F: Fn(&str, u32, u64) -> Result<u64, String> + Clone + Send + Sync + 'static,
 {
-    let mut said_failing = false;
-    loop {
-        match raise_book_to_records(&bus, raise.clone()).await {
-            Ok(shards) => {
-                tracing::info!(
-                    shards,
-                    "the book's plugin shard fences raised to the lake's records of their takes"
-                );
-                return;
+    let raising = async {
+        let mut said_failing = false;
+        loop {
+            match raise_book_to_records(&bus, raise.clone()).await {
+                Ok(shards) => {
+                    tracing::info!(
+                        shards,
+                        "the book's plugin shard fences raised to the lake's records of their takes"
+                    );
+                    return;
+                }
+                Err(failed) if !said_failing => {
+                    tracing::warn!(%failed, "the book's plugin shard fences were not raised to the lake's records; asking again");
+                    said_failing = true;
+                }
+                Err(_) => {}
             }
-            Err(failed) if !said_failing => {
-                tracing::warn!(%failed, "the book's plugin shard fences were not raised to the lake's records; asking again");
-                said_failing = true;
-            }
-            Err(_) => {}
+            tokio::time::sleep(RECORDS_PAGE_WITHIN).await;
         }
-        tokio::time::sleep(RECORDS_PAGE_WITHIN).await;
+    };
+    let done = tokio::time::timeout(within, raising).await.is_ok();
+    if !done {
+        tracing::warn!(
+            within_s = within.as_secs(),
+            "the book's plugin shard fences were not raised to the lake's records in time; \
+             serving on: each take raises every book group before it is answered"
+        );
     }
+    done
 }
 
 /// The book's fences raised to the lake's records again each time a store
@@ -711,13 +738,13 @@ where
         let now = meridian_changes::timeline::raised();
         if now != seen {
             seen = now;
-            raise_book_until_done(Arc::clone(&bus), raise.clone()).await;
+            raise_book_until_done(Arc::clone(&bus), raise.clone(), RECORDS_WITHIN).await;
         }
     }
 }
 
 /// How long the whole read of the lake's records of the takes may take
-/// (review c5a2 N6): a book that cannot read them in it does not serve.
+/// (review c5a2 N6), and how long a book asks again for it (c5a3 M2).
 pub const RECORDS_WITHIN: Duration = Duration::from_secs(30);
 
 /// How long one page of the lake's control partition is waited for, read
@@ -819,6 +846,8 @@ mod tests {
         down: AtomicBool,
         /// When each Lease was last written.
         written: Mutex<HashMap<String, tokio::time::Instant>>,
+        /// How many Leases were made: each made one's uid.
+        made: std::sync::atomic::AtomicU64,
     }
 
     impl Memory {
@@ -861,6 +890,8 @@ mod tests {
             }
             let mut record = record.clone();
             record.resource_version = "1".into();
+            // The API server's: a Lease made again has another.
+            record.uid = format!("{name}@{}", self.made.fetch_add(1, Ordering::SeqCst));
             leases.insert(name.to_string(), record);
             self.wrote(name);
             Ok(Wrote::Done("1".into()))
@@ -877,6 +908,7 @@ mod tests {
             let next = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
             let mut record = record.clone();
             record.resource_version = next.clone();
+            record.uid = current.uid.clone();
             leases.insert(name.to_string(), record);
             self.wrote(name);
             Ok(Wrote::Done(next))
@@ -1347,8 +1379,13 @@ mod tests {
                 .unwrap()
                 .expect("a shard");
             *renewal.lock().unwrap() = Some(set.renewal());
-            let transitions = set.taken().await.unwrap().transitions;
-            *epoch.lock().unwrap() = fence.take("feed-1", mine, transitions).unwrap();
+            let taken = set.taken().await.unwrap();
+            let taking = meridian_changes::shard_fence::Taking {
+                lease_transitions: taken.transitions,
+                lease_uid: taken.lease_uid,
+                admit: None,
+            };
+            *epoch.lock().unwrap() = fence.take("feed-1", mine, &taking).unwrap();
             let kept = set.keep(|_| {}, stop).await;
             (At::now(), kept)
         })
@@ -1505,6 +1542,18 @@ mod tests {
                 meridian_domain::v1::TakeoverReason::LeaseLapsed as i32
             )
         );
+        // The Lease object's uid, as the API server holds it (c5a2 N5).
+        let uid = api
+            .leases
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .uid
+            .clone();
+        assert!(!uid.is_empty());
+        assert_eq!(request.lease_uid, uid);
         assert_eq!(bus.shard_stamped(), Some((0, 7)));
         bus.call("platform.test.command.write", "t", Vec::new(), None, None)
             .await
@@ -1521,6 +1570,26 @@ mod tests {
         );
     }
 
+    /// Review c5a2 N5: a shard whose Lease was made again -- its
+    /// transitions from 0 -- is taken at a new epoch: the take names the new
+    /// Lease's uid, and the floor the old Lease's takes raised holds it no
+    /// more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_made_again_is_taken_at_a_new_epoch() {
+        let fence = Arc::new(meridian_changes::shard_fence::Memory::default());
+        let old = meridian_changes::shard_fence::Taking {
+            lease_transitions: 7,
+            lease_uid: "the Lease before".into(),
+            admit: None,
+        };
+        assert_eq!(fence.take("feed-1", 0, &old), Ok(7));
+        let bus = lake_numbering(&fence);
+        let api = Arc::new(Memory::default());
+        let mut fresh = pod(&api, 1, "f");
+        assert_eq!(fresh.look(Instant::now(), 0).await, shard(0, &[]));
+        assert_eq!(take_epoch(&bus, "feed-1", &mut fresh).await, Ok(8));
+    }
+
     /// A bus whose lake numbers takes by `fence`, as the control writer does
     /// (refusing a take below the transitions seen), for the tests below.
     fn lake_numbering(fence: &Arc<meridian_changes::shard_fence::Memory>) -> meridian_bus::Bus {
@@ -1534,8 +1603,13 @@ mod tests {
         bus.serve(meridian_lake::service::TAKE_SHARD, move |envelope| {
             let request =
                 meridian_domain::v1::TakeShardRequest::decode(&envelope.payload[..]).unwrap();
+            let taking = meridian_changes::shard_fence::Taking {
+                lease_transitions: request.lease_transitions,
+                lease_uid: request.lease_uid,
+                admit: None,
+            };
             let epoch = numbering
-                .take(&request.instance, request.shard, request.lease_transitions)
+                .take(&request.instance, request.shard, &taking)
                 .map_err(|behind| format!("fenced: transitions seen {}", behind.seen))?;
             Ok((
                 "meridian.v1.TakeShardReply".into(),

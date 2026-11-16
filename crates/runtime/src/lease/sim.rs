@@ -31,6 +31,7 @@ fn to_json(record: &Record) -> Value {
         "renew_time": record.renew_time,
         "transitions": record.transitions,
         "resource_version": record.resource_version,
+        "uid": record.uid,
     })
 }
 
@@ -45,6 +46,7 @@ fn from_json(value: &Value) -> Record {
             .as_str()
             .unwrap_or_default()
             .into(),
+        uid: value["uid"].as_str().unwrap_or_default().into(),
     }
 }
 

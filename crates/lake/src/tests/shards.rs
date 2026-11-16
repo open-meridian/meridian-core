@@ -26,6 +26,7 @@ async fn take(bus: &Bus, shard: u32, transitions: u64) -> Result<u64, String> {
             holder: "feed-pod-b_1".into(),
             previous_holder: "feed-pod-a_1".into(),
             reason: TakeoverReason::LeaseLapsed as i32,
+            lease_uid: "uid-1".into(),
         }
         .encode_to_vec(),
         None,
@@ -200,6 +201,7 @@ async fn a_take_is_answered_inside_the_sidecar_s_wait_however_slow_a_group_is() 
                 instance: INSTANCE.into(),
                 shard: 0,
                 holder: "feed-pod-b_1".into(),
+                lease_uid: "uid-1".into(),
                 ..Default::default()
             }
             .encode_to_vec(),
@@ -233,6 +235,7 @@ async fn a_take_raised_after_its_sidecar_gave_up_is_not_recorded() {
         instance: INSTANCE.into(),
         shard: 0,
         holder: "feed-pod-b_1".into(),
+        lease_uid: "uid-1".into(),
         ..Default::default()
     };
     let late = tokio::task::spawn_blocking(move || {
@@ -249,4 +252,84 @@ async fn a_take_raised_after_its_sidecar_gave_up_is_not_recorded() {
         .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
         .count();
     assert_eq!(recorded, 0, "a take its sidecar gave up on was recorded");
+}
+
+/// Review c5a3 L2: a write is stamped with its place in the write-ahead
+/// stream only once the lake knows the stream's identity, read with the
+/// reader that took it; never in a stream 0, which a place could admit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_s_place_is_never_stamped_in_stream_0() {
+    let (_bus, _zero, _one, lake) = two_groups();
+    let stamp = ShardStamp::of(INSTANCE, 0, 1).unwrap();
+    let unknown = lake.in_stream(stamp.clone(), 100);
+    assert_eq!(
+        (unknown.in_stream, unknown.stream),
+        (0, 0),
+        "a place stamped with no stream's identity"
+    );
+    lake.with_stream(1_790_000_000_000_000_000);
+    let known = lake.in_stream(stamp, 100);
+    assert_eq!(
+        (known.in_stream, known.stream),
+        (100, 1_790_000_000_000_000_000)
+    );
+}
+
+/// Review c5a3 L1: a take's deadline counts from when its sidecar sent it,
+/// not from when the lake received it; a sender's clock ahead never
+/// stretches it past the wait counted from receipt.
+#[test]
+fn a_take_s_deadline_counts_from_its_sending() {
+    use meridian_changes::shard_fence::TAKE_WITHIN;
+    let now = std::time::Instant::now();
+    let wait = |sent_at_ns: i64| service::take_deadline(now, 10_000_000_000, sent_at_ns) - now;
+    let from_receipt = wait(0);
+    assert!(from_receipt < TAKE_WITHIN, "{from_receipt:?}");
+    // Sent 3.4 s before it was received: past the sidecar's wait already.
+    assert_eq!(wait(10_000_000_000 - 3_400_000_000), Duration::ZERO);
+    // Sent 1 s before: a second less.
+    assert_eq!(wait(9_000_000_000), from_receipt - Duration::from_secs(1));
+    // A sender's clock ahead of the lake's: as from receipt.
+    assert_eq!(wait(12_000_000_000), from_receipt);
+}
+
+/// Review c5a3 L1: a take that reached the lake after its sidecar's wait
+/// had passed is refused before it is numbered, and recorded nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_sent_past_its_sidecar_s_wait_is_not_numbered_or_recorded() {
+    let (bus, zero, _one, lake) = two_groups();
+    lake.with_book_groups(1);
+    let book = book_group(&bus, 0);
+    let sent_at = NOW - 3_400_000_000;
+    let envelope = Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: INSTANCE.into(),
+            published_at_ns: sent_at,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let request = TakeShardRequest {
+        instance: INSTANCE.into(),
+        shard: 0,
+        holder: "feed-pod-b_1".into(),
+        lease_uid: "uid-1".into(),
+        ..Default::default()
+    };
+    let late = tokio::task::spawn_blocking(move || lake.take_shard(request, &envelope))
+        .await
+        .unwrap();
+    assert!(late.is_err(), "{late:?}");
+    assert_eq!(book.epoch(INSTANCE, 0), 0, "a late take was raised");
+    let recorded = zero
+        .read_changes(meridian_changes::CONTROL, 0, meridian_changes::PAGE_MOST)
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
+        .count();
+    assert_eq!(
+        recorded, 0,
+        "a take sent past its sidecar's wait was recorded"
+    );
 }

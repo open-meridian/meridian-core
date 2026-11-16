@@ -23,5 +23,9 @@ CREATE TABLE IF NOT EXISTS lake_shard_fence (
     -- it is refused, so a slow pod's late take never fences the holder that
     -- took the Lease after it (review c5a M2; provisional name, item 48).
     lease_transitions bigint NOT NULL DEFAULT 0,
+    -- The uid of the Lease those transitions were seen on: a take naming
+    -- another -- a Lease made again, its transitions from 0 -- starts the
+    -- floor afresh (review c5a2 N5; approved 2026-11-16).
+    lease_uid text NOT NULL DEFAULT '',
     PRIMARY KEY (instance, shard)
 );

@@ -982,10 +982,6 @@ pub async fn write_forever(
         // A stream made again -- its volume lost, or JetStream off and on
         // again -- numbers from its own first: the position was taken in
         // another, and what that one held past it is gone.
-        // Its identity said to the lake for each write's stamp (c5a2 N4).
-        if let Ok(info) = stream.info().await {
-            lake.with_stream(identity(info));
-        }
         if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
             let state = &info.state;
             if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
@@ -999,8 +995,13 @@ pub async fn write_forever(
                 writer.begin_at(state.first_sequence.max(1));
             }
         }
+        // Its identity, read with the reader that takes its writes, said to
+        // the lake for each write's stamp (c5a2 N4, c5a3 L2).
         let mut messages = match follow(&mut stream, writer.next()).await {
-            Ok((messages, _)) => messages,
+            Ok((messages, _, identity)) => {
+                lake.with_stream(identity);
+                messages
+            }
             Err(failed) => {
                 tracing::warn!(%failed, "the write-ahead stream's reader could not be made");
                 tokio::time::sleep(AGAIN_AFTER).await;
@@ -1277,14 +1278,13 @@ pub fn on_leader(leader: Option<&str>, placed: Option<&str>) -> bool {
 async fn follow(
     stream: &mut stream::Stream,
     from: u64,
-) -> Result<(consumer::pull::Stream, bool), String> {
+) -> Result<(consumer::pull::Stream, bool, i64), String> {
     let mut tries = 0;
     loop {
         tries += 1;
-        let leader = stream
-            .info()
-            .await
-            .map_err(|failed| failed.to_string())?
+        let info = stream.info().await.map_err(|failed| failed.to_string())?;
+        let made_at = identity(info);
+        let leader = info
             .cluster
             .as_ref()
             .and_then(|cluster| cluster.leader.clone());
@@ -1320,7 +1320,7 @@ async fn follow(
             return made
                 .messages()
                 .await
-                .map(|messages| (messages, on))
+                .map(|messages| (messages, on, made_at))
                 .map_err(|failed| failed.to_string());
         }
         let name = info.name.clone();
@@ -1579,8 +1579,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (mut messages, on) = follow(&mut stream, 2).await.unwrap();
+        let (mut messages, on, made_at) = follow(&mut stream, 2).await.unwrap();
         assert!(on, "one server: its leader");
+        // The identity is read with the reader, never 0 (review c5a3 L2).
+        assert_ne!(made_at, 0);
+        assert_eq!(made_at, identity(stream.info().await.unwrap()));
         let mut seen = Vec::new();
         while seen.len() < 4 {
             let message = futures_util::StreamExt::next(&mut messages)
@@ -1616,7 +1619,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..12 {
-            let (_, on) = follow(&mut stream, 1).await.unwrap();
+            let (_, on, _) = follow(&mut stream, 1).await.unwrap();
             assert!(on, "placed off the stream's leader");
         }
         context.delete_stream(&name).await.unwrap();

@@ -683,6 +683,36 @@ pub(crate) fn met_by_children(mut heads: BTreeMap<String, u64>) -> BTreeMap<Stri
 /// c5a2 L1).
 const TAKE_ANSWER_BACK: Duration = Duration::from_millis(250);
 
+/// When a take received at `now` (`now_ns` on the lake's clock) must be
+/// answered by: its sidecar's wait counted from `sent_at_ns`, the take's
+/// `published_at_ns`, less the way back (review c5a3 L1); from `now` where
+/// it says none. A sender's clock ahead of the lake's never stretches it
+/// past the wait counted from receipt; one behind only brings it earlier,
+/// and the sidecar asks again.
+pub(crate) fn take_deadline(
+    now: std::time::Instant,
+    now_ns: i64,
+    sent_at_ns: i64,
+) -> std::time::Instant {
+    let wait = meridian_changes::shard_fence::TAKE_WITHIN.saturating_sub(TAKE_ANSWER_BACK);
+    let age = if sent_at_ns > 0 {
+        Duration::from_nanos(now_ns.saturating_sub(sent_at_ns).max(0) as u64)
+    } else {
+        Duration::ZERO
+    };
+    now + wait.saturating_sub(age)
+}
+
+/// A take past its sidecar's wait: refused, recorded nowhere.
+fn late_take() -> String {
+    refusal_with_status(
+        RefusalStatus::Unavailable,
+        &[],
+        "the take was answered after its sidecar stopped waiting: not recorded; its next take \
+         asks again",
+    )
+}
+
 /// One part waiting in a dataset's lane: its rows, its time, and its
 /// plugin shard's stamp (step 3d, checkpoint 5, item 32).
 type LanePart = (Vec<Observation>, i64, Option<crate::store::ShardStamp>);
@@ -1089,6 +1119,21 @@ impl Lake {
 
     fn stream_identity(&self) -> i64 {
         self.stream.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A write's stamp, with its place in the write-ahead stream where this
+    /// member knows the stream's identity; checked as a write from no
+    /// stream where it does not, so a place is never stamped in stream 0
+    /// (review c5a3 L2).
+    pub(crate) fn in_stream(
+        &self,
+        stamp: crate::store::ShardStamp,
+        sequence: u64,
+    ) -> crate::store::ShardStamp {
+        match self.stream_identity() {
+            0 => stamp,
+            identity => stamp.in_stream(sequence, identity),
+        }
     }
 
     /// Its writer group and the lake's count (step 3d).
@@ -2854,8 +2899,8 @@ impl Lake {
             // checked with each of its parts in the batch's transaction, by
             // its place in the stream too: one the stream held before the
             // take reached this group is admitted (review c5a H2).
-            let shard = shard_of(&write.envelope)
-                .map(|stamp| stamp.in_stream(write.sequence, self.stream_identity()));
+            let shard =
+                shard_of(&write.envelope).map(|stamp| self.in_stream(stamp, write.sequence));
             let prepared =
                 rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
                     let keys = row_keys(&rows);
@@ -5889,10 +5934,14 @@ impl Lake {
         request: meridian_domain::v1::TakeShardRequest,
         envelope: &Envelope,
     ) -> Result<meridian_domain::v1::TakeShardReply, String> {
-        // Answered inside the sidecar's wait, the way back allowed for, or
-        // not recorded at all (review c5a2 L1).
-        let until = std::time::Instant::now() + meridian_changes::shard_fence::TAKE_WITHIN
-            - TAKE_ANSWER_BACK;
+        // Answered inside the sidecar's wait, counted from when it sent the
+        // take, the way back allowed for, or not recorded at all (reviews
+        // c5a2 L1, c5a3 L1).
+        let sent_at = envelope
+            .meta
+            .as_ref()
+            .map_or(0, |meta| meta.published_at_ns);
+        let until = take_deadline(std::time::Instant::now(), self.clock.now_ns(), sent_at);
         self.take_shard_until(request, envelope, until)
     }
 
@@ -5919,6 +5968,24 @@ impl Lake {
                 "holder: the Lease's holder the sidecar wrote",
             ));
         }
+        if request.lease_uid.is_empty() {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["lease_uid".to_string()],
+                "lease_uid: the uid of the Lease the sidecar took",
+            ));
+        }
+        if std::time::Instant::now() >= until {
+            return Err(late_take());
+        }
+        // The stream's place before the numbering, kept with the epoch in
+        // database 0's row: group 0's raise finds the epoch there already
+        // (review c5a3 M1).
+        let taking = meridian_changes::shard_fence::Taking {
+            lease_transitions: request.lease_transitions,
+            lease_uid: request.lease_uid.clone(),
+            admit: self.stream_place()?,
+        };
         let took = meridian_domain::v1::ShardTookOver {
             instance: request.instance,
             shard: request.shard,
@@ -5934,20 +6001,26 @@ impl Lake {
         // them.
         let took = self
             .store
-            .take_shard(took, request.lease_transitions)
+            .take_shard(took, &taking)
             .map_err(|failed| refusal_of(failed, "lease_transitions", &[]))?;
         self.confirm_shard(&took)?;
         if std::time::Instant::now() >= until {
-            return Err(refusal_with_status(
-                RefusalStatus::Unavailable,
-                &[],
-                "the take was raised in every writer group after its sidecar stopped waiting: \
-                 not recorded; its next take asks again",
-            ));
+            return Err(late_take());
         }
         self.store
             .record_shard_take(&took)
             .map_err(|failed| failed.to_string())?;
+        if std::time::Instant::now() >= until {
+            // Its record's commit ran past the sidecar's wait: the sidecar
+            // has given up, and is answered nothing it could act on.
+            tracing::warn!(
+                instance = took.instance,
+                shard = took.shard,
+                epoch = took.epoch,
+                "a shard's take was recorded after its sidecar stopped waiting: its holder never serves at that epoch"
+            );
+            return Err(late_take());
+        }
         tracing::info!(
             instance = took.instance,
             shard = took.shard,
@@ -6056,6 +6129,27 @@ impl Lake {
         }
     }
 
+    /// The write-ahead stream's place as this member reads it now, within
+    /// half a raise's ask; none where it writes no stream.
+    fn stream_place(&self) -> Result<Option<meridian_changes::shard_fence::Admit>, String> {
+        let Some(client) = self.write_ahead.get() else {
+            return Ok(None);
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "this member has no runtime to read the stream's place with")?;
+        let client = client.clone();
+        handle
+            .block_on(async move {
+                tokio::time::timeout(
+                    meridian_changes::shard_fence::ASK_EACH / 2,
+                    crate::write_ahead::place(&client),
+                )
+                .await
+                .map_err(|_| "the write-ahead stream's place was not read in time".to_string())?
+            })
+            .map(Some)
+    }
+
     /// This writer group's part of a take (step 3d, checkpoint 5, item 32):
     /// the shard's epoch raised in every database it writes, and the epoch
     /// held after answered.
@@ -6067,24 +6161,7 @@ impl Lake {
         // held through it was sent before the take reached this group
         // (review c5a H2). Not read, the raise is not confirmed, and the
         // control writer asks again.
-        let admit = match self.write_ahead.get() {
-            None => None,
-            Some(client) => {
-                let handle = tokio::runtime::Handle::try_current()
-                    .map_err(|_| "this member has no runtime to read the stream's place with")?;
-                let client = client.clone();
-                Some(handle.block_on(async move {
-                    tokio::time::timeout(
-                        meridian_changes::shard_fence::ASK_EACH / 2,
-                        crate::write_ahead::place(&client),
-                    )
-                    .await
-                    .map_err(|_| {
-                        "the write-ahead stream's place was not read in time".to_string()
-                    })?
-                })?)
-            }
-        };
+        let admit = self.stream_place()?;
         let epoch = self
             .store
             .raise_shard(&took.instance, took.shard, took.epoch, admit)

@@ -453,15 +453,15 @@ impl Store for MemoryStore {
     fn take_shard(
         &self,
         mut took: meridian_domain::v1::ShardTookOver,
-        lease_transitions: u64,
+        taking: &meridian_changes::shard_fence::Taking,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
         let mut held = self.lock();
         // Checked before anything is raised, as Postgres checks it.
         self.fenced(&mut held)?;
         took.epoch = self
             .shards
-            .take(&took.instance, took.shard, lease_transitions)
-            .map_err(|behind| crate::postgres::take_behind(&took, lease_transitions, behind))?;
+            .take(&took.instance, took.shard, taking)
+            .map_err(|behind| crate::postgres::take_behind(&took, taking, behind))?;
         Ok(took)
     }
 

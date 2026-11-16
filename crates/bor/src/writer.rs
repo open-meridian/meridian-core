@@ -155,6 +155,29 @@ pub struct Writer {
     /// commit): then they are published as the batch's one page, in order,
     /// and not again as each act returns.
     batched: bool,
+    stamped: StampedHeld,
+}
+
+/// Whether a book writer holds back commands stamped with a plugin shard's
+/// epoch: while its start-up raise of its shard fences runs in the
+/// background, those alone are refused UNAVAILABLE, "ask again", and every
+/// other command is served at once (review c5a3 M2, ruled 2026-11-16).
+/// Served unless held.
+#[derive(Debug, Clone, Default)]
+pub struct StampedHeld(Arc<std::sync::atomic::AtomicBool>);
+
+impl StampedHeld {
+    pub fn hold(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn serve(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn held(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// An account's placement key: its owner label when one is set, else its
@@ -229,7 +252,13 @@ impl Writer {
             books: Mutex::new(Books::default()),
             bound,
             batched,
+            stamped: StampedHeld::default(),
         }
+    }
+
+    /// Its hold on commands stamped with a plugin shard's epoch.
+    pub fn stamped_held(&self) -> StampedHeld {
+        self.stamped.clone()
     }
 
     fn books(&self) -> std::sync::MutexGuard<'_, Books> {
@@ -253,6 +282,12 @@ impl Store for Writer {
         shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        if shard.is_some() && self.stamped.held() {
+            return Err(crate::store::StoreError::Unavailable(
+                "this book's plugin shard fences are still being raised as it starts: ask again"
+                    .into(),
+            ));
+        }
         // Placed first where it never was (step 3d; section 6.3): by its
         // owner label, read from the conductor once, at its creation.
         if self.inner.placement_needed(account_id)? {

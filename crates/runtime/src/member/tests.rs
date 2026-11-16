@@ -1071,6 +1071,7 @@ async fn a_standby_told_to_stop_between_looks_stops_at_once_and_one_never_told_t
         renew_time: crate::lease::micro_time(now_ns()),
         transitions: 0,
         resource_version: "7".into(),
+        uid: "uid-1".into(),
     });
     let waiting = tokio::spawn(async move {
         stand_by(
@@ -1194,6 +1195,7 @@ async fn a_standby_leaves_a_free_lease_to_a_newer_member_of_its_group() {
         renew_time: crate::lease::micro_time(now_ns()),
         transitions: 1,
         resource_version: "1".into(),
+        uid: "uid-1".into(),
     });
     for n in 2..12u64 {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1295,6 +1297,7 @@ async fn a_stop_after_a_take_whose_answer_was_lost_gives_the_lease_up() {
             renew_time: crate::lease::micro_time(now_ns()),
             transitions: 3,
             resource_version: "7".into(),
+            uid: "uid-1".into(),
         }))),
     };
     let mut elector = Elector::new(

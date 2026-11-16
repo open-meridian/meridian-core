@@ -20,6 +20,7 @@ impl Leases for Memory {
         }
         let mut record = record.clone();
         record.resource_version = "1".into();
+        record.uid = "uid-1".into();
         *held = Some(record);
         Ok(Wrote::Done("1".into()))
     }
@@ -35,6 +36,7 @@ impl Leases for Memory {
         let next = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
         let mut record = record.clone();
         record.resource_version = next.clone();
+        record.uid = current.uid.clone();
         *held = Some(record);
         Ok(Wrote::Done(next))
     }

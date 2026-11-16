@@ -538,22 +538,24 @@ impl PostgresStore {
             |tx| raise(tx, &by, None),
         )
         .map_err(unavailable)?;
-        // A new timeline: every plugin shard's epoch raised again to
-        // database 0's, in the same transaction, as the writer's own is
-        // (review c5a H1). Database 0's own rows commit on the synchronous
-        // standby (c5a2 N1), so they are their own backstop.
+        // A new timeline: every plugin shard this database holds no row of
+        // made from database 0's, in the same transaction, as the writer's
+        // own epoch is raised (review c5a H1, L1). A row it holds is never
+        // raised: every raise commits on the synchronous standby (c5a2 N1),
+        // so one below database 0's is a take still being raised, and an
+        // honest write's replay before that take's raise passes (c5a3 H1).
         if let meridian_changes::timeline::Timeline::Moved(_) = found {
             let numbered = self.numbered_shards()?;
-            let raised = meridian_changes::shard_fence::raise_all(
+            let made = meridian_changes::shard_fence::seat(
                 &mut tx,
                 meridian_changes::shard_fence::LAKE,
                 &numbered,
             )
             .map_err(unavailable)?;
-            if raised > 0 {
+            if made > 0 {
                 tracing::warn!(
-                    raised,
-                    "plugin shards' epochs raised again to their records' on the new timeline"
+                    made,
+                    "plugin shards' fence rows this database lacked made from database 0's on the new timeline"
                 );
             }
         }
@@ -1755,14 +1757,16 @@ fn shards_checked<'a>(
 /// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits.
 pub(crate) fn take_behind(
     took: &meridian_domain::v1::ShardTookOver,
-    lease_transitions: u64,
+    taking: &meridian_changes::shard_fence::Taking,
     behind: meridian_changes::shard_fence::TakeBehind,
 ) -> StoreError {
+    let lease_transitions = taking.lease_transitions;
     tracing::warn!(
         instance = took.instance,
         shard = took.shard,
         holder = took.holder,
         lease_transitions,
+        lease_uid = taking.lease_uid,
         seen = behind.seen,
         "a shard's take refused: a later take of its Lease was numbered already"
     );
@@ -1779,11 +1783,13 @@ pub(crate) fn take_behind(
 }
 
 impl PostgresStore {
-    /// Each plugin shard's epoch as the database numbering the takes holds
-    /// it -- database 0's `lake_shard_fence`, committed on the synchronous
-    /// standby (review c5a2 N1, N6) -- where this store is another
-    /// database's; none where it is database 0's own.
-    fn numbered_shards(&self) -> Result<BTreeMap<(String, u32), u64>> {
+    /// Each plugin shard's epoch and place as the database numbering the
+    /// takes holds them -- database 0's `lake_shard_fence`, committed on the
+    /// synchronous standby (review c5a2 N1, N6) -- where this store is
+    /// another database's; none where it is database 0's own.
+    fn numbered_shards(
+        &self,
+    ) -> Result<BTreeMap<(String, u32), meridian_changes::shard_fence::Held>> {
         match self.home_of(0) {
             Some(home) if !std::ptr::eq(home.as_ref(), self) => {
                 meridian_changes::shard_fence::held(
@@ -2977,7 +2983,7 @@ impl Store for PostgresStore {
     fn take_shard(
         &self,
         mut took: meridian_domain::v1::ShardTookOver,
-        lease_transitions: u64,
+        taking: &meridian_changes::shard_fence::Taking,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
         if !self.groups.holds_control() {
             return Err(StoreError::Unavailable(
@@ -2994,12 +3000,12 @@ impl Store for PostgresStore {
             meridian_changes::shard_fence::LAKE,
             &took.instance,
             took.shard,
-            lease_transitions,
+            taking,
         )
         .map_err(unavailable)?;
         took.epoch = match numbered {
             Ok(epoch) => epoch,
-            Err(behind) => return Err(take_behind(&took, lease_transitions, behind)),
+            Err(behind) => return Err(take_behind(&took, taking, behind)),
         };
         tx.commit().map_err(unavailable)?;
         Ok(took)
@@ -3049,17 +3055,17 @@ impl Store for PostgresStore {
     }
 
     fn reseat_shards(&self) -> Result<usize> {
-        let recorded = self.numbered_shards()?;
+        let numbered = self.numbered_shards()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let raised = meridian_changes::shard_fence::raise_all(
+        let made = meridian_changes::shard_fence::seat(
             &mut tx,
             meridian_changes::shard_fence::LAKE,
-            &recorded,
+            &numbered,
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
-        Ok(raised)
+        Ok(made)
     }
 
     fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {

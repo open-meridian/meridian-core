@@ -88,6 +88,10 @@ pub struct Record {
     pub renew_time: String,
     pub transitions: u64,
     pub resource_version: String,
+    /// The Lease object's `metadata.uid`, the API server's: one Lease made
+    /// again has another (step 3d, checkpoint 5, review c5a2 N5). Empty
+    /// before a read.
+    pub uid: String,
 }
 
 /// What a write of a Lease answered.
@@ -238,6 +242,16 @@ impl<L: Leases> Elector<L> {
         self.observed.as_ref().map(|(record, _)| record.transitions)
     }
 
+    /// The Lease object's uid as this member last read it: what the lake
+    /// keeps a shard's floor of transitions on (review c5a2 N5). None
+    /// before a read of it.
+    pub fn uid(&self) -> Option<String> {
+        self.observed
+            .as_ref()
+            .map(|(record, _)| record.uid.clone())
+            .filter(|uid| !uid.is_empty())
+    }
+
     /// When this member last renewed as holder.
     pub fn renewed_at(&self) -> Option<Instant> {
         self.renewed_at
@@ -306,6 +320,7 @@ impl<L: Leases> Elector<L> {
                 renew_time: stamp,
                 transitions: 0,
                 resource_version: String::new(),
+                uid: String::new(),
             };
             return match self.api.create(&self.settings.name, &record).await? {
                 Wrote::Done(version) => {
@@ -357,6 +372,7 @@ impl<L: Leases> Elector<L> {
                 current.transitions + 1
             },
             resource_version: current.resource_version.clone(),
+            uid: current.uid.clone(),
         };
         match self.api.update(&self.settings.name, &record).await? {
             Wrote::Done(version) => {
@@ -600,6 +616,7 @@ pub fn record_of(lease: &serde_json::Value) -> Record {
         renew_time: text(&spec["renewTime"]),
         transitions: spec["leaseTransitions"].as_u64().unwrap_or(0),
         resource_version: text(&lease["metadata"]["resourceVersion"]),
+        uid: text(&lease["metadata"]["uid"]),
     }
 }
 

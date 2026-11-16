@@ -26293,6 +26293,19 @@
       "store": "conductor"
     },
     {
+      "name": "meridian.v1.TakeShardRequest.lease_uid",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the Lease object the floor was seen on (W8.3; approved 2026-11-16, review c5a2 N5)",
+      "meaning": "the Lease's metadata.uid as the sidecar read it taking the Lease; a take naming another uid than the one the lake's floor of lease_transitions was seen on -- a Lease made again, whose transitions start at 0 -- starts that floor afresh",
+      "not_meaning": "a pod's or a holder's identity",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
       "name": "meridian.v1.TakeShardRequest.holder",
       "type": "text",
       "empty": "never empty",

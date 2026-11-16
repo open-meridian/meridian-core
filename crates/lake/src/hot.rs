@@ -804,9 +804,9 @@ impl Store for HotStore {
     fn take_shard(
         &self,
         took: meridian_domain::v1::ShardTookOver,
-        lease_transitions: u64,
+        taking: &meridian_changes::shard_fence::Taking,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
-        self.inner.take_shard(took, lease_transitions)
+        self.inner.take_shard(took, taking)
     }
 
     fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {

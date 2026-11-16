@@ -504,11 +504,10 @@ fn run() -> Result<(), String> {
         // tail (step 3a).
         // and each account's book at its head held in memory, bounded by
         // bor.hotLayer.booksMiB (the hot layer).
-        let store: Arc<dyn meridian_bor::Store> = Arc::new(meridian_bor::writer::Writer::bounded(
-            record.clone(),
-            bus.clone(),
-            books_bound,
-        ));
+        let writer =
+            meridian_bor::writer::Writer::bounded(record.clone(), bus.clone(), books_bound);
+        let stamped = writer.stamped_held();
+        let store: Arc<dyn meridian_bor::Store> = Arc::new(writer);
         // A new database timeline raises the epoch (contract v30, stage C):
         // the books held let go of what the record may have lost.
         // Its plugin shard fences, too: raised again to the lake's records of
@@ -524,26 +523,27 @@ fn run() -> Result<(), String> {
                 .follow_timeline()
                 .map_err(|failed| failed.to_string())
         });
-        // As it starts, before it serves: not served until done, within its
-        // bound (review c5a H1, L1: a database added later too; c5a2 N3).
-        let shards = meridian_runtime::shards::raise_book_to_records(&bus, raise_book.clone())
-            .await
-            .map_err(|failed| {
-                format!(
-                    "the book's plugin shard fences were not raised to the lake's records: {failed}; \
-                     not serving"
+        // As it starts, in the background once it serves, best effort and
+        // bounded (review c5a3 M2, ruled 2026-11-16): a backstop, since
+        // every raise commits on the synchronous standby and every take
+        // needs every book group's. Until it ends, only commands stamped
+        // with a shard's epoch are held back, UNAVAILABLE, "ask again";
+        // every other is served at once. Then on each new database
+        // timeline, whichever connection met it first (c5a2 N3).
+        stamped.hold();
+        meridian_runtime::background({
+            let (bus, raise_book) = (Arc::clone(&bus), raise_book.clone());
+            async move {
+                meridian_runtime::shards::raise_book_until_done(
+                    Arc::clone(&bus),
+                    raise_book.clone(),
+                    meridian_runtime::shards::RECORDS_WITHIN,
                 )
-            })?;
-        tracing::info!(
-            shards,
-            "the book's plugin shard fences raised to the lake's records"
-        );
-        // And on each new database timeline, whichever connection met it
-        // first (c5a2 N3).
-        meridian_runtime::background(meridian_runtime::shards::raise_book_on_new_timelines(
-            Arc::clone(&bus),
-            raise_book,
-        ));
+                .await;
+                stamped.serve();
+                meridian_runtime::shards::raise_book_on_new_timelines(bus, raise_book).await;
+            }
+        });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // This writer group's raise of a plugin shard's epoch (step 3d,

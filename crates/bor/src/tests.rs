@@ -2521,6 +2521,64 @@ async fn a_book_readers_reply_says_the_position_it_was_answered_at() {
 /// FAILED_PRECONDITION's REFUSAL_REASON_SHARD_FENCED and journals nothing;
 /// equal passes; higher raises; a raise the lake's control writer asks is
 /// seen by the next command.
+/// Review c5a3 M2 (ruled 2026-11-16): a book writer serves at once as it
+/// starts; while its start-up raise of its shard fences runs, it holds back
+/// only commands stamped with a shard's epoch, UNAVAILABLE, "ask again",
+/// and serves them once the raise has ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_book_holds_back_only_shard_stamped_commands() {
+    let store = Arc::new(MemoryStore::new());
+    let writer = crate::writer::Writer::new(
+        store.clone(),
+        Arc::new(Bus::single(
+            "operations-sample-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+        )),
+    );
+    let held = writer.stamped_held();
+    held.hold();
+    let writer: Arc<dyn Store> = Arc::new(writer);
+    let pod = |epoch: u64| {
+        let bus = Arc::new(Bus::single(
+            "operations-sample-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+        ));
+        serve(bus.clone(), writer.clone(), bus.clock());
+        resolving(&bus);
+        if epoch > 0 {
+            bus.stamp_shard(0, epoch).unwrap();
+        }
+        bus
+    };
+    let (stamped, plain) = (pod(1), pod(0));
+    let send_opening = |bus: Arc<Bus>, account: &'static str| {
+        let request = RecordOpeningBalanceRequest {
+            account_id: account.into(),
+            idempotency_key: format!("open-{account}"),
+            ..opening()
+        };
+        async move {
+            send(
+                &bus,
+                RECORD_OPENING_BALANCE,
+                "meridian.v1.RecordOpeningBalanceRequest",
+                &request,
+                Some(PERSON),
+            )
+            .await
+        }
+    };
+    let refused = send_opening(Arc::clone(&stamped), "ACC-H1")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("ask again"), "{refused}");
+    send_opening(Arc::clone(&plain), "ACC-H2").await.unwrap();
+    held.serve();
+    send_opening(Arc::clone(&stamped), "ACC-H1").await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_under_a_lower_shard_epoch_is_refused_on_the_memory_book() {
     let store = Arc::new(MemoryStore::new());

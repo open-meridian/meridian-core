@@ -24509,6 +24509,11 @@ pub struct TakeShardRequest {
     /// LEASE_LAPSED or RELEASED, as the sidecar found the Lease.
     #[prost(enumeration = "TakeoverReason", tag = "6")]
     pub reason: i32,
+    /// The Lease's metadata.uid as the sidecar read it: a take naming another
+    /// uid than the one the epoch's floor was seen on -- a Lease made again --
+    /// starts the floor afresh.
+    #[prost(string, tag = "7")]
+    pub lease_uid: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct TakeShardReply {

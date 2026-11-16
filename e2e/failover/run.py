@@ -1392,16 +1392,58 @@ QUEUE_MADE = "the units go by JetStream's work queue"
 QUEUE_NOT_THERE = "the units' work queue is not there"
 
 
+# The lake's write-ahead stream (meridian_bus::write_ahead::STREAM).
+WRITE_AHEAD_STREAM = "LAKE_WRITE_AHEAD"
+
+
+def write_ahead_made():
+    """Each broker server's view of the lake's write-ahead stream: its
+    `created`, which the lake takes as the stream's identity (a plugin
+    shard's raise keeps its place in it, review c5a2 N4), and its leader,
+    by server, from /jsz on every server holding a replica of it."""
+    path = "/jsz?streams=true&config=true"
+    seen = {}
+    for server in broker_servers():
+        status, said = monitored(server, (path,))[path]
+        if status != 200:
+            continue
+        try:
+            jsz = json.loads(said)
+        except ValueError:
+            continue
+        for account in jsz.get("account_details") or []:
+            for stream in account.get("stream_detail") or []:
+                if stream.get("name") == WRITE_AHEAD_STREAM:
+                    seen[server] = (stream.get("created"), (stream.get("cluster") or {}).get("leader"))
+    return seen
+
+
 def jetstream_rolled(s):
     """The broker's servers restarted one at a time, as an upgrade rolls
     them, and JetStream still there after: each analytics copy restarted
     makes or finds its stream at three, rather than going by the queue
     group. CI 42294258528: with the stream in memory, a roll left the three
-    answering "no suitable peers for placement" for twelve minutes."""
+    answering "no suitable peers for placement" for twelve minutes.
+
+    In ha, the lake's write-ahead stream's `created` is the same on every
+    server, and the same after the roll, which moves its leader on each
+    leader's restart (review c5a3 I2): the lake's identity of the stream
+    never changes with the server that answers."""
+    before = write_ahead_made() if PROFILE == "ha" else {}
     kubectl("rollout", "restart", f"statefulset/{broker_set()}")
     rolled = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
                      check=False).returncode == 0
     s.check(rolled, "broker: its servers restarted one at a time")
+    if PROFILE == "ha":
+        servers = len(broker_servers())
+        happens(lambda: len(write_ahead_made()) == servers, 120)
+        after = write_ahead_made()
+        made = {created for created, _ in list(before.values()) + list(after.values())}
+        leaders = sorted({leader or "none" for _, leader in list(before.values()) + list(after.values())})
+        s.check(len(before) == servers and len(after) == servers and len(made) == 1 and None not in made,
+                f"broker: the lake's write-ahead stream's created is one on every server, before and after "
+                f"its leader moved ({len(before)} and {len(after)} of {servers} servers; created "
+                f"{sorted(str(m) for m in made)}; leaders {', '.join(leaders)})")
     parts = ("analytics-coordinator", "analytics-worker")
     for part in parts:
         kubectl("rollout", "restart", f"deployment/{FULL}-{part}")
