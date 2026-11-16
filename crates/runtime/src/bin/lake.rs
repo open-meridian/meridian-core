@@ -373,13 +373,12 @@ fn run() -> Result<(), String> {
         // starting, or waiting on the broker to say it serves, is kept and
         // answered by giving the lease up, never by ending where it stands.
         let mut told = meridian_runtime::stopping();
-        let holding = tokio::select! {
-            holding = member.wait_to_write(&bus) => holding?,
-            // A standby told to stop holds nothing: it stops at once.
-            _ = told.wait_for(|told| *told) => {
-                tracing::info!("stopping");
-                return Ok(());
-            }
+        // A standby told to stop holds nothing and stops at once; a stop
+        // that lands while it takes the lease lets the take finish, then
+        // gives the lease up (ruled 2026-11-15).
+        let Some(holding) = member.wait_to_write_unless(&bus, &mut told).await? else {
+            tracing::info!("stopping");
+            return Ok(());
         };
         // Each range's writer group (step 3d; `writer_group` ruled
         // 2026-11-14): the control partition's group names every one not

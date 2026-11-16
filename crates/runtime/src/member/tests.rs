@@ -948,3 +948,145 @@ fn a_member_says_its_mode_only_once_it_serves() {
     assert_eq!(serving_mode(), "writer");
     set_serving(false);
 }
+
+/// One Lease as the API server keeps it, each write conditional on the
+/// version read, and slow to answer: a write lands at once and its answer
+/// is read `answers_in` later, as a request in flight.
+#[derive(Clone)]
+struct SlowLeases {
+    held: Arc<std::sync::Mutex<Option<crate::lease::Record>>>,
+    answers_in: Duration,
+}
+
+impl Leases for SlowLeases {
+    async fn get(&self, _name: &str) -> Result<Option<crate::lease::Record>, String> {
+        Ok(self.held.lock().unwrap().clone())
+    }
+
+    async fn create(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        {
+            let mut held = self.held.lock().unwrap();
+            if held.is_some() {
+                return Ok(crate::lease::Wrote::Conflict);
+            }
+            let mut record = record.clone();
+            record.resource_version = "1".into();
+            *held = Some(record);
+        }
+        tokio::time::sleep(self.answers_in).await;
+        Ok(crate::lease::Wrote::Done("1".into()))
+    }
+
+    async fn update(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        let next = {
+            let mut held = self.held.lock().unwrap();
+            let Some(current) = held.as_ref() else {
+                return Ok(crate::lease::Wrote::Conflict);
+            };
+            if current.resource_version != record.resource_version {
+                return Ok(crate::lease::Wrote::Conflict);
+            }
+            let next = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
+            let mut record = record.clone();
+            record.resource_version = next.clone();
+            *held = Some(record);
+            next
+        };
+        tokio::time::sleep(self.answers_in).await;
+        Ok(crate::lease::Wrote::Done(next))
+    }
+}
+
+fn standing_by(
+    answers_in: Duration,
+) -> (
+    SlowLeases,
+    Elector<SlowLeases>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    let api = SlowLeases {
+        held: Arc::default(),
+        answers_in,
+    };
+    let elector = Elector::new(
+        api.clone(),
+        crate::lease::Settings {
+            name: "release-bor".into(),
+            holder: "bor-b_1".into(),
+            renew: Duration::from_secs(2),
+            duration: Duration::from_secs(6),
+        },
+    );
+    let (tell, told) = tokio::sync::watch::channel(false);
+    (api, elector, tell, told)
+}
+
+/// A standby is told to stop while its take of the lease is in flight: the
+/// write has landed at the API server and its answer is not read yet.
+/// Ended where it stood, it stopped holding a lease nobody renews, and its
+/// store went unwritten until the lapse. The take is finished and the lease
+/// given up: the stop holds nothing, and the lease is free for the next
+/// member at once.
+#[tokio::test(start_paused = true)]
+async fn a_stop_that_lands_while_the_lease_is_taken_gives_it_up_and_never_ends_holding_it() {
+    let (api, mut elector, tell, mut told) = standing_by(Duration::from_secs(2));
+    let waiting = tokio::spawn(async move {
+        stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told).await
+    });
+    // The take is out: written, not yet answered.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().map(|r| r.holder.clone()),
+        Some("bor-b_1".into()),
+        "the take had not landed when the stop was sent"
+    );
+    tell.send(true).unwrap();
+    let holds = waiting.await.unwrap();
+    assert!(!holds, "told to stop, it went on to write");
+    let left = api.held.lock().unwrap().clone().expect("the lease is gone");
+    assert_eq!(
+        left.holder, "",
+        "it stopped holding the lease: nobody renews it, and nothing is written until it lapses"
+    );
+}
+
+/// A standby told to stop between its looks holds nothing and stops at
+/// once, no look made after; one never told takes a free lease as before.
+#[tokio::test(start_paused = true)]
+async fn a_standby_told_to_stop_between_looks_stops_at_once_and_one_never_told_takes_the_lease() {
+    let (api, mut elector, tell, mut told) = standing_by(Duration::ZERO);
+    *api.held.lock().unwrap() = Some(crate::lease::Record {
+        holder: "bor-a_1".into(),
+        duration_seconds: 6,
+        acquire_time: crate::lease::micro_time(now_ns()),
+        renew_time: crate::lease::micro_time(now_ns()),
+        transitions: 0,
+        resource_version: "7".into(),
+    });
+    let waiting = tokio::spawn(async move {
+        stand_by(&mut elector, Duration::from_secs(3600), "bor", &mut told).await
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let began = tokio::time::Instant::now();
+    tell.send(true).unwrap();
+    assert!(!waiting.await.unwrap());
+    assert_eq!(began.elapsed(), Duration::ZERO, "it waited its look out");
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "bor-a_1",
+        "the writer's lease was touched"
+    );
+
+    let (api, mut elector, _tell, mut told) = standing_by(Duration::ZERO);
+    assert!(stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told).await);
+    assert_eq!(api.held.lock().unwrap().as_ref().unwrap().holder, "bor-b_1");
+}

@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use meridian_bus::Bus;
 use prost::Message as _;
 
-use crate::lease::{Elector, KubeLeases, Settings, Standing};
+use crate::lease::{Elector, KubeLeases, Leases, Settings, Standing};
 use crate::{now_ns, var};
 
 /// The exit a member steps down with: its pod's restart brings it back as
@@ -504,6 +504,27 @@ impl Member {
     /// lag is under its bound, looking at the lease twice a renew, until it
     /// takes it. The member reports as a standby meanwhile.
     pub async fn wait_to_write(&self, bus: &Arc<Bus>) -> Result<Holding, String> {
+        // Never told: the sender is kept for as long as the wait.
+        let (_never, mut told) = tokio::sync::watch::channel(false);
+        match self.wait_to_write_unless(bus, &mut told).await? {
+            Some(holding) => Ok(holding),
+            None => Err(format!(
+                "{} stopped waiting to write, told by nobody",
+                self.component
+            )),
+        }
+    }
+
+    /// [`Member::wait_to_write`], unless told to stop meanwhile: `None`
+    /// then, this member holding nothing. A standby told to stop stops at
+    /// once; a stop that lands while it takes the lease lets the take
+    /// finish and gives the lease up (ruled 2026-11-15): it never ends
+    /// holding one.
+    pub async fn wait_to_write_unless(
+        &self,
+        bus: &Arc<Bus>,
+        told: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<Holding>, String> {
         // A read naming a `read_after` this member has not reached waits up
         // to its bound, `<store>.readyLagMs`, and is never answered from
         // behind it (contract v30, stage B; spec section 5).
@@ -513,12 +534,12 @@ impl Member {
         meridian_changes::set_member(&member_name());
         let Some(settings) = self.lease.clone() else {
             said().set_mode(Mode::Writer);
-            return Ok(Holding {
+            return Ok(Some(Holding {
                 elector: None,
                 component: self.component,
                 why: "",
                 previous: String::new(),
-            });
+            }));
         };
         said().set_mode(Mode::Standby);
         tokio::spawn(report_forever(Arc::clone(bus), self.component));
@@ -533,26 +554,7 @@ impl Member {
             // waits.
             crate::mark_ready(true);
         }
-        let mut said_waiting = false;
-        loop {
-            match elector.look(Instant::now(), now_ns()).await {
-                Ok(Standing::Held) => break,
-                Ok(Standing::HeldBy(holder)) => {
-                    if !said_waiting {
-                        tracing::info!(
-                            component = self.component,
-                            writer = %holder,
-                            "a standby: following the writer until its lease lapses"
-                        );
-                        said_waiting = true;
-                    }
-                }
-                Err(failed) => {
-                    tracing::warn!(component = self.component, %failed, "the lease could not be read; looking again");
-                }
-            }
-            tokio::time::sleep(look_every).await;
-        }
+        let holds = stand_by(&mut elector, look_every, self.component, told).await;
         // Stopped, and waited for: a follower aborted mid-poll on another
         // thread still finished that poll, and its readiness written then
         // -- mode "standby", maybe not ready -- landed after the writer's
@@ -561,6 +563,9 @@ impl Member {
         if let Some(following) = following {
             following.abort();
             let _ = following.await;
+        }
+        if !holds {
+            return Ok(None);
         }
         crate::mark_ready(false);
         said().set_lag_ms(0);
@@ -576,7 +581,7 @@ impl Member {
             Some(Some(_)) => meridian_changes::LEASE_RELEASED,
             _ => meridian_changes::LEASE_FREE,
         };
-        Ok(Holding {
+        Ok(Some(Holding {
             elector: Some(Arc::new(tokio::sync::Mutex::new(elector))),
             component: self.component,
             why,
@@ -584,7 +589,62 @@ impl Member {
                 .flatten()
                 .map(|holder| holder_member(&holder))
                 .unwrap_or_default(),
-        })
+        }))
+    }
+}
+
+/// Stand by on a lease until this member holds it, or is told to stop:
+/// whether it holds it.
+///
+/// A look that is out is always finished, never dropped where it stands:
+/// the write that takes the lease may have landed before its answer is
+/// read, and a member that stopped there would end holding a lease nobody
+/// renews, its store unwritten until the lapse (step 3d, ruled 2026-11-15).
+/// Told to stop, it is heard between looks; where the look just finished
+/// took the lease, the lease is given up before this returns.
+pub(crate) async fn stand_by<L: Leases>(
+    elector: &mut Elector<L>,
+    look_every: Duration,
+    component: &'static str,
+    told: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let mut said_waiting = false;
+    loop {
+        if *told.borrow() {
+            return false;
+        }
+        match elector.look(Instant::now(), now_ns()).await {
+            Ok(Standing::Held) => {
+                if *told.borrow() {
+                    tracing::info!(component, "told to stop as it took the lease: giving it up");
+                    elector.release(now_ns()).await;
+                    return false;
+                }
+                return true;
+            }
+            Ok(Standing::HeldBy(holder)) => {
+                if !said_waiting {
+                    tracing::info!(
+                        component,
+                        writer = %holder,
+                        "a standby: following the writer until its lease lapses"
+                    );
+                    said_waiting = true;
+                }
+            }
+            Err(failed) => {
+                tracing::warn!(component, %failed, "the lease could not be read; looking again");
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(look_every) => {}
+            heard = told.changed() => {
+                // Nobody left to tell it: it waits its look out as before.
+                if heard.is_err() {
+                    tokio::time::sleep(look_every).await;
+                }
+            }
+        }
     }
 }
 
