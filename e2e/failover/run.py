@@ -1362,25 +1362,43 @@ def driver_acked():
     return acked
 
 
-# What the stores hold of the driver, by kind: the store, and its read.
+# What the stores hold of the driver, by kind: the store, and its read --
+# each key, and whether this database is its partition's or range's home:
+# 'left' where its head here is a move's pointer (POINTER_EPOCH), so the
+# key is a copy the move left behind, never read (the review's M1: a lake
+# move keeps the source's rows).
 KEPT_SQL = {
-    "order": ("book", "select order_id from book_order where account_id like 'ACC-DRIVE-%'"),
-    "placement": ("book", "select placement_id from book_placement where account_id like 'ACC-DRIVE-%'"),
-    "price": ("lake", "select row_key from lake_row where dataset = 'drive-data:drive'"),
+    "order": ("book", "select o.order_id || '|' || case when exists (select 1 from book_partition_head h "
+                      "where h.partition = o.partition and h.epoch = -1) then 'left' else 'home' end "
+                      "from book_order o where o.account_id like 'ACC-DRIVE-%'"),
+    "placement": ("book", "select p.placement_id || '|' || case when exists (select 1 from book_partition_head h "
+                          "where h.partition = p.partition and h.epoch = -1) then 'left' else 'home' end "
+                          "from book_placement p where p.account_id like 'ACC-DRIVE-%'"),
+    # A row's range: its `partition`, or its dataset's whole range where
+    # it names none (kept before 3d).
+    "price": ("lake", "select r.row_key || '|' || case when exists (select 1 from lake_partition p "
+                      "where p.dataset = coalesce(nullif(r.partition, ''), r.dataset) and p.epoch = -1) "
+                      "then 'left' else 'home' end from lake_row r where r.dataset = 'drive-data:drive'"),
 }
 KEPT_KINDS = {"book": ("order", "placement"), "lake": ("price",)}
 
 
 def driver_kept_each(pod=None):
-    """What each database of each store holds of the driver, by kind: a
-    set for each of the store's databases, the first first (`pod` in place
+    """What each database of each store holds of the driver at home, by
+    kind: a set for each of the store's databases, the first first (`pod` in place
     of its primary). A partition moved home to database 1 has its
     projections let go in the first (CI 43788516279: the whole run read the
     first alone and counted P0's 1486 orders lost)."""
     databases = {store: store_databases(store) for store in KEPT_KINDS}
-    return {kind: [set(psql(sql, pod=pod if d == 0 and pod else database).split())
+    return {kind: [home_keys(psql(sql, pod=pod if d == 0 and pod else database))
                    for d, database in databases[store]]
             for kind, (store, sql) in KEPT_SQL.items()}
+
+
+def home_keys(said):
+    """The keys a KEPT_SQL read found at home in its database: none left
+    behind by a move."""
+    return {line.split("|", 1)[0] for line in said.split() if not line.endswith("|left")}
 
 
 def driver_kept(pod=None, each=None):
@@ -1422,9 +1440,10 @@ def held_words(at):
 def moved_and_kept(s, what, sampled):
     """The writes acknowledged before a move home (`sampled`, where_now()
     then), where they were and where they are now, by store: counts of each
-    shift. None held before is in none of the store's databases now, and
-    some are in database 1: the run shows writes moving, none vanishing (CI
-    43788516279 read the first database alone)."""
+    shift. Each key held before is held now at its home -- a copy a move
+    left behind in a database it left counts for nothing (the review's M2)
+    -- and some are in database 1: the run shows writes moving, none
+    vanishing (CI 43788516279 read the first database alone)."""
     now = where_kept(set(sampled), driver_kept_each())
     for store, kinds in KEPT_KINDS.items():
         mine = [key for key in sampled if key[0] in kinds]
@@ -1436,8 +1455,8 @@ def moved_and_kept(s, what, sampled):
         moved = any(1 in now[key] for key in mine)
         words = "; ".join(f"{held_words(was)} -> {held_words(is_)}: {n}"
                           for (was, is_), n in sorted(shifts.items()))
-        s.check(not gone and moved, f"{what}: the {store}'s writes acknowledged before the move home are in "
-                f"database 1 or where they were, none in none ({words or 'none sampled'}"
+        s.check(not gone and moved, f"{what}: each of the {store}'s writes acknowledged before the move home is "
+                f"held at its home, database 1 or where it was, none only where a move left it ({words or 'none sampled'}"
                 f"{'; gone: ' + ', '.join(gone[:5]) if gone else ''})")
 
 
@@ -3204,30 +3223,46 @@ def group_counts(s):
     settled_ns = time.time_ns()
 
     def one_group_writes():
+        # The lake's half reads rows into group 1's open ranges of the
+        # driver's dataset, each row by its own range (the review's L3).
         said = psql(
-            "select (select count(*) from lake_partition where dataset = 'drive-data:drive' "
+            "select (select count(*) from lake_partition where split_part(dataset, '/', 1) = 'drive-data:drive' "
             "and closed_at is null and writer_group >= 1), "
-            "(select count(*) from lake_row where dataset = 'drive-data:drive' "
-            f"and recorded_at_ns >= {settled_ns}), "
+            "(select count(*) from lake_row r join lake_partition p "
+            "on p.dataset = coalesce(nullif(r.partition, ''), r.dataset) "
+            "where p.closed_at is null and p.writer_group >= 1 "
+            f"and r.dataset = 'drive-data:drive' and r.recorded_at_ns >= {settled_ns}), "
             "(select count(*) from book_partition_head where partition <> 'control' and writer_group >= 1), "
             "(select count(*) from book_entry e join book_partition_head h on h.partition = e.partition "
             f"where h.writer_group >= 1 and e.committed_at_ns >= {settled_ns}), "
             "(select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
-            f"and committed_at_ns >= {settled_ns})")
-        return [int(n) for n in said.split("|")] if said else [0, 0, 0, 0, 0]
+            f"and committed_at_ns >= {settled_ns}), "
+            "(select count(*) from lake_row where dataset = 'drive-data:drive' "
+            f"and recorded_at_ns >= {settled_ns})")
+        # Nothing read is nothing shown: never a pass (the review's L3).
+        return [int(n) for n in said.split("|")] if said else None
 
-    def written():
-        lake_named, prices, book_named, into_named, entries = one_group_writes()
-        return (lake_named == 0 or prices > 0) and (book_named == 0 or into_named > 0) and prices > 0 and entries > 0
+    happens(lambda: lowered_written(one_group_writes()), 300, every=5)
+    said = one_group_writes()
+    s.check(lowered_written(said, into_only=True), "groups lowered: what group 1 held is written by the one group "
+            "left " + (f"(the driver's dataset: {said[0]} range(s) named group 1, {said[1]} rows into them since; "
+                       f"the book: {said[2]} partition(s) named group 1, {said[3]} entries into them since)"
+                       if said else "(the stores could not be read)"))
+    s.check(bool(said) and said[5] > 0 and said[4] > 0, "groups lowered: the driver's prices and orders committed "
+            "by the one group left " + (f"({said[5]} rows, {said[4]} entries since)" if said else "(not read)"))
 
-    happens(written, 300, every=5)
-    lake_named, prices, book_named, into_named, entries = one_group_writes()
-    s.check((lake_named == 0 or prices > 0) and (book_named == 0 or into_named > 0),
-            "groups lowered: what group 1 held is written by the one group left "
-            f"(the driver's dataset: {lake_named} range(s) named group 1, {prices} rows since; "
-            f"the book: {book_named} partition(s) named group 1, {into_named} entries since)")
-    s.check(prices > 0 and entries > 0, "groups lowered: the driver's prices and orders committed by the one group "
-            f"left ({prices} rows, {entries} entries since)")
+
+def lowered_written(said, into_only=False):
+    """Whether what group 1 held is written by the one group left, from
+    `one_group_writes`' counts: each store's writes into what names group 1
+    since the count settled, where anything names it; and, unless
+    `into_only`, the driver's prices and entries since at all. Nothing read
+    is never written."""
+    if not said:
+        return False
+    lake_named, into_lake, book_named, into_book, entries, prices = said
+    into = (lake_named == 0 or into_lake > 0) and (book_named == 0 or into_book > 0)
+    return into if into_only else into and prices > 0 and entries > 0
 
 
 def two_groups_two_databases(s):
