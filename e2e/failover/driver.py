@@ -391,10 +391,14 @@ async def drive_data(plugin, gen):
                 # every price after its range moved to another writer group
                 # was answered 0, 0, 0): never acknowledged, and kept as a
                 # refusal is, so a move's window holds it to none.
-                words = (f"UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
-                         f"unchanged {done.unchanged} for one row")
-                say(f"REFUSED price {key}: {words}")
-                kept("/tmp/refused", f"REFUSED price {key} {int(time.time() * 1000)} {words}")
+                # Its own name: `words` is the module's function, which the
+                # except below calls (CI 43804841979: a local of that name
+                # made every refused price an UnboundLocalError, which ended
+                # the driver's loop and hid what the lake said).
+                uncounted = (f"UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
+                             f"unchanged {done.unchanged} for one row")
+                say(f"REFUSED price {key}: {uncounted}")
+                kept("/tmp/refused", f"REFUSED price {key} {int(time.time() * 1000)} {uncounted}")
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
             say(f"REFUSED price {key}: {words(failed)}")
             refused("price", key, failed)
