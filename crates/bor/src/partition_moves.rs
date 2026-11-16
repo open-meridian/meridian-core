@@ -398,8 +398,25 @@ impl Mover {
             0
         };
         // Gate: the target's lag under readyLagMs within switchSeconds.
+        // A target group whose writer has not taken over in its database
+        // is not ready at all: it has no epoch, and a move never makes one
+        // (CI 43820357549: an epoch no takeover recorded).
         let gate = Instant::now();
+        let mut ready = false;
         loop {
+            ready = ready || to.group_ready(target)?;
+            if !ready {
+                if gate.elapsed() >= self.settings.switch {
+                    tracing::warn!(
+                        partition,
+                        target,
+                        "a partition's move did not switch: its target group's writer has not taken over"
+                    );
+                    return Ok(aborted(MoveAbortCause::Lag, None));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             let lag = match self.settings.injected_lag() {
                 Some(lag) => lag,
                 None if !across => Duration::ZERO,
@@ -796,5 +813,23 @@ fn rebalance_one(mover: &Mover, partition: &str) -> Option<Result<Ended>> {
         }
     }
     let target = if away.is_some() { now } else { wanted };
+    // Its group's writer not taken over in its database yet -- the count
+    // raised, and it has not started: left to a later sweep, never moved
+    // under an epoch no takeover recorded (CI 43820357549).
+    match mover.database_of(target).group_ready(target) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                partition,
+                target,
+                "a partition is not moved yet: its writer group's writer has not taken over"
+            );
+            return None;
+        }
+        Err(failed) => {
+            tracing::warn!(partition, %failed, "a partition's target group was not read");
+            return None;
+        }
+    }
     Some(mover.run_alone(partition, target, &Asked::default(), away))
 }

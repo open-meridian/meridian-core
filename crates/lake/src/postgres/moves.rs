@@ -111,9 +111,23 @@ const ANCHOR_SQL: &str =
 /// The epoch writer group `group` commits under in this database: the
 /// control partition's for group 0, its `lake_writer_group` row's past it
 /// (kept while it owns nothing, so a range moved back carries the epoch its
-/// writer holds). A group with no row yet -- its writer never started -- is
-/// given one past every epoch, which its writer adopts at its start.
+/// writer holds). A group with no row yet -- its writer has not taken over
+/// here -- has none, and a move never makes one: an epoch no takeover
+/// recorded (the book's CI 43820357549, reconfigure). Its move waits at
+/// the gate until its writer has taken over ([`PostgresStore::group_ready`]).
 fn group_epoch(client: &mut impl GenericClient, group: u32) -> Result<u64> {
+    own_epoch(client, group)?.ok_or_else(|| {
+        StoreError::Unavailable(format!(
+            "writer group {group} has no epoch in this database yet: its writer has not taken over, \
+             so nothing is moved to it"
+        ))
+    })
+}
+
+/// Writer group `group`'s own epoch in this database: the control
+/// partition's for group 0, its `lake_writer_group` row's past it; none
+/// where it has no row yet.
+fn own_epoch(client: &mut impl GenericClient, group: u32) -> Result<Option<u64>> {
     let found = if group == 0 {
         client.query_opt(
             "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
@@ -126,29 +140,18 @@ fn group_epoch(client: &mut impl GenericClient, group: u32) -> Result<u64> {
         )
     }
     .map_err(unavailable)?;
-    if let Some(row) = found {
-        return Ok(row.get::<_, i64>(0) as u64);
-    }
-    client
-        .execute(
-            "INSERT INTO lake_writer_group (writer_group, epoch, origin)
-             SELECT $1, greatest(coalesce((SELECT max(epoch) FROM lake_change_head), 0),
-                                 coalesce((SELECT max(epoch) FROM lake_partition), 0),
-                                 coalesce((SELECT max(epoch) FROM lake_writer_group), 0)) + 1, $2
-             ON CONFLICT (writer_group) DO NOTHING",
-            &[&(group as i32), &meridian_changes::origin()],
-        )
-        .map_err(unavailable)?;
-    Ok(client
-        .query_one(
-            "SELECT epoch FROM lake_writer_group WHERE writer_group = $1",
-            &[&(group as i32)],
-        )
-        .map_err(unavailable)?
-        .get::<_, i64>(0) as u64)
+    Ok(found.map(|row| row.get::<_, i64>(0) as u64))
 }
 
 impl PostgresStore {
+    /// Whether writer group `group` has an epoch of its own in this
+    /// database (step 3d): its writer has taken over here, so a range moved
+    /// to it is written under an epoch a takeover recorded. Group 0's is
+    /// the control partition's, always there.
+    pub fn group_ready(&self, group: u32) -> Result<bool> {
+        Ok(own_epoch(&mut *self.conn()?, group)?.is_some())
+    }
+
     /// `partition` (a dataset's full range or one split from it) as this
     /// database holds it; none where it has no row.
     pub fn range_tip(&self, partition: &str) -> Result<Option<RangeTip>> {

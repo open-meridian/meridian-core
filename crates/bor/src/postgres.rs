@@ -3858,22 +3858,17 @@ fn tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Option<Tip
 /// 3d): the control partition's for group 0; a later group's own row
 /// (`book_writer_group`), kept while it owns nothing, so a partition moved
 /// back to it carries the epoch its writer holds. A group with no row yet
-/// -- its writer never started -- is given one past every epoch, which its
-/// writer adopts at its start.
+/// -- its writer has not taken over here -- has none, and a move never
+/// makes one: an epoch no takeover recorded (CI 43820357549, reconfigure:
+/// "commit(s) at an epoch no takeover recorded"). Its move waits at the
+/// gate until its writer has taken over ([`PostgresStore::group_ready`]).
 fn group_epoch(client: &mut impl GenericClient, group: u32) -> Result<u64> {
-    if let Some(epoch) = own_epoch(client, group)? {
-        return Ok(epoch);
-    }
-    let fresh: i64 = client
-        .query_one(
-            "SELECT greatest((SELECT max(epoch) FROM book_partition_head),
-                             (SELECT coalesce(max(epoch), 0) FROM book_writer_group)) + 1",
-            &[],
-        )
-        .map_err(unavailable)?
-        .get(0);
-    keep_own_epoch(client, group, fresh as u64)?;
-    Ok(own_epoch(client, group)?.unwrap_or(fresh as u64))
+    own_epoch(client, group)?.ok_or_else(|| {
+        StoreError::Unavailable(format!(
+            "writer group {group} has no epoch in this database yet: its writer has not taken over, \
+             so nothing is moved to it"
+        ))
+    })
 }
 
 /// Writer group `group`'s own epoch in this database: the control
@@ -4715,6 +4710,15 @@ impl PostgresStore {
 }
 
 impl PostgresStore {
+    /// Whether writer group `group` has an epoch of its own in this
+    /// database (step 3d): its writer has taken over here (or adopted the
+    /// epoch its partitions shared), so a partition moved to it is written
+    /// under an epoch a takeover recorded. Group 0's is the control
+    /// partition's, always there.
+    pub fn group_ready(&self, group: u32) -> Result<bool> {
+        Ok(own_epoch(&mut *self.conn()?, group)?.is_some())
+    }
+
     /// `partition`'s `writer_group` read from this database's head row into
     /// the member's view (step 3d; ruled 2026-11-14); nothing where this
     /// database holds no head of it. Says whether a head was read.

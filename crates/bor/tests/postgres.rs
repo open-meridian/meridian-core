@@ -2736,6 +2736,10 @@ async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_swee
     }
     // The count raised to two databases: group 1's home is the second.
     let (bus_zero, zero) = blocking(|| member(0, 2));
+    // Group 1's writer at two databases started, as the runtime starts it:
+    // its epoch taken at its home, where its partition moves.
+    let (bus_one, one) = blocking(|| member(1, 2));
+    blocking(|| Store::adopt(one.as_ref())).unwrap();
     let fresh = |d: usize| PostgresStore::connect(&urls[d], 1).unwrap();
     let head = |d: usize| {
         blocking(|| fresh(d).tip(&partition))
@@ -2799,7 +2803,7 @@ async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_swee
         "moved home once it was gone: {moved:?}"
     );
     assert!(head(1) >= head(0), "at home, level with where it was");
-    blocking(move || drop((zero, bus_zero)));
+    blocking(move || drop((zero, bus_zero, one, bus_one)));
 }
 
 /// A move by hand to another database waits for the book's rollout too
@@ -4664,36 +4668,11 @@ fn two_members(url: &str) -> TwoMembers {
 /// partitions, the book's heads made for 8 as they start: a raised
 /// `bor.partitions` whose heads are made after.
 fn two_members_at(url: &str, partitions: u32) -> TwoMembers {
-    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
-    use meridian_changes::groups::Groups;
     let broker = Arc::new(GroupsBroker {
         inner: MemoryBackend::new(),
         groups: Default::default(),
         handed: AtomicU64::new(0),
     });
-    let member = |group: u32| {
-        let store = Arc::new(
-            PostgresStore::connect(url, 4)
-                .unwrap()
-                .with_groups(Groups::new(group, 2).unwrap())
-                .with_partitions(partitions),
-        );
-        store.make_partitions(8).unwrap();
-        store.pin_owners().unwrap();
-        let bus = Arc::new(Bus::single(
-            "bor-moves-test",
-            Arc::clone(&broker) as Arc<dyn meridian_bus::Backend>,
-            Arc::new(meridian_clock::SystemClock),
-        ));
-        bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
-        let writer: Arc<dyn Store> = Arc::new(Writer::new(
-            Arc::clone(&store) as Arc<dyn Store>,
-            Arc::clone(&bus),
-        ));
-        serve(bus.clone(), writer, bus.clock());
-        resolving_equities(&bus);
-        (bus, store)
-    };
     // Each group's partitions at an epoch of its own, as a deployment's
     // are once each writer has started: neither takes the other's over --
     // a takeover ends the sessions holding its partitions' locks, by key,
@@ -4703,7 +4682,15 @@ fn two_members_at(url: &str, partitions: u32) -> TwoMembers {
         .make_partitions(8)
         .unwrap();
     apart(url);
-    let (zero, one) = (member(0), member(1));
+    let (zero, one) = (
+        group_member(url, &broker, 0, 2, partitions),
+        group_member(url, &broker, 1, 2, partitions),
+    );
+    // Each writer started: its group's epoch its own (step 3d), so a move
+    // to either finds its target ready.
+    for (_, store) in [&zero, &one] {
+        Store::adopt(store.as_ref()).unwrap();
+    }
     let mover = meridian_bor::partition_moves::Mover::new(
         vec![Arc::clone(&zero.1)],
         zero.1.groups(),
@@ -4714,6 +4701,196 @@ fn two_members_at(url: &str, partitions: u32) -> TwoMembers {
         Arc::new(meridian_clock::SystemClock),
     );
     (broker, [zero, one], mover)
+}
+
+/// A member of writer group `group` of `count`, serving the book over the
+/// database at `url` and handing the other groups' commands on through
+/// `broker`, its accounts placed in `partitions` partitions; the book's
+/// heads made for 8 and named their owners where none is named yet. Its
+/// writer has not started: nothing adopted or taken over.
+fn group_member(
+    url: &str,
+    broker: &Arc<GroupsBroker>,
+    group: u32,
+    count: u32,
+    partitions: u32,
+) -> (Arc<Bus>, Arc<PostgresStore>) {
+    use meridian_bor::writer::{is_command, Writer, INTERNAL_COMMAND};
+    use meridian_changes::groups::Groups;
+    let store = Arc::new(
+        PostgresStore::connect(url, 4)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+            .with_partitions(partitions),
+    );
+    store.make_partitions(8).unwrap();
+    store.pin_owners().unwrap();
+    let bus = Arc::new(Bus::single(
+        "bor-moves-test",
+        Arc::clone(broker) as Arc<dyn meridian_bus::Backend>,
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.hand_writes_on(INTERNAL_COMMAND, group, is_command);
+    let writer: Arc<dyn Store> = Arc::new(Writer::new(
+        Arc::clone(&store) as Arc<dyn Store>,
+        Arc::clone(&bus),
+    ));
+    serve(bus.clone(), writer, bus.clock());
+    resolving_equities(&bus);
+    (bus, store)
+}
+
+/// What the book's record breaks of "every epoch above the first raised by
+/// a recorded takeover, the takeovers one per epoch with none skipped"
+/// (ruling 1105; e2e/failover/run.py `properties`), in the database at
+/// `url`: each entry committed, and each head held, at an epoch no
+/// takeover recorded, and a takeover count short of the epochs it spans.
+fn unrecorded_epochs(url: &str) -> Vec<String> {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let mut broken = Vec::new();
+    for (what, table) in [
+        ("entries committed", "book_entry"),
+        ("heads held", "book_partition_head"),
+    ] {
+        let rows = admin
+            .query(
+                &format!(
+                    "SELECT epoch, count(*) FROM {table}
+                      WHERE epoch > 1 AND epoch NOT IN (SELECT epoch FROM book_writer_took_over)
+                      GROUP BY epoch ORDER BY epoch"
+                ),
+                &[],
+            )
+            .unwrap();
+        for row in rows {
+            broken.push(format!(
+                "{} {what} at epoch {}, which no takeover recorded",
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(0)
+            ));
+        }
+    }
+    let row = admin
+        .query_one(
+            "SELECT count(*), coalesce(max(epoch) - min(epoch) + 1, 0) FROM book_writer_took_over",
+            &[],
+        )
+        .unwrap();
+    let (recorded, spanned): (i64, i64) = (row.get(0), row.get(1));
+    if recorded != spanned {
+        broken.push(format!(
+            "{recorded} takeovers recorded over {spanned} epochs"
+        ));
+    }
+    broken
+}
+
+/// A partition moved to a writer group whose writer has not taken over in
+/// its database commits nothing at an epoch no takeover recorded (CI
+/// 43820357549, reconfigure, "groups raised": "book: 83 commit(s) at an
+/// epoch no takeover recorded", then "7 takeovers recorded over 8 epochs").
+/// The count raised from one group to two: group 0's writer starts again
+/// and rebalances before group 1's writer has started. A move never makes
+/// an epoch: group 1 is not ready, so its partitions stay group 0's; once
+/// its writer has taken over -- recorded, with its own member and why --
+/// the next sweep moves them under that epoch, and group 1 writes there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_move_to_a_group_whose_writer_has_not_taken_over_commits_nothing_at_an_unrecorded_epoch()
+{
+    use meridian_bor::partition_moves::{rebalance, Ended, Mover, Settings};
+    use meridian_changes::groups::{owner, Groups};
+    let (url, migrated) = blocking(isolated);
+    // At one group: every head pinned to group 0, its writer's takeover
+    // recorded.
+    blocking(|| {
+        let alone = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(0, 1).unwrap())
+            .with_partitions(8);
+        alone.make_partitions(8).unwrap();
+        assert_eq!(alone.pin_owners().unwrap(), 8);
+        Store::take_over(
+            &alone,
+            &meridian_changes::TookOver::unnamed(meridian_changes::LEASE_FREE),
+        )
+        .unwrap();
+    });
+    // Raised to two: group 0's writer starts again and adopts its epoch;
+    // group 1's has not started.
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let (zero, zero_store) = blocking(|| group_member(&url, &broker, 0, 2, 8));
+    blocking(|| Store::adopt(zero_store.as_ref())).unwrap();
+    // A switch's bound long enough for another test's move of the same
+    // partition name: partition locks are keyed by name over every schema
+    // of the test database.
+    let mover = Mover::new(
+        vec![Arc::clone(&zero_store)],
+        zero_store.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(15),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let wanted: Vec<String> = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .filter(|p| owner(p, 2) == 1)
+        .collect();
+    assert!(wanted.contains(&"P4".to_string()));
+    // The sweep at group 0's start, before group 1's writer has started.
+    let early = blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    let unready: Vec<(String, Option<u32>)> = blocking(|| {
+        wanted
+            .iter()
+            .map(|p| (p.clone(), zero_store.tip(p).unwrap().unwrap().writer_group))
+            .collect()
+    });
+    // Group 1's writer starts, and the next sweep runs.
+    let (one, one_store) = blocking(|| group_member(&url, &broker, 1, 2, 8));
+    let epoch = blocking(|| Store::adopt(one_store.as_ref())).unwrap();
+    let ended = blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    // Group 1 writes into one of its partitions.
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-UNREC-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    blocking(|| {
+        // Nothing committed or held at an epoch no takeover recorded.
+        assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
+        // Nothing moved before group 1's writer took over.
+        assert!(
+            early.is_empty(),
+            "moved before group 1's writer took over: {early:?}"
+        );
+        assert!(
+            unready.iter().all(|(_, group)| *group == Some(0)),
+            "{unready:?}"
+        );
+        // Then moved, under the epoch its takeover recorded, and written.
+        let moved: Vec<String> = ended
+            .iter()
+            .map(|e| match e {
+                Ended::Moved(m) => {
+                    assert_eq!((m.from_group, m.to_group, m.epoch), (0, 1, epoch));
+                    m.partition.clone()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(moved, wanted);
+        let written = numbered(&url, "P4");
+        assert!(
+            written.iter().any(|(_, _, e)| *e as u64 == epoch),
+            "group 1 wrote P4 under its epoch {epoch}: {written:?}"
+        );
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, mover, migrated)));
 }
 
 /// Writes to `accounts` through `bus` until `stop`: each answered, never
@@ -5323,6 +5500,15 @@ async fn a_partition_moved_by_hand_stays_through_the_sweep_and_a_raised_count() 
                 .with_groups(Groups::new(0, 3).unwrap())
                 .with_partitions(8),
         )
+    });
+    // Group 2's writer started: it takes over, so a partition moved to it
+    // is written under an epoch its takeover recorded.
+    blocking(|| {
+        let two = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(2, 3).unwrap())
+            .with_partitions(8);
+        Store::adopt(&two).unwrap();
     });
     let mover_three = Mover::new(
         vec![Arc::clone(&three)],
@@ -6092,6 +6278,12 @@ async fn a_raised_database_count_writes_where_each_head_is_and_moves_each_partit
     assert!(heads_before.iter().all(|h| *h > 0), "{heads_before:?}");
     // The count raised to two databases: group 1's home is the second.
     let ((bus_zero, zero), (bus_one, one)) = blocking(|| (member(0, 2), member(1, 2)));
+    // Each writer started, as the runtime starts it: its epoch adopted at
+    // home, so group 1 is ready in the database its partitions move to.
+    blocking(|| {
+        Store::adopt(zero.as_ref()).unwrap();
+        Store::adopt(one.as_ref()).unwrap();
+    });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let load = [
         writing(bus_one.clone(), accounts.clone(), stop.clone()),

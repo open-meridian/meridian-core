@@ -9208,6 +9208,15 @@ fn m11_a_range_is_moved_home_only_once_every_member_seen_runs_the_sweeps_revisio
     for store in &zeros {
         store.read_owners().unwrap();
     }
+    // Group 1's writer started at two databases, as the runtime starts it:
+    // its epoch taken at its home, so a range moved home is moved under it.
+    PostgresStore::connect(&urls[1], 2)
+        .unwrap()
+        .with_groups(Groups::new(1, 2).unwrap())
+        .with_databases(2)
+        .in_database(1)
+        .adopt()
+        .unwrap();
     // The same release, the count alone raised: one database against two.
     let (before, after) = (
         revision("0.1.540", 1, 2, None),
@@ -10204,4 +10213,142 @@ fn t_a_writer_told_to_stop_commits_nothing_beside_its_replacement() {
         (3, took),
         "a, b and d: only the second committed, and no takeover was recorded"
     );
+}
+
+/// What the lake's record breaks of "every epoch above the first raised by
+/// a recorded takeover, the takeovers one per epoch with none skipped"
+/// (ruling 1105; e2e/failover/run.py `properties`), in the database at
+/// `url`: each row recorded, and each range held, at an epoch no takeover
+/// recorded, and a takeover count short of the epochs it spans.
+fn unrecorded_lake_epochs(url: &str) -> Vec<String> {
+    let mut admin = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let mut broken = Vec::new();
+    for (what, table) in [
+        ("rows recorded", "lake_row"),
+        ("ranges held", "lake_partition"),
+    ] {
+        for row in admin
+            .query(
+                &format!(
+                    "SELECT epoch, count(*) FROM {table}
+                      WHERE epoch > 1 AND epoch NOT IN (SELECT epoch FROM lake_writer_took_over)
+                      GROUP BY epoch ORDER BY epoch"
+                ),
+                &[],
+            )
+            .unwrap()
+        {
+            broken.push(format!(
+                "{} {what} at epoch {}, which no takeover recorded",
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(0)
+            ));
+        }
+    }
+    let row = admin
+        .query_one(
+            "SELECT count(*), coalesce(max(epoch) - min(epoch) + 1, 0) FROM lake_writer_took_over",
+            &[],
+        )
+        .unwrap();
+    let (recorded, spanned): (i64, i64) = (row.get(0), row.get(1));
+    if recorded != spanned {
+        broken.push(format!(
+            "{recorded} takeovers recorded over {spanned} epochs"
+        ));
+    }
+    broken
+}
+
+/// A range moved to a writer group whose writer has not taken over in its
+/// database records nothing at an epoch no takeover recorded (the book's
+/// CI 43820357549, reconfigure, "groups raised"; the lake's moves made an
+/// epoch the same way). The count raised from one group to two: group 0's
+/// writer starts again and rebalances before group 1's writer has started.
+/// A move never makes an epoch: group 1 is not ready, so the range stays
+/// group 0's; once its writer has taken over -- recorded -- the next sweep
+/// moves it under that epoch, and group 1 records there.
+#[test]
+fn a_range_moved_to_a_group_whose_writer_has_not_taken_over_records_nothing_at_an_unrecorded_epoch()
+{
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_lake::partition_moves::{Ended, Mover, Settings};
+    let (url, _migrated) = isolated("lake-unrecorded");
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:unrec{n}")))
+        .find(|dataset| owner(dataset, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-UNREC");
+    // At one group: its writer's takeover recorded, the dataset recorded
+    // and its range pinned to group 0.
+    {
+        let alone = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(0, 1).unwrap());
+        alone
+            .take_over(&meridian_changes::TookOver::unnamed(
+                meridian_changes::LEASE_FREE,
+            ))
+            .unwrap();
+        alone
+            .record(
+                &dataset,
+                vec![trade(&dataset, "before", &subject, 10)],
+                1_000,
+            )
+            .unwrap();
+        alone.pin_owners().unwrap();
+    }
+    // Raised to two: group 0's writer starts again and adopts its epoch;
+    // group 1's has not started.
+    let zero = Arc::new(
+        PostgresStore::connect(&url, 4)
+            .unwrap()
+            .with_groups(Groups::new(0, 2).unwrap()),
+    );
+    zero.adopt().unwrap();
+    zero.read_owners().unwrap();
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(2),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    // The sweep at group 0's start, before group 1's writer has started.
+    let early = mover.rebalance();
+    let unready = zero.range_tip(&dataset).unwrap().unwrap().writer_group;
+    // Group 1's writer starts, and the next sweep runs.
+    let one = PostgresStore::connect(&url, 4)
+        .unwrap()
+        .with_groups(Groups::new(1, 2).unwrap());
+    let epoch = one.adopt().unwrap();
+    let ended = mover.rebalance();
+    // Group 1 records into its range.
+    one.read_owners().unwrap();
+    one.record(
+        &dataset,
+        vec![trade(&dataset, "after", &subject, 20)],
+        2_000,
+    )
+    .unwrap();
+    // Nothing recorded or held at an epoch no takeover recorded.
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+    // Nothing moved before group 1's writer took over.
+    assert!(
+        early.is_empty(),
+        "moved before group 1's writer took over: {early:?}"
+    );
+    assert_eq!(unready, Some(0));
+    // Then moved, under the epoch its takeover recorded, and recorded.
+    match &ended[..] {
+        [Ended::Moved(m)] => {
+            assert_eq!((m.from_group, m.to_group, m.epoch), (0, 1, epoch), "{m:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let tip = zero.range_tip(&dataset).unwrap().unwrap();
+    assert_eq!((tip.writer_group, tip.epoch), (Some(1), epoch));
 }

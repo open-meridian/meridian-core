@@ -419,8 +419,25 @@ impl Mover {
             0
         };
         // Gate: the target's lag under readyLagMs within switchSeconds.
+        // A target group whose writer has not taken over in its database
+        // is not ready at all: it has no epoch, and a move never makes one
+        // (the book's CI 43820357549: an epoch no takeover recorded).
         let gate = Instant::now();
+        let mut ready = false;
         loop {
+            ready = ready || to.group_ready(target)?;
+            if !ready {
+                if gate.elapsed() >= self.settings.switch {
+                    tracing::warn!(
+                        partition,
+                        target,
+                        "a range's move did not switch: its target group's writer has not taken over"
+                    );
+                    return Ok(aborted(MoveAbortCause::Lag, None));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             let lag = match self.settings.injected_lag() {
                 Some(lag) => lag,
                 None if !across => Duration::ZERO,
@@ -598,6 +615,9 @@ impl Mover {
             if written_there && !self.rolled_out(partition) {
                 return None;
             }
+            if !self.target_ready(partition, away.0) {
+                return None;
+            }
             return Some(self.run_alone(partition, away.0, &Asked::default(), Some(away)));
         }
         let now = match self.owner_now(partition) {
@@ -623,10 +643,32 @@ impl Mover {
             .iter()
             .find_map(|range| by_hand.get(range))
             .is_some_and(|group| *group == now && *group < self.groups.count());
-        if now == wanted || placed {
+        if now == wanted || placed || !self.target_ready(partition, wanted) {
             return None;
         }
         Some(self.run_alone(partition, wanted, &Asked::default(), None))
+    }
+
+    /// Whether writer group `target`'s writer has taken over in its
+    /// database: else a range is left to a later sweep -- the count raised,
+    /// its writer not started -- never moved under an epoch no takeover
+    /// recorded (the book's CI 43820357549).
+    fn target_ready(&self, partition: &str, target: u32) -> bool {
+        match self.database_of(target).group_ready(target) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::info!(
+                    partition,
+                    target,
+                    "a range is not moved yet: its writer group's writer has not taken over"
+                );
+                false
+            }
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a range's target group was not read");
+                false
+            }
+        }
     }
 
     /// How a move ended logged in the lake's `control` (database 0's), its
