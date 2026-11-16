@@ -116,6 +116,7 @@ type Shared<L> = Arc<tokio::sync::Mutex<Elector<Arc<L>>>>;
 
 /// One pod's view of its instance's shard Leases.
 pub struct ShardSet<L: Leases> {
+    api: Arc<L>,
     instance: String,
     electors: Vec<Shared<L>>,
     settings: Settings,
@@ -229,34 +230,47 @@ impl<L: Leases + 'static> ShardSet<L> {
         renew: Duration,
         duration: Duration,
     ) -> Result<Self, String> {
-        let mut electors = Vec::with_capacity(count as usize);
-        let mut first = None;
-        for shard in 0..count.max(1) {
-            let settings = Settings {
-                name: lease_name(instance, shard),
-                holder: holder.to_string(),
-                renew,
-                duration,
-            };
-            settings.check()?;
-            first.get_or_insert_with(|| settings.clone());
-            electors.push(Arc::new(tokio::sync::Mutex::new(
-                Elector::new(Arc::clone(&api), settings).of_a_holder_that_stops(clock),
-            )));
-        }
-        let live = vec![false; electors.len()];
-        let first_deadline = first
-            .as_ref()
-            .map_or(Duration::ZERO, Settings::renew_deadline);
-        Ok(Self {
+        let settings = Settings {
+            name: lease_name(instance, 0),
+            holder: holder.to_string(),
+            renew,
+            duration,
+        };
+        settings.check()?;
+        let mut set = Self {
+            api,
             instance: instance.to_string(),
-            electors,
-            settings: first.expect("at least one shard"),
+            electors: Vec::new(),
+            renewal: Renewal::new(settings.renew_deadline()),
+            settings,
             mine: None,
-            live,
+            live: vec![false; count.max(1) as usize],
             writes_on: false,
-            renewal: Renewal::new(first_deadline),
-        })
+        };
+        set.electors = set.electors_of(count.max(1));
+        Ok(set)
+    }
+
+    /// One elector per shard's Lease. A holder that stops by the clock has
+    /// its standbys count a stretch they could not read toward its lapse;
+    /// one that writes on, never ([`ShardSet::writing_on`]).
+    fn electors_of(&self, count: u32) -> Vec<Shared<L>> {
+        (0..count)
+            .map(|shard| {
+                let elector = Elector::new(
+                    Arc::clone(&self.api),
+                    Settings {
+                        name: lease_name(&self.instance, shard),
+                        ..self.settings.clone()
+                    },
+                );
+                Arc::new(tokio::sync::Mutex::new(if self.writes_on {
+                    elector
+                } else {
+                    elector.of_a_holder_that_stops(clock)
+                }))
+            })
+            .collect()
     }
 
     /// A shard fenced by its epoch, which writes on through an API server
@@ -264,8 +278,16 @@ impl<L: Leases + 'static> ShardSet<L> {
     /// that fails or hangs never ends it. It is lost only when its Lease
     /// shows another holder -- or, outside this set, when the lake or the
     /// book refuses one of its writes as fenced.
+    ///
+    /// **Its standby, likewise, counts only what it observed** (review c5a5
+    /// F4; item 32's Rule), as a store's member does: a stretch in which
+    /// it could not read a Lease is never its holder's silence, since that
+    /// holder wrote on through it. Once the API server answers again, the
+    /// standby waits a whole lapse from its first read before it takes.
+    /// Said before the set's first look.
     pub fn writing_on(mut self) -> Self {
         self.writes_on = true;
+        self.electors = self.electors_of(self.electors.len() as u32);
         self
     }
 
@@ -513,13 +535,6 @@ impl<L: Leases + 'static> ShardSet<L> {
             };
             self.renewal.renewed(renewed);
             let stop_by = tokio::time::Instant::from_std(renewed + deadline);
-            // Fenced, it writes on: a renewal waits one renewal at most and
-            // is tried again; the clock never ends it.
-            let give_up_by = if writes_on {
-                tokio::time::Instant::now() + renew
-            } else {
-                stop_by
-            };
             let deadline_passed = async {
                 if writes_on {
                     std::future::pending::<()>().await
@@ -536,6 +551,14 @@ impl<L: Leases + 'static> ShardSet<L> {
                 _ = deadline_passed => break Kept::Lost(self.unrenewed(mine)),
                 _ = renewing.tick() => {
                     let looking = async { own.lock().await.look(clock(), crate::now_ns()).await };
+                    // Fenced, it writes on: a renewal waits one renewal at
+                    // most from its tick -- never from before it (review
+                    // c5a5 F5) -- and is tried again; the clock never ends it.
+                    let give_up_by = if writes_on {
+                        tokio::time::Instant::now() + renew
+                    } else {
+                        stop_by
+                    };
                     match tokio::time::timeout_at(give_up_by, looking).await {
                         Err(_) if writes_on => {
                             tracing::warn!(shard = mine, "the shard's lease renewal did not answer; writing on, fenced by its epoch, and trying again");
@@ -1458,6 +1481,79 @@ mod tests {
             "{kept:?}"
         );
         drop(c);
+    }
+
+    /// Review c5a5 F5: a data shard's renewal is given its one renewal from
+    /// when its tick fires, never from before the tick: with the API server
+    /// answering at once, no renewal is given up and none is late.
+    #[tokio::test(start_paused = true)]
+    async fn a_data_shard_s_renewals_each_get_a_whole_renewal_and_none_is_given_up() {
+        let store = Arc::new(Memory::default());
+        let to_a = Link::to(&store);
+        to_a.slow("", secs(0.01), false);
+        let (_stopper, stop) = watch::channel(false);
+        let a = tokio::spawn(async move {
+            let (set, _, _) = on(&to_a, 1, "a")
+                .writing_on()
+                .take(stop.clone())
+                .await
+                .unwrap()
+                .expect("a shard");
+            set.keep(|_| {}, stop).await
+        });
+        tokio::time::sleep(secs(0.1)).await;
+        let (mut last, mut longest) = (store.written_at("feed-1-shard-0"), Duration::ZERO);
+        for _ in 0..400 {
+            tokio::time::sleep(secs(0.05)).await;
+            let written = store.written_at("feed-1-shard-0");
+            if written != last {
+                longest = longest.max(written.duration_since(last));
+                last = written;
+            }
+        }
+        assert!(!a.is_finished());
+        assert!(
+            longest <= RENEW + secs(0.1),
+            "renewals {longest:?} apart; each is due every {RENEW:?}"
+        );
+    }
+
+    /// Review c5a5 F4: a data shard's standby never counts an API server
+    /// outage it did not observe toward its holder's lapse (item 32's Rule:
+    /// shards and standbys write on through it), as a store's member does
+    /// not (CI 42958621081): where the API answers the standby first, it
+    /// waits a whole lapse from then, and the holder keeps its shard.
+    #[test]
+    fn a_data_shard_s_standby_never_takes_the_shard_for_an_outage_it_did_not_see() {
+        run(async {
+            let api = Arc::new(Memory::default());
+            let (mut a, mut c) = (
+                pod(&api, 1, "a").writing_on(),
+                pod(&api, 1, "c").writing_on(),
+            );
+            let start = Instant::now();
+            assert_eq!(a.look(start, 0).await, shard(0, &[]));
+            assert_eq!(c.look(start, 0).await, Stand::Standby);
+            // 15 s with no API server, for both pods: the holder writes on.
+            api.down.store(true, Ordering::SeqCst);
+            for second in (2..=14).step_by(2) {
+                let now = start + Duration::from_secs(second);
+                assert_eq!(a.look(now, 0).await, shard(0, &[]));
+                assert_eq!(c.look(now, 0).await, Stand::Standby);
+            }
+            // The API answers again: the standby looks before the holder
+            // renews, and stands by.
+            api.down.store(false, Ordering::SeqCst);
+            let back = start + Duration::from_secs(15);
+            assert_eq!(c.look(back, 0).await, Stand::Standby);
+            assert_eq!(a.look(back, 0).await, shard(0, &[]));
+            assert_eq!(
+                c.look(back + RENEW, 0).await,
+                Stand::Standby,
+                "the standby took a shard its holder renews"
+            );
+            assert_eq!(api.holder("feed-1-shard-0"), "a");
+        });
     }
 
     /// Another role's shard keeps the 4 s stop (item 32: a property of the

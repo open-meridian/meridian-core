@@ -187,8 +187,9 @@ impl<L: Leases> Elector<L> {
     }
 
     /// For a lease whose holder stops once it has gone its renew deadline
-    /// unrenewed, since nothing else fences it (step 3d: a plugin's shard,
-    /// which no epoch fences as a store's writer is). Two things follow,
+    /// unrenewed, since nothing else fences it (step 3d: a plugin's shard
+    /// of a role its epoch cannot stop, an order path's above all; a data
+    /// shard writes on, as a store's writer does). Two things follow,
     /// neither true of a store's member, which writes on:
     /// - **a record is held seen when its read answered,** by `clock`, not
     ///   when the look began: the write it shows may have landed anywhere

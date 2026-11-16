@@ -1137,6 +1137,69 @@ def previous_log(pod_name, container="sidecar"):
     return said.stdout.decode(errors="replace") if said.returncode == 0 else ""
 
 
+def sidecar_status(pod):
+    """The pod's sidecar container's status, as the kubelet reports it."""
+    return next((c for c in pod["status"].get("containerStatuses", []) if c["name"] == "sidecar"), {})
+
+
+def shard_restarts_said(s, when):
+    """Each shard pod's sidecar log before its last restart, where it
+    restarted, said in the run's own log: a rollout replaces the pods, and
+    those logs with them (review c5a5 F3: every shard sidecar had ended
+    once at its start, and why was lost with its pod)."""
+    for pod in shard_pods():
+        name, sidecar = pod["metadata"]["name"], sidecar_status(pod)
+        if not sidecar.get("restartCount"):
+            continue
+        ended = sidecar.get("lastState", {}).get("terminated", {})
+        said = kubectl("logs", name, "-c", "sidecar", "--previous", "--timestamps", "--tail=80", check=False)
+        s.note(f"shards, {when}: {name}'s sidecar restarted {sidecar['restartCount']} time(s); its last run ended "
+               f"{ended.get('reason')} (exit {ended.get('exitCode')}) at {ended.get('finishedAt')}, saying:")
+        for line in (said.stdout or said.stderr).decode(errors="replace").splitlines():
+            print(f"        {line}", flush=True)
+
+
+# A shard Lease's lapse (leases.durationSeconds).
+SHARD_LAPSE_S = 6
+# The kubelet's longest wait before it starts a container that ended again
+# (CrashLoopBackOff's cap): a sidecar that lost its shard ends, and comes
+# back as the standby only after it (review c5a5 F3).
+SIDECAR_BACK_OFF_S = 300
+
+
+def the_standby():
+    """The shard pod holding no shard's Lease; empty where none does."""
+    holders = {shard_holder(n)[0] for n in range(SHARDS)}
+    return next((p["metadata"]["name"] for p in shard_pods() if p["metadata"]["name"] not in holders), "")
+
+
+def standing_by(pod_name):
+    """Whether the pod's sidecar runs, started, and said in its current run
+    that it stands by at least a Lease's lapse ago: a standby that takes a
+    lapsed shard within the bound, its first read of the Lease done (review
+    c5a5 F2: a standby whose sidecar was waiting out its back-off took the
+    killed shard's Lease 23 s after the kill)."""
+    sidecar = sidecar_status(json.loads(out("get", "pod", pod_name, "-o", "json")))
+    if "running" not in sidecar.get("state", {}) or not sidecar.get("started"):
+        return False
+    said = said_at(pod_name, "standing by")
+    return said is not None and time.time() - said >= SHARD_LAPSE_S
+
+
+def a_standby_stands_by(s, before):
+    """Before a takeover's bound is measured: the standby pod's sidecar
+    standing by for a lapse, checked."""
+    standby = ""
+
+    def stands():
+        nonlocal standby
+        standby = the_standby()
+        return bool(standby) and standing_by(standby)
+    stood = happens(stands, SIDECAR_BACK_OFF_S + 30, every=1.0)
+    s.check(stood, f"shards: before {before}, the standby's sidecar has stood by for a lapse ({standby or 'none'})")
+    return stood
+
+
 # How long the shard pods are cut from the API server: well past a Lease's
 # lapse (leases.durationSeconds, 6 s), so a shard stopping by the clock would
 # have stopped.
@@ -1192,6 +1255,8 @@ def shards_fenced(s, settled):
             f"shards: no take, each shard's epoch as it was ({epochs} -> {after})")
 
     # (b) The holder of shard 1 alone cut.
+    if not a_standby_stands_by(s, "the holder alone is cut"):
+        return False
     lost, was = shard_holder(1)
     epoch, takes = shard_epoch(1), shard_takes()
     before = restarts(lost)
@@ -1257,6 +1322,7 @@ def shards(s):
     holders = [shard_holder(n)[0] for n in range(SHARDS)]
     s.check(there, f"shards: {SHARDS + 1} pods of the one instance, each shard's lease held by a pod of its own "
                    f"({len(names)} pods; holders {holders})")
+    shard_restarts_said(s, "as they first settled")
     if not there:
         return
     standby = next(n for n in names if n not in holders)
@@ -1299,6 +1365,8 @@ def shards(s):
     # with the holder alone cut from it. Its holders as they stand after.
     if not shards_fenced(s, settled):
         return
+    if not a_standby_stands_by(s, "the kill"):
+        return
     holders = [shard_holder(n)[0] for n in range(SHARDS)]
 
     # Shard 1's sidecar killed outright: no signal it can answer, so nothing
@@ -1332,6 +1400,7 @@ def shards(s):
     # The instance's pods rolled: a shard at a time, a new pod standing by
     # and taking the Lease an old one gives up as it stops. Never fewer
     # than one shard ready, and it ends.
+    shard_restarts_said(s, "before its pods roll")
     name = deployment["metadata"]["name"]
     before = {p["metadata"]["name"] for p in shard_pods()}
     kubectl("rollout", "restart", f"deployment/{name}")
@@ -1360,6 +1429,7 @@ def shards(s):
     # (the standby goes first, being not ready, then a shard, which gives
     # its Lease up), then back to three.
     changed = "the instance's live shards changed"
+    shard_restarts_said(s, "before they are scaled down")
     kubectl("scale", f"deployment/{name}", "--replicas=1")
     alone = happens(lambda: len(shard_pods()) == 1 and ready(shard_pods()[0]), 120)
     stayed = shard_pods()[0]["metadata"]["name"] if alone else ""
