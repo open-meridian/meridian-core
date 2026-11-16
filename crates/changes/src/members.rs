@@ -378,15 +378,17 @@ mod tests {
         }
     }
 
-    /// A writer of group 1 told to stop, every group rolled at once: it
-    /// stops for the first group's new writer once that serves and is said
-    /// again, never for the old one about to stop with it, a standby, a
-    /// reader, its own group's, or one holding its lease not yet serving.
+    /// A newer member is one of the standby's own group, at another
+    /// revision, started since its first look and said again (ruled
+    /// 2026-11-16).
     #[test]
     fn a_newer_member_is_one_of_its_group_at_another_revision_started_since_and_said_again() {
         let mut newer = Newer::new(0, "v/db1/wg1");
         let old = said("lake-old-b", "v/db1/wg1", 1, 10, 0, "standby");
-        assert!(!newer.there(&[old.clone()]), "never at the first look");
+        assert!(
+            !newer.there(std::slice::from_ref(&old)),
+            "never at the first look"
+        );
         // A member of its group at the new count, started since.
         let new = said("lake-new-a", "v/db1/wg2", 50, 60, 0, "standby");
         assert!(newer.there(&[old.clone(), new.clone()]));
@@ -404,6 +406,10 @@ mod tests {
         assert!(!late.there(&[said("lake-new-a", "v/db1/wg2", 50, 70, 0, "standby")]));
     }
 
+    /// A writer of group 1 told to stop, every group rolled at once: it
+    /// stops for the first group's new writer once that serves and is said
+    /// again, never for the old one about to stop with it, a standby, a
+    /// reader, its own group's, or one holding its lease not yet serving.
     #[test]
     fn a_watch_finds_another_groups_writer_serving_anew() {
         let mut watch = Watch::new(1, "r1", false);
