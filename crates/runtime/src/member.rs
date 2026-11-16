@@ -608,20 +608,16 @@ impl Member {
             member = %member_name(),
             "this member holds the lease: taking the writer's partitions over"
         );
-        let took_from = elector.took_from();
-        let why = match &took_from {
-            Some(Some(holder)) if !holder.is_empty() => meridian_changes::LEASE_LAPSED,
-            Some(Some(_)) => meridian_changes::LEASE_RELEASED,
-            _ => meridian_changes::LEASE_FREE,
-        };
+        let (why, from) = elector.takeover();
         Ok(Some(Holding {
             elector: Some(Arc::new(tokio::sync::Mutex::new(elector))),
             component: self.component,
             why,
-            previous: took_from
-                .flatten()
-                .map(|holder| holder_member(&holder))
-                .unwrap_or_default(),
+            previous: if from.is_empty() {
+                from
+            } else {
+                holder_member(&from)
+            },
         }))
     }
 }

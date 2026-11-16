@@ -185,6 +185,51 @@ fn a_released_lease_is_taken_at_the_standbys_next_look() {
     });
 }
 
+/// A store's takeover says why (CI 43920761210): a lease released by its
+/// holder is "released", never "lapsed", whoever released it; one taken
+/// from a holder that stopped renewing is "lapsed", naming it; one never
+/// held is "free".
+#[test]
+fn a_takeover_says_released_lapsed_or_free_as_it_was() {
+    run(async {
+        let api = Memory::default();
+        let mut a = Elector::new(api.clone(), settings("lake-a"));
+        let mut b = Elector::new(api.clone(), settings("lake-b"));
+        let t0 = Instant::now();
+        assert_eq!(a.look(t0, 0).await.unwrap(), Standing::Held);
+        assert_eq!(a.takeover().0, meridian_changes::LEASE_FREE);
+        assert!(matches!(b.look(t0, 0).await.unwrap(), Standing::HeldBy(_)));
+        a.release(1_000_000_000).await;
+        assert_eq!(
+            b.look(t0 + Duration::from_millis(500), 1_500_000_000)
+                .await
+                .unwrap(),
+            Standing::Held
+        );
+        assert_eq!(
+            b.takeover(),
+            (meridian_changes::LEASE_RELEASED, String::new()),
+            "a release said as a lapse"
+        );
+        // `b` stops renewing; `c` takes it after the lapse.
+        let mut c = Elector::new(api.clone(), settings("lake-c"));
+        assert!(matches!(
+            c.look(t0 + Duration::from_secs(1), 0).await.unwrap(),
+            Standing::HeldBy(_)
+        ));
+        assert_eq!(
+            c.look(t0 + Duration::from_secs(8), 8_000_000_000)
+                .await
+                .unwrap(),
+            Standing::Held
+        );
+        assert_eq!(
+            c.takeover(),
+            (meridian_changes::LEASE_LAPSED, "lake-b".to_string())
+        );
+    });
+}
+
 /// A member that gave its lease up is stopping: it never takes it back,
 /// though a released lease is free to the first member that looks and it
 /// may look before its standby does. Its standby takes it.

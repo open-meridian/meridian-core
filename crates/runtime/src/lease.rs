@@ -225,6 +225,25 @@ impl<L: Leases> Elector<L> {
         self.took_from.clone()
     }
 
+    /// Why this member last took the lease, as a store's takeover record
+    /// says it, and from whom: from another holder whose lease lapsed; from
+    /// one that released it (its record names nobody, as it always has);
+    /// or free -- never held, or its own name's taken back after its
+    /// container restarted. A release is never said to have lapsed (CI
+    /// 43920761210: review c5a L3's names of a release's holder read as
+    /// lapses in every store's rollout).
+    pub fn takeover(&self) -> (&'static str, String) {
+        match (&self.took_from, self.took_free) {
+            (Some(Some(_)), true) => (meridian_changes::LEASE_RELEASED, String::new()),
+            (Some(Some(holder)), false)
+                if !holder.is_empty() && *holder != self.settings.holder =>
+            {
+                (meridian_changes::LEASE_LAPSED, holder.clone())
+            }
+            _ => (meridian_changes::LEASE_FREE, String::new()),
+        }
+    }
+
     /// Whether the lease was free when this member last took it: released
     /// by its holder, or never held.
     pub fn took_free(&self) -> bool {
@@ -380,11 +399,11 @@ impl<L: Leases> Elector<L> {
                 if !mine {
                     // Released: from whoever this member last saw hold it.
                     self.took_free = current.holder.is_empty();
-                    self.took_from = Some(if self.took_free {
-                        self.last_other.clone()
+                    self.took_from = Some(Some(if self.took_free {
+                        self.last_other.clone().unwrap_or_default()
                     } else {
-                        Some(current.holder)
-                    });
+                        current.holder
+                    }));
                 } else if self.took_from.is_none() {
                     // Its own name's lease, held by this pod before this
                     // process: taken back from itself.

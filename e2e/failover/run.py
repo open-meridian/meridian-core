@@ -1107,31 +1107,19 @@ def shard_epoch(shard):
     return int(said or 0)
 
 
-def store_databases(store):
-    """`store`'s databases: database 0, and each one past it whose primary
-    runs (`lake.databases`, `bor.databases`)."""
-    found = [0]
-    component = {"book": "bor"}.get(store, store)
-    while True:
-        d = len(found)
-        said = json.loads(out("get", "pods", "-l",
-                              f"app.kubernetes.io/instance={RELEASE},"
-                              f"meridian.dev/component={component}-database-{d},"
-                              "meridian.dev/database-role=primary", "-o", "json"))["items"]
-        if not [p for p in said if not p["metadata"].get("deletionTimestamp")]:
-            return found
-        found.append(d)
-
-
 def shard_epochs(shard):
     """The shard's epoch as every lake and book database holds it (review c5a
     M5), by (store, database): 0 where one holds none."""
     held = {}
     for store, table in (("lake", "lake_shard_fence"), ("book", "book_shard_fence")):
-        for d in store_databases(store):
+        # store_databases (below) is the run's one: (d, its primary's pod).
+        # c5a's second definition of the name, above it, was overridden by
+        # it, and its label built from a pair broke the scaled run (CI
+        # 43920761210).
+        for d, pod in store_databases(store):
             said = psql(f"select coalesce(max(epoch), 0) from {table} "
                         f"where instance = '{SHARDED}' and shard = {shard}",
-                        quiet=True, pod=database_pod(store, d))
+                        quiet=True, pod=pod)
             held[(store, d)] = int(said or 0)
     return held
 
