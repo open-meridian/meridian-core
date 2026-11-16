@@ -362,7 +362,19 @@ pub struct Member {
     /// A reader member (contract v30, stage B): the chart's
     /// `MERIDIAN_MEMBER_MODE=reader`.
     reader: bool,
+    /// The look a standby takes before it takes its lease: whether a newer
+    /// member of its group is there ([`Member::deferring_to_newer`]).
+    newer: Option<Arc<NewerLook>>,
 }
+
+/// A standby's look at its store's members: whether a newer member of its
+/// writer group is there now (`meridian_changes::members::Newer`).
+/// Blocking: the store is read.
+pub type NewerLook = dyn Fn() -> Result<bool, String> + Send + Sync;
+
+/// The most a writer stepping down spends giving its lease up before it
+/// ends (ruled 2026-11-16): past it, the lease lapses on its own.
+pub const STEP_DOWN_RELEASE: Duration = Duration::from_secs(1);
 
 /// What a standby's lag is held under by default where the chart says
 /// nothing: five seconds, a tail far behind any healthy writer's.
@@ -420,7 +432,21 @@ impl Member {
             lease,
             ready_lag: Duration::from_millis(whole("MERIDIAN_READY_LAG_MS", READY_LAG_DEFAULT_MS)?),
             reader,
+            newer: None,
         })
+    }
+
+    /// A standby that defers to a newer member of its writer group (step
+    /// 3d; ruled 2026-11-16): while `look` finds one there, it takes no
+    /// free lease, leaving it to the member a rollout brought at the new
+    /// count, unless nobody takes it within one lease duration -- a writer
+    /// at the old count is better than none.
+    pub fn deferring_to_newer<F>(mut self, look: F) -> Self
+    where
+        F: Fn() -> Result<bool, String> + Send + Sync + 'static,
+    {
+        self.newer = Some(Arc::new(look));
+        self
     }
 
     /// A member with no lease: what tests and a local stack run.
@@ -431,6 +457,7 @@ impl Member {
             lease: None,
             ready_lag: Duration::from_millis(READY_LAG_DEFAULT_MS),
             reader: false,
+            newer: None,
         }
     }
 
@@ -443,6 +470,7 @@ impl Member {
             lease: None,
             ready_lag,
             reader: true,
+            newer: None,
         }
     }
 
@@ -554,7 +582,14 @@ impl Member {
             // waits.
             crate::mark_ready(true);
         }
-        let holds = stand_by(&mut elector, look_every, self.component, told).await;
+        let holds = stand_by(
+            &mut elector,
+            look_every,
+            self.component,
+            told,
+            self.newer.clone(),
+        )
+        .await;
         // Stopped, and waited for: a follower aborted mid-poll on another
         // thread still finished that poll, and its readiness written then
         // -- mode "standby", maybe not ready -- landed after the writer's
@@ -607,11 +642,67 @@ pub(crate) async fn stand_by<L: Leases>(
     look_every: Duration,
     component: &'static str,
     told: &mut tokio::sync::watch::Receiver<bool>,
+    newer: Option<Arc<NewerLook>>,
 ) -> bool {
     let mut said_waiting = false;
+    let mut said_deferring = false;
+    // When a newer member of its group was last found there, and since
+    // when the lease has been free while this member deferred, each by its
+    // own clock (ruled 2026-11-16).
+    let mut newer_seen: Option<tokio::time::Instant> = None;
+    let mut free_since: Option<tokio::time::Instant> = None;
+    let duration = elector.settings().duration;
     loop {
         if *told.borrow() {
             return false;
+        }
+        if let Some(look) = &newer {
+            let look = Arc::clone(look);
+            // A look that fails or does not come back defers nothing:
+            // better a writer at the old count than none.
+            if let Ok(Ok(Ok(true))) =
+                tokio::time::timeout(look_every, tokio::task::spawn_blocking(move || look())).await
+            {
+                newer_seen = Some(tokio::time::Instant::now());
+            }
+        }
+        let deferring = newer_seen.is_some_and(|at| at.elapsed() < duration);
+        if !deferring {
+            free_since = None;
+        } else {
+            // Watched, never taken, while the newer member may take it.
+            match elector.watch(Instant::now()).await {
+                Ok(Some(_)) => free_since = None,
+                Ok(None) => {
+                    let since = *free_since.get_or_insert_with(tokio::time::Instant::now);
+                    if !said_deferring {
+                        tracing::info!(
+                            component,
+                            "a standby: a newer member of its group is there; the free lease is left to it"
+                        );
+                        said_deferring = true;
+                    }
+                    if since.elapsed() >= duration {
+                        tracing::warn!(
+                            component,
+                            "a standby: no newer member took the free lease within its duration; taking it at this member's count"
+                        );
+                        newer_seen = None;
+                    }
+                }
+                Err(_) => {}
+            }
+            if newer_seen.is_some() {
+                tokio::select! {
+                    _ = tokio::time::sleep(look_every) => {}
+                    heard = told.changed() => {
+                        if heard.is_err() {
+                            tokio::time::sleep(look_every).await;
+                        }
+                    }
+                }
+                continue;
+            }
         }
         match elector.look(Instant::now(), now_ns()).await {
             Ok(Standing::Held) => {
@@ -720,16 +811,22 @@ impl Holding {
         let component = self.component;
         let bus = Arc::clone(bus);
         let look = Arc::new(look);
+        let elector = self.elector.clone();
         tokio::spawn(async move {
             let mut raised = meridian_changes::timeline::raised();
             let mut said_failing = false;
             loop {
                 let looking = Arc::clone(&look);
                 match tokio::task::spawn_blocking(move || looking()).await {
-                    Ok(Ok(Timeline::NotMine(epoch))) => step_down(
-                        component,
-                        &format!("the store's epoch is {epoch}, another writer's"),
-                    ),
+                    Ok(Ok(Timeline::NotMine(epoch))) => {
+                        if let Some(elector) = &elector {
+                            let_go_stepping_down(elector, component).await;
+                        }
+                        step_down(
+                            component,
+                            &format!("the store's epoch is {epoch}, another writer's"),
+                        )
+                    }
                     Ok(Ok(Timeline::First)) => tracing::info!(
                         component,
                         "the database's identity is kept: a new timeline raises the epoch"
@@ -785,15 +882,22 @@ impl Holding {
         let epoch_now = Arc::new(epoch_now);
         tokio::spawn(async move {
             let renew = elector.lock().await.settings().renew;
+            let watching = Arc::clone(&elector);
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(renew).await;
                     let reading = Arc::clone(&epoch_now);
                     match tokio::task::spawn_blocking(move || reading()).await {
-                        Ok(Ok(head)) if head > mine() => step_down(
-                            component,
-                            &format!("the store's epoch is {head}, past this writer's {}", mine()),
-                        ),
+                        Ok(Ok(head)) if head > mine() => {
+                            let_go_stepping_down(&watching, component).await;
+                            step_down(
+                                component,
+                                &format!(
+                                    "the store's epoch is {head}, past this writer's {}",
+                                    mine()
+                                ),
+                            )
+                        }
                         Ok(Ok(_)) => {}
                         Ok(Err(failed)) => {
                             tracing::warn!(component, %failed, "the store's epoch could not be read")
@@ -817,6 +921,7 @@ impl Holding {
             loop {
                 tokio::time::sleep(renew).await;
                 if meridian_changes::fenced_seen() {
+                    let_go_stepping_down(&elector, component).await;
                     step_down(
                         component,
                         "a commit of this writer was refused by a newer epoch",
@@ -873,6 +978,33 @@ impl Holding {
         if let Some(elector) = &self.elector {
             elector.lock().await.release(now_ns()).await;
         }
+    }
+}
+
+/// A writer stepping down gives its lease up first, within
+/// [`STEP_DOWN_RELEASE`] (ruled 2026-11-16): its standby takes over at its
+/// next look rather than after the lease lapses -- a write gap of up to the
+/// lease's duration (CI 43788516279: group 0's lake writer, its epoch
+/// passed, stepped down holding its lease, and its standby waited it out).
+/// Only a lease still this member's is released (`release_if_mine`).
+pub async fn let_go_stepping_down<L: Leases>(
+    elector: &tokio::sync::Mutex<Elector<L>>,
+    component: &str,
+) {
+    let released = tokio::time::timeout(STEP_DOWN_RELEASE, async {
+        elector.lock().await.release_if_mine(now_ns()).await
+    })
+    .await;
+    match released {
+        Ok(Ok(true)) => tracing::info!(component, "stepping down: the lease given up"),
+        Ok(Ok(false)) => {}
+        Ok(Err(failed)) => {
+            tracing::warn!(component, %failed, "stepping down: the lease could not be given up; it lapses on its own")
+        }
+        Err(_) => tracing::warn!(
+            component,
+            "stepping down: the lease was not given up within its bound; it lapses on its own"
+        ),
     }
 }
 

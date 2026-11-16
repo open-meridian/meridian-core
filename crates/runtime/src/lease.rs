@@ -385,6 +385,34 @@ impl<L: Leases> Elector<L> {
     }
 }
 
+impl<L: Leases> Elector<L> {
+    /// Give the lease up as a writer steps down (ruled 2026-11-16): read
+    /// again, and released only where it still names this member, by a
+    /// write conditional on the version read. A lease another member took
+    /// meanwhile is never touched. Says whether it was released. From here
+    /// this member neither takes nor renews it.
+    pub async fn release_if_mine(&mut self, wall_ns: i64) -> Result<bool, String> {
+        self.gave_up = true;
+        self.renewed_at = None;
+        let Some(current) = self.api.get(&self.settings.name).await? else {
+            return Ok(false);
+        };
+        if current.holder != self.settings.holder {
+            return Ok(false);
+        }
+        let record = Record {
+            holder: String::new(),
+            duration_seconds: 1,
+            renew_time: micro_time(wall_ns),
+            ..current
+        };
+        Ok(matches!(
+            self.api.update(&self.settings.name, &record).await?,
+            Wrote::Done(_)
+        ))
+    }
+}
+
 /// Whether two records are the same holding unrenewed: any write, a renew
 /// with the same stamp among them, is a new version.
 fn same_spec(a: &Record, b: &Record) -> bool {

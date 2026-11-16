@@ -146,6 +146,66 @@ impl Watch {
     }
 }
 
+/// What a standby watches for before it takes its group's lease (step 3d;
+/// ruled 2026-11-16 for c30d-t4): a member of its own writer group that
+/// runs another revision and started after this standby first looked -- a
+/// rollout's new member, there to take the lease at the new count. An old
+/// member that took it would write at the count it runs, and its takeover
+/// would fence the writers of the groups the new count added (CI
+/// 43788516279, "ha groups raised": group 1's lake writer took its lease
+/// by lapse three times).
+///
+/// No clock is compared with another pod's, as in [`Watch`]: newer is a
+/// process this watch did not find at its first look, and there now is a
+/// row said again between two of this watch's own looks.
+#[derive(Debug)]
+pub struct Newer {
+    writer_group: u32,
+    revision: String,
+    first: Option<std::collections::HashMap<String, i64>>,
+    before: std::collections::HashMap<String, i64>,
+}
+
+impl Newer {
+    /// A watch by a standby of `writer_group` running `revision`.
+    pub fn new(writer_group: u32, revision: &str) -> Self {
+        Self {
+            writer_group,
+            revision: revision.to_string(),
+            first: None,
+            before: std::collections::HashMap::new(),
+        }
+    }
+
+    /// One look at the store's other members ([`Table::others`]): whether
+    /// a newer member of its group is there now. Never at the first look,
+    /// which only notes who is there.
+    pub fn there(&mut self, others: &[Said]) -> bool {
+        let before = std::mem::take(&mut self.before);
+        self.before = others
+            .iter()
+            .map(|said| (said.member.clone(), said.seen_at_ns))
+            .collect();
+        let Some(first) = self.first.as_ref() else {
+            self.first = Some(
+                others
+                    .iter()
+                    .map(|said| (said.member.clone(), said.started_at_ns))
+                    .collect(),
+            );
+            return false;
+        };
+        others.iter().any(|said| {
+            let mine = said.writer_group == Some(self.writer_group);
+            let said_again = before
+                .get(&said.member)
+                .is_none_or(|seen| said.seen_at_ns != *seen);
+            let started_since = first.get(&said.member) != Some(&said.started_at_ns);
+            mine && said.revision != self.revision && said_again && started_since
+        })
+    }
+}
+
 impl Table {
     /// The table's name.
     pub fn name(&self) -> &'static str {
@@ -322,6 +382,28 @@ mod tests {
     /// stops for the first group's new writer once that serves and is said
     /// again, never for the old one about to stop with it, a standby, a
     /// reader, its own group's, or one holding its lease not yet serving.
+    #[test]
+    fn a_newer_member_is_one_of_its_group_at_another_revision_started_since_and_said_again() {
+        let mut newer = Newer::new(0, "v/db1/wg1");
+        let old = said("lake-old-b", "v/db1/wg1", 1, 10, 0, "standby");
+        assert!(!newer.there(&[old.clone()]), "never at the first look");
+        // A member of its group at the new count, started since.
+        let new = said("lake-new-a", "v/db1/wg2", 50, 60, 0, "standby");
+        assert!(newer.there(&[old.clone(), new.clone()]));
+        // Not said again since: not there now.
+        assert!(!newer.there(&[old.clone(), new.clone()]));
+        let again = said("lake-new-a", "v/db1/wg2", 50, 70, 0, "standby");
+        assert!(newer.there(&[old.clone(), again]));
+        // Another group's, or its own revision's, is never newer.
+        let other_group = said("lake-g1-a", "v/db1/wg2", 50, 80, 1, "writer");
+        let same = said("lake-old-c", "v/db1/wg1", 50, 80, 0, "standby");
+        assert!(!newer.there(&[old.clone(), other_group, same]));
+        // One found at the first look is never newer, said again or not.
+        let mut late = Newer::new(0, "v/db1/wg1");
+        late.there(&[said("lake-new-a", "v/db1/wg2", 50, 60, 0, "standby")]);
+        assert!(!late.there(&[said("lake-new-a", "v/db1/wg2", 50, 70, 0, "standby")]));
+    }
+
     #[test]
     fn a_watch_finds_another_groups_writer_serving_anew() {
         let mut watch = Watch::new(1, "r1", false);

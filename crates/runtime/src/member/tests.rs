@@ -1040,7 +1040,7 @@ fn standing_by(
 async fn a_stop_that_lands_while_the_lease_is_taken_gives_it_up_and_never_ends_holding_it() {
     let (api, mut elector, tell, mut told) = standing_by(Duration::from_secs(2));
     let waiting = tokio::spawn(async move {
-        stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told).await
+        stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told, None).await
     });
     // The take is out: written, not yet answered.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1073,7 +1073,14 @@ async fn a_standby_told_to_stop_between_looks_stops_at_once_and_one_never_told_t
         resource_version: "7".into(),
     });
     let waiting = tokio::spawn(async move {
-        stand_by(&mut elector, Duration::from_secs(3600), "bor", &mut told).await
+        stand_by(
+            &mut elector,
+            Duration::from_secs(3600),
+            "bor",
+            &mut told,
+            None,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_secs(5)).await;
     let began = tokio::time::Instant::now();
@@ -1087,6 +1094,146 @@ async fn a_standby_told_to_stop_between_looks_stops_at_once_and_one_never_told_t
     );
 
     let (api, mut elector, _tell, mut told) = standing_by(Duration::ZERO);
-    assert!(stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told).await);
+    assert!(stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told, None).await);
     assert_eq!(api.held.lock().unwrap().as_ref().unwrap().holder, "bor-b_1");
+}
+
+/// A writer stepping down gives its lease up first (ruled 2026-11-16): its
+/// standby takes over at its next look, not after the lapse (CI
+/// 43788516279: the lake's writer, its epoch passed, stepped down holding
+/// its lease). Only its own: a lease another member took meanwhile is never
+/// touched. And within its bound, the API server slow to answer.
+#[tokio::test(start_paused = true)]
+async fn a_writer_stepping_down_gives_its_own_lease_up_and_never_one_another_took() {
+    let (api, mut elector, _tell, _told) = standing_by(Duration::ZERO);
+    assert_eq!(
+        elector.look(Instant::now(), now_ns()).await,
+        Ok(Standing::Held)
+    );
+    let elector = tokio::sync::Mutex::new(elector);
+    let_go_stepping_down(&elector, "bor").await;
+    let left = api.held.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        left.holder, "",
+        "the lease it held is given up: its standby takes it at once"
+    );
+
+    // Another member took it meanwhile: never cleared.
+    let (api, mut elector, _tell, _told) = standing_by(Duration::ZERO);
+    assert_eq!(
+        elector.look(Instant::now(), now_ns()).await,
+        Ok(Standing::Held)
+    );
+    {
+        let mut held = api.held.lock().unwrap();
+        let current = held.as_mut().unwrap();
+        current.holder = "bor-c_1".into();
+        current.resource_version = "9".into();
+    }
+    let elector = tokio::sync::Mutex::new(elector);
+    let_go_stepping_down(&elector, "bor").await;
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "bor-c_1",
+        "a lease another member took was cleared"
+    );
+
+    // The API server slow: given up on within the bound.
+    let (api, mut elector, _tell, _told) = standing_by(Duration::ZERO);
+    assert_eq!(
+        elector.look(Instant::now(), now_ns()).await,
+        Ok(Standing::Held)
+    );
+    let slow = SlowLeases {
+        held: Arc::clone(&api.held),
+        answers_in: Duration::from_secs(30),
+    };
+    let mut slowly = Elector::new(slow, elector.settings().clone());
+    assert_eq!(
+        slowly.look(Instant::now(), now_ns()).await,
+        Ok(Standing::Held)
+    );
+    let began = tokio::time::Instant::now();
+    let_go_stepping_down(&tokio::sync::Mutex::new(slowly), "bor").await;
+    assert!(
+        began.elapsed() <= STEP_DOWN_RELEASE,
+        "it waited {:?} to give the lease up",
+        began.elapsed()
+    );
+}
+
+/// A standby defers to a newer member of its group (ruled 2026-11-16): a
+/// free lease is left to the member a rollout brought at the new count,
+/// which takes it; this member, at the old count, never takes it then (CI
+/// 43788516279, "ha groups raised": an old member's takeover fenced the
+/// added group's writer).
+#[tokio::test(start_paused = true)]
+async fn a_standby_leaves_a_free_lease_to_a_newer_member_of_its_group() {
+    let (api, mut elector, _tell, mut told) = standing_by(Duration::ZERO);
+    let newer: Arc<NewerLook> = Arc::new(|| Ok(true));
+    let waiting = tokio::spawn(async move {
+        stand_by(
+            &mut elector,
+            Duration::from_secs(1),
+            "bor",
+            &mut told,
+            Some(newer),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        api.held.lock().unwrap().is_none(),
+        "the old member took the free lease while a newer member of its group was there"
+    );
+    // The newer member takes it, and renews it.
+    *api.held.lock().unwrap() = Some(crate::lease::Record {
+        holder: "bor-new_1".into(),
+        duration_seconds: 6,
+        acquire_time: crate::lease::micro_time(now_ns()),
+        renew_time: crate::lease::micro_time(now_ns()),
+        transitions: 1,
+        resource_version: "1".into(),
+    });
+    for n in 2..12u64 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut held = api.held.lock().unwrap();
+        let current = held.as_mut().unwrap();
+        current.renew_time = crate::lease::micro_time(now_ns() + n as i64);
+        current.resource_version = n.to_string();
+    }
+    assert!(
+        !waiting.is_finished(),
+        "the old member took the newer member's lease"
+    );
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "bor-new_1"
+    );
+    waiting.abort();
+}
+
+/// ... but never leaves nobody to write: where no newer member takes the
+/// free lease within one lease duration, the old member takes it -- a
+/// writer at the old count is better than none.
+#[tokio::test(start_paused = true)]
+async fn a_standby_deferring_takes_a_lease_nobody_newer_took_within_its_duration() {
+    let (api, mut elector, _tell, mut told) = standing_by(Duration::ZERO);
+    let newer: Arc<NewerLook> = Arc::new(|| Ok(true));
+    let began = tokio::time::Instant::now();
+    let holds = stand_by(
+        &mut elector,
+        Duration::from_secs(1),
+        "bor",
+        &mut told,
+        Some(newer),
+    )
+    .await;
+    let waited = began.elapsed();
+    assert!(holds);
+    assert_eq!(api.held.lock().unwrap().as_ref().unwrap().holder, "bor-b_1");
+    assert!(
+        waited >= Duration::from_secs(6) && waited <= Duration::from_secs(8),
+        "it took the lease after {waited:?}: one lease duration (6 s), and a look or two more at most"
+    );
 }

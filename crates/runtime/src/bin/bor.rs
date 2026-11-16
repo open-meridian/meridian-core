@@ -296,6 +296,23 @@ fn run() -> Result<(), String> {
                 Ok(watch.lock().expect("watch poisoned").serves(&others))
             }
         };
+        // A standby takes no free lease while a newer member of its group
+        // is there (ruled 2026-11-16): a rollout's member at the new count
+        // takes it, never an old one whose takeover at the old count fences
+        // the groups the new count added; unless nobody takes it within
+        // one lease duration.
+        let member = member.deferring_to_newer({
+            let home = Arc::clone(&every_database[0]);
+            let me = meridian_runtime::member::seen_as(&instance_id);
+            let newer = std::sync::Mutex::new(meridian_changes::members::Newer::new(
+                groups.mine(),
+                &revision,
+            ));
+            move || {
+                let others = home.members_but(&me).map_err(|failed| failed.to_string())?;
+                Ok(newer.lock().expect("newer poisoned").there(&others))
+            }
+        });
         // A reader member (contract v30, stage B): the book's reads alone,
         // its books kept by the writer's change log, never acting.
         if member.is_reader() {
