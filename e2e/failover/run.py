@@ -325,6 +325,22 @@ def out(*args, check=True):
     return kubectl(*args, check=check).stdout.decode().strip()
 
 
+def settled_read(read, settled, seconds, every=2.0):
+    """`read()` asked every `every` until `settled` says its answer has
+    settled, within `seconds`: that answer, the one checked, or the last
+    one read where none settled. A second read after the one that settled
+    can straddle a change -- a takeover, a new timeline -- that the first
+    waited out (PR CI 43810170103)."""
+    said = []
+
+    def ready():
+        said[:] = [read()]
+        return settled(said[0])
+
+    happens(ready, seconds, every)
+    return said[0] if said else read()
+
+
 def happens(ready, seconds, every=2.0):
     """Whether `ready` comes true within `seconds`, asked every `every`. A
     command it runs that fails is "not yet": `run` stops with SystemExit,
@@ -5599,12 +5615,15 @@ def writer_groups(s):
             f"and recorded_at_ns >= {since_ns} and epoch = {own})")
         return (said.strip().split("|") + [""] * 5)[:5]
 
-    def lake_settled():
-        lake_one, control, drive, _, by_one = lake_groups()
+    def lake_settled(said):
+        lake_one, control, drive, _, by_one = said
         return bool(lake_one) and drive == lake_one and control != lake_one and by_one.isdigit() and int(by_one) > 0
 
-    happens(lake_settled, 60)
-    lake_one, control, drive, flood, by_one = lake_groups()
+    # The read that settled is the one checked, never a read after it: a
+    # new timeline between the two raised every epoch again (PR CI
+    # 43810170103: the book's P0 settled, then read under its next epoch,
+    # 0 entries, after the database's timeline moved at 05:54:20).
+    lake_one, control, drive, flood, by_one = settled_read(lake_groups, lake_settled, 60)
     s.check(lake_one and drive == lake_one and control != lake_one,
             f"writer groups: the lake's group 1 owns drive-data:drive under its own epoch "
             f"(group 1 {lake_one or 'none'}, the dataset {drive}, control {control})")
@@ -5626,12 +5645,11 @@ def writer_groups(s):
             f"and committed_at_ns >= {since_ns} and partition = 'P0' and epoch = {p0})")
         return (said.strip().split("|") + [""] * 3)[:3]
 
-    def book_settled():
-        p0, book_control, acted = book_groups()
+    def book_settled(said):
+        p0, book_control, acted = said
         return bool(p0) and bool(book_control) and p0 != book_control and acted.isdigit() and int(acted) > 0
 
-    happens(book_settled, 60)
-    p0, book_control, acted = book_groups()
+    p0, book_control, acted = settled_read(book_groups, book_settled, 60)
     s.check(p0 and book_control and p0 != book_control,
             f"writer groups: the book's P0 (group 1's) and control (group 0's) under their own epochs "
             f"({p0} and {book_control})")
