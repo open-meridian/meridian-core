@@ -83,6 +83,7 @@ nobody gives. No value of a secret, a key or a password is ever printed.
 
 import base64
 import datetime
+import http.client
 import json
 import os
 import queue
@@ -1082,18 +1083,21 @@ def shards(s):
     name = deployment["metadata"]["name"]
     before = {p["metadata"]["name"] for p in shard_pods()}
     kubectl("rollout", "restart", f"deployment/{name}")
-    rolling = subprocess.Popen(["kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{name}",
-                                "--timeout=300s"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    least = SHARDS
-    while rolling.poll() is None:
+    # Judged by its pods, not by `kubectl rollout status`: that waits for
+    # every replica available, and the standby pod is never ready, by
+    # design, so it never ends for this Deployment (PR CI 43783060111: it
+    # ran to its 300 s with the three new pods there, two ready and the
+    # third standing by, which is the rollout done).
+    least, rolled, until = SHARDS, False, time.time() + 300
+    while time.time() < until and not rolled:
         try:
-            least = min(least, len([p for p in shard_pods() if ready(p)]))
+            live = shard_pods()
+            least = min(least, len([p for p in live if ready(p)]))
+            rolled = (not ({p["metadata"]["name"] for p in live} & before) and settled()
+                      and len([p for p in shard_pods() if ready(p)]) == SHARDS)
         except (Exception, SystemExit):
             pass
         time.sleep(0.5)
-    rolled = rolling.returncode == 0 and happens(
-        lambda: settled() and not ({p["metadata"]["name"] for p in shard_pods()} & before)
-        and len([p for p in shard_pods() if ready(p)]) == SHARDS, 120)
     s.check(rolled, f"shards: its pods rolled to new ones, two shards and a standby "
                     f"({len(shard_pods())} pods, {len([p for p in shard_pods() if ready(p)])} ready)")
     s.check(rolled and least >= 1, f"shards: a shard at a time: never fewer than one ready (least {least})")
@@ -3939,18 +3943,40 @@ class Dashboard:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        self.forward = subprocess.Popen(
-            ["kubectl", "--namespace", NAMESPACE, "port-forward", f"svc/{FULL}-dashboard", f"{port}:80"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.port = port
         self.base = f"http://127.0.0.1:{port}"
         self.cookies = {}
         self.access = None
-        if not happens(lambda: self.send("GET", "/sign-in")[0] == 200, 60, every=1):
-            self.close()
+        self.forward = None
+        if not self.forwarded():
             raise SystemExit("the dashboard did not answer over its port-forward")
 
+    def forwarded(self):
+        """A port-forward to the dashboard's Service, made anew: one lands
+        on the pod the Service chose when it was made, and ends with it.
+        Whether the dashboard answers over it."""
+        self.close()
+
+        def answers():
+            if self.forward is None or self.forward.poll() is not None:
+                self.forward = subprocess.Popen(
+                    ["kubectl", "--namespace", NAMESPACE, "port-forward", f"svc/{FULL}-dashboard",
+                     f"{self.port}:80"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(1)
+            try:
+                return self.send("GET", "/sign-in")[0] == 200
+            except (OSError, http.client.HTTPException):
+                return False
+        if happens(answers, 120, every=1):
+            return True
+        self.close()
+        return False
+
     def close(self):
-        self.forward.terminate()
+        if self.forward is not None:
+            self.forward.terminate()
+            self.forward.wait()
+            self.forward = None
 
     def send(self, method, path, fields=None, body=None, bearer=None):
         data, kind = None, None
@@ -4450,6 +4476,12 @@ def moves(s, dash):
             "--timeout=420s", check=False)
     ready = happens(all_ready, 600, every=5)
     s.check(ready, "rebalance: every component ready at two databases")
+    # The dashboard's pod was replaced too: it is handed the chart's
+    # resilience values (item 34), which the databases' count changed, and
+    # her port-forward ended with the old pod (PR CI 43783060111: the next
+    # tool call, "Remote end closed connection without response"). Her
+    # client's grant is the dashboard's record, not the pod's.
+    s.check(dash.forwarded(), "rebalance: the dashboard, restarted with the chart's new values, answers her again")
     since_ms = int(time.time() * 1000)
     writing = happens(lambda: all(sum(1 for at in driver_acked().get(kind, {}).values() if at > since_ms) >= 10
                                   for kind in ("price", "order")), 300, every=3)
