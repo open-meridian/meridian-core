@@ -147,8 +147,8 @@ impl Watch {
 }
 
 /// What a standby watches for before it takes its group's lease (step 3d;
-/// ruled 2026-11-16 for c30d-t4): a member of its own writer group that
-/// runs another revision and started after this standby first looked -- a
+/// ruled 2026-11-16 for c30d-t4): a writer or standby of its own writer
+/// group that runs another revision and started after this standby first looked -- a
 /// rollout's new member, there to take the lease at the new count. An old
 /// member that took it would write at the count it runs, and its takeover
 /// would fence the writers of the groups the new count added (CI
@@ -196,7 +196,10 @@ impl Newer {
             return false;
         };
         others.iter().any(|said| {
-            let mine = said.writer_group == Some(self.writer_group);
+            // A writer or a standby of its group: a reader never takes the
+            // lease (the review's M3).
+            let mine = said.writer_group == Some(self.writer_group)
+                && (said.mode == "writer" || said.mode == "standby");
             let said_again = before
                 .get(&said.member)
                 .is_none_or(|seen| said.seen_at_ns != *seen);
@@ -400,6 +403,13 @@ mod tests {
         let other_group = said("lake-g1-a", "v/db1/wg2", 50, 80, 1, "writer");
         let same = said("lake-old-c", "v/db1/wg1", 50, 80, 0, "standby");
         assert!(!newer.there(&[old.clone(), other_group, same]));
+        // A reader of its group never takes a lease: never newer (the
+        // review's M3).
+        let reader = said("lake-reader-x", "v/db1/wg2", 50, 90, 0, "reader");
+        assert!(
+            !newer.there(&[old.clone(), reader]),
+            "a reader counted as a newer member that would take the lease"
+        );
         // One found at the first look is never newer, said again or not.
         let mut late = Newer::new(0, "v/db1/wg1");
         late.there(&[said("lake-new-a", "v/db1/wg2", 50, 60, 0, "standby")]);

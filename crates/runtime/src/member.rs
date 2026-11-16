@@ -652,8 +652,14 @@ pub(crate) async fn stand_by<L: Leases>(
     let mut newer_seen: Option<tokio::time::Instant> = None;
     let mut free_since: Option<tokio::time::Instant> = None;
     let duration = elector.settings().duration;
+    // A look that failed may have taken the lease: its write landed and
+    // its answer was lost (the review's L2).
+    let mut may_hold = false;
     loop {
         if *told.borrow() {
+            if may_hold {
+                give_up_if_mine(elector, component).await;
+            }
             return false;
         }
         if let Some(look) = &newer {
@@ -708,7 +714,7 @@ pub(crate) async fn stand_by<L: Leases>(
             Ok(Standing::Held) => {
                 if *told.borrow() {
                     tracing::info!(component, "told to stop as it took the lease: giving it up");
-                    elector.release(now_ns()).await;
+                    give_up_if_mine(elector, component).await;
                     return false;
                 }
                 return true;
@@ -724,6 +730,7 @@ pub(crate) async fn stand_by<L: Leases>(
                 }
             }
             Err(failed) => {
+                may_hold = true;
                 tracing::warn!(component, %failed, "the lease could not be read; looking again");
             }
         }
@@ -978,6 +985,23 @@ impl Holding {
         if let Some(elector) = &self.elector {
             elector.lock().await.release(now_ns()).await;
         }
+    }
+}
+
+/// A member stopping gives up a lease that names it, within
+/// [`STEP_DOWN_RELEASE`]: read again, and released only where it still
+/// names this member (`release_if_mine`).
+async fn give_up_if_mine<L: Leases>(elector: &mut Elector<L>, component: &str) {
+    match tokio::time::timeout(STEP_DOWN_RELEASE, elector.release_if_mine(now_ns())).await {
+        Ok(Ok(true)) => tracing::info!(component, "stopping: the lease given up"),
+        Ok(Ok(false)) => {}
+        Ok(Err(failed)) => {
+            tracing::warn!(component, %failed, "stopping: the lease could not be given up; it lapses on its own")
+        }
+        Err(_) => tracing::warn!(
+            component,
+            "stopping: the lease was not given up within its bound; it lapses on its own"
+        ),
     }
 }
 

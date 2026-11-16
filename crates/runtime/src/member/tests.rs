@@ -1237,3 +1237,90 @@ async fn a_standby_deferring_takes_a_lease_nobody_newer_took_within_its_duration
         "it took the lease after {waited:?}: one lease duration (6 s), and a look or two more at most"
     );
 }
+
+/// One Lease whose writes land and whose answers are lost: the API server
+/// commits the update, and the client is told it failed (a timeout).
+#[derive(Clone)]
+struct LostAnswers {
+    held: Arc<std::sync::Mutex<Option<crate::lease::Record>>>,
+}
+
+impl Leases for LostAnswers {
+    async fn get(&self, _name: &str) -> Result<Option<crate::lease::Record>, String> {
+        Ok(self.held.lock().unwrap().clone())
+    }
+
+    async fn create(
+        &self,
+        _name: &str,
+        _record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        Ok(crate::lease::Wrote::Conflict)
+    }
+
+    async fn update(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        let mut held = self.held.lock().unwrap();
+        let current = held.as_ref().unwrap();
+        if current.resource_version != record.resource_version {
+            return Ok(crate::lease::Wrote::Conflict);
+        }
+        let next = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
+        let taking = !record.holder.is_empty();
+        let mut record = record.clone();
+        record.resource_version = next.clone();
+        *held = Some(record);
+        // A take's answer is lost; a release's is read.
+        if taking {
+            Err("the API server did not answer within 2 s".into())
+        } else {
+            Ok(crate::lease::Wrote::Done(next))
+        }
+    }
+}
+
+/// A standby whose take of a free lease landed while its answer was lost,
+/// then told to stop: it gives up the lease that names it (the review's
+/// L2), never stopping with the lease left to lapse.
+#[tokio::test(start_paused = true)]
+async fn a_stop_after_a_take_whose_answer_was_lost_gives_the_lease_up() {
+    let api = LostAnswers {
+        held: Arc::new(std::sync::Mutex::new(Some(crate::lease::Record {
+            holder: String::new(),
+            duration_seconds: 1,
+            acquire_time: crate::lease::micro_time(now_ns()),
+            renew_time: crate::lease::micro_time(now_ns()),
+            transitions: 3,
+            resource_version: "7".into(),
+        }))),
+    };
+    let mut elector = Elector::new(
+        api.clone(),
+        crate::lease::Settings {
+            name: "release-bor".into(),
+            holder: "bor-b_1".into(),
+            renew: Duration::from_secs(2),
+            duration: Duration::from_secs(6),
+        },
+    );
+    let (tell, mut told) = tokio::sync::watch::channel(false);
+    let waiting = tokio::spawn(async move {
+        stand_by(&mut elector, Duration::from_secs(1), "bor", &mut told, None).await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "bor-b_1",
+        "the take had not landed"
+    );
+    tell.send(true).unwrap();
+    assert!(!waiting.await.unwrap(), "told to stop, it went on to write");
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "",
+        "it stopped with the lease naming it: nobody renews it until it lapses"
+    );
+}
