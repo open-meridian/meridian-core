@@ -226,11 +226,27 @@ SHARDS = 2
 # PR CI 43740296065.)
 SHARD_STUB_NO_TOKEN = "stub: no lease token in the plugin container"
 SHARD_STUB_ANSWERED = "stub: the sidecar answers"
+# Said each time the sidecar stops answering: a shard lost ends its
+# sidecar, which comes back in its pod as the standby, while the plugin's
+# container -- and its log -- runs on (PR CI 43854641653: a standby's
+# plugin log held the answer of a shard its pod had held before). So the
+# stub says each change, and a check reads its last word.
+SHARD_STUB_GONE = "stub: the sidecar no longer answers"
 SHARD_STUB = (
     "test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && echo '" + SHARD_STUB_NO_TOKEN + "'; "
-    "until (exec 3<>/dev/tcp/127.0.0.1/9191) 2>/dev/null; do sleep 0.2; done; "
-    "echo '" + SHARD_STUB_ANSWERED + "'; while true; do sleep 3600; done"
+    "was=; while true; do "
+    "if (exec 3<>/dev/tcp/127.0.0.1/9191) 2>/dev/null; then now=yes; else now=; fi; "
+    "if [ \"$now\" != \"$was\" ]; then "
+    "if [ -n \"$now\" ]; then echo '" + SHARD_STUB_ANSWERED + "'; else echo '" + SHARD_STUB_GONE + "'; fi; "
+    "was=$now; fi; sleep 0.5; done"
 )
+
+
+def stub_answered(said):
+    """Whether the shard stub's log `said` ends answered: its last word of
+    the sidecar is that it answers, not that it no longer does."""
+    words = [line for line in said.splitlines() if SHARD_STUB_ANSWERED in line or SHARD_STUB_GONE in line]
+    return bool(words) and SHARD_STUB_ANSWERED in words[-1]
 # A standby holds a lapsed shard within this (ruling 1056, question 12).
 SHARD_TAKEOVER = 10
 # The write-scale step's load (step 3d, stage T; section 15), in the scaled
@@ -1131,8 +1147,16 @@ def shards(s):
     stubs = {n: shard_log(n, container="plugin") for n in names}
     s.check(all(SHARD_STUB_NO_TOKEN in said for said in stubs.values()),
             "shards: no pod's plugin container holds the token")
-    answered = happens(lambda: all(SHARD_STUB_ANSWERED in shard_log(h, container="plugin") for h in holders), 30)
-    s.check(answered and SHARD_STUB_ANSWERED not in shard_log(standby, container="plugin"),
+    answered = happens(lambda: all(stub_answered(shard_log(h, container="plugin")) for h in holders), 30)
+    # The standby's as it stands now: a pod whose shard was lost before
+    # (its sidecar ended and came back standing by) said both, in turn.
+    waits = happens(lambda: not stub_answered(shard_log(standby, container="plugin")), 10)
+    if SHARD_STUB_ANSWERED in shard_log(standby, container="plugin"):
+        restarts = out("get", "pod", standby, "-o", "jsonpath={.status.containerStatuses[?(@.name=='sidecar')]"
+                       ".restartCount}")
+        s.note(f"shards: the standby {standby} held a shard before (its sidecar restarted {restarts} time(s)); "
+               f"its plugin: {shard_log(standby, container='plugin').strip()[-400:]}")
+    s.check(answered and waits,
             "shards: each shard's plugin is answered by its sidecar; the standby's is not, so its run() waits")
     deployment = json.loads(out("get", "deployment", "-l", f"meridian.dev/instance={SHARDED}", "-o", "json"))["items"][0]
     shard_admission(s, deployment)
@@ -1160,7 +1184,7 @@ def shards(s):
     figure("shards: the lease changed hands, and its taker served, after the kill",
            lease_s=round(took, 2), serving_s=None if serving is None else round(serving, 2))
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
-    plugged = happens(lambda: SHARD_STUB_ANSWERED in shard_log(now_pod, container="plugin"), 30)
+    plugged = happens(lambda: stub_answered(shard_log(now_pod, container="plugin")), 30)
     s.check(plugged, "shards: the taker's plugin is answered by its sidecar")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
