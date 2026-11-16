@@ -43,15 +43,12 @@ pub fn raise_topic(domain: &str, group: u32) -> String {
 
 /// Whether `topic` is a writer group's ask to raise a shard's epoch.
 pub fn is_raise_topic(topic: &str) -> bool {
-    [
-        "platform.lake.internal.raise-shard.",
-        "platform.book.internal.raise-shard.",
-    ]
-    .iter()
-    .any(|prefix| {
-        topic
-            .strip_prefix(prefix)
-            .is_some_and(|group| group.parse::<u32>().is_ok())
+    topic.rsplit_once('.').is_some_and(|(_, group)| {
+        group.parse::<u32>().is_ok_and(|group| {
+            ["lake", "book"]
+                .iter()
+                .any(|domain| raise_topic(domain, group) == topic)
+        })
     })
 }
 
@@ -315,6 +312,15 @@ mod tests {
 
     fn stamp(epoch: u64) -> ShardStamp {
         ShardStamp::of("feed-1", 1, epoch).unwrap()
+    }
+
+    #[test]
+    fn a_raise_topic_is_a_store_s_and_a_group_s() {
+        assert!(is_raise_topic(&raise_topic("lake", 3)));
+        assert!(is_raise_topic(&raise_topic("book", 0)));
+        assert!(!is_raise_topic(&raise_topic("street", 0)));
+        assert!(!is_raise_topic("platform.lake.internal.record"));
+        assert!(!is_raise_topic(&format!("{}x", raise_topic("lake", 1))));
     }
 
     #[test]
