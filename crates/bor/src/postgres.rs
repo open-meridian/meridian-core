@@ -2294,7 +2294,7 @@ impl Store for PostgresStore {
             shard,
             epoch,
             // The book takes no write from a stream (review c5a H2).
-            0,
+            None,
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;

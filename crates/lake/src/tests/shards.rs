@@ -214,3 +214,39 @@ async fn a_take_is_answered_inside_the_sidecar_s_wait_however_slow_a_group_is() 
         "the sidecar gave up before the lake answered: {answered}"
     );
 }
+
+/// Review c5a2 L1: a take raised in every group after its sidecar stopped
+/// waiting records nothing, so no record names a holder that gave up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_raised_after_its_sidecar_gave_up_is_not_recorded() {
+    let (bus, zero, _one, lake) = two_groups();
+    lake.with_book_groups(1);
+    book_group(&bus, 0);
+    let envelope = Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: INSTANCE.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let request = TakeShardRequest {
+        instance: INSTANCE.into(),
+        shard: 0,
+        holder: "feed-pod-b_1".into(),
+        ..Default::default()
+    };
+    let late = tokio::task::spawn_blocking(move || {
+        lake.take_shard_until(request, &envelope, std::time::Instant::now())
+    })
+    .await
+    .unwrap();
+    assert!(late.is_err(), "{late:?}");
+    let recorded = zero
+        .read_changes(meridian_changes::CONTROL, 0, meridian_changes::PAGE_MOST)
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
+        .count();
+    assert_eq!(recorded, 0, "a take its sidecar gave up on was recorded");
+}

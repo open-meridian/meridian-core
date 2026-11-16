@@ -609,13 +609,13 @@ impl Store for Spread {
         instance: &str,
         shard: u32,
         epoch: u64,
-        admit_through: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
     ) -> Result<u64> {
         // Every database this group may write a part to: a range moved
         // between databases is written where its head is (step 3d).
         let mut held = 0;
         for store in &self.stores {
-            held = held.max(store.raise_shard(instance, shard, epoch, admit_through)?);
+            held = held.max(store.raise_shard(instance, shard, epoch, admit)?);
         }
         Ok(held)
     }

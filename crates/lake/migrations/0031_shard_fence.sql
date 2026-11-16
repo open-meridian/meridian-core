@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS lake_shard_fence (
     -- its epoch, so a replay of one already answered is never refused
     -- (review c5a H2; provisional name, item 48).
     admit_through bigint NOT NULL DEFAULT 0,
+    -- The identity (creation time, ns) of the stream admit_through is a
+    -- place in: a write of another stream -- one made again, numbering from
+    -- 1 -- is admitted by nothing (review c5a2 N4; provisional, item 48).
+    admit_stream bigint NOT NULL DEFAULT 0,
     -- The highest Lease transitions a take was numbered with: a take below
     -- it is refused, so a slow pod's late take never fences the holder that
     -- took the Lease after it (review c5a M2; provisional name, item 48).

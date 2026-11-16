@@ -818,10 +818,9 @@ impl Store for HotStore {
         instance: &str,
         shard: u32,
         epoch: u64,
-        admit_through: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
     ) -> Result<u64> {
-        self.inner
-            .raise_shard(instance, shard, epoch, admit_through)
+        self.inner.raise_shard(instance, shard, epoch, admit)
     }
 
     fn reseat_shards(&self) -> Result<usize> {

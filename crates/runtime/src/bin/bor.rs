@@ -519,32 +519,31 @@ fn run() -> Result<(), String> {
                 .map_err(|failed| failed.to_string())
         };
         let following = Arc::clone(&store);
-        let (asking, raising_on) = (Arc::clone(&bus), raise_book.clone());
         holding.follow_timeline(&bus, "book", move || {
-            let found = following
+            following
                 .follow_timeline()
-                .map_err(|failed| failed.to_string())?;
-            if let meridian_changes::timeline::Timeline::Moved(_) = found {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(meridian_runtime::shards::raise_book_until_done(
-                        Arc::clone(&asking),
-                        raising_on.clone(),
-                    ));
-                }
-            }
-            Ok(found)
+                .map_err(|failed| failed.to_string())
         });
-        // As it starts, before it serves: tried once in time, then asked
-        // again until done (review c5a H1, L1: a database added later too).
-        if let Err(failed) =
-            meridian_runtime::shards::raise_book_to_records(&bus, raise_book.clone()).await
-        {
-            tracing::warn!(%failed, "the book's plugin shard fences were not raised to the lake's records before it serves; asking again");
-            meridian_runtime::background(meridian_runtime::shards::raise_book_until_done(
-                Arc::clone(&bus),
-                raise_book,
-            ));
-        }
+        // As it starts, before it serves: not served until done, within its
+        // bound (review c5a H1, L1: a database added later too; c5a2 N3).
+        let shards = meridian_runtime::shards::raise_book_to_records(&bus, raise_book.clone())
+            .await
+            .map_err(|failed| {
+                format!(
+                    "the book's plugin shard fences were not raised to the lake's records: {failed}; \
+                     not serving"
+                )
+            })?;
+        tracing::info!(
+            shards,
+            "the book's plugin shard fences raised to the lake's records"
+        );
+        // And on each new database timeline, whichever connection met it
+        // first (c5a2 N3).
+        meridian_runtime::background(meridian_runtime::shards::raise_book_on_new_timelines(
+            Arc::clone(&bus),
+            raise_book,
+        ));
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // This writer group's raise of a plugin shard's epoch (step 3d,

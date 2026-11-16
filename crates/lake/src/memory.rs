@@ -108,17 +108,6 @@ impl MemoryStore {
         self.held.lock().expect("lake store poisoned")
     }
 
-    /// Each plugin shard's highest epoch its records name (review c5a H1).
-    fn recorded_shards(held: &Held) -> BTreeMap<(String, u32), u64> {
-        let bodies: Vec<Vec<u8>> = held
-            .control
-            .iter()
-            .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
-            .map(|change| change.body.clone())
-            .collect();
-        meridian_changes::shard_fence::highest_recorded(bodies.iter().map(Vec::as_slice))
-    }
-
     /// Log what is not a dataset's row in the `control` partition (step
     /// 3b), under the writer's epoch as Postgres checks it.
     fn log_control(&self, held: &mut Held, entries: Vec<(&str, Vec<u8>, i64)>) -> Result<()> {
@@ -469,13 +458,9 @@ impl Store for MemoryStore {
         let mut held = self.lock();
         // Checked before anything is raised, as Postgres checks it.
         self.fenced(&mut held)?;
-        let recorded = Self::recorded_shards(&held)
-            .get(&(took.instance.clone(), took.shard))
-            .copied()
-            .unwrap_or(0);
         took.epoch = self
             .shards
-            .take(&took.instance, took.shard, lease_transitions, recorded)
+            .take(&took.instance, took.shard, lease_transitions)
             .map_err(|behind| crate::postgres::take_behind(&took, lease_transitions, behind))?;
         Ok(took)
     }
@@ -496,16 +481,16 @@ impl Store for MemoryStore {
         instance: &str,
         shard: u32,
         epoch: u64,
-        admit_through: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
     ) -> Result<u64> {
         Ok(self
             .shards
-            .raise_admitting(instance, shard, epoch, admit_through))
+            .raise_admitting(instance, shard, epoch, admit.unwrap_or_default()))
     }
 
     fn reseat_shards(&self) -> Result<usize> {
-        let recorded = Self::recorded_shards(&self.lock());
-        Ok(self.shards.raise_all(&recorded))
+        // One store, which numbers the takes itself: its own epochs.
+        Ok(0)
     }
 
     fn record_write_ahead(

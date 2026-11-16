@@ -15,5 +15,9 @@ CREATE TABLE IF NOT EXISTS book_shard_fence (
     -- its epoch, so a replay of one already answered is never refused
     -- (review c5a H2; provisional name, item 48).
     admit_through bigint NOT NULL DEFAULT 0,
+    -- The identity (creation time, ns) of the stream admit_through is a
+    -- place in: a write of another stream -- one made again, numbering from
+    -- 1 -- is admitted by nothing (review c5a2 N4; provisional, item 48).
+    admit_stream bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (instance, shard)
 );

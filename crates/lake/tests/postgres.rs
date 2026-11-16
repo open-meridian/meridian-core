@@ -10652,8 +10652,8 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
         .collect();
     assert_eq!(recorded, vec![1, 4, 9, 1]);
     // A raise heard from the control writer: never down.
-    assert_eq!(store.raise_shard(&instance, 1, 5, 0).unwrap(), 9);
-    assert_eq!(store.raise_shard(&instance, 1, 12, 0).unwrap(), 12);
+    assert_eq!(store.raise_shard(&instance, 1, 5, None).unwrap(), 9);
+    assert_eq!(store.raise_shard(&instance, 1, 12, None).unwrap(), 12);
     let done = store.record_parts(
         &dataset,
         vec![vec![close(&dataset, "h", &subject, "2026-11-16", 8)]],
@@ -10663,74 +10663,112 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
     assert!(fenced(&done[0]), "{:?}", done[0]);
 }
 
-/// Review c5a H1: a shard's epoch outlives its database's lost commits. A
-/// row a restore took back is raised again to the highest the takes'
-/// records name on the new timeline, and as a member starts, so a stale
-/// holder's write is refused; a take numbers past the records, not the row
-/// alone.
+/// Review c5a2 N1, N2: every fence transaction commits on the synchronous
+/// standby, whatever the lake's connections default to (they commit
+/// locally): the take's numbering, a group's raise and its stream's place,
+/// and the raise to database 0's epochs.
 #[test]
-fn a_shard_s_epoch_lost_with_a_database_s_commits_is_raised_again_from_its_records() {
-    use meridian_changes::timeline::Timeline;
-    use meridian_lake::store::{ShardStamp, StoreError};
-    let (url, writer) = isolated("lake-shard-timeline");
+fn a_shard_s_fence_commits_on_the_synchronous_standby() {
+    use meridian_changes::shard_fence::{raise_all, raise_to, take, Admit, LAKE};
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let joined = if url.contains('?') { "&" } else { "?" };
+    let local = format!("{url}{joined}options=-c%20synchronous_commit%3Dlocal");
+    let mut client = postgres::Client::connect(&local, postgres::NoTls).unwrap();
     let instance = unique("feed");
-    let dataset = unique("feed:prices");
-    let subject = unique("LCL-BTC");
-    let stamp = |epoch: u64| ShardStamp::of(&instance, 1, epoch);
-    assert_eq!(writer.adopt().unwrap(), 1);
-    assert_eq!(writer.follow_timeline().unwrap(), Timeline::First);
-    for want in [1, 2] {
-        let taken = writer.take_shard(took(&instance, 1), 0).unwrap();
-        assert_eq!(taken.epoch, want);
-        writer.record_shard_take(&taken).unwrap();
-    }
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    // As a restore from before the last raise leaves it.
-    let lose = |admin: &mut postgres::Client| {
-        admin
-            .execute("UPDATE lake_shard_fence SET epoch = 1", &[])
-            .unwrap();
+    let setting = |tx: &mut postgres::Transaction<'_>| -> String {
+        tx.query_one("SHOW synchronous_commit", &[]).unwrap().get(0)
     };
-    lose(&mut admin);
+    let mut tx = client.transaction().unwrap();
+    assert_eq!(setting(&mut tx), "local", "the connection commits locally");
+    take(&mut tx, LAKE, &instance, 1, 0).unwrap().unwrap();
+    assert_eq!(setting(&mut tx), "on", "a take's numbering");
+    tx.commit().unwrap();
+    let mut tx = client.transaction().unwrap();
+    let admit = Admit {
+        through: 9,
+        stream: 1,
+    };
+    raise_to(&mut tx, LAKE, &instance, 1, 2, Some(admit)).unwrap();
+    assert_eq!(setting(&mut tx), "on", "a group's raise");
+    tx.commit().unwrap();
+    let mut tx = client.transaction().unwrap();
+    let highest = [((instance.clone(), 1), 3)].into_iter().collect();
+    raise_all(&mut tx, LAKE, &highest).unwrap();
+    assert_eq!(setting(&mut tx), "on", "a raise to database 0's epochs");
+    tx.commit().unwrap();
+    // The stream's place a raise kept is never lowered by it (N2).
+    let (epoch, through): (i64, i64) = {
+        let row = client
+            .query_one(
+                "SELECT epoch, admit_through FROM lake_shard_fence WHERE instance = $1",
+                &[&instance],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    assert_eq!((epoch, through), (3, 9));
+}
+
+/// Review c5a2 N6: a take is numbered by the shard's row, which holds the
+/// highest epoch, never by reading the control journal: a record naming a
+/// higher epoch than the row changes nothing.
+#[test]
+fn a_take_is_numbered_by_its_row_not_by_the_control_journal() {
+    let (url, writer) = isolated("lake-shard-row");
+    let instance = unique("feed");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    let taken = writer.take_shard(took(&instance, 1), 0).unwrap();
+    assert_eq!(taken.epoch, 1);
+    writer.record_shard_take(&taken).unwrap();
+    // A record the row never saw, as a journal read would find it.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let body = {
+        use prost::Message as _;
+        meridian_domain::v1::ShardTookOver {
+            epoch: 50,
+            ..took(&instance, 1)
+        }
+        .encode_to_vec()
+    };
     admin
         .execute(
-            "UPDATE lake_change_head SET database_identity = 'another/00000001'
-              WHERE partition = 'control'",
-            &[],
+            "INSERT INTO lake_control_change (sequence, epoch, committed_at_ns, kind, body)
+             SELECT max(sequence) + 1, 1, 1, 'meridian.v1.ShardTookOver', $1 FROM lake_control_change",
+            &[&body],
         )
         .unwrap();
-    assert!(matches!(
-        writer.follow_timeline().unwrap(),
-        Timeline::Moved(_)
-    ));
-    let done = writer.record_parts(
-        &dataset,
-        vec![vec![close(&dataset, "a", &subject, "2026-11-16", 1)]],
-        &[stamp(1)],
-        1_000,
-    );
+    assert_eq!(writer.take_shard(took(&instance, 1), 0).unwrap().epoch, 2);
+}
+
+/// Review c5a2 L2: the first takes of a shard racing each other: the row is
+/// made before it is locked, so the take under fewer Lease transitions,
+/// committed after the other's, is refused, never numbered past it.
+#[test]
+fn a_first_take_racing_another_under_fewer_transitions_is_refused() {
+    use meridian_changes::shard_fence::{take, LAKE};
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let instance = unique("feed");
+    let mut first = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut tx = first.transaction().unwrap();
+    assert_eq!(take(&mut tx, LAKE, &instance, 1, 1).unwrap(), Ok(1));
+    let racing = {
+        let (url, instance) = (url.clone(), instance.clone());
+        std::thread::spawn(move || {
+            let mut second = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let mut tx = second.transaction().unwrap();
+            let taken = take(&mut tx, LAKE, &instance, 1, 0).unwrap();
+            tx.commit().unwrap();
+            taken
+        })
+    };
+    // The second waits on the first's row.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    tx.commit().unwrap();
+    let late = racing.join().unwrap();
     assert!(
-        matches!(done[0], Err(StoreError::ShardFenced(_))),
-        "the old holder's write passed a row the new timeline took back: {:?}",
-        done[0]
+        late.is_err(),
+        "the take under fewer transitions was numbered: {late:?}"
     );
-    // As a member starts: raised to its records before it serves.
-    lose(&mut admin);
-    assert_eq!(writer.reseat_shards().unwrap(), 1);
-    let done = writer.record_parts(
-        &dataset,
-        vec![vec![close(&dataset, "b", &subject, "2026-11-16", 2)]],
-        &[stamp(1)],
-        2_000,
-    );
-    assert!(
-        matches!(done[0], Err(StoreError::ShardFenced(_))),
-        "{:?}",
-        done[0]
-    );
-    // A take numbers past its records, whatever the row holds.
-    admin.execute("DELETE FROM lake_shard_fence", &[]).unwrap();
-    assert_eq!(writer.take_shard(took(&instance, 1), 0).unwrap().epoch, 3);
 }
 
 /// Review c5a H2: a write the write-ahead stream held before the take
@@ -10739,18 +10777,33 @@ fn a_shard_s_epoch_lost_with_a_database_s_commits_is_raised_again_from_its_recor
 /// epoch; one past the stream's place at the raise is refused.
 #[test]
 fn a_write_ahead_replay_the_stream_held_before_the_take_is_recorded_not_refused() {
+    use meridian_changes::shard_fence::Admit;
     use meridian_lake::store::{ShardStamp, StoreError, WriteAheadBatch, WriteAheadPosition};
+    const STREAM: i64 = 1_790_000_000_000_000_000;
     let store = store();
     let instance = unique("feed");
     let dataset = unique("feed:prices");
     let subject = unique("LCL-BTC");
     let stream = unique("STREAM");
-    let old = |sequence| ShardStamp::of(&instance, 1, 1).map(|s| s.in_stream(sequence));
+    let old = |sequence| ShardStamp::of(&instance, 1, 1).map(|s| s.in_stream(sequence, STREAM));
     let first = store.take_shard(took(&instance, 1), 0).unwrap();
     assert_eq!(first.epoch, 1);
     // The take that fenced the old holder reached this group with the
     // stream at 7: sequences 1 to 7 were sent before it.
-    assert_eq!(store.raise_shard(&instance, 1, 2, 7).unwrap(), 2);
+    assert_eq!(
+        store
+            .raise_shard(
+                &instance,
+                1,
+                2,
+                Some(Admit {
+                    through: 7,
+                    stream: STREAM
+                })
+            )
+            .unwrap(),
+        2
+    );
     let batch = |sequence: u64, key: &str, stamp| WriteAheadBatch {
         stream: stream.clone(),
         after: None,

@@ -60,9 +60,12 @@ const AGAIN_AFTER: Duration = Duration::from_millis(500);
 /// and answered within the hold, never only once another write comes.
 pub const TAKEN_BACK_LOOK_EVERY: Duration = Duration::from_millis(250);
 
-/// The stream's last sequence as the broker holds it now: what a plugin
-/// shard's raise admits the writes the stream held through (review c5a H2).
-pub async fn last_sequence(client: &async_nats::Client) -> Result<u64, String> {
+/// The stream's place as the broker holds it now -- its last sequence and
+/// its identity, its creation time -- what a plugin shard's raise admits
+/// the writes the stream held through (review c5a H2, c5a2 N4).
+pub async fn place(
+    client: &async_nats::Client,
+) -> Result<meridian_changes::shard_fence::Admit, String> {
     let context = jetstream::new(client.clone());
     let mut stream = context
         .get_stream(STREAM)
@@ -72,7 +75,15 @@ pub async fn last_sequence(client: &async_nats::Client) -> Result<u64, String> {
         .info()
         .await
         .map_err(|failed| format!("the write-ahead stream's place was not read: {failed}"))?;
-    Ok(info.state.last_sequence)
+    Ok(meridian_changes::shard_fence::Admit {
+        through: info.state.last_sequence,
+        stream: identity(info),
+    })
+}
+
+/// A stream's identity: its creation time, ns.
+pub fn identity(info: &stream::Info) -> i64 {
+    info.created.unix_timestamp_nanos() as i64
 }
 
 /// One write as the stream held it.
@@ -971,6 +982,10 @@ pub async fn write_forever(
         // A stream made again -- its volume lost, or JetStream off and on
         // again -- numbers from its own first: the position was taken in
         // another, and what that one held past it is gone.
+        // Its identity said to the lake for each write's stamp (c5a2 N4).
+        if let Ok(info) = stream.info().await {
+            lake.with_stream(identity(info));
+        }
         if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
             let state = &info.state;
             if at.sequence > state.last_sequence && writer.next() > state.first_sequence {

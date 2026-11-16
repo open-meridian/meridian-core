@@ -894,18 +894,18 @@ pub trait Store: Send + Sync {
     /// A plugin shard's epoch raised to `epoch` where this group's
     /// database holds it lower -- a take its control writer asked it to
     /// raise -- and the epoch held after (step 3d, checkpoint 5, item 32).
-    /// In every database the group writes. `admit_through` is the
-    /// write-ahead stream's last sequence as the raise found it (0 with no
-    /// stream): a write the stream held at or below it is admitted whatever
-    /// its epoch (review c5a H2).
+    /// In every database the group writes. `admit` is the write-ahead
+    /// stream's place as the raise found it (none with no stream): a write
+    /// that stream held at or below it is admitted whatever its epoch
+    /// (review c5a H2, c5a2 N4).
     fn raise_shard(
         &self,
         instance: &str,
         shard: u32,
         epoch: u64,
-        admit_through: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
     ) -> Result<u64> {
-        let _ = (instance, shard, epoch, admit_through);
+        let _ = (instance, shard, epoch, admit);
         Err(StoreError::Unavailable(
             "this store keeps no shard epochs: a writer does".into(),
         ))

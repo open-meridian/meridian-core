@@ -538,18 +538,16 @@ impl PostgresStore {
             |tx| raise(tx, &by, None),
         )
         .map_err(unavailable)?;
-        // A new timeline may have lost a take's raise: every plugin shard's
-        // epoch raised again to the highest its records name, in the same
-        // transaction, as the writer's own is (review c5a H1).
+        // A new timeline: every plugin shard's epoch raised again to
+        // database 0's, in the same transaction, as the writer's own is
+        // (review c5a H1). Database 0's own rows commit on the synchronous
+        // standby (c5a2 N1), so they are their own backstop.
         if let meridian_changes::timeline::Timeline::Moved(_) = found {
-            let recorded = match self.home_of(0) {
-                Some(home) if !std::ptr::eq(home.as_ref(), self) => home.recorded_shards()?,
-                _ => shard_records(&mut tx)?,
-            };
+            let numbered = self.numbered_shards()?;
             let raised = meridian_changes::shard_fence::raise_all(
                 &mut tx,
                 meridian_changes::shard_fence::LAKE,
-                &recorded,
+                &numbered,
             )
             .map_err(unavailable)?;
             if raised > 0 {
@@ -1751,23 +1749,6 @@ fn shards_checked<'a>(
         .collect())
 }
 
-/// Each plugin shard's highest epoch its `ShardTookOver` records in this
-/// database's control journal name (review c5a H1).
-fn shard_records(client: &mut impl GenericClient) -> Result<BTreeMap<(String, u32), u64>> {
-    let bodies: Vec<Vec<u8>> = client
-        .query(
-            "SELECT body FROM lake_control_change WHERE kind = $1",
-            &[&crate::store::CONTROL_SHARD_TOOK_OVER],
-        )
-        .map_err(unavailable)?
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    Ok(meridian_changes::shard_fence::highest_recorded(
-        bodies.iter().map(Vec::as_slice),
-    ))
-}
-
 /// A take refused: the Lease's transitions it was sent with are below the
 /// highest a take of the shard was numbered with (review c5a M2), so a
 /// later take holds the Lease. FAILED_PRECONDITION,
@@ -1791,19 +1772,28 @@ pub(crate) fn take_behind(
             shard: took.shard,
             epoch: lease_transitions,
             in_stream: 0,
+            stream: 0,
         },
         held: behind.seen,
     })
 }
 
 impl PostgresStore {
-    /// Each plugin shard's highest recorded epoch, from the database whose
-    /// control journal the takes are recorded in: database 0's (review c5a
-    /// H1).
-    fn recorded_shards(&self) -> Result<BTreeMap<(String, u32), u64>> {
+    /// Each plugin shard's epoch as the database numbering the takes holds
+    /// it -- database 0's `lake_shard_fence`, committed on the synchronous
+    /// standby (review c5a2 N1, N6) -- where this store is another
+    /// database's; none where it is database 0's own.
+    fn numbered_shards(&self) -> Result<BTreeMap<(String, u32), u64>> {
         match self.home_of(0) {
-            Some(home) if !std::ptr::eq(home.as_ref(), self) => home.recorded_shards(),
-            _ => shard_records(&mut *self.conn()?),
+            Some(home) if !std::ptr::eq(home.as_ref(), self) => {
+                meridian_changes::shard_fence::held(
+                    &mut *home.conn()?,
+                    meridian_changes::shard_fence::LAKE,
+                    "",
+                )
+                .map_err(unavailable)
+            }
+            _ => Ok(BTreeMap::new()),
         }
     }
 
@@ -2997,19 +2987,14 @@ impl Store for PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        // Numbered past the highest its records name, never the row alone
-        // (review c5a H1); recorded only once every group raised it (M4).
-        let recorded = shard_records(&mut tx)?
-            .get(&(took.instance.clone(), took.shard))
-            .copied()
-            .unwrap_or(0);
+        // Numbered by its row, committed on the synchronous standby (review
+        // c5a2 N1); recorded only once every group raised it (c5a M4).
         let numbered = meridian_changes::shard_fence::take(
             &mut tx,
             meridian_changes::shard_fence::LAKE,
             &took.instance,
             took.shard,
             lease_transitions,
-            recorded,
         )
         .map_err(unavailable)?;
         took.epoch = match numbered {
@@ -3029,6 +3014,9 @@ impl Store for PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // On the synchronous standby, as the take's numbering (c5a2 N1).
+        tx.batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(unavailable)?;
         let entry = (
             crate::store::CONTROL_SHARD_TOOK_OVER,
             took.encode_to_vec(),
@@ -3043,7 +3031,7 @@ impl Store for PostgresStore {
         instance: &str,
         shard: u32,
         epoch: u64,
-        admit_through: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
     ) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -3053,7 +3041,7 @@ impl Store for PostgresStore {
             instance,
             shard,
             epoch,
-            admit_through,
+            admit,
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
@@ -3061,7 +3049,7 @@ impl Store for PostgresStore {
     }
 
     fn reseat_shards(&self) -> Result<usize> {
-        let recorded = self.recorded_shards()?;
+        let recorded = self.numbered_shards()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let raised = meridian_changes::shard_fence::raise_all(

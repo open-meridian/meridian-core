@@ -168,7 +168,7 @@ impl Renewal {
 /// -- its write-ahead stream's subject, or a read, which changes nothing.
 pub fn sent_on_unrenewed(topic: &str) -> bool {
     meridian_lake::service::is_record_write(topic)
-        || topic.starts_with("platform.lake.internal.write-ahead.")
+        || meridian_bus::write_ahead::dataset_of_subject(topic).is_some()
         || topic.split('.').nth(2) == Some("query")
 }
 
@@ -698,6 +698,28 @@ where
     }
 }
 
+/// The book's fences raised to the lake's records again each time a store
+/// of this process raises its epoch on a new database timeline, whichever
+/// connection met it first (review c5a2 N3): looked at every second.
+pub async fn raise_book_on_new_timelines<F>(bus: Arc<meridian_bus::Bus>, raise: F)
+where
+    F: Fn(&str, u32, u64) -> Result<u64, String> + Clone + Send + Sync + 'static,
+{
+    let mut seen = meridian_changes::timeline::raised();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = meridian_changes::timeline::raised();
+        if now != seen {
+            seen = now;
+            raise_book_until_done(Arc::clone(&bus), raise.clone()).await;
+        }
+    }
+}
+
+/// How long the whole read of the lake's records of the takes may take
+/// (review c5a2 N6): a book that cannot read them in it does not serve.
+pub const RECORDS_WITHIN: Duration = Duration::from_secs(30);
+
 /// How long one page of the lake's control partition is waited for, read
 /// for its shards' takes.
 const RECORDS_PAGE_WITHIN: Duration = Duration::from_secs(5);
@@ -754,7 +776,14 @@ pub async fn raise_book_to_records<F>(bus: &meridian_bus::Bus, raise: F) -> Resu
 where
     F: Fn(&str, u32, u64) -> Result<u64, String> + Send + Sync + 'static,
 {
-    let recorded = recorded_epochs(bus).await?;
+    let recorded = tokio::time::timeout(RECORDS_WITHIN, recorded_epochs(bus))
+        .await
+        .map_err(|_| {
+            format!(
+                "the lake's records of the takes were not read within {} s",
+                RECORDS_WITHIN.as_secs()
+            )
+        })??;
     tokio::task::spawn_blocking(move || {
         for ((instance, shard), epoch) in &recorded {
             raise(instance, *shard, *epoch)?;
@@ -1319,7 +1348,7 @@ mod tests {
                 .expect("a shard");
             *renewal.lock().unwrap() = Some(set.renewal());
             let transitions = set.taken().await.unwrap().transitions;
-            *epoch.lock().unwrap() = fence.take("feed-1", mine, transitions, 0).unwrap();
+            *epoch.lock().unwrap() = fence.take("feed-1", mine, transitions).unwrap();
             let kept = set.keep(|_| {}, stop).await;
             (At::now(), kept)
         })
@@ -1506,12 +1535,7 @@ mod tests {
             let request =
                 meridian_domain::v1::TakeShardRequest::decode(&envelope.payload[..]).unwrap();
             let epoch = numbering
-                .take(
-                    &request.instance,
-                    request.shard,
-                    request.lease_transitions,
-                    0,
-                )
+                .take(&request.instance, request.shard, request.lease_transitions)
                 .map_err(|behind| format!("fenced: transitions seen {}", behind.seen))?;
             Ok((
                 "meridian.v1.TakeShardReply".into(),
