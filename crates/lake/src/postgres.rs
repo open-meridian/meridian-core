@@ -4587,14 +4587,20 @@ impl Store for PostgresStore {
             return Ok(self.fence.epoch());
         }
         let (anchor, mine, others) = epochs_of(&mut *conn, self.groups)?;
-        drop(conn);
         match anchor {
             Some(epoch) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                // An epoch no takeover recorded -- one an earlier release's
+                // move made for this group (the book's CI 43820357549) --
+                // recorded now as this member's, before anything is
+                // recorded under it (review t7, M1).
+                record_adopted(&mut conn, self.groups, epoch).map_err(unavailable)?;
+                drop(conn);
                 Ok(self.fence.adopt_once(epoch))
             }
-            _ => self.take_over(&meridian_changes::TookOver::unnamed(
-                meridian_changes::groups::ASSIGNED,
-            )),
+            _ => {
+                drop(conn);
+                self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED))
+            }
         }
     }
 
@@ -4934,6 +4940,86 @@ fn owned_in_row(groups: meridian_changes::groups::Groups, row: &postgres::Row) -
         groups.assign(&partition, named);
     }
     groups.owner_by(&partition, crate::range::dataset_of(&partition)) == groups.mine()
+}
+
+/// A takeover made by this store's own writer for `why`, named by this
+/// process's member (review t7, I1: a record never names nobody).
+fn by_this_member(why: &str) -> meridian_changes::TookOver {
+    meridian_changes::TookOver {
+        member: meridian_changes::member().to_string(),
+        ..meridian_changes::TookOver::unnamed(why)
+    }
+}
+
+/// `epoch`, which `groups`' writer adopts, recorded as its takeover of the
+/// ranges it owns under it where no takeover recorded it (review t7, M1):
+/// every epoch above the first is raised by a recorded takeover
+/// (decisions/031; ruling 1105). Named by this member, why the group's
+/// datasets were assigned to it, as a takeover at its start is; kept in
+/// `lake_writer_took_over` and logged in the control partition, as a
+/// takeover is. An epoch recorded already, or the first, is left as it is.
+fn record_adopted(
+    client: &mut postgres::Client,
+    groups: meridian_changes::groups::Groups,
+    epoch: u64,
+) -> std::result::Result<(), postgres::Error> {
+    if epoch <= 1 {
+        return Ok(());
+    }
+    let mut tx = client.transaction()?;
+    let recorded = tx
+        .query_opt(
+            "SELECT 1 FROM lake_writer_took_over WHERE epoch = $1 FOR UPDATE",
+            &[&(epoch as i64)],
+        )?
+        .is_some();
+    if recorded {
+        return tx.commit();
+    }
+    let mut partitions: Vec<String> = tx
+        .query(
+            "SELECT dataset, writer_group FROM lake_partition WHERE epoch = $1 ORDER BY dataset",
+            &[&(epoch as i64)],
+        )?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    if groups.holds_control() {
+        partitions.push(meridian_changes::CONTROL.to_string());
+    }
+    let by = by_this_member(meridian_changes::groups::ASSIGNED);
+    let made = tx.execute(
+        "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (epoch) DO NOTHING",
+        &[
+            &(epoch as i64),
+            &by.member,
+            &partitions,
+            &by.why,
+            &meridian_changes::origin(),
+            &by.at_ns,
+        ],
+    )?;
+    if made == 1 {
+        log_record(
+            &mut tx,
+            &meridian_changes::records::Record::TookOver(meridian_changes::records::took_over(
+                "lake",
+                &by,
+                partitions.clone(),
+                epoch,
+            )),
+            by.at_ns,
+        )?;
+        tracing::warn!(
+            epoch,
+            partitions = partitions.len(),
+            "the lake's writer adopted an epoch no takeover recorded: recorded now as its takeover"
+        );
+    }
+    tx.commit()
 }
 
 /// `groups`' group's own epoch where it has one -- the control partition's

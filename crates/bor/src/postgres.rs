@@ -2504,15 +2504,20 @@ impl Store for PostgresStore {
             }
             _ => None,
         };
+        // An epoch no takeover recorded -- one an earlier release's move
+        // made for this group (CI 43820357549), or its partitions' shared
+        // one no takeover raised -- recorded now as this member's, before
+        // anything commits under it (review t7, M1 and L3).
+        if let Some(epoch) = adopted {
+            record_adopted(&mut *conn, self.groups, epoch)?;
+        }
         drop(conn);
         match adopted {
             Some(epoch) => Ok(self.fence.adopt_once(epoch)),
             // Its partitions were assigned to it -- the count changed -- or
             // it has no epoch of its own yet: it takes them over, and its
             // row records the epoch.
-            None => self.take_over(&meridian_changes::TookOver::unnamed(
-                meridian_changes::groups::ASSIGNED,
-            )),
+            None => self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED)),
         }
     }
 
@@ -3674,6 +3679,70 @@ fn raise(
         ],
     )?;
     Ok(epoch as u64)
+}
+
+/// A takeover made by this store's own writer for `why`, named by this
+/// process's member (review t7, I1: a record never names nobody).
+fn by_this_member(why: &str) -> meridian_changes::TookOver {
+    meridian_changes::TookOver {
+        member: meridian_changes::member().to_string(),
+        ..meridian_changes::TookOver::unnamed(why)
+    }
+}
+
+/// `epoch`, which `groups`' writer adopts, recorded as its takeover of the
+/// partitions it owns under it where no takeover recorded it (review t7, M1
+/// and L3): every epoch above the first is raised by a recorded takeover
+/// (decisions/031; ruling 1105). Named by this member, why the group's
+/// partitions were assigned to it, as a takeover at its start is. An epoch
+/// recorded already, or the first, is left as it is.
+fn record_adopted(client: &mut impl GenericClient, groups: Groups, epoch: u64) -> Result<()> {
+    if epoch <= 1 {
+        return Ok(());
+    }
+    let recorded = client
+        .query_opt(
+            "SELECT 1 FROM book_writer_took_over WHERE epoch = $1",
+            &[&(epoch as i64)],
+        )
+        .map_err(unavailable)?
+        .is_some();
+    if recorded {
+        return Ok(());
+    }
+    let partitions: Vec<String> = client
+        .query(
+            "SELECT partition, writer_group FROM book_partition_head WHERE epoch = $1
+              ORDER BY partition",
+            &[&(epoch as i64)],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let by = by_this_member(meridian_changes::groups::ASSIGNED);
+    client
+        .execute(
+            "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (epoch) DO NOTHING",
+            &[
+                &(epoch as i64),
+                &by.member,
+                &partitions,
+                &by.why,
+                &meridian_changes::origin(),
+                &by.at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+    tracing::warn!(
+        epoch,
+        partitions = partitions.len(),
+        "the book's writer adopted an epoch no takeover recorded: recorded now as its takeover"
+    );
+    Ok(())
 }
 
 /// The partition `groups`' group reads its epoch from: `control` with one

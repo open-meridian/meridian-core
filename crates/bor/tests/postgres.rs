@@ -4797,45 +4797,10 @@ fn unrecorded_epochs(url: &str) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_move_to_a_group_whose_writer_has_not_taken_over_commits_nothing_at_an_unrecorded_epoch()
 {
-    use meridian_bor::partition_moves::{rebalance, Ended, Mover, Settings};
-    use meridian_changes::groups::{owner, Groups};
+    use meridian_bor::partition_moves::{rebalance, Ended};
+    use meridian_changes::groups::owner;
     let (url, migrated) = blocking(isolated);
-    // At one group: every head pinned to group 0, its writer's takeover
-    // recorded.
-    blocking(|| {
-        let alone = PostgresStore::connect(&url, 2)
-            .unwrap()
-            .with_groups(Groups::new(0, 1).unwrap())
-            .with_partitions(8);
-        alone.make_partitions(8).unwrap();
-        assert_eq!(alone.pin_owners().unwrap(), 8);
-        Store::take_over(
-            &alone,
-            &meridian_changes::TookOver::unnamed(meridian_changes::LEASE_FREE),
-        )
-        .unwrap();
-    });
-    // Raised to two: group 0's writer starts again and adopts its epoch;
-    // group 1's has not started.
-    let broker = Arc::new(GroupsBroker {
-        inner: MemoryBackend::new(),
-        groups: Default::default(),
-        handed: AtomicU64::new(0),
-    });
-    let (zero, zero_store) = blocking(|| group_member(&url, &broker, 0, 2, 8));
-    blocking(|| Store::adopt(zero_store.as_ref())).unwrap();
-    // A switch's bound long enough for another test's move of the same
-    // partition name: partition locks are keyed by name over every schema
-    // of the test database.
-    let mover = Mover::new(
-        vec![Arc::clone(&zero_store)],
-        zero_store.groups(),
-        Settings {
-            switch: std::time::Duration::from_secs(15),
-            ..Default::default()
-        },
-        Arc::new(meridian_clock::SystemClock),
-    );
+    let (broker, zero, zero_store, mover) = blocking(|| raised_to_two(&url, 15));
     let wanted: Vec<String> = (0..8)
         .map(meridian_bor::store::partition_named)
         .filter(|p| owner(p, 2) == 1)
@@ -4891,6 +4856,183 @@ async fn a_move_to_a_group_whose_writer_has_not_taken_over_commits_nothing_at_an
         );
     });
     blocking(move || drop((zero, one, zero_store, one_store, mover, migrated)));
+}
+
+/// The book at `url` started at one writer group -- every head pinned to
+/// group 0, its writer's takeover recorded -- then raised to two: group 0's
+/// writer started again, its epoch adopted, and its mover, whose switch is
+/// bound by `switch_seconds`; group 1's writer not started.
+fn raised_to_two(
+    url: &str,
+    switch_seconds: u64,
+) -> (
+    Arc<GroupsBroker>,
+    Arc<Bus>,
+    Arc<PostgresStore>,
+    meridian_bor::partition_moves::Mover,
+) {
+    use meridian_bor::partition_moves::{Mover, Settings};
+    use meridian_changes::groups::Groups;
+    let alone = PostgresStore::connect(url, 2)
+        .unwrap()
+        .with_groups(Groups::new(0, 1).unwrap())
+        .with_partitions(8);
+    alone.make_partitions(8).unwrap();
+    assert_eq!(alone.pin_owners().unwrap(), 8);
+    Store::take_over(
+        &alone,
+        &meridian_changes::TookOver::unnamed(meridian_changes::LEASE_FREE),
+    )
+    .unwrap();
+    let broker = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let (zero, zero_store) = group_member(url, &broker, 0, 2, 8);
+    Store::adopt(zero_store.as_ref()).unwrap();
+    // A switch's bound long enough for another test's move of the same
+    // partition name: partition locks are keyed by name over every schema
+    // of the test database.
+    let mover = Mover::new(
+        vec![Arc::clone(&zero_store)],
+        zero_store.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(switch_seconds),
+            ..Default::default()
+        },
+        Arc::new(meridian_clock::SystemClock),
+    );
+    (broker, zero, zero_store, mover)
+}
+
+/// An epoch an earlier release's move made for a writer group with no
+/// takeover recorded (7bbbf608 and before: CI 43820357549) is recorded as
+/// its writer's own when that writer adopts it, before anything commits
+/// under it (review t7, M1): a database upgraded with such a row keeps
+/// every epoch above the first raised by a recorded takeover, named by the
+/// member that adopted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_epoch_an_earlier_move_made_with_no_takeover_is_recorded_before_anything_commits_under_it(
+) {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    meridian_changes::set_member("bor-t7-member");
+    let (url, migrated) = blocking(isolated);
+    let (broker, zero, zero_store, mover) = blocking(|| raised_to_two(&url, 15));
+    // Group 1's row as an earlier release's move made it: one past every
+    // epoch, no takeover recorded.
+    let made: i64 = blocking(|| {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .query_one(
+                "INSERT INTO book_writer_group (writer_group, epoch, origin)
+                 SELECT 1, max(epoch) + 1, '' FROM book_partition_head RETURNING epoch",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    });
+    // P4 moved to group 1 under it, then group 1's writer starts and writes.
+    let ended = blocking(|| {
+        assert!(mover.begin("P4"));
+        mover.run("P4", 1, &Asked::default())
+    })
+    .unwrap();
+    assert!(
+        matches!(&ended, Ended::Moved(m) if m.epoch == made as u64),
+        "{ended:?}"
+    );
+    let (one, one_store) = blocking(|| group_member(&url, &broker, 1, 2, 8));
+    let epoch = blocking(|| Store::adopt(one_store.as_ref())).unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-MINTED-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == "P4")
+        .unwrap();
+    blocking(|| one_store.place_first(&account, &account)).unwrap();
+    open(&one, &account, "INS-AAPL").await;
+    blocking(|| {
+        assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
+        assert_eq!(epoch, made as u64, "adopted, not raised again");
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let row = admin
+            .query_one(
+                "SELECT member, partitions FROM book_writer_took_over WHERE epoch = $1",
+                &[&made],
+            )
+            .unwrap();
+        let (member, partitions): (String, Vec<String>) = (row.get(0), row.get(1));
+        assert_eq!(
+            member, "bor-t7-member",
+            "named by the member that adopted it"
+        );
+        assert!(partitions.contains(&"P4".to_string()), "{partitions:?}");
+    });
+    blocking(move || drop((zero, one, zero_store, one_store, mover, migrated)));
+}
+
+/// A move by hand to a writer group whose writer has not taken over in its
+/// database waits at the gate, and aborts for lag past moves.switchSeconds
+/// with nothing held: the source still owns the partition, and nothing is
+/// at an epoch no takeover recorded (review t7, L1). Its writer taking over
+/// while the gate waits, the move switches under that takeover's epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_once_it_takes_over()
+{
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::groups::Groups;
+    let (url, migrated) = blocking(isolated);
+    let (_broker, zero, zero_store, mover) = blocking(|| raised_to_two(&url, 2));
+    let asked = Asked {
+        by_hand: true,
+        moved_by: PERSON.into(),
+        reason: "group 1 is to write P4".into(),
+    };
+    let began = std::time::Instant::now();
+    let ended = blocking(|| {
+        assert!(mover.begin("P4"));
+        mover.run("P4", 1, &asked)
+    })
+    .unwrap();
+    let waited = began.elapsed();
+    match &ended {
+        Ended::Aborted(aborted, None) => {
+            assert_eq!(aborted.cause, MoveAbortCause::Lag as i32, "{aborted:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(waited >= std::time::Duration::from_secs(2), "{waited:?}");
+    blocking(|| {
+        assert_eq!(zero_store.tip("P4").unwrap().unwrap().writer_group, Some(0));
+        assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
+    });
+    // Group 1's writer takes over while the gate waits: moved under its
+    // epoch.
+    let taking = {
+        let url = url.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let one = PostgresStore::connect(&url, 2)
+                .unwrap()
+                .with_groups(Groups::new(1, 2).unwrap())
+                .with_partitions(8);
+            Store::adopt(&one).unwrap()
+        })
+    };
+    let ended = blocking(|| {
+        assert!(mover.begin("P4"));
+        mover.run("P4", 1, &asked)
+    })
+    .unwrap();
+    let epoch = taking.join().unwrap();
+    assert!(
+        matches!(&ended, Ended::Moved(m) if m.epoch == epoch && m.to_group == 1),
+        "{ended:?}"
+    );
+    blocking(|| {
+        assert_eq!(zero_store.tip("P4").unwrap().unwrap().writer_group, Some(1));
+        assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
+    });
+    blocking(move || drop((zero, zero_store, mover, migrated)));
 }
 
 /// Writes to `accounts` through `bus` until `stop`: each answered, never

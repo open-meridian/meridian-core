@@ -10271,52 +10271,9 @@ fn unrecorded_lake_epochs(url: &str) -> Vec<String> {
 #[test]
 fn a_range_moved_to_a_group_whose_writer_has_not_taken_over_records_nothing_at_an_unrecorded_epoch()
 {
-    use meridian_changes::groups::{owner, Groups};
-    use meridian_lake::partition_moves::{Ended, Mover, Settings};
-    let (url, _migrated) = isolated("lake-unrecorded");
-    let dataset = (0..)
-        .map(|n| unique(&format!("coinbase-1:unrec{n}")))
-        .find(|dataset| owner(dataset, 2) == 1)
-        .unwrap();
-    let subject = unique("LCL-UNREC");
-    // At one group: its writer's takeover recorded, the dataset recorded
-    // and its range pinned to group 0.
-    {
-        let alone = PostgresStore::connect(&url, 2)
-            .unwrap()
-            .with_groups(Groups::new(0, 1).unwrap());
-        alone
-            .take_over(&meridian_changes::TookOver::unnamed(
-                meridian_changes::LEASE_FREE,
-            ))
-            .unwrap();
-        alone
-            .record(
-                &dataset,
-                vec![trade(&dataset, "before", &subject, 10)],
-                1_000,
-            )
-            .unwrap();
-        alone.pin_owners().unwrap();
-    }
-    // Raised to two: group 0's writer starts again and adopts its epoch;
-    // group 1's has not started.
-    let zero = Arc::new(
-        PostgresStore::connect(&url, 4)
-            .unwrap()
-            .with_groups(Groups::new(0, 2).unwrap()),
-    );
-    zero.adopt().unwrap();
-    zero.read_owners().unwrap();
-    let mover = Mover::new(
-        vec![zero.clone()],
-        zero.groups(),
-        Settings {
-            switch: std::time::Duration::from_secs(2),
-            ..Default::default()
-        },
-        Arc::new(SystemClock),
-    );
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::Ended;
+    let (url, dataset, subject, zero, mover) = lake_raised_to_two("lake-unrecorded");
     // The sweep at group 0's start, before group 1's writer has started.
     let early = mover.rebalance();
     let unready = zero.range_tip(&dataset).unwrap().unwrap().writer_group;
@@ -10351,4 +10308,195 @@ fn a_range_moved_to_a_group_whose_writer_has_not_taken_over_records_nothing_at_a
     }
     let tip = zero.range_tip(&dataset).unwrap().unwrap();
     assert_eq!((tip.writer_group, tip.epoch), (Some(1), epoch));
+}
+
+/// A lake at a schema of its own, started at one writer group -- its
+/// writer's takeover recorded, a dataset of group 1's at two groups
+/// recorded and its range pinned to group 0 -- then raised to two: group
+/// 0's writer started again, its epoch adopted, and its mover, whose switch
+/// is bound by 2 s; group 1's writer not started. Says the database's URL,
+/// the dataset, its subject, group 0's store and the mover.
+fn lake_raised_to_two(
+    tag: &str,
+) -> (
+    String,
+    String,
+    String,
+    Arc<PostgresStore>,
+    meridian_lake::partition_moves::Mover,
+) {
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_lake::partition_moves::{Mover, Settings};
+    let (url, _migrated) = isolated(tag);
+    let dataset = (0..)
+        .map(|n| unique(&format!("coinbase-1:{tag}{n}")))
+        .find(|dataset| owner(dataset, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-UNREC");
+    let alone = PostgresStore::connect(&url, 2)
+        .unwrap()
+        .with_groups(Groups::new(0, 1).unwrap());
+    alone
+        .take_over(&meridian_changes::TookOver::unnamed(
+            meridian_changes::LEASE_FREE,
+        ))
+        .unwrap();
+    alone
+        .record(
+            &dataset,
+            vec![trade(&dataset, "before", &subject, 10)],
+            1_000,
+        )
+        .unwrap();
+    alone.pin_owners().unwrap();
+    let zero = Arc::new(
+        PostgresStore::connect(&url, 4)
+            .unwrap()
+            .with_groups(Groups::new(0, 2).unwrap()),
+    );
+    zero.adopt().unwrap();
+    zero.read_owners().unwrap();
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(2),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    (url, dataset, subject, zero, mover)
+}
+
+/// An epoch an earlier release's move made for a writer group with no
+/// takeover recorded (7bbbf608 and before) is recorded as its writer's own
+/// when that writer adopts it, before anything is recorded under it (review
+/// t7, M1), named by the member that adopted it, and logged in the control
+/// partition as a takeover is.
+#[test]
+fn an_epoch_an_earlier_range_move_made_with_no_takeover_is_recorded_before_anything_under_it() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended};
+    meridian_changes::set_member("lake-t7-member");
+    let (url, dataset, subject, zero, mover) = lake_raised_to_two("lake-minted");
+    // Group 1's row as an earlier release's move made it: one past every
+    // epoch, no takeover recorded.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let made: i64 = admin
+        .query_one(
+            "INSERT INTO lake_writer_group (writer_group, epoch, origin)
+             SELECT 1, greatest((SELECT max(epoch) FROM lake_partition),
+                                (SELECT max(epoch) FROM lake_change_head)) + 1, ''
+             RETURNING epoch",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    // The range moved to group 1 under it, then group 1's writer starts and
+    // records.
+    assert!(mover.begin(&dataset));
+    let ended = mover.run(&dataset, 1, &Asked::default()).unwrap();
+    assert!(
+        matches!(&ended, Ended::Moved(m) if m.epoch == made as u64),
+        "{ended:?}"
+    );
+    let one = PostgresStore::connect(&url, 4)
+        .unwrap()
+        .with_groups(Groups::new(1, 2).unwrap());
+    let epoch = one.adopt().unwrap();
+    one.read_owners().unwrap();
+    one.record(
+        &dataset,
+        vec![trade(&dataset, "after", &subject, 20)],
+        2_000,
+    )
+    .unwrap();
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+    assert_eq!(epoch, made as u64, "adopted, not raised again");
+    let row = admin
+        .query_one(
+            "SELECT member, partitions FROM lake_writer_took_over WHERE epoch = $1",
+            &[&made],
+        )
+        .unwrap();
+    let (member, partitions): (String, Vec<String>) = (row.get(0), row.get(1));
+    assert_eq!(
+        member, "lake-t7-member",
+        "named by the member that adopted it"
+    );
+    assert!(partitions.contains(&dataset), "{partitions:?}");
+    let logged: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM lake_control_change WHERE kind = $1",
+            &[&meridian_changes::records::TOOK_OVER],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        logged, 2,
+        "the first takeover and this one, each logged in control"
+    );
+    drop(zero);
+}
+
+/// A range's move by hand to a writer group whose writer has not taken
+/// over in its database waits at the gate, and aborts for lag past
+/// moves.switchSeconds with nothing held: the source still owns it, and
+/// nothing is at an epoch no takeover recorded (review t7, L1). Its writer
+/// taking over while the gate waits, the move switches under that
+/// takeover's epoch.
+#[test]
+fn a_range_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_once_it_takes_over()
+{
+    use meridian_changes::groups::Groups;
+    use meridian_lake::partition_moves::{Asked, Ended};
+    let (url, dataset, _subject, zero, mover) = lake_raised_to_two("lake-gate");
+    let asked = Asked {
+        by_hand: true,
+        moved_by: "https://directory.example.org|8812".into(),
+        reason: "group 1 is to write it".into(),
+    };
+    let began = std::time::Instant::now();
+    assert!(mover.begin(&dataset));
+    let ended = mover.run(&dataset, 1, &asked).unwrap();
+    let waited = began.elapsed();
+    match &ended {
+        Ended::Aborted(aborted, None) => assert_eq!(
+            aborted.cause,
+            meridian_domain::v1::MoveAbortCause::Lag as i32,
+            "{aborted:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(waited >= std::time::Duration::from_secs(2), "{waited:?}");
+    assert_eq!(
+        zero.range_tip(&dataset).unwrap().unwrap().writer_group,
+        Some(0)
+    );
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+    // Group 1's writer takes over while the gate waits: moved under its
+    // epoch.
+    let taking = {
+        let url = url.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            PostgresStore::connect(&url, 2)
+                .unwrap()
+                .with_groups(Groups::new(1, 2).unwrap())
+                .adopt()
+                .unwrap()
+        })
+    };
+    assert!(mover.begin(&dataset));
+    let ended = mover.run(&dataset, 1, &asked).unwrap();
+    let epoch = taking.join().unwrap();
+    assert!(
+        matches!(&ended, Ended::Moved(m) if m.epoch == epoch && m.to_group == 1),
+        "{ended:?}"
+    );
+    assert_eq!(
+        zero.range_tip(&dataset).unwrap().unwrap().writer_group,
+        Some(1)
+    );
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
 }
