@@ -275,6 +275,10 @@ pub struct Bus {
     /// 3d; the resilience spec's section 6.7): unset, as with one group,
     /// nothing is handed on.
     routing: Arc<RwLock<Option<Routing>>>,
+
+    /// Told to stop, and writing nothing more here
+    /// ([`Bus::stop_writing_here`]): every write is handed on.
+    handing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A member's hand-off of writes to their owners.
@@ -388,6 +392,7 @@ impl Bus {
             reads: Arc::default(),
             serves_only: RwLock::new(None),
             routing: Arc::default(),
+            handing: Arc::default(),
         }
     }
 
@@ -418,6 +423,17 @@ impl Bus {
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
         self
+    }
+
+    /// Every handler served and every subscription made on this bus so far
+    /// in force on each of its backends ([`Backend::subscribed`]): at a
+    /// broker, the broker holds them. A component says it serves after
+    /// this, never before.
+    pub async fn subscribed(&self) -> Result<(), BusError> {
+        for backend in self.backends.values() {
+            backend.subscribed().await?;
+        }
+        Ok(())
     }
 
     fn backend_for(&self, topic: &str) -> &Arc<dyn Backend> {
@@ -642,9 +658,48 @@ impl Bus {
         }
     }
 
+    /// Write nothing more here (step 3d, stage T's review, finding 3;
+    /// ruled 2026-11-15): from now on every write this member receives is
+    /// handed on, its own group's too -- to its group on the internal
+    /// topic, where its replacement answers once it serves -- and its
+    /// handler never run; the internal topic is no longer offered here, so
+    /// a write handed to its group reaches its replacement alone; `leaves`
+    /// names the topics it stops offering besides (its reads: its books
+    /// are no longer brought up to date by what it commits); and its
+    /// shared subscriptions end, their work its replacement's.
+    ///
+    /// What a store's writer with no lease does when it is told to stop
+    /// and serves on, so that the store's public write topics stay served
+    /// while it never commits beside its replacement. A write whose group
+    /// has no writer serving is not answered there, and its caller is
+    /// refused UNAVAILABLE at its deadline, to ask again: held, never lost.
+    /// False, and nothing done, where no hand-off is configured.
+    pub fn stop_writing_here(&self, leaves: impl Fn(&str) -> bool + Send + Sync + 'static) -> bool {
+        let Some(route) = self.routing.read().expect("routing poisoned").clone() else {
+            return false;
+        };
+        self.handing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let internal = route.internal.clone();
+        let what = crate::backend::Withdrawn {
+            topics: Arc::new(move |topic: &str| topic == internal || leaves(topic)),
+            shared_work: true,
+        };
+        for backend in self.backends.values() {
+            backend.withdraw(what.clone());
+        }
+        true
+    }
+
+    /// Whether [`Bus::stop_writing_here`] was called.
+    pub fn writes_nothing_here(&self) -> bool {
+        self.handing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// A write's handler, handed to its owner where its store says so.
     fn routed(&self, topic: &str, handler: Handler) -> Handler {
         let routing = Arc::clone(&self.routing);
+        let handing = Arc::clone(&self.handing);
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
             let route = routing
@@ -656,6 +711,18 @@ impl Bus {
                 return handler(envelope);
             };
             let handed = crate::owners::take_arriving();
+            // Told to stop: nothing is written here. Its owner's where the
+            // request says it, else this member's own group's -- its
+            // replacement, this member no longer offering the internal
+            // topic -- which finds the owner as this one would have.
+            if handing.load(std::sync::atomic::Ordering::SeqCst) {
+                let group = route
+                    .owner_of
+                    .as_ref()
+                    .and_then(|owner_of| owner_of(&topic, &envelope))
+                    .unwrap_or(route.group);
+                return hand(&route, group, &topic, envelope);
+            }
             // The owner decided from the request first: another group's
             // write handed on before any of its handler's work.
             if !handed {
@@ -1481,6 +1548,7 @@ mod tests {
             reads: Arc::default(),
             serves_only: RwLock::new(None),
             routing: Arc::default(),
+            handing: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

@@ -34,10 +34,11 @@ mod router;
 pub use backend::{
     overloaded, read_refusal, read_refusal_status, refusal, refusal_fields, refusal_naming,
     refusal_retry_after, refusal_retrying, refusal_status_retrying, refusal_with_status, Answer,
-    Backend, BusError, Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Subscription,
+    Backend, BusError, Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Settled,
+    Subscription, Withdrawn,
 };
 pub use memory::MemoryBackend;
-pub use nats::{header_words, NatsBackend, INTERNAL_TLS_CA};
+pub use nats::{header_words, servers_asked, NatsBackend, INTERNAL_TLS_CA};
 pub use router::{caller_of, CANCELLED_QUERY};
 pub use router::{
     calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, Stamp,

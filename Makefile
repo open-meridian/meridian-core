@@ -1410,6 +1410,11 @@ test-broker: network runtime-image tests-image
 	@$(COMPOSE_TEST) restart nats >/dev/null
 	@$(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
+	@# The three-server cluster the bus's tests ask across (stage T's review,
+	@# finding 5), its routes made before the tests start.
+	@$(COMPOSE_TEST) --profile tests up -d nats-a nats-b nats-c >/dev/null
+	@$(COMPOSE_TEST) --profile tests exec -T nats-b sh -c 'for i in $$(seq 1 60); do [ "$$(wget -qO- http://localhost:8222/routez 2>/dev/null | grep remote_name | sort -u | wc -l)" -ge 2 ] && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: the test cluster's servers did not find each other" >&2; exit 1; }
 	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \

@@ -1508,3 +1508,243 @@ async fn a_passed_write_keeps_its_callers_identity_and_wait() {
     );
     assert_eq!(ran, 20 - reached_group_0, "and was never run at the owner");
 }
+
+/// Step 3d, stage T: a component says it serves once `subscribed` returns,
+/// and from then the broker holds every topic it served. A broker's
+/// subscriptions are made on tasks of their own after `serve` returns: a
+/// store that said it was ready on `serve` alone was ready before the broker
+/// held its topics, its rollout stopped the member that did serve them, and
+/// its callers were told nothing serves (PR CI 43636763392). No settling
+/// sleep here: the first call after `subscribed` is answered, each round on
+/// connections of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_made_once_subscribed_returns_is_never_told_nothing_serves() {
+    for round in 0..25 {
+        let asking = bus("asking-at-once").await;
+        let answering = bus("answering-at-once").await;
+        let topics: Vec<String> = (0..40).map(|_| topic("query.at-once")).collect();
+        for topic in &topics {
+            answering.serve(topic, |_| Ok((String::new(), vec![])));
+        }
+        answering
+            .subscribed()
+            .await
+            .expect("the broker holds what was served");
+        // Every topic, the last served first (the review's finding 12: only
+        // the last was asked).
+        for topic in topics.iter().rev() {
+            let answered = asking
+                .call(topic, "meridian.test.Question", vec![], None, None)
+                .await;
+            assert!(
+                answered.is_ok(),
+                "round {round}: {topic}, asked once subscribed returned: {answered:?}"
+            );
+        }
+    }
+}
+
+/// Stage T's review, finding 5: a subscription the broker refused is never
+/// counted as made. Its refusal is said after the fact, and the round trip
+/// that follows the subscriptions still comes back; a member said it
+/// served a topic the broker did not hold for it. It is never made later,
+/// so the member never says it serves.
+#[tokio::test]
+async fn a_member_whose_subscription_the_broker_refused_never_says_it_is_subscribed() {
+    let custody = as_custody().await;
+    let granted = "platform.config.event.plugin-configuration-changed";
+    let _allowed = custody.subscribe(granted);
+    custody
+        .subscribed()
+        .await
+        .expect("what it may subscribe to is held");
+    // The contract gives custody no subscription to another role's events.
+    let forbidden = "platform.street.event.custodial-position-updated";
+    let _refused = custody.subscribe(forbidden);
+    let said = custody.subscribed().await;
+    let Err(BusError::HandlerFailed { detail, .. }) = &said else {
+        panic!("a refused subscription counted as made: {said:?}");
+    };
+    assert!(detail.contains("could not be made"), "{detail}");
+    assert!(
+        custody.subscribed().await.is_err(),
+        "never made later: asked again, refused again"
+    );
+}
+
+/// Two servers of the test broker's three-server cluster.
+fn cluster() -> (String, String) {
+    let urls = std::env::var("MERIDIAN_TEST_BROKER_CLUSTER_URLS").expect(
+        "MERIDIAN_TEST_BROKER_CLUSTER_URLS is not set: two servers of a three-server \
+         cluster, comma-separated; run these with `make test-broker`.",
+    );
+    let (a, b) = urls
+        .split_once(',')
+        .expect("two servers of the cluster, comma-separated");
+    (a.trim().to_string(), b.trim().to_string())
+}
+
+async fn bus_at(instance: &str, url: &str) -> Bus {
+    Bus::single(
+        instance,
+        Arc::new(
+            NatsBackend::connect(url)
+                .await
+                .expect("could not reach a server of the test cluster"),
+        ),
+        Arc::new(meridian_clock::SystemClock),
+    )
+}
+
+/// Stage T's review, finding 5: the broker is three servers in `ha`, and a
+/// member's subscriptions reach the servers it is not connected to after
+/// the one it is. `subscribed` returns once every server holds them: a
+/// call through another server, made at once, is never told nothing
+/// serves. The member connects to one server and its caller to another,
+/// each round on connections of its own, with no settling sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_through_another_server_once_subscribed_returns_is_never_told_nothing_serves() {
+    let (a, b) = cluster();
+    for round in 0..40 {
+        let asking = bus_at("asking-across", &b).await;
+        let answering = bus_at("answering-across", &a).await;
+        let topics: Vec<String> = (0..40).map(|_| topic("query.across")).collect();
+        for topic in &topics {
+            answering.serve(topic, |_| Ok((String::new(), vec![])));
+        }
+        answering
+            .subscribed()
+            .await
+            .expect("every server holds what was served");
+        for topic in topics.iter().rev() {
+            let answered = asking
+                .call(topic, "meridian.test.Question", vec![], None, None)
+                .await;
+            assert!(
+                answered.is_ok(),
+                "round {round}: {topic}, asked through another server: {answered:?}"
+            );
+        }
+    }
+}
+
+/// Stage T's review, finding 5: `subscribed` asks through each other
+/// server, and is refused while one does not hold the subscriptions. A
+/// server whose route to the member's is cut holds none of them: here the
+/// member is at a server of its own, outside the cluster, and the probe is
+/// shown to go through the cluster's servers by a member inside it being
+/// answered and one outside it never claiming the cluster.
+#[tokio::test]
+async fn subscribed_goes_through_every_server_the_broker_advertises() {
+    let (a, _) = cluster();
+    let inside = NatsBackend::connect(&a).await.unwrap();
+    let before = meridian_bus::servers_asked();
+    let _held = inside.subscribe(&topic("event.across"));
+    inside.subscribed().await.expect("held by every server");
+    let asked = meridian_bus::servers_asked() - before;
+    assert!(
+        asked >= 2,
+        "the two other servers of the three were each asked: {asked}"
+    );
+}
+
+/// Stage T's review, finding 3 (ruled 2026-11-15): a store's writer told
+/// to stop where no lease fences its group writes nothing more and keeps
+/// the store's write topics served. Every write it receives is handed to
+/// its group, where its replacement -- a member of the same group, started
+/// beside it -- answers; it no longer offers its group's internal topic,
+/// so a write another group hands to theirs reaches the replacement alone;
+/// and the reads it leaves are the replacement's too. Before, both
+/// members' handlers ran, each write by whichever member received it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_told_to_stop_hands_every_write_on_and_its_handler_never_runs() {
+    let instance = format!("store-{}", mark("stop"));
+    let write = topic("command.record");
+    let read = topic("query.read");
+    let internal = topic("internal.command");
+    // The first group's member, the second's old writer, and its replacement.
+    let ran = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    let read_by = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
+    let mut members = Vec::new();
+    for (member, group) in [(0usize, 0u32), (1, 1), (2, 1)] {
+        let bus = bus(&instance).await;
+        bus.hand_writes_on(&internal, group, {
+            let write = write.clone();
+            move |topic| topic == write
+        });
+        // Every write is the second group's, as its request says.
+        bus.route_writes_by(|_, _| Some(1));
+        let counted = Arc::clone(&ran);
+        bus.serve(&write, move |envelope| {
+            counted[member].fetch_add(1, Ordering::SeqCst);
+            Ok((
+                "meridian.test.Answer".to_string(),
+                [format!("member {member}: ").into_bytes(), envelope.payload].concat(),
+            ))
+        });
+        let counted = Arc::clone(&read_by);
+        bus.serve(&read, move |_| {
+            counted[member].fetch_add(1, Ordering::SeqCst);
+            Ok(("meridian.test.Answer".to_string(), vec![]))
+        });
+        bus.subscribed().await.expect("subscribed");
+        members.push(bus);
+    }
+    let asking = bus("asking").await;
+    let ask = |topic: String, n: u32| {
+        let asking = &asking;
+        async move {
+            asking
+                .call(
+                    &topic,
+                    "meridian.test.Question",
+                    n.to_string().into_bytes(),
+                    None,
+                    None,
+                )
+                .await
+        }
+    };
+    for n in 0..30u32 {
+        ask(write.clone(), n).await.expect("answered");
+    }
+    assert_eq!(ran[0].load(Ordering::SeqCst), 0, "never the first group's");
+    assert!(
+        ran[1].load(Ordering::SeqCst) > 0 && ran[2].load(Ordering::SeqCst) > 0,
+        "both members of the second group wrote, side by side"
+    );
+    // The old writer is told to stop.
+    let was = ran[1].load(Ordering::SeqCst);
+    assert!(members[1].stop_writing_here({
+        let read = read.clone();
+        move |topic| topic == read
+    }));
+    let reads_before = read_by[1].load(Ordering::SeqCst);
+    for n in 0..60u32 {
+        let (_, payload) = ask(write.clone(), n)
+            .await
+            .expect("answered, by its replacement");
+        assert_eq!(payload, format!("member 2: {n}").into_bytes());
+    }
+    assert_eq!(
+        ran[1].load(Ordering::SeqCst),
+        was,
+        "told to stop, its handler never ran again"
+    );
+    // Its reads are left to the members that serve them, once the broker
+    // has taken its leave of them.
+    settle().await;
+    let left = read_by[1].load(Ordering::SeqCst);
+    for n in 0..30u32 {
+        ask(read.clone(), n).await.expect("read");
+    }
+    assert_eq!(
+        read_by[1].load(Ordering::SeqCst),
+        left,
+        "no read answered by it"
+    );
+    assert!(left - reads_before <= 1, "at most what had already arrived");
+    assert!(members[1].writes_nothing_here());
+    // A member with no hand-off configured has nothing to stop.
+    assert!(!asking.stop_writing_here(|_| true));
+}

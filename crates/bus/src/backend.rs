@@ -447,6 +447,20 @@ pub type PreRoute = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + 
 pub type Answer<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Envelope, BusError>> + Send + 'a>>;
 
+/// What [`Backend::subscribed`] returns, boxed as [`Answer`] is.
+/// What a member leaves to its group's other members ([`Backend::withdraw`]).
+#[derive(Clone)]
+pub struct Withdrawn {
+    /// The topics it no longer offers.
+    pub topics: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Whether its shared subscriptions end too: the work each message
+    /// brings is then another member's.
+    pub shared_work: bool,
+}
+
+pub type Settled<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BusError>> + Send + 'a>>;
+
 /// A transport the bus can route onto.
 ///
 /// Deliberately narrow. Everything above this trait -- routing rules,
@@ -546,6 +560,30 @@ pub trait Backend: Send + Sync {
     fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
         self.serve(topic, group, handler);
         delivered.notify_one();
+    }
+
+    /// Every `serve` and `subscribe` asked of this backend so far in force
+    /// where its messages are routed: what a component waits for before it
+    /// says it serves (step 3d, stage T: a pod ready before the broker held
+    /// its subscriptions left its topics served by nobody).
+    ///
+    /// Defaulted to at once: a backend with no wire holds a subscription
+    /// from the moment it is asked for.
+    fn subscribed(&self) -> Settled<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Leave what `what` names, from now on (step 3d, stage T's review,
+    /// finding 3): each topic offered that it names is no longer offered
+    /// here -- another member of its queue group is asked instead, and
+    /// what had already arrived is still answered -- and, where it says
+    /// so, every shared subscription is ended. What a writer does when it
+    /// is told to stop and serves on beside its replacement.
+    ///
+    /// Defaulted to nothing: a backend with no wire has no other member to
+    /// leave a topic to.
+    fn withdraw(&self, what: Withdrawn) {
+        let _ = what;
     }
 
     /// Messages dropped across every subscription on this backend: a
