@@ -589,6 +589,24 @@ fn run() -> Result<(), String> {
                 });
             }
         }
+        // Every plugin shard's epoch, in every database this member writes,
+        // raised to the highest its takes' records name before it serves: a
+        // database that lost a raise, or joined later, holds it (review c5a
+        // H1, L1).
+        let reseating = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || reseating.reseat_shards()).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(raised)) => tracing::warn!(
+                raised,
+                "plugin shards' epochs raised to their records' as the lake starts"
+            ),
+            Ok(Err(failed)) => {
+                return Err(format!(
+                    "the plugin shards' epochs were not raised to their records': {failed}"
+                ))
+            }
+            Err(failed) => return Err(format!("the plugin shards' raise did not run: {failed}")),
+        }
         // Every handler and subscription in place before this returns.
         let lake =
             meridian_lake::service::serve_grouped(bus.clone(), Arc::clone(&store), clock(), groups);
@@ -608,6 +626,8 @@ fn run() -> Result<(), String> {
                 .await
                 .map_err(|failed| format!("the write-ahead stream's broker: {failed}"))?;
             let bounds = write_ahead_bounds()?;
+            // A shard's raise reads the stream's place (review c5a H2).
+            lake.with_write_ahead(client.clone());
             let writing = Arc::clone(&lake);
             let stepping = holding.stepping_down();
             meridian_runtime::background(async move {

@@ -130,7 +130,7 @@ async fn a_take_is_answered_once_every_group_raised_it_and_a_second_group_refuse
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_take_a_writer_group_does_not_confirm_is_refused_and_another_s_shard_is_never_taken() {
-    let (bus, _zero, _one, lake) = two_groups();
+    let (bus, zero, _one, lake) = two_groups();
     // Two book groups, one of them not answering.
     lake.with_book_groups(2);
     book_group(&bus, 0);
@@ -141,9 +141,20 @@ async fn a_take_a_writer_group_does_not_confirm_is_refused_and_another_s_shard_i
         "{refused}"
     );
     assert!(
-        started.elapsed() >= meridian_changes::shard_fence::CONFIRM_WITHIN,
+        started.elapsed()
+            >= meridian_changes::shard_fence::CONFIRM_WITHIN
+                - meridian_changes::shard_fence::ASK_EACH,
         "asked again until its time ran out"
     );
+    // Nothing recorded of a take that was not confirmed (review c5a M4).
+    let recorded = zero
+        .read_changes(meridian_changes::CONTROL, 0, meridian_changes::PAGE_MOST)
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
+        .count();
+    assert_eq!(recorded, 0, "a take not confirmed was recorded as taken");
     // Another instance's shard: refused, nothing raised.
     let other = bus
         .call(
@@ -163,4 +174,43 @@ async fn a_take_a_writer_group_does_not_confirm_is_refused_and_another_s_shard_i
         .unwrap_err()
         .to_string();
     assert!(other.contains("its own instance's shards"), "{other}");
+}
+
+/// Review c5a M3: the lake answers a take -- here refused, a book group
+/// confirming nothing, each ask taking all but its whole window -- inside
+/// the sidecar's wait, one constant shared: it starts no round it cannot
+/// end inside its confirm window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_is_answered_inside_the_sidecar_s_wait_however_slow_a_group_is() {
+    let (bus, _zero, _one, lake) = two_groups();
+    lake.with_book_groups(1);
+    // A book group that answers each ask just inside it, never raised.
+    bus.serve(&raise_topic("book", 0), move |_| {
+        std::thread::sleep(meridian_changes::shard_fence::ASK_EACH - Duration::from_millis(10));
+        Ok((
+            "meridian.v1.TakeShardReply".into(),
+            TakeShardReply { epoch: 0 }.encode_to_vec(),
+        ))
+    });
+    let answered = bus
+        .call(
+            service::TAKE_SHARD,
+            "meridian.v1.TakeShardRequest",
+            TakeShardRequest {
+                instance: INSTANCE.into(),
+                shard: 0,
+                holder: "feed-pod-b_1".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            None,
+            Some(meridian_changes::shard_fence::TAKE_WITHIN),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        answered.contains("was not confirmed"),
+        "the sidecar gave up before the lake answered: {answered}"
+    );
 }

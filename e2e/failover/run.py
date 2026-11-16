@@ -1107,6 +1107,35 @@ def shard_epoch(shard):
     return int(said or 0)
 
 
+def store_databases(store):
+    """`store`'s databases: database 0, and each one past it whose primary
+    runs (`lake.databases`, `bor.databases`)."""
+    found = [0]
+    component = {"book": "bor"}.get(store, store)
+    while True:
+        d = len(found)
+        said = json.loads(out("get", "pods", "-l",
+                              f"app.kubernetes.io/instance={RELEASE},"
+                              f"meridian.dev/component={component}-database-{d},"
+                              "meridian.dev/database-role=primary", "-o", "json"))["items"]
+        if not [p for p in said if not p["metadata"].get("deletionTimestamp")]:
+            return found
+        found.append(d)
+
+
+def shard_epochs(shard):
+    """The shard's epoch as every lake and book database holds it (review c5a
+    M5), by (store, database): 0 where one holds none."""
+    held = {}
+    for store, table in (("lake", "lake_shard_fence"), ("book", "book_shard_fence")):
+        for d in store_databases(store):
+            said = psql(f"select coalesce(max(epoch), 0) from {table} "
+                        f"where instance = '{SHARDED}' and shard = {shard}",
+                        quiet=True, pod=database_pod(store, d))
+            held[(store, d)] = int(said or 0)
+    return held
+
+
 def shard_takes():
     """How many shard takes the lake's control partition records."""
     said = psql("select count(*) from lake_control_change where kind = 'meridian.v1.ShardTookOver'",
@@ -1144,9 +1173,9 @@ def shards_fenced(s, settled):
     its pod coming back as the standby."""
     names = {p["metadata"]["name"] for p in shard_pods()}
     held = [shard_holder(n)[1] for n in range(SHARDS)]
-    epochs = [shard_epoch(n) for n in range(SHARDS)]
-    s.check(all(e >= 1 for e in epochs),
-            f"shards: each shard's epoch raised by the lake as its pod took it ({epochs})")
+    epochs = [shard_epochs(n) for n in range(SHARDS)]
+    s.check(all(e >= 1 for each in epochs for e in each.values()),
+            f"shards: each shard's epoch raised in every lake and book database as its pod took it ({epochs})")
     takes = shard_takes()
     restarted = {n: restarts(n) for n in names}
     began = time.time()
@@ -1161,12 +1190,16 @@ def shards_fenced(s, settled):
                   said_at(h, "the shard's lease renewal did not answer") or 0) >= began - 1
               for h in holder_pods)
     s.check(bit, f"shards: the cut reached each shard: its renewals failed for {SHARD_CUT_S} s")
-    s.check(all(restarts(n) == restarted[n] for n in names if n in {p["metadata"]["name"] for p in shard_pods()})
+    # Every pod still listed, none replaced: a pod deleted and made again
+    # would pass a check of the pods listed alone (review c5a M5).
+    listed = {p["metadata"]["name"] for p in shard_pods()}
+    s.check(listed == names and all(restarts(n) == restarted[n] for n in names)
             and not any(LOST in shard_log(h) for h in holder_pods),
-            "shards: through the API server's outage, no shard stopped: written on, fenced by its epoch")
+            f"shards: through the API server's outage, no shard stopped: written on, fenced by its epoch "
+            f"(pods {sorted(names)} -> {sorted(listed)})")
     s.check([shard_holder(n)[1] for n in range(SHARDS)] == held,
             "shards: each Lease's holder as it was after the outage")
-    after = [shard_epoch(n) for n in range(SHARDS)]
+    after = [shard_epochs(n) for n in range(SHARDS)]
     s.check(after == epochs and shard_takes() == takes,
             f"shards: no take, each shard's epoch as it was ({epochs} -> {after})")
 
@@ -1183,19 +1216,32 @@ def shards_fenced(s, settled):
         s.check(taken and took <= SHARD_TAKEOVER,
                 f"shards: the holder alone cut from the API server, another took its lease within "
                 f"{SHARD_TAKEOVER} s ({round(took, 2)} s; {now}, was {was})")
-        raised = happens(lambda: shard_epoch(1) == epoch + 1 and shard_takes() == takes + 1, 15, every=0.5)
-        s.check(raised, f"shards: one take recorded, the shard's epoch raised by one "
-                        f"({epoch} -> {shard_epoch(1)}; takes {takes} -> {shard_takes()})")
+        raised = happens(lambda: set(shard_epochs(1).values()) == {epoch + 1}
+                         and shard_takes() == takes + 1, 15, every=0.5)
+        s.check(raised, f"shards: one take recorded, the shard's epoch raised by one in every lake and "
+                        f"book database ({epoch} -> {shard_epochs(1)}; takes {takes} -> {shard_takes()})")
+        # Take to serving: the new holder's sidecar serving within the
+        # takeover's bound of the cut, not only its Lease changed (M5).
+        serving = happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began,
+                          SHARD_TAKEOVER + 10, every=0.25)
+        served = (said_at(now_pod, "the sidecar is serving") or 0) - began
+        s.check(serving and served <= SHARD_TAKEOVER,
+                f"shards: the standby serves the shard within {SHARD_TAKEOVER} s of the cut "
+                f"({round(served, 2)} s)")
         s.check(restarts(lost) == before and LOST not in shard_log(lost),
                 "shards: the cut holder serves on while it cannot hear the API server")
-        figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2))
+        figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2),
+               serving_s=round(served, 2))
     finally:
         cut_api("-D", only={lost})
     exited = happens(lambda: restarts(lost) > before, 30, every=0.5)
     said = previous_log(lost)
-    s.check(exited and LOST in said and "held by" in said,
+    # By the sidecar's own words as it exits: the lease lost, held by the
+    # pod that took it, and stopping (M5).
+    words = [line for line in said.splitlines() if LOST in line]
+    s.check(exited and any(f"held by {now_pod}" in line and "; stopping" in line for line in words),
             f"shards: the cut holder, hearing the API server again, found another holder and exited "
-            f"({'exited' if exited else 'did not exit'})")
+            f"({'exited' if exited else 'did not exit'}; {words[-1:] or 'it said nothing of it'})")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
     return back

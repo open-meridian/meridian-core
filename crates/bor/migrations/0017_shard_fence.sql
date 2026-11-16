@@ -10,5 +10,10 @@ CREATE TABLE IF NOT EXISTS book_shard_fence (
     instance text   NOT NULL,
     shard    bigint NOT NULL,
     epoch    bigint NOT NULL,
+    -- The write-ahead stream's last sequence as the raise to this epoch
+    -- found it: a write the stream held at or below it is admitted whatever
+    -- its epoch, so a replay of one already answered is never refused
+    -- (review c5a H2; provisional name, item 48).
+    admit_through bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (instance, shard)
 );

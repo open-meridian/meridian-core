@@ -125,6 +125,68 @@ pub struct ShardSet<L: Leases> {
     /// Whether its shard writes on unrenewed, fenced by its epoch
     /// ([`ShardSet::writing_on`]); else it stops at its renew deadline.
     writes_on: bool,
+    /// When it last renewed its own Lease, shared with its sends' gate.
+    renewal: Renewal,
+}
+
+/// When a pod last renewed its shard's Lease, shared with the gate on what
+/// its sidecar sends (review c5a M1, ruled 2026-11-16): a data shard writes
+/// on through an API server outage with its lake record writes alone, the
+/// writes its epoch fences; every other send waits for a renewal once the
+/// Lease has gone its renew deadline unrenewed.
+#[derive(Debug, Clone)]
+pub struct Renewal {
+    at: Arc<std::sync::Mutex<Option<Instant>>>,
+    deadline: Duration,
+}
+
+impl Renewal {
+    fn new(deadline: Duration) -> Self {
+        Self {
+            at: Arc::default(),
+            deadline,
+        }
+    }
+
+    fn renewed(&self, at: Instant) {
+        let mut held = self.at.lock().expect("renewal poisoned");
+        *held = Some(held.map_or(at, |was| was.max(at)));
+    }
+
+    /// Whether the Lease was renewed within its renew deadline: true before
+    /// any take, which nothing is gated by.
+    pub fn within_deadline(&self) -> bool {
+        self.at
+            .lock()
+            .expect("renewal poisoned")
+            .is_none_or(|at| clock().saturating_duration_since(at) < self.deadline)
+    }
+}
+
+/// Whether `topic` is sent through an API server outage, past the Lease's
+/// renew deadline: a lake record write -- the writes a shard's epoch fences
+/// -- its write-ahead stream's subject, or a read, which changes nothing.
+pub fn sent_on_unrenewed(topic: &str) -> bool {
+    meridian_lake::service::is_record_write(topic)
+        || topic.starts_with("platform.lake.internal.write-ahead.")
+        || topic.split('.').nth(2) == Some("query")
+}
+
+/// The gate on what a data shard's sidecar sends (review c5a M1): every
+/// send but [`sent_on_unrenewed`]'s held back while `renewal` is past its
+/// renew deadline.
+pub fn send_gate(renewal: Renewal) -> meridian_bus::SendGate {
+    Arc::new(move |topic: &str| {
+        if renewal.within_deadline() || sent_on_unrenewed(topic) {
+            Ok(())
+        } else {
+            Err(format!(
+                "this shard's Lease has gone its renew deadline ({} s) unrenewed: it sends its lake \
+                 record writes alone until it renews",
+                renewal.deadline.as_secs()
+            ))
+        }
+    })
 }
 
 /// The Leases of `shards` read at once, each by looking alone: whether
@@ -183,6 +245,9 @@ impl<L: Leases + 'static> ShardSet<L> {
             )));
         }
         let live = vec![false; electors.len()];
+        let first_deadline = first
+            .as_ref()
+            .map_or(Duration::ZERO, Settings::renew_deadline);
         Ok(Self {
             instance: instance.to_string(),
             electors,
@@ -190,6 +255,7 @@ impl<L: Leases + 'static> ShardSet<L> {
             mine: None,
             live,
             writes_on: false,
+            renewal: Renewal::new(first_deadline),
         })
     }
 
@@ -205,16 +271,30 @@ impl<L: Leases + 'static> ShardSet<L> {
 
     /// The shard this pod holds, the Lease's transitions as it took it --
     /// the floor of the epoch the lake raises (item 32) -- whom it took it
-    /// from, and this pod's holder name. None before a take.
-    pub async fn taken(&self) -> Option<(u32, u64, Option<Option<String>>, String)> {
+    /// from, this pod's holder name, and whether the Lease was free (released
+    /// or never held). None before a take.
+    pub async fn taken(&self) -> Option<Taken> {
         let mine = self.mine?;
         let elector = self.electors[mine].lock().await;
-        Some((
-            mine as u32,
-            elector.transitions()?,
-            elector.took_from(),
-            elector.settings().holder.clone(),
-        ))
+        Some(Taken {
+            shard: mine as u32,
+            transitions: elector.transitions()?,
+            from: elector.took_from().flatten().unwrap_or_default(),
+            holder: elector.settings().holder.clone(),
+            free: elector.took_free(),
+        })
+    }
+
+    /// When this pod last renewed its Lease, for the gate on what it sends
+    /// ([`send_gate`]).
+    pub fn renewal(&self) -> Renewal {
+        self.renewal.clone()
+    }
+
+    /// The Lease's duration: how long a holder's take may stand unrenewed
+    /// before a standby may take it.
+    pub fn lasts(&self) -> Duration {
+        self.settings.duration
     }
 
     /// How often to look: a standby twice a renewal, as a store's does; a
@@ -267,7 +347,11 @@ impl<L: Leases + 'static> ShardSet<L> {
         };
         let looked = self.electors[mine].lock().await.look(now, wall_ns).await;
         match looked {
-            Ok(Standing::Held) => {}
+            Ok(Standing::Held) => {
+                if let Some(at) = self.electors[mine].lock().await.renewed_at() {
+                    self.renewal.renewed(at);
+                }
+            }
             Ok(Standing::HeldBy(other)) => return Stand::Lost(self.held_by(&other)),
             Err(failed) => {
                 let deadline = self.settings.renew_deadline();
@@ -426,6 +510,7 @@ impl<L: Leases + 'static> ShardSet<L> {
             let Some(renewed) = own.lock().await.renewed_at() else {
                 break Kept::Lost(self.held_by("another pod"));
             };
+            self.renewal.renewed(renewed);
             let stop_by = tokio::time::Instant::from_std(renewed + deadline);
             // Fenced, it writes on: a renewal waits one renewal at most and
             // is tried again; the clock never ends it.
@@ -491,10 +576,41 @@ impl<L: Leases + 'static> ShardSet<L> {
     }
 }
 
-/// How long a take waits for the lake: its every writer group's
-/// confirmation, with the way there and back; the Lease is renewed only
-/// after it ([`ShardSet::renew_now`]), inside the lease's lapse.
-pub const TAKE_SHARD_WITHIN: Duration = Duration::from_secs(3);
+/// A shard's take as this pod made it ([`ShardSet::taken`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taken {
+    pub shard: u32,
+    /// The Lease's transitions as it took it.
+    pub transitions: u64,
+    /// Whom it took it from: empty where it never saw a holder.
+    pub from: String,
+    /// This pod's holder name.
+    pub holder: String,
+    /// Whether the Lease was free: released, or never held.
+    pub free: bool,
+}
+
+/// How long a take waits for the lake: the lake's confirm window and the
+/// way there and back, one constant shared with the lake (review c5a M3).
+/// The Lease is renewed just before it and just after it
+/// ([`take_epoch`]), so the take ends inside the renew deadline.
+pub const TAKE_SHARD_WITHIN: Duration = meridian_changes::shard_fence::TAKE_WITHIN;
+
+/// The shard `set` just took, its epoch raised (step 3d, checkpoint 5,
+/// item 32): the Lease renewed first -- read again, so a pod whose take
+/// stalled past its lapse finds the holder that took it since and never
+/// asks (review c5a M2) -- then [`raise_epoch`], then renewed again before
+/// anything is served.
+pub async fn take_epoch<L: Leases + 'static>(
+    bus: &meridian_bus::Bus,
+    instance: &str,
+    set: &mut ShardSet<L>,
+) -> Result<u64, String> {
+    set.renew_now().await?;
+    let epoch = raise_epoch(bus, instance, set).await?;
+    set.renew_now().await?;
+    Ok(epoch)
+}
 
 /// The shard `set` just took has the lake raise its epoch (step 3d,
 /// checkpoint 5, item 32): `TakeShard`, answered once every lake and book
@@ -506,12 +622,17 @@ pub async fn raise_epoch<L: Leases + 'static>(
     set: &ShardSet<L>,
 ) -> Result<u64, String> {
     use prost::Message as _;
-    let (shard, transitions, took_from, holder) = set
+    let Taken {
+        shard,
+        transitions,
+        from: previous_holder,
+        holder,
+        free,
+    } = set
         .taken()
         .await
         .ok_or("this pod holds no shard to raise the epoch of")?;
-    let previous_holder = took_from.flatten().unwrap_or_default();
-    let reason = if previous_holder.is_empty() {
+    let reason = if free {
         meridian_domain::v1::TakeoverReason::Released
     } else {
         meridian_domain::v1::TakeoverReason::LeaseLapsed
@@ -548,6 +669,100 @@ pub async fn raise_epoch<L: Leases + 'static>(
         "the shard's epoch is raised in every writer group: stamped on every write"
     );
     Ok(epoch)
+}
+
+/// The book's fences raised to the lake's records, asked again every few
+/// seconds until it is done: as a book writer starts, and on a new database
+/// timeline (review c5a H1). Said once raised, and once failing.
+pub async fn raise_book_until_done<F>(bus: Arc<meridian_bus::Bus>, raise: F)
+where
+    F: Fn(&str, u32, u64) -> Result<u64, String> + Clone + Send + Sync + 'static,
+{
+    let mut said_failing = false;
+    loop {
+        match raise_book_to_records(&bus, raise.clone()).await {
+            Ok(shards) => {
+                tracing::info!(
+                    shards,
+                    "the book's plugin shard fences raised to the lake's records of their takes"
+                );
+                return;
+            }
+            Err(failed) if !said_failing => {
+                tracing::warn!(%failed, "the book's plugin shard fences were not raised to the lake's records; asking again");
+                said_failing = true;
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(RECORDS_PAGE_WITHIN).await;
+    }
+}
+
+/// How long one page of the lake's control partition is waited for, read
+/// for its shards' takes.
+const RECORDS_PAGE_WITHIN: Duration = Duration::from_secs(5);
+
+/// Each plugin shard's highest epoch its takes' records name, read from
+/// the lake's control partition through its read of changes (review c5a
+/// H1): what the book raises its fence rows to, since the book records no
+/// take of its own.
+pub async fn recorded_epochs(
+    bus: &meridian_bus::Bus,
+) -> Result<std::collections::BTreeMap<(String, u32), u64>, String> {
+    use prost::Message as _;
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    let mut after = 0;
+    loop {
+        let asked = meridian_changes::ReadChangesRequest {
+            partition: meridian_changes::CONTROL.to_string(),
+            after_sequence: after,
+            page_size: 0,
+        };
+        let (_, body) = bus
+            .call(
+                &meridian_changes::read_changes_topic("lake"),
+                "meridian.v1.ReadChangesRequest",
+                asked.encode_to_vec(),
+                None,
+                Some(RECORDS_PAGE_WITHIN),
+            )
+            .await
+            .map_err(|failed| format!("the lake's control partition was not read: {failed}"))?;
+        let page = meridian_changes::ReadChangesReply::decode(body.as_slice())
+            .map_err(|failed| failed.to_string())?;
+        for change in &page.changes {
+            after = change.sequence;
+            if change.kind == meridian_lake::store::CONTROL_SHARD_TOOK_OVER {
+                bodies.push(change.body.clone());
+            }
+        }
+        if page.changes.is_empty() || after >= page.head {
+            break;
+        }
+    }
+    Ok(meridian_changes::shard_fence::highest_recorded(
+        bodies.iter().map(Vec::as_slice),
+    ))
+}
+
+/// The book's plugin shard fences raised to the lake's records (review c5a
+/// H1, L1): as a book writer starts, before it serves, and on a new
+/// database timeline, which may have lost a take's raise. `raise` is the
+/// book store's own, in every database its group writes. Answers how many
+/// shards the records name.
+pub async fn raise_book_to_records<F>(bus: &meridian_bus::Bus, raise: F) -> Result<usize, String>
+where
+    F: Fn(&str, u32, u64) -> Result<u64, String> + Send + Sync + 'static,
+{
+    let recorded = recorded_epochs(bus).await?;
+    tokio::task::spawn_blocking(move || {
+        for ((instance, shard), epoch) in &recorded {
+            raise(instance, *shard, *epoch)?;
+        }
+        Ok(recorded.len())
+    })
+    .await
+    .map_err(|failed| failed.to_string())?
 }
 
 /// The reading of the other shards' Leases, ended when it is dropped.
@@ -1091,8 +1306,10 @@ mod tests {
         stop: &watch::Receiver<bool>,
         fence: &Arc<meridian_changes::shard_fence::Memory>,
         epoch: &Arc<Mutex<u64>>,
+        renewal: &Arc<Mutex<Option<Renewal>>>,
     ) -> tokio::task::JoinHandle<(At, Kept)> {
         let (stop, fence, epoch) = (stop.clone(), Arc::clone(fence), Arc::clone(epoch));
+        let renewal = Arc::clone(renewal);
         tokio::spawn(async move {
             let (set, mine, _) = set
                 .writing_on()
@@ -1100,8 +1317,9 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("a shard");
-            let (_, transitions, _, _) = set.taken().await.unwrap();
-            *epoch.lock().unwrap() = fence.take("feed-1", mine, transitions);
+            *renewal.lock().unwrap() = Some(set.renewal());
+            let transitions = set.taken().await.unwrap().transitions;
+            *epoch.lock().unwrap() = fence.take("feed-1", mine, transitions, 0).unwrap();
             let kept = set.keep(|_| {}, stop).await;
             (At::now(), kept)
         })
@@ -1118,10 +1336,11 @@ mod tests {
         let (to_a, to_c) = (Link::to(&store), Link::to(&store));
         let fence = Arc::new(meridian_changes::shard_fence::Memory::default());
         let (a_epoch, c_epoch) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
+        let (a_renewal, c_renewal) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
         let (_stopper, stop) = watch::channel(false);
-        let a = serving_fenced(on(&to_a, 1, "a"), &stop, &fence, &a_epoch);
+        let a = serving_fenced(on(&to_a, 1, "a"), &stop, &fence, &a_epoch, &a_renewal);
         tokio::time::sleep(secs(0.1)).await;
-        let c = serving_fenced(on(&to_c, 1, "c"), &stop, &fence, &c_epoch);
+        let c = serving_fenced(on(&to_c, 1, "c"), &stop, &fence, &c_epoch, &c_renewal);
         tokio::time::sleep(secs(5.0)).await;
         let cut_at = At::now();
         let renewed = store.written_at("feed-1-shard-0");
@@ -1142,6 +1361,24 @@ mod tests {
         assert!(store.written_at("feed-1-shard-0").duration_since(renewed) >= LASTS);
         let (old, new) = (*a_epoch.lock().unwrap(), *c_epoch.lock().unwrap());
         assert_eq!((old, new), (1, 2));
+        // Past its renew deadline it sends its lake record writes alone
+        // (review c5a M1): a want's renewal, a ticket, its liveness wait.
+        let gate = send_gate(a_renewal.lock().unwrap().clone().expect("a's renewal"));
+        assert!(gate("platform.lake.command.record-prices").is_ok());
+        assert!(gate("platform.lake.internal.write-ahead.feed-1.prices").is_ok());
+        assert!(gate("platform.lake.query.read-observations").is_ok());
+        for held_back in [
+            "platform.lake.command.renew-wants",
+            "platform.lake.command.decline-want",
+            "platform.lake.command.record-liveness",
+            "platform.config.command.file-ticket",
+            "platform.deployment.command.report-latency",
+        ] {
+            assert!(gate(held_back).is_err(), "{held_back} was sent unrenewed");
+        }
+        // The new holder, renewing, sends everything.
+        let c_gate = send_gate(c_renewal.lock().unwrap().clone().expect("c's renewal"));
+        assert!(c_gate("platform.lake.command.renew-wants").is_ok());
         // The holder's next write is refused; the new holder's passes.
         let stamp = |epoch| meridian_changes::shard_fence::ShardStamp::of("feed-1", 0, epoch);
         let refused = fence.check(&[stamp(old).as_ref()]);
@@ -1248,8 +1485,174 @@ mod tests {
         let fresh = Arc::new(Memory::default());
         let mut first = pod(&fresh, 1, "f");
         assert_eq!(first.look(start, 0).await, shard(0, &[]));
-        let (_, transitions, from, _) = first.taken().await.unwrap();
-        assert_eq!((transitions, from), (0, Some(None)));
+        let taken = first.taken().await.unwrap();
+        assert_eq!(
+            (taken.transitions, taken.from.as_str(), taken.free),
+            (0, "", true)
+        );
+    }
+
+    /// A bus whose lake numbers takes by `fence`, as the control writer does
+    /// (refusing a take below the transitions seen), for the tests below.
+    fn lake_numbering(fence: &Arc<meridian_changes::shard_fence::Memory>) -> meridian_bus::Bus {
+        use prost::Message as _;
+        let bus = meridian_bus::Bus::single(
+            "feed-1",
+            Arc::new(meridian_bus::MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(1)),
+        );
+        let numbering = Arc::clone(fence);
+        bus.serve(meridian_lake::service::TAKE_SHARD, move |envelope| {
+            let request =
+                meridian_domain::v1::TakeShardRequest::decode(&envelope.payload[..]).unwrap();
+            let epoch = numbering
+                .take(
+                    &request.instance,
+                    request.shard,
+                    request.lease_transitions,
+                    0,
+                )
+                .map_err(|behind| format!("fenced: transitions seen {}", behind.seen))?;
+            Ok((
+                "meridian.v1.TakeShardReply".into(),
+                meridian_domain::v1::TakeShardReply { epoch }.encode_to_vec(),
+            ))
+        });
+        bus
+    }
+
+    /// Review c5a M2 (paused clock): a pod whose take stalls past its
+    /// Lease's lapse -- its bus slow to set up, nothing renewing -- never
+    /// fences the pod that took the lapsed Lease after it: it reads its
+    /// Lease again before it asks, finds the other holder, and stops; and
+    /// the lake would refuse its take under fewer transitions anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_whose_take_stalled_past_its_lapse_never_fences_the_holder_that_took_it_since() {
+        let api = Arc::new(Memory::default());
+        let (mut b, mut c) = (pod(&api, 1, "b"), pod(&api, 1, "c"));
+        assert_eq!(b.look(clock(), 0).await, shard(0, &[]));
+        assert_eq!(c.look(clock(), 0).await, Stand::Standby);
+        // b's take stalls; nothing renews its Lease.
+        tokio::time::sleep(secs(7.0)).await;
+        assert_eq!(c.look(clock(), 0).await, shard(0, &[]));
+        let fence = Arc::new(meridian_changes::shard_fence::Memory::default());
+        let bus = lake_numbering(&fence);
+        let c_epoch = take_epoch(&bus, "feed-1", &mut c).await.unwrap();
+        // b's take, late.
+        let late = take_epoch(&bus, "feed-1", &mut b).await;
+        assert!(late.is_err(), "the late take was answered: {late:?}");
+        // The holder that took the Lease since is not fenced.
+        let stamp = meridian_changes::shard_fence::ShardStamp::of("feed-1", 0, c_epoch);
+        assert_eq!(fence.check(&[stamp.as_ref()]), vec![Ok(())]);
+        assert_eq!(fence.epoch("feed-1", 0), c_epoch);
+    }
+
+    /// Review c5a L3: a take names whom it took the shard from -- the pod
+    /// that released it, as this pod last saw it held; itself, where it
+    /// takes back its own name's Lease after its container restarted -- and
+    /// whether the Lease was free.
+    #[tokio::test(start_paused = true)]
+    async fn a_take_names_whom_it_took_the_shard_from() {
+        // Released by a: b takes it free, from a.
+        let api = Arc::new(Memory::default());
+        let (mut a, mut b) = (pod(&api, 1, "a"), pod(&api, 1, "b"));
+        assert_eq!(a.look(clock(), 0).await, shard(0, &[]));
+        assert_eq!(b.look(clock(), 0).await, Stand::Standby);
+        a.release(0).await;
+        assert_eq!(b.look(clock(), 0).await, shard(0, &[]));
+        let taken = b.taken().await.unwrap();
+        assert_eq!((taken.from.as_str(), taken.free), ("a", true));
+        // A container restarted in its pod: its own name's Lease, taken back
+        // from itself once it lapsed, not free.
+        let api = Arc::new(Memory::default());
+        let mut x = pod(&api, 1, "x");
+        assert_eq!(x.look(clock(), 0).await, shard(0, &[]));
+        drop(x);
+        tokio::time::sleep(secs(7.0)).await;
+        let mut again = pod(&api, 1, "x");
+        assert_eq!(again.look(clock(), 0).await, shard(0, &[]));
+        let taken = again.taken().await.unwrap();
+        assert_eq!((taken.from.as_str(), taken.free), ("x", false));
+        // Lapsed from another: from it, not free.
+        let api = Arc::new(Memory::default());
+        let (mut p, mut q) = (pod(&api, 1, "p"), pod(&api, 1, "q"));
+        assert_eq!(p.look(clock(), 0).await, shard(0, &[]));
+        assert_eq!(q.look(clock(), 0).await, Stand::Standby);
+        tokio::time::sleep(secs(7.0)).await;
+        assert_eq!(q.look(clock(), 0).await, shard(0, &[]));
+        let taken = q.taken().await.unwrap();
+        assert_eq!((taken.from.as_str(), taken.free), ("p", false));
+    }
+
+    /// Review c5a H1, the book: a book database that lost a take's raise --
+    /// a new timeline, or a database added later -- is raised again to the
+    /// highest epoch the lake's records of the takes name, read a page at a
+    /// time from the lake's control partition; an old holder's write is
+    /// then refused there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_book_that_lost_a_raise_is_raised_again_from_the_lake_s_records() {
+        use prost::Message as _;
+        let bus = Arc::new(meridian_bus::Bus::single(
+            "book-1",
+            Arc::new(meridian_bus::MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(1)),
+        ));
+        // The lake's control partition: two takes of shard 1, one of shard 0,
+        // and another record; a page of two at a time.
+        let change = |sequence: u64, kind: &str, body: Vec<u8>| meridian_changes::Change {
+            partition: meridian_changes::CONTROL.into(),
+            sequence,
+            kind: kind.into(),
+            body,
+            ..Default::default()
+        };
+        let took = |shard, epoch| {
+            meridian_domain::v1::ShardTookOver {
+                instance: "feed-1".into(),
+                shard,
+                epoch,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        let kind = meridian_lake::store::CONTROL_SHARD_TOOK_OVER;
+        let log = vec![
+            change(1, kind, took(1, 2)),
+            change(2, "meridian.v1.PartitionOwner", Vec::new()),
+            change(3, kind, took(1, 3)),
+            change(4, kind, took(0, 1)),
+        ];
+        bus.serve(
+            &meridian_changes::read_changes_topic("lake"),
+            move |envelope| {
+                let asked =
+                    meridian_changes::ReadChangesRequest::decode(&envelope.payload[..]).unwrap();
+                let page = meridian_changes::ReadChangesReply {
+                    changes: log
+                        .iter()
+                        .filter(|c| c.sequence > asked.after_sequence)
+                        .take(2)
+                        .cloned()
+                        .collect(),
+                    head: 4,
+                    ..Default::default()
+                };
+                Ok(("meridian.v1.ReadChangesReply".into(), page.encode_to_vec()))
+            },
+        );
+        // The book's database, its raise to 3 lost: it holds 1.
+        let book = Arc::new(meridian_changes::shard_fence::Memory::default());
+        book.raise_to("feed-1", 1, 1);
+        let raising = Arc::clone(&book);
+        let shards = raise_book_to_records(&bus, move |instance, shard, epoch| {
+            Ok(raising.raise_to(instance, shard, epoch))
+        })
+        .await
+        .unwrap();
+        assert_eq!(shards, 2);
+        assert_eq!((book.epoch("feed-1", 1), book.epoch("feed-1", 0)), (3, 1));
+        let stale = meridian_changes::shard_fence::ShardStamp::of("feed-1", 1, 2);
+        assert!(book.check(&[stale.as_ref()])[0].is_err());
     }
 
     /// A shard told to stop releases its Lease, and the standby holds it at

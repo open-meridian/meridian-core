@@ -511,12 +511,40 @@ fn run() -> Result<(), String> {
         ));
         // A new database timeline raises the epoch (contract v30, stage C):
         // the books held let go of what the record may have lost.
-        let following = Arc::clone(&store);
-        holding.follow_timeline(&bus, "book", move || {
-            following
-                .follow_timeline()
+        // Its plugin shard fences, too: raised again to the lake's records of
+        // the takes, which a new timeline may have lost (review c5a H1).
+        let raising = Arc::clone(&store);
+        let raise_book = move |instance: &str, shard: u32, epoch: u64| {
+            meridian_bor::Store::raise_shard(raising.as_ref(), instance, shard, epoch)
                 .map_err(|failed| failed.to_string())
+        };
+        let following = Arc::clone(&store);
+        let (asking, raising_on) = (Arc::clone(&bus), raise_book.clone());
+        holding.follow_timeline(&bus, "book", move || {
+            let found = following
+                .follow_timeline()
+                .map_err(|failed| failed.to_string())?;
+            if let meridian_changes::timeline::Timeline::Moved(_) = found {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(meridian_runtime::shards::raise_book_until_done(
+                        Arc::clone(&asking),
+                        raising_on.clone(),
+                    ));
+                }
+            }
+            Ok(found)
         });
+        // As it starts, before it serves: tried once in time, then asked
+        // again until done (review c5a H1, L1: a database added later too).
+        if let Err(failed) =
+            meridian_runtime::shards::raise_book_to_records(&bus, raise_book.clone()).await
+        {
+            tracing::warn!(%failed, "the book's plugin shard fences were not raised to the lake's records before it serves; asking again");
+            meridian_runtime::background(meridian_runtime::shards::raise_book_until_done(
+                Arc::clone(&bus),
+                raise_book,
+            ));
+        }
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // This writer group's raise of a plugin shard's epoch (step 3d,

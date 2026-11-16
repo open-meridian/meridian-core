@@ -150,9 +150,14 @@ pub struct Elector<L: Leases> {
     observed: Option<(Record, Instant)>,
     /// When this member last wrote the lease as its holder.
     renewed_at: Option<Instant>,
-    /// Whom it took the lease from, the last time it took it: `Some("")`
-    /// where it was released, `None` where nobody had ever held it.
+    /// Whom it took the lease from, the last time it took it
+    /// ([`Elector::took_from`]).
     took_from: Option<Option<String>>,
+    /// Whether the lease was free when it took it: released, or never held.
+    took_free: bool,
+    /// The last holder other than this member it saw hold the lease: whom
+    /// a lease released since was released by (review c5a L3).
+    last_other: Option<String>,
     /// Whether this member gave the lease up ([`Elector::release`]): it is
     /// stopping, and never takes or renews it again.
     gave_up: bool,
@@ -170,6 +175,8 @@ impl<L: Leases> Elector<L> {
             observed: None,
             renewed_at: None,
             took_from: None,
+            took_free: false,
+            last_other: None,
             gave_up: false,
             answered: None,
         }
@@ -206,10 +213,18 @@ impl<L: Leases> Elector<L> {
     }
 
     /// Whom this member took the lease from: `Some(Some(holder))` from a
-    /// holder whose lease lapsed, `Some(Some(""))` where it was released,
-    /// `Some(None)` where none was held; `None` before it took it.
+    /// holder whose lease lapsed, or which released it (the last holder this
+    /// member saw), itself where it took back its own name's lease (a
+    /// container restarted in its pod); `Some(None)` where it never saw a
+    /// holder; `None` before it took it (review c5a L3).
     pub fn took_from(&self) -> Option<Option<String>> {
         self.took_from.clone()
+    }
+
+    /// Whether the lease was free when this member last took it: released
+    /// by its holder, or never held.
+    pub fn took_free(&self) -> bool {
+        self.took_free
     }
 
     pub fn settings(&self) -> &Settings {
@@ -296,6 +311,7 @@ impl<L: Leases> Elector<L> {
                 Wrote::Done(version) => {
                     self.wrote(record, version, now);
                     self.took_from = Some(None);
+                    self.took_free = true;
                     Ok(Standing::Held)
                 }
                 Wrote::Conflict => Ok(Standing::HeldBy(String::new())),
@@ -307,6 +323,9 @@ impl<L: Leases> Elector<L> {
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
             self.observed = Some((current.clone(), self.seen_at(now)));
+        }
+        if !current.holder.is_empty() && current.holder != me {
+            self.last_other = Some(current.holder.clone());
         }
         // Given up: whoever holds it, never this member again. A released
         // lease's holder is empty, free to the first member that looks, and
@@ -343,7 +362,18 @@ impl<L: Leases> Elector<L> {
             Wrote::Done(version) => {
                 self.wrote(record, version, now);
                 if !mine {
-                    self.took_from = Some(Some(current.holder));
+                    // Released: from whoever this member last saw hold it.
+                    self.took_free = current.holder.is_empty();
+                    self.took_from = Some(if self.took_free {
+                        self.last_other.clone()
+                    } else {
+                        Some(current.holder)
+                    });
+                } else if self.took_from.is_none() {
+                    // Its own name's lease, held by this pod before this
+                    // process: taken back from itself.
+                    self.took_free = false;
+                    self.took_from = Some(Some(me));
                 }
                 Ok(Standing::Held)
             }

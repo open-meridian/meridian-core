@@ -10539,6 +10539,7 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
 
     let first = store.take_shard(took(&instance, 1), 0).unwrap();
     assert_eq!(first.epoch, 1, "a shard never taken: epoch 1");
+    store.record_shard_take(&first).unwrap();
 
     // Equal passes.
     let done = store.record_parts(
@@ -10623,11 +10624,19 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
     );
     assert!(fenced(&served), "{served:?}");
 
-    // A take raises past the epoch held, and past the Lease's transitions.
-    assert_eq!(store.take_shard(took(&instance, 1), 0).unwrap().epoch, 4);
-    assert_eq!(store.take_shard(took(&instance, 1), 9).unwrap().epoch, 9);
+    // A take raises past the epoch held, and past the Lease's transitions;
+    // each is recorded once every group raised it (review c5a M4).
+    let take = |shard, transitions| {
+        let taken = store
+            .take_shard(took(&instance, shard), transitions)
+            .unwrap();
+        store.record_shard_take(&taken).unwrap();
+        taken.epoch
+    };
+    assert_eq!(take(1, 0), 4);
+    assert_eq!(take(1, 9), 9);
     // Another shard of the instance is its own.
-    assert_eq!(store.take_shard(took(&instance, 0), 0).unwrap().epoch, 1);
+    assert_eq!(take(0, 0), 1);
     // Each take is its own record in the control partition, with its epoch.
     let recorded: Vec<u64> = store
         .control_entries()
@@ -10643,8 +10652,8 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
         .collect();
     assert_eq!(recorded, vec![1, 4, 9, 1]);
     // A raise heard from the control writer: never down.
-    assert_eq!(store.raise_shard(&instance, 1, 5).unwrap(), 9);
-    assert_eq!(store.raise_shard(&instance, 1, 12).unwrap(), 12);
+    assert_eq!(store.raise_shard(&instance, 1, 5, 0).unwrap(), 9);
+    assert_eq!(store.raise_shard(&instance, 1, 12, 0).unwrap(), 12);
     let done = store.record_parts(
         &dataset,
         vec![vec![close(&dataset, "h", &subject, "2026-11-16", 8)]],
@@ -10652,4 +10661,181 @@ fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises(
         6_000,
     );
     assert!(fenced(&done[0]), "{:?}", done[0]);
+}
+
+/// Review c5a H1: a shard's epoch outlives its database's lost commits. A
+/// row a restore took back is raised again to the highest the takes'
+/// records name on the new timeline, and as a member starts, so a stale
+/// holder's write is refused; a take numbers past the records, not the row
+/// alone.
+#[test]
+fn a_shard_s_epoch_lost_with_a_database_s_commits_is_raised_again_from_its_records() {
+    use meridian_changes::timeline::Timeline;
+    use meridian_lake::store::{ShardStamp, StoreError};
+    let (url, writer) = isolated("lake-shard-timeline");
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let stamp = |epoch: u64| ShardStamp::of(&instance, 1, epoch);
+    assert_eq!(writer.adopt().unwrap(), 1);
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::First);
+    for want in [1, 2] {
+        let taken = writer.take_shard(took(&instance, 1), 0).unwrap();
+        assert_eq!(taken.epoch, want);
+        writer.record_shard_take(&taken).unwrap();
+    }
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As a restore from before the last raise leaves it.
+    let lose = |admin: &mut postgres::Client| {
+        admin
+            .execute("UPDATE lake_shard_fence SET epoch = 1", &[])
+            .unwrap();
+    };
+    lose(&mut admin);
+    admin
+        .execute(
+            "UPDATE lake_change_head SET database_identity = 'another/00000001'
+              WHERE partition = 'control'",
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        writer.follow_timeline().unwrap(),
+        Timeline::Moved(_)
+    ));
+    let done = writer.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "a", &subject, "2026-11-16", 1)]],
+        &[stamp(1)],
+        1_000,
+    );
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "the old holder's write passed a row the new timeline took back: {:?}",
+        done[0]
+    );
+    // As a member starts: raised to its records before it serves.
+    lose(&mut admin);
+    assert_eq!(writer.reseat_shards().unwrap(), 1);
+    let done = writer.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "b", &subject, "2026-11-16", 2)]],
+        &[stamp(1)],
+        2_000,
+    );
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "{:?}",
+        done[0]
+    );
+    // A take numbers past its records, whatever the row holds.
+    admin.execute("DELETE FROM lake_shard_fence", &[]).unwrap();
+    assert_eq!(writer.take_shard(took(&instance, 1), 0).unwrap().epoch, 3);
+}
+
+/// Review c5a H2: a write the write-ahead stream held before the take
+/// reached the group -- one the lake answered as recorded, taken again
+/// after a database failover lost its commit -- is admitted whatever its
+/// epoch; one past the stream's place at the raise is refused.
+#[test]
+fn a_write_ahead_replay_the_stream_held_before_the_take_is_recorded_not_refused() {
+    use meridian_lake::store::{ShardStamp, StoreError, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let stream = unique("STREAM");
+    let old = |sequence| ShardStamp::of(&instance, 1, 1).map(|s| s.in_stream(sequence));
+    let first = store.take_shard(took(&instance, 1), 0).unwrap();
+    assert_eq!(first.epoch, 1);
+    // The take that fenced the old holder reached this group with the
+    // stream at 7: sequences 1 to 7 were sent before it.
+    assert_eq!(store.raise_shard(&instance, 1, 2, 7).unwrap(), 2);
+    let batch = |sequence: u64, key: &str, stamp| WriteAheadBatch {
+        stream: stream.clone(),
+        after: None,
+        through: WriteAheadPosition {
+            sequence,
+            at_ns: sequence as i64,
+        },
+        parts: vec![(
+            dataset.clone(),
+            vec![close(
+                &dataset,
+                key,
+                &subject,
+                "2026-11-16",
+                sequence as i64,
+            )],
+        )],
+        shards: vec![stamp],
+        ..Default::default()
+    };
+    // The replay of a write the lake had answered: recorded.
+    let done = store
+        .record_write_ahead(batch(5, "a", old(5)), 5_000)
+        .unwrap();
+    assert_eq!(
+        done[0].as_ref().map(|d| d.recorded).ok(),
+        Some(1),
+        "a write the stream held before the take was refused on its replay: {:?}",
+        done[0]
+    );
+    // One the old holder sent after the take reached the group: refused.
+    let mut late = batch(8, "b", old(8));
+    late.after = store.write_ahead_position(&stream).unwrap();
+    let done = store.record_write_ahead(late, 8_000).unwrap();
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "{:?}",
+        done[0]
+    );
+}
+
+/// Review c5a M2: a take whose Lease's transitions are below the highest a
+/// take of the shard was numbered with is refused, SHARD_FENCED, and the
+/// shard's epoch is left as the later take numbered it.
+#[test]
+fn a_late_take_under_fewer_lease_transitions_is_refused() {
+    use meridian_lake::store::StoreError;
+    let store = store();
+    let instance = unique("feed");
+    assert_eq!(store.take_shard(took(&instance, 1), 5).unwrap().epoch, 5);
+    let late = store.take_shard(took(&instance, 1), 4);
+    assert!(matches!(late, Err(StoreError::ShardFenced(_))), "{late:?}");
+    // The same transitions take again: a sidecar restarted in its pod.
+    assert_eq!(store.take_shard(took(&instance, 1), 5).unwrap().epoch, 6);
+}
+
+/// Review c5a L1: a database added later holds every plugin shard's epoch
+/// before it serves. A member's start raises every database it writes to
+/// the highest epoch database 0's records name, so a stale holder's write
+/// routed there is refused, never taken as the first epoch seen.
+#[test]
+fn a_database_added_later_holds_each_shard_s_recorded_epoch_once_a_member_starts() {
+    use meridian_lake::store::{ShardStamp, StoreError};
+    let urls = two_databases();
+    let zero = spread(&urls, 0);
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    for want in [1, 2] {
+        let taken = zero.take_shard(took(&instance, 1), 0).unwrap();
+        assert_eq!(taken.epoch, want);
+        zero.record_shard_take(&taken).unwrap();
+    }
+    // Database 1 never heard a raise, as one added after the takes.
+    assert_eq!(zero.reseat_shards().unwrap(), 1, "database 1 raised");
+    let added = PostgresStore::connect(&urls[1], 2).unwrap();
+    let done = added.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "a", &subject, "2026-11-16", 1)]],
+        &[ShardStamp::of(&instance, 1, 1)],
+        1_000,
+    );
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "a stale stamp passed in a database added later: {:?}",
+        done[0]
+    );
 }

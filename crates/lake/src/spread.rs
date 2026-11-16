@@ -600,14 +600,34 @@ impl Store for Spread {
         self.own().take_shard(took, lease_transitions)
     }
 
-    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        self.own().record_shard_take(took)
+    }
+
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit_through: u64,
+    ) -> Result<u64> {
         // Every database this group may write a part to: a range moved
         // between databases is written where its head is (step 3d).
         let mut held = 0;
         for store in &self.stores {
-            held = held.max(store.raise_shard(instance, shard, epoch)?);
+            held = held.max(store.raise_shard(instance, shard, epoch, admit_through)?);
         }
         Ok(held)
+    }
+
+    fn reseat_shards(&self) -> Result<usize> {
+        // Every database, each from database 0's records (review c5a H1,
+        // L1): a database added later holds them before it serves.
+        let mut raised = 0;
+        for store in &self.stores {
+            raised += store.reseat_shards()?;
+        }
+        Ok(raised)
     }
 
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {

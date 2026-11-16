@@ -108,6 +108,17 @@ impl MemoryStore {
         self.held.lock().expect("lake store poisoned")
     }
 
+    /// Each plugin shard's highest epoch its records name (review c5a H1).
+    fn recorded_shards(held: &Held) -> BTreeMap<(String, u32), u64> {
+        let bodies: Vec<Vec<u8>> = held
+            .control
+            .iter()
+            .filter(|change| change.kind == crate::store::CONTROL_SHARD_TOOK_OVER)
+            .map(|change| change.body.clone())
+            .collect();
+        meridian_changes::shard_fence::highest_recorded(bodies.iter().map(Vec::as_slice))
+    }
+
     /// Log what is not a dataset's row in the `control` partition (step
     /// 3b), under the writer's epoch as Postgres checks it.
     fn log_control(&self, held: &mut Held, entries: Vec<(&str, Vec<u8>, i64)>) -> Result<()> {
@@ -455,24 +466,46 @@ impl Store for MemoryStore {
         mut took: meridian_domain::v1::ShardTookOver,
         lease_transitions: u64,
     ) -> Result<meridian_domain::v1::ShardTookOver> {
-        use prost::Message as _;
         let mut held = self.lock();
         // Checked before anything is raised, as Postgres checks it.
         self.fenced(&mut held)?;
+        let recorded = Self::recorded_shards(&held)
+            .get(&(took.instance.clone(), took.shard))
+            .copied()
+            .unwrap_or(0);
         took.epoch = self
             .shards
-            .take(&took.instance, took.shard, lease_transitions);
+            .take(&took.instance, took.shard, lease_transitions, recorded)
+            .map_err(|behind| crate::postgres::take_behind(&took, lease_transitions, behind))?;
+        Ok(took)
+    }
+
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        use prost::Message as _;
+        let mut held = self.lock();
         let entry = (
             crate::store::CONTROL_SHARD_TOOK_OVER,
             took.encode_to_vec(),
             took.took_over_at_ns,
         );
-        self.log_control(&mut held, vec![entry])?;
-        Ok(took)
+        self.log_control(&mut held, vec![entry])
     }
 
-    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
-        Ok(self.shards.raise_to(instance, shard, epoch))
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit_through: u64,
+    ) -> Result<u64> {
+        Ok(self
+            .shards
+            .raise_admitting(instance, shard, epoch, admit_through))
+    }
+
+    fn reseat_shards(&self) -> Result<usize> {
+        let recorded = Self::recorded_shards(&self.lock());
+        Ok(self.shards.raise_all(&recorded))
     }
 
     fn record_write_ahead(

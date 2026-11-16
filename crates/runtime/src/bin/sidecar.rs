@@ -185,10 +185,28 @@ fn run() -> Result<(), String> {
             // in `ha` (the resilience spec's section 4): held by the stream
             // before the lake records them, so none it was answered for is
             // lost.
-            let bus = if writes_rows {
-                bus_from_env_writing_ahead(&instance_id).await?
-            } else {
-                bus_from_env(&instance_id).await?
+            // Bounded where a shard is held: its Lease is not renewed until the
+            // take, so a bus that cannot be set up inside the Lease's lapse
+            // gives the shard up rather than take it late (review c5a M2).
+            let made = async {
+                if writes_rows {
+                    bus_from_env_writing_ahead(&instance_id).await
+                } else {
+                    bus_from_env(&instance_id).await
+                }
+            };
+            let bus = match &mut shard {
+                None => made.await?,
+                Some((set, _)) => match tokio::time::timeout(set.lasts(), made).await {
+                    Ok(made) => made?,
+                    Err(_) => {
+                        tracing::error!(
+                            "the bus was not set up inside the shard's Lease; giving its lease up and stopping"
+                        );
+                        set.release(meridian_runtime::now_ns()).await;
+                        std::process::exit(1);
+                    }
+                },
             };
             // A shard taken: its epoch raised by the lake in every writer
             // group before anything is served, and stamped on every write
@@ -196,17 +214,20 @@ fn run() -> Result<(), String> {
             // confirmed gives the Lease up and ends the process: its pod
             // comes back as the standby, and the next take asks again.
             if let Some((set, _)) = &mut shard {
+                // Renewed just before the take and just after it (review c5a
+                // M2, M3): a take that stalled past its lapse is never sent.
                 let raised =
-                    match meridian_runtime::shards::raise_epoch(&bus, &identity.instance_id, set)
-                        .await
-                    {
-                        Ok(_) => set.renew_now().await,
-                        Err(failed) => Err(failed),
-                    };
+                    meridian_runtime::shards::take_epoch(&bus, &identity.instance_id, set).await;
                 if let Err(failed) = raised {
                     tracing::error!("the shard's epoch was not raised: {failed}; giving its lease up and stopping");
                     set.release(meridian_runtime::now_ns()).await;
                     std::process::exit(1);
+                }
+                // A data shard writes on past its renew deadline with its
+                // lake record writes alone; every other send waits for a
+                // renewal (review c5a M1, ruled 2026-11-16).
+                if meridian_runtime::shards::writes_on(&identity.roles) {
+                    bus.gate_sends(meridian_runtime::shards::send_gate(set.renewal()))?;
                 }
             }
             // Its own hops' ages -- a record batch accepted, a row delivered

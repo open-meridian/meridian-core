@@ -538,6 +538,27 @@ impl PostgresStore {
             |tx| raise(tx, &by, None),
         )
         .map_err(unavailable)?;
+        // A new timeline may have lost a take's raise: every plugin shard's
+        // epoch raised again to the highest its records name, in the same
+        // transaction, as the writer's own is (review c5a H1).
+        if let meridian_changes::timeline::Timeline::Moved(_) = found {
+            let recorded = match self.home_of(0) {
+                Some(home) if !std::ptr::eq(home.as_ref(), self) => home.recorded_shards()?,
+                _ => shard_records(&mut tx)?,
+            };
+            let raised = meridian_changes::shard_fence::raise_all(
+                &mut tx,
+                meridian_changes::shard_fence::LAKE,
+                &recorded,
+            )
+            .map_err(unavailable)?;
+            if raised > 0 {
+                tracing::warn!(
+                    raised,
+                    "plugin shards' epochs raised again to their records' on the new timeline"
+                );
+            }
+        }
         tx.commit().map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
             self.fence.adopt(epoch);
@@ -1730,7 +1751,62 @@ fn shards_checked<'a>(
         .collect())
 }
 
+/// Each plugin shard's highest epoch its `ShardTookOver` records in this
+/// database's control journal name (review c5a H1).
+fn shard_records(client: &mut impl GenericClient) -> Result<BTreeMap<(String, u32), u64>> {
+    let bodies: Vec<Vec<u8>> = client
+        .query(
+            "SELECT body FROM lake_control_change WHERE kind = $1",
+            &[&crate::store::CONTROL_SHARD_TOOK_OVER],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    Ok(meridian_changes::shard_fence::highest_recorded(
+        bodies.iter().map(Vec::as_slice),
+    ))
+}
+
+/// A take refused: the Lease's transitions it was sent with are below the
+/// highest a take of the shard was numbered with (review c5a M2), so a
+/// later take holds the Lease. FAILED_PRECONDITION,
+/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits.
+pub(crate) fn take_behind(
+    took: &meridian_domain::v1::ShardTookOver,
+    lease_transitions: u64,
+    behind: meridian_changes::shard_fence::TakeBehind,
+) -> StoreError {
+    tracing::warn!(
+        instance = took.instance,
+        shard = took.shard,
+        holder = took.holder,
+        lease_transitions,
+        seen = behind.seen,
+        "a shard's take refused: a later take of its Lease was numbered already"
+    );
+    StoreError::ShardFenced(ShardFenced {
+        stamp: ShardStamp {
+            instance: took.instance.clone(),
+            shard: took.shard,
+            epoch: lease_transitions,
+            in_stream: 0,
+        },
+        held: behind.seen,
+    })
+}
+
 impl PostgresStore {
+    /// Each plugin shard's highest recorded epoch, from the database whose
+    /// control journal the takes are recorded in: database 0's (review c5a
+    /// H1).
+    fn recorded_shards(&self) -> Result<BTreeMap<(String, u32), u64>> {
+        match self.home_of(0) {
+            Some(home) if !std::ptr::eq(home.as_ref(), self) => home.recorded_shards(),
+            _ => shard_records(&mut *self.conn()?),
+        }
+    }
+
     /// One part recorded alone, under its plugin shard's stamp where it
     /// names one (step 3d, checkpoint 5, item 32).
     fn record_alone(
@@ -2921,27 +2997,54 @@ impl Store for PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        // The shard's row first, as every batch takes it, then the control
-        // partition's head (step 3d, checkpoint 5, item 32).
-        took.epoch = meridian_changes::shard_fence::take(
+        // Numbered past the highest its records name, never the row alone
+        // (review c5a H1); recorded only once every group raised it (M4).
+        let recorded = shard_records(&mut tx)?
+            .get(&(took.instance.clone(), took.shard))
+            .copied()
+            .unwrap_or(0);
+        let numbered = meridian_changes::shard_fence::take(
             &mut tx,
             meridian_changes::shard_fence::LAKE,
             &took.instance,
             took.shard,
             lease_transitions,
+            recorded,
         )
         .map_err(unavailable)?;
+        took.epoch = match numbered {
+            Ok(epoch) => epoch,
+            Err(behind) => return Err(take_behind(&took, lease_transitions, behind)),
+        };
+        tx.commit().map_err(unavailable)?;
+        Ok(took)
+    }
+
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        if !self.groups.holds_control() {
+            return Err(StoreError::Unavailable(
+                "a shard's take is the lake's control writer's: writer group 0's".into(),
+            ));
+        }
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
         let entry = (
             crate::store::CONTROL_SHARD_TOOK_OVER,
             took.encode_to_vec(),
             took.took_over_at_ns,
         );
         self.log_control(&mut tx, &[entry])?;
-        tx.commit().map_err(unavailable)?;
-        Ok(took)
+        tx.commit().map_err(unavailable)
     }
 
-    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit_through: u64,
+    ) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let held = meridian_changes::shard_fence::raise_to(
@@ -2950,10 +3053,25 @@ impl Store for PostgresStore {
             instance,
             shard,
             epoch,
+            admit_through,
         )
         .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         Ok(held)
+    }
+
+    fn reseat_shards(&self) -> Result<usize> {
+        let recorded = self.recorded_shards()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let raised = meridian_changes::shard_fence::raise_all(
+            &mut tx,
+            meridian_changes::shard_fence::LAKE,
+            &recorded,
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(raised)
     }
 
     fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {

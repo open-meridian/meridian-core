@@ -60,6 +60,21 @@ const AGAIN_AFTER: Duration = Duration::from_millis(500);
 /// and answered within the hold, never only once another write comes.
 pub const TAKEN_BACK_LOOK_EVERY: Duration = Duration::from_millis(250);
 
+/// The stream's last sequence as the broker holds it now: what a plugin
+/// shard's raise admits the writes the stream held through (review c5a H2).
+pub async fn last_sequence(client: &async_nats::Client) -> Result<u64, String> {
+    let context = jetstream::new(client.clone());
+    let mut stream = context
+        .get_stream(STREAM)
+        .await
+        .map_err(|failed| format!("the write-ahead stream was not found: {failed}"))?;
+    let info = stream
+        .info()
+        .await
+        .map_err(|failed| format!("the write-ahead stream's place was not read: {failed}"))?;
+    Ok(info.state.last_sequence)
+}
+
 /// One write as the stream held it.
 #[derive(Debug, Clone)]
 pub struct Taken {
@@ -200,6 +215,9 @@ pub struct Written {
     /// groups (step 3d; spec 6.7): what this group's rows of it do is kept
     /// with them, for its answer.
     pub counted: Option<u64>,
+    /// Its sequence in the stream: what its plugin shard's fence admits a
+    /// write the stream held before the take by (review c5a H2).
+    pub sequence: u64,
 }
 
 /// What [`crate::service::Lake::record_written`] did, once committed: each
@@ -419,6 +437,7 @@ impl Writer {
                 // group's too: an answer counts each part as committed,
                 // whichever take committed it (spec 6.7).
                 counted: spans.then_some(write.sequence),
+                sequence: write.sequence,
             });
         }
         let batch = WriteAheadBatch {

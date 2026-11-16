@@ -1592,6 +1592,9 @@ pub(crate) fn refused(failed: BusError) -> Status {
     match failed {
         BusError::NoHandler(topic) => Status::unavailable(format!("nothing serves {topic}")),
         timeout @ BusError::Timeout { .. } => Status::deadline_exceeded(timeout.to_string()),
+        // Held back by the sidecar's own gate (review c5a M1): its shard's
+        // Lease is past its renew deadline; a renewal sends it again.
+        held @ BusError::NotSent { .. } => Status::unavailable(held.to_string()),
         // A component's refusal of its own (W9's book, contract v8), its
         // reason code carried beside the status and its words alone in it.
         // The fields it names as left out, where it names any, ride with it.

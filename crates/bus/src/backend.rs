@@ -24,6 +24,12 @@ pub enum BusError {
     #[error("the bus is shutting down")]
     ShuttingDown,
 
+    /// Held back by the sender's own gate ([`crate::Bus::gate_sends`]): a
+    /// plugin shard's sidecar whose Lease has gone its renew deadline
+    /// unrenewed sends nothing but its lake record writes (review c5a M1).
+    #[error("`{topic}` was not sent: {why}")]
+    NotSent { topic: String, why: String },
+
     /// A question past what the broker carries, refused before it was sent
     /// rather than lost on the way.
     #[error("a question to `{topic}` is {size} bytes, past the broker's limit of {most} bytes, and was not sent")]

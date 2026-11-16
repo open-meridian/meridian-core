@@ -863,11 +863,14 @@ pub trait Store: Send + Sync {
     }
 
     /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch
-    /// raised to max(the epoch held + 1, `lease_transitions`), at least 1,
-    /// and `took` recorded with that epoch as its `ShardTookOver` in the
-    /// `control` partition, in one transaction. The control writer's (group
-    /// 0's): its database holds the shard's epoch the takes are numbered by.
-    /// Answered with the record as kept.
+    /// numbered max(the epoch held + 1, the highest its records name + 1,
+    /// `lease_transitions`), at least 1, and answered in `took`. Nothing is
+    /// recorded yet: [`Store::record_shard_take`] records it once every
+    /// writer group raised it (review c5a M4). Refused
+    /// [`StoreError::ShardFenced`] where `lease_transitions` is below the
+    /// highest a take of the shard was numbered with (M2). The control
+    /// writer's (group 0's): its database holds the epoch takes are
+    /// numbered by.
     fn take_shard(
         &self,
         took: meridian_domain::v1::ShardTookOver,
@@ -879,15 +882,41 @@ pub trait Store: Send + Sync {
         ))
     }
 
+    /// A take every writer group raised, recorded as its `ShardTookOver` in
+    /// the `control` partition (decisions/031): the control writer's.
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        let _ = took;
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: the lake's control writer does".into(),
+        ))
+    }
+
     /// A plugin shard's epoch raised to `epoch` where this group's
     /// database holds it lower -- a take its control writer asked it to
     /// raise -- and the epoch held after (step 3d, checkpoint 5, item 32).
-    /// In every database the group writes.
-    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
-        let _ = (instance, shard, epoch);
+    /// In every database the group writes. `admit_through` is the
+    /// write-ahead stream's last sequence as the raise found it (0 with no
+    /// stream): a write the stream held at or below it is admitted whatever
+    /// its epoch (review c5a H2).
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit_through: u64,
+    ) -> Result<u64> {
+        let _ = (instance, shard, epoch, admit_through);
         Err(StoreError::Unavailable(
             "this store keeps no shard epochs: a writer does".into(),
         ))
+    }
+
+    /// Every plugin shard's epoch raised, in every database this member
+    /// writes, to the highest its `ShardTookOver` records name: as a member
+    /// starts, so a database that lost a raise, or joined later, holds it
+    /// before it serves (review c5a H1, L1). Answers how many were raised.
+    fn reseat_shards(&self) -> Result<usize> {
+        Ok(0)
     }
 
     /// A dataset gap's next state, its own record (W10.14; decisions/031),

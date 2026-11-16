@@ -285,7 +285,14 @@ pub struct Bus {
     /// Unset, as for every core component and every one-pod instance's
     /// sidecar: shard and epoch 0, which no fence checks.
     shard: Arc<std::sync::OnceLock<(u32, u64)>>,
+
+    /// What this bus may send now, asked before every publish and call
+    /// ([`Bus::gate_sends`]); unset, everything.
+    gate: Arc<std::sync::OnceLock<SendGate>>,
 }
+
+/// A bus's own gate on what it sends: `Err(why)` holds a topic back.
+pub type SendGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// A member's hand-off of writes to their owners.
 #[derive(Clone)]
@@ -400,6 +407,7 @@ impl Bus {
             routing: Arc::default(),
             handing: Arc::default(),
             shard: Arc::default(),
+            gate: Arc::default(),
         }
     }
 
@@ -412,6 +420,26 @@ impl Bus {
         self.shard
             .set((shard, epoch))
             .map_err(|_| "this bus already stamps a shard".to_string())
+    }
+
+    /// Hold back what `gate` refuses, from here on: every publish and call
+    /// asks it first (review c5a M1: a data shard's sidecar past its Lease's
+    /// renew deadline sends its lake record writes alone). Set once.
+    pub fn gate_sends(&self, gate: SendGate) -> Result<(), String> {
+        self.gate
+            .set(gate)
+            .map_err(|_| "this bus already gates its sends".to_string())
+    }
+
+    /// Whether this bus may send on `topic` now.
+    fn may_send(&self, topic: &str) -> crate::Result<()> {
+        match self.gate.get() {
+            Some(gate) => gate(topic).map_err(|why| BusError::NotSent {
+                topic: topic.to_string(),
+                why,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The shard and epoch this bus stamps; none where it stamps none.
@@ -496,6 +524,7 @@ impl Bus {
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
     ) -> crate::Result<String> {
+        self.may_send(topic)?;
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
             meta: Some(self.meta(
@@ -983,6 +1012,7 @@ impl Bus {
         timeout: Option<Duration>,
         stamp: &Stamp,
     ) -> crate::Result<(String, Vec<u8>)> {
+        self.may_send(topic)?;
         let handler = self
             .handlers
             .read()
@@ -1296,6 +1326,62 @@ mod tests {
         assert_eq!(super::calls_by_topic(&[]), "");
     }
 
+    /// Review c5a M1: a bus's own gate holds back what it refuses, a
+    /// publish and a call alike, before anything is sent; the rest go.
+    #[tokio::test]
+    async fn a_gated_bus_sends_nothing_its_gate_holds_back() {
+        let bus = bus();
+        bus.serve("platform.lake.command.record-prices", |_| {
+            Ok(("R".into(), vec![]))
+        });
+        bus.serve("platform.lake.command.renew-wants", |_| {
+            Ok(("R".into(), vec![]))
+        });
+        let mut heard = bus.subscribe_every("platform.lake.event.**");
+        bus.gate_sends(Arc::new(|topic: &str| {
+            if topic.contains("record-") {
+                Ok(())
+            } else {
+                Err("held".into())
+            }
+        }))
+        .unwrap();
+        assert!(bus
+            .call(
+                "platform.lake.command.record-prices",
+                "t",
+                vec![],
+                None,
+                None
+            )
+            .await
+            .is_ok());
+        let held = bus
+            .call("platform.lake.command.renew-wants", "t", vec![], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&held, BusError::NotSent { why, .. } if why == "held"),
+            "{held}"
+        );
+        let held = bus
+            .publish(
+                "platform.lake.event.want-withdrawn",
+                "t",
+                vec![],
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(held, BusError::NotSent { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), heard.recv())
+                .await
+                .is_err(),
+            "a message held back was heard"
+        );
+    }
+
     #[tokio::test]
     async fn the_time_stamped_is_the_clocks_it_was_given() {
         let clock = Arc::new(ManualClock::at(NOW));
@@ -1577,6 +1663,7 @@ mod tests {
             routing: Arc::default(),
             handing: Arc::default(),
             shard: Arc::default(),
+            gate: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

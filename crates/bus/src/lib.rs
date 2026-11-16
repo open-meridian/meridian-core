@@ -41,8 +41,8 @@ pub use memory::MemoryBackend;
 pub use nats::{header_words, servers_asked, NatsBackend, INTERNAL_TLS_CA};
 pub use router::{caller_of, CANCELLED_QUERY};
 pub use router::{
-    calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, Stamp,
-    TimedCall,
+    calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, SendGate,
+    Stamp, TimedCall,
 };
 
 /// Envelope and metadata, re-exported so consumers need not depend on the

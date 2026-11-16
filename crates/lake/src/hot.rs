@@ -809,8 +809,23 @@ impl Store for HotStore {
         self.inner.take_shard(took, lease_transitions)
     }
 
-    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
-        self.inner.raise_shard(instance, shard, epoch)
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        self.inner.record_shard_take(took)
+    }
+
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit_through: u64,
+    ) -> Result<u64> {
+        self.inner
+            .raise_shard(instance, shard, epoch, admit_through)
+    }
+
+    fn reseat_shards(&self) -> Result<usize> {
+        self.inner.reseat_shards()
     }
 
     /// The record's: the layer holds no view of the ranges' owners. Left to
