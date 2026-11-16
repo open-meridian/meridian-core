@@ -445,8 +445,12 @@ spec:
           # reconfigure run: a third server outside the metadata group while
           # the switch to ha said every member ready, and the lake's
           # write-ahead stream, kept on three, could not be placed for six
-          # minutes. A server that does not come right within its start's
-          # bound is started again, and joins afresh. The set starts its
+          # minutes. NATS's /healthz says only that a server is current with
+          # its leader, so its place in the group is read from the group as
+          # the server holds it (/raftz): in CI 43539633884 all three said
+          # ok with one outside. A server that does not
+          # come right within its start's bound is started again, and joins
+          # afresh. The set starts its
           # servers in parallel and each name resolves before it is ready,
           # so no server waits on another's readiness to start.
           startupProbe:

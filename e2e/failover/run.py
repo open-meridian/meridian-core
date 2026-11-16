@@ -791,7 +791,21 @@ def first_run(s):
     wait_for("the first-run Job to finish", lambda: json.loads(out(
         "get", "job", job["metadata"]["name"], "-o", "json"))["status"].get("succeeded"), seconds=180)
     kubectl("delete", "rolebinding", env["MERIDIAN_FIRST_RUN_BINDING"], "--ignore-not-found")
-    wait_for("every component ready", all_ready, seconds=900)
+    if not happens(all_ready, 900):
+        # Why, in the job's own log (CI 43955282180: the lake's write-ahead
+        # stream could not be placed for fifteen minutes, and nothing said
+        # what JetStream held): the deployments not available, and each
+        # broker server's JetStream as it sees itself.
+        deployments = json.loads(out("get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}",
+                                     "-o", "json", check=False) or "{}").get("items", [])
+        unready = [f"{d['metadata']['name']} {d.get('status', {}).get('availableReplicas', 0)}/"
+                   f"{d.get('spec', {}).get('replicas')}" for d in deployments
+                   if d.get("status", {}).get("availableReplicas", 0) != d.get("spec", {}).get("replicas")]
+        print(f"A: not available after 900s: {', '.join(unready) or 'none'}", flush=True)
+        for line in broker_jetstream_said():
+            print(f"A: {line}", flush=True)
+        cluster_said("the install never got every component ready")
+        raise SystemExit("every component ready never happened, in 900s")
     s.check(True, "first run applied; every component ready")
 
 
@@ -3164,7 +3178,7 @@ SAID_KEPT = []
 # a port-forward, which lands on the pod's own loopback.
 BROKER_MONITOR_PORT = 8222
 BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=true&config=true",
-               "/routez", "/varz")
+               "/raftz?group=_meta_", "/routez", "/varz")
 
 
 def broker_servers():
@@ -3187,6 +3201,57 @@ def broker_said():
             parts.append(f"== {server}, {path}")
             parts.append(said)
     return parts
+
+
+def broker_jetstream_said():
+    """Each broker server's JetStream as it sees itself, a few lines each,
+    for the job's log: its full health, its storage reserved against its
+    bound, its metadata group (the leader, the size, and the peers it
+    knows, itself among them or not: CI 43539633884 had a server outside
+    the group while every /healthz said ok), and each
+    stream with its replicas, its bound and where it is placed. Never
+    raises."""
+    paths = ("/healthz", "/jsz?accounts=true&streams=true&config=true", "/raftz?group=_meta_")
+    lines = []
+    try:
+        servers = broker_servers()
+    except (ValueError, SystemExit) as failed:
+        return [f"the broker's servers could not be listed: {failed}"]
+    for server in servers:
+        said = monitored(server, paths)
+        status, health = said[paths[0]]
+        lines.append(f"{server}: /healthz {status} {health.strip()[:160]}")
+        try:
+            jsz = json.loads(said[paths[1]][1])
+            config = jsz.get("config") or {}
+            meta = jsz.get("meta_cluster") or {}
+            lines.append(f"{server}:   storage reserved {jsz.get('reserved_storage')} of "
+                         f"{config.get('max_storage')}, used {jsz.get('storage')}; memory reserved "
+                         f"{jsz.get('reserved_memory')} of {config.get('max_memory')}; meta leader "
+                         f"{meta.get('leader')!r}, cluster_size {meta.get('cluster_size')}")
+            for account in jsz.get("account_details") or []:
+                for stream in account.get("stream_detail") or []:
+                    sc = stream.get("config") or {}
+                    cluster = stream.get("cluster") or {}
+                    lines.append(
+                        f"{server}:   stream {account.get('name')} > {stream.get('name')}: replicas "
+                        f"{sc.get('num_replicas')}, max_bytes {sc.get('max_bytes')}, leader "
+                        f"{cluster.get('leader')!r}, replicas at "
+                        f"{[r.get('name') for r in cluster.get('replicas') or []]}")
+        except (ValueError, AttributeError, TypeError) as failed:
+            lines.append(f"{server}:   /jsz unread: {failed}: {said[paths[1]][1][:160]}")
+        try:
+            groups = json.loads(said[paths[2]][1])
+            group = next(iter(groups.values()))["_meta_"]
+            known = sorted(p.get("name") for p in (group.get("peers") or {}).values() if p.get("known"))
+            # Its own peer is never listed; a member knows size - 1 others.
+            member = len(known) == (group.get("size") or 0) - 1
+            lines.append(f"{server}:   meta group as it sees it: {group.get('state')}, size "
+                         f"{group.get('size')}, leader {group.get('leader')!r}, knows {known}: "
+                         f"{'a member' if member else 'NOT a member'}")
+        except (ValueError, AttributeError, TypeError, KeyError, StopIteration) as failed:
+            lines.append(f"{server}:   /raftz unread: {failed}: {said[paths[2]][1][:160]}")
+    return lines
 
 
 def monitored(server, paths):

@@ -2415,7 +2415,10 @@ chart-check:
 	@# health check says so -- routes, and with JetStream its place in the
 	@# metadata group -- read on its loopback by its startup and readiness
 	@# probes, alone and as three; and each server's name resolves before it
-	@# is ready, so no server waits on another's readiness to start.
+	@# is ready, so no server waits on another's readiness to start. With
+	@# JetStream, ready also asks that the server is one of the metadata
+	@# group's peers by its own /raftz, which /healthz does not (CI
+	@# 43539633884, 43955282180); without, there is no group to ask.
 	@for profile in tolerant ha; do \
 		said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
 			--set resilience.profile=$$profile --show-only templates/broker.yaml 2>/dev/null)"; \
@@ -2427,6 +2430,10 @@ chart-check:
 			|| { echo "chart-check FAILED: a broker server's name does not resolve before it is ready ($$profile)" >&2; exit 1; }; \
 		echo "$$said" | grep -q '^  podManagementPolicy: Parallel$$' \
 			|| { echo "chart-check FAILED: the broker's servers do not start in parallel ($$profile)" >&2; exit 1; }; \
+		members=$$(echo "$$said" | grep -c 'GET /raftz?group=_meta_ HTTP/1.0.*-eq [$$][(][(]size - 1[)][)]'); \
+		want=0; [ $$profile = ha ] && want=2; \
+		[ "$$members" -eq $$want ] \
+			|| { echo "chart-check FAILED: $$members of the broker's probes ask that the server is one of JetStream's metadata group's peers, not $$want ($$profile; CI 43539633884)" >&2; exit 1; }; \
 	done; true
 	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
 	@# a broker credential of its own, made by the bundled broker and read by

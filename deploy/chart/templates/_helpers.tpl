@@ -126,12 +126,25 @@ HA standbys serve no reads. Takes the chart.
 {{/*
 The broker's own full health check, as its probes run it (step 3d): NATS's
 /healthz on the pod's loopback, where its monitoring alone listens, which
-answers 200 only once the server is current -- with JetStream, in the
-metadata group and current with its leader. Bash's own TCP, as the image
-carries no HTTP client.
+answers 200 only once the server is current with its metadata leader. Bash's
+own TCP, as the image carries no HTTP client.
+
+With JetStream, also that the server is one of its metadata group's peers,
+by the group as the server itself holds it (/raftz): the leader's peer set,
+which never lists the server's own peer, so a member knows the size less
+one others. /healthz alone does not say it: CI 43539633884 had a server
+current with the leader, /healthz 200, that the leader had never added, so
+the group was two and no stream at three could be placed (and, by the same
+signature, CI 43955282180, for fifteen minutes).
+Not ready, its startup probe's bound starts it again, and it joins afresh.
+Takes the chart.
 */}}
 {{- define "meridian-runtime.brokerHealthz" -}}
-["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8222 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8222 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 -}}
+{{- " " -}} && exec 4<>/dev/tcp/127.0.0.1/8222 && printf 'GET /raftz?group=_meta_ HTTP/1.0\\r\\n\\r\\n' >&4 && group=$(cat <&4) && size=$(sed -nE 's/^ *.size.: *([0-9]+).*/\\1/p' <<<\"$group\" | head -1) && [ -n \"$size\" ] && [ $(grep -cE 'known.: *true' <<<\"$group\") -eq $((size - 1)) ]
+{{- end -}}
+"]
 {{- end -}}
 
 {{- define "meridian-runtime.jetstreamReplicas" -}}
