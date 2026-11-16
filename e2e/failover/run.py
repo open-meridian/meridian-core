@@ -206,7 +206,10 @@ SHARDS = 2
 # The stand-in: the runtime's image, saying whether the members' token is
 # in its container and when its sidecar first answers on loopback -- where
 # a plugin's Register is answered, and so when its run() may start.
-SHARD_STUB_NO_TOKEN = "stub: no lease token in the plugin's container"
+# (No apostrophe in either: each is echoed inside single quotes. The first
+# run's said "the plugin's container", and bash read the script as unended:
+# PR CI 43740296065.)
+SHARD_STUB_NO_TOKEN = "stub: no lease token in the plugin container"
 SHARD_STUB_ANSWERED = "stub: the sidecar answers"
 SHARD_STUB = (
     "test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && echo '" + SHARD_STUB_NO_TOKEN + "'; "

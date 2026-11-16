@@ -3261,13 +3261,15 @@ async fn the_launch_sheet_sends_shards_and_standby_and_shows_a_shards_refusal_at
     held.access_groups[0].entries[0].level = AccessLevel::Admin as i32;
     held.permissions.extend(records(&[INSTANCE]).permissions);
     h.app.records.store(held, h.app.clock.now_ns());
-    // The version declaring shards is a data plugin's: nothing splits
-    // another role's work among shards (ruled 2026-11-15).
+    // Shards are offered wherever the version declares them, whatever its
+    // role, as the browser's run holds the sheet to (PR CI 43740296065,
+    // settings-page): which roles may be sharded is the conductor's to
+    // refuse, naming shards, shown at the field.
     let version = |v: &str, most_shards: u32| meridian_domain::v1::PluginVersion {
         metadata: Some(meridian_domain::v1::PluginMetadata {
             name: "snaptrade".into(),
             version: v.into(),
-            roles: vec![if most_shards > 1 { "data" } else { "custody" }.into()],
+            roles: vec!["custody".into()],
             declaration: Some(meridian_pb::v1::PluginDeclaration {
                 most_shards,
                 ..Default::default()

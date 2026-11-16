@@ -702,10 +702,10 @@ pub(super) async fn launch_sheet(
     }
 }
 
-/// The Launch sheet's Pods (contract v30, W8.3): Shards only for a data
-/// plugin whose version declares more than one -- nothing splits another
-/// role's work among shards (ruled 2026-11-15) -- at most its most_shards,
-/// beside a standby pod for any, on one line under the Limits. Neither is
+/// The Launch sheet's Pods (contract v30, W8.3): Shards only where the
+/// version declares more than one, at most its most_shards, beside a
+/// standby pod for any, on one line under the Limits. Which roles may be
+/// sharded is the conductor's to refuse, naming shards. Neither is
 /// offered where the deployment renders no lease right for several pods
 /// of an instance (no store runs a standby): what cannot be launched is
 /// not asked for. A refusal naming shards or the standby pod is shown
@@ -713,7 +713,6 @@ pub(super) async fn launch_sheet(
 /// nothing is offered (a launch not sent from this sheet).
 fn pods_group(
     most: u32,
-    roles: &[String],
     lease_right: Option<bool>,
     entered: &Entered,
     refused_shards: Option<&str>,
@@ -734,7 +733,7 @@ fn pods_group(
             group(refused)
         };
     }
-    let (hint, shards) = if most > 1 && roles == ["data"] {
+    let (hint, shards) = if most > 1 {
         (
             if refused_shards.is_some() {
                 String::new()
@@ -808,7 +807,6 @@ fn draw_launch_sheet(
     });
     let pods = pods_group(
         most_shards(version),
-        &roles,
         super::lease_right(),
         entered,
         refused_shards,
@@ -1143,35 +1141,32 @@ pub fn pulled_said(listing: &ListedVersion) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Ruled 2026-11-15 (the review of 95d68904, S4; finding 3): the Launch
-    /// sheet offers shards only to a data plugin whose version declares
-    /// more than one, and neither shards nor a standby pod where the
-    /// deployment renders no lease right for them. A refusal naming either
-    /// is still shown.
+    /// Ruled 2026-11-15 (the review of 95d68904, S4; item 34): the Launch
+    /// sheet offers shards where the version declares more than one, and
+    /// neither shards nor a standby pod where the deployment renders no
+    /// lease right for them. A refusal naming either is still shown.
     #[test]
-    fn the_sheet_offers_pods_only_where_the_deployment_and_the_role_can_run_them() {
+    fn the_sheet_offers_pods_only_where_the_deployment_can_run_them() {
         let entered = Entered::default();
-        let data = ["data".to_string()];
-        let custody = ["custody".to_string()];
-        // A data plugin of four shards, the lease right rendered or unsaid.
+        // A version of four shards, the lease right rendered or unsaid.
         for lease_right in [Some(true), None] {
-            let drawn = pods_group(4, &data, lease_right, &entered, None);
+            let drawn = pods_group(4, lease_right, &entered, None);
             assert!(
                 drawn.contains("name=\"shards\" min=\"1\" max=\"4\""),
                 "{drawn}"
             );
             assert!(drawn.contains("name=\"standby\""), "{drawn}");
         }
-        // Another role: a standby pod, never shards, whatever it declares.
-        let drawn = pods_group(4, &custody, Some(true), &entered, None);
+        // One declaring none: a standby pod, no Shards.
+        let drawn = pods_group(0, Some(true), &entered, None);
         assert!(!drawn.contains("name=\"shards\""), "{drawn}");
         assert!(drawn.contains("name=\"standby\""), "{drawn}");
-        // No lease right: neither is offered, for any role.
-        for roles in [&data[..], &custody[..]] {
-            assert_eq!(pods_group(4, roles, Some(false), &entered, None), "");
+        // No lease right: neither is offered.
+        for most in [0, 4] {
+            assert_eq!(pods_group(most, Some(false), &entered, None), "");
         }
         // A refusal is shown wherever it came from.
-        let drawn = pods_group(4, &data, Some(false), &entered, Some("standby was asked"));
+        let drawn = pods_group(4, Some(false), &entered, Some("standby was asked"));
         assert!(
             drawn.contains("role=\"alert\"") && drawn.contains("standby was asked"),
             "{drawn}"
