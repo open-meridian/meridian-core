@@ -340,6 +340,7 @@ impl PostgresStore {
     /// takeover raises only theirs.
     pub fn with_groups(mut self, groups: meridian_changes::groups::Groups) -> Self {
         self.groups = groups;
+        self.lead();
         self
     }
 
@@ -5316,14 +5317,11 @@ impl PostgresStore {
 /// about, and what this database's own control journal recorded, relayed
 /// into database 0's.
 impl PostgresStore {
-    /// Whether this store's writer group leads its database of `count`
-    /// (step 3d): the lowest group writing there, which follows that
-    /// database's timeline and raises every epoch in it, as group 0 does
-    /// database 0's.
+    /// The lake's count of databases (step 3d; section 6.4), and whether
+    /// this store's writer group leads this database (`lead`).
     pub fn with_databases(mut self, count: u32) -> Self {
-        self.leads_database =
-            meridian_changes::databases::leads(self.groups.mine(), count) && count > 1;
         self.databases = count.max(1);
+        self.lead();
         self
     }
 
@@ -5331,7 +5329,21 @@ impl PostgresStore {
     /// 6.4): its reads answer the ranges whose group writes it.
     pub fn in_database(mut self, d: u32) -> Self {
         self.database = d;
+        self.lead();
         self
+    }
+
+    /// Whether this store's writer group leads this database, past the
+    /// first: the lowest group writing there, its own home, which follows
+    /// its timeline and raises every epoch in it, as group 0 does database
+    /// 0's. Never another database it holds a range in ahead of home (CI
+    /// 43788516279: group 1's takeover in database 0 raised its control
+    /// head, and group 0's writer stepped down without its lease).
+    fn lead(&mut self) {
+        let mine = self.groups.mine();
+        self.leads_database = self.databases > 1
+            && meridian_changes::databases::leads(mine, self.databases)
+            && meridian_changes::databases::of_group(mine, self.databases) == self.database;
     }
 
     /// Every partition of `datasets` a read here answers (step 3d; section

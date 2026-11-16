@@ -6641,6 +6641,68 @@ fn an_aliased_key_restated_after_a_merge_is_routed_to_its_anchors_range() {
     assert_eq!(in_upper, 0, "nothing in the wrong range");
 }
 
+/// A group past the first leads only its own database (step 3d; section
+/// 6.4): its takeover in database 0, where a range of its own is still
+/// ahead of home, raises its own epoch there and never database 0's
+/// control head, which group 0's writer holds. CI 43788516279 (ha, a
+/// database added): group 1's new writer took over in database 1 and in
+/// database 0 behind it; database 0's control head went to 22, and group
+/// 0's writer, at 21, stepped down without its lease, which lapsed.
+#[test]
+fn t_a_later_groups_takeover_in_database_0_never_fences_group_0() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let stores = |group: u32| -> Vec<Arc<PostgresStore>> {
+        let groups = Groups::new(group, 2).unwrap();
+        urls.iter()
+            .enumerate()
+            .map(|(d, url)| {
+                Arc::new(
+                    PostgresStore::connect(url, 2)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_databases(2)
+                        .in_database(d as u32),
+                )
+            })
+            .collect()
+    };
+    let (zeros, ones) = (stores(0), stores(1));
+    let mine = zeros[0].adopt().unwrap();
+    ones[1].adopt().unwrap();
+    assert_eq!(
+        zeros[0].head_epoch().unwrap(),
+        mine,
+        "group 0's writer reads its own epoch"
+    );
+    // Group 1's takeover where it writes, then in database 0 behind it.
+    ones[1]
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    let theirs = ones[0]
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    assert!(
+        theirs > mine,
+        "group 1's takeover in database 0 raised its own epoch there"
+    );
+    assert_eq!(
+        zeros[0].head_epoch().unwrap(),
+        mine,
+        "database 0's control head is group 0's: another group's takeover there never raises it"
+    );
+    assert_eq!(
+        ones[0].head_epoch().unwrap(),
+        theirs,
+        "group 1 reads its own epoch in database 0"
+    );
+    assert_eq!(
+        ones[1].head_epoch().unwrap(),
+        ones[1].epoch(),
+        "and leads its own database"
+    );
+}
+
 /// A lake range moved to a writer group of another database under write
 /// load (step 3d; sections 6.4 and 6.8): the target's database first
 /// copies the range, its lineage's rows its anchors hold and its keys'
