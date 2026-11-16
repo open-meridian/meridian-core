@@ -1389,10 +1389,25 @@ def driver_kept_each(pod=None):
     of its primary). A partition moved home to database 1 has its
     projections let go in the first (CI 43788516279: the whole run read the
     first alone and counted P0's 1486 orders lost)."""
-    databases = {store: store_databases(store) for store in KEPT_KINDS}
-    return {kind: [home_keys(psql(sql, pod=pod if d == 0 and pod else database))
-                   for d, database in databases[store]]
+    databases = {store: [d for d, _ in store_databases(store)] for store in KEPT_KINDS}
+    return {kind: [home_keys(read_kept(store, d, sql, pod)) for d in databases[store]]
             for kind, (store, sql) in KEPT_SQL.items()}
+
+
+def read_kept(store, d, sql, pod=None):
+    """`sql` read in `store`'s database `d`, its primary found at each try
+    (`pod` in place of the first's): a primary shutting down for a planned
+    restart, or not answering yet as its standby takes over, is asked again
+    for up to a minute (CI 43799885541, ha: writer groups read database 0's
+    primary as an upgrade's raised connections restarted it)."""
+    for attempt in range(30):
+        target = pod if d == 0 and pod else (primary() if d == 0 else database_pod(store, d))
+        try:
+            return psql(sql, pod=target)
+        except SystemExit:
+            if attempt == 29:
+                raise
+            time.sleep(2)
 
 
 def home_keys(said):
