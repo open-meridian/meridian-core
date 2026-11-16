@@ -1362,13 +1362,88 @@ def driver_acked():
     return acked
 
 
-def driver_kept(pod=None):
-    """What the stores hold of it: the book's orders in the driver's
-    accounts, the lake's rows in its dataset."""
-    orders = psql("select order_id from book_order where account_id like 'ACC-DRIVE-%'", pod=pod)
-    placements = psql("select placement_id from book_placement where account_id like 'ACC-DRIVE-%'", pod=pod)
-    prices = psql("select row_key from lake_row where dataset = 'drive-data:drive'", pod=pod)
-    return {"order": set(orders.split()), "placement": set(placements.split()), "price": set(prices.split())}
+# What the stores hold of the driver, by kind: the store, and its read.
+KEPT_SQL = {
+    "order": ("book", "select order_id from book_order where account_id like 'ACC-DRIVE-%'"),
+    "placement": ("book", "select placement_id from book_placement where account_id like 'ACC-DRIVE-%'"),
+    "price": ("lake", "select row_key from lake_row where dataset = 'drive-data:drive'"),
+}
+KEPT_KINDS = {"book": ("order", "placement"), "lake": ("price",)}
+
+
+def driver_kept_each(pod=None):
+    """What each database of each store holds of the driver, by kind: a
+    set for each of the store's databases, the first first (`pod` in place
+    of its primary). A partition moved home to database 1 has its
+    projections let go in the first (CI 43788516279: the whole run read the
+    first alone and counted P0's 1486 orders lost)."""
+    databases = {store: store_databases(store) for store in KEPT_KINDS}
+    return {kind: [set(psql(sql, pod=pod if d == 0 and pod else database).split())
+                   for d, database in databases[store]]
+            for kind, (store, sql) in KEPT_SQL.items()}
+
+
+def driver_kept(pod=None, each=None):
+    """What the stores hold of it, in any of their databases: the book's
+    orders in the driver's accounts, the lake's rows in its dataset."""
+    each = each if each is not None else driver_kept_each(pod)
+    return {kind: set().union(*held) for kind, held in each.items()}
+
+
+def where_kept(ids, each):
+    """Where each of `ids` ((kind, id) pairs) is held: the indices of the
+    databases of its store that hold it, () for none."""
+    return {(kind, i): tuple(d for d, held in enumerate(each[kind]) if i in held) for kind, i in ids}
+
+
+def kept_by_database(acked, each):
+    """Per store, how many of the acknowledged writes each of its databases
+    holds, and how many none holds: counts only."""
+    said = {}
+    for store, kinds in KEPT_KINDS.items():
+        where = where_kept({(kind, i) for kind in kinds for i in acked.get(kind, {})}, each)
+        databases = len(each[kinds[0]])
+        said[store] = {"each": [sum(1 for at in where.values() if d in at) for d in range(databases)],
+                       "none": sum(1 for at in where.values() if not at)}
+    return said
+
+
+def where_now():
+    """Where each write the driver has had acknowledged is held now, by
+    (kind, id): the indices of its store's databases that hold it."""
+    acked = driver_acked()
+    return where_kept({(kind, i) for kind in KEPT_SQL for i in acked.get(kind, {})}, driver_kept_each())
+
+
+def held_words(at):
+    return "none" if not at else ("database " if len(at) == 1 else "databases ") + ", ".join(map(str, at))
+
+
+def moved_and_kept(s, what, sampled):
+    """The writes acknowledged before a move home (`sampled`, where_now()
+    then), where they were and where they are now, by store: counts of each
+    shift. None held before is in none of the store's databases now, and
+    some are in database 1: the run shows writes moving, none vanishing (CI
+    43788516279 read the first database alone)."""
+    now = where_kept(set(sampled), driver_kept_each())
+    for store, kinds in KEPT_KINDS.items():
+        mine = [key for key in sampled if key[0] in kinds]
+        shifts = {}
+        for key in mine:
+            shift = (sampled[key], now[key])
+            shifts[shift] = shifts.get(shift, 0) + 1
+        gone = sorted(i for kind, i in mine if sampled[(kind, i)] and not now[(kind, i)])
+        moved = any(1 in now[key] for key in mine)
+        words = "; ".join(f"{held_words(was)} -> {held_words(is_)}: {n}"
+                          for (was, is_), n in sorted(shifts.items()))
+        s.check(not gone and moved, f"{what}: the {store}'s writes acknowledged before the move home are in "
+                f"database 1 or where they were, none in none ({words or 'none sampled'}"
+                f"{'; gone: ' + ', '.join(gone[:5]) if gone else ''})")
+
+
+def kept_words(store, counts):
+    return (f"{store}: " + ", ".join(f"database {d} {n}" for d, n in enumerate(counts["each"]))
+            + f", in none {counts['none']}")
 
 
 # What a class lost, kept as it is found, so a later class is not charged
@@ -1376,13 +1451,15 @@ def driver_kept(pod=None):
 DRIVER_LOST = {"order": set(), "placement": set(), "price": set()}
 
 
-def store_rpo(since_ms=0, pod=None):
+def store_rpo(since_ms=0, pod=None, each=None):
     """RPO through the stores: every acknowledged order and price looked
-    for in the book's and the lake's own rows (read after what was
-    acknowledged, so nothing acknowledged after is counted). Says the
-    acknowledgements since `since_ms`, and what is newly lost."""
+    for in the book's and the lake's own rows, in every database of each
+    (read after what was acknowledged, so nothing acknowledged after is
+    counted). Says the acknowledgements since `since_ms`, what is newly
+    lost (in none of them), and how many each database holds."""
     acked = driver_acked()
-    kept = driver_kept(pod)
+    each = each if each is not None else driver_kept_each(pod)
+    kept = driver_kept(each=each)
     said = {}
     for name, kinds in (("book", ("order", "placement")), ("lake", ("price",))):
         held = {}
@@ -1396,6 +1473,8 @@ def store_rpo(since_ms=0, pod=None):
         said[name] = {"acknowledged": sum(1 for at in held.values() if at >= since_ms),
                       "lost": sorted(lost), "lost_s": round(
                           (max(held[i] for i in lost) - min(held[i] for i in lost)) / 1000, 2) if lost else 0}
+    for store, counts in kept_by_database(acked, each).items():
+        said[store]["by_database"] = counts
     return said
 
 
@@ -1416,14 +1495,17 @@ def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
     write-ahead stream, contract v30 stage E)."""
     rpo = rpo or store_rpo()
     book, lake = rpo["book"], rpo["lake"]
+    # Lost is in none of the store's databases; each one's count said.
     s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
-            f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''})")
+            f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''}; "
+            f"{kept_words('held by', book['by_database'])})")
     if lake_may_lose:
         s.note(f"{after}: the lake lost {len(lake['lost'])} acknowledged row(s), within {lake['lost_s']}s "
-               "(its commits are local)")
+               f"(its commits are local; {kept_words('held by', lake['by_database'])})")
     else:
         s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
-                f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''})")
+                f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''}; "
+                f"{kept_words('held by', lake['by_database'])})")
     return rpo
 
 
@@ -2981,6 +3063,7 @@ def no_lease_lapsed(s, what, since_ns, groups=1):
     nothing of them. And read to have found something: with `groups`
     writer groups rolled, at least that many takeovers are there since, one
     for each group's writer replaced, over the store's databases together."""
+    any_lapsed = False
     for store in ("book", "lake"):
         lapsed, took = [], 0
         for d, pod in store_databases(store):
@@ -2988,13 +3071,26 @@ def no_lease_lapsed(s, what, since_ns, groups=1):
                         f"from {store}_writer_took_over where at_ns >= {since_ns} and why like '%lapsed%'", pod=pod)
             if said:
                 lapsed.append(f"database {d}: {said}")
+                # Each takeover's time from the rollout's start, kept with
+                # the figures: when each lapse ended (c30d-t4, item 3).
+                every = psql(f"select coalesce(string_agg(epoch || ' ' || member || ' ' || "
+                             f"round((at_ns - {since_ns}) / 1e9, 1) || ' ' || why, '; ' order by epoch), '') "
+                             f"from {store}_writer_took_over where at_ns >= {since_ns}", pod=pod)
+                figure(f"{what}: the {store}'s takeovers in database {d}, each at seconds from the rollout's start",
+                       took_over=every)
             took += int(psql(f"select count(*) from {store}_writer_took_over where at_ns >= {since_ns}",
                              pod=pod) or 0)
         s.check(not lapsed, f"{what}: the {store}'s writers' leases were released, none left to lapse "
                 f"({took} takeover(s) since, over {len(store_databases(store))} database(s)"
                 f"{': ' + '; '.join(lapsed) if lapsed else ''})")
+        any_lapsed = any_lapsed or bool(lapsed)
         s.check(took >= groups, f"{what}: the {store}'s takeovers since were read: {took} recorded over its "
                 f"database(s), at least one for each of its {groups} writer group(s) rolled")
+    if any_lapsed:
+        # The members that stepped down were replaced by this rollout, and the
+        # next replaces their replacements: what they said, kept now
+        # (CI 43788516279 kept nothing of "ha groups raised"'s lapses).
+        cluster_said(f"{what}: a lease lapsed")
 
 
 # A partition's head a move between databases let go, in the database it
@@ -3094,31 +3190,42 @@ def group_counts(s):
                     f"lake.scrub.intervalDays={SCRUB_DAYS}", f"bor.scrub.intervalDays={SCRUB_DAYS}")
     # Lowered: the second group's members stop for good, its writer serving
     # on until the first group's serves at the new count.
-    since_ns = time.time_ns()
     if not groups_upgraded(s, "groups lowered: lake.writerGroups and bor.writerGroups set back to 1", 1, True,
                            "lake.writerGroups=1", "bor.writerGroups=1"):
         return
-    # What group 1 wrote is the one group's again: the driver's dataset and
-    # its accounts' partition named no group past the first, and written
-    # since the lowered count settled.
+    # What group 1 wrote is the one group's again: written since the lowered
+    # count settled, by the one group left (group 1's members are gone:
+    # group_members_ready). A partition's head still names group 1 -- no
+    # code renames it, and a name past the count is the rendezvous owner's,
+    # group 0 at one group (meridian_changes::groups, `assigned`); raised
+    # again, the count gives it back -- so the check reads the writes into
+    # what group 1 held, never the name (CI 43788516279: "the highest group
+    # named: lake 1, book 1", 300 s, with 596 rows and 2844 entries since).
     settled_ns = time.time_ns()
 
     def one_group_writes():
         said = psql(
-            "select (select coalesce(max(writer_group), 0) from lake_partition "
-            "where dataset = 'drive-data:drive' and closed_at is null), "
-            "(select coalesce(max(writer_group), 0) from book_partition_head where partition <> 'control'), "
+            "select (select count(*) from lake_partition where dataset = 'drive-data:drive' "
+            "and closed_at is null and writer_group >= 1), "
             "(select count(*) from lake_row where dataset = 'drive-data:drive' "
             f"and recorded_at_ns >= {settled_ns}), "
+            "(select count(*) from book_partition_head where partition <> 'control' and writer_group >= 1), "
+            "(select count(*) from book_entry e join book_partition_head h on h.partition = e.partition "
+            f"where h.writer_group >= 1 and e.committed_at_ns >= {settled_ns}), "
             "(select count(*) from book_entry where account_id like 'ACC-DRIVE-%' "
             f"and committed_at_ns >= {settled_ns})")
-        return [int(n) for n in said.split("|")] if said else [-1, -1, 0, 0]
+        return [int(n) for n in said.split("|")] if said else [0, 0, 0, 0, 0]
 
-    happens(lambda: one_group_writes()[:2] == [0, 0] and all(n > 0 for n in one_group_writes()[2:]), 300, every=5)
-    lake_group, book_group, prices, entries = one_group_writes()
-    s.check(lake_group == 0 and book_group == 0,
-            f"groups lowered: the driver's dataset and the book's partitions are the one group's again "
-            f"(the highest group named: lake {lake_group}, book {book_group})")
+    def written():
+        lake_named, prices, book_named, into_named, entries = one_group_writes()
+        return (lake_named == 0 or prices > 0) and (book_named == 0 or into_named > 0) and prices > 0 and entries > 0
+
+    happens(written, 300, every=5)
+    lake_named, prices, book_named, into_named, entries = one_group_writes()
+    s.check((lake_named == 0 or prices > 0) and (book_named == 0 or into_named > 0),
+            "groups lowered: what group 1 held is written by the one group left "
+            f"(the driver's dataset: {lake_named} range(s) named group 1, {prices} rows since; "
+            f"the book: {book_named} partition(s) named group 1, {into_named} entries since)")
     s.check(prices > 0 and entries > 0, "groups lowered: the driver's prices and orders committed by the one group "
             f"left ({prices} rows, {entries} entries since)")
 
@@ -3135,6 +3242,9 @@ def two_groups_two_databases(s):
         return
     no_lease_lapsed(s, "ha groups raised", since_ns)
     since_ns = time.time_ns()
+    # Where each acknowledged write is before the databases are added, so
+    # before any move home: the first database (moved_and_kept, below).
+    sampled = where_now()
     if not groups_upgraded(s, "ha databases added: a database added to each store in ha", 2, False,
                            "lake.databases=2", "bor.databases=2"):
         return
@@ -3157,6 +3267,7 @@ def two_groups_two_databases(s):
             f"count's change ({away_from_home('lake')} still in the first)")
     s.check(acks_again(int(time.time() * 1000), seconds=300),
             "ha databases added: the write driver acknowledged again once the partitions were home")
+    moved_and_kept(s, "ha databases added", sampled)
 
 
 # ── reconfigure's archive and its last act: a restore to a time in ha ─────
