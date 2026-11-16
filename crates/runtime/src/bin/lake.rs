@@ -259,11 +259,42 @@ fn run() -> Result<(), String> {
                 &instance_id,
                 revision.clone(),
                 move |member, revision, started, now| {
-                    home.member_seen(member, revision, started, now)
-                        .map_err(|failed| failed.to_string())
+                    // With what it serves as, in the one statement (stage
+                    // T; approved 2026-11-15; the review's finding 9): its
+                    // group, and its mode once it serves.
+                    home.member_says(
+                        member,
+                        revision,
+                        started,
+                        now,
+                        groups.mine(),
+                        &meridian_runtime::member::serving_mode(),
+                    )
+                    .map_err(|failed| failed.to_string())
                 },
             );
         }
+        // Told to stop, a writer of a group past the first serves on until
+        // another group's writer serves (stage T; approved 2026-11-15): the
+        // look it waits on, at the store's members in database 0.
+        // No clock is compared with another pod's (the review's findings
+        // 9 and 10): it watches for a writer said again between its own
+        // looks that it did not find at its first. Where no lease fences
+        // its group, its own group's replacement serving is leave to stop
+        // too (finding 3).
+        let another_serves = {
+            let home = Arc::clone(&every_database[0]);
+            let me = meridian_runtime::member::seen_as(&instance_id);
+            let watch = std::sync::Mutex::new(meridian_changes::members::Watch::new(
+                groups.mine(),
+                &revision,
+                !member.leased(),
+            ));
+            move |_told_at_ns: i64, _now_ns: i64| {
+                let others = home.members_but(&me).map_err(|failed| failed.to_string())?;
+                Ok(watch.lock().expect("watch poisoned").serves(&others))
+            }
+        };
         // A reader member (contract v30, stage B): the lake's reads alone,
         // its hot layer kept by the writer's change log, never writing.
         if member.is_reader() {
@@ -337,7 +368,19 @@ fn run() -> Result<(), String> {
         // A standby waits here (step 3b): following the writer's change log,
         // serving nothing, until it takes the lease. With no lease -- the
         // tolerant default, one member -- it writes at once, as it always has.
-        let holding = member.wait_to_write(&bus).await?;
+        // Told to stop, heard from here on (stage T's review, finding 6):
+        // once this member holds its lease, a signal while it is still
+        // starting, or waiting on the broker to say it serves, is kept and
+        // answered by giving the lease up, never by ending where it stands.
+        let mut told = meridian_runtime::stopping();
+        let holding = tokio::select! {
+            holding = member.wait_to_write(&bus) => holding?,
+            // A standby told to stop holds nothing: it stops at once.
+            _ = told.wait_for(|told| *told) => {
+                tracing::info!("stopping");
+                return Ok(());
+            }
+        };
         // Each range's writer group (step 3d; `writer_group` ruled
         // 2026-11-14): the control partition's group names every one not
         // named yet, by its dataset's owner at the count now, so a later
@@ -575,9 +618,41 @@ fn run() -> Result<(), String> {
             started_at_ns = now_ns(),
             "the lake is serving"
         );
-        ready.serving();
-        shutdown().await;
+        if ready.serving_on_unless(&bus, &mut told).await {
+            let _ = told.wait_for(|told| *told).await;
+        }
         tracing::info!("stopping");
+        // No lease fences this writer's group (the tolerant default), and
+        // its replacement starts beside it while it serves on: it commits
+        // nothing more, from now (stage T's review, finding 3; ruled
+        // 2026-11-15). Every write it receives is handed on -- its own
+        // group's to its group, where its replacement answers once it
+        // serves -- its reads and its shared work are left to the members
+        // that serve them, and every commit of its own is refused. It only
+        // keeps the store's public write topics served meanwhile. With a
+        // lease nothing changes: no standby writes until it is given up.
+        if !holding.took_over()
+            && groups.mine() != 0
+            && groups.several()
+            && bus.stop_writing_here(meridian_bus::read_after::is_read)
+        {
+            for store in &every_database {
+                store.stop_committing();
+            }
+            tracing::info!(
+                writer_group = groups.mine(),
+                "told to stop with no lease: committing nothing more, every write handed on"
+            );
+        }
+        // A rollout keeps the store's public topics served (stage T).
+        meridian_runtime::member::serve_on_until_another_group_serves(
+            groups.mine(),
+            groups.count(),
+            true,
+            meridian_runtime::now_ns(),
+            another_serves,
+        )
+        .await;
         holding.release().await;
         Ok(())
     })

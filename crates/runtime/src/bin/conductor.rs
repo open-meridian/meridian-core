@@ -514,7 +514,7 @@ fn run() -> Result<(), String> {
             started_at_ns = now_ns(),
             "the conductor is connected"
         );
-        ready.serving();
+        ready.serving_on(&bus).await;
 
         shutdown().await;
         tracing::info!("stopping");

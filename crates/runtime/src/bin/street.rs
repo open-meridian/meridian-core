@@ -239,7 +239,7 @@ fn run() -> Result<(), String> {
             started_at_ns = now_ns(),
             "the street store is serving"
         );
-        ready.serving();
+        ready.serving_on(&bus).await;
         shutdown().await;
         tracing::info!("stopping");
         holding.release().await;

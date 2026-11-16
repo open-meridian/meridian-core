@@ -346,7 +346,7 @@ fn run() -> Result<(), String> {
                 }
             });
             tracing::info!(instance_id, "the launcher is serving");
-            ready.serving();
+            ready.serving_on(&bus).await;
             shutdown().await;
             tracing::info!("stopping");
             holding.release().await;

@@ -204,6 +204,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "part_refused",
         sql: include_str!("../migrations/0029_part_refused.sql"),
     },
+    // What each member serves as (step 3d, stage T; `writer_group` and
+    // `mode` approved 2026-11-15): what a writer told to stop waits on.
+    Migration {
+        version: 30,
+        name: "member_serves",
+        sql: include_str!("../migrations/0030_member_serves.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

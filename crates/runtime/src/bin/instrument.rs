@@ -283,7 +283,7 @@ fn run() -> Result<(), String> {
             "reference",
         );
 
-        let service = InstrumentService::new(bus, Arc::clone(&store), clock());
+        let service = InstrumentService::new(bus.clone(), Arc::clone(&store), clock());
 
         // Registered and subscribed before this returns, so nothing is
         // published into the gap between starting and listening.
@@ -297,7 +297,7 @@ fn run() -> Result<(), String> {
         });
 
         tracing::info!(instance_id, "the instrument store is serving");
-        ready.serving();
+        ready.serving_on(&bus).await;
 
         tokio::select! {
             _ = running => {

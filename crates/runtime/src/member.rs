@@ -35,7 +35,7 @@
 //! commits: the lease is liveness, the epoch the fence.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -157,10 +157,7 @@ pub fn keep_seen<F>(store: &'static str, instance_id: &str, revision: String, se
 where
     F: Fn(&str, &str, i64, i64) -> Result<(), String> + Send + Sync + 'static,
 {
-    let name = match member_name() {
-        name if name.is_empty() => instance_id.to_string(),
-        name => name,
-    };
+    let name = seen_as(instance_id);
     let started = now_ns();
     let (every, _) = seen_every_and_within();
     let seen = Arc::new(seen);
@@ -182,6 +179,176 @@ where
             tokio::time::sleep(every).await;
         }
     });
+}
+
+/// The name this member's row is kept under in its store's members
+/// ([`keep_seen`]): its pod's, or its instance's where it runs in none.
+pub fn seen_as(instance_id: &str) -> String {
+    match member_name() {
+        name if name.is_empty() => instance_id.to_string(),
+        name => name,
+    }
+}
+
+/// Whether this member serves, as its readiness file says it
+/// ([`crate::mark_ready`]).
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_serving(serving: bool) {
+    SERVING.store(serving, Ordering::SeqCst);
+}
+
+/// The mode this member serves in -- `writer`, `standby` or `reader` --
+/// and empty until it serves: what it says with its row in its store's
+/// members (step 3d, stage T; `mode` approved 2026-11-15). A writer that
+/// holds its lease and has not yet served its topics is not yet one another
+/// group's writer may stop for.
+pub fn serving_mode() -> String {
+    if SERVING.load(Ordering::SeqCst) {
+        said().mode()
+    } else {
+        String::new()
+    }
+}
+
+/// How long a writer of a group past the first serves on, told to stop,
+/// for another group's writer to serve (approved 2026-11-15): under the
+/// 30 s a pod is given to stop, with time left to give its lease up.
+pub const SERVES_ON_AT_MOST: Duration = Duration::from_secs(20);
+/// How often it looks meanwhile.
+const SERVES_ON_LOOKS_EVERY: Duration = Duration::from_millis(500);
+
+/// Why a member told to stop stopped serving when it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedOn {
+    /// It waits on nobody: the first group's, one group's only, or not a
+    /// writer.
+    AtOnce,
+    /// Another group's writer serves that will not stop with it.
+    AnotherServes,
+    /// None was seen within [`SERVES_ON_AT_MOST`].
+    Bound,
+}
+
+/// A writer told to stop keeps serving until another writer group's writer
+/// serves its store's public topics (step 3d, stage T; section 15; approved
+/// 2026-11-15, option A).
+///
+/// Every group's writer serves the store's public topics and hands a write
+/// on to its owner, and an upgrade rolls every group's members at once: all
+/// stopped in the same seconds, nothing served them. So the first group's
+/// writer stops at once, and a writer of group `mine` past it, of `count`,
+/// serves on -- its lease held, its handlers answering -- until `look`
+/// says another group's writer serves that will not stop with it: one
+/// started after this member was told, at `told_at_ns`, or running another
+/// revision. At most [`SERVES_ON_AT_MOST`]: a stop that is no rollout -- a
+/// drained node, a deleted pod -- finds none, and stops then, having served
+/// meanwhile. A look that fails is asked again.
+///
+/// `look(told_at_ns, now_ns)` reads the store's members; it blocks, and is
+/// run off the runtime's own threads.
+pub async fn serve_on_until_another_group_serves<F>(
+    mine: u32,
+    count: u32,
+    writer: bool,
+    told_at_ns: i64,
+    look: F,
+) -> ServedOn
+where
+    F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+{
+    serve_on_within(
+        mine,
+        count,
+        writer,
+        told_at_ns,
+        look,
+        SERVES_ON_AT_MOST,
+        SERVES_ON_LOOKS_EVERY,
+    )
+    .await
+}
+
+/// [`serve_on_until_another_group_serves`], for at most `at_most`, looking
+/// every `every`.
+///
+/// A look is given what is left of `at_most` and no longer (stage T's
+/// review, finding 1). It reads the store's database 0 through the store's
+/// pool, which waits up to its connection timeout -- 30 s -- while that
+/// database's primary is lost or switching: a look begun late in the bound
+/// came back long after it, the pod was killed at its 30 s before its
+/// lease was given up, and the standby recorded a lapse. A look still out
+/// at the bound is left behind, and the member stops on time.
+async fn serve_on_within<F>(
+    mine: u32,
+    count: u32,
+    writer: bool,
+    told_at_ns: i64,
+    look: F,
+    at_most: Duration,
+    every: Duration,
+) -> ServedOn
+where
+    F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+{
+    if mine == 0 || count < 2 || !writer {
+        return ServedOn::AtOnce;
+    }
+    let look = Arc::new(look);
+    let until = tokio::time::Instant::now() + at_most;
+    let mut said_why = false;
+    tracing::info!(
+        writer_group = mine,
+        "told to stop: serving on until another writer group's writer serves"
+    );
+    loop {
+        let asked = Arc::clone(&look);
+        let now = now_ns();
+        let looked = tokio::time::timeout_at(
+            until,
+            tokio::task::spawn_blocking(move || asked(told_at_ns, now)),
+        )
+        .await;
+        match looked {
+            Ok(Ok(Ok(true))) => {
+                tracing::info!(
+                    writer_group = mine,
+                    "another writer group's writer serves: stopping"
+                );
+                return ServedOn::AnotherServes;
+            }
+            Ok(Ok(Ok(false))) => {}
+            Ok(Ok(Err(failed))) => {
+                if !said_why {
+                    tracing::warn!(%failed, "the store's members could not be read; looking again");
+                    said_why = true;
+                }
+            }
+            Ok(Err(failed)) => {
+                if !said_why {
+                    tracing::warn!(%failed, "the look at the store's members did not run; looking again");
+                    said_why = true;
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    writer_group = mine,
+                    seconds = at_most.as_secs(),
+                    "the store's members were not read within the bound: stopping"
+                );
+                return ServedOn::Bound;
+            }
+        }
+        if tokio::time::Instant::now() + every > until {
+            tracing::info!(
+                writer_group = mine,
+                seconds = at_most.as_secs(),
+                "no other writer group's writer was seen serving anew: stopping"
+            );
+            return ServedOn::Bound;
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// A member's settings, from what the chart sets.

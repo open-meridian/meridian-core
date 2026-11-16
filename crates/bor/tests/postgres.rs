@@ -7457,3 +7457,233 @@ async fn m12_a_write_held_between_two_databases_is_answered_before_its_callers_d
     write_once(&one.0, &accounts[0], 2).await.unwrap();
     blocking(move || drop((zero, one, mover)));
 }
+
+/// Step 3d, stage T (section 15; `writer_group` and `mode` approved
+/// 2026-11-15): which of the store's members a writer told to stop may stop
+/// for, read from the members' own rows look after look. Only another
+/// group's writer that serves, said again since the look before, and that
+/// will not stop with it: not there at its first look, or running another
+/// revision. Never the writer its own upgrade is about to stop too, a
+/// standby, a reader, its own group's, one holding its lease that does not
+/// serve yet, one no longer said, or a member of the release before, which
+/// says neither its group nor its mode. No time is compared with another
+/// member's clock (the review's finding 10): every member here stamps its
+/// rows by a clock of its own, hours apart.
+#[test]
+fn t_a_writer_told_to_stop_stops_only_for_another_groups_writer_serving_anew() {
+    use meridian_changes::members::Watch;
+    let store = isolated().1;
+    let revision = meridian_changes::members::revision("0.1.900", 1, 2, Some(4));
+    let other = meridian_changes::members::revision("0.1.901", 1, 2, Some(4));
+    let hour = 3_600_000_000_000_i64;
+    let mut tick = 0_i64;
+    // Each member says its row by its own clock: `skew` hours from the rest.
+    let mut says =
+        |member: &str, revision: &str, skew: i64, started: i64, group: u32, mode: &str| {
+            tick += 1;
+            store
+                .member_says(
+                    member,
+                    revision,
+                    skew * hour + started,
+                    skew * hour + 1_000 + tick,
+                    group,
+                    mode,
+                )
+                .unwrap();
+        };
+    let mut watch = Watch::new(1, &revision, false);
+    let look = |watch: &mut Watch| watch.serves(&store.members_but("one-old").unwrap());
+    // The first group's writer of before the upgrade, about to stop too,
+    // its clock five hours ahead: "started" long after any tell.
+    says("zero-old", &revision, 5, 1, 0, "writer");
+    says("one-old", &revision, 0, 1, 1, "writer");
+    // A member of the release before: neither group nor mode said.
+    store.member_seen("zero-older", &other, 1, 1_000).unwrap();
+    assert!(!look(&mut watch), "the first look notes who is there");
+    says("zero-old", &revision, 5, 1, 0, "writer");
+    store.member_seen("zero-older", &other, 1, 1_001).unwrap();
+    assert!(
+        !look(&mut watch),
+        "the writer about to stop too, and the release before's member"
+    );
+    // Its own group's new writer, a standby and a reader of the first group.
+    says("one-new", &revision, -3, 9, 1, "writer");
+    says("zero-standby", &revision, 0, 9, 0, "standby");
+    says("zero-reader", &revision, 0, 9, 0, "reader");
+    assert!(
+        !look(&mut watch),
+        "none is another group's writer serving anew"
+    );
+    // The first group's new member: its lease held, its topics not served.
+    says("zero-new", &revision, -7, 9, 0, "");
+    assert!(!look(&mut watch), "a writer that does not serve yet");
+    says("zero-new", &revision, -7, 9, 0, "writer");
+    assert!(
+        look(&mut watch),
+        "the first group's writer serves anew, its clock seven hours behind"
+    );
+    // Not said again: stopped, or cut off.
+    assert!(
+        !look(&mut watch),
+        "a writer not said again since the look before"
+    );
+    // Running another revision, there from the first look: the roll reached
+    // that group first.
+    let mut rolled = Watch::new(1, &revision, false);
+    says("zero-rolled", &other, 2, 1, 0, "writer");
+    assert!(!look(&mut rolled));
+    assert!(!look(&mut rolled), "not said again");
+    says("zero-rolled", &other, 2, 1, 0, "writer");
+    assert!(
+        look(&mut rolled),
+        "another group's writer at another revision, said again"
+    );
+    // Where no lease fences its group, its own group's new writer too.
+    let mut unleased = Watch::new(1, &revision, true);
+    assert!(!look(&mut unleased));
+    says("one-newer", &revision, 0, 20, 1, "writer");
+    assert!(look(&mut unleased), "its own group's replacement serves");
+}
+
+/// Stage T's review, finding 9: a member's row never says one process's
+/// start beside another's mode. Its container restarted under the same
+/// name, the new process says nothing of what it serves as until it
+/// serves; before, its row kept the old process's `writer` beside the new
+/// start, and a writer told to stop stopped for a member serving nothing.
+#[test]
+fn t_a_member_started_again_says_nothing_of_the_process_before() {
+    let store = isolated().1;
+    let revision = meridian_changes::members::revision("0.1.900", 1, 2, Some(4));
+    let mode = |member: &str| {
+        store
+            .members_but("nobody")
+            .unwrap()
+            .into_iter()
+            .find(|said| said.member == member)
+            .map(|said| (said.started_at_ns, said.mode))
+            .unwrap()
+    };
+    store
+        .member_says("zero", &revision, 10, 100, 0, "writer")
+        .unwrap();
+    // The same process, seen again: what it serves as is kept.
+    store.member_seen("zero", &revision, 10, 102).unwrap();
+    assert_eq!(mode("zero"), (10, "writer".to_string()));
+    // Another process under its name: nothing said of what it serves as.
+    store.member_seen("zero", &revision, 20, 104).unwrap();
+    assert_eq!(mode("zero"), (20, String::new()));
+    // And the one statement says both: never the old mode beside the new start.
+    store
+        .member_says("zero", &revision, 10, 105, 0, "writer")
+        .unwrap();
+    store
+        .member_says("zero", &revision, 30, 106, 0, "")
+        .unwrap();
+    assert_eq!(mode("zero"), (30, String::new()));
+}
+
+/// Stage T's review, finding 3 (ruled 2026-11-15): two writers of one
+/// group, the second started while the first serves on, told to stop. No
+/// lease fences the group -- the tolerant default -- so the second adopts
+/// the epoch the first writes under and neither is fenced: both committed,
+/// side by side. Told to stop, the first commits nothing more; only the
+/// second commits. No epoch is raised and no takeover recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_a_writer_told_to_stop_commits_nothing_beside_its_replacement() {
+    let (url, migrated) = blocking(isolated);
+    let (_broker, [(zero, zero_store), (first, first_store)], mover) =
+        blocking(|| two_members(&url));
+    let partition = (0..8)
+        .map(meridian_bor::store::partition_named)
+        .find(|p| meridian_changes::groups::owner(p, 2) == 1)
+        .unwrap();
+    let account = (0..)
+        .map(|n| unique(&format!("ACC-TSTOP-{n}")))
+        .find(|a| meridian_bor::store::placement_of(a, 8) == partition)
+        .unwrap();
+    blocking(|| first_store.place_first(&account, &account)).unwrap();
+    open(&first, &account, "INS-AAPL").await;
+    let read = {
+        let (url, account) = (url.clone(), account.clone());
+        move || {
+            let (url, account) = (url.clone(), account.clone());
+            blocking(move || {
+                let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+                let row = admin
+                    .query_one(
+                        "SELECT (SELECT count(*) FROM book_entry WHERE account_id = $1),
+                                (SELECT count(*) FROM book_writer_took_over),
+                                (SELECT epoch FROM book_writer_group WHERE writer_group = 1)",
+                        &[&account],
+                    )
+                    .unwrap();
+                (
+                    row.get::<_, i64>(0),
+                    row.get::<_, i64>(1),
+                    row.get::<_, i64>(2),
+                )
+            })
+        }
+    };
+    let (entries, took, epoch) = read();
+    let write = |bus: Arc<Bus>, n: u64| {
+        let account = account.clone();
+        async move {
+            let request = SetAccountAttributeRequest {
+                account_id: account,
+                attribute: Some(
+                    set_account_attribute_request::Attribute::WaitsForCompliance(
+                        n.is_multiple_of(2),
+                    ),
+                ),
+                reason: format!("write {n}"),
+            };
+            send(&bus, SET_ACCOUNT_ATTRIBUTE, &request, Some(PERSON)).await
+        }
+    };
+    write(first.clone(), 1)
+        .await
+        .expect("the first writes, until it is told to stop");
+    // Told to stop, it serves on; its replacement starts beside it, a
+    // member of the same group on a bus of its own.
+    first_store.stop_committing();
+    let (_second_broker, [_, (second, second_store)], second_mover) =
+        blocking(|| two_members(&url));
+    assert_eq!(
+        blocking({
+            let second_store = second_store.clone();
+            move || second_store.adopt()
+        })
+        .unwrap() as i64,
+        epoch,
+        "the same epoch: no lease, nobody fenced"
+    );
+    write(second.clone(), 2).await.expect("the second commits");
+    let refused = write(first.clone(), 3)
+        .await
+        .expect_err("the first commits nothing more");
+    assert!(refused.contains(meridian_changes::STOPPED), "{refused}");
+    write(second.clone(), 4)
+        .await
+        .expect("the second commits on");
+    assert!(write(first.clone(), 5).await.is_err());
+    assert_eq!(
+        read(),
+        (entries + 3, took, epoch),
+        "writes 1, 2 and 4: only the second committed once the first was told, no epoch raised, no takeover recorded"
+    );
+    blocking(move || {
+        drop((
+            migrated,
+            zero,
+            zero_store,
+            first,
+            first_store,
+            mover,
+            second,
+            second_store,
+            second_mover,
+        ))
+    });
+}

@@ -766,6 +766,48 @@ impl PostgresStore {
             .map_err(unavailable)
     }
 
+    /// This member seen, with what it serves as, in one statement (step
+    /// 3d, stage T; approved 2026-11-15; the review's finding 9): its
+    /// writer group, and its mode once it serves.
+    pub fn member_says(
+        &self,
+        member: &str,
+        revision: &str,
+        started_at_ns: i64,
+        now_ns: i64,
+        writer_group: u32,
+        mode: &str,
+    ) -> Result<()> {
+        meridian_changes::members::LAKE
+            .says(
+                &mut *self.conn()?,
+                member,
+                revision,
+                started_at_ns,
+                now_ns,
+                writer_group,
+                mode,
+            )
+            .map_err(unavailable)
+    }
+
+    /// Every other member's row, as each last said it: what a writer told
+    /// to stop watches ([`meridian_changes::members::Watch`]).
+    pub fn members_but(&self, member: &str) -> Result<Vec<meridian_changes::members::Said>> {
+        meridian_changes::members::LAKE
+            .others(&mut *self.conn()?, member)
+            .map_err(unavailable)
+    }
+
+    /// Commit nothing more through this store (step 3d, stage T's review,
+    /// finding 3): every commit from here is refused as a fenced one is.
+    /// What the lake's writer does, told to stop, where no lease fences
+    /// its group and it serves on beside its replacement
+    /// ([`meridian_changes::Fence::stop`]).
+    pub fn stop_committing(&self) {
+        self.fence.stop();
+    }
+
     /// The members seen within `within_ns` of `now_ns` running another
     /// revision than `revision`: none once the lake's rollout is complete.
     pub fn members_behind(

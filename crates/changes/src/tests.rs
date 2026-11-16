@@ -311,3 +311,18 @@ async fn a_stores_reads_are_held_to_read_after_by_its_change_logs_heads() {
         "answered by its own commit"
     );
 }
+
+/// Stage T's review, finding 3: a writer told to stop where no lease fences
+/// its group commits nothing more -- at its own epoch, which its
+/// replacement shares -- and is not told it was deposed, so it serves on.
+#[test]
+fn a_fence_stopped_admits_nothing_and_is_no_deposition() {
+    let fence = Fence::new();
+    fence.adopt(3);
+    assert!(fence.admits(3).is_ok());
+    fence.stop();
+    let refused = fence.admits(3).expect_err("stopped: nothing commits");
+    assert_eq!(refused.mine, Fenced::STOPPED);
+    assert!(refused.to_string().contains(STOPPED), "{refused}");
+    assert_eq!(fence.epoch(), 3, "its epoch as it was: nothing raised");
+}

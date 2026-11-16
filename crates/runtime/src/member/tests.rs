@@ -803,3 +803,148 @@ fn a_member_waiting_reports_itself_degraded_and_why() {
     assert_eq!(report.health, ComponentHealth::Serving as i32);
     assert!(report.detail.is_empty());
 }
+
+// ── A writer told to stop serves on until another group serves (stage T) ──
+
+/// A look that says another group's writer serves from `after` on, by the
+/// (paused) clock, counting how often it was asked.
+fn serves_after(
+    after: Duration,
+) -> (
+    impl Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+    Arc<AtomicU64>,
+) {
+    let began = tokio::time::Instant::now();
+    let asked = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&asked);
+    (
+        move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(began.elapsed() >= after)
+        },
+        asked,
+    )
+}
+
+/// The first group's writer, a store of one group, and a member that is no
+/// writer wait on nobody: told to stop, each stops at once, the store's
+/// members never read.
+#[tokio::test(start_paused = true)]
+async fn the_first_groups_writer_one_group_alone_and_no_writer_stop_at_once() {
+    for (mine, count, writer) in [(0, 2, true), (0, 1, true), (1, 2, false)] {
+        let (look, asked) = serves_after(Duration::from_secs(3600));
+        let began = tokio::time::Instant::now();
+        let stopped = serve_on_until_another_group_serves(mine, count, writer, 1, look).await;
+        assert_eq!(stopped, ServedOn::AtOnce, "group {mine} of {count}");
+        assert_eq!(began.elapsed(), Duration::ZERO, "group {mine} of {count}");
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "group {mine} of {count}");
+    }
+}
+
+/// Every group's members are rolled at once. A writer of group 1, told to
+/// stop, serves on while no other group's writer serves anew, and stops
+/// within a look of one serving: here the first group's writer is back
+/// after 7 s. Stopped at once, as before, nothing served the store's public
+/// topics for those seconds (PR CI 43636763392).
+#[tokio::test(start_paused = true)]
+async fn a_later_groups_writer_serves_on_until_another_groups_writer_serves() {
+    let (look, asked) = serves_after(Duration::from_secs(7));
+    let began = tokio::time::Instant::now();
+    let stopped = serve_on_until_another_group_serves(1, 2, true, 1, look).await;
+    assert_eq!(stopped, ServedOn::AnotherServes);
+    let served_on = began.elapsed();
+    assert!(
+        served_on >= Duration::from_secs(7) && served_on <= Duration::from_millis(7_500),
+        "it served on for {served_on:?}: until the other group's writer served, and a look more at most"
+    );
+    assert!(
+        asked.load(Ordering::SeqCst) >= 14,
+        "looked every half second"
+    );
+}
+
+/// A stop that is no rollout -- its node drained, its pod deleted -- sees no
+/// other group's writer serve anew: it serves on for the bound and stops,
+/// inside the 30 s its pod is given, with time left to give its lease up.
+#[tokio::test(start_paused = true)]
+async fn it_stops_at_the_bound_where_no_other_groups_writer_serves_anew() {
+    let (look, _) = serves_after(Duration::from_secs(3600));
+    let began = tokio::time::Instant::now();
+    let stopped = serve_on_until_another_group_serves(3, 4, true, 1, look).await;
+    assert_eq!(stopped, ServedOn::Bound);
+    let served_on = began.elapsed();
+    assert!(
+        served_on <= SERVES_ON_AT_MOST && served_on >= SERVES_ON_AT_MOST - Duration::from_secs(1),
+        "it served on for {served_on:?}, the bound {SERVES_ON_AT_MOST:?}"
+    );
+}
+
+/// The store's members unread -- its database 0 restarting with the same
+/// upgrade -- is no answer: asked again, never taken as leave to stop, and
+/// the time it was told passed to every look as it was.
+#[tokio::test(start_paused = true)]
+async fn a_look_that_fails_is_asked_again_and_is_no_leave_to_stop() {
+    let began = tokio::time::Instant::now();
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let heard = Arc::clone(&told);
+    let look = move |told_at_ns: i64, _now: i64| {
+        heard.lock().unwrap().push(told_at_ns);
+        if began.elapsed() < Duration::from_secs(4) {
+            Err("the database is starting up".to_string())
+        } else {
+            Ok(true)
+        }
+    };
+    let stopped = serve_on_until_another_group_serves(1, 2, true, 42, look).await;
+    assert_eq!(stopped, ServedOn::AnotherServes);
+    assert!(began.elapsed() >= Duration::from_secs(4));
+    let told = told.lock().unwrap();
+    assert!(told.len() >= 8 && told.iter().all(|at| *at == 42));
+}
+
+/// Stage T's review, finding 1: a look that does not come back -- the
+/// store's pool waiting on a database whose primary is switching -- is
+/// given what is left of the bound and no longer, so the member stops and
+/// gives its lease up inside the time its pod is given. Before, the bound
+/// was read only once the look returned.
+#[tokio::test]
+async fn a_look_that_does_not_come_back_never_holds_the_stop_past_the_bound() {
+    let (let_go, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    // Each look waits five seconds on a database that does not answer.
+    let look = move |_: i64, _: i64| {
+        let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        Ok(false)
+    };
+    let began = std::time::Instant::now();
+    let stopped = super::serve_on_within(
+        1,
+        2,
+        true,
+        1,
+        look,
+        Duration::from_millis(400),
+        Duration::from_millis(100),
+    )
+    .await;
+    let took = began.elapsed();
+    drop(let_go);
+    assert_eq!(stopped, ServedOn::Bound);
+    assert!(
+        took < Duration::from_millis(1_500),
+        "it stopped {took:?} after it was told, its bound 400 ms: a look still out is left behind"
+    );
+}
+
+/// What a member says it serves as: nothing until it serves, then its mode.
+/// A writer holding its lease whose topics are not yet served is not one
+/// another group's writer may stop for.
+#[test]
+fn a_member_says_its_mode_only_once_it_serves() {
+    said().set_mode(Mode::Writer);
+    set_serving(false);
+    assert_eq!(serving_mode(), "");
+    set_serving(true);
+    assert_eq!(serving_mode(), "writer");
+    set_serving(false);
+}

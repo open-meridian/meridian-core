@@ -535,13 +535,32 @@ pub fn now_ns() -> i64 {
 pub struct Fence {
     /// 0 until adopted.
     epoch: AtomicU64,
+    /// Told to stop, and committing nothing more ([`Fence::stop`]).
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl Fence {
     pub const fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Commit nothing more under this fence: every commit from here is
+    /// refused as a fenced one is, whatever the head's epoch (step 3d,
+    /// stage T's review, finding 3). What a writer with no lease does when
+    /// told to stop while it serves on: its replacement starts beside it
+    /// under the same epoch, which fences neither, so the one stopping
+    /// stops committing itself, at once and for good. No epoch is raised
+    /// and no takeover recorded; this process is not told it was deposed.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Fence::stop`] was called.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// The epoch adopted; 0 if none yet.
@@ -570,6 +589,12 @@ impl Fence {
     /// ([`fenced_seen`]), whose member steps down (step 3b).
     pub fn admits(&self, head_epoch: u64) -> Result<(), Fenced> {
         let mine = self.epoch();
+        if self.stopped() {
+            return Err(Fenced {
+                mine: Fenced::STOPPED,
+                head: head_epoch,
+            });
+        }
         if mine == head_epoch {
             Ok(())
         } else {
@@ -640,8 +665,23 @@ pub struct Fenced {
 /// The words a fenced commit is refused with, everywhere.
 pub const FENCED: &str = "fenced: this writer's epoch is no longer the partition's";
 
+/// The words a commit is refused with once its writer was told to stop.
+pub const STOPPED: &str = "this writer was told to stop and commits nothing more";
+
+impl Fenced {
+    /// `mine` where no epoch refused the commit: its writer was told to
+    /// stop, and commits nothing more ([`Fence::stop`]).
+    pub const STOPPED: u64 = u64::MAX;
+}
+
 impl std::fmt::Display for Fenced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.mine == Self::STOPPED {
+            return write!(
+                f,
+                "{STOPPED}; its group's writer that replaces it commits it: ask again"
+            );
+        }
         write!(
             f,
             "{FENCED} (this writer's {}, the partition's {}); another writer took it over, \

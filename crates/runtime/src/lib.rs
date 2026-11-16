@@ -536,7 +536,10 @@ impl Ready {
     /// Serving: said once everything this component needs is there and its
     /// handlers are registered.
     pub fn serving(&self) {
-        let Some(path) = &self.0 else { return };
+        let Some(path) = &self.0 else {
+            member::set_serving(true);
+            return;
+        };
         match std::fs::write(path, b"serving\n") {
             Ok(()) => {
                 tracing::debug!(path = %path.display(), "marked ready");
@@ -548,6 +551,48 @@ impl Ready {
                 %failed,
                 "this component serves and could not say so; its readiness probe will fail"
             ),
+        }
+    }
+}
+
+impl Ready {
+    /// [`Ready::serving`], said only once `bus` holds every handler this
+    /// component has served and every subscription it has made
+    /// ([`meridian_bus::Bus::subscribed`]; step 3d, stage T). A broker's
+    /// subscriptions are made after `serve` returns: said before the broker
+    /// held them, a pod was ready, its rollout stopped the member that did
+    /// serve, and its topics were served by nobody. A bus that cannot say
+    /// so yet is asked again every second, the pod not ready meanwhile.
+    pub async fn serving_on(&self, bus: &Bus) {
+        let mut waiting = false;
+        while let Err(failed) = bus.subscribed().await {
+            if !waiting {
+                tracing::warn!(
+                    %failed,
+                    "not ready yet: the bus does not hold this component's subscriptions"
+                );
+                waiting = true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        self.serving();
+    }
+
+    /// [`Ready::serving_on`], unless this process is told to stop first
+    /// (`told`, from [`stopping`]): false then, nothing said. A writer that
+    /// holds its lease waits here for as long as the broker does not hold
+    /// its subscriptions -- a broker rolling in the same upgrade -- and,
+    /// told to stop meanwhile, goes on to give its lease up rather than be
+    /// ended where it stands (stage T's review, finding 6).
+    pub async fn serving_on_unless(
+        &self,
+        bus: &Bus,
+        told: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            _ = told.wait_for(|told| *told) => false,
+            () = self.serving_on(bus) => true,
         }
     }
 }
@@ -567,6 +612,9 @@ impl Drop for Ready {
 /// unset. Beside it, `member.json` says the member's mode, lag and
 /// partitions, which `meridian status` reads in the pod (the probe shape).
 pub fn mark_ready(serving: bool) {
+    // Said in the process too, whether or not a file says it: what the
+    // member says of itself in its store's members (stage T).
+    member::set_serving(serving);
     let Some(path) = var("MERIDIAN_READY_FILE").map(std::path::PathBuf::from) else {
         return;
     };
@@ -1941,5 +1989,75 @@ mod tests {
         );
         assert_eq!(done, Err("the database URL is unreadable".into()));
         assert_eq!(tried.get(), 1);
+    }
+
+    /// A broker that never holds this component's subscriptions: it is
+    /// restarting, with the same upgrade.
+    struct NeverHeld(meridian_bus::MemoryBackend);
+
+    impl meridian_bus::Backend for NeverHeld {
+        fn publish(
+            &self,
+            topic: &str,
+            envelope: meridian_bus::Envelope,
+        ) -> Result<u64, meridian_bus::BusError> {
+            self.0.publish(topic, envelope)
+        }
+        fn subscribe(&self, pattern: &str) -> meridian_bus::Subscription {
+            self.0.subscribe(pattern)
+        }
+        fn subscribe_shared(&self, pattern: &str, group: &str) -> meridian_bus::Subscription {
+            self.0.subscribe_shared(pattern, group)
+        }
+        fn dropped(&self) -> u64 {
+            self.0.dropped()
+        }
+        fn subscribed(&self) -> meridian_bus::Settled<'_> {
+            Box::pin(async {
+                Err(meridian_bus::BusError::HandlerFailed {
+                    topic: "the broker".into(),
+                    detail: "it does not answer".into(),
+                })
+            })
+        }
+    }
+
+    /// Stage T's review, finding 6: a writer that holds its lease and is
+    /// still waiting on the broker to hold its subscriptions, told to stop,
+    /// stops waiting -- and goes on to give its lease up. Before, it
+    /// waited on the broker alone, and the signal ended it where it stood:
+    /// its lease lapsed, and the standby recorded a lapse.
+    #[tokio::test]
+    async fn a_member_told_to_stop_while_the_broker_holds_nothing_stops_waiting_to_serve() {
+        let bus = meridian_bus::Bus::single(
+            "bor-1",
+            std::sync::Arc::new(NeverHeld(meridian_bus::MemoryBackend::new())),
+            std::sync::Arc::new(meridian_clock::SystemClock),
+        );
+        let ready = super::Ready(None);
+        let (tell, mut told) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = tell.send(true);
+            tell.closed().await;
+        });
+        let serving = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            ready.serving_on_unless(&bus, &mut told),
+        )
+        .await;
+        assert_eq!(
+            serving,
+            Ok(false),
+            "told to stop, it stopped waiting on the broker, and never said it serves"
+        );
+        // And one never told serves once the broker holds its subscriptions.
+        let held = meridian_bus::Bus::single(
+            "bor-1",
+            std::sync::Arc::new(meridian_bus::MemoryBackend::new()),
+            std::sync::Arc::new(meridian_clock::SystemClock),
+        );
+        let (_quiet, mut never) = tokio::sync::watch::channel(false);
+        assert!(ready.serving_on_unless(&held, &mut never).await);
     }
 }
