@@ -213,7 +213,10 @@ def timelines_of(db):
     """One database's timelines in the archive: when each began, its
     history (each ancestor and where it left it), and its segments."""
     archive_id = archive_of.get(db)
-    listed = json.loads(pgbackrest("repo-ls", f"archive/meridian/{archive_id}", "--recurse",
+    # Its own stanza's archive, never the first database's (CI 43788516279:
+    # bor-database-1's restore listed meridian's timelines and fetched a
+    # history file its own archive never held).
+    listed = json.loads(pgbackrest("repo-ls", f"archive/{STANZA}/{archive_id}", "--recurse",
                                    "--output=json") or "{}") if archive_id else {}
     began, history, segments = {1: None}, {1: []}, {}
     for name, entry in listed.items():
