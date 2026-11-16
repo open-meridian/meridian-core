@@ -3382,6 +3382,105 @@ async fn capacity_book_hand_off() {
     }
 }
 
+/// What an open-loop run measured: each ask's time from when it was due, in
+/// the order asked, how many were in flight at the most, and how long the
+/// whole run took.
+struct OpenLoop {
+    took: Vec<std::time::Duration>,
+    most_in_flight: usize,
+    elapsed: std::time::Duration,
+}
+
+/// `count` asks at a fixed arrival rate, `per_second` (step 3d, stage T;
+/// the bench's open-loop mode, PO 2026-11-14): ask `n` is due at
+/// `n / per_second` from the start and is made then, whether or not the
+/// asks before it were answered, so the load offered never slows with the
+/// answers. Each ask's time counts from when it was due, never from when
+/// it was sent: a closed loop, which asks again only once answered, hides
+/// the wait of every ask it did not make meanwhile.
+async fn open_loop<F, W>(count: usize, per_second: f64, ask: F) -> OpenLoop
+where
+    F: Fn(usize) -> W,
+    W: std::future::Future<Output = ()> + Send + 'static,
+{
+    let started = tokio::time::Instant::now();
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut asked = Vec::with_capacity(count);
+    for n in 0..count {
+        let due = started + std::time::Duration::from_secs_f64(n as f64 / per_second);
+        tokio::time::sleep_until(due).await;
+        let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
+        most.fetch_max(
+            in_flight.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
+        let work = ask(n);
+        asked.push(tokio::spawn(async move {
+            work.await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            due.elapsed()
+        }));
+    }
+    let mut took = Vec::with_capacity(count);
+    for ask in asked {
+        took.push(ask.await.unwrap());
+    }
+    OpenLoop {
+        took,
+        most_in_flight: most.load(Ordering::SeqCst),
+        elapsed: started.elapsed(),
+    }
+}
+
+/// The open loop keeps its arrival rate whatever the answers take: 50 asks
+/// at 10 a second, each answered in a second, are all made within 4.9 s --
+/// ten in flight at once -- and done at 5.9 s, each taking its one second.
+/// And with one ask stuck for 30 s the ones after it are made on time and
+/// take their one second each: its wait is its own. Asked one at a time, as
+/// a closed loop asks, the 50 take 50 s and the stuck one delays every ask
+/// after it unseen.
+#[tokio::test(start_paused = true)]
+async fn an_open_loop_asks_at_its_rate_whatever_the_answers_take() {
+    let second = std::time::Duration::from_secs(1);
+    let ran = open_loop(50, 10.0, |_| tokio::time::sleep(second)).await;
+    assert_eq!(ran.took.len(), 50);
+    assert!(
+        ran.took.iter().all(|took| *took == second),
+        "each ask took its own second from when it was due: {:?}",
+        ran.took.iter().max()
+    );
+    assert_eq!(
+        ran.elapsed,
+        std::time::Duration::from_millis(5_900),
+        "the last was due at 4.9 s and took its second"
+    );
+    // The ask due as the first is answered may be made before or after it.
+    assert!(
+        (10..=11).contains(&ran.most_in_flight),
+        "a second's arrivals at once: {}",
+        ran.most_in_flight
+    );
+    // One ask stuck: nothing after it waits on it.
+    let ran = open_loop(50, 10.0, |n| {
+        tokio::time::sleep(if n == 5 { 30 * second } else { second })
+    })
+    .await;
+    assert_eq!(ran.took[5], 30 * second);
+    assert!(
+        ran.took
+            .iter()
+            .enumerate()
+            .all(|(n, took)| n == 5 || *took == second),
+        "the asks after the stuck one were made when due"
+    );
+    assert!(
+        (11..=12).contains(&ran.most_in_flight),
+        "a second's arrivals and the stuck one: {}",
+        ran.most_in_flight
+    );
+}
+
 /// The book across writer groups and partitions (step 3d, stage B; the
 /// brief's benches, figures private): `MERIDIAN_BENCH_PROPOSALS`
 /// proposals (100,000) at `MERIDIAN_BENCH_IN_FLIGHT` at once (64), through
@@ -3393,6 +3492,12 @@ async fn capacity_book_hand_off() {
 /// the conductor's accounts read answered by a stand-in. It prints each
 /// run's rate and latency (p50, p90, p99, the most), and the hand-offs'
 /// count, mean and most.
+///
+/// The open-loop mode (stage T; PO 2026-11-14): with `MERIDIAN_BENCH_RATE`
+/// set -- proposals a second, or several rates by commas -- each shape
+/// then takes `MERIDIAN_BENCH_PROPOSALS` proposals at each rate, each due
+/// at its own time whatever the answers take ([`open_loop`]), its latency
+/// from when it was due: a point of the latency/load curve a rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "the capacity bench: make bench"]
 async fn capacity_book_partitions() {
@@ -3408,6 +3513,17 @@ async fn capacity_book_partitions() {
         .unwrap();
     let at_once: usize = from_env("MERIDIAN_BENCH_IN_FLIGHT", "64").parse().unwrap();
     let light: usize = from_env("MERIDIAN_BENCH_LIGHT", "2000").parse().unwrap();
+    // The open loop's arrival rates, proposals a second: none, and the
+    // closed-loop runs alone, as before.
+    let rates: Vec<f64> = from_env("MERIDIAN_BENCH_RATE", "")
+        .split(',')
+        .filter(|rate| !rate.trim().is_empty())
+        .map(|rate| {
+            let rate: f64 = rate.trim().parse().expect("MERIDIAN_BENCH_RATE: a rate");
+            assert!(rate > 0.0, "MERIDIAN_BENCH_RATE: a rate above 0");
+            rate
+        })
+        .collect();
     let shapes: Vec<(u32, u32)> = from_env("MERIDIAN_BENCH_SHAPES", "1x1,2x2,2x4")
         .split(',')
         .map(|shape| {
@@ -3618,6 +3734,97 @@ async fn capacity_book_partitions() {
                 at(0.99).as_secs_f64() * 1e3,
                 took.last().unwrap().as_secs_f64() * 1e3,
                 most.as_secs_f64() * 1e3,
+                retried.load(Ordering::Relaxed),
+            );
+        }
+        // The open loop (stage T): at each rate, every proposal due at its
+        // own time, asked again after a refusal's retry-after as above,
+        // its latency from when it was due.
+        for rate in &rates {
+            let label = format!("open-{rate}");
+            let (count_before, total_before, _) = meridian_bus::owners::handed_on();
+            let retried = Arc::new(AtomicU64::new(0));
+            let timeouts = Arc::new(AtomicU64::new(0));
+            let ran = open_loop(proposals, *rate, |n| {
+                let (client, retried, timeouts) = (
+                    Arc::clone(&client),
+                    Arc::clone(&retried),
+                    Arc::clone(&timeouts),
+                );
+                let proposal = ProposeOrderRequest {
+                    account_id: accounts[n % accounts.len()].clone(),
+                    instrument_id: "INS-AAPL".into(),
+                    sleeve: "core".into(),
+                    side: Side::Buy as i32,
+                    quantity: d("10"),
+                    order_type: OrderType::Limit as i32,
+                    limit_price: usd("227.50"),
+                    time_in_force: TimeInForce::Day as i32,
+                    idempotency_key: format!("{run}-{label}-{n}"),
+                    ..Default::default()
+                };
+                async move {
+                    loop {
+                        match send_order(&client, PROPOSE_ORDER, &proposal, Some(PERSON), None)
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(refused) if refused.contains("timed out after") => {
+                                timeouts.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(refused) => {
+                                let detail = refused
+                                    .find('[')
+                                    .map_or(refused.as_str(), |at| &refused[at..]);
+                                let Some(wait) = meridian_bus::refusal_retry_after(detail) else {
+                                    panic!("proposal {n} refused: {refused}")
+                                };
+                                retried.fetch_add(1, Ordering::Relaxed);
+                                tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait)))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            let mut took = ran.took;
+            took.sort();
+            let at = |q: f64| took[((took.len() as f64 * q) as usize).min(took.len() - 1)];
+            let (count_after, total_after, _) = meridian_bus::owners::handed_on();
+            let handed = count_after - count_before;
+            let mean_ms = if handed > 0 {
+                (total_after - total_before).as_secs_f64() * 1e3 / handed as f64
+            } else {
+                0.0
+            };
+            figures.push(serde_json::json!({
+                "run": "open",
+                "groups": groups,
+                "partitions": partitions,
+                "proposals": proposals,
+                "offered_per_s": rate,
+                "rate_per_s": proposals as f64 / ran.elapsed.as_secs_f64(),
+                "most_in_flight": ran.most_in_flight,
+                "p50_ms": at(0.50).as_secs_f64() * 1e3,
+                "p90_ms": at(0.90).as_secs_f64() * 1e3,
+                "p99_ms": at(0.99).as_secs_f64() * 1e3,
+                "max_ms": took.last().unwrap().as_secs_f64() * 1e3,
+                "timeouts": timeouts.load(Ordering::Relaxed),
+                "asked_again": retried.load(Ordering::Relaxed),
+                "handed": handed,
+                "handed_mean_ms": mean_ms,
+            }));
+            println!(
+                "CAPACITY book partitions groups={groups} partitions={partitions} run=open \
+                 proposals={proposals} offered_per_s={rate} rate_per_s={:.0} most_in_flight={} \
+                 p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} most_ms={:.2} asked_again={}",
+                proposals as f64 / ran.elapsed.as_secs_f64(),
+                ran.most_in_flight,
+                at(0.50).as_secs_f64() * 1e3,
+                at(0.90).as_secs_f64() * 1e3,
+                at(0.99).as_secs_f64() * 1e3,
+                took.last().unwrap().as_secs_f64() * 1e3,
                 retried.load(Ordering::Relaxed),
             );
         }

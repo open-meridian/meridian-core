@@ -566,11 +566,19 @@ bench: network
 # It prints only `done <path>`: core is public, and so are its CI logs, so
 # no figure is ever printed. Never wired into CI (stage T's write-scale is
 # separate).
+#
+# The open-loop mode (stage T; PO 2026-11-14): BENCH_RATE, proposals a
+# second -- or several rates, by commas -- adds a run at each rate after the
+# two above: BENCH_PROPOSALS proposals, each due at its own time whatever
+# the answers take, its latency counted from when it was due. One rate is a
+# point of the shape's latency/load curve; BENCH_PROPOSALS over the rate is
+# how long it runs.
 BENCH_GROUPS ?= 1
 BENCH_PARTITIONS ?= 1
 BENCH_IN_FLIGHT ?= 64
 BENCH_PROPOSALS ?= 100000
 BENCH_LIGHT ?= 2000
+BENCH_RATE ?=
 BENCH_BROKER_URL ?= nats://127.0.0.1:4222
 bench-book:
 	@test -n "$(BENCH_DATABASE_URL)" \
@@ -582,6 +590,7 @@ bench-book:
 	MERIDIAN_BENCH_IN_FLIGHT="$(BENCH_IN_FLIGHT)" \
 	MERIDIAN_BENCH_PROPOSALS="$(BENCH_PROPOSALS)" \
 	MERIDIAN_BENCH_LIGHT="$(BENCH_LIGHT)" \
+	MERIDIAN_BENCH_RATE="$(BENCH_RATE)" \
 	MERIDIAN_BENCH_JSON="$(abspath $(BENCH_OUT))" \
 	MERIDIAN_BENCH_COMMIT="$$(git rev-parse HEAD 2>/dev/null)" \
 	MERIDIAN_BENCH_LOAD_BEFORE="$$(cat /proc/loadavg 2>/dev/null || uptime)" \
