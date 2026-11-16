@@ -603,6 +603,7 @@ fn run() -> Result<(), String> {
                 .map_err(|failed| format!("the write-ahead stream's broker: {failed}"))?;
             let bounds = write_ahead_bounds()?;
             let writing = Arc::clone(&lake);
+            let stepping = holding.stepping_down();
             meridian_runtime::background(async move {
                 if let Err(failed) =
                     meridian_lake::write_ahead::write_forever(writing, client, bounds, |why| {
@@ -613,7 +614,7 @@ fn run() -> Result<(), String> {
                     })
                     .await
                 {
-                    meridian_runtime::member::step_down("lake", &failed);
+                    stepping.now(&failed).await;
                 }
             });
         }

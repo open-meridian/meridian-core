@@ -979,6 +979,19 @@ impl Holding {
         });
     }
 
+    /// What a task of this writer's own steps down with, giving the lease
+    /// up first as the epoch's and the fence's step-downs do (ruled
+    /// 2026-11-16): a writer that ended where it stood left its standby
+    /// to wait out the lease (CI 43799885541, ha groups raised: the lake's
+    /// old writer, its write-ahead commit fenced by the added group's
+    /// takeover, ended holding its lease, which lapsed).
+    pub fn stepping_down(&self) -> SteppingDown {
+        SteppingDown {
+            elector: self.elector.clone(),
+            component: self.component,
+        }
+    }
+
     /// Give the lease up on a planned stop: the standby takes over at its
     /// next look rather than after the lease lapses.
     pub async fn release(&self) {
@@ -1029,6 +1042,23 @@ pub async fn let_go_stepping_down<L: Leases>(
             component,
             "stepping down: the lease was not given up within its bound; it lapses on its own"
         ),
+    }
+}
+
+/// A writer's step-down for a task of its own ([`Holding::stepping_down`]).
+pub struct SteppingDown {
+    elector: Option<Arc<tokio::sync::Mutex<Elector<KubeLeases>>>>,
+    component: &'static str,
+}
+
+impl SteppingDown {
+    /// The lease given up where it still names this member (within
+    /// [`STEP_DOWN_RELEASE`]), then [`step_down`].
+    pub async fn now(self, why: &str) -> ! {
+        if let Some(elector) = &self.elector {
+            let_go_stepping_down(elector, self.component).await;
+        }
+        step_down(self.component, why)
     }
 }
 
