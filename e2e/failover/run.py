@@ -1202,6 +1202,8 @@ LOST = "the shard's lease is lost"
 # What a shard's sidecar says as it stands by again in its process, its
 # shard lost (item 49, ruled 2026-11-16): it no longer ends.
 STANDING_AGAIN = "; standing by again"
+# What it says once it stands by, every shard's Lease another's.
+STOOD_BY = "standing by, serving nothing"
 
 
 def shards_fenced(s, settled):
@@ -1217,9 +1219,14 @@ def shards_fenced(s, settled):
     (b) The holder of shard 1 alone cut from it: the standby takes the
     Lease once it lapses, within the takeover's bound; the lake records one
     take and raises the shard's epoch by one; the cut holder serves on
-    until it hears the API server again, finds another holder, and exits,
-    and stands by again in its process: its container never restarts (item
-    49, ruled 2026-11-16)."""
+    until it hears the API server again and finds another holder, then stands
+    by again in its process, its container never restarted (item 49, ruled
+    2026-11-16), within a lapse and the takeover's bound of hearing the API
+    server again.
+
+    Answers the cut holder, its sidecar container's status before the cut,
+    and when its Lease was taken; none where the shards did not settle
+    again."""
     names = {p["metadata"]["name"] for p in shard_pods()}
     held = [shard_holder(n)[1] for n in range(SHARDS)]
     epochs = [shard_epochs(n) for n in range(SHARDS)]
@@ -1241,11 +1248,16 @@ def shards_fenced(s, settled):
     s.check(bit, f"shards: the cut reached each shard: its renewals failed for {SHARD_CUT_S} s")
     # Every pod still listed, none replaced: a pod deleted and made again
     # would pass a check of the pods listed alone (review c5a M5).
+    # A serving lost stands by again in its process, so no restart says
+    # it (item 49): judged by every end's words since the cut began --
+    # lost, fenced, or a take not completed -- never by restarts alone
+    # (review c5a6 L1).
     listed = {p["metadata"]["name"] for p in shard_pods()}
-    s.check(listed == names and all(restarts(n) == restarted[n] for n in names)
-            and not any(LOST in shard_log(h) for h in holder_pods),
+    ended = [h for h in holder_pods
+             if max(said_at(h, LOST) or 0, said_at(h, STANDING_AGAIN) or 0) >= began - 1]
+    s.check(listed == names and all(restarts(n) == restarted[n] for n in names) and not ended,
             f"shards: through the API server's outage, no shard stopped: written on, fenced by its epoch "
-            f"(pods {sorted(names)} -> {sorted(listed)})")
+            f"(pods {sorted(names)} -> {sorted(listed)}; serving ended in {ended})")
     s.check([shard_holder(n)[1] for n in range(SHARDS)] == held,
             "shards: each Lease's holder as it was after the outage")
     after = [shard_epochs(n) for n in range(SHARDS)]
@@ -1280,12 +1292,13 @@ def shards_fenced(s, settled):
         s.check(serving and served <= SHARD_TAKEOVER,
                 f"shards: the standby serves the shard within {SHARD_TAKEOVER} s of the cut "
                 f"({round(served, 2)} s)")
-        s.check(restarts(lost) == before and LOST not in shard_log(lost),
+        s.check(restarts(lost) == before and (said_at(lost, LOST) or 0) < began,
                 "shards: the cut holder serves on while it cannot hear the API server")
         figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2),
                serving_s=round(served, 2))
     finally:
         cut_api("-D", only={lost})
+    lifted, lost_at = time.time(), began + took
     # By the sidecar's own words, in the run it was serving in: the lease
     # lost, held by the pod that took it, standing by again -- and then
     # standing by -- and its plugin no longer answered. Judged by its log
@@ -1308,9 +1321,17 @@ def shards_fenced(s, settled):
             f"process, its plugin no longer answered ({'stood by again' if again else 'did not stand by again'}; "
             f"{'its container ran on' if kept_on else 'its container ended: ' + json.dumps(sidecar_after.get('lastState'))}"
             f"; {words[-1:] or 'it said nothing of it'})")
+    # A pod that lost its shard is a standby within the bound, with no
+    # back-off between (item 49; review c5a6 M4): timed from the API
+    # server heard again.
+    stood_at = said_at(lost, STOOD_BY)
+    stood_in = None if stood_at is None else round(stood_at - lifted, 2)
+    s.check(again and stood_in is not None and stood_in <= SHARD_LAPSE_S + SHARD_TAKEOVER,
+            f"shards: the cut holder stood by again within {SHARD_LAPSE_S + SHARD_TAKEOVER} s of hearing the API "
+            f"server again ({stood_in} s)")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
-    return back
+    return (lost, sidecar_before, lost_at) if back else None
 
 
 def shards(s):
@@ -1320,9 +1341,10 @@ def shards(s):
     is not answered -- and the members' token in the sidecar's container
     alone. A shard's sidecar killed outright (SIGKILL, so nothing is
     released) is another process's once its Lease has lapsed, never before,
-    and that one serves within the bound, the other shard never taken; and
-    its taker killed in turn within 60 s, the second taker serves within the
-    bound too (item 49). Its pods then roll a shard at a time, and a shard
+    and that one serves within the bound, the other shard never taken: the
+    pod that lost that shard in the fence's step (b), standing by in its
+    process since (item 49). Its taker killed in turn within 60 s, the
+    second taker serves within the bound too. Its pods then roll a shard at a time, and a shard
     gone and back is read by the one that stayed."""
     print("S: a plugin instance at two shards with a standby pod", flush=True)
 
@@ -1377,32 +1399,51 @@ def shards(s):
     shard_admission(s, deployment)
     # The epoch fence (item 32): through an outage of the API server, and
     # with the holder alone cut from it. Its holders as they stand after.
-    if not shards_fenced(s, settled):
+    fenced = shards_fenced(s, settled)
+    if not fenced:
         return
+    cut_holder, cut_sidecar, cut_lost_at = fenced
     if not a_standby_stands_by(s, "the kill"):
         return
     holders = [shard_holder(n)[0] for n in range(SHARDS)]
 
     # Shard 1's sidecar killed outright: no signal it can answer, so nothing
-    # is released and its Lease lapses. Whichever process takes it -- the
-    # standby pod's, or the killed pod's sidecar started again, which comes
-    # back standing by -- does so no sooner than the lapse, and serves
-    # within the bound.
+    # is released and its Lease lapses. Its taker does so no sooner than the
+    # lapse, and serves within the bound.
+    #
+    # And shard 1 lost twice within 60 s (item 49; review c5a6 M4): its
+    # holder cut in (b), and now the pod that took it killed. The killed pod
+    # is cut from the API server until its shard is taken, so its sidecar,
+    # started again, cannot take it back: the taker is the pod that lost it
+    # the first time, standing by in its process -- its sidecar never
+    # restarted -- and it serves within the bound.
     lost, other = holders[1], holders[0]
     was, other_held = shard_holder(1)[1], shard_holder(0)[1]
     began = time.time()
-    crash(lost, "sidecar")
-    taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 20, every=0.25)
-    took = time.time() - began
-    now_pod, now = shard_holder(1)
-    s.check(taken, f"shards: another process holds the killed shard's lease ({now}, was {was})")
-    s.check(taken and took >= 3.0,
-            "shards: no sooner than its lapse: its holder stops unrenewed first")
-    served = happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
-    serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
-    s.check(served and serving <= SHARD_TAKEOVER,
-            f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill"
-            + ("" if served else " (never)"))
+    cut_api("-I", only={lost})
+    try:
+        crash(lost, "sidecar")
+        taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 20, every=0.25)
+        took = time.time() - began
+        now_pod, now = shard_holder(1)
+        s.check(taken, f"shards: another process holds the killed shard's lease ({now}, was {was})")
+        s.check(taken and took >= 3.0,
+                "shards: no sooner than its lapse: its holder stops unrenewed first")
+        served = happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
+        serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
+        s.check(served and serving <= SHARD_TAKEOVER,
+                f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill"
+                + ("" if served else " (never)"))
+    finally:
+        cut_api("-D", only={lost})
+    after = sidecar_status(json.loads(out("get", "pod", cut_holder, "-o", "json")))
+    ran_on = (after.get("restartCount") == cut_sidecar.get("restartCount")
+              and after.get("lastState") == cut_sidecar.get("lastState") and "running" in after.get("state", {}))
+    apart = round(began - cut_lost_at, 1)
+    s.check(taken and now_pod == cut_holder and ran_on and apart <= 60,
+            f"shards: shard 1 lost twice within 60 s ({apart} s apart), its holder cut and then its taker killed: "
+            f"the pod that lost it the first time took it back, its sidecar never restarted ({now_pod}, lost by "
+            f"{cut_holder}; {'its container ran on' if ran_on else 'its container ended: ' + json.dumps(after.get('lastState'))})")
     figure("shards: the lease changed hands, and its taker served, after the kill",
            lease_s=round(took, 2), serving_s=None if serving is None else round(serving, 2))
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
@@ -1416,8 +1457,12 @@ def shards(s):
     # within the bound. A pod that loses its shard stands by in its process,
     # so no back-off but the first kill's own stands between.
     first_kill, lost, was = began, now_pod, now
-    left = max(0.0, 60 - (time.time() - first_kill))
-    stood = happens(lambda: bool(the_standby()) and standing_by(the_standby()), left, every=1.0)
+    # Asked once at least, however long the first kill's checks took
+    # (review c5a6 L6).
+    left = 60 - (time.time() - first_kill)
+    stood = ((bool(the_standby()) and standing_by(the_standby()))
+             or happens(lambda: bool(the_standby()) and standing_by(the_standby()), left, every=1.0))
+    stood = stood and time.time() - first_kill <= 60
     s.check(stood, f"shards: within 60 s of the kill, a standby stood by for a lapse again ({the_standby() or 'none'})")
     if not stood:
         return
@@ -1427,7 +1472,7 @@ def shards(s):
     now_pod, now = shard_holder(1)
     served = taken and happens(lambda: (said_at(now_pod, "the sidecar is serving") or 0) >= began - 1, 30, every=0.5)
     serving = (said_at(now_pod, "the sidecar is serving") or 0) - began if served else None
-    s.check(served and serving <= SHARD_TAKEOVER,
+    s.check(served and serving <= SHARD_TAKEOVER and began - first_kill <= 60,
             f"shards: shard 1's holder killed twice, {round(began - first_kill, 1)} s apart, its second taker serves "
             f"within {SHARD_TAKEOVER} s ({'never' if serving is None else round(serving, 2)}; {now}, was {was})")
     figure("shards: the second kill within 60 s, its taker served",

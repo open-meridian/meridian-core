@@ -22,6 +22,7 @@ pub mod replicas;
 pub mod resilience;
 pub mod scrub;
 pub mod shards;
+pub mod sidecar_serving;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};

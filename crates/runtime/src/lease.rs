@@ -205,6 +205,15 @@ impl<L: Leases> Elector<L> {
         self
     }
 
+    /// [`Elector::of_a_holder_that_stops`], given to a member once it holds
+    /// the lease (review c5a6 M1): a data shard's own Lease, whose standby
+    /// counts only what it saw (F4) but whose holder keeps what it saw
+    /// through a failed look -- else one API error after its take leaves
+    /// it no transitions to raise its epoch by and nothing to release.
+    pub fn keep_seen_through_failures(&mut self, clock: fn() -> Instant) {
+        self.answered = Some(clock);
+    }
+
     /// When a record just read is held to have been seen: when its read
     /// answered where this lease's holder stops unrenewed, else `now`.
     fn seen_at(&self, now: Instant) -> Instant {

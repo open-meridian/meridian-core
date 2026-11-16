@@ -191,6 +191,23 @@ pub fn send_gate(renewal: Renewal) -> meridian_bus::SendGate {
     })
 }
 
+/// The gate on what a shard's sidecar sends (review c5a6 L3): nothing at
+/// all once its serving has `ended` -- set as a lost serving ends, before
+/// its runtime is shut, so nothing it still holds sends in between -- and
+/// for a data shard, given its `renewal`, [`send_gate`]'s.
+pub fn serving_gate(
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    renewal: Option<Renewal>,
+) -> meridian_bus::SendGate {
+    let renewed = renewal.map(send_gate);
+    Arc::new(move |topic: &str| {
+        if ended.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("this shard's serving has ended: it sends nothing more".into());
+        }
+        renewed.as_ref().map_or(Ok(()), |gate| gate(topic))
+    })
+}
+
 /// The Leases of `shards` read at once, each by looking alone: whether
 /// each is held, and none where it could not be read.
 async fn read<L: Leases + 'static>(
@@ -285,7 +302,9 @@ impl<L: Leases + 'static> ShardSet<L> {
     /// it could not read a Lease is never its holder's silence, since that
     /// holder wrote on through it. Once the API server answers again, the
     /// standby waits a whole lapse from its first read before it takes.
-    /// Said before the set's first look.
+    /// The Lease it takes is then kept as seen through a failed look, so
+    /// its take and its release never miss for one API error (review c5a6
+    /// M1). Said before the set's first look.
     pub fn writing_on(mut self) -> Self {
         self.writes_on = true;
         self.electors = self.electors_of(self.electors.len() as u32);
@@ -362,6 +381,15 @@ impl<L: Leases + 'static> ShardSet<L> {
                 return Stand::Standby;
             };
             self.mine = Some(mine);
+            // Its own Lease kept as seen through a failed look, as every
+            // holder's is: only a data standby's lapse count drops it
+            // (review c5a6 M1; F4).
+            if self.writes_on {
+                self.electors[mine]
+                    .lock()
+                    .await
+                    .keep_seen_through_failures(clock);
+            }
             // One not read is held live, as the others of a running
             // instance are, until it is read.
             for (shard, held) in read(&self.others(mine), now).await {
@@ -592,11 +620,38 @@ impl<L: Leases + 'static> ShardSet<L> {
         }
     }
 
+    /// This pod's own Lease, held apart from its keeping, to give up as a
+    /// serving ends unplanned ([`Holding::give_up`]): none before a take.
+    pub fn holding(&self) -> Option<Holding<L>> {
+        self.mine
+            .map(|mine| Holding(Arc::clone(&self.electors[mine])))
+    }
+
     /// Give this pod's shard up: a planned stop hands it to the standby at
     /// once.
     pub async fn release(&mut self, wall_ns: i64) {
         if let Some(mine) = self.mine {
             self.electors[mine].lock().await.release(wall_ns).await;
+        }
+    }
+}
+
+/// A pod's own shard Lease, held apart from its keeping (review c5a6 L4).
+pub struct Holding<L: Leases>(Shared<L>);
+
+impl<L: Leases + 'static> Holding<L> {
+    /// Given up where it still names this pod, by a write conditional on a
+    /// fresh read: a serving that ended other than by a planned stop -- a
+    /// write refused as fenced, its surface or front door stopped -- hands
+    /// its shard on at once, not after a lapse under a name that is gone. A
+    /// Lease another pod took is never touched.
+    pub async fn give_up(&self) {
+        match self.0.lock().await.release_if_mine(crate::now_ns()).await {
+            Ok(true) => tracing::info!("the shard's lease is released"),
+            Ok(false) => {}
+            Err(failed) => {
+                tracing::warn!(%failed, "the shard's lease could not be released; it lapses on its own")
+            }
         }
     }
 }
@@ -922,7 +977,7 @@ impl Drop for Reading {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::lease::{Record, Wrote};
     use std::collections::HashMap;
@@ -932,9 +987,9 @@ mod tests {
     /// The namespace's Leases, as the API server keeps them: every write
     /// conditional on the version read. `down` answers nothing.
     #[derive(Default)]
-    struct Memory {
-        leases: Mutex<HashMap<String, Record>>,
-        down: AtomicBool,
+    pub(crate) struct Memory {
+        pub(crate) leases: Mutex<HashMap<String, Record>>,
+        pub(crate) down: AtomicBool,
         /// When each Lease was last written.
         written: Mutex<HashMap<String, tokio::time::Instant>>,
         /// How many Leases were made: each made one's uid.
@@ -958,7 +1013,7 @@ mod tests {
         fn written_at(&self, name: &str) -> tokio::time::Instant {
             self.written.lock().unwrap()[name]
         }
-        fn holder(&self, name: &str) -> String {
+        pub(crate) fn holder(&self, name: &str) -> String {
             self.leases
                 .lock()
                 .unwrap()
@@ -1621,6 +1676,37 @@ mod tests {
                 "the standby took a shard its holder renews"
             );
             assert_eq!(api.holder("feed-1-shard-0"), "a");
+        });
+    }
+
+    /// Review c5a6 M1: a data shard's own Lease is kept as it was last seen
+    /// through a failed look -- only its standby's lapse count drops what
+    /// it saw (F4) -- so one API error after a take neither fails the take
+    /// nor leaves the Lease held by a name that is gone: the take still
+    /// knows its transitions, and a release still writes.
+    #[test]
+    fn a_data_shard_s_own_lease_is_kept_as_seen_through_a_failed_look_and_released_after() {
+        run(async {
+            let api = Arc::new(Memory::default());
+            let mut a = pod(&api, 1, "a").writing_on();
+            let start = Instant::now();
+            assert_eq!(a.look(start, 0).await, shard(0, &[]));
+            api.down.store(true, Ordering::SeqCst);
+            assert_eq!(
+                a.look(start + Duration::from_secs(1), 0).await,
+                shard(0, &[])
+            );
+            api.down.store(false, Ordering::SeqCst);
+            assert!(
+                a.taken().await.is_some(),
+                "one failed look lost the take's record"
+            );
+            a.release(0).await;
+            assert_eq!(
+                api.holder("feed-1-shard-0"),
+                "",
+                "the release wrote nothing"
+            );
         });
     }
 

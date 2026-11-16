@@ -12,18 +12,16 @@
 //! Who this serves is launch configuration and never what registers: a plugin
 //! that named its own roles would be choosing its own privileges.
 
+use meridian_runtime::lease::KubeLeases;
+use meridian_runtime::sidecar_serving::{serve, serve_as_shards, MakeBus, Serving};
 use meridian_runtime::{
     bus_from_env, bus_from_env_writing_ahead, names_from, required, stopping, var,
 };
 use std::sync::Arc;
 
-use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
-use meridian_sidecar::share::{Limits, Share, Shared};
-use meridian_sidecar::{
-    Identity, OlderPagesRead, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
-};
-
-use meridian_runtime::shards::Served;
+use meridian_sidecar::front_door::Verifier;
+use meridian_sidecar::share::Limits;
+use meridian_sidecar::{Identity, DEFAULT_BIND};
 
 /// Where the chart mounts the dashboard's public keys, one file per key id.
 const DASHBOARD_KEYS: &str = "/etc/meridian/dashboard-keys";
@@ -148,6 +146,23 @@ fn run() -> Result<(), String> {
     let declaration = var("MERIDIAN_PLUGIN_DECLARATION")
         .map(|path| declaration_from(&path).map(|declared| (path, declared)))
         .transpose()?;
+    // Each serving's bus, from the environment. A data plugin's lake writes
+    // go by the lake's write-ahead stream in `ha` (the resilience spec's
+    // section 4): held by the stream before the lake records them, so none
+    // it was answered for is lost.
+    let bus: MakeBus = {
+        let instance_id = instance_id.clone();
+        Arc::new(move || {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                if writes_rows {
+                    bus_from_env_writing_ahead(&instance_id).await
+                } else {
+                    bus_from_env(&instance_id).await
+                }
+            })
+        })
+    };
     let serving = Arc::new(Serving {
         deployment_id,
         identity,
@@ -155,10 +170,10 @@ fn run() -> Result<(), String> {
         front,
         listening,
         instance_id,
-        writes_rows,
         limits,
         write_share,
         declaration,
+        bus,
     });
 
     tokio::runtime::Builder::new_multi_thread()
@@ -184,410 +199,24 @@ fn run() -> Result<(), String> {
             )?;
             let Some(count) = shard_count else {
                 // An instance's one pod: served once, its process its own.
-                return match serve(serving, None, stop).await? {
-                    Ended::Served(_) => Ok(()),
-                    Ended::NoBus(failed) => Err(failed),
-                };
+                return serve::<KubeLeases>(serving, None, stop).await.map(|_| ());
             };
-            serve_as_shards(serving, count, stop).await
-        })
-}
-
-/// What each serving of this sidecar is made from, read once at its start.
-struct Serving {
-    deployment_id: String,
-    identity: Identity,
-    verifier: Option<Arc<Verifier>>,
-    front: Option<(
-        std::net::SocketAddr,
-        Arc<Verifier>,
-        Option<tokio_rustls::TlsAcceptor>,
-    )>,
-    listening: std::net::SocketAddr,
-    instance_id: String,
-    writes_rows: bool,
-    limits: Limits,
-    write_share: Option<Arc<meridian_sidecar::share::WriteShare>>,
-    /// The declaration a harness's sidecar holds its plugin's registration
-    /// to, and the file it was read from.
-    declaration: Option<(String, meridian_pb::v1::PluginDeclaration)>,
-}
-
-/// How one serving ended.
-enum Ended {
-    Served(Served),
-    /// Its bus could not be set up: why.
-    NoBus(String),
-}
-
-type ShardSet = meridian_runtime::shards::ShardSet<meridian_runtime::lease::KubeLeases>;
-
-/// A shard's take not completed for want of a bus this many times running
-/// ends the process: a fault of the pod's own, a credential or an address,
-/// which a restart and its log say better than a standby that never takes.
-const BUS_TRIES: u32 = 5;
-
-/// How long a lost shard's serving is given to end -- its surface, front
-/// door, bus and every task they started -- before the pod stands by again.
-const SERVING_ENDS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// One pod of several (step 3d; the resilience spec's section 7): nothing
-/// is served -- no plugin surface, no front door, nothing on the bus --
-/// until a shard's Lease is this pod's. A standby waits here, and its
-/// plugin's registration waits with it.
-///
-/// **A shard lost stands by again in this process** (item 32 as item 49
-/// ruled it, 2026-11-16; review c5a5 F3): its Lease showing another holder,
-/// a write refused as fenced, or a take that did not complete. Its serving
-/// -- the plugin's surface, the front door, the bus and its stamp, and every
-/// task they started -- runs on a runtime of its own, ended whole when the
-/// shard is lost, so nothing of it outlives the shard: the plugin's stream
-/// ends with its connection, and the SDK leaves as it does when a sidecar
-/// ends. The pod then stands by under a new holder name. Its process ends
-/// only for a fault of its own: a surface or front door that stops, a bus
-/// not set up in [`BUS_TRIES`] takes running, or a Lease setting refused.
-async fn serve_as_shards(
-    serving: Arc<Serving>,
-    count: u32,
-    stop: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), String> {
-    use meridian_runtime::shards;
-    let instance = serving.identity.instance_id.clone();
-    if instance.is_empty() {
-        return Err(format!(
-            "{} needs MERIDIAN_PLUGIN_INSTANCE_ID: a shard is a pod of an instance",
-            shards::SHARDS_ENV
-        ));
-    }
-    let whole = |name: &str, default: u64| -> Result<u64, String> {
-        match var(name) {
-            None => Ok(default),
-            Some(said) => said
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("{name} is {said:?}; a whole number")),
-        }
-    };
-    let renew = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_RENEW_SECONDS", 2)?);
-    let duration = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_DURATION_SECONDS", 6)?);
-    // A data shard writes on through an API server outage, fenced by its
-    // epoch; every other role stops by the clock (step 3d, checkpoint 5,
-    // item 32: a property of the role).
-    let writes_on = shards::writes_on(&serving.identity.roles);
-    // Each request gives up within half a renewal: a shard stops at its
-    // renew deadline whatever is in flight, and one request lost leaves it
-    // a second try before that.
-    let api = Arc::new(meridian_runtime::lease::KubeLeases::in_cluster(renew / 2)?);
-    let no_bus = std::cell::Cell::new(0u32);
-    let no_bus = &no_bus;
-    shards::serve_shards(
-        || {
-            // This process's take, not only its pod's, as a store's member
-            // names itself: each standing by again is a new holder.
-            let holder = format!(
-                "{}_{:x}",
-                meridian_runtime::member::member_name(),
-                meridian_runtime::now_ns()
-            );
-            let set = ShardSet::new(Arc::clone(&api), &instance, count, &holder, renew, duration)?;
-            Ok(if writes_on { set.writing_on() } else { set })
-        },
-        |set, mine, others| {
-            let (serving, stop, instance) = (Arc::clone(&serving), stop.clone(), instance.clone());
-            async move {
-                tracing::info!(
-                    instance,
-                    shard = mine,
-                    of = count,
-                    "this pod holds a shard's lease"
-                );
-                let held = Arc::new(meridian_sidecar::shards::Shards::new(mine));
-                held.set_live(others);
-                // A refusal heard was the last serving's, whose bus is gone.
-                meridian_sidecar::shards::clear_fenced();
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name("sidecar-shard")
-                    .build()
-                    .map_err(|failed| failed.to_string())?;
-                let ended = runtime.spawn(serve(serving, Some((set, held)), stop)).await;
-                // Ended whole: every task the serving started, its
-                // connections and its listeners with it.
-                let _ = tokio::task::spawn_blocking(move || {
-                    runtime.shutdown_timeout(SERVING_ENDS_WITHIN)
-                })
-                .await;
-                match ended.map_err(|failed| format!("the shard's serving failed: {failed}"))?? {
-                    Ended::Served(served) => {
-                        no_bus.set(0);
-                        Ok(served)
-                    }
-                    Ended::NoBus(failed) => {
-                        no_bus.set(no_bus.get() + 1);
-                        if no_bus.get() >= BUS_TRIES {
-                            return Err(format!("{failed}, {BUS_TRIES} takes running"));
-                        }
-                        Ok(Served::NotTaken(failed))
-                    }
+            let whole = |name: &str, default: u64| -> Result<u64, String> {
+                match var(name) {
+                    None => Ok(default),
+                    Some(said) => said
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("{name} is {said:?}; a whole number")),
                 }
-            }
-        },
-        stop.clone(),
-    )
-    .await
-}
-
-/// One serving: the bus set up, the shard's epoch raised where it is a
-/// shard, and the plugin's surface and the front door served until the pod
-/// is told to stop, a shard it holds is lost, or either stops.
-async fn serve(
-    serving: Arc<Serving>,
-    mut shard: Option<(ShardSet, Arc<meridian_sidecar::shards::Shards>)>,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) -> Result<Ended, String> {
-    use meridian_runtime::shards::Kept;
-    let Serving {
-        deployment_id,
-        identity,
-        verifier,
-        front,
-        listening,
-        instance_id,
-        writes_rows,
-        limits,
-        write_share,
-        declaration,
-    } = &*serving;
-    let (listening, limits) = (*listening, *limits);
-    // A data plugin's lake writes go by the lake's write-ahead stream in
-    // `ha` (the resilience spec's section 4): held by the stream before the
-    // lake records them, so none it was answered for is lost.
-    let made = async {
-        if *writes_rows {
-            bus_from_env_writing_ahead(instance_id).await
-        } else {
-            bus_from_env(instance_id).await
-        }
-    };
-    // Bounded where a shard is held: its Lease is not renewed until the
-    // take, so a bus that cannot be set up inside the Lease's lapse gives
-    // the shard up rather than take it late (review c5a M2).
-    let bus = match &mut shard {
-        None => match made.await {
-            Ok(bus) => bus,
-            Err(failed) => return Ok(Ended::NoBus(failed)),
-        },
-        Some((set, _)) => match tokio::time::timeout(set.lasts(), made).await {
-            Ok(Ok(bus)) => bus,
-            failed => {
-                set.release(meridian_runtime::now_ns()).await;
-                return Ok(Ended::NoBus(match failed {
-                    Ok(Err(failed)) => format!("the bus was not set up: {failed}"),
-                    _ => "the bus was not set up inside the shard's Lease".into(),
-                }));
-            }
-        },
-    };
-    // A shard taken: its epoch raised by the lake in every writer group
-    // before anything is served, and stamped on every write from here on
-    // (step 3d, checkpoint 5, item 32). A take not confirmed gives the
-    // Lease up, and the pod stands by again (item 49).
-    if let Some((set, _)) = &mut shard {
-        // Renewed just before the take and just after it (review c5a M2,
-        // M3): a take that stalled past its lapse is never sent.
-        let raised = meridian_runtime::shards::take_epoch(&bus, &identity.instance_id, set).await;
-        if let Err(failed) = raised {
-            set.release(meridian_runtime::now_ns()).await;
-            return Ok(Ended::Served(Served::NotTaken(format!(
-                "the shard's epoch was not raised: {failed}"
-            ))));
-        }
-        // A data shard writes on past its renew deadline with its lake
-        // record writes alone; every other send waits for a renewal
-        // (review c5a M1, ruled 2026-11-16).
-        if meridian_runtime::shards::writes_on(&identity.roles) {
-            bus.gate_sends(meridian_runtime::shards::send_gate(set.renewal()))?;
-        }
-    }
-    // Its own hops' ages -- a record batch accepted, a row delivered -- to
-    // the monitor, under its plugin's instance (W4.16; 606).
-    tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
-    let mut sidecar = Sidecar::new(bus, deployment_id, identity.clone());
-    if let Some(verifier) = verifier {
-        sidecar = sidecar.with_verifier(Arc::clone(verifier));
-    }
-    if let Some(share) = write_share {
-        tracing::info!(
-            bytes_per_second = share.bytes_per_second(),
-            "the plugin's lake write share at its sidecar"
-        );
-        sidecar = sidecar.with_write_share(Arc::clone(share));
-    }
-    // Kept while it serves: its own Lease renewed, the others read.
-    let mut keeping = None;
-    if let Some((set, shards)) = shard {
-        sidecar = sidecar.as_shard(Arc::clone(&shards));
-        let live = Arc::clone(&shards);
-        keeping = Some(tokio::spawn(
-            set.keep(move |others| live.set_live(others), stop.clone()),
-        ));
-    }
-    // A harness's sidecar, which no launch made, holds its plugin's
-    // registration to the declaration an upload would carry (W4.1,
-    // contract v25): the SDK's JSON, as `meridian-declaration` prints it.
-    // The launcher never sets it.
-    if let Some((path, declared)) = declaration {
-        sidecar = sidecar.held_to(declared.clone());
-        tracing::info!(path, "registration held to the declaration in this file");
-    }
-    let sidecar = Arc::new(sidecar);
-
-    // A live instance of a development deployment: the development
-    // endpoint behind the front door (spec/live-plugin-development). Both
-    // told, or none.
-    if let Some(live) = meridian_sidecar::live::Live::from_env(
-        var("MERIDIAN_LIVE_DIR"),
-        var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true"),
-        sidecar.clock(),
-    ) {
-        sidecar.go_live(Arc::new(live));
-        tracing::info!("live: the development endpoint is on");
-    }
-
-    tracing::info!(instance_id, %listening, "the sidecar is serving");
-
-    // What it knows of its plugin, for the conductor and the dashboard
-    // (W4.8): now, on each registration, and every 30s.
-    tokio::spawn(meridian_sidecar::report::report_forever(Arc::clone(
-        &sidecar,
-    )));
-
-    let door = match front {
-        None => None,
-        Some((at, verifier, tls)) => {
-            let door = FrontDoor::new(Arc::clone(&sidecar), Arc::clone(verifier))?;
-            let listener = tokio::net::TcpListener::bind(*at)
-                .await
-                .map_err(|failed| format!("the front door could not bind {at}: {failed}"))?;
-            tracing::info!(%at, tls = tls.is_some(), "the front door is open to the dashboard");
-            Some(serve_door(listener, front_door::router(door), tls.clone()))
-        }
-    };
-    let front_door = async {
-        match door {
-            Some(serving) => serving
-                .await
-                .map_err(|failed| format!("the front door stopped: {failed}")),
-            None => std::future::pending().await,
-        }
-    };
-
-    // The plugin's own share (stage M; the resilience spec's section 10a):
-    // past it, only this plugin is refused.
-    tracing::info!(
-        in_flight = limits.in_flight,
-        requests_per_second = limits.requests_per_second,
-        answer_mib = limits.answer_mib,
-        "the plugin's share at its sidecar"
-    );
-    let share = Share::new(limits);
-    let surface = tonic::transport::Server::builder()
-        // An older plugin's admin pages, read as pages at `admin` while its
-        // contract is accepted (W4.8).
-        .add_service(Shared::new(
-            OlderPagesRead::new(SidecarServiceServer::from_arc(Arc::clone(&sidecar))),
-            Arc::clone(&share),
-        ))
-        // The typed operations (spec/typed-sidecar-operations).
-        .add_service(Shared::new(
-            PluginOperationsServer::from_arc(sidecar),
-            share,
-        ))
-        .serve(listening);
-
-    // Whichever ended first.
-    enum Woke {
-        Surface(Result<(), String>),
-        Door(Result<(), String>),
-        Fenced,
-        Kept(Result<Kept, tokio::task::JoinError>),
-        Told,
-    }
-    let kept = async {
-        match keeping.as_mut() {
-            Some(keeping) => keeping.await,
-            None => std::future::pending().await,
-        }
-    };
-    let woke = tokio::select! {
-        // A port already taken lands here, and so does a surface that
-        // stopped later. Either way no plugin can reach this sidecar, so
-        // it exits non-zero and an orchestrator restarts it rather than
-        // leaving it up and unreachable.
-        served = surface => Woke::Surface(
-            served.map_err(|failed| format!("the sidecar surface at {listening} stopped: {failed}")),
-        ),
-        // The page is how a person reaches the plugin, so a door that
-        // stopped is a sidecar to restart, as the surface is.
-        stopped = front_door => Woke::Door(stopped),
-        // A write refused as fenced (step 3d, checkpoint 5, item 32):
-        // another pod took this shard.
-        _ = meridian_sidecar::shards::fenced() => Woke::Fenced,
-        // Its Lease shows another holder.
-        kept = kept => Woke::Kept(kept),
-        _ = meridian_runtime::shards::told(&mut stop) => Woke::Told,
-    };
-    match woke {
-        Woke::Surface(ended) | Woke::Door(ended) => ended.map(|()| Ended::Served(Served::Stopped)),
-        Woke::Fenced => Ok(Ended::Served(Served::Lost(
-            "a store refused a write as fenced: this shard's epoch is no longer the instance's"
-                .into(),
-        ))),
-        Woke::Kept(Ok(Kept::Lost(why))) => Ok(Ended::Served(Served::Lost(format!(
-            "the shard's lease is lost: {why}"
-        )))),
-        Woke::Kept(Ok(Kept::Released)) => Ok(Ended::Served(Served::Stopped)),
-        Woke::Kept(Err(failed)) => Err(format!("the shard's keeping failed: {failed}")),
-        Woke::Told => {
-            tracing::info!("stopping");
-            // Its shard given up, so the standby takes it at once: its
-            // keeping heard the same word.
-            if let Some(keeping) = keeping {
-                let _ = keeping.await;
-            }
-            Ok(Ended::Served(Served::Stopped))
-        }
-    }
-}
-
-/// The front door served: over TLS where the deployment's internal TLS is
-/// on, each connection's handshake its own task so one slow client holds up
-/// no other; in the clear, as axum serves it, otherwise.
-fn serve_door(
-    listener: tokio::net::TcpListener,
-    router: axum::Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
-    let Some(tls) = tls else {
-        return Box::pin(async move { axum::serve(listener, router).await });
-    };
-    Box::pin(async move {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let tls = tls.clone();
-            let service = hyper_util::service::TowerToHyperService::new(router.clone());
-            tokio::spawn(async move {
-                // A client that does not speak TLS -- plaintext, the
-                // refusal internal TLS promises -- ends here.
-                let Ok(stream) = tls.accept(stream).await else {
-                    return;
-                };
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
-                .await;
-            });
-        }
-    })
+            };
+            let renew = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_RENEW_SECONDS", 2)?);
+            let duration =
+                std::time::Duration::from_secs(whole("MERIDIAN_LEASE_DURATION_SECONDS", 6)?);
+            // Each request gives up within half a renewal: a shard stops at
+            // its renew deadline whatever is in flight, and one request lost
+            // leaves it a second try before that.
+            let leases = || KubeLeases::in_cluster(renew / 2).map(Arc::new);
+            serve_as_shards(serving, count, leases, (renew, duration), stop).await
+        })
 }
