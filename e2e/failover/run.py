@@ -251,7 +251,11 @@ SCALE_DATASETS = 8
 # by rendezvous, so the step writes as many accounts of each (scale_accounts).
 SCALE_PARTITIONS = 8
 # Two writer groups on two databases against one on one: at least this
-# ("about twice", ruled 2026-11-10).
+# ("about twice", ruled 2026-11-10). Proved off CI (PO, item 39,
+# 2026-11-16): on the private cloud benchmark machine, on 3d's final head,
+# its figures in the private file. CI runs the three shapes and holds that
+# each group commits to its own database and the run completes; the ratio
+# is computed here all the same, held or not, into SCALE_FIGURES alone.
 SCALE_AT_LEAST = 1.8
 SCALE_WARM_S = 15
 SCALE_MEASURED_S = 45
@@ -5527,11 +5531,15 @@ def write_scale(s):
             # database's, whatever it is.
             s.check(len(two["by_database"]) == 2 and all(n > 0 for n in two["by_database"]),
                     f"write-scale: the {name}'s two groups each committed to their own database")
-            held = one > 0 and two["per_s"] >= SCALE_AT_LEAST * one
-            figures[f"{name}_held"] = held
-            s.check(held, f"write-scale: the {name} with two writer groups on two databases commits at least "
-                    f"{SCALE_AT_LEAST} times what one group on one database does "
-                    f"({'held' if held else 'NOT held'}; the figures are kept in {SCALE_FIGURES}, never printed)")
+            # The ratio, measured off CI (PO, item 39): computed and kept,
+            # held or not, for the private cloud run; never asserted here.
+            figures[f"{name}_held"] = one > 0 and two["per_s"] >= SCALE_AT_LEAST * one
+            s.note(f"write-scale: the {name}'s ratio of two writer groups on two databases to one on one is "
+                   f"measured off CI, on the private benchmark machine, against at least {SCALE_AT_LEAST}; "
+                   f"this run's is kept in {SCALE_FIGURES}, never printed")
+        # Every shape ran to its end: each store measured in each.
+        s.check(all(component in figures[shape] for shape in shapes for component in ("lake", "bor")),
+                "write-scale: the run completed, each store measured in all three shapes")
     finally:
         figures["threshold"] = SCALE_AT_LEAST
         figures["run"] = os.environ.get("GITHUB_RUN_ID", "local")
