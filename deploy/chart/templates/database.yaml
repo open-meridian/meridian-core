@@ -69,6 +69,19 @@
   or none: its data directory is Patroni's.
 */}}
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
+{{- /* A database past the first that is new (step 3d; section 6.4: each
+       brought database with the profile's standbys, read replicas and WAL
+       archive) holds nothing to move under Patroni: beside a first already
+       under it, it starts in its full shape at once, never alone awaiting a
+       second upgrade nobody runs for it (CI 43788516279: database 1 ran
+       one member in ha, and its readers waited for a read replica that
+       never came). Beside a first still alone, it moves with it, in the
+       same two upgrades. */}}
+{{- $first := dict }}
+{{- if and $extra (not $live) }}
+{{- $first = default (dict) (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-database" $full)) }}
+{{- $wasPatroni = eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" $first) "patroni" }}
+{{- end }}
 {{- $patroni := or (gt $standbys 0) (gt $readReplicas 0) $wasPatroni }}
 {{- /* Moving under Patroni from alone, in the first of two upgrades (see
        the StatefulSet's replicas): member 0 runs alone, so nothing waits
@@ -77,7 +90,7 @@
 {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
 {{- /* One past the first starts with the first: running once it runs. */}}
 {{- if and $extra (not $live) }}
-{{- $running = dig "spec" "replicas" 0 (default (dict) (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-database" $full))) }}
+{{- $running = dig "spec" "replicas" 0 $first }}
 {{- end }}
 {{- $converting := and (gt (int $running) 0) (gt (add $standbys $readReplicas) 0) (not $wasPatroni) }}
 {{- $synchronous := ternary 0 $standbys $converting }}

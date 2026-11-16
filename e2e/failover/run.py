@@ -3252,6 +3252,13 @@ def two_groups_two_databases(s):
         rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status",
                      f"statefulset/{FULL}-{component}-database-1", "--timeout=420s", check=False)
         s.check(rolled.returncode == 0, f"ha databases added: {component}'s database 1 brought and ready")
+        # In its full shape at once, as the first is in ha (section 6.4; CI
+        # 43788516279: one member, alone, waiting for a second upgrade).
+        shape = json.loads(out("get", "statefulset", f"{FULL}-{component}-database-1", "-o", "json"))
+        wanted, ready_now = shape["spec"].get("replicas", 0), shape.get("status", {}).get("readyReplicas", 0)
+        s.check(wanted == database_members() and ready_now == wanted,
+                f"ha databases added: {component}'s database 1 runs the first's shape, its standbys with it "
+                f"({ready_now} of {wanted} ready, the first's {database_members()})")
     # Read once each store's second database is there: group 1's takeovers
     # are recorded in it (finding 4).
     no_lease_lapsed(s, "ha databases added", since_ns, groups=2)
