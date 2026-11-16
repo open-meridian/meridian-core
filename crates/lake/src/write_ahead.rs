@@ -53,6 +53,13 @@ pub const BATCH_MOST_BYTES: usize = meridian_changes::group_commit::BATCH_MOST_B
 /// could not take.
 const AGAIN_AFTER: Duration = Duration::from_millis(500);
 
+/// How often the writer, delivered nothing, looks whether a move's switch
+/// took its place in the stream back, while one may (step 3d; spec 6.1 and
+/// 6.8; PR CI 43810170103, ha): a write it passed, its row another group's,
+/// then switched to its own group, is taken again from the place taken back
+/// and answered within the hold, never only once another write comes.
+pub const TAKEN_BACK_LOOK_EVERY: Duration = Duration::from_millis(250);
+
 /// One write as the stream held it.
 #[derive(Debug, Clone)]
 pub struct Taken {
@@ -219,6 +226,10 @@ pub struct Writer {
     from: Option<u64>,
     dropped: Vec<Dropped>,
     valid: BTreeMap<String, i64>,
+    /// When it last passed a write whose rows were another group's: a
+    /// move's switch may take its place back to before it, for as long as
+    /// the hold (step 3d; spec 6.1 and 6.8).
+    passed_at: Option<tokio::time::Instant>,
 }
 
 /// Whether `dataset`'s ranges span writer groups as this member last read
@@ -247,7 +258,25 @@ impl Writer {
             from: None,
             dropped,
             valid,
+            passed_at: None,
         })
+    }
+
+    /// Whether a move's switch may yet take the writer's place back (step
+    /// 3d; spec 6.1 and 6.8): within the hold of a write it passed, its
+    /// rows another group's. A switch takes the target's place back to its
+    /// source's committed place, and owes the target only the writes the
+    /// source had not committed: those the source's batch was held on, for
+    /// at most the hold. Never otherwise, so an idle writer asks nothing.
+    pub fn may_be_taken_back(&self) -> bool {
+        self.passed_at
+            .is_some_and(|at| at.elapsed() < meridian_changes::moves::hold())
+    }
+
+    /// Whether the store's place in the stream is no longer the one the
+    /// writer holds: a move's switch took it back (spec 6.1).
+    pub fn taken_back(&self) -> Result<bool, StoreError> {
+        Ok(self.lake.write_ahead_position(&self.stream)? != self.position)
     }
 
     /// The position the writer goes on from.
@@ -350,10 +379,12 @@ impl Writer {
         // datasets' writes alone, and moves its own position past the rest
         // (step 3d; section 6.1). The rest are their owners' to answer.
         let groups = self.lake.groups();
+        let all = taken.len();
         let taken: Vec<Taken> = taken
             .into_iter()
             .filter(|write| ours(groups, write))
             .collect();
+        let passed = taken.len() < all;
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
         for write in taken {
@@ -403,6 +434,9 @@ impl Writer {
         }
         self.position = Some(through);
         self.from = None;
+        if passed {
+            self.passed_at = Some(tokio::time::Instant::now());
+        }
         self.dropped.extend(dropped);
         for (dataset, valid_ns) in recorded.valid {
             let at = self.valid.entry(dataset).or_insert(valid_ns);
@@ -941,8 +975,21 @@ pub async fn write_forever(
         };
         let mut stall = Stall::new(STALL_AFTER);
         loop {
-            let batch = match read(&mut messages, &mut stall, writer.next(), &mut stream).await {
+            let next = writer.next();
+            let batch = match read(&mut messages, &mut stall, next, &mut stream, &writer).await {
                 Read::Batch(batch) => batch,
+                Read::TakenBack => {
+                    tracing::info!(
+                        next,
+                        "a move's switch took the lake's place in the write-ahead stream back: \
+                         taken again from there"
+                    );
+                    while let Err(failed) = tokio::task::block_in_place(|| writer.reread()) {
+                        tracing::warn!(%failed, "the write-ahead position could not be read yet");
+                        tokio::time::sleep(AGAIN_AFTER).await;
+                    }
+                    break;
+                }
                 Read::Stopped(failed) => {
                     tracing::warn!(%failed, "the write-ahead stream stopped; following it again");
                     break;
@@ -1078,12 +1125,41 @@ impl Leader for stream::Stream {
     }
 }
 
+/// The writer's place in the stream, as the reader looks at it while it
+/// delivers nothing (step 3d; spec 6.1 and 6.8).
+pub trait Place {
+    /// Whether a move's switch may yet take the place back: only then is
+    /// the store asked.
+    fn may_be_taken_back(&self) -> bool;
+    /// Whether the store's place is no longer the writer's.
+    fn taken_back(&self) -> impl std::future::Future<Output = bool> + Send;
+}
+
+impl Place for Writer {
+    fn may_be_taken_back(&self) -> bool {
+        Writer::may_be_taken_back(self)
+    }
+
+    async fn taken_back(&self) -> bool {
+        match tokio::task::block_in_place(|| Writer::taken_back(self)) {
+            Ok(taken_back) => taken_back,
+            Err(failed) => {
+                tracing::debug!(%failed, "the write-ahead position was not read to look whether a switch took it back");
+                false
+            }
+        }
+    }
+}
+
 /// What the reader gave.
 #[derive(Debug)]
 pub enum Read {
     Batch(Vec<Taken>),
     /// It ended, or failed.
     Stopped(String),
+    /// Delivered nothing, the writer's place was taken back by a move's
+    /// switch: the writer reads it again and takes the stream from there.
+    TakenBack,
     /// The stream holds writes past the position, and it delivered none of
     /// them for [`STALL_AFTER`]: `last` is the stream's last sequence.
     Stalled {
@@ -1095,29 +1171,54 @@ pub enum Read {
 /// [`STALL_LOOK_EVERY`], the stream's `leader` asked how far it has reached,
 /// and a reader that has delivered none of the writes past `next` for
 /// `stall`'s bound said to have stalled -- placed on a replica left behind,
-/// or lost -- never a quiet stream.
-pub async fn read<S, E, L>(messages: &mut S, stall: &mut Stall, next: u64, leader: &mut L) -> Read
+/// or lost -- never a quiet stream. While a move's switch may take the
+/// writer's `place` back, it is looked at every [`TAKEN_BACK_LOOK_EVERY`]
+/// the reader delivers nothing, and said taken back once it was (PR CI
+/// 43810170103, ha: a price waited 6.65 s for the next write to find it).
+pub async fn read<S, E, L, P>(
+    messages: &mut S,
+    stall: &mut Stall,
+    next: u64,
+    leader: &mut L,
+    place: &P,
+) -> Read
 where
     S: futures_util::Stream<Item = Result<jetstream::Message, E>> + Unpin,
     E: std::fmt::Display,
     L: Leader,
+    P: Place,
 {
+    let mut leader_at = tokio::time::Instant::now() + STALL_LOOK_EVERY;
     loop {
-        match tokio::time::timeout(STALL_LOOK_EVERY, gather(messages)).await {
+        let until = if place.may_be_taken_back() {
+            leader_at.min(tokio::time::Instant::now() + TAKEN_BACK_LOOK_EVERY)
+        } else {
+            leader_at
+        };
+        match tokio::time::timeout_at(until, gather(messages)).await {
             Ok(Ok(batch)) => {
                 stall.delivered();
                 return Read::Batch(batch);
             }
             Ok(Err(failed)) => return Read::Stopped(failed),
-            Err(_) => match leader.last().await {
-                Ok(last) if stall.looked(tokio::time::Instant::now(), last, next) => {
-                    return Read::Stalled { last };
+            Err(_) => {
+                if place.may_be_taken_back() && place.taken_back().await {
+                    return Read::TakenBack;
                 }
-                Ok(_) => {}
-                Err(failed) => {
-                    tracing::debug!(%failed, "the write-ahead stream's leader did not say how far it is");
+                if tokio::time::Instant::now() < leader_at {
+                    continue;
                 }
-            },
+                leader_at = tokio::time::Instant::now() + STALL_LOOK_EVERY;
+                match leader.last().await {
+                    Ok(last) if stall.looked(tokio::time::Instant::now(), last, next) => {
+                        return Read::Stalled { last };
+                    }
+                    Ok(_) => {}
+                    Err(failed) => {
+                        tracing::debug!(%failed, "the write-ahead stream's leader did not say how far it is");
+                    }
+                }
+            }
         }
     }
 }
@@ -1290,6 +1391,77 @@ mod tests {
 
     type Delivered = futures_util::stream::Pending<Result<jetstream::Message, String>>;
 
+    /// A place no move may take back.
+    struct Still;
+
+    impl Place for Still {
+        fn may_be_taken_back(&self) -> bool {
+            false
+        }
+
+        async fn taken_back(&self) -> bool {
+            panic!("asked while no switch may take it back")
+        }
+    }
+
+    /// A place a switch may take back, taken back at the `at`th look; it
+    /// counts the looks.
+    struct Looked {
+        may: bool,
+        at: usize,
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Place for Looked {
+        fn may_be_taken_back(&self) -> bool {
+            self.may
+        }
+
+        async fn taken_back(&self) -> bool {
+            self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.at
+        }
+    }
+
+    /// A reader delivering nothing, its writer's place taken back by a
+    /// move's switch, says so within a few looks -- never only once
+    /// another write comes, nor at the stall look (PR CI 43810170103, ha: a
+    /// price waited 6.65 s for the next write). The store is asked only
+    /// while a switch may take the place back.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_reader_whose_place_was_taken_back_says_so_within_its_looks() {
+        let mut quiet: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let place = Looked {
+            may: true,
+            at: 3,
+            looks: Default::default(),
+        };
+        let began = tokio::time::Instant::now();
+        let said = tokio::time::timeout(
+            STALL_LOOK_EVERY,
+            read(&mut quiet, &mut stall, 10, &mut Says(9), &place),
+        )
+        .await;
+        assert!(matches!(said, Ok(Read::TakenBack)), "{said:?}");
+        assert_eq!(began.elapsed(), TAKEN_BACK_LOOK_EVERY * 3);
+        assert!(TAKEN_BACK_LOOK_EVERY * 3 < STALL_LOOK_EVERY);
+        // No switch may take it back: never asked, the reader reads on.
+        let mut quiet: Delivered = futures_util::stream::pending();
+        let mut stall = Stall::new(STALL_AFTER);
+        let place = Looked {
+            may: false,
+            at: 1,
+            looks: Default::default(),
+        };
+        let waited = tokio::time::timeout(
+            STALL_AFTER * 4,
+            read(&mut quiet, &mut stall, 10, &mut Says(9), &place),
+        )
+        .await;
+        assert!(waited.is_err(), "a quiet reader kept reading");
+        assert_eq!(place.looks.into_inner(), 0, "the store asked for nothing");
+    }
+
     #[test]
     fn a_reader_is_on_the_leader_only_where_it_was_placed_there() {
         assert!(on_leader(Some("js-0"), Some("js-0")));
@@ -1324,7 +1496,7 @@ mod tests {
         let mut stopped: Delivered = futures_util::stream::pending();
         let mut stall = Stall::new(STALL_AFTER);
         let began = tokio::time::Instant::now();
-        match read(&mut stopped, &mut stall, 593, &mut Says(609)).await {
+        match read(&mut stopped, &mut stall, 593, &mut Says(609), &Still).await {
             Read::Stalled { last } => assert_eq!(last, 609),
             other => panic!("not said to have stalled: {other:?}"),
         }
@@ -1338,7 +1510,7 @@ mod tests {
         let mut stall = Stall::new(STALL_AFTER);
         let waited = tokio::time::timeout(
             STALL_AFTER * 10,
-            read(&mut quiet, &mut stall, 610, &mut Says(609)),
+            read(&mut quiet, &mut stall, 610, &mut Says(609), &Still),
         )
         .await;
         assert!(waited.is_err(), "a quiet stream's reader kept reading");
@@ -1421,7 +1593,7 @@ mod tests {
         let mut ended = futures_util::stream::empty::<Result<jetstream::Message, String>>();
         let mut stall = Stall::new(STALL_AFTER);
         assert!(matches!(
-            read(&mut ended, &mut stall, 1, &mut Says(0)).await,
+            read(&mut ended, &mut stall, 1, &mut Says(0), &Still).await,
             Read::Stopped(_)
         ));
     }
