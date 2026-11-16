@@ -2941,3 +2941,23 @@ async fn a_write_past_the_plugin_s_share_is_held_and_one_past_its_deadline_is_re
     );
     assert_eq!(sent(), before + 1);
 }
+
+/// Item 32 (step 3d, checkpoint 5): a store's refusal of a write under an
+/// epoch no longer its shard's reaches the plugin FAILED_PRECONDITION with
+/// REFUSAL_REASON_SHARD_FENCED and the words, and says to the process that
+/// this shard is fenced -- what its sidecar exits on, as on a lost Lease.
+#[tokio::test]
+async fn a_write_refused_as_fenced_is_failed_precondition_and_the_sidecar_is_told_to_exit() {
+    let words = "fenced: this shard's epoch is no longer the instance's";
+    let status = super::refused(meridian_bus::BusError::HandlerFailed {
+        topic: "platform.lake.command.record-prices".into(),
+        detail: meridian_bus::refusal(RefusalReason::ShardFenced as i32, words),
+    });
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), words);
+    assert_eq!(reason(&status), Some(RefusalReason::ShardFenced));
+    assert!(crate::shards::was_fenced());
+    tokio::time::timeout(std::time::Duration::from_secs(1), crate::shards::fenced())
+        .await
+        .expect("the process is told");
+}

@@ -89,7 +89,12 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// From step 3d (the resilience spec's section 6.7), a write handed to the
 /// writer group owning its partition: the lake's `internal.record` and the
 /// book's `internal.command`, each to its store's members alone.
-const COMPONENT_TOPICS: [(&str, &str); 22] = [
+///
+/// From step 3d's checkpoint 5 (item 32), a plugin shard's epoch raised in
+/// each writer group: `raise-shard.{group}`, the lake's and the book's,
+/// asked by the lake's control writer of every group before it answers a
+/// take.
+const COMPONENT_TOPICS: [(&str, &str); 24] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
     ("analytics", "platform.analytics.internal.members"),
     ("analytics", "platform.analytics.internal.standing.*"),
@@ -99,6 +104,7 @@ const COMPONENT_TOPICS: [(&str, &str); 22] = [
     ("lake", "platform.lake.internal.changes.*"),
     ("lake", "platform.lake.internal.read-from-writer"),
     ("lake", "platform.lake.internal.record"),
+    ("lake", "platform.lake.internal.raise-shard.*"),
     ("lake", "$JS.API.STREAM.*.LAKE_WRITE_AHEAD"),
     ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD"),
     ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>"),
@@ -106,6 +112,7 @@ const COMPONENT_TOPICS: [(&str, &str); 22] = [
     ("bor", "platform.book.internal.read-changes"),
     ("bor", "platform.book.internal.changes.*"),
     ("bor", "platform.book.internal.command"),
+    ("bor", "platform.book.internal.raise-shard.*"),
     ("instrument", "platform.reference.internal.read-changes"),
     ("instrument", "platform.reference.internal.changes.*"),
     ("street", "platform.street.internal.read-changes"),
@@ -115,12 +122,14 @@ const COMPONENT_TOPICS: [(&str, &str); 22] = [
 ];
 
 /// Who else holds a component's topic (topics.md's "Who else is granted
-/// it"): the analytics component, the lake's and the book's change logs.
-const COMPONENT_TOPICS_ALSO: [(&str, &str); 4] = [
+/// it"): the analytics component, the lake's and the book's change logs;
+/// and the lake, the book's `raise-shard.{group}` (step 3d, item 32).
+const COMPONENT_TOPICS_ALSO: [(&str, &str); 5] = [
     ("analytics", "platform.lake.internal.read-changes"),
     ("analytics", "platform.lake.internal.changes.*"),
     ("analytics", "platform.book.internal.read-changes"),
     ("analytics", "platform.book.internal.changes.*"),
+    ("lake", "platform.book.internal.raise-shard.*"),
 ];
 
 /// Every component topic a credential holding `components` is granted.

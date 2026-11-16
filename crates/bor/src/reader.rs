@@ -192,7 +192,15 @@ fn past_positions(read: &PositionsRead) -> bool {
 }
 
 impl Store for ReaderStore {
-    fn act(&self, _: &str, _: &str, _: &str, _: &[u8], _: &mut Decide<'_>) -> Result<Acted> {
+    fn act_stamped(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[u8],
+        _: Option<&crate::store::ShardStamp>,
+        _: &mut Decide<'_>,
+    ) -> Result<Acted> {
         Err(acted())
     }
 

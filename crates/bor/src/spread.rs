@@ -156,6 +156,17 @@ impl Spread {
     }
 
     /// The store of database `d`.
+    /// A plugin shard's epoch raised in every database this group may
+    /// write a command to (step 3d, checkpoint 5, item 32): the highest held
+    /// after.
+    fn raise_everywhere(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let mut held = 0;
+        for store in &self.stores {
+            held = held.max(store.raise_shard(instance, shard, epoch)?);
+        }
+        Ok(held)
+    }
+
     pub fn database(&self, d: u32) -> &Arc<PostgresStore> {
         &self.stores[d as usize]
     }
@@ -507,12 +518,17 @@ impl Spread {
 }
 
 impl Store for Spread {
-    fn act(
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        self.raise_everywhere(instance, shard, epoch)
+    }
+
+    fn act_stamped(
         &self,
         account_id: &str,
         message_id: &str,
         idempotency_key: &str,
         request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
         // Where it is placed, wherever that is: the store then hands an
@@ -545,7 +561,14 @@ impl Store for Spread {
             if crate::moves::is_open_key(idempotency_key) {
                 self.bring_in(account_id, d)?;
             }
-            match store.act(account_id, message_id, idempotency_key, request, decide) {
+            match store.act_stamped(
+                account_id,
+                message_id,
+                idempotency_key,
+                request,
+                shard,
+                decide,
+            ) {
                 // Its own group's partition headed elsewhere: moved home, or
                 // not yet -- routed again.
                 Err(StoreError::NotOwned { partition, group }) if group == self.groups.mine() => {

@@ -29,6 +29,35 @@ use std::sync::{Mutex, RwLock};
 use meridian_domain::v1::{ObservationsWantedEvent, WantWithdrawnEvent};
 use tokio::sync::watch;
 
+/// A store refused one of this sidecar's writes as fenced (step 3d,
+/// checkpoint 5, item 32: `REFUSAL_REASON_SHARD_FENCED`): another pod took
+/// its shard. Said once by the refusal's path; the process waits on it and
+/// exits, as on a lost Lease, and its pod comes back as the standby.
+static FENCED: std::sync::LazyLock<watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| watch::channel(false).0);
+
+/// Say this sidecar's shard was fenced: its plugin has its refusal, and
+/// the process ends.
+pub fn say_fenced(words: &str) {
+    if !*FENCED.borrow() {
+        tracing::error!(words, "a store refused a write as fenced: this shard's epoch is no longer the instance's; stopping");
+    }
+    FENCED.send_replace(true);
+}
+
+/// Whether a store has refused a write as fenced.
+pub fn was_fenced() -> bool {
+    *FENCED.borrow()
+}
+
+/// Wait until a store refuses a write as fenced.
+pub async fn fenced() {
+    let mut seen = FENCED.subscribe();
+    if seen.wait_for(|fenced| *fenced).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// The most standing wants a shard keeps to share again when the live
 /// shards change: the oldest forgotten first, and shared again at the
 /// lake's redelivery. As many one-off wants are kept beside them, for what

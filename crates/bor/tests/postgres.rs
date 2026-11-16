@@ -8228,3 +8228,92 @@ async fn t_a_writer_told_to_stop_commits_nothing_beside_its_replacement() {
         ))
     });
 }
+
+// ── A plugin shard's epoch fence (step 3d, checkpoint 5, item 32) ───────────
+
+/// A bus whose sidecar stamps shard 1 at `epoch` on every command, serving
+/// the book over `store`: one of an instance's pods, before and after a take.
+fn stamped(store: &Arc<PostgresStore>, epoch: u64) -> Arc<Bus> {
+    let (bus, _) = wired_with(Arc::clone(store));
+    bus.stamp_shard(1, epoch).unwrap();
+    bus
+}
+
+/// A command stamped with a shard's epoch, checked in its batch's own
+/// transaction against `book_shard_fence`: lower is refused and journals
+/// nothing, equal passes, higher raises; a raise the lake's control writer
+/// asks is never taken back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises() {
+    let store = blocking(store);
+    let instance = "operations-test-1";
+    // The instance's earlier takes: its fence row, as the lake's control
+    // writer asked this group to raise it.
+    let shard_row = |store: &PostgresStore| {
+        let mut client = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+        client
+            .execute(
+                "DELETE FROM book_shard_fence WHERE instance = $1",
+                &[&instance],
+            )
+            .unwrap();
+        store.raise_shard(instance, 1, 1).unwrap()
+    };
+    assert_eq!(blocking(|| shard_row(&store)), 1);
+    let (one, two, three) = (stamped(&store, 1), stamped(&store, 2), stamped(&store, 3));
+    let account = |tag: &str| unique(&format!("ACC-{tag}"));
+
+    // Equal passes.
+    let a = account("a");
+    send(
+        &one,
+        RECORD_OPENING_BALANCE,
+        &opening(&a, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    // Higher raises, and passes.
+    let b = account("b");
+    send(
+        &three,
+        RECORD_OPENING_BALANCE,
+        &opening(&b, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    // Lower is refused, with the words, and journals nothing.
+    let c = account("c");
+    let refused = send(
+        &two,
+        RECORD_OPENING_BALANCE,
+        &opening(&c, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains(meridian_changes::shard_fence::WORDS),
+        "{refused}"
+    );
+    assert!(blocking(|| store.journal(&c).unwrap().is_empty()));
+    // A raise heard from the lake's control writer, never down; the pod at
+    // the old epoch is refused from then on.
+    assert_eq!(blocking(|| store.raise_shard(instance, 1, 2).unwrap()), 3);
+    assert_eq!(blocking(|| store.raise_shard(instance, 1, 5).unwrap()), 5);
+    let d = account("d");
+    let refused = send(
+        &three,
+        RECORD_OPENING_BALANCE,
+        &opening(&d, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains(meridian_changes::shard_fence::WORDS),
+        "{refused}"
+    );
+    blocking(move || drop((one, two, three, store)));
+}

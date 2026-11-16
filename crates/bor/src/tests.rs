@@ -2515,3 +2515,62 @@ async fn a_book_readers_reply_says_the_position_it_was_answered_at() {
     // primary's.
     assert_eq!(events(Some(ahead)).await, ahead);
 }
+
+/// A plugin shard's epoch fence on the in-memory book (step 3d, checkpoint
+/// 5, item 32): a command stamped lower than the shard's held is refused
+/// FAILED_PRECONDITION's REFUSAL_REASON_SHARD_FENCED and journals nothing;
+/// equal passes; higher raises; a raise the lake's control writer asks is
+/// seen by the next command.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_under_a_lower_shard_epoch_is_refused_on_the_memory_book() {
+    let store = Arc::new(MemoryStore::new());
+    let pod = |epoch: u64| {
+        let bus = Arc::new(Bus::single(
+            "operations-sample-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+        ));
+        serve(bus.clone(), store.clone(), bus.clock());
+        resolving(&bus);
+        bus.stamp_shard(0, epoch).unwrap();
+        bus
+    };
+    let (one, two, three) = (pod(1), pod(2), pod(3));
+    let opening_of = |account: &str| RecordOpeningBalanceRequest {
+        account_id: account.into(),
+        idempotency_key: format!("open-{account}"),
+        ..opening()
+    };
+    let send_opening = |bus: Arc<Bus>, account: &'static str| {
+        let request = opening_of(account);
+        async move {
+            send(
+                &bus,
+                RECORD_OPENING_BALANCE,
+                "meridian.v1.RecordOpeningBalanceRequest",
+                &request,
+                Some(PERSON),
+            )
+            .await
+        }
+    };
+    send_opening(Arc::clone(&one), "ACC-S1").await.unwrap();
+    send_opening(Arc::clone(&three), "ACC-S3").await.unwrap();
+    let refused = send_opening(Arc::clone(&two), "ACC-S2").await.unwrap_err();
+    assert_eq!(
+        code(&refused),
+        Some(RefusalReason::ShardFenced),
+        "{refused}"
+    );
+    assert!(refused.contains(meridian_changes::shard_fence::WORDS));
+    assert!(store.journal("ACC-S2").unwrap().is_empty());
+    assert_eq!(store.raise_shard("operations-sample-1", 0, 4).unwrap(), 4);
+    let refused = send_opening(Arc::clone(&three), "ACC-S4")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(&refused),
+        Some(RefusalReason::ShardFenced),
+        "{refused}"
+    );
+}

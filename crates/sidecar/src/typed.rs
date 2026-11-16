@@ -1630,6 +1630,18 @@ pub(crate) fn refused(failed: BusError) -> Status {
                     words.to_string(),
                 )
             }
+            // A write under an epoch no longer its shard's (step 3d,
+            // checkpoint 5, item 32): FAILED_PRECONDITION to the plugin,
+            // and this sidecar exits, as on a lost Lease.
+            Some((RefusalReason::ShardFenced, words)) => {
+                crate::shards::say_fenced(words);
+                refused_naming(
+                    Code::FailedPrecondition,
+                    words.to_string(),
+                    RefusalReason::ShardFenced,
+                    Vec::new(),
+                )
+            }
             // A store that could not check the command, nothing recorded:
             // to be tried again, so the status a caller retries (contract
             // v10). Every other refusal of a component's is `aborted`.

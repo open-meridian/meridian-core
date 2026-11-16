@@ -173,6 +173,8 @@ pub fn takeover_word(reason: i32) -> &'static str {
         TakeoverReason::SteppedDown => "the writer stepped down",
         TakeoverReason::Moved => "a partition moved",
         TakeoverReason::DatabaseTimeline => "the database's timeline moved",
+        // A plugin shard's take (step 3d, checkpoint 5, item 32).
+        TakeoverReason::Released => "its lease was free",
         TakeoverReason::Unspecified => "not said",
     }
 }
@@ -201,16 +203,19 @@ pub fn check_word(check: i32) -> &'static str {
 /// The store and the partition a history item's record names, where it
 /// names them: what a caller follows a move or a split by, rather than by
 /// the item's words (2026-11-15). A split's partition is its parent; an
-/// account's move is the book's, its partition the one it left.
-pub fn history_names(item: &ResilienceHistoryItem) -> (Option<&str>, Option<&str>) {
+/// account's move is the book's, its partition the one it left. A plugin
+/// shard's take names its instance and `shard <n>` (step 3d, checkpoint 5,
+/// item 32; approved 2026-11-16).
+pub fn history_names(item: &ResilienceHistoryItem) -> (Option<String>, Option<String>) {
     let (component, partition) = match &item.item {
-        Some(Item::WriterTookOver(r)) => (r.component.as_str(), ""),
-        Some(Item::PartitionMoved(r)) => (r.component.as_str(), r.partition.as_str()),
-        Some(Item::PartitionSplit(r)) => ("lake", r.parent.as_str()),
-        Some(Item::PartitionMoveAborted(r)) => (r.component.as_str(), r.partition.as_str()),
-        Some(Item::AccountMoved(r)) => ("bor", r.from_partition.as_str()),
-        Some(Item::IntegrityFinding(r)) => (r.component.as_str(), r.partition.as_str()),
-        _ => ("", ""),
+        Some(Item::WriterTookOver(r)) => (r.component.clone(), String::new()),
+        Some(Item::PartitionMoved(r)) => (r.component.clone(), r.partition.clone()),
+        Some(Item::PartitionSplit(r)) => ("lake".to_string(), r.parent.clone()),
+        Some(Item::PartitionMoveAborted(r)) => (r.component.clone(), r.partition.clone()),
+        Some(Item::AccountMoved(r)) => ("bor".to_string(), r.from_partition.clone()),
+        Some(Item::IntegrityFinding(r)) => (r.component.clone(), r.partition.clone()),
+        Some(Item::ShardTookOver(r)) => (r.instance.clone(), format!("shard {}", r.shard)),
+        _ => (String::new(), String::new()),
     };
     (
         Some(component).filter(|c| !c.is_empty()),
@@ -233,6 +238,25 @@ pub fn history_words(item: &ResilienceHistoryItem) -> (i64, &'static str, String
                     String::new()
                 } else {
                     format!(" from {}", r.previous_member)
+                },
+                r.epoch,
+                takeover_word(r.reason)
+            ),
+        ),
+        // A plugin shard taken by a pod, its epoch raised (step 3d,
+        // checkpoint 5, item 32).
+        Some(Item::ShardTookOver(r)) => (
+            r.took_over_at_ns,
+            "shard taken over",
+            format!(
+                "{} shard {}: {} took it{}, epoch {}: {}",
+                r.instance,
+                r.shard,
+                r.holder,
+                if r.previous_holder.is_empty() {
+                    String::new()
+                } else {
+                    format!(" from {}", r.previous_holder)
                 },
                 r.epoch,
                 takeover_word(r.reason)
@@ -987,6 +1011,44 @@ mod tests {
                  kraken-1:quotes/8000-ffff after sequence 41, by local|ada"
                     .to_string()
             )
+        );
+        // A plugin shard taken (step 3d, checkpoint 5, item 32): named by its
+        // instance and shard, with both holders, the epoch and why.
+        let shard = ResilienceHistoryItem {
+            item: Some(Item::ShardTookOver(meridian_domain::v1::ShardTookOver {
+                instance: "kraken-1".into(),
+                shard: 1,
+                epoch: 5,
+                holder: "pod-b".into(),
+                previous_holder: "pod-a".into(),
+                reason: TakeoverReason::LeaseLapsed as i32,
+                took_over_at_ns: 9,
+            })),
+        };
+        assert_eq!(
+            history_words(&shard),
+            (
+                9,
+                "shard taken over",
+                "kraken-1 shard 1: pod-b took it from pod-a, epoch 5: its lease lapsed".to_string()
+            )
+        );
+        assert_eq!(
+            history_names(&shard),
+            (Some("kraken-1".to_string()), Some("shard 1".to_string()))
+        );
+        let released = ResilienceHistoryItem {
+            item: Some(Item::ShardTookOver(meridian_domain::v1::ShardTookOver {
+                instance: "kraken-1".into(),
+                holder: "pod-a".into(),
+                epoch: 1,
+                reason: TakeoverReason::Released as i32,
+                ..Default::default()
+            })),
+        };
+        assert_eq!(
+            history_words(&released).2,
+            "kraken-1 shard 0: pod-a took it, epoch 1: its lease was free"
         );
         let digest = ResilienceHistoryItem {
             item: Some(Item::PartitionMoveAborted(PartitionMoveAborted {

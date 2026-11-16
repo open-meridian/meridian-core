@@ -33,6 +33,7 @@ use crate::store::{
     Query, Recorded, Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind,
     When, WriteAheadBatch, WriteAheadPosition,
 };
+use crate::store::{shard_at, ShardFenced, ShardStamp};
 
 type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 type Connection =
@@ -1680,6 +1681,7 @@ fn again(failed: &StoreError) -> StoreError {
             field,
             words: words.clone(),
         },
+        StoreError::ShardFenced(fenced) => StoreError::ShardFenced(fenced.clone()),
     }
 }
 
@@ -1698,7 +1700,51 @@ fn aliases_in(client: &mut impl GenericClient) -> Result<BTreeMap<String, String
         .collect())
 }
 
+/// Each part's plugin shard's epoch checked in `tx` against the lake's
+/// `lake_shard_fence` (step 3d, checkpoint 5, item 32), in its own
+/// transaction's order: by place, the refusal of a part whose epoch is lower
+/// than its shard's held; none for a part that passes or names no shard.
+fn shards_checked<'a>(
+    tx: &mut Transaction<'_>,
+    stamps: impl Iterator<Item = Option<&'a ShardStamp>>,
+) -> Result<Vec<Option<ShardFenced>>> {
+    let stamps: Vec<Option<&ShardStamp>> = stamps.collect();
+    if stamps.iter().all(Option::is_none) {
+        return Ok(vec![None; stamps.len()]);
+    }
+    let checked =
+        meridian_changes::shard_fence::check(tx, meridian_changes::shard_fence::LAKE, &stamps)
+            .map_err(unavailable)?;
+    Ok(checked
+        .into_iter()
+        .map(|checked| {
+            checked
+                .inspect_err(|fenced| {
+                    tracing::warn!(
+                        detail = fenced.detail(),
+                        "a write refused by its shard's epoch"
+                    );
+                })
+                .err()
+        })
+        .collect())
+}
+
 impl PostgresStore {
+    /// One part recorded alone, under its plugin shard's stamp where it
+    /// names one (step 3d, checkpoint 5, item 32).
+    fn record_alone(
+        &self,
+        dataset: &str,
+        rows: Vec<Observation>,
+        shard: Option<&ShardStamp>,
+        now_ns: i64,
+    ) -> Result<Recorded> {
+        self.record_together(dataset, vec![rows], &[shard.cloned()], now_ns)?
+            .pop()
+            .unwrap_or_else(|| Ok(Recorded::default()))
+    }
+
     /// Batches of one dataset recorded in one transaction (step 3d, group
     /// commit; section 6.5), numbered in turn as one, each answered with what
     /// it did: the epoch checked once, every row's latest version and every
@@ -1708,6 +1754,7 @@ impl PostgresStore {
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
         // Adopted before a connection is taken: one store never waits on
@@ -1719,8 +1766,10 @@ impl PostgresStore {
         // advice on writer groups, approved 2026-11-14).
         let began = std::time::Instant::now();
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let done = self
-            .record_dataset(&mut tx, dataset, parts, now_ns)
+        // Each part's plugin shard's epoch checked first, its row held for
+        // the transaction (step 3d, checkpoint 5, item 32).
+        let done = shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
+            .and_then(|fenced| self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns))
             .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
         meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
@@ -1738,11 +1787,16 @@ impl PostgresStore {
     /// alone. Every row key's latest version is read across the dataset's
     /// ranges in one look, and each subject's last sequence across its
     /// range's lineage.
+    ///
+    /// `fenced` is each part's plugin shard's check, by its place, made
+    /// earlier in `tx` ([`shards_checked`]): a part refused there is refused
+    /// alone here, nothing of it recorded.
     fn record_dataset(
         &self,
         tx: &mut Transaction<'_>,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        fenced: &[Option<ShardFenced>],
         now_ns: i64,
     ) -> Result<Vec<Result<Recorded>>> {
         lock_dataset_to_record(tx, dataset)?;
@@ -1783,6 +1837,10 @@ impl PostgresStore {
         let mut by_range: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
         let mut answered: Vec<Result<Recorded>> = Vec::with_capacity(parts.len());
         for (at, (rows, refused)) in parts.into_iter().zip(refused).enumerate() {
+            if let Some(Some(fenced)) = fenced.get(at) {
+                answered.push(Err(StoreError::ShardFenced(fenced.clone())));
+                continue;
+            }
             if let Some(refused) = refused {
                 answered.push(Err(refused));
                 continue;
@@ -2511,12 +2569,22 @@ impl PostgresStore {
             .map(|(dataset, _)| dataset.clone())
             .collect();
         let part_sizes: Vec<usize> = batch.parts.iter().map(|(_, rows)| rows.len()).collect();
+        // Every part's plugin shard's epoch checked at once, in one order,
+        // before any head's lock (step 3d, checkpoint 5, item 32).
+        let fenced = shards_checked(
+            &mut tx,
+            (0..batch.parts.len()).map(|at| shard_at(&batch.shards, at)),
+        )?;
         for (place, (dataset, rows)) in batch.parts.into_iter().enumerate() {
             by_dataset.entry(dataset).or_default().push((place, rows));
         }
         for (dataset, parts) in by_dataset {
             let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
-            let done = self.record_dataset(&mut tx, &dataset, rows, now_ns)?;
+            let theirs: Vec<Option<ShardFenced>> = places
+                .iter()
+                .map(|place| fenced.get(*place).cloned().flatten())
+                .collect();
+            let done = self.record_dataset(&mut tx, &dataset, rows, &theirs, now_ns)?;
             for (place, part) in places.into_iter().zip(done) {
                 answered[place] = part;
             }
@@ -2687,26 +2755,26 @@ impl Store for PostgresStore {
     }
 
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
-        self.record_together(dataset, vec![rows], now_ns)?
-            .pop()
-            .unwrap_or_else(|| Ok(Recorded::default()))
+        self.record_alone(dataset, rows, None, now_ns)
     }
 
     fn record_parts(
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
         now_ns: i64,
     ) -> Vec<Result<Recorded>> {
         if parts.len() < 2 {
             return parts
                 .into_iter()
-                .map(|rows| self.record(dataset, rows, now_ns))
+                .enumerate()
+                .map(|(at, rows)| self.record_alone(dataset, rows, shard_at(shards, at), now_ns))
                 .collect();
         }
         // Kept to be tried again alone: a batch is at most 512 KiB.
         let each = parts.clone();
-        match self.record_together(dataset, parts, now_ns) {
+        match self.record_together(dataset, parts, shards, now_ns) {
             Ok(done) => done,
             // An unexpected database error: each part tried again alone
             // (section 6.5), so it is refused only for the part it was. A
@@ -2719,7 +2787,10 @@ impl Store for PostgresStore {
                     "a batch's transaction failed: each of its parts is tried alone"
                 );
                 each.into_iter()
-                    .map(|rows| self.record(dataset, rows, now_ns))
+                    .enumerate()
+                    .map(|(at, rows)| {
+                        self.record_alone(dataset, rows, shard_at(shards, at), now_ns)
+                    })
                     .collect()
             }
             Err(failed) => each.iter().map(|_| Err(again(&failed))).collect(),
@@ -2835,6 +2906,54 @@ impl Store for PostgresStore {
             )],
         )?;
         tx.commit().map_err(unavailable)
+    }
+
+    fn take_shard(
+        &self,
+        mut took: meridian_domain::v1::ShardTookOver,
+        lease_transitions: u64,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        if !self.groups.holds_control() {
+            return Err(StoreError::Unavailable(
+                "a shard's take is the lake's control writer's: writer group 0's".into(),
+            ));
+        }
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The shard's row first, as every batch takes it, then the control
+        // partition's head (step 3d, checkpoint 5, item 32).
+        took.epoch = meridian_changes::shard_fence::take(
+            &mut tx,
+            meridian_changes::shard_fence::LAKE,
+            &took.instance,
+            took.shard,
+            lease_transitions,
+        )
+        .map_err(unavailable)?;
+        let entry = (
+            crate::store::CONTROL_SHARD_TOOK_OVER,
+            took.encode_to_vec(),
+            took.took_over_at_ns,
+        );
+        self.log_control(&mut tx, &[entry])?;
+        tx.commit().map_err(unavailable)?;
+        Ok(took)
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let held = meridian_changes::shard_fence::raise_to(
+            &mut tx,
+            meridian_changes::shard_fence::LAKE,
+            instance,
+            shard,
+            epoch,
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(held)
     }
 
     fn record_switches(&self, switches: &[meridian_domain::v1::SourceSwitched]) -> Result<()> {
@@ -3046,6 +3165,7 @@ impl Store for PostgresStore {
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded> {
         self.epoch_now()?;
@@ -3055,6 +3175,11 @@ impl Store for PostgresStore {
         }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // The write's plugin shard's epoch, first (step 3d, checkpoint 5,
+        // item 32).
+        if let Some(Some(fenced)) = shards_checked(&mut tx, std::iter::once(shard))?.pop() {
+            return Err(StoreError::ShardFenced(fenced));
+        }
         lock_dataset(&mut tx, dataset)?;
         // Each row in the open range of its first subject's hash, as a kept
         // row is placed (step 3d): numbered there, its values kept nowhere.

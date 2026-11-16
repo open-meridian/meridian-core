@@ -40,6 +40,9 @@ pub struct Command {
     pub message_id: String,
     pub idempotency_key: String,
     pub request: Vec<u8>,
+    /// Its plugin shard and epoch as its sidecar stamped it (step 3d,
+    /// checkpoint 5, item 32): checked in its batch's transaction.
+    pub shard: Option<meridian_changes::shard_fence::ShardStamp>,
 }
 
 /// What the leader asks a waiting caller.
@@ -289,6 +292,7 @@ mod tests {
             message_id: String::new(),
             idempotency_key: String::new(),
             request: vec![0; bytes],
+            shard: None,
         }
     }
 

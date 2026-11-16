@@ -485,7 +485,10 @@ fn run() -> Result<(), String> {
             if !groups.holds_control() {
                 let changes = meridian_changes::read_changes_topic("lake");
                 bus.serve_only(move |topic| {
-                    meridian_lake::service::is_record_write(topic) || topic == changes
+                    meridian_lake::service::is_record_write(topic)
+                        || topic == changes
+                        // Its raise of a shard's epoch (step 3d, item 32).
+                        || meridian_changes::shard_fence::is_raise_topic(topic)
                 });
             }
             tracing::info!(
@@ -590,6 +593,9 @@ fn run() -> Result<(), String> {
         let lake =
             meridian_lake::service::serve_grouped(bus.clone(), Arc::clone(&store), clock(), groups);
         lake.build_at_most(answers_at_once);
+        // The book's writer groups (`bor.writerGroups`; step 3d, checkpoint
+        // 5, item 32): each raises a shard's epoch before a take is answered.
+        lake.with_book_groups(book_writer_groups()?);
 
         // The write-ahead stream in `ha` (the resilience spec's section 4;
         // the rulings of 2026-11-08): the data plugins' writes taken from
@@ -788,4 +794,20 @@ fn lake_replica(
     Ok(Some(Arc::new(meridian_lake::spread::Spread::new(
         stores, groups,
     ))))
+}
+
+/// The book's count of writer groups, as the chart gives the lake
+/// `bor.writerGroups` (step 3d, checkpoint 5, item 32): 1 where unset.
+const BOR_WRITER_GROUPS_VAR: &str = "MERIDIAN_BOR_WRITER_GROUPS";
+
+fn book_writer_groups() -> Result<u32, String> {
+    match std::env::var(BOR_WRITER_GROUPS_VAR) {
+        Err(_) => Ok(1),
+        Ok(said) => said
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|count| (1..=64).contains(count))
+            .ok_or_else(|| format!("{BOR_WRITER_GROUPS_VAR} is {said:?}; a whole number, 1 to 64")),
+    }
 }

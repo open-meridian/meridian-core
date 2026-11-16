@@ -216,6 +216,13 @@ impl<L: Leases> Elector<L> {
         &self.settings
     }
 
+    /// The Lease's `leaseTransitions` as this member last wrote or read
+    /// it: one more on every take by another holder (step 3d, checkpoint 5,
+    /// item 32: the floor of a plugin shard's epoch). None before a read.
+    pub fn transitions(&self) -> Option<u64> {
+        self.observed.as_ref().map(|(record, _)| record.transitions)
+    }
+
     /// When this member last renewed as holder.
     pub fn renewed_at(&self) -> Option<Instant> {
         self.renewed_at

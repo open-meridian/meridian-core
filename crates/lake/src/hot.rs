@@ -783,9 +783,10 @@ impl Store for HotStore {
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        shards: &[Option<crate::store::ShardStamp>],
         now_ns: i64,
     ) -> Vec<Result<Recorded>> {
-        let done = self.inner.record_parts(dataset, parts, now_ns);
+        let done = self.inner.record_parts(dataset, parts, shards, now_ns);
         // Held in the parts' order, as they were numbered.
         for part in done.iter().flatten() {
             self.committed(dataset, &part.rows);
@@ -798,6 +799,18 @@ impl Store for HotStore {
         stream: &str,
     ) -> Result<Option<crate::store::WriteAheadPosition>> {
         self.inner.write_ahead_position(stream)
+    }
+
+    fn take_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+        lease_transitions: u64,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        self.inner.take_shard(took, lease_transitions)
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        self.inner.raise_shard(instance, shard, epoch)
     }
 
     /// The record's: the layer holds no view of the ranges' owners. Left to
@@ -914,9 +927,11 @@ impl Store for HotStore {
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&crate::store::ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded> {
-        self.inner.serve_unkept(dataset, rows, readers, now_ns)
+        self.inner
+            .serve_unkept(dataset, rows, readers, shard, now_ns)
     }
 
     fn read(&self, query: &Query) -> Result<Vec<Observation>> {

@@ -244,12 +244,13 @@ impl Writer {
 }
 
 impl Store for Writer {
-    fn act(
+    fn act_stamped(
         &self,
         account_id: &str,
         message_id: &str,
         idempotency_key: &str,
         request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
         // Placed first where it never was (step 3d; section 6.3): by its
@@ -258,9 +259,14 @@ impl Store for Writer {
             let key = self.placement_key(account_id)?;
             self.inner.place_first(account_id, &key)?;
         }
-        let acted = self
-            .inner
-            .act(account_id, message_id, idempotency_key, request, decide)?;
+        let acted = self.inner.act_stamped(
+            account_id,
+            message_id,
+            idempotency_key,
+            request,
+            shard,
+            decide,
+        )?;
         if let Acted::Committed(decided) = &acted {
             // An account moving away is not held here: its next acts are
             // another partition's, perhaps another group's (step 3d).
@@ -283,6 +289,10 @@ impl Store for Writer {
 
     fn writes(&self, account_id: &str) -> bool {
         self.inner.writes(account_id)
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        self.inner.raise_shard(instance, shard, epoch)
     }
 
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {

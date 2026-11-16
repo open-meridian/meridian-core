@@ -279,6 +279,12 @@ pub struct Bus {
     /// Told to stop, and writing nothing more here
     /// ([`Bus::stop_writing_here`]): every write is handed on.
     handing: Arc<std::sync::atomic::AtomicBool>,
+
+    /// A sidecar's plugin shard and its epoch, stamped on every message it
+    /// sends once set (step 3d, checkpoint 5, item 32; [`Bus::stamp_shard`]).
+    /// Unset, as for every core component and every one-pod instance's
+    /// sidecar: shard and epoch 0, which no fence checks.
+    shard: Arc<std::sync::OnceLock<(u32, u64)>>,
 }
 
 /// A member's hand-off of writes to their owners.
@@ -393,7 +399,24 @@ impl Bus {
             serves_only: RwLock::new(None),
             routing: Arc::default(),
             handing: Arc::default(),
+            shard: Arc::default(),
         }
+    }
+
+    /// Stamp every message this bus sends from here on with its plugin's
+    /// shard and the epoch the lake answered its take with (step 3d,
+    /// checkpoint 5, item 32: `MessageMeta.shard`, `.shard_epoch`). A
+    /// sidecar's alone, set once, before it serves: never by a plugin, and
+    /// never changed after -- a shard lost ends its process.
+    pub fn stamp_shard(&self, shard: u32, epoch: u64) -> Result<(), String> {
+        self.shard
+            .set((shard, epoch))
+            .map_err(|_| "this bus already stamps a shard".to_string())
+    }
+
+    /// The shard and epoch this bus stamps; none where it stamps none.
+    pub fn shard_stamped(&self) -> Option<(u32, u64)> {
+        self.shard.get().copied()
     }
 
     /// Route the topics `rules` match to the backends they name, beside the
@@ -1076,6 +1099,10 @@ impl Bus {
             // Contract v30's read_after (W4.4): a sidecar's session stamps
             // its plugin's reads (stage B); unset reads from the nearest member.
             read_after: stamp.read_after.clone(),
+            // A sidecar holding a shard (step 3d, checkpoint 5, item 32): its
+            // shard and epoch on every message, which the stores' fences check.
+            shard: self.shard.get().map_or(0, |(shard, _)| *shard),
+            shard_epoch: self.shard.get().map_or(0, |(_, epoch)| *epoch),
         }
     }
 }
@@ -1549,6 +1576,7 @@ mod tests {
             serves_only: RwLock::new(None),
             routing: Arc::default(),
             handing: Arc::default(),
+            shard: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

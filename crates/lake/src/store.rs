@@ -14,6 +14,7 @@ use meridian_domain::v1::{
 };
 
 use crate::row::{DataType, Observation};
+pub use meridian_changes::shard_fence::{ShardFenced, ShardStamp};
 use meridian_changes::{Change, ReadChangesReply, ReadError};
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +66,19 @@ pub enum StoreError {
     /// `SplitPartition`'s INVALID_ARGUMENT naming `partition`.
     #[error("{words}")]
     Invalid { field: &'static str, words: String },
+
+    /// A write refused by its plugin shard's epoch (step 3d, checkpoint 5,
+    /// item 32): another pod took the shard and the lake has seen its
+    /// epoch. FAILED_PRECONDITION, REFUSAL_REASON_SHARD_FENCED; nothing of
+    /// the part is recorded, and its sidecar exits.
+    #[error("{0}")]
+    ShardFenced(#[from] ShardFenced),
+}
+
+/// The shard stamp of a batch's part at `place`: none where the part was
+/// sent by no shard, or the batch names none ([`WriteAheadBatch::shards`]).
+pub fn shard_at(shards: &[Option<ShardStamp>], place: usize) -> Option<&ShardStamp> {
+    shards.get(place).and_then(Option::as_ref)
 }
 
 /// The field a restated row's valid time is refused by (the-lake rule 5),
@@ -147,6 +161,12 @@ pub struct WriteAheadBatch {
     /// The position the batch commits.
     pub through: WriteAheadPosition,
     pub parts: Vec<(String, Vec<Observation>)>,
+    /// Each part's plugin shard and epoch, by the part's place, as its
+    /// sidecar stamped the write (step 3d, checkpoint 5, item 32): checked
+    /// in the batch's transaction, a part whose epoch is lower than the
+    /// shard's held refused alone. A place past its end, or none, is a part
+    /// sent by no shard.
+    pub shards: Vec<Option<ShardStamp>>,
     /// Sequences the stream dropped before the lake took them, found by
     /// this batch: kept, so a later write naming one is known to follow a
     /// gap (W10.14).
@@ -369,6 +389,9 @@ pub const CONTROL_OWNER: &str = "meridian.v1.PartitionOwner";
 /// A range's split (step 3d; section 6.1, approved 2026-11-12): its
 /// `PartitionSplit`, in the `control` partition.
 pub const CONTROL_SPLIT: &str = "meridian.v1.PartitionSplit";
+/// A plugin shard's take (step 3d, checkpoint 5, item 32): its
+/// `ShardTookOver`, in the `control` partition.
+pub const CONTROL_SHARD_TOOK_OVER: &str = "meridian.v1.ShardTookOver";
 
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -778,26 +801,31 @@ pub trait Store: Send + Sync {
     /// what the parts before it numbered, and answered with what it did, in
     /// the parts' order. A store that commits them together tries each
     /// again alone after an unexpected database error.
+    ///
+    /// `shards` is each part's plugin shard and epoch, by its place (step
+    /// 3d, checkpoint 5, item 32): checked in the parts' transaction, a part
+    /// under an epoch lower than its shard's held refused alone
+    /// ([`StoreError::ShardFenced`]), a higher one raising it.
     fn record_parts(
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
         now_ns: i64,
-    ) -> Vec<Result<Recorded>> {
-        parts
-            .into_iter()
-            .map(|rows| self.record(dataset, rows, now_ns))
-            .collect()
-    }
+    ) -> Vec<Result<Recorded>>;
 
     /// A batch of a dataset whose licence forbids keeping it: numbered from
     /// its partition's head as any batch is, each row version 1, its values
     /// kept nowhere; only that it was served, and to whom (W10.7).
+    ///
+    /// `shard` is the write's plugin shard and epoch (step 3d, checkpoint
+    /// 5, item 32), checked in the same transaction as a kept part's is.
     fn serve_unkept(
         &self,
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded>;
 
@@ -832,6 +860,34 @@ pub trait Store: Send + Sync {
     fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
         let _ = stream;
         Err(no_write_ahead())
+    }
+
+    /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch
+    /// raised to max(the epoch held + 1, `lease_transitions`), at least 1,
+    /// and `took` recorded with that epoch as its `ShardTookOver` in the
+    /// `control` partition, in one transaction. The control writer's (group
+    /// 0's): its database holds the shard's epoch the takes are numbered by.
+    /// Answered with the record as kept.
+    fn take_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+        lease_transitions: u64,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        let _ = (took, lease_transitions);
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: the lake's control writer does".into(),
+        ))
+    }
+
+    /// A plugin shard's epoch raised to `epoch` where this group's
+    /// database holds it lower -- a take its control writer asked it to
+    /// raise -- and the epoch held after (step 3d, checkpoint 5, item 32).
+    /// In every database the group writes.
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let _ = (instance, shard, epoch);
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: a writer does".into(),
+        ))
     }
 
     /// A dataset gap's next state, its own record (W10.14; decisions/031),

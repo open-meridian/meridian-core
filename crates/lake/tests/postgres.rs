@@ -170,6 +170,7 @@ fn a_priority_carries_the_stale_guard_and_what_is_served_wants_and_misses_are_ke
             &dataset,
             vec![close(&dataset, "x", "LCL-BTC", "", 1)],
             &["reporting-1".to_string()],
+            None,
             7,
         )
         .unwrap();
@@ -1013,6 +1014,7 @@ fn the_rows_in_force_are_counted_by_their_effective_state_without_reading_every_
             &dataset,
             vec![close(&dataset, "d", &subject, "2026-10-16", 13)],
             &["reporting-1".to_string()],
+            None,
             2_500,
         )
         .unwrap();
@@ -7021,7 +7023,7 @@ fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept
         trade(&dataset, "u-h", &high, 21),
     ];
     let refused = zero
-        .serve_unkept(&dataset, mixed, &["reader".into()], 7_000)
+        .serve_unkept(&dataset, mixed, &["reader".into()], None, 7_000)
         .unwrap_err();
     assert!(
         matches!(
@@ -7035,6 +7037,7 @@ fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept
             &dataset,
             vec![trade(&dataset, "u-h", &high, 21)],
             &["reader".into()],
+            None,
             7_000,
         )
         .unwrap();
@@ -7044,6 +7047,7 @@ fn a_datasets_ranges_in_two_databases_keep_their_own_retention_counts_and_unkept
             &dataset,
             vec![trade(&dataset, "u-l", &low, 20)],
             &["reader".into()],
+            None,
             7_000,
         )
         .unwrap();
@@ -10499,4 +10503,153 @@ fn a_range_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_
         Some(1)
     );
     assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+}
+
+// ── A plugin shard's epoch fence (step 3d, checkpoint 5, item 32) ───────────
+
+fn took(instance: &str, shard: u32) -> meridian_domain::v1::ShardTookOver {
+    meridian_domain::v1::ShardTookOver {
+        instance: instance.to_string(),
+        shard,
+        holder: "feed-pod-b_1".into(),
+        previous_holder: "feed-pod-a_1".into(),
+        reason: meridian_domain::v1::TakeoverReason::LeaseLapsed as i32,
+        took_over_at_ns: 9_000,
+        ..Default::default()
+    }
+}
+
+/// A write stamped with a shard's epoch, checked in its own transaction
+/// against `lake_shard_fence`: lower is refused and records nothing, equal
+/// passes, higher raises -- by `record_parts`, by a write-ahead batch, and
+/// for a dataset whose licence keeps nothing. A take raises past the epoch
+/// held and the Lease's transitions, and is recorded in the control
+/// partition.
+#[test]
+fn a_write_under_a_lower_shard_epoch_is_refused_an_equal_passes_a_higher_raises() {
+    use meridian_lake::store::{ShardStamp, StoreError, WriteAheadBatch, WriteAheadPosition};
+    let store = store();
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let stamp = |epoch: u64| ShardStamp::of(&instance, 1, epoch);
+    let fenced = |done: &Result<meridian_lake::store::Recorded, StoreError>| {
+        matches!(done, Err(StoreError::ShardFenced(_)))
+    };
+
+    let first = store.take_shard(took(&instance, 1), 0).unwrap();
+    assert_eq!(first.epoch, 1, "a shard never taken: epoch 1");
+
+    // Equal passes.
+    let done = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "a", &subject, "2026-11-16", 1)]],
+        &[stamp(1)],
+        1_000,
+    );
+    assert_eq!(done[0].as_ref().unwrap().recorded, 1);
+    // Higher raises, and passes.
+    let done = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "b", &subject, "2026-11-16", 2)]],
+        &[stamp(3)],
+        2_000,
+    );
+    assert_eq!(done[0].as_ref().unwrap().recorded, 1);
+    // Lower is refused, with the words, and records nothing; a part beside
+    // it with no stamp passes.
+    let head = store.heads().unwrap()[&dataset];
+    let done = store.record_parts(
+        &dataset,
+        vec![
+            vec![close(&dataset, "c", &subject, "2026-11-16", 3)],
+            vec![close(&dataset, "d", &subject, "2026-11-16", 4)],
+        ],
+        &[stamp(2), None],
+        3_000,
+    );
+    assert!(fenced(&done[0]), "{:?}", done[0]);
+    assert_eq!(
+        done[0].as_ref().unwrap_err().to_string(),
+        meridian_changes::shard_fence::WORDS
+    );
+    assert_eq!(done[1].as_ref().unwrap().recorded, 1);
+    assert_eq!(
+        store.heads().unwrap()[&dataset],
+        head + 1,
+        "only the unstamped part"
+    );
+
+    // A write-ahead batch: the lower part refused alone, the rest and the
+    // position committed.
+    let stream = unique("STREAM");
+    let at = WriteAheadPosition {
+        sequence: 2,
+        at_ns: 4_000,
+    };
+    let done = store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: stream.clone(),
+                after: None,
+                through: at,
+                parts: vec![
+                    (
+                        dataset.clone(),
+                        vec![close(&dataset, "e", &subject, "2026-11-16", 5)],
+                    ),
+                    (
+                        dataset.clone(),
+                        vec![close(&dataset, "f", &subject, "2026-11-16", 6)],
+                    ),
+                ],
+                shards: vec![stamp(2), stamp(3)],
+                ..Default::default()
+            },
+            4_000,
+        )
+        .unwrap();
+    assert!(fenced(&done[0]), "{:?}", done[0]);
+    assert_eq!(done[1].as_ref().unwrap().recorded, 1);
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), Some(at));
+
+    // A dataset whose licence keeps nothing: served, fenced the same.
+    let served = store.serve_unkept(
+        &dataset,
+        vec![close(&dataset, "g", &subject, "2026-11-16", 7)],
+        &["reporting-1".to_string()],
+        stamp(2).as_ref(),
+        5_000,
+    );
+    assert!(fenced(&served), "{served:?}");
+
+    // A take raises past the epoch held, and past the Lease's transitions.
+    assert_eq!(store.take_shard(took(&instance, 1), 0).unwrap().epoch, 4);
+    assert_eq!(store.take_shard(took(&instance, 1), 9).unwrap().epoch, 9);
+    // Another shard of the instance is its own.
+    assert_eq!(store.take_shard(took(&instance, 0), 0).unwrap().epoch, 1);
+    // Each take is its own record in the control partition, with its epoch.
+    let recorded: Vec<u64> = store
+        .control_entries()
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _, _)| kind == "meridian.v1.ShardTookOver")
+        .filter_map(|(_, body, _)| {
+            use prost::Message as _;
+            meridian_domain::v1::ShardTookOver::decode(body.as_slice()).ok()
+        })
+        .filter(|took| took.instance == instance)
+        .map(|took| took.epoch)
+        .collect();
+    assert_eq!(recorded, vec![1, 4, 9, 1]);
+    // A raise heard from the control writer: never down.
+    assert_eq!(store.raise_shard(&instance, 1, 5).unwrap(), 9);
+    assert_eq!(store.raise_shard(&instance, 1, 12).unwrap(), 12);
+    let done = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "h", &subject, "2026-11-16", 8)]],
+        &[stamp(9)],
+        6_000,
+    );
+    assert!(fenced(&done[0]), "{:?}", done[0]);
 }

@@ -1701,6 +1701,7 @@ fn again(failed: &StoreError) -> StoreError {
         StoreError::Fenced(fenced) => StoreError::Fenced(*fenced),
         StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
         StoreError::Held(words) => StoreError::Held(words.clone()),
+        StoreError::ShardFenced(fenced) => StoreError::ShardFenced(fenced.clone()),
         StoreError::NotOwned { partition, group } => StoreError::NotOwned {
             partition: partition.clone(),
             group: *group,
@@ -1940,8 +1941,34 @@ impl PostgresStore {
         // The partition's last digest, its chain's end (step 3b).
         let mut last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
         let began = head;
+        // Each command's plugin shard's epoch, checked once for the batch
+        // under the head's lock (step 3d, checkpoint 5, item 32): a command
+        // under a lower one refused alone, its row held for the batch.
+        let stamps: Vec<Option<&crate::store::ShardStamp>> = batch
+            .iter()
+            .map(|pending| pending.command.shard.as_ref())
+            .collect();
+        let mut fenced = if stamps.iter().all(Option::is_none) {
+            vec![Ok(()); batch.len()]
+        } else {
+            meridian_changes::shard_fence::check(
+                &mut tx,
+                meridian_changes::shard_fence::BOOK,
+                &stamps,
+            )
+            .map_err(whole)?
+        }
+        .into_iter();
         let mut outcomes = Vec::with_capacity(batch.len());
         for pending in batch {
+            if let Some(Err(refused)) = fenced.next() {
+                tracing::warn!(
+                    detail = refused.detail(),
+                    "a command refused by its shard's epoch"
+                );
+                outcomes.push(Err(StoreError::ShardFenced(refused)));
+                continue;
+            }
             let outcome = self
                 .one(
                     &mut tx,
@@ -1982,6 +2009,7 @@ impl PostgresStore {
             message_id,
             idempotency_key,
             request,
+            ..
         } = &pending.command;
         // Its account's partition read again under the partition's lock
         // (section 6.3): an account found in another is acted on there.
@@ -2139,6 +2167,7 @@ impl PostgresStore {
         message_id: &str,
         idempotency_key: &str,
         request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
         // The writer's epoch, adopted before a connection is taken, so a
@@ -2151,6 +2180,7 @@ impl PostgresStore {
             message_id: message_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             request: request.to_vec(),
+            shard: shard.cloned(),
         };
         // An account never placed, with several partitions: placed by its
         // owner label first, never by its ID instead (step 3d; ruled
@@ -2231,19 +2261,42 @@ impl PostgresStore {
 }
 
 impl Store for PostgresStore {
-    fn act(
+    fn act_stamped(
         &self,
         account_id: &str,
         message_id: &str,
         idempotency_key: &str,
         request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
         // Held while its move is between its close and its open (step 3d;
         // section 6.8): tried again for at most the hold.
         crate::moves::holding(crate::moves::hold_now(), || {
-            self.act_once(account_id, message_id, idempotency_key, request, decide)
+            self.act_once(
+                account_id,
+                message_id,
+                idempotency_key,
+                request,
+                shard,
+                decide,
+            )
         })
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let held = meridian_changes::shard_fence::raise_to(
+            &mut tx,
+            meridian_changes::shard_fence::BOOK,
+            instance,
+            shard,
+            epoch,
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(held)
     }
 
     fn writes(&self, account_id: &str) -> bool {

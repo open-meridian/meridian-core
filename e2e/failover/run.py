@@ -1100,6 +1100,107 @@ def shard_admission(s, deployment):
         s.check(not admitted and says in why, f"shards: the launcher may not make one {what} ({why})")
 
 
+def shard_epoch(shard):
+    """The shard's epoch as the lake's database 0 holds it: 0 before any take."""
+    said = psql(f"select coalesce(max(epoch), 0) from lake_shard_fence "
+                f"where instance = '{SHARDED}' and shard = {shard}", quiet=True)
+    return int(said or 0)
+
+
+def shard_takes():
+    """How many shard takes the lake's control partition records."""
+    said = psql("select count(*) from lake_control_change where kind = 'meridian.v1.ShardTookOver'",
+                quiet=True)
+    return int(said or 0)
+
+
+def previous_log(pod_name, container="sidecar"):
+    """The log of the container's run before its last restart; empty where none."""
+    said = kubectl("logs", pod_name, "-c", container, "--previous", check=False, quiet=True)
+    return said.stdout.decode(errors="replace") if said.returncode == 0 else ""
+
+
+# How long the shard pods are cut from the API server: well past a Lease's
+# lapse (leases.durationSeconds, 6 s), so a shard stopping by the clock would
+# have stopped.
+SHARD_CUT_S = 15
+LOST = "the shard's lease is lost"
+
+
+def shards_fenced(s, settled):
+    """Step 3d, checkpoint 5, item 32: the epoch fence for plugin writes, as
+    the shards' sidecars meet it with the stub plugin, which writes nothing
+    (its writes' checks are item 33's, with the shard driver).
+
+    (a) Every pod of the instance cut from the API server, both ways, past
+    a Lease's lapse: a data shard writes on through it, fenced by its epoch,
+    and is never stopped by the clock -- no sidecar restarts, each Lease's
+    holder and each shard's epoch as they were, no take recorded.
+
+    (b) The holder of shard 1 alone cut from it: the standby takes the
+    Lease once it lapses, within the takeover's bound; the lake records one
+    take and raises the shard's epoch by one; the cut holder serves on
+    until it hears the API server again, finds another holder, and exits,
+    its pod coming back as the standby."""
+    names = {p["metadata"]["name"] for p in shard_pods()}
+    held = [shard_holder(n)[1] for n in range(SHARDS)]
+    epochs = [shard_epoch(n) for n in range(SHARDS)]
+    s.check(all(e >= 1 for e in epochs),
+            f"shards: each shard's epoch raised by the lake as its pod took it ({epochs})")
+    takes = shard_takes()
+    restarted = {n: restarts(n) for n in names}
+    began = time.time()
+    cut_api("-I", only=names)
+    try:
+        time.sleep(SHARD_CUT_S)
+    finally:
+        cut_api("-D", only=names)
+    time.sleep(5)
+    holder_pods = [h.split("_", 1)[0] for h in held]
+    bit = all(max(said_at(h, "the shard's lease was not renewed") or 0,
+                  said_at(h, "the shard's lease renewal did not answer") or 0) >= began - 1
+              for h in holder_pods)
+    s.check(bit, f"shards: the cut reached each shard: its renewals failed for {SHARD_CUT_S} s")
+    s.check(all(restarts(n) == restarted[n] for n in names if n in {p["metadata"]["name"] for p in shard_pods()})
+            and not any(LOST in shard_log(h) for h in holder_pods),
+            "shards: through the API server's outage, no shard stopped: written on, fenced by its epoch")
+    s.check([shard_holder(n)[1] for n in range(SHARDS)] == held,
+            "shards: each Lease's holder as it was after the outage")
+    after = [shard_epoch(n) for n in range(SHARDS)]
+    s.check(after == epochs and shard_takes() == takes,
+            f"shards: no take, each shard's epoch as it was ({epochs} -> {after})")
+
+    # (b) The holder of shard 1 alone cut.
+    lost, was = shard_holder(1)
+    epoch, takes = shard_epoch(1), shard_takes()
+    before = restarts(lost)
+    began = time.time()
+    cut_api("-I", only={lost})
+    try:
+        taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 10, every=0.25)
+        took = time.time() - began
+        now_pod, now = shard_holder(1)
+        s.check(taken and took <= SHARD_TAKEOVER,
+                f"shards: the holder alone cut from the API server, another took its lease within "
+                f"{SHARD_TAKEOVER} s ({round(took, 2)} s; {now}, was {was})")
+        raised = happens(lambda: shard_epoch(1) == epoch + 1 and shard_takes() == takes + 1, 15, every=0.5)
+        s.check(raised, f"shards: one take recorded, the shard's epoch raised by one "
+                        f"({epoch} -> {shard_epoch(1)}; takes {takes} -> {shard_takes()})")
+        s.check(restarts(lost) == before and LOST not in shard_log(lost),
+                "shards: the cut holder serves on while it cannot hear the API server")
+        figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2))
+    finally:
+        cut_api("-D", only={lost})
+    exited = happens(lambda: restarts(lost) > before, 30, every=0.5)
+    said = previous_log(lost)
+    s.check(exited and LOST in said and "held by" in said,
+            f"shards: the cut holder, hearing the API server again, found another holder and exited "
+            f"({'exited' if exited else 'did not exit'})")
+    back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
+    s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
+    return back
+
+
 def shards(s):
     """Two shards and a standby pod of one instance: three pods of its one
     Deployment, each shard's Lease held by a pod of its own, the pod holding
@@ -1160,6 +1261,11 @@ def shards(s):
             "shards: each shard's plugin is answered by its sidecar; the standby's is not, so its run() waits")
     deployment = json.loads(out("get", "deployment", "-l", f"meridian.dev/instance={SHARDED}", "-o", "json"))["items"][0]
     shard_admission(s, deployment)
+    # The epoch fence (item 32): through an outage of the API server, and
+    # with the holder alone cut from it. Its holders as they stand after.
+    if not shards_fenced(s, settled):
+        return
+    holders = [shard_holder(n)[0] for n in range(SHARDS)]
 
     # Shard 1's sidecar killed outright: no signal it can answer, so nothing
     # is released and its Lease lapses. Whichever process takes it -- the
@@ -4166,15 +4272,18 @@ def api_addresses():
     return [a for a in said if a]
 
 
-def cut_api(verb):
+def cut_api(verb, only=None):
     """Every pod of the release cut from the API server, both ways, on its
     node: routed through the node (FORWARD), and to the node itself where
     the API server runs there (INPUT), in the mangle table (CUT). One exec
-    per node, so the cut starts and ends at once."""
+    per node, so the cut starts and ends at once. `only`, a set of pod
+    names, cuts those alone (step 3d, checkpoint 5, item 32)."""
     api = api_addresses()
     by_node = {}
     for pod in json.loads(out("get", "pods", "-o", "json"))["items"]:
         ip, node = pod["status"].get("podIP"), pod["spec"].get("nodeName")
+        if only is not None and pod["metadata"]["name"] not in only:
+            continue
         if ip and node and not pod["metadata"].get("deletionTimestamp"):
             by_node.setdefault(node, set()).add(ip)
     at = "1 " if verb == "-I" else ""

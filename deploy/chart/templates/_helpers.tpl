@@ -436,6 +436,16 @@ under (`<component>.readyLagMs`). Takes a dict: top, component, values.
   value: {{ $groups | quote }}
 {{- end }}
 {{- end }}
+{{- /* The book's count of writer groups, to the lake (step 3d, checkpoint 5,
+       item 32): its control writer asks each to raise a plugin shard's epoch
+       before it answers a take. Said only with several. */}}
+{{- if eq .component "lake" }}
+{{- $bookGroups := int (include "meridian-runtime.writerGroups" (dict "top" .top "component" "bor" "values" .top.Values.bor)) }}
+{{- if gt $bookGroups 1 }}
+- name: MERIDIAN_BOR_WRITER_GROUPS
+  value: {{ $bookGroups | quote }}
+{{- end }}
+{{- end }}
 {{- if include "meridian-runtime.leased" . }}
 - name: MERIDIAN_LEASE_NAME
   value: {{ printf "%s-%s" (include "meridian-runtime.fullname" .top) .component | quote }}

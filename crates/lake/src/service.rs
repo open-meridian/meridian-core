@@ -289,6 +289,10 @@ pub fn whole_owner(groups: meridian_changes::groups::Groups, dataset: &str) -> O
 /// A deployment admin halves a lake range (step 3d; section 6.1, approved
 /// 2026-11-12): answered by the range's writer once the split commits.
 pub const SPLIT_PARTITION: &str = "platform.lake.command.split-partition";
+/// A sidecar that took a shard's Lease has the lake raise the shard's epoch
+/// (step 3d, checkpoint 5, item 32; approved 2026-11-16): answered by the
+/// control writer once every lake and book writer group has raised it.
+pub const TAKE_SHARD: &str = "platform.lake.command.take-shard";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -541,8 +545,10 @@ pub struct Lake {
     switches: Mutex<crate::switches::Switches>,
     /// Each dataset's lane (step 3d, group commit; the resilience spec's
     /// section 6.5): the batches waiting for its transaction in flight.
+    /// The book's count of writer groups ([`Lake::with_book_groups`]).
+    book_groups: std::sync::atomic::AtomicU32,
     lanes: meridian_changes::group_commit::Lanes<
-        (Vec<Observation>, i64),
+        LanePart,
         Result<crate::store::Recorded, crate::store::StoreError>,
     >,
     /// Its writer group and the lake's count (step 3d; section 6.1): the
@@ -666,6 +672,17 @@ pub(crate) fn met_by_children(mut heads: BTreeMap<String, u64>) -> BTreeMap<Stri
     heads
 }
 
+/// One part waiting in a dataset's lane: its rows, its time, and its
+/// plugin shard's stamp (step 3d, checkpoint 5, item 32).
+type LanePart = (Vec<Observation>, i64, Option<crate::store::ShardStamp>);
+
+/// A write's plugin shard and epoch as its sidecar stamped the envelope
+/// (step 3d, checkpoint 5, item 32): none where it stamped no epoch.
+pub(crate) fn shard_of(envelope: &Envelope) -> Option<crate::store::ShardStamp> {
+    let meta = envelope.meta.as_ref()?;
+    crate::store::ShardStamp::of(&meta.publisher_instance_id, meta.shard, meta.shard_epoch)
+}
+
 /// Each row's data type and row key, in the request's order: where a
 /// refusal naming one row finds its place (`<field>[i]`).
 fn row_keys(rows: &[Observation]) -> Vec<(i16, String)> {
@@ -689,6 +706,12 @@ fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, Strin
             meridian_changes::moves::HELD_RETRY_SECONDS,
             words,
         ),
+        // Its plugin shard's epoch is no longer the instance's (step 3d,
+        // checkpoint 5, item 32): FAILED_PRECONDITION, and its sidecar
+        // exits.
+        crate::store::StoreError::ShardFenced(fenced) => {
+            meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
+        }
         other => other.to_string(),
     }
 }
@@ -1024,8 +1047,17 @@ impl Lake {
             switches: Mutex::new(switches),
             lanes: Default::default(),
             groups: meridian_changes::groups::Groups::one(),
+            book_groups: std::sync::atomic::AtomicU32::new(1),
             store,
         })
+    }
+
+    /// The book's count of writer groups (`bor.writerGroups`; step 3d,
+    /// checkpoint 5, item 32): each is asked to raise a shard's epoch before
+    /// a take is answered. 1 unless told; 0 where no book runs.
+    pub fn with_book_groups(&self, count: u32) {
+        self.book_groups
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Its writer group and the lake's count (step 3d).
@@ -2156,6 +2188,7 @@ impl Lake {
         let keys = row_keys(&rows);
         let mut pending = self.prepared(field, rows, envelope)?;
         let now = self.clock.now_ns();
+        let shard = shard_of(envelope);
         let mut said = Said::default();
         // A range a move is switching holds its rows -- its siblings'
         // commit -- until the switch ends, at most `moves.holdSeconds`;
@@ -2177,7 +2210,7 @@ impl Lake {
             let mut held = BTreeMap::new();
             for (dataset, rows) in mine {
                 let kept = self.groups.several().then(|| rows.clone());
-                match self.write_one(&dataset, rows, want_id, now) {
+                match self.write_one(&dataset, rows, want_id, shard.as_ref(), now) {
                     Ok(done) => self.published(&dataset, &done, &mut said),
                     Err(
                         failed @ (crate::store::StoreError::Held(_)
@@ -2492,11 +2525,12 @@ impl Lake {
         dataset: &str,
         rows: Vec<Observation>,
         want_id: &str,
+        shard: Option<&crate::store::ShardStamp>,
         now: i64,
     ) -> Result<crate::store::Recorded, crate::store::StoreError> {
         let config = self.config();
         if config.licence(dataset).kept {
-            return self.recorded_together(dataset, rows, now);
+            return self.recorded_together(dataset, rows, shard, now);
         }
         let readers: Vec<String> = self
             .wants
@@ -2506,7 +2540,9 @@ impl Lake {
             .get(want_id)
             .map(|w| w.asked_by.iter().cloned().collect())
             .unwrap_or_else(|| config.entitled(dataset));
-        let served = self.store.serve_unkept(dataset, rows, &readers, now)?;
+        let served = self
+            .store
+            .serve_unkept(dataset, rows, &readers, shard, now)?;
         // The reads waiting on the want hear what was served (W10.7; ruling
         // 734): the lake keeps none of it.
         self.publish_changes(dataset, &served, Some(&readers), now);
@@ -2524,18 +2560,22 @@ impl Lake {
         &self,
         dataset: &str,
         rows: Vec<Observation>,
+        shard: Option<&crate::store::ShardStamp>,
         now: i64,
     ) -> Result<crate::store::Recorded, crate::store::StoreError> {
         let bytes: usize = rows.iter().map(Observation::encoded_len).sum();
         self.lanes.lane(dataset).commit(
-            (rows, now),
+            (rows, now, shard.cloned()),
             bytes,
             |batch| {
                 // Recorded at the latest time of the batch's parts.
-                let now = batch.iter().map(|(_, at)| *at).max().unwrap_or(now);
-                let parts = batch.into_iter().map(|(rows, _)| rows).collect();
+                let now = batch.iter().map(|(_, at, _)| *at).max().unwrap_or(now);
+                let (parts, shards): (Vec<_>, Vec<_>) = batch
+                    .into_iter()
+                    .map(|(rows, _, shard)| (rows, shard))
+                    .unzip();
                 self.store
-                    .record_parts(dataset, parts, now)
+                    .record_parts(dataset, parts, &shards, now)
                     .into_iter()
                     .map(|done| {
                         let done = done?;
@@ -2754,6 +2794,7 @@ impl Lake {
     ) -> Result<crate::write_ahead::Recorded, crate::store::StoreError> {
         struct Kept {
             want_id: String,
+            shard: Option<crate::store::ShardStamp>,
             envelope: Envelope,
             kept: Vec<(String, usize)>,
             unkept: Vec<(String, Vec<Observation>)>,
@@ -2778,6 +2819,9 @@ impl Lake {
         let mut valid: BTreeMap<String, i64> = BTreeMap::new();
         let mut written: Vec<Result<Kept, String>> = Vec::with_capacity(writes.len());
         for write in writes {
+            // Its plugin shard's stamp (step 3d, checkpoint 5, item 32),
+            // checked with each of its parts in the batch's transaction.
+            let shard = shard_of(&write.envelope);
             let prepared =
                 rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
                     let keys = row_keys(&rows);
@@ -2804,6 +2848,7 @@ impl Lake {
             };
             let mut kept = Kept {
                 want_id,
+                shard: shard.clone(),
                 envelope: write.envelope,
                 kept: Vec::new(),
                 unkept: Vec::new(),
@@ -2872,6 +2917,8 @@ impl Lake {
                         }
                     }
                     kept.kept.push((dataset.clone(), batch.parts.len()));
+                    batch.shards.resize(batch.parts.len(), None);
+                    batch.shards.push(shard.clone());
                     batch.parts.push((dataset, rows));
                 } else {
                     kept.sent.served += rows.len() as u32;
@@ -2933,7 +2980,7 @@ impl Lake {
                 }
                 for (dataset, rows) in write.unkept {
                     let served = self
-                        .write_one(&dataset, rows, &write.want_id, now)
+                        .write_one(&dataset, rows, &write.want_id, write.shard.as_ref(), now)
                         .map_err(|failed| refusal_of(failed, write.field, &write.keys))?;
                     self.published(&dataset, &served, &mut said);
                 }
@@ -5792,6 +5839,168 @@ impl Lake {
     /// `partition` for the control partition, a book partition, a range
     /// not open and one hash value; REASON_REQUIRED naming `reason` with
     /// none. The page, the tool and the CLI that ask it are stage M's.
+    /// A sidecar took a shard's Lease (step 3d, checkpoint 5, item 32): the
+    /// shard's epoch raised and `ShardTookOver` recorded in the control
+    /// partition, then raised in every lake and book writer group, each
+    /// asked on its own and asked again until it confirms. Answered only
+    /// once every group has; past [`CONFIRM_WITHIN`], refused UNAVAILABLE,
+    /// the record kept, and the sidecar does not serve.
+    ///
+    /// [`CONFIRM_WITHIN`]: meridian_changes::shard_fence::CONFIRM_WITHIN
+    pub(crate) fn take_shard(
+        &self,
+        request: meridian_domain::v1::TakeShardRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::TakeShardReply, String> {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        if request.instance.is_empty() || request.instance != meta.publisher_instance_id {
+            return Err(refusal_with_status(
+                RefusalStatus::PermissionDenied,
+                &["instance".to_string()],
+                "instance: a sidecar takes its own instance's shards alone",
+            ));
+        }
+        if request.holder.is_empty() {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["holder".to_string()],
+                "holder: the Lease's holder the sidecar wrote",
+            ));
+        }
+        let took = meridian_domain::v1::ShardTookOver {
+            instance: request.instance,
+            shard: request.shard,
+            epoch: 0,
+            holder: request.holder,
+            previous_holder: request.previous_holder,
+            reason: request.reason,
+            took_over_at_ns: self.clock.now_ns(),
+        };
+        let took = self
+            .store
+            .take_shard(took, request.lease_transitions)
+            .map_err(|failed| failed.to_string())?;
+        self.confirm_shard(&took)?;
+        tracing::info!(
+            instance = took.instance,
+            shard = took.shard,
+            epoch = took.epoch,
+            holder = took.holder,
+            previous = took.previous_holder,
+            "a shard was taken: its epoch raised in every writer group"
+        );
+        Ok(meridian_domain::v1::TakeShardReply { epoch: took.epoch })
+    }
+
+    /// Every lake and book writer group asked to raise `took`'s shard to its
+    /// epoch, each on its own topic, those not yet confirmed asked again,
+    /// within [`meridian_changes::shard_fence::CONFIRM_WITHIN`].
+    fn confirm_shard(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<(), String> {
+        use meridian_changes::shard_fence::{raise_topic, ASK_EACH, CONFIRM_WITHIN};
+        let unconfirmed = |groups: &[String], why: &str| {
+            refusal_with_status(
+                RefusalStatus::Unavailable,
+                &[],
+                format!(
+                    "the shard's epoch {} was not confirmed by {} within {} ms ({why}): the \
+                     sidecar does not serve; its next take asks again",
+                    took.epoch,
+                    groups.join(", "),
+                    CONFIRM_WITHIN.as_millis()
+                ),
+            )
+        };
+        let mut asking: Vec<String> = (0..self.groups.count())
+            .map(|group| raise_topic("lake", group))
+            .chain(
+                (0..self.book_groups.load(std::sync::atomic::Ordering::SeqCst))
+                    .map(|group| raise_topic("book", group)),
+            )
+            .collect();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| unconfirmed(&asking, "this member has no runtime to ask with"))?;
+        let body = took.encode_to_vec();
+        let until = std::time::Instant::now() + CONFIRM_WITHIN;
+        let mut last = String::new();
+        loop {
+            let asked = handle.block_on(async {
+                let mut asks = tokio::task::JoinSet::new();
+                for (at, topic) in asking.iter().enumerate() {
+                    let (bus, topic, body) = (Arc::clone(&self.bus), topic.clone(), body.clone());
+                    asks.spawn(async move {
+                        let answer = bus
+                            .call(
+                                &topic,
+                                "meridian.v1.ShardTookOver",
+                                body,
+                                None,
+                                Some(ASK_EACH),
+                            )
+                            .await
+                            .map_err(|failed| failed.to_string())
+                            .and_then(|(_, reply)| {
+                                meridian_domain::v1::TakeShardReply::decode(reply.as_slice())
+                                    .map_err(|failed| failed.to_string())
+                            });
+                        (at, answer)
+                    });
+                }
+                let mut answers = Vec::new();
+                while let Some(joined) = asks.join_next().await {
+                    if let Ok(answer) = joined {
+                        answers.push(answer);
+                    }
+                }
+                answers
+            });
+            let mut confirmed = BTreeSet::new();
+            for (at, answer) in asked {
+                match answer {
+                    Ok(raised) if raised.epoch >= took.epoch => {
+                        confirmed.insert(at);
+                    }
+                    Ok(raised) => last = format!("one held {} after its raise", raised.epoch),
+                    Err(failed) => last = failed,
+                }
+            }
+            asking = asking
+                .into_iter()
+                .enumerate()
+                .filter(|(at, _)| !confirmed.contains(at))
+                .map(|(_, topic)| topic)
+                .collect();
+            if asking.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= until {
+                tracing::warn!(
+                    instance = took.instance,
+                    shard = took.shard,
+                    epoch = took.epoch,
+                    unconfirmed = ?asking,
+                    last,
+                    "a shard's take was not confirmed by every writer group in time"
+                );
+                return Err(unconfirmed(&asking, &last));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// This writer group's part of a take (step 3d, checkpoint 5, item 32):
+    /// the shard's epoch raised in every database it writes, and the epoch
+    /// held after answered.
+    pub(crate) fn raise_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+    ) -> Result<meridian_domain::v1::TakeShardReply, String> {
+        let epoch = self
+            .store
+            .raise_shard(&took.instance, took.shard, took.epoch)
+            .map_err(|failed| failed.to_string())?;
+        Ok(meridian_domain::v1::TakeShardReply { epoch })
+    }
+
     pub(crate) fn split_partition(
         &self,
         request: meridian_domain::v1::SplitPartitionRequest,
@@ -8135,6 +8344,32 @@ pub fn serve_grouped(
             lake.split_partition(request, envelope)
         },
     );
+    // A sidecar's take of a shard (step 3d, checkpoint 5, item 32): the
+    // control writer's, which raises the shard's epoch in every group.
+    serve_on(
+        &bus,
+        &lake,
+        TAKE_SHARD,
+        ("meridian.v1.TakeShardRequest", "meridian.v1.TakeShardReply"),
+        |lake, request: meridian_domain::v1::TakeShardRequest, envelope| {
+            lake.take_shard(request, envelope)
+        },
+    );
+    // This writer group's raise of a shard's epoch, which the control
+    // writer asks of every group before it answers a take.
+    {
+        let raising = Arc::clone(&lake);
+        let topic = meridian_changes::shard_fence::raise_topic("lake", lake.groups.mine());
+        bus.serve(&topic, move |envelope| {
+            let took: meridian_domain::v1::ShardTookOver =
+                decode(&envelope, "meridian.v1.ShardTookOver")?;
+            let raised = raising.raise_shard(took)?;
+            Ok((
+                "meridian.v1.TakeShardReply".to_string(),
+                raised.encode_to_vec(),
+            ))
+        });
+    }
     serve_on(
         &bus,
         &lake,

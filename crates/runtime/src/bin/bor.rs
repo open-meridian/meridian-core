@@ -519,6 +519,10 @@ fn run() -> Result<(), String> {
         });
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // This writer group's raise of a plugin shard's epoch (step 3d,
+        // checkpoint 5, item 32), which the lake's control writer asks of
+        // every group before it answers a take.
+        meridian_bor::service::serve_shard_raises(&bus, Arc::clone(&store), groups.mine());
         // A partition's move (step 3d; section 6.8): the control partition's
         // group runs each, one at a time, over every database.
         if groups.holds_control() {

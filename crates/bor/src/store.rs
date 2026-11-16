@@ -25,10 +25,19 @@ use meridian_pb::v1::RefusalReason;
 use crate::book::{Book, Changes};
 use crate::journal::Entry;
 
+pub use meridian_changes::shard_fence::{ShardFenced, ShardStamp};
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("the book is unavailable: {0}")]
     Unavailable(String),
+
+    /// A command refused by its plugin shard's epoch (step 3d, checkpoint 5,
+    /// item 32): another pod took the shard and this database has seen its
+    /// epoch. FAILED_PRECONDITION, REFUSAL_REASON_SHARD_FENCED; nothing
+    /// applied, and its sidecar exits.
+    #[error("{0}")]
+    ShardFenced(ShardFenced),
 
     /// A command refused by its partition's epoch: another writer took the
     /// book over, and this one steps down (step 3a; ruling 1060).
@@ -238,6 +247,11 @@ impl StoreError {
                 crate::moves::HELD_RETRY_SECONDS,
                 words,
             ),
+            // Its plugin shard's epoch is no longer the instance's (step 3d,
+            // checkpoint 5, item 32): its sidecar exits.
+            StoreError::ShardFenced(fenced) => {
+                meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
+            }
             other => other.to_string(),
         }
     }
@@ -624,7 +638,42 @@ pub trait Store: Send + Sync {
         idempotency_key: &str,
         request: &[u8],
         decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        self.act_stamped(
+            account_id,
+            message_id,
+            idempotency_key,
+            request,
+            None,
+            decide,
+        )
+    }
+
+    /// [`Store::act`], for a command a plugin's sidecar stamped with its
+    /// shard and epoch (step 3d, checkpoint 5, item 32): checked in the
+    /// command's batch's transaction against `book_shard_fence`, a command
+    /// under an epoch lower than its shard's held refused alone
+    /// ([`StoreError::ShardFenced`]), a higher one raising it. None is the
+    /// book's own act, or a one-pod instance's, which nothing checks.
+    fn act_stamped(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        shard: Option<&ShardStamp>,
+        decide: &mut Decide<'_>,
     ) -> Result<Acted>;
+
+    /// A plugin shard's epoch raised to `epoch` where this group's
+    /// databases hold it lower -- a take the lake's control writer asked it
+    /// to raise -- and the epoch held after (step 3d, checkpoint 5, item 32).
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let _ = (instance, shard, epoch);
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: a writer does".into(),
+        ))
+    }
 
     /// Have `observer` told of each batch's commits, in order, once they
     /// commit (step 3d, group commit), and answer whether this store tells

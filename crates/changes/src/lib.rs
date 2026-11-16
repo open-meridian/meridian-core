@@ -47,6 +47,7 @@ pub mod members;
 pub mod moves;
 pub mod records;
 pub mod serving;
+pub mod shard_fence;
 pub mod timeline;
 pub mod tls;
 

@@ -35,6 +35,9 @@ struct State {
 pub struct MemoryStore {
     state: Mutex<State>,
     fence: meridian_changes::Fence,
+    /// Each plugin shard's highest epoch seen (step 3d, checkpoint 5, item
+    /// 32): `book_shard_fence`, as Postgres keeps it.
+    shards: meridian_changes::shard_fence::Memory,
     /// Its partitions (step 3d): a new account placed over them by its ID,
     /// as a test double places it; the owner label is the writer's to read.
     partitions: u32,
@@ -110,6 +113,7 @@ impl MemoryStore {
         MemoryStore {
             state: Mutex::new(state),
             fence: meridian_changes::Fence::new(),
+            shards: Default::default(),
             partitions: 1,
             #[cfg(test)]
             crash: Mutex::new(None),
@@ -273,19 +277,28 @@ impl Store for MemoryStore {
         Some(moving_to(book).unwrap_or_else(|| book.partition.clone()))
     }
 
-    fn act(
+    fn act_stamped(
         &self,
         account_id: &str,
         message_id: &str,
         idempotency_key: &str,
         request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        // Its plugin shard's epoch first (step 3d, checkpoint 5, item 32).
+        if let Some(Err(fenced)) = self.shards.check(&[shard]).pop() {
+            return Err(StoreError::ShardFenced(fenced));
+        }
         // Held while its move is between its close and its open (step 3d;
         // section 6.8): tried again for at most the hold.
         crate::moves::holding(crate::moves::hold(), || {
             self.act_once(account_id, message_id, idempotency_key, request, decide)
         })
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        Ok(self.shards.raise_to(instance, shard, epoch))
     }
 
     fn book(&self, account_id: &str) -> Result<Book> {

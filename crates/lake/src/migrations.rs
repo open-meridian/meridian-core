@@ -211,6 +211,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "member_serves",
         sql: include_str!("../migrations/0030_member_serves.sql"),
     },
+    // A plugin shard's epoch as this database last saw it (step 3d,
+    // checkpoint 5, item 32): what a write stamped with an epoch is checked
+    // against, in its own transaction.
+    Migration {
+        version: 31,
+        name: "shard_fence",
+        sql: include_str!("../migrations/0031_shard_fence.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

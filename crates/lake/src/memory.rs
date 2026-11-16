@@ -51,6 +51,9 @@ struct Held {
 pub struct MemoryStore {
     held: Mutex<Held>,
     fence: meridian_changes::Fence,
+    /// Each plugin shard's highest epoch seen (step 3d, checkpoint 5, item
+    /// 32): `lake_shard_fence`, as Postgres keeps it.
+    shards: meridian_changes::shard_fence::Memory,
     /// A dataset whose next write is refused as another writer group's,
     /// once, as a store whose view of a range was stale refuses it.
     #[cfg(test)]
@@ -420,8 +423,56 @@ impl Store for MemoryStore {
         Ok(done)
     }
 
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        shards: &[Option<crate::store::ShardStamp>],
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        // Each part's plugin shard's epoch checked first, as Postgres checks
+        // it in the parts' transaction (step 3d, checkpoint 5, item 32).
+        let stamps: Vec<_> = (0..parts.len())
+            .map(|at| crate::store::shard_at(shards, at))
+            .collect();
+        let fenced = self.shards.check(&stamps);
+        parts
+            .into_iter()
+            .zip(fenced)
+            .map(|(rows, fenced)| match fenced {
+                Err(fenced) => Err(StoreError::ShardFenced(fenced)),
+                Ok(()) => self.record(dataset, rows, now_ns),
+            })
+            .collect()
+    }
+
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
         Ok(self.lock().write_ahead.get(stream).copied())
+    }
+
+    fn take_shard(
+        &self,
+        mut took: meridian_domain::v1::ShardTookOver,
+        lease_transitions: u64,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        use prost::Message as _;
+        let mut held = self.lock();
+        // Checked before anything is raised, as Postgres checks it.
+        self.fenced(&mut held)?;
+        took.epoch = self
+            .shards
+            .take(&took.instance, took.shard, lease_transitions);
+        let entry = (
+            crate::store::CONTROL_SHARD_TOOK_OVER,
+            took.encode_to_vec(),
+            took.took_over_at_ns,
+        );
+        self.log_control(&mut held, vec![entry])?;
+        Ok(took)
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        Ok(self.shards.raise_to(instance, shard, epoch))
     }
 
     fn record_write_ahead(
@@ -444,7 +495,17 @@ impl Store for MemoryStore {
             .map(|_| Ok(Recorded::default()))
             .collect();
         let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
-        for (at, (dataset, rows)) in batch.parts.into_iter().enumerate() {
+        // Each part's plugin shard's epoch checked first (step 3d,
+        // checkpoint 5, item 32): a part under a lower one refused alone.
+        let stamps: Vec<_> = (0..batch.parts.len())
+            .map(|at| crate::store::shard_at(&batch.shards, at))
+            .collect();
+        let fenced = self.shards.check(&stamps);
+        for (at, ((dataset, rows), fenced)) in batch.parts.into_iter().zip(fenced).enumerate() {
+            if let Err(fenced) = fenced {
+                answered[at] = Err(StoreError::ShardFenced(fenced));
+                continue;
+            }
             by_dataset.entry(dataset).or_default().push((at, rows));
         }
         for (dataset, parts) in by_dataset {
@@ -608,8 +669,12 @@ impl Store for MemoryStore {
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&crate::store::ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded> {
+        if let Some(Err(fenced)) = self.shards.check(&[shard]).pop() {
+            return Err(StoreError::ShardFenced(fenced));
+        }
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);

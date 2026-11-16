@@ -207,7 +207,24 @@ impl Store for ReaderStore {
         Err(written())
     }
 
-    fn serve_unkept(&self, _: &str, _: Vec<Observation>, _: &[String], _: i64) -> Result<Recorded> {
+    fn record_parts(
+        &self,
+        _: &str,
+        parts: Vec<Vec<Observation>>,
+        _: &[Option<crate::store::ShardStamp>],
+        _: i64,
+    ) -> Vec<Result<Recorded>> {
+        parts.iter().map(|_| Err(written())).collect()
+    }
+
+    fn serve_unkept(
+        &self,
+        _: &str,
+        _: Vec<Observation>,
+        _: &[String],
+        _: Option<&crate::store::ShardStamp>,
+        _: i64,
+    ) -> Result<Recorded> {
         Err(written())
     }
 

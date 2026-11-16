@@ -1275,6 +1275,8 @@ fn at_of(item: &ResilienceHistoryItem) -> i64 {
         // step 3d's stage H; the move that did not switch from stage M.
         Some(Item::PartitionSplit(r)) => r.split_at_ns,
         Some(Item::PartitionMoveAborted(r)) => r.aborted_at_ns,
+        // A plugin shard's take (step 3d, checkpoint 5, item 32).
+        Some(Item::ShardTookOver(r)) => r.took_over_at_ns,
         None => 0,
     }
 }
@@ -1356,6 +1358,16 @@ impl History {
                 {
                     items.push(ResilienceHistoryItem {
                         item: Some(Item::PartitionMoveAborted(aborted)),
+                    });
+                }
+            }
+            // A plugin shard's take, in the lake's control partition (step
+            // 3d, checkpoint 5, item 32).
+            "meridian.v1.ShardTookOver" => {
+                if let Ok(took) = meridian_domain::v1::ShardTookOver::decode(change.body.as_slice())
+                {
+                    items.push(ResilienceHistoryItem {
+                        item: Some(Item::ShardTookOver(took)),
                     });
                 }
             }

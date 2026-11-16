@@ -24393,7 +24393,7 @@ pub struct PartitionOwner {
 /// One item of the Resilience page's history: exactly one is set.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResilienceHistoryItem {
-    #[prost(oneof = "resilience_history_item::Item", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "resilience_history_item::Item", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub item: ::core::option::Option<resilience_history_item::Item>,
 }
 /// Nested message and enum types in `ResilienceHistoryItem`.
@@ -24418,6 +24418,11 @@ pub mod resilience_history_item {
         /// cause (approved 2026-11-12).
         #[prost(message, tag = "7")]
         PartitionMoveAborted(super::PartitionMoveAborted),
+        /// A plugin instance's shard taken by a pod, its epoch raised (step 3d,
+        /// checkpoint 5, item 32; approved 2026-11-16): shown with component the
+        /// instance and partition the shard.
+        #[prost(message, tag = "8")]
+        ShardTookOver(super::ShardTookOver),
     }
 }
 /// A standby took a store's writer lease and raised its partitions' epoch, and
@@ -24445,6 +24450,71 @@ pub struct WriterTookOver {
     /// By the store's clock, at the fence.
     #[prost(int64, tag = "7")]
     pub took_over_at_ns: i64,
+}
+/// A pod took a plugin instance's shard (W8.3; step 3d, checkpoint 5, item
+/// 32; the record approved 2026-11-16): the lake raised the shard's epoch to
+/// max(the epoch held + 1, the Lease's transitions), and records this as its
+/// own record in its control partition (decisions/031). One per take.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardTookOver {
+    /// The plugin instance.
+    #[prost(string, tag = "1")]
+    pub instance: ::prost::alloc::string::String,
+    /// Its shard, numbered from 0: the Lease `<instance>-shard-<n>`.
+    #[prost(uint32, tag = "2")]
+    pub shard: u32,
+    /// The shard's new epoch, which its sidecar stamps on every write
+    /// (MessageMeta.shard_epoch). Never zero.
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// Who took it: the Lease's holderIdentity, its pod and process.
+    #[prost(string, tag = "4")]
+    pub holder: ::prost::alloc::string::String,
+    /// Who held it before; empty where the Lease was free.
+    #[prost(string, tag = "5")]
+    pub previous_holder: ::prost::alloc::string::String,
+    /// LEASE_LAPSED or RELEASED.
+    #[prost(enumeration = "TakeoverReason", tag = "6")]
+    pub reason: i32,
+    /// By the lake's clock, at the raise's commit.
+    #[prost(int64, tag = "7")]
+    pub took_over_at_ns: i64,
+}
+/// A sidecar that took a shard's Lease asks the lake to raise the shard's
+/// epoch before it serves (W8.3; step 3d, checkpoint 5, item 32; the act and
+/// its topic platform.lake.command.take-shard approved 2026-11-16). The
+/// lake's control writer raises it, records ShardTookOver, and answers once
+/// every lake and book writer group has raised its fence row to it. Refused
+/// PERMISSION_DENIED for an instance not the envelope's publisher; UNAVAILABLE
+/// where a writer group did not confirm within the takeover's budget, and the
+/// sidecar does not serve.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TakeShardRequest {
+    /// The instance the sidecar serves.
+    #[prost(string, tag = "1")]
+    pub instance: ::prost::alloc::string::String,
+    /// The shard whose Lease it now holds.
+    #[prost(uint32, tag = "2")]
+    pub shard: u32,
+    /// The Lease's leaseTransitions as the sidecar wrote it taking the Lease:
+    /// the epoch's floor.
+    #[prost(uint64, tag = "3")]
+    pub lease_transitions: u64,
+    /// The Lease's holderIdentity the sidecar wrote.
+    #[prost(string, tag = "4")]
+    pub holder: ::prost::alloc::string::String,
+    /// The holderIdentity it read before taking it; empty where it was free.
+    #[prost(string, tag = "5")]
+    pub previous_holder: ::prost::alloc::string::String,
+    /// LEASE_LAPSED or RELEASED, as the sidecar found the Lease.
+    #[prost(enumeration = "TakeoverReason", tag = "6")]
+    pub reason: i32,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct TakeShardReply {
+    /// The shard's new epoch, raised in every writer group. Never zero.
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
 }
 /// A store's record found changed where it rests (W6.39, plan 5j; the record
 /// approved by 1057): its own record in the store's control partition, a
@@ -24760,6 +24830,9 @@ pub enum TakeoverReason {
     /// its partitions' epoch, so a follower that applied the lost tail drops it
     /// (approved 2026-11-11).
     DatabaseTimeline = 4,
+    /// The lease was free: released by its holder's planned stop, or never
+    /// held (approved 2026-11-16). A plugin shard's take (ShardTookOver).
+    Released = 5,
 }
 impl TakeoverReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -24773,6 +24846,7 @@ impl TakeoverReason {
             Self::SteppedDown => "TAKEOVER_REASON_STEPPED_DOWN",
             Self::Moved => "TAKEOVER_REASON_MOVED",
             Self::DatabaseTimeline => "TAKEOVER_REASON_DATABASE_TIMELINE",
+            Self::Released => "TAKEOVER_REASON_RELEASED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -24783,6 +24857,7 @@ impl TakeoverReason {
             "TAKEOVER_REASON_STEPPED_DOWN" => Some(Self::SteppedDown),
             "TAKEOVER_REASON_MOVED" => Some(Self::Moved),
             "TAKEOVER_REASON_DATABASE_TIMELINE" => Some(Self::DatabaseTimeline),
+            "TAKEOVER_REASON_RELEASED" => Some(Self::Released),
             _ => None,
         }
     }

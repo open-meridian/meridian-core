@@ -653,11 +653,17 @@ pub(crate) fn command_store(
         .get(crate::store::CONTROL_PARTITION)
         .copied()
         .unwrap_or(0);
-    let acted = store.act(
+    // Its plugin shard and epoch, as its sidecar stamped it (step 3d,
+    // checkpoint 5, item 32): checked in its batch's transaction.
+    let shard = envelope.meta.as_ref().and_then(|meta| {
+        crate::store::ShardStamp::of(&meta.publisher_instance_id, meta.shard, meta.shard_epoch)
+    });
+    let acted = store.act_stamped(
         account_id,
         &ctx.message_id,
         idempotency_key,
         &envelope.payload,
+        shard.as_ref(),
         &mut |book, head| {
             let (made, reply) = decide(book, head, &ctx)?;
             Ok(decided(made, reply))
@@ -989,6 +995,25 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             ))
         });
     }
+}
+
+/// Writer group `group`'s raise of a plugin shard's epoch (step 3d,
+/// checkpoint 5, item 32): asked by the lake's control writer of every
+/// group before it answers a take, on `platform.book.internal.raise-shard.
+/// {group}`; the epoch held after answered.
+pub fn serve_shard_raises(bus: &Bus, store: Arc<dyn Store>, group: u32) {
+    let topic = meridian_changes::shard_fence::raise_topic("book", group);
+    bus.serve(&topic, move |envelope| {
+        let took: meridian_domain::v1::ShardTookOver =
+            decode(&envelope, "meridian.v1.ShardTookOver")?;
+        let epoch = store
+            .raise_shard(&took.instance, took.shard, took.epoch)
+            .map_err(|failed| failed.on_the_bus())?;
+        Ok((
+            "meridian.v1.TakeShardReply".to_string(),
+            meridian_domain::v1::TakeShardReply { epoch }.encode_to_vec(),
+        ))
+    });
 }
 
 /// Register every handler the book serves.

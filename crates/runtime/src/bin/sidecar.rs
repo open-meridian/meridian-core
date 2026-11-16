@@ -158,7 +158,12 @@ fn run() -> Result<(), String> {
             let mut stop = stopping();
             let mut shard = None;
             if let Some(count) = shard_count {
-                let Some(held) = take_a_shard(&identity.instance_id, count, stop.clone()).await?
+                // A data shard writes on through an API server outage,
+                // fenced by its epoch; every other role stops by the clock
+                // (step 3d, checkpoint 5, item 32: a property of the role).
+                let writes_on = meridian_runtime::shards::writes_on(&identity.roles);
+                let Some(held) =
+                    take_a_shard(&identity.instance_id, count, writes_on, stop.clone()).await?
                 else {
                     tracing::info!("stopping");
                     return Ok(());
@@ -185,6 +190,25 @@ fn run() -> Result<(), String> {
             } else {
                 bus_from_env(&instance_id).await?
             };
+            // A shard taken: its epoch raised by the lake in every writer
+            // group before anything is served, and stamped on every write
+            // from here on (step 3d, checkpoint 5, item 32). A take not
+            // confirmed gives the Lease up and ends the process: its pod
+            // comes back as the standby, and the next take asks again.
+            if let Some((set, _)) = &mut shard {
+                let raised =
+                    match meridian_runtime::shards::raise_epoch(&bus, &identity.instance_id, set)
+                        .await
+                    {
+                        Ok(_) => set.renew_now().await,
+                        Err(failed) => Err(failed),
+                    };
+                if let Err(failed) = raised {
+                    tracing::error!("the shard's epoch was not raised: {failed}; giving its lease up and stopping");
+                    set.release(meridian_runtime::now_ns()).await;
+                    std::process::exit(1);
+                }
+            }
             // Its own hops' ages -- a record batch accepted, a row delivered
             // -- to the monitor, under its plugin's instance (W4.16; 606).
             tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
@@ -284,6 +308,12 @@ fn run() -> Result<(), String> {
                 // The page is how a person reaches the plugin, so a door that
                 // stopped is a sidecar to restart, as the surface is.
                 stopped = front_door => stopped,
+                // A write refused as fenced (step 3d, checkpoint 5, item
+                // 32): another pod took this shard. The process ends, as
+                // on a lost Lease; its pod comes back as the standby.
+                _ = meridian_sidecar::shards::fenced() => {
+                    std::process::exit(1);
+                }
                 _ = meridian_runtime::shards::told(&mut stop) => {
                     tracing::info!("stopping");
                     // Its shard given up, so the standby takes it at once:
@@ -306,6 +336,7 @@ type ShardSet = meridian_runtime::shards::ShardSet<meridian_runtime::lease::Kube
 async fn take_a_shard(
     instance: &str,
     count: u32,
+    writes_on: bool,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<(ShardSet, Arc<meridian_sidecar::shards::Shards>)>, String> {
     if instance.is_empty() {
@@ -336,7 +367,10 @@ async fn take_a_shard(
     // renew deadline whatever is in flight, and one request lost leaves it
     // a second try before that.
     let api = Arc::new(meridian_runtime::lease::KubeLeases::in_cluster(renew / 2)?);
-    let set = ShardSet::new(api, instance, count, &holder, renew, duration)?;
+    let mut set = ShardSet::new(api, instance, count, &holder, renew, duration)?;
+    if writes_on {
+        set = set.writing_on();
+    }
     let Some((set, mine, others)) = set.take(stop).await? else {
         return Ok(None);
     };
@@ -353,8 +387,10 @@ async fn take_a_shard(
 
 /// Its shard kept: the Lease renewed every renewal and the other shards'
 /// read, so the sidecar shares its instance's subjects over those that
-/// live. A shard lost ends the process: no epoch fences a plugin, so it
-/// stops serving at once and its pod comes back as the standby.
+/// live. A shard lost ends the process: it stops serving at once and its
+/// pod comes back as the standby. A data shard is lost only when the Lease
+/// shows another holder, or a store refuses a write as fenced (step 3d,
+/// checkpoint 5, item 32).
 async fn keep_shard(
     set: ShardSet,
     shards: Arc<meridian_sidecar::shards::Shards>,

@@ -461,6 +461,35 @@ fn the_history_is_newest_first_and_paged() {
     assert_eq!(history.priorities().len(), 1);
 }
 
+/// Step 3d, checkpoint 5, item 32: a plugin shard's take, recorded in the
+/// lake's control partition, is a history item at its own time.
+#[test]
+fn a_shard_s_take_is_in_the_history() {
+    let history = History::default();
+    let took = meridian_domain::v1::ShardTookOver {
+        instance: "kraken-1".into(),
+        shard: 1,
+        epoch: 5,
+        took_over_at_ns: 40,
+        ..Default::default()
+    };
+    {
+        let mut held = history.held.lock().unwrap();
+        History::take(
+            &mut held,
+            &meridian_changes::Change {
+                kind: "meridian.v1.ShardTookOver".into(),
+                body: took.encode_to_vec(),
+                ..Default::default()
+            },
+        );
+    }
+    let (items, _) = history.page(5, "").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(at_of(&items[0]), 40);
+    assert!(matches!(&items[0].item, Some(Item::ShardTookOver(r)) if r.epoch == 5));
+}
+
 /// Step 3d (the product owner's item of 2026-11-14; `advice` approved that
 /// day): the book's partitions not above its writer groups is advised
 /// raised, while it is small; above them, nothing.

@@ -27,6 +27,7 @@ mod hot;
 mod quality;
 mod read_from_writer;
 mod reader;
+mod shards;
 mod switches;
 mod write_ahead;
 

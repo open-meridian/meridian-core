@@ -35,6 +35,7 @@ use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
 use crate::postgres::PostgresStore;
 use crate::row::{DataType, Observation};
+use crate::store::{shard_at, ShardStamp};
 use crate::store::{
     Assessment, ClosedDayAmendment, Dropped, Query, Recorded, Removal, Result, Served, Stale,
     Store, StoreError, WantChange, WriteAheadBatch, WriteAheadPosition,
@@ -209,11 +210,20 @@ impl Spread {
     /// `write` on each database's store: each part's answer, its rows'
     /// parts in several databases merged. A part found moved home is
     /// routed again (the same-group fence), never refused for it.
+    ///
+    /// Each part's plugin shard stamp, by its place in `parts`, goes with
+    /// every database's piece of it (step 3d, checkpoint 5, item 32): each
+    /// database checks it against its own `lake_shard_fence`.
     fn routed(
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
-        write: impl Fn(&PostgresStore, Vec<Vec<Observation>>) -> Vec<Result<Recorded>>,
+        shards: &[Option<ShardStamp>],
+        write: impl Fn(
+            &PostgresStore,
+            Vec<Vec<Observation>>,
+            &[Option<ShardStamp>],
+        ) -> Vec<Result<Recorded>>,
     ) -> Vec<Result<Recorded>> {
         let mine = self.groups.mine();
         let mut answers: Vec<Option<Result<Recorded>>> = (0..parts.len()).map(|_| None).collect();
@@ -236,7 +246,11 @@ impl Spread {
             for (d, subs) in by_db {
                 let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = subs.into_iter().unzip();
                 let kept = rows.clone();
-                let done = write(self.database(d), rows);
+                let stamps: Vec<Option<ShardStamp>> = places
+                    .iter()
+                    .map(|at| shard_at(shards, *at).cloned())
+                    .collect();
+                let done = write(self.database(d), rows, &stamps);
                 for ((at, result), rows) in places.into_iter().zip(done).zip(kept) {
                     match result {
                         Err(StoreError::NotOwned { partition, group })
@@ -531,7 +545,7 @@ impl Spread {
 impl Store for Spread {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         // Where each range's head is (step 3d; ruled 2026-11-14).
-        self.routed(dataset, vec![rows], |store, mut parts| {
+        self.routed(dataset, vec![rows], &[], |store, mut parts, _| {
             vec![store.record(dataset, parts.pop().unwrap_or_default(), now_ns)]
         })
         .pop()
@@ -542,10 +556,11 @@ impl Store for Spread {
         &self,
         dataset: &str,
         parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
         now_ns: i64,
     ) -> Vec<Result<Recorded>> {
-        self.routed(dataset, parts, |store, parts| {
-            store.record_parts(dataset, parts, now_ns)
+        self.routed(dataset, parts, shards, |store, parts, shards| {
+            store.record_parts(dataset, parts, shards, now_ns)
         })
     }
 
@@ -554,13 +569,45 @@ impl Store for Spread {
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded> {
-        self.routed(dataset, vec![rows], |store, mut parts| {
-            vec![store.serve_unkept(dataset, parts.pop().unwrap_or_default(), readers, now_ns)]
-        })
+        self.routed(
+            dataset,
+            vec![rows],
+            &[shard.cloned()],
+            |store, mut parts, shards| {
+                vec![store.serve_unkept(
+                    dataset,
+                    parts.pop().unwrap_or_default(),
+                    readers,
+                    shard_at(shards, 0),
+                    now_ns,
+                )]
+            },
+        )
         .pop()
         .unwrap_or_else(|| Ok(Recorded::default()))
+    }
+
+    fn take_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+        lease_transitions: u64,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        // Numbered at home, where the control partition is; every other
+        // database is raised by the group's raise (step 3d, item 32).
+        self.own().take_shard(took, lease_transitions)
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        // Every database this group may write a part to: a range moved
+        // between databases is written where its head is (step 3d).
+        let mut held = 0;
+        for store in &self.stores {
+            held = held.max(store.raise_shard(instance, shard, epoch)?);
+        }
+        Ok(held)
     }
 
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
@@ -692,14 +739,18 @@ impl Store for Spread {
             .map(|(dataset, _)| dataset.clone())
             .collect();
         let sizes: Vec<usize> = batch.parts.iter().map(|(_, rows)| rows.len()).collect();
+        let shards = std::mem::take(&mut batch.shards);
+        let mut here_shards = Vec::new();
         for (at, (dataset, rows)) in std::mem::take(&mut batch.parts).into_iter().enumerate() {
+            let shard = shard_at(&shards, at).cloned();
             if self.write_dbs(&dataset, &rows).iter().all(|d| *d == own) {
                 places.push(at);
                 here.push((dataset, rows));
+                here_shards.push(shard);
             } else {
                 answers[at] = self
-                    .routed(&dataset, vec![rows], |store, parts| {
-                        store.record_parts(&dataset, parts, now_ns)
+                    .routed(&dataset, vec![rows], &[shard], |store, parts, shards| {
+                        store.record_parts(&dataset, parts, shards, now_ns)
                     })
                     .pop();
             }
@@ -747,16 +798,17 @@ impl Store for Spread {
             }
             counted.parts = kept;
         }
-        let again = here.clone();
+        let again: Vec<_> = here.clone().into_iter().zip(here_shards.clone()).collect();
         batch.parts = here;
+        batch.shards = here_shards;
         let done = self.own().record_write_ahead(batch, now_ns)?;
-        for ((at, result), (dataset, rows)) in places.into_iter().zip(done).zip(again) {
+        for ((at, result), ((dataset, rows), shard)) in places.into_iter().zip(done).zip(again) {
             answers[at] = Some(match result {
                 // Moved home since it was routed: routed again.
                 Err(StoreError::NotOwned { partition, group }) if group == self.groups.mine() => {
                     self.route_again(&partition);
-                    self.routed(&dataset, vec![rows], |store, parts| {
-                        store.record_parts(&dataset, parts, now_ns)
+                    self.routed(&dataset, vec![rows], &[shard], |store, parts, shards| {
+                        store.record_parts(&dataset, parts, shards, now_ns)
                     })
                     .pop()
                     .unwrap_or_else(|| Ok(Recorded::default()))
