@@ -173,6 +173,9 @@ pub struct Elector<L: Leases> {
     /// ([`Elector::of_a_holder_that_stops`]); else it drops it, and an
     /// unobserved stretch is never counted toward a lapse.
     keeps_seen: bool,
+    /// Whether a lease not there is waited for rather than made
+    /// ([`Elector::makes_none`]).
+    makes_none: bool,
 }
 
 impl<L: Leases> Elector<L> {
@@ -188,7 +191,19 @@ impl<L: Leases> Elector<L> {
             gave_up: false,
             answered: None,
             keeps_seen: false,
+            makes_none: false,
         }
+    }
+
+    /// A lease this member never makes (step 3d, checkpoint 5, item 31): a
+    /// plugin shard's, which the launcher -- or the chart, for a sidecars[]
+    /// instance -- makes before any pod of the instance starts, and never
+    /// deletes, so its `leaseTransitions` only grows; its sidecar holds no
+    /// right to make one. A look that finds none fails, saying so, and
+    /// takes nothing: the member waits for it.
+    pub fn makes_none(mut self) -> Self {
+        self.makes_none = true;
+        self
     }
 
     /// For a lease whose holder stops once it has gone its renew deadline
@@ -360,6 +375,13 @@ impl<L: Leases> Elector<L> {
         let me = self.settings.holder.clone();
         let stamp = micro_time(wall_ns);
         let Some(current) = self.api.get(&self.settings.name).await? else {
+            if self.makes_none {
+                return Err(format!(
+                    "{} is not there; a shard's Lease is made by the launcher or the chart, \
+                     never by its sidecar, so this pod waits for it",
+                    self.settings.name
+                ));
+            }
             let record = Record {
                 holder: me.clone(),
                 duration_seconds: self.settings.duration.as_secs(),

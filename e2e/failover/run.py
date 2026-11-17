@@ -124,6 +124,7 @@ FIGURES = os.environ.get("E2E_FAILOVER_FIGURES", ".e2e-failover-figures.jsonl")
 # so the run and CI's claims-check judge a line by one rule.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 import claims as claims_tool  # noqa: E402
+import shard_accounts  # noqa: E402
 CLUSTER = os.environ.get("E2E_K3D_CLUSTER", "meridian-e2e")
 ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
@@ -1090,6 +1091,9 @@ def shard_admission(s, deployment):
     made["spec"]["selector"] = {"matchLabels": {"meridian.dev/instance": "admission-proof"}}
     made["spec"]["template"]["metadata"]["labels"] = {"meridian.dev/instance": "admission-proof",
                                                       "meridian.dev/launched": "true"}
+    made["metadata"]["labels"]["meridian.dev/instance"] = "admission-proof"
+    # Its own instance's account (item 31), as the launcher would run it.
+    made["spec"]["template"]["spec"]["serviceAccountName"] = shard_accounts.account_of(FULL, "admission-proof")
 
     def asked(change):
         tried = json.loads(json.dumps(made))
@@ -1446,6 +1450,19 @@ def shards(s):
             "shards: each shard's plugin is answered by its sidecar; the standby's is not, so its run() waits")
     deployment = json.loads(out("get", "deployment", "-l", f"meridian.dev/instance={SHARDED}", "-o", "json"))["items"][0]
     shard_admission(s, deployment)
+    # Its own account (item 31): its pods run under it, its Role names its
+    # shards' Leases alone, and it may do nothing else; the launcher's
+    # admission policy holds what the launcher makes to that shape.
+    accounts = {p["spec"].get("serviceAccountName") for p in shard_pods()}
+    s.check(accounts == {shard_accounts.account_of(FULL, SHARDED)},
+            f"accounts: the instance's pods run under its own account, never the members' ({sorted(accounts)})")
+    names = shard_accounts.role_names(kubectl, FULL, SHARDED)
+    s.check(names == [f"{SHARDED}-shard-{n}" for n in range(SHARDS)],
+            f"accounts: its Role names exactly its {SHARDS} shards' Leases ({names})")
+    for held, what in (shard_accounts.rights(kubectl, NAMESPACE, FULL, SHARDED, SHARDS, "another-1", f"{FULL}-lake")
+                       + shard_accounts.admission(kubectl, NAMESPACE, FULL)
+                       + shard_accounts.deployments(kubectl, NAMESPACE, FULL, SHARDED)):
+        s.check(held, what)
     # The epoch fence (item 32): through an outage of the API server, and
     # with the holder alone cut from it. Its holders as they stand after.
     fenced = shards_fenced(s, settled)

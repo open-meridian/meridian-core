@@ -63,12 +63,13 @@
 {{/*
   The shape of an instance launched with shards or a standby pod (step 3d;
   the resilience spec's section 7): the same definition as several pods,
-  each sidecar given the shard count and the members' lease right. Rendered
-  for one shard; the launcher sets the pods and the count the launch asked.
-  Only where a store runs a standby, and so the members' lease right is
-  rendered (members.yaml): shards and standby pods are configuration, as
-  every standby is (ruling 1052). Elsewhere the launcher has no shape for
-  them, and refuses such a launch saying so.
+  each sidecar given the shard count and run under its instance's own
+  account, `<fullname>-shards-<instance>`, which the launcher makes with a
+  Role naming that instance's shards' Leases alone, and the Leases (item
+  31). Rendered for one shard; the launcher sets the pods and the count the
+  launch asked. Only where a store runs a standby: shards and standby pods
+  are configuration, as every standby is (ruling 1052). Elsewhere the
+  launcher has no shape for them, and refuses such a launch saying so.
 */}}
 {{- $leased := false -}}
 {{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
@@ -153,10 +154,14 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 ---
 # Deployments in this namespace, and an edge plugin's storage claim, made and
-# read but never deleted (decisions/028), and nothing else: no Secret, no
-# Service, no NetworkPolicy, no Role. RBAC cannot narrow `create` to a name,
-# so the launcher narrows itself -- it creates only from the templates above
-# and deletes only what carries its label -- and where the cluster has
+# read but never deleted (decisions/028); and where the launcher has a shape
+# for shards and standby pods, an instance's own account, Role and binding
+# and its shards' Leases (item 31) -- the Leases made, never deleted -- and
+# nothing else: no Secret, no Service, no NetworkPolicy. It holds no
+# `escalate` and no `bind`: a Role it makes grants only what it holds itself,
+# its Lease right. RBAC cannot narrow `create` to a name, so the launcher
+# narrows itself -- it creates only from the templates above and deletes only
+# what carries its label -- and where the cluster has
 # ValidatingAdmissionPolicy, the cluster holds it to that too (below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -175,8 +180,20 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "get"]
   {{- end }}
-  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher) }}
+  {{- if $shards }}
+  # An instance of several pods' own account, its Role naming its shards'
+  # Leases alone, and their binding (item 31).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "get", "update", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "update", "delete"]
+  {{- end }}
+  {{- if or $shards (include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher)) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
+  # And an instance of several pods' Leases, made before its pods and never
+  # deleted (item 31); held, so the Role it makes grants nothing it lacks.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
@@ -312,15 +329,16 @@ spec:
           configMap:
             name: {{ $name }}-template
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
-{{- $member := printf "%s-member" $full }}
-{{- $accounts := list (quote "") (quote "default") (quote $member) }}
+{{- $own := printf "%s-shards-" $full }}
+{{- $accounts := list (quote "") (quote "default") }}
 {{- with .Values.pluginArchive.serviceAccount }}
 {{- $accounts = append $accounts (quote .) }}
 {{- end }}
 ---
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
-# the launcher's account does to a Deployment, or a claim it makes, it is one
-# the launcher made.
+# the launcher's account does to a Deployment, a claim, or an instance's own
+# account, Role or binding (item 31), it is one the launcher made, and of
+# exactly the shape it makes.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -338,12 +356,26 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["persistentvolumeclaims"]
+        resources: ["persistentvolumeclaims", "serviceaccounts"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["roles", "rolebindings"]
   matchConditions:
     - name: the-launcher
       expression: >-
         request.userInfo.username ==
         "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}"
+  variables:
+    # The instance an object is made for, by its label, and that instance's
+    # own account (item 31): `<fullname>-shards-<instance>`.
+    - name: instance
+      expression: >-
+        request.operation == "DELETE" || !has(object.metadata.labels)
+        ? "" : object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: own
+      expression: >-
+        {{ $own | quote }} + variables.instance
   validations:
     - expression: >-
         request.operation == "DELETE"
@@ -355,24 +387,26 @@ spec:
     # Which account a launched plugin's pods run as (step 3d; review of
     # 95d68904, S2): Kubernetes asks nobody whether a pod may use an
     # account, so the launcher's Deployments are held to the ones the chart
-    # gives it -- none (the namespace's default, which holds no right), the
-    # members' lease right for an instance of several pods, and the
-    # archive's where one is set.
+    # gives it -- none (the namespace's default, which holds no right), its
+    # instance's own account for an instance of several pods (item 31: the
+    # members' is the stores' alone), and the archive's where one is set.
     - expression: >-
         request.operation == "DELETE" ||
         request.resource.resource != "deployments" ||
         !has(object.spec.template.spec.serviceAccountName) ||
         object.spec.template.spec.serviceAccountName in
-        [{{ $accounts | join ", " }}]
-      message: a launched plugin runs under no account, the members' lease account or the archive's
-    # Under the members' account the lease right is the sidecar's alone,
-    # never the plugin's: nothing mounts the token by default, and no
+        [{{ $accounts | join ", " }}] ||
+        (variables.instance != "" &&
+         object.spec.template.spec.serviceAccountName == variables.own)
+      message: a launched plugin runs under no account, its instance's shards account or the archive's
+    # Under its instance's own account the lease right is the sidecar's
+    # alone, never the plugin's: nothing mounts the token by default, and no
     # container but the sidecar mounts a volume that carries one.
     - expression: >-
         request.operation == "DELETE" ||
         request.resource.resource != "deployments" ||
         !has(object.spec.template.spec.serviceAccountName) ||
-        object.spec.template.spec.serviceAccountName != {{ $member | quote }} ||
+        !object.spec.template.spec.serviceAccountName.startsWith({{ $own | quote }}) ||
         (
           has(object.spec.template.spec.automountServiceAccountToken) &&
           object.spec.template.spec.automountServiceAccountToken == false &&
@@ -386,7 +420,55 @@ spec:
                 v.name == m.name && has(v.projected) && has(v.projected.sources) &&
                 v.projected.sources.exists(s, has(s.serviceAccountToken)))))
         )
-      message: under the members' lease account the token is mounted in the sidecar's container alone
+      message: under its instance's shards account the token is mounted in the sidecar's container alone
+    # An instance's own account (item 31), of exactly the shape the launcher
+    # makes: the Role's one rule, `get` and `update` on Leases named
+    # `<instance>-shard-<n>` alone, the instance read from its label; the
+    # binding of that Role to the account of the same name alone; and the
+    # account carrying no secret. Each named `<fullname>-shards-<instance>`.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "roles" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          has(object.rules) && size(object.rules) == 1 &&
+          object.rules[0].apiGroups == ["coordination.k8s.io"] &&
+          object.rules[0].resources == ["leases"] &&
+          size(object.rules[0].verbs) == 2 &&
+          "get" in object.rules[0].verbs && "update" in object.rules[0].verbs &&
+          !has(object.rules[0].nonResourceURLs) &&
+          has(object.rules[0].resourceNames) && size(object.rules[0].resourceNames) > 0 &&
+          object.rules[0].resourceNames.all(lease,
+            lease.matches("^" + variables.instance + "-shard-[0-9]+$"))
+        )
+      message: the launcher's Role grants get and update on its instance's shard Leases alone
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "rolebindings" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          object.roleRef.apiGroup == "rbac.authorization.k8s.io" &&
+          object.roleRef.kind == "Role" &&
+          object.roleRef.name == variables.own &&
+          has(object.subjects) && size(object.subjects) == 1 &&
+          object.subjects[0].kind == "ServiceAccount" &&
+          object.subjects[0].name == variables.own &&
+          has(object.subjects[0].namespace) &&
+          object.subjects[0].namespace == {{ .Release.Namespace | quote }}
+        )
+      message: the launcher's RoleBinding binds its instance's shards Role to the same-named account alone
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "serviceaccounts" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          (!has(object.secrets) || size(object.secrets) == 0) &&
+          (!has(object.imagePullSecrets) || size(object.imagePullSecrets) == 0)
+        )
+      message: the launcher's ServiceAccount carries no secrets
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

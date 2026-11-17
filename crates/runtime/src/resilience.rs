@@ -186,10 +186,10 @@ pub struct Values {
 }
 
 impl Values {
-    /// Whether the chart renders the members' lease right, which a plugin
+    /// Whether the chart lets the launcher make the account a plugin
     /// instance of several pods -- shards, or a standby pod -- takes its
-    /// shards' Leases under (step 3d; section 7): where a store runs a
-    /// standby, as members.yaml and the launcher's shards shape render.
+    /// shards' Leases under (step 3d; section 7; checkpoint 5, item 31):
+    /// where a store runs a standby, as the launcher's shards shape renders.
     pub fn lease_right(&self) -> bool {
         ["lake", "bor", "instrument", "street", "conductor"]
             .iter()

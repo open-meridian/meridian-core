@@ -165,6 +165,8 @@ struct Pod {
 
 fn pod(buses: Arc<Buses>) -> Pod {
     let store = Arc::new(Memory::default());
+    // Made before the pod starts, as the launcher or the chart does (item 31).
+    store.make(LEASE);
     let (surface, door) = (free_port(), free_port());
     let (stopper, stop) = watch::channel(false);
     let api = Arc::clone(&store);

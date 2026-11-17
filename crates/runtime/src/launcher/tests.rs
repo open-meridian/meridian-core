@@ -477,10 +477,15 @@ fn a_launchs_own_limits_are_written_over_the_charts_and_a_share_leaving_nothing_
 
 /// The chart's shards shape, as far as the launcher reads it.
 fn several_pods() -> serde_json::Value {
-    serde_json::json!({"spec": {"replicas": 2,
+    serde_json::json!({"metadata": {"name": "check-meridian-runtime-plugin-snaptrade-1", "labels": {
+        "app.kubernetes.io/instance": "check",
+        "meridian.dev/component": "sidecar",
+        "meridian.dev/instance": "snaptrade-1",
+        "meridian.dev/launched": "true"
+    }}, "spec": {"replicas": 2,
         "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 2}},
         "template": {"spec": {
-        "serviceAccountName": "check-meridian-runtime-member",
+        "serviceAccountName": "check-meridian-runtime-shards-snaptrade-1",
         "containers": [
             {"name": "sidecar", "env": [
                 {"name": "MERIDIAN_PLUGIN_SHARDS", "value": "1"},
@@ -515,7 +520,7 @@ fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the
         .unwrap();
         assert_eq!(chosen, plain);
         assert_eq!(
-            with_shards(several_pods(), &asked, false).unwrap(),
+            with_shards(several_pods(), &asked).unwrap(),
             several_pods(),
             "untouched"
         );
@@ -554,7 +559,7 @@ fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the
                 claim: None
             }
         );
-        let made = with_shards(several_pods(), &asked, false).unwrap();
+        let made = with_shards(several_pods(), &asked).unwrap();
         assert_eq!(
             made["spec"]["replicas"], pods,
             "{shards} shards, standby {standby}"
@@ -596,21 +601,21 @@ fn shards_above_a_limit_its_sidecars_are_given_are_refused_naming_shards() {
         ("MERIDIAN_SIDECAR_IN_FLIGHT", "sidecar.limits.inFlight"),
         ("MERIDIAN_SIDECAR_ANSWER_MIB", "sidecar.limits.answerMiB"),
     ] {
-        let refused = with_shards(limited(name, "2"), &asked, false).unwrap_err();
+        let refused = with_shards(limited(name, "2"), &asked).unwrap_err();
         assert!(
             refused.starts_with("shards:")
                 && refused.contains(said)
                 && refused.contains("at most 2"),
             "{refused}"
         );
-        with_shards(limited(name, "3"), &asked, false).unwrap();
+        with_shards(limited(name, "3"), &asked).unwrap();
     }
     // A standby alone is one shard, within any limit.
     let standby = CreatePluginRequest {
         standby: true,
         ..request()
     };
-    with_shards(limited("MERIDIAN_SIDECAR_IN_FLIGHT", "1"), &standby, false).unwrap();
+    with_shards(limited("MERIDIAN_SIDECAR_IN_FLIGHT", "1"), &standby).unwrap();
 }
 
 #[test]
@@ -651,10 +656,322 @@ fn shards_are_refused_where_the_instance_cannot_be_several_pods() {
     let refused =
         shards_template(template_for(&many, false, &shapes).unwrap(), &many, &shapes).unwrap_err();
     assert!(refused.starts_with("shards:"), "{refused}");
-    // An archive's own account: the lease right is the members'.
-    let refused = with_shards(several_pods(), &asked, true).unwrap_err();
-    assert!(refused.contains("under the members' account"), "{refused}");
+    // A shape that runs its pods under any account but the instance's own
+    // (item 31): the members', which is the stores' alone.
+    let mut members = several_pods();
+    members["spec"]["template"]["spec"]["serviceAccountName"] =
+        "check-meridian-runtime-member".into();
+    let refused = with_shards(members, &asked).unwrap_err();
+    assert!(refused.contains("not the instance's own"), "{refused}");
     // A template that tells its sidecar no count is not the shards shape.
-    let refused = with_shards(pod(), &asked, false).unwrap_err();
+    let refused = with_shards(pod(), &asked).unwrap_err();
     assert!(refused.contains("MERIDIAN_PLUGIN_SHARDS"), "{refused}");
+}
+
+// ── Item 31: an instance's own account ──────────────────────────────────────
+
+fn sharded(shards: u32, standby: bool) -> CreatePluginRequest {
+    CreatePluginRequest {
+        shards,
+        standby,
+        ..request()
+    }
+}
+
+fn objects(shards: u32) -> ShardsAccount {
+    let asked = sharded(shards, true);
+    let made = with_shards(several_pods(), &asked).unwrap();
+    shards_objects(&made, &asked, "meridian", &serde_json::Map::new()).unwrap()
+}
+
+fn names(role: &serde_json::Value) -> Vec<String> {
+    role["rules"][0]["resourceNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Item 31 (approved 2026-11-15): an instance of several pods runs under
+/// an account of its own, `<fullname>-shards-<instance>`, whose Role's one
+/// rule is `get` and `update` on exactly its N shards' Leases, bound to
+/// that account alone; it carries no secret, and its Leases are made free.
+#[test]
+fn an_instance_of_several_pods_is_given_an_account_naming_its_own_shards_leases_alone() {
+    const ACCOUNT: &str = "check-meridian-runtime-shards-snaptrade-1";
+    for (shards, standby, want) in [
+        (2, false, vec!["snaptrade-1-shard-0", "snaptrade-1-shard-1"]),
+        (0, true, vec!["snaptrade-1-shard-0"]),
+        (
+            3,
+            true,
+            vec![
+                "snaptrade-1-shard-0",
+                "snaptrade-1-shard-1",
+                "snaptrade-1-shard-2",
+            ],
+        ),
+    ] {
+        let asked = sharded(shards, standby);
+        let made = with_shards(several_pods(), &asked).unwrap();
+        assert_eq!(
+            made["spec"]["template"]["spec"]["serviceAccountName"],
+            ACCOUNT
+        );
+        let kept = shards_objects(&made, &asked, "meridian", &serde_json::Map::new()).unwrap();
+        assert_eq!(
+            names(&kept.role),
+            want,
+            "{shards} shards, standby {standby}"
+        );
+        assert_eq!(
+            kept.role["rules"],
+            serde_json::json!([{
+                "apiGroups": ["coordination.k8s.io"],
+                "resources": ["leases"],
+                "verbs": ["get", "update"],
+                "resourceNames": want,
+            }]),
+            "one rule, and no create: RBAC cannot narrow it to a name"
+        );
+        assert_eq!(kept.role["metadata"]["name"], ACCOUNT);
+        assert_eq!(
+            kept.binding["subjects"],
+            serde_json::json!([{"kind": "ServiceAccount", "name": ACCOUNT, "namespace": "meridian"}])
+        );
+        assert_eq!(
+            kept.binding["roleRef"],
+            serde_json::json!({"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": ACCOUNT})
+        );
+        assert_eq!(kept.account["metadata"]["name"], ACCOUNT);
+        assert!(kept.account.get("secrets").is_none());
+        assert!(kept.account.get("imagePullSecrets").is_none());
+        assert_eq!(kept.account["automountServiceAccountToken"], false);
+        let leases: Vec<&str> = kept
+            .leases
+            .iter()
+            .map(|lease| lease["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(leases, want);
+        assert!(kept
+            .leases
+            .iter()
+            .all(|lease| lease["spec"] == serde_json::json!({})));
+        // Labelled as the launcher's, for the instance; not as a sidecar.
+        for object in [&kept.account, &kept.role, &kept.binding, &kept.leases[0]] {
+            let labels = &object["metadata"]["labels"];
+            assert_eq!(labels["meridian.dev/launched"], "true");
+            assert_eq!(labels["meridian.dev/instance"], "snaptrade-1");
+            assert!(labels.get("meridian.dev/component").is_none());
+        }
+    }
+}
+
+/// The API server's objects, in memory, as far as [`Objects`] needs them.
+#[derive(Default)]
+struct Cluster {
+    held: std::sync::Mutex<std::collections::HashMap<(Kind, String), serde_json::Value>>,
+    versions: std::sync::atomic::AtomicU64,
+}
+
+impl Cluster {
+    fn of(&self, kind: Kind, name: &str) -> Option<serde_json::Value> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&(kind, name.to_string()))
+            .cloned()
+    }
+    fn put(&self, kind: Kind, mut object: serde_json::Value) {
+        let version = self
+            .versions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        object["metadata"]["resourceVersion"] = version.to_string().into();
+        let name = object["metadata"]["name"].as_str().unwrap().to_string();
+        self.held.lock().unwrap().insert((kind, name), object);
+    }
+}
+
+impl Objects for Cluster {
+    async fn get(&self, kind: Kind, name: &str) -> Result<Option<serde_json::Value>, String> {
+        Ok(self.of(kind, name))
+    }
+    async fn create(&self, kind: Kind, object: &serde_json::Value) -> Result<bool, String> {
+        let name = object["metadata"]["name"].as_str().unwrap();
+        if self.of(kind, name).is_some() {
+            return Ok(false);
+        }
+        self.put(kind, object.clone());
+        Ok(true)
+    }
+    async fn replace(&self, kind: Kind, object: &serde_json::Value) -> Result<(), String> {
+        let name = object["metadata"]["name"].as_str().unwrap();
+        let there = self.of(kind, name).ok_or("404")?;
+        if there["metadata"]["resourceVersion"] != object["metadata"]["resourceVersion"] {
+            return Err("409".into());
+        }
+        self.put(kind, object.clone());
+        Ok(())
+    }
+    async fn delete(&self, kind: Kind, name: &str) -> Result<bool, String> {
+        Ok(self
+            .held
+            .lock()
+            .unwrap()
+            .remove(&(kind, name.to_string()))
+            .is_some())
+    }
+}
+
+fn block<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+/// Item 31: the Role names exactly the count launched, written again at a
+/// launch at another count -- 2 to 3, and 3 to 2 -- whether stopping
+/// removed it between or not; every Lease is made once and kept as it is,
+/// its holder and transitions with it, and stopping never removes one.
+#[test]
+fn a_launch_at_another_count_writes_the_role_again_and_keeps_every_lease() {
+    const ACCOUNT: &str = "check-meridian-runtime-shards-snaptrade-1";
+    block(async {
+        let api = Cluster::default();
+        make_shards_account(&api, &objects(2)).await.unwrap();
+        let role = api.of(Kind::Role, ACCOUNT).unwrap();
+        assert_eq!(names(&role), ["snaptrade-1-shard-0", "snaptrade-1-shard-1"]);
+        // A take of shard 0, as a sidecar writes it.
+        let mut taken = api.of(Kind::Lease, "snaptrade-1-shard-0").unwrap();
+        taken["spec"] = serde_json::json!({"holderIdentity": "p_1", "leaseTransitions": 4});
+        api.put(Kind::Lease, taken);
+        // 2 to 3 in place, as a launch finding them there.
+        make_shards_account(&api, &objects(3)).await.unwrap();
+        assert_eq!(
+            names(&api.of(Kind::Role, ACCOUNT).unwrap()),
+            [
+                "snaptrade-1-shard-0",
+                "snaptrade-1-shard-1",
+                "snaptrade-1-shard-2"
+            ]
+        );
+        assert_eq!(
+            api.of(Kind::Lease, "snaptrade-1-shard-0").unwrap()["spec"]["leaseTransitions"],
+            4,
+            "a Lease there is never made again"
+        );
+        // Stopped: the account, its Role and binding gone; the Leases kept.
+        let removed = remove_shards_account(&api, ACCOUNT).await.unwrap();
+        assert_eq!(
+            removed,
+            [Kind::RoleBinding, Kind::Role, Kind::ServiceAccount]
+        );
+        for shard in 0..3 {
+            assert!(api
+                .of(Kind::Lease, &format!("snaptrade-1-shard-{shard}"))
+                .is_some());
+        }
+        // 3 to 2, launched again after the stop.
+        make_shards_account(&api, &objects(2)).await.unwrap();
+        assert_eq!(
+            names(&api.of(Kind::Role, ACCOUNT).unwrap()),
+            ["snaptrade-1-shard-0", "snaptrade-1-shard-1"]
+        );
+        assert_eq!(
+            api.of(Kind::Lease, "snaptrade-1-shard-0").unwrap()["spec"]["leaseTransitions"],
+            4
+        );
+        assert!(api.of(Kind::Lease, "snaptrade-1-shard-2").is_some());
+        // Nothing removed twice, and never what the launcher did not make.
+        remove_shards_account(&api, ACCOUNT).await.unwrap();
+        assert!(remove_shards_account(&api, ACCOUNT)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut theirs = objects(2).role;
+        theirs["metadata"]["labels"] = serde_json::json!({});
+        api.put(Kind::Role, theirs);
+        let refused = make_shards_account(&api, &objects(2)).await.unwrap_err();
+        assert!(refused.contains("not made by the launcher"), "{refused}");
+        // Its account, made before the Role was refused, is the launcher's.
+        assert_eq!(
+            remove_shards_account(&api, ACCOUNT).await.unwrap(),
+            [Kind::ServiceAccount]
+        );
+        assert!(api.of(Kind::Role, ACCOUNT).is_some());
+    });
+}
+
+/// Item 31: a bucket archive's workload identity moves onto the instance's
+/// own account -- its annotations, not a tool's or the cluster's -- and the
+/// pods stay under that account; one pod is run under the archive's, as
+/// before.
+#[test]
+fn a_bucket_archive_s_identity_moves_onto_an_instance_s_own_account() {
+    let archive = serde_json::json!({"metadata": {"name": "archive-writer", "annotations": {
+        "eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/archive",
+        "iam.gke.io/gcp-service-account": "archive@p.iam.gserviceaccount.com",
+        "kubectl.kubernetes.io/last-applied-configuration": "{}",
+        "meta.helm.sh/release-name": "check",
+        "kubernetes.io/enforce-mountable-secrets": "true"
+    }}});
+    let identity = identity_of(&archive);
+    assert_eq!(
+        identity.keys().collect::<Vec<_>>(),
+        [
+            "eks.amazonaws.com/role-arn",
+            "iam.gke.io/gcp-service-account"
+        ]
+    );
+    let asked = CreatePluginRequest {
+        shards: 2,
+        roles: vec!["data".into()],
+        ..allowed()
+    };
+    assert_eq!(
+        archive_account(Some(BUCKET_ARCHIVE), &asked).as_deref(),
+        Some("archive-writer")
+    );
+    assert_eq!(archive_account(Some(LOCAL_ARCHIVE), &asked), None);
+    assert_eq!(
+        archive_account(Some(BUCKET_ARCHIVE), &sharded(2, false)),
+        None
+    );
+    let made = with_shards(several_pods(), &asked).unwrap();
+    let made = with_archive(made, Some(BUCKET_ARCHIVE), &asked, &["data".to_string()]).unwrap();
+    assert_eq!(
+        made["spec"]["template"]["spec"]["serviceAccountName"],
+        "check-meridian-runtime-shards-snaptrade-1"
+    );
+    let kept = shards_objects(&made, &asked, "meridian", &identity).unwrap();
+    assert_eq!(
+        kept.account["metadata"]["annotations"],
+        serde_json::Value::Object(identity)
+    );
+    // One pod: the archive's own account, as before.
+    let one = with_archive(pod(), Some(BUCKET_ARCHIVE), &allowed(), &edge()).unwrap();
+    assert_eq!(
+        one["spec"]["template"]["spec"]["serviceAccountName"],
+        "archive-writer"
+    );
+}
+
+/// Item 31: what stopping removes is read from the chart's shards shape.
+#[test]
+fn the_account_stopping_removes_is_the_shards_shape_s_for_the_instance() {
+    let shape = r#"{"spec":{"template":{"spec":{"serviceAccountName":"r-shards-__INSTANCE__","containers":[{"name":"plugin","image":"__IMAGE__"}]}}}}"#;
+    assert_eq!(
+        shards_account_of(Some(shape), "feed-1").as_deref(),
+        Some("r-shards-feed-1")
+    );
+    assert_eq!(shards_account_of(None, "feed-1"), None);
+    assert_eq!(
+        shards_account_of(
+            Some(r#"{"spec":{"template":{"spec":{"serviceAccountName":"r-member"}}}}"#),
+            "feed-1"
+        ),
+        None
+    );
 }

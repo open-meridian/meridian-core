@@ -14,11 +14,19 @@ mount sits in, or what a setting's value is, so these checks read the shape:
             container beside it, the shard count told, and a rollout a
             shard at a time;
   sharded   a sidecars[] entry given shards and a standby (INSTANCE, PODS,
-            SHARDS): the same, read from its own Deployment.
+            SHARDS): the same, read from its own Deployment;
+  trio      a sidecars[] entry's own account (INSTANCE, SHARDS; checkpoint
+            5, item 31): a ServiceAccount, Role and RoleBinding named
+            `<fullname>-shards-<instance>`, the Role's one rule `get` and
+            `update` on exactly its shards' Leases, bound to that account
+            alone, the account carrying no secret; each Lease rendered and
+            kept; and the members' account, Role and binding -- the
+            stores' alone -- never a plugin's.
 
 Usage:  helm template ... | python3 tools/chart_shards.py default
         helm template ... | python3 tools/chart_shards.py ha
         helm template ... | python3 tools/chart_shards.py sharded feed-1 3 2
+        helm template ... | python3 tools/chart_shards.py trio feed-1 2
 Exit:   0 as it should be, 1 naming what is not
 """
 
@@ -57,12 +65,12 @@ def default(render: str) -> list[str]:
     return wrong
 
 
-def shape_wrong(pod: dict, strategy: dict, standby: bool, shards: str | None) -> list[str]:
+def shape_wrong(pod: dict, strategy: dict, standby: bool, shards: str | None, instance: str) -> list[str]:
     """What is wrong with a several-pod instance's pod spec, read as JSON."""
     wrong = []
     account = pod.get("serviceAccountName", "")
-    if not account.endswith("-member"):
-        wrong.append(f"its account is {account!r}, not the members'")
+    if not account.endswith(f"-shards-{instance}"):
+        wrong.append(f"its account is {account!r}, not its instance's own, <fullname>-shards-{instance} (item 31)")
     if pod.get("automountServiceAccountToken") is not False:
         wrong.append(
             "automountServiceAccountToken is "
@@ -115,7 +123,8 @@ def ha(render: str) -> list[str]:
     shape = json.loads(json.loads(line.group(1)))
     return [
         f"the launcher's shards shape: {what}"
-        for what in shape_wrong(shape["spec"]["template"]["spec"], shape["spec"].get("strategy", {}), True, None)
+        for what in shape_wrong(shape["spec"]["template"]["spec"], shape["spec"].get("strategy", {}), True, None,
+                                "__INSTANCE__")
     ]
 
 
@@ -183,13 +192,76 @@ def sharded(render: str, instance: str, pods: str, shards: str) -> list[str]:
         if found.group(2):
             strategy["rollingUpdate"] = {"maxSurge": int(found.group(2)), "maxUnavailable": int(found.group(3))}
     standby = int(pods) > int(shards)
-    return wrong + [f"{instance}: {what}" for what in shape_wrong(pod, strategy, standby, shards)]
+    return wrong + [f"{instance}: {what}" for what in shape_wrong(pod, strategy, standby, shards, instance)]
+
+
+def named(render: str, which: str, name: str) -> list[str]:
+    return [doc for doc in documents(render) if kind(doc) == which and re.search(rf"^  name: {re.escape(name)}$", doc, re.M)]
+
+
+def trio(render: str, instance: str, shards: str) -> list[str]:
+    """A sidecars[] entry's own account, its Role, binding and Leases (item
+    31), read by their lines: helm renders each block style, the Role's
+    lists as the template writes them."""
+    wrong = []
+    leases = [f"{instance}-shard-{n}" for n in range(int(shards))]
+    accounts = [doc for doc in documents(render) if kind(doc) == "ServiceAccount"
+                and re.search(rf"^  name: \S+-shards-{re.escape(instance)}$", doc, re.M)]
+    if len(accounts) != 1:
+        return [f"{len(accounts)} ServiceAccounts are {instance}'s own, not one"]
+    own = re.search(r"^  name: (\S+)$", accounts[0], re.M).group(1)
+    if re.search(r"^(image[pP]ull)?[sS]ecrets:", accounts[0], re.M):
+        wrong.append(f"{own} carries a secret")
+    roles = named(render, "Role", own)
+    if len(roles) != 1:
+        wrong.append(f"{len(roles)} Roles are named {own}, not one")
+    else:
+        role = roles[0]
+        rules = re.findall(r"^  - ", role, re.M)
+        verbs = re.findall(r"^    verbs: (\[.*\])$", role, re.M)
+        groups = re.findall(r"^  - apiGroups: (\[.*\])$", role, re.M)
+        resources = re.findall(r"^    resources: (\[.*\])$", role, re.M)
+        names = re.findall(r"^      - \"(\S+)\"$", role, re.M)
+        if len(rules) != 1:
+            wrong.append(f"{own}'s Role has {len(rules)} rules, not one")
+        if [json.loads(v) for v in verbs] != [["get", "update"]]:
+            wrong.append(f"{own}'s Role grants {verbs}, not get and update alone")
+        if [json.loads(g) for g in groups] != [["coordination.k8s.io"]] or \
+                [json.loads(r) for r in resources] != [["leases"]]:
+            wrong.append(f"{own}'s Role is on {groups} {resources}, not leases alone")
+        if names != leases:
+            wrong.append(f"{own}'s Role names {names}, not exactly {leases}")
+    bindings = named(render, "RoleBinding", own)
+    if len(bindings) != 1:
+        wrong.append(f"{len(bindings)} RoleBindings are named {own}, not one")
+    else:
+        binding = bindings[0]
+        subjects = re.findall(r"^  - kind: (\S+)\n    name: (\S+)$", binding, re.M)
+        ref = re.search(r"^roleRef:\n  kind: (\S+)\n  name: (\S+)$", binding, re.M)
+        if subjects != [("ServiceAccount", own)]:
+            wrong.append(f"{own}'s binding binds {subjects}, not {own} alone")
+        if not ref or ref.groups() != ("Role", own):
+            wrong.append(f"{own}'s binding is to {ref.groups() if ref else None}, not its own Role")
+    for lease in leases:
+        made = named(render, "Lease", lease)
+        if len(made) != 1 or "helm.sh/resource-policy: keep" not in made[0]:
+            wrong.append(f"{lease} is not rendered once and kept ({len(made)} rendered)")
+    # The members' account is the stores' alone: no plugin's Deployment runs
+    # under it, and its binding binds no plugin's account.
+    for doc in documents(render):
+        if kind(doc) == "Deployment" and "meridian.dev/component: sidecar" in doc and \
+                re.search(r"^      serviceAccountName: \S+-member$", doc, re.M):
+            wrong.append("a plugin's Deployment runs under the members' account, the stores' alone")
+        if kind(doc) == "RoleBinding" and re.search(r"^  name: \S+-member$", re.split(r"^roleRef:", doc, flags=re.M)[-1], re.M) \
+                and re.search(r"^    name: \S+-shards-", doc, re.M):
+            wrong.append("the members' Role is bound to a plugin instance's own account")
+    return wrong
 
 
 def main() -> int:
     render = sys.stdin.read()
     mode, rest = sys.argv[1], sys.argv[2:]
-    wrong = {"default": default, "ha": ha, "sharded": sharded}[mode](render, *rest)
+    wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio}[mode](render, *rest)
     for what in wrong:
         print(f"chart-check FAILED (step 3d, shards): {what}", file=sys.stderr)
     return 1 if wrong else 0

@@ -3097,14 +3097,21 @@ chart-check:
 	@# Step 3d (the resilience spec's section 7): a plugin instance as
 	@# shards with a standby pod. The default renders no lease right and the
 	@# launcher no shape for them (standbys are configuration, ruling 1052);
-	@# `ha` renders the shape, under the members' account with its token
-	@# mounted in the sidecar's container alone, rolled a shard at a time.
-	@# A sidecars[] entry given shards and a standby is a pod each, told the
-	@# count; with storage of its own it is refused, saying why. The shapes
-	@# are read, not grepped (tools/chart_shards.py; the review of 95d68904,
+	@# `ha` renders the shape, under its instance's own account with its
+	@# token mounted in the sidecar's container alone, rolled a shard at a
+	@# time. A sidecars[] entry given shards and a standby is a pod each,
+	@# told the count, under its own account (checkpoint 5, item 31): a
+	@# ServiceAccount, Role and RoleBinding `<fullname>-shards-<instance>`,
+	@# the Role naming its shards' Leases alone, each Lease rendered and
+	@# kept, and the members' account the stores' alone -- the check shown
+	@# to find each violation planted in a render as well as passing it.
+	@# With storage of its own it is refused, saying why. The shapes are
+	@# read, not grepped (tools/chart_shards.py; the review of 95d68904,
 	@# S6): a word in a render says nothing of which container holds it.
 	@# Where the cluster can, the launcher's admission policy pins the
-	@# account its Deployments run under (S2).
+	@# account its Deployments run under (S2) and the shape of what it
+	@# makes for an instance (item 31); the launcher may make that and no
+	@# more, with no escalate and no bind.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
 	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | $(PY) tools/chart_shards.py default || exit 1; \
 	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha \
@@ -3112,15 +3119,35 @@ chart-check:
 		|| { echo "chart-check FAILED: the ha profile did not render: $$ha" >&2; exit 1; }; \
 	echo "$$ha" | $(PY) tools/chart_shards.py ha || exit 1; \
 	echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName in' \
-		&& echo "$$ha" | grep -q '\["", "default", "check-meridian-runtime-member"\]' \
+		&& echo "$$ha" | grep -q '\["", "default"\] ||' \
+		&& echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName == variables.own' \
 		&& echo "$$ha" | grep -q "the token is mounted in the sidecar's container alone" \
-		|| { echo "chart-check FAILED: the launcher's admission policy does not pin the account a launched plugin runs under, or its token to the sidecar (step 3d, S2)" >&2; exit 1; }; \
+		&& echo "$$ha" | grep -q "the launcher's Role grants get and update on its instance's shard Leases alone" \
+		&& echo "$$ha" | grep -q "the launcher's RoleBinding binds its instance's shards Role to the same-named account alone" \
+		&& echo "$$ha" | grep -q "the launcher's ServiceAccount carries no secrets" \
+		|| { echo "chart-check FAILED: the launcher's admission policy does not pin the account a launched plugin runs under, its token to the sidecar, or what it makes for an instance to its shape (step 3d, S2, item 31)" >&2; exit 1; }; \
+	echo "$$ha" | grep -q '"check-meridian-runtime-member"' \
+		&& { echo "chart-check FAILED: a launched plugin may still run under the members' account, the stores' alone (item 31)" >&2; exit 1; }; \
+	echo "$$ha" | grep -Eq '^ *verbs:.*"(escalate|bind)"' \
+		&& { echo "chart-check FAILED: a Role in the ha render holds escalate or bind (item 31: the launcher holds neither)" >&2; exit 1; }; \
 	sharded="--set sidecars[0].instanceId=feed-1 --set sidecars[0].roles={data} --set sidecars[0].plugin.image=example/plugin:1 --set sidecars[0].shards=2 --set sidecars[0].standby=true"; \
 	made="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false 2>&1)" \
 		|| { echo "chart-check FAILED: a sidecars[] entry with shards and a standby did not render: $$made" >&2; exit 1; }; \
 	echo "$$made" | $(PY) tools/chart_shards.py sharded feed-1 3 2 || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py trio feed-1 2 || exit 1; \
 	echo "$$made" | grep -q "name: check-meridian-runtime-member$$" \
-		|| { echo "chart-check FAILED: a sharded sidecars[] entry renders no members' account to run under (step 3d)" >&2; exit 1; }; \
+		&& { echo "chart-check FAILED: a sharded sidecars[] entry alone renders the members' account, the stores' alone (item 31)" >&2; exit 1; }; \
+	withstores="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false --set resilience.profile=ha 2>&1)" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry under the ha profile did not render: $$withstores" >&2; exit 1; }; \
+	echo "$$withstores" | $(PY) tools/chart_shards.py trio feed-1 2 || exit 1; \
+	for plant in 's/verbs: \["get", "update"\]$$/verbs: ["get", "update", "create"]/' \
+		's/^      - "feed-1-shard-1"$$/      - "other-1-shard-0"/' \
+		's/^    name: check-meridian-runtime-shards-feed-1$$/    name: check-meridian-runtime-conductor/' \
+		's/^  name: feed-1-shard-1$$/  name: feed-1-shard-x/' \
+		's/serviceAccountName: check-meridian-runtime-shards-feed-1$$/serviceAccountName: check-meridian-runtime-member/'; do \
+		echo "$$withstores" | sed "$$plant" | $(PY) tools/chart_shards.py trio feed-1 2 2>/dev/null \
+			&& { echo "chart-check FAILED: the item 31 check passed a render with a violation planted ($$plant), so it proves nothing" >&2; exit 1; }; \
+	done; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=true 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: a sharded instance rendered with storage of its own, which is one pod's" >&2; exit 1; }; \
 	echo "$$said" | grep -q "storage is one pod's" \

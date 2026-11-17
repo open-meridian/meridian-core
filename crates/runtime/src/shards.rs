@@ -11,6 +11,14 @@
 //! its role classes' `run()` has not started -- and takes whichever Lease
 //! lapses or is released, within the lease's duration.
 //!
+//! **The Leases are made for it** (step 3d, checkpoint 5, item 31): the
+//! launcher, or the chart for a `sidecars[]` instance, makes each shard's
+//! Lease before the instance's pods start and never deletes one, so its
+//! `leaseTransitions` only grows. A sidecar takes and renews them under its
+//! instance's own account, `<fullname>-shards-<instance>`, whose Role names
+//! those Leases alone, and never makes one: a pod that finds its Lease
+//! missing says so and waits.
+//!
 //! A shard reads the others' Leases, never writing them, to learn which
 //! shards live: what the sidecar's rendezvous hashing shares the
 //! instance's subjects over ([`meridian_sidecar::shards`]).
@@ -276,13 +284,16 @@ impl<L: Leases + 'static> ShardSet<L> {
     fn electors_of(&self, count: u32) -> Vec<Shared<L>> {
         (0..count)
             .map(|shard| {
+                // Never made here (item 31): the launcher, or the chart,
+                // makes each shard's Lease before the instance's pods start.
                 let elector = Elector::new(
                     Arc::clone(&self.api),
                     Settings {
                         name: lease_name(&self.instance, shard),
                         ..self.settings.clone()
                     },
-                );
+                )
+                .makes_none();
                 Arc::new(tokio::sync::Mutex::new(if self.writes_on {
                     elector.seen_as_answered(clock)
                 } else {
@@ -1020,6 +1031,35 @@ pub(crate) mod tests {
         fn written_at(&self, name: &str) -> tokio::time::Instant {
             self.written.lock().unwrap()[name]
         }
+        /// A Lease made free, as the launcher or the chart makes each shard's
+        /// before its pods start (item 31); one already there is kept.
+        pub(crate) fn make(&self, name: &str) {
+            let mut leases = self.leases.lock().unwrap();
+            if leases.contains_key(name) {
+                return;
+            }
+            let uid = format!("{name}@{}", self.made.fetch_add(1, Ordering::SeqCst));
+            leases.insert(
+                name.to_string(),
+                Record {
+                    holder: String::new(),
+                    duration_seconds: 0,
+                    acquire_time: String::new(),
+                    renew_time: String::new(),
+                    transitions: 0,
+                    resource_version: "1".into(),
+                    uid,
+                },
+            );
+            drop(leases);
+            self.wrote(name);
+        }
+        /// The instance's `count` shard Leases, made.
+        pub(crate) fn make_shards(&self, count: u32) {
+            for shard in 0..count.max(1) {
+                self.make(&lease_name("feed-1", shard));
+            }
+        }
         pub(crate) fn holder(&self, name: &str) -> String {
             self.leases
                 .lock()
@@ -1072,6 +1112,7 @@ pub(crate) mod tests {
     const LASTS: Duration = Duration::from_secs(6);
 
     fn pod(api: &Arc<Memory>, count: u32, holder: &str) -> ShardSet<Memory> {
+        api.make_shards(count);
         ShardSet::new(Arc::clone(api), "feed-1", count, holder, RENEW, LASTS).unwrap()
     }
 
@@ -1100,6 +1141,24 @@ pub(crate) mod tests {
             assert!(count(Some(bad)).unwrap_err().contains(SHARDS_ENV), "{bad}");
         }
         assert_eq!(lease_name("feed-1", 3), "feed-1-shard-3");
+    }
+
+    /// Item 31: a shard's Lease is the launcher's or the chart's to make.
+    /// A pod that finds none takes nothing and makes nothing -- its sidecar
+    /// holds no right to -- and stands by until it is made.
+    #[test]
+    fn a_pod_never_makes_its_shard_s_lease_and_waits_for_it() {
+        run(async {
+            let api = Arc::new(Memory::default());
+            let mut a = ShardSet::new(Arc::clone(&api), "feed-1", 2, "a", RENEW, LASTS).unwrap();
+            assert_eq!(a.look(Instant::now(), 0).await, Stand::Standby);
+            assert!(api.leases.lock().unwrap().is_empty(), "no Lease made");
+            assert_eq!(a.taken().await, None);
+            api.make("feed-1-shard-1");
+            assert_eq!(a.look(Instant::now(), 0).await, shard(1, &[]));
+            assert_eq!(api.holder("feed-1-shard-1"), "a");
+            assert!(!api.leases.lock().unwrap().contains_key("feed-1-shard-0"));
+        });
     }
 
     #[test]
@@ -1320,6 +1379,7 @@ pub(crate) mod tests {
     }
 
     fn on(link: &Arc<Link>, count: u32, holder: &str) -> ShardSet<Link> {
+        link.store.make_shards(count);
         ShardSet::new(Arc::clone(link), "feed-1", count, holder, RENEW, LASTS).unwrap()
     }
 
@@ -2062,7 +2122,9 @@ pub(crate) mod tests {
             (
                 "feed-1",
                 0,
-                1,
+                // Its second take: `a` took it free from the launcher's
+                // making (item 31), at 1.
+                2,
                 "b",
                 "a",
                 meridian_domain::v1::TakeoverReason::LeaseLapsed as i32
@@ -2090,9 +2152,10 @@ pub(crate) mod tests {
         let mut first = pod(&fresh, 1, "f");
         assert_eq!(first.look(start, 0).await, shard(0, &[]));
         let taken = first.taken().await.unwrap();
+        // Made free (item 31), so its first take is its first transition.
         assert_eq!(
             (taken.transitions, taken.from.as_str(), taken.free),
-            (0, "", true)
+            (1, "", true)
         );
     }
 

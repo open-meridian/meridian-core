@@ -14,6 +14,10 @@
 {{- include "meridian-runtime.pluginStorage" (dict "top" $top "instance" .instanceId) }}
 ---
 {{- end }}
+{{- if or (gt (int (.shards | default 1)) 1) .standby }}
+{{- include "meridian-runtime.shardsAccount" (dict "top" $top "instance" .instanceId "shards" .shards) }}
+---
+{{- end }}
 {{- include "meridian-runtime.plugin" (dict
       "top" $top
       "name" (printf "%s-sidecar-%s" $full .instanceId)

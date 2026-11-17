@@ -695,7 +695,7 @@ fn several_refused(
         meridian_bus::RefusalStatus::FailedPrecondition,
         &[field.to_string()],
         format!(
-            "{field} was asked for {}, and this deployment runs no store standby: an instance              of several pods takes its shards' leases under the members' lease right, which              the chart renders where a store runs a standby (lake.standby, bor.standby,              instrument.standby, street.standby or conductor.standby at 1; the ha profile              sets each)",
+            "{field} was asked for {}, and this deployment runs no store standby: an instance              of several pods takes its shards' Leases under an account the launcher makes for              the instance, which the chart lets it make where a store runs a standby (lake.standby, bor.standby,              instrument.standby, street.standby or conductor.standby at 1; the ha profile              sets each)",
             instance
         ),
     ))

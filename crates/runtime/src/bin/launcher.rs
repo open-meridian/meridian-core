@@ -7,7 +7,10 @@
 //! itself further: it makes nothing for an instance that has a workload
 //! already, and removes only what carries its label. For an edge plugin it
 //! also makes the instance's storage claim, once, and never removes one
-//! (decisions/028).
+//! (decisions/028). For an instance of several pods it makes the instance's
+//! own account, `<fullname>-shards-<instance>`, with a Role naming its
+//! shards' Leases alone and their binding, and the Leases themselves, which
+//! it never deletes (step 3d, checkpoint 5, item 31).
 
 use std::sync::Arc;
 
@@ -18,8 +21,10 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    checked, claim, manifest, reusable, shards_template, template_for, with_archive, with_limits,
-    with_shards, Shapes, StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
+    archive_account, checked, claim, identity_of, make_shards_account, manifest,
+    remove_shards_account, reusable, several, shards_account_of, shards_objects, shards_template,
+    template_for, with_archive, with_limits, with_shards, Kind, Objects, Shapes, StorageShapes,
+    CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -34,6 +39,41 @@ fn main() {
     if let Err(failed) = run() {
         tracing::error!("{failed}");
         std::process::exit(1);
+    }
+}
+
+/// The API server, as far as an instance's own account and its Leases
+/// need it (item 31).
+struct Kube<'a>(&'a ApiServer);
+
+impl Objects for Kube<'_> {
+    async fn get(&self, kind: Kind, name: &str) -> Result<Option<serde_json::Value>, String> {
+        let (root, plural) = kind.root_and_plural();
+        self.0
+            .object(root, plural, name)
+            .await
+            .map_err(|failed| failed.0)
+    }
+    async fn create(&self, kind: Kind, object: &serde_json::Value) -> Result<bool, String> {
+        let (root, plural) = kind.root_and_plural();
+        self.0
+            .make_object(root, plural, object)
+            .await
+            .map_err(|failed| failed.0)
+    }
+    async fn replace(&self, kind: Kind, object: &serde_json::Value) -> Result<(), String> {
+        let (root, plural) = kind.root_and_plural();
+        self.0
+            .replace_object(root, plural, object)
+            .await
+            .map_err(|failed| failed.0)
+    }
+    async fn delete(&self, kind: Kind, name: &str) -> Result<bool, String> {
+        let (root, plural) = kind.root_and_plural();
+        self.0
+            .delete_object(root, plural, name)
+            .await
+            .map_err(|failed| failed.0)
     }
 }
 
@@ -85,22 +125,15 @@ impl Launcher {
             .as_ref()
             .map(|storage| storage.edge_roles.clone())
             .unwrap_or_default();
-        let made = with_archive(
-            manifest(chosen.workload, &request)?,
-            self.shapes.archive.as_deref(),
-            &request,
-            &edge,
-        )?;
         // Its own share at its sidecar, over the chart's (contract v30).
-        let made = with_limits(made, &request)?;
+        let made = with_limits(manifest(chosen.workload, &request)?, &request)?;
         // A pod per shard and one more for a standby, each sidecar told the
-        // count; never under an archive's own account.
-        let own_account = meridian_runtime::launcher::archive_allowed(&request)
-            && self.shapes.archive.as_deref().is_some_and(|shape| {
-                serde_json::from_str::<serde_json::Value>(shape)
-                    .is_ok_and(|shape| shape["serviceAccountName"].is_string())
-            });
-        let made = with_shards(made, &request, own_account)?;
+        // count, under the instance's own account (item 31).
+        let made = with_shards(made, &request)?;
+        let made = with_archive(made, self.shapes.archive.as_deref(), &request, &edge)?;
+        if several(&request) {
+            self.shards_account(&made, &request)?;
+        }
         if let Some(template) = chosen.claim {
             self.storage(template, &request)?;
         }
@@ -118,6 +151,46 @@ impl Launcher {
             "a plugin created"
         );
         Ok(CreatePluginReply { workload })
+    }
+
+    /// An instance of several pods' own account, Role and binding, and its
+    /// shards' Leases, there before its Deployment is (item 31); an allowed
+    /// bucket archive's workload identity moved onto the account.
+    fn shards_account(
+        &self,
+        made: &serde_json::Value,
+        request: &CreatePluginRequest,
+    ) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::current();
+        let identity = match archive_account(self.shapes.archive.as_deref(), request) {
+            None => serde_json::Map::new(),
+            Some(account) => {
+                let (root, plural) = Kind::ServiceAccount.root_and_plural();
+                let held = handle
+                    .block_on(self.api.object(root, plural, &account))
+                    .map_err(|failed| failed.0)?
+                    .ok_or_else(|| {
+                        format!(
+                            "{} was allowed an archive, and its account {account} \
+                             (pluginArchive.serviceAccount) is not there",
+                            request.instance_id
+                        )
+                    })?;
+                identity_of(&held)
+            }
+        };
+        let objects = shards_objects(made, request, self.api.namespace(), &identity)?;
+        handle.block_on(make_shards_account(&Kube(&self.api), &objects))?;
+        tracing::info!(
+            instance = request.instance_id,
+            account = objects.account["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default(),
+            leases = objects.leases.len(),
+            identity = !identity.is_empty(),
+            "its own account and its shards' Leases, made"
+        );
+        Ok(())
     }
 
     /// The instance's storage, there before its Deployment is: the claim it
@@ -208,6 +281,22 @@ impl Launcher {
                 .block_on(self.api.delete_deployment(&workload))
                 .map_err(|failed| failed.0)?;
             tracing::info!(instance = request.instance_id, workload, "a plugin removed");
+        }
+        // Its own account, Role and binding, where it was several pods;
+        // never its Leases (item 31).
+        if let Some(account) =
+            shards_account_of(self.shapes.shards.as_deref(), &request.instance_id)
+        {
+            let gone = tokio::runtime::Handle::current()
+                .block_on(remove_shards_account(&Kube(&self.api), &account))?;
+            if !gone.is_empty() {
+                tracing::info!(
+                    instance = request.instance_id,
+                    account,
+                    removed = ?gone,
+                    "its own account removed; its Leases kept"
+                );
+            }
         }
         Ok(RemovePluginReply { removed })
     }

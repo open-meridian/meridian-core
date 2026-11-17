@@ -19,10 +19,11 @@
   path MERIDIAN_STORAGE_DIR names; and shards and standby (step 3d; the
   resilience spec's section 7): the instance as several pods of this one
   Deployment, one per shard and one more for a standby, each sidecar told
-  the shard count and given the members' lease right -- in its own
-  container alone, never the plugin's -- to take a Lease
-  `<instance>-shard-<n>`. Unset, or one shard and no standby, the
-  instance's one pod as ever, with no lease.
+  the shard count and given its instance's own account,
+  `<fullname>-shards-<instance>` -- in its own container alone, never the
+  plugin's -- to take a Lease `<instance>-shard-<n>`, made for it (item
+  31). Unset, or one shard and no standby, the instance's one pod as
+  ever, with no lease.
 
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -123,10 +124,13 @@ spec:
       {{- if $several }}
       {{- /*
         Several pods of the instance (step 3d): each sidecar takes a shard's
-        Lease under the members' account. Its token is mounted in the
+        Lease under its instance's own account, whose Role names that
+        instance's shards' Leases alone (checkpoint 5, item 31): made by the
+        launcher for a launched instance, by this chart for a sidecars[]
+        one (meridian-runtime.shardsAccount). Its token is mounted in the
         sidecar's container alone, below; the plugin's holds none.
       */}}
-      serviceAccountName: {{ include "meridian-runtime.fullname" $top }}-member
+      serviceAccountName: {{ include "meridian-runtime.fullname" $top }}-shards-{{ .instance }}
       automountServiceAccountToken: false
       {{- end }}
       {{- /*
@@ -464,4 +468,73 @@ spec:
             name: {{ include "meridian-runtime.fullname" $top }}-dashboard-keys
         {{- end }}
       {{- end }}
+{{- end -}}
+
+{{/*
+  A sidecars[] instance of several pods' own account (step 3d, checkpoint 5,
+  item 31), as the launcher makes a launched one's: a ServiceAccount, and a
+  Role and RoleBinding of its name, `<fullname>-shards-<instance>`, the Role
+  granting `get` and `update` on exactly the instance's shards' Leases, by
+  name -- RBAC names no prefix and cannot narrow `create` to a name -- so
+  each Lease is made here too, free, and kept: never deleted, by an upgrade
+  or an uninstall, so its leaseTransitions only grows. Takes a dict: top,
+  instance, shards (the count).
+*/}}
+{{- define "meridian-runtime.shardsAccount" -}}
+{{- $top := .top -}}
+{{- $name := printf "%s-shards-%s" (include "meridian-runtime.fullname" $top) .instance -}}
+{{- $count := int (max 1 (int (.shards | default 1))) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "update"]
+    resourceNames:
+      {{- range $shard := until $count }}
+      - {{ printf "%s-shard-%d" $.instance $shard | quote }}
+      {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $top.Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+{{- range $shard := until $count }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ printf "%s-shard-%d" $.instance $shard }}
+  labels:
+    meridian.dev/instance: {{ $.instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec: {}
+{{- end }}
 {{- end -}}
