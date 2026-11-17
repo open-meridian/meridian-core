@@ -9141,6 +9141,254 @@ async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_s
     tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
 }
 
+/// A write of `dataset`'s row `key` on `subject`, sent now, its caller
+/// waiting `wait_ms`, as the stream holds it at `sequence`.
+fn a_callers_write(
+    dataset: &str,
+    key: &str,
+    subject: &str,
+    sequence: u64,
+    wait_ms: u64,
+) -> meridian_lake::write_ahead::Taken {
+    use meridian_domain::v1::RecordTradesRequest;
+    use prost::Message;
+    let sent = SystemClock.now_ns();
+    meridian_lake::write_ahead::Taken {
+        sequence,
+        at_ns: sent,
+        topic: meridian_lake::service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.{key}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: sent,
+                message_id: key.into(),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(dataset, key, subject, 7_000 + sequence as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.to_string(),
+        timeout_ms: Some(wait_ms),
+    }
+}
+
+/// Group 1's dataset, which it answers, its upper half moved to group 0 in
+/// database 0 (the shape ha run 3 moved it back from): the across, the
+/// upper half's name and a subject in it, and the mover.
+fn answering_with_its_upper_half_out(
+    tag: &str,
+) -> (
+    Across,
+    String,
+    String,
+    meridian_lake::partition_moves::Mover,
+) {
+    use meridian_lake::partition_moves::{Asked, Ended};
+    let a = across_owned(tag, true, 1);
+    let upper = format!("{}/8000-ffff", a.dataset);
+    let (_, high) = halves_of(tag);
+    let mover = a.mover();
+    assert!(mover.begin(&upper));
+    let asked = Asked {
+        by_hand: true,
+        moved_by: "admin-1".into(),
+        reason: "the upper half to the group not answering its dataset".into(),
+    };
+    let ended = mover.run(&upper, 0, &asked).unwrap();
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    for store in a.zeros.iter().chain(&a.ones) {
+        store.read_owners().unwrap();
+    }
+    (a, upper, high, mover)
+}
+
+/// Each answer of a batch is sent the moment it is decided, by its own
+/// caller's wait (review c5r M1): one that waits on no other group at once,
+/// and of two waiting on a part group 0 never commits, the one whose caller
+/// waits 2 s refused within those 2 s, never held for its batch-mate's 5 s.
+/// While either waits, the writer still looks at its place (review c5r L3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_answer_of_a_batch_is_sent_by_its_own_callers_wait() {
+    use meridian_lake::write_ahead::{settle_each, taken_past_a_switch, Writer};
+    use std::sync::atomic::Ordering;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let (a, _upper, high, mover) =
+        tokio::task::block_in_place(|| answering_with_its_upper_half_out("each"));
+    let dataset = a.dataset.clone();
+    let lake1 = tokio::task::block_in_place(|| {
+        ha_lake_over(
+            a.one.clone() as Arc<dyn Store>,
+            a.ones[0].groups(),
+            "lake-1",
+            &dataset,
+        )
+    });
+    // One batch: a 5 s caller's write first, then a 2 s caller's, each a
+    // row of group 0's half, which group 0 never takes.
+    let began = std::time::Instant::now();
+    let writes = vec![
+        a_callers_write(&dataset, "each-5s", &high, 1, 5_000),
+        a_callers_write(&dataset, "each-2s", &high, 2, 2_000),
+    ];
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    let mut answers = taken_past_a_switch(&mut writer1, writes).await.unwrap();
+    let mut waits = writer1.take_waits();
+    assert_eq!(
+        waits.len(),
+        2,
+        "group 1 answers both once group 0's parts commit"
+    );
+    // A batch-mate that waits on nothing, first in the batch.
+    answers.insert(
+        0,
+        (
+            Some("_INBOX.each-now".into()),
+            Ok(("meridian.v1.RecordObservationsReply".into(), Vec::new())),
+        ),
+    );
+    for wait in &mut waits {
+        wait.at += 1;
+    }
+    let settling = writer1.settling();
+    let mut each = settle_each(
+        lake1.clone(),
+        STREAM.to_string(),
+        answers,
+        waits,
+        Some(settling.clone()),
+    );
+    let mut heard = Vec::new();
+    while let Some((at, to, answered)) = each.recv().await {
+        if heard.is_empty() {
+            assert_eq!(settling.load(Ordering::SeqCst), 2, "both wait");
+            assert!(
+                writer1.may_be_taken_back(),
+                "it looks while an answer waits"
+            );
+        }
+        heard.push((at, to, answered.is_ok(), began.elapsed()));
+    }
+    let when = |to: &str| {
+        heard
+            .iter()
+            .find(|(_, said, _, _)| said.as_deref() == Some(to))
+            .unwrap_or_else(|| panic!("{to} never answered: {heard:?}"))
+            .clone()
+    };
+    let now = when("_INBOX.each-now");
+    assert!(
+        now.3 < std::time::Duration::from_millis(500),
+        "the answer waiting on nothing was held {:?}: {heard:?}",
+        now.3
+    );
+    let two = when("_INBOX.each-2s");
+    assert!(
+        !two.2 && two.3 < std::time::Duration::from_millis(2_000),
+        "the 2 s caller's refusal came {:?} after it was sent, past its wait: {heard:?}",
+        two.3
+    );
+    let five = when("_INBOX.each-5s");
+    assert!(
+        !five.2 && five.3 < std::time::Duration::from_millis(5_000),
+        "the 5 s caller's refusal came {:?}: {heard:?}",
+        five.3
+    );
+    assert_eq!(settling.load(Ordering::SeqCst), 0, "no answer waits");
+    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
+}
+
+/// A batch held by a move's switch is held no longer than its caller waits
+/// (review c5r M2; spec 6.8): its switch stopped between the two databases,
+/// the range a pointer where it goes, a write into it whose caller waits 2 s
+/// is refused Held within those 2 s -- never the hold's 5 s -- and the
+/// group answering it answers OVERLOADED with a retry-after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_held_by_a_switch_is_refused_before_its_caller_stops_waiting() {
+    use meridian_changes::moves::points;
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::store::StoreError;
+    use meridian_lake::write_ahead::{taken_past_a_switch, Writer};
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    const WAIT_MS: u64 = 2_000;
+    let (a, upper, high, mover) =
+        tokio::task::block_in_place(|| answering_with_its_upper_half_out("held"));
+    let dataset = a.dataset.clone();
+    // Back to group 1, stopped between the two databases: the target's row
+    // a pointer, so its writes there are held until the sweep opens it.
+    tokio::task::block_in_place(|| {
+        points::arm(
+            "lake.switch.between",
+            &upper,
+            Arc::new(|_| Err("stopped between the two databases".into())),
+        );
+        assert!(mover.begin(&upper));
+        let asked = Asked {
+            by_hand: true,
+            moved_by: "admin-1".into(),
+            reason: "the upper half home, stopped between".into(),
+        };
+        let ended = mover.run(&upper, 1, &asked);
+        points::disarm("lake.switch.between", &upper);
+        assert!(ended.is_ok(), "{ended:?}");
+        for store in a.zeros.iter().chain(&a.ones) {
+            store.read_owners().unwrap();
+        }
+    });
+    let lake1 = tokio::task::block_in_place(|| {
+        ha_lake_over(
+            a.one.clone() as Arc<dyn Store>,
+            a.ones[0].groups(),
+            "lake-1",
+            &dataset,
+        )
+    });
+    let write = a_callers_write(&dataset, "held-1", &high, 1, WAIT_MS);
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    let began = std::time::Instant::now();
+    let took = taken_past_a_switch(&mut writer1, vec![write.clone()]).await;
+    let held = began.elapsed();
+    assert!(
+        matches!(took, Err(StoreError::Held(_))),
+        "held by the switch: {:?}",
+        took.map(|answers| answers.len())
+    );
+    assert!(
+        held < std::time::Duration::from_millis(WAIT_MS),
+        "held {held:?}, past its caller's {WAIT_MS} ms"
+    );
+    assert!(
+        held >= std::time::Duration::from_millis(WAIT_MS)
+            - meridian_changes::moves::ANSWERED_BEFORE
+            - std::time::Duration::from_millis(100),
+        "held only {held:?}: refused well before its caller's wait less the way back"
+    );
+    let refused = writer1.held_refusals(&[write]);
+    assert_eq!(refused.len(), 1, "the write group 1 answers");
+    assert_eq!(refused[0].0.as_deref(), Some("_INBOX.held-1"));
+    let refusal = refused[0].1.clone().unwrap_err();
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refusal.contains(&overloaded) && meridian_bus::refusal_retry_after(&refusal).is_some(),
+        "OVERLOADED with a retry-after: {refusal}"
+    );
+    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
+}
+
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
 /// group answering it waits until the other group's consumer has committed
 /// its part -- its position in the stream past the write -- and answers

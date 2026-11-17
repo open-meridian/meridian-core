@@ -111,26 +111,30 @@ pub struct Taken {
 
 impl Taken {
     /// When its answer is given by at the latest (step 3d; spec 6.8, the
-    /// hold): its caller's wait counted from when it was sent -- the earlier
-    /// of its sidecar's stamp and the stream's time for it -- less the
-    /// answer's way back ([`ANSWERED_BEFORE`]), as `moves::hold_now` bounds
-    /// a held write; none where its sidecar said no wait. `now_ns` is now on
-    /// the lake's clock.
+    /// hold): its caller's wait counted from when the stream took it -- the
+    /// broker's time, one hop from the lake (review c5r L2); its sidecar's
+    /// stamp only where the stream said none -- less the answer's way back
+    /// ([`ANSWERED_BEFORE`]), as `moves::hold_now` bounds a held write; none
+    /// where its sidecar said no wait. `now_ns` is now on the lake's clock;
+    /// the age is never below none or above the wait.
     ///
     /// [`ANSWERED_BEFORE`]: meridian_changes::moves::ANSWERED_BEFORE
     pub fn answer_by(&self, now_ns: i64) -> Option<tokio::time::Instant> {
-        let wait = Duration::from_millis(self.timeout_ms?);
-        let stamped = self
-            .envelope
-            .meta
-            .as_ref()
-            .map_or(0, |meta| meta.published_at_ns);
-        let sent = if stamped > 0 {
-            stamped.min(self.at_ns)
-        } else {
+        // A day at most: past any hold, and never an overflow.
+        let wait = Duration::from_millis(self.timeout_ms?.min(86_400_000));
+        let sent = if self.at_ns > 0 {
             self.at_ns
+        } else {
+            self.envelope
+                .meta
+                .as_ref()
+                .map_or(0, |meta| meta.published_at_ns)
         };
-        let age = Duration::from_nanos(now_ns.saturating_sub(sent).max(0) as u64);
+        let age = if sent > 0 {
+            Duration::from_nanos(now_ns.saturating_sub(sent).max(0) as u64).min(wait)
+        } else {
+            Duration::ZERO
+        };
         Some(
             tokio::time::Instant::now()
                 + wait
@@ -138,6 +142,12 @@ impl Taken {
                     .saturating_sub(meridian_changes::moves::ANSWERED_BEFORE),
         )
     }
+}
+
+/// A caller's wait as its sidecar said it (`Meridian-Timeout-Ms`, ms): none
+/// where it said none or what it said is no count of ms (review c5r L5).
+pub fn timeout_of(said: Option<&str>) -> Option<u64> {
+    said?.trim().parse().ok()
 }
 
 /// Where a writer group keeps its position in the stream (step 3d; section
@@ -297,6 +307,10 @@ pub struct Writer {
     /// another group's: a move's switch may take its place back to before
     /// it, for as long as the hold (step 3d; spec 6.1 and 6.8).
     passed_at: Option<tokio::time::Instant>,
+    /// How many of its answers still wait on other groups' parts: while
+    /// any does, a move's switch may yet take its place back, however long
+    /// ago it passed the write (review c5r L3).
+    settling: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Whether `dataset`'s ranges span writer groups as this member last read
@@ -326,6 +340,7 @@ impl Writer {
             dropped,
             valid,
             passed_at: None,
+            settling: Arc::default(),
         })
     }
 
@@ -341,6 +356,54 @@ impl Writer {
     pub fn may_be_taken_back(&self) -> bool {
         self.passed_at
             .is_some_and(|at| at.elapsed() < meridian_changes::moves::hold())
+            || self.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// How many of its answers still wait on other groups' parts, counted
+    /// by [`settle_each`] (review c5r L3).
+    pub fn settling(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.settling)
+    }
+
+    /// The earliest any caller of `batch` this group answers stops waiting,
+    /// less the answer's way back ([`Taken::answer_by`]): what a batch held
+    /// by a move's switch is held to at most (review c5r M2).
+    pub fn answer_by(&self, batch: &[Taken]) -> Option<tokio::time::Instant> {
+        let now_ns = self.lake.now_ns();
+        self.answered(batch)
+            .filter_map(|write| write.answer_by(now_ns))
+            .min()
+    }
+
+    /// The writes of `batch` this group answers: those with somewhere to
+    /// answer, of datasets this group answers.
+    fn answered<'a>(&self, batch: &'a [Taken]) -> impl Iterator<Item = &'a Taken> {
+        let groups = self.lake.groups();
+        batch.iter().filter(move |write| {
+            write.reply_to.is_some() && ours(groups, write) && answers(groups, write)
+        })
+    }
+
+    /// The answers of a batch a move's switch held past the hold, or past
+    /// the earliest of its callers' waits (spec 6.8; review c5r M2): each
+    /// write this group answers refused OVERLOADED with a retry-after, as
+    /// a held write is. Nothing of it was committed and the stream keeps
+    /// it: taken again, its rows are committed then, and its plugin's
+    /// retry finds them unchanged.
+    pub fn held_refusals(&self, batch: &[Taken]) -> Answers {
+        self.answered(batch)
+            .map(|write| {
+                (
+                    write.reply_to.clone(),
+                    Err(meridian_bus::refusal_retrying(
+                        meridian_pb::v1::RefusalReason::Overloaded as i32,
+                        meridian_changes::moves::HELD_RETRY_SECONDS,
+                        "a range of this write is held by a move's switch past the hold or its \
+                         caller's wait: nothing of it is committed yet; ask again",
+                    )),
+                )
+            })
+            .collect()
     }
 
     /// Whether the store's place in the stream is no longer the one the
@@ -579,7 +642,7 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         envelope: Envelope::decode(message.payload.clone()).unwrap_or_default(),
         dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)
             .unwrap_or_default(),
-        timeout_ms: header(TIMEOUT_HEADER).and_then(|said| said.trim().parse().ok()),
+        timeout_ms: timeout_of(header(TIMEOUT_HEADER).as_deref()),
     })
 }
 
@@ -618,155 +681,221 @@ impl Writer {
 /// 0, unchanged 0 in the half second after the driver's range switched to
 /// database 1). So no answer is given while a range of its dataset is
 /// between two databases.
-pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec<Wait>) -> Answers {
-    let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
-    for wait in waits {
-        let Some((_, answer)) = answers.get_mut(wait.at) else {
-            continue;
-        };
-        let Ok((_, payload)) = answer else {
-            continue;
-        };
-        let mut groups = wait.groups.clone();
-        let mine = lake.groups().mine();
-        groups.retain(|group| *group != mine);
-        // The dataset's ranges' owners now: read at once, again now and then
-        // while the answer waits, and once more after every group waited on
-        // has passed the write. A range moved to another group since the
-        // write was taken is waited on there too (the review's C4): an old
-        // owner skips the rows only once the move names the new one, so a
-        // read after its position passed the write names the new owner.
-        let more = |groups: &mut Vec<u32>| -> bool {
-            if wait.dataset.is_empty() {
-                return false;
-            }
-            if tokio::task::block_in_place(|| lake.read_owners_again()).is_err() {
-                return true;
-            }
-            let mut grew = false;
-            for group in other_groups(lake.groups(), &wait.dataset) {
-                if !groups.contains(&group) {
-                    groups.push(group);
-                    grew = true;
-                }
-            }
-            grew
-        };
-        more(&mut groups);
-        // The hold, and never past its caller's wait less the answer's way
-        // back: past it, refused OVERLOADED with a retry-after its caller
-        // hears, never a timeout (failover-repeat 43993402238, ha run 3: a
-        // price's answer could wait the hold from its take, past its
-        // caller's 5 s; its caller heard DEADLINE_EXCEEDED).
-        let until = wait.answer_by.map_or(until, |by| by.min(until));
-        let mut looked = tokio::time::Instant::now();
-        let reached = loop {
-            if looked.elapsed() >= Duration::from_millis(100) {
-                looked = tokio::time::Instant::now();
-                more(&mut groups);
-            }
-            let passed = |groups: &[u32]| {
-                tokio::task::block_in_place(|| {
-                    !lake.range_between(&wait.dataset).unwrap_or(true)
-                        && groups.iter().chain([&mine]).all(|group| {
-                            lake.group_position(&group_key(stream, *group), *group)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|at| at.sequence >= wait.sequence)
-                        })
-                })
-            };
-            if passed(&groups) && !more(&mut groups) && passed(&groups) {
-                break true;
-            }
-            if tokio::time::Instant::now() >= until {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        *answer = if reached {
-            tokio::task::block_in_place(|| {
-                // Each group's part as it kept it: this group's own in place
-                // of what this take alone did, where it kept one.
-                let part = |group: u32| {
-                    lake.write_ahead_part(&group_key(stream, group), group, wait.sequence)
-                        .map_err(|failed| failed.to_string())
-                };
-                let own = part(mine)?;
-                // Every other group's, not only those owning a range of it
-                // now: one that committed a part and has since moved its
-                // range away kept it all the same.
-                let mut others = crate::store::Counts::default();
-                for group in (0..lake.groups().count()).filter(|group| *group != mine) {
-                    // Rows of it that group refused by the lake's rule 5:
-                    // the write's answer, by name, as this group's own
-                    // part's refusal is (ruled 2026-11-15). Its other
-                    // parts committed all the same.
-                    if let Some(refused) = lake
-                        .write_ahead_refused(&group_key(stream, group), group, wait.sequence)
-                        .map_err(|failed| failed.to_string())?
-                    {
-                        return Err(refused);
-                    }
-                    if let Some(theirs) = part(group)? {
-                        others.add(theirs);
-                    }
-                }
-                // Every row of a kept dataset accounted for, by this
-                // group's part or its take and by every other group's part
-                // (ruled 2026-11-15): else refused, to be sent again.
-                let counted = match own {
-                    Some(own) => own.all(),
-                    None => crate::service::counted(payload).saturating_sub(wait.sent.served),
-                } + others.all();
-                if counted < wait.sent.kept {
-                    tracing::warn!(
-                        sequence = wait.sequence,
-                        dataset = %wait.dataset,
-                        group = mine,
-                        waited_on = ?groups,
-                        own_part = own.is_some(),
-                        counted,
-                        sent = wait.sent.kept,
-                        "a write of the stream is refused: its answer does not account for every row it sent"
-                    );
-                    return Err(unaccounted(counted, wait.sent.kept));
-                }
-                let again = lake.answer_again(payload, own, others, &wait.dataset)?;
-                // Answered counting no row at all -- neither a part any
-                // group kept nor what this take did itself: said with what
-                // was waited on, so the member that answered names the path
-                // (PR CI 43680214054 and 43684440785, ha: prices answered
-                // recorded 0, restated 0, unchanged 0 after a range's move
-                // between databases). Not said only because this group kept
-                // no part: it keeps none where its rows of the write did
-                // nothing it counts, and another group's part may count them.
-                if crate::service::counts_nothing(&again) {
-                    tracing::warn!(
-                        sequence = wait.sequence,
-                        dataset = %wait.dataset,
-                        group = mine,
-                        waited_on = ?groups,
-                        own_part = own.is_some(),
-                        "a write of the stream is answered counting none of its rows"
-                    );
-                }
-                Ok::<_, String>(again)
-            })
-            .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
-        } else {
-            Err(meridian_bus::refusal_retrying(
-                meridian_pb::v1::RefusalReason::Overloaded as i32,
-                meridian_changes::moves::HELD_RETRY_SECONDS,
-                format!(
-                    "writer group(s) {:?} had not committed their part of this write within the \
-                     hold: its rows are kept and committed in turn; ask again",
-                    groups
-                ),
-            ))
-        };
+pub async fn settled(
+    lake: &Arc<Lake>,
+    stream: &str,
+    answers: Answers,
+    waits: Vec<Wait>,
+) -> Answers {
+    let mut settled: Vec<Option<(Option<String>, HandlerReply)>> =
+        (0..answers.len()).map(|_| None).collect();
+    let mut each = settle_each(Arc::clone(lake), stream.to_string(), answers, waits, None);
+    while let Some((at, to, answered)) = each.recv().await {
+        settled[at] = Some((to, answered));
     }
-    answers
+    settled.into_iter().flatten().collect()
+}
+
+/// A batch's answers, each sent on as soon as it is decided, with its place
+/// in the batch (review c5r M1): those that wait on no other group at once;
+/// each that waits once its own wait is over ([`settled`]'s rules), on a
+/// task of its own, by its own bound -- the hold from now, and never past
+/// its caller's wait less the answer's way back -- never held for another
+/// write's wait. `settling`, where given, counts the waits not yet over.
+pub fn settle_each(
+    lake: Arc<Lake>,
+    stream: String,
+    answers: Answers,
+    waits: Vec<Wait>,
+    settling: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(usize, Option<String>, HandlerReply)> {
+    use std::sync::atomic::Ordering;
+    let (sent, each) = tokio::sync::mpsc::unbounded_channel();
+    let until = tokio::time::Instant::now() + meridian_changes::moves::hold();
+    let mut waiting: BTreeMap<usize, (Option<String>, HandlerReply)> = BTreeMap::new();
+    let waited: std::collections::BTreeSet<usize> = waits.iter().map(|wait| wait.at).collect();
+    for (at, (to, answered)) in answers.into_iter().enumerate() {
+        if waited.contains(&at) {
+            waiting.insert(at, (to, answered));
+        } else {
+            let _ = sent.send((at, to, answered));
+        }
+    }
+    for wait in waits {
+        let Some((to, answered)) = waiting.remove(&wait.at) else {
+            continue;
+        };
+        if let Some(settling) = &settling {
+            settling.fetch_add(1, Ordering::SeqCst);
+        }
+        let (lake, stream, sent, settling) = (
+            Arc::clone(&lake),
+            stream.clone(),
+            sent.clone(),
+            settling.clone(),
+        );
+        tokio::spawn(async move {
+            let answered = settle_one(&lake, &stream, answered, &wait, until).await;
+            let _ = sent.send((wait.at, to, answered));
+            if let Some(settling) = settling {
+                settling.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+    }
+    each
+}
+
+/// One write's answer once its wait is over ([`settled`]'s rules), by
+/// `until` (the hold) and never past its caller's wait less the answer's
+/// way back.
+async fn settle_one(
+    lake: &Lake,
+    stream: &str,
+    answered: HandlerReply,
+    wait: &Wait,
+    until: tokio::time::Instant,
+) -> HandlerReply {
+    let Ok((_, payload)) = &answered else {
+        return answered;
+    };
+    let mut groups = wait.groups.clone();
+    let mine = lake.groups().mine();
+    groups.retain(|group| *group != mine);
+    // The dataset's ranges' owners now: read at once, again now and then
+    // while the answer waits, and once more after every group waited on
+    // has passed the write. A range moved to another group since the
+    // write was taken is waited on there too (the review's C4): an old
+    // owner skips the rows only once the move names the new one, so a
+    // read after its position passed the write names the new owner.
+    let more = |groups: &mut Vec<u32>| -> bool {
+        if wait.dataset.is_empty() {
+            return false;
+        }
+        if tokio::task::block_in_place(|| lake.read_owners_again()).is_err() {
+            return true;
+        }
+        let mut grew = false;
+        for group in other_groups(lake.groups(), &wait.dataset) {
+            if !groups.contains(&group) {
+                groups.push(group);
+                grew = true;
+            }
+        }
+        grew
+    };
+    more(&mut groups);
+    // The hold, and never past its caller's wait less the answer's way
+    // back: past it, refused OVERLOADED with a retry-after its caller
+    // hears, never a timeout (failover-repeat 43993402238, ha run 3: a
+    // price's answer could wait the hold from its take, past its
+    // caller's 5 s; its caller heard DEADLINE_EXCEEDED).
+    let until = wait.answer_by.map_or(until, |by| by.min(until));
+    let mut looked = tokio::time::Instant::now();
+    let reached = loop {
+        if looked.elapsed() >= Duration::from_millis(100) {
+            looked = tokio::time::Instant::now();
+            more(&mut groups);
+        }
+        let passed = |groups: &[u32]| {
+            tokio::task::block_in_place(|| {
+                !lake.range_between(&wait.dataset).unwrap_or(true)
+                    && groups.iter().chain([&mine]).all(|group| {
+                        lake.group_position(&group_key(stream, *group), *group)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|at| at.sequence >= wait.sequence)
+                    })
+            })
+        };
+        if passed(&groups) && !more(&mut groups) && passed(&groups) {
+            break true;
+        }
+        if tokio::time::Instant::now() >= until {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    if reached {
+        tokio::task::block_in_place(|| {
+            // Each group's part as it kept it: this group's own in place
+            // of what this take alone did, where it kept one.
+            let part = |group: u32| {
+                lake.write_ahead_part(&group_key(stream, group), group, wait.sequence)
+                    .map_err(|failed| failed.to_string())
+            };
+            let own = part(mine)?;
+            // Every other group's, not only those owning a range of it
+            // now: one that committed a part and has since moved its
+            // range away kept it all the same.
+            let mut others = crate::store::Counts::default();
+            for group in (0..lake.groups().count()).filter(|group| *group != mine) {
+                // Rows of it that group refused by the lake's rule 5:
+                // the write's answer, by name, as this group's own
+                // part's refusal is (ruled 2026-11-15). Its other
+                // parts committed all the same.
+                if let Some(refused) = lake
+                    .write_ahead_refused(&group_key(stream, group), group, wait.sequence)
+                    .map_err(|failed| failed.to_string())?
+                {
+                    return Err(refused);
+                }
+                if let Some(theirs) = part(group)? {
+                    others.add(theirs);
+                }
+            }
+            // Every row of a kept dataset accounted for, by this
+            // group's part or its take and by every other group's part
+            // (ruled 2026-11-15): else refused, to be sent again.
+            let counted = match own {
+                Some(own) => own.all(),
+                None => crate::service::counted(payload).saturating_sub(wait.sent.served),
+            } + others.all();
+            if counted < wait.sent.kept {
+                tracing::warn!(
+                    sequence = wait.sequence,
+                    dataset = %wait.dataset,
+                    group = mine,
+                    waited_on = ?groups,
+                    own_part = own.is_some(),
+                    counted,
+                    sent = wait.sent.kept,
+                    "a write of the stream is refused: its answer does not account for every row it sent"
+                );
+                return Err(unaccounted(counted, wait.sent.kept));
+            }
+            let again = lake.answer_again(payload, own, others, &wait.dataset)?;
+            // Answered counting no row at all -- neither a part any
+            // group kept nor what this take did itself: said with what
+            // was waited on, so the member that answered names the path
+            // (PR CI 43680214054 and 43684440785, ha: prices answered
+            // recorded 0, restated 0, unchanged 0 after a range's move
+            // between databases). Not said only because this group kept
+            // no part: it keeps none where its rows of the write did
+            // nothing it counts, and another group's part may count them.
+            if crate::service::counts_nothing(&again) {
+                tracing::warn!(
+                    sequence = wait.sequence,
+                    dataset = %wait.dataset,
+                    group = mine,
+                    waited_on = ?groups,
+                    own_part = own.is_some(),
+                    "a write of the stream is answered counting none of its rows"
+                );
+            }
+            Ok::<_, String>(again)
+        })
+        .map(|again| ("meridian.v1.RecordObservationsReply".to_string(), again))
+    } else {
+        Err(meridian_bus::refusal_retrying(
+            meridian_pb::v1::RefusalReason::Overloaded as i32,
+            meridian_changes::moves::HELD_RETRY_SECONDS,
+            format!(
+                "writer group(s) {:?} had not committed their part of this write within the \
+                 hold: its rows are kept and committed in turn; ask again",
+                groups
+            ),
+        ))
+    }
 }
 
 /// Each answer sent to the inbox its write named, as the broker's request
@@ -910,21 +1039,30 @@ async fn answer_when_settled(
     if waits.is_empty() {
         return answer(client, answers).await;
     }
-    let (lake, client, stream) = (
-        lake.clone(),
-        client.clone(),
+    // Each sent the moment it is decided, never held for a batch-mate's
+    // wait (review c5r M1).
+    let mut each = settle_each(
+        Arc::clone(lake),
         writer.stream_name().to_string(),
+        answers,
+        waits,
+        Some(Arc::clone(&writer.settling)),
     );
+    let client = client.clone();
     tokio::spawn(async move {
-        let answers = settled(&lake, &stream, answers, waits).await;
-        answer(&client, answers).await;
+        while let Some((_, to, answered)) = each.recv().await {
+            answer(&client, vec![(to, answered)]).await;
+        }
     });
 }
 
 /// A batch taken, tried again while a range of it is held by a move's
 /// switch (step 3d; spec 6.8): refused whole while held, nothing committed,
-/// and taken again once the switch is done -- at most moves.holdSeconds,
-/// then refused as held and the writer goes on from its position. Every
+/// and taken again once the switch is done -- at most moves.holdSeconds, and
+/// never past the earliest of its callers' waits less the answer's way
+/// back -- then refused as held, and the writer answers each write of it
+/// that it answers OVERLOADED with a retry-after and goes on from its
+/// position (review c5r M2). Every
 /// dataset this group takes waits with it: a switch takes milliseconds. A
 /// batch refused for a range another group owns since the view was read is
 /// taken again at once on the corrected view.
@@ -934,11 +1072,19 @@ pub async fn taken_past_a_switch(
 ) -> Result<Answers, StoreError> {
     let hold = meridian_changes::moves::hold();
     let began = std::time::Instant::now();
+    // Held for at most the hold, and never past the earliest of its
+    // callers' waits less the answer's way back (spec 6.8; review c5r M2):
+    // past that, refused Held, and the writer answers each such write
+    // OVERLOADED with a retry-after ([`Writer::held_refusals`]).
+    let held_until = tokio::time::Instant::now() + hold;
+    let held_until = writer
+        .answer_by(&batch)
+        .map_or(held_until, |by| by.min(held_until));
     let mut wait = Duration::from_millis(5);
     loop {
         let took = tokio::task::block_in_place(|| writer.take(batch.clone()));
         match took {
-            Err(StoreError::Held(_)) if began.elapsed() + wait < hold => {
+            Err(StoreError::Held(_)) if tokio::time::Instant::now() + wait < held_until => {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_millis(100));
             }
@@ -1106,6 +1252,9 @@ pub async fn write_forever(
             // Kept to be tried again one write at a time (step 3d, group
             // commit; section 6.5): a batch is at most 512 KiB.
             let each = (batch.len() > 1).then(|| batch.clone());
+            // Where a move's switch holds it past its bound, each write
+            // this group answers is refused for it (review c5r M2).
+            let held = writer.held_refusals(&batch);
             let took = taken_past_a_switch(&mut writer, batch).await;
             let took = match (took, each) {
                 // An unexpected database error: each write tried alone, in
@@ -1140,6 +1289,9 @@ pub async fn write_forever(
                     return Err(format!("the lake's writer was fenced: {fenced}"));
                 }
                 Err(failed) => {
+                    if matches!(failed, StoreError::Held(_)) {
+                        answer(&client, held).await;
+                    }
                     tracing::warn!(
                         %failed,
                         "a batch from the write-ahead stream was not recorded; going on from the \
@@ -1437,6 +1589,76 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller's wait read from its header: a count of ms, trimmed; none
+    /// where it is missing or no count (review c5r L5).
+    #[test]
+    fn a_callers_wait_is_read_from_its_header() {
+        assert_eq!(timeout_of(Some("5000")), Some(5_000));
+        assert_eq!(timeout_of(Some(" 2000 ")), Some(2_000));
+        assert_eq!(timeout_of(Some("0")), Some(0));
+        assert_eq!(timeout_of(Some("five")), None);
+        assert_eq!(timeout_of(Some("-1")), None);
+        assert_eq!(timeout_of(None), None);
+    }
+
+    /// When a write's answer is given by (review c5r L2, L5): its caller's
+    /// wait from the stream's time less the way back; the sidecar's stamp
+    /// only where the stream gave none; an age never below none or above
+    /// the wait; none without a wait; never an overflow.
+    #[tokio::test(start_paused = true)]
+    async fn a_writes_answer_is_given_by_its_callers_wait_from_the_streams_time() {
+        let now_ns: i64 = 1_000_000_000_000;
+        let ms = |n: i64| n * 1_000_000;
+        let write = |at_ns: i64, stamped: i64, timeout_ms: Option<u64>| Taken {
+            sequence: 1,
+            at_ns,
+            topic: String::new(),
+            reply_to: Some("_INBOX.1".into()),
+            after: None,
+            envelope: Envelope {
+                meta: Some(meridian_bus::MessageMeta {
+                    published_at_ns: stamped,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dataset: String::new(),
+            timeout_ms,
+        };
+        let left = |write: Taken| {
+            write
+                .answer_by(now_ns)
+                .map(|by| by.duration_since(tokio::time::Instant::now()).as_millis())
+        };
+        // Taken by the stream 1 s ago, a 5 s caller: 3.5 s left.
+        assert_eq!(
+            left(write(now_ns - ms(1_000), now_ns - ms(1_000), Some(5_000))),
+            Some(3_500)
+        );
+        // A stamp 10 s behind the stream's time (a sender's clock behind):
+        // the stream's time decides.
+        assert_eq!(
+            left(write(now_ns, now_ns - ms(10_000), Some(5_000))),
+            Some(4_500)
+        );
+        // No stream time: the stamp.
+        assert_eq!(left(write(0, now_ns - ms(2_000), Some(5_000))), Some(2_500));
+        // Neither: counted from now.
+        assert_eq!(left(write(0, 0, Some(5_000))), Some(4_500));
+        // From the future (the lake's clock behind): never more than the wait.
+        assert_eq!(left(write(now_ns + ms(3_000), 0, Some(5_000))), Some(4_500));
+        // Older than its wait, or a wait of 0: now.
+        assert_eq!(left(write(now_ns - ms(9_000), 0, Some(5_000))), Some(0));
+        assert_eq!(left(write(now_ns, 0, Some(0))), Some(0));
+        // No wait said: none, the hold alone.
+        assert_eq!(left(write(now_ns, now_ns, None)), None);
+        // The largest wait: a day at most, no overflow.
+        assert_eq!(
+            left(write(now_ns, 0, Some(u64::MAX))),
+            Some(86_400_000 - 500)
+        );
+    }
 
     /// A dataset whose ranges span groups is taken by each group owning one
     /// of its open ranges, each committing its own rows; the group of its
