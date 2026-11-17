@@ -941,33 +941,22 @@ spec:
 {{/*
   The pod the launcher copies an instance's own storage claim into its
   shared storage's `shard-0/` with, once, before its first launch as
-  several pods (step 3d, checkpoint 5, item 30): the runtime's image, the
-  launcher's `copy-storage`, the instance's own claim read only and its
-  shared claim, and nothing else -- no account's token, no secret. It
+  several pods (step 3d, checkpoint 5, item 30): the instance's own plugin
+  image, which the launcher fills in, running the SDK's `meridian-storage
+  copy` as the plugin's own user (PO items 86 and 88), the instance's own
+  claim read only and its shared claim, and nothing else -- no account's
+  token, no secret. It
   writes a marker once the copy is whole, which the instance's pods wait
   for before their plugin starts. The launcher's admission policy holds
   what it makes to exactly this shape. Takes the chart.
 */}}
-{{/*
-  The user and group an instance's storage copy runs as (item 30, review c5c
-  H1): the plugins' 65532, or podSecurityContext's own where it names them.
-  The launcher's admission policy holds the copy pod to the same.
-*/}}
-{{- define "meridian-runtime.storageCopyUser" -}}
-{{- $given := .Values.podSecurityContext | default dict -}}
-runAsUser: {{ $given.runAsUser | default 65532 | int64 }}
-runAsGroup: {{ $given.runAsGroup | default 65532 | int64 }}
-{{- end -}}
-
 {{- define "meridian-runtime.storageCopy" -}}
 {{- $full := include "meridian-runtime.fullname" . -}}
-{{- /* As the plugins' user and group (review c5c H1): plugin images run as
-       65532, and the SDK writes its files 0600, so the copy reads them as
-       their owner and what it writes stays theirs to write on; never root
-       with every capability dropped, which reads neither. A
-       podSecurityContext that names its own user wins, as it does for the
-       plugins' pods. */ -}}
-{{- $podSecurity := merge (deepCopy (.Values.podSecurityContext | default dict)) (include "meridian-runtime.storageCopyUser" . | fromYaml) (dict "runAsNonRoot" true "seccompProfile" (dict "type" "RuntimeDefault")) -}}
+{{- /* As the plugin's own user (item 86): its image's, or the one the
+       cluster assigns, as for its pods -- no uid pinned, which OpenShift
+       refuses -- so the copy reads the SDK's 0600 files as their owner and
+       what it writes stays theirs to write on. */ -}}
+{{- $podSecurity := merge (deepCopy (.Values.podSecurityContext | default dict)) (dict "seccompProfile" (dict "type" "RuntimeDefault")) -}}
 {{- if .Values.pluginStorage.fsGroup -}}
 {{- $podSecurity = merge (deepCopy $podSecurity) (dict "fsGroup" .Values.pluginStorage.fsGroup "fsGroupChangePolicy" "OnRootMismatch") -}}
 {{- end -}}
@@ -996,9 +985,9 @@ spec:
   {{- end }}
   containers:
     - name: copy
-      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-      imagePullPolicy: {{ .Values.image.pullPolicy }}
-      args: ["meridian-launcher", "copy-storage", "{{ $full }}-storage-__INSTANCE__"]
+      image: "__IMAGE__"
+      imagePullPolicy: IfNotPresent
+      command: ["meridian-storage", "copy", "{{ $full }}-storage-__INSTANCE__"]
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true

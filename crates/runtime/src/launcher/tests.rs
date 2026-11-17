@@ -1204,7 +1204,7 @@ fn the_account_stopping_removes_is_the_shards_shape_s_for_the_instance() {
 
 // ── Item 30: one shared claim per instance, a folder per shard ─────────────
 
-const COPY: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"check-meridian-runtime-storage-copy-__INSTANCE__","labels":{"meridian.dev/component":"storage-copy","meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"}},"spec":{"restartPolicy":"OnFailure","automountServiceAccountToken":false,"containers":[{"name":"copy","image":"meridian-runtime:check","imagePullPolicy":"IfNotPresent","args":["meridian-launcher","copy-storage","check-meridian-runtime-storage-__INSTANCE__"],"securityContext":{"allowPrivilegeEscalation":false},"volumeMounts":[{"name":"from","mountPath":"/var/lib/meridian/copy/from","readOnly":true},{"name":"to","mountPath":"/var/lib/meridian/copy/to"}]}],"volumes":[{"name":"from","persistentVolumeClaim":{"claimName":"check-meridian-runtime-storage-__INSTANCE__","readOnly":true}},{"name":"to","persistentVolumeClaim":{"claimName":"check-meridian-runtime-shared-storage-__INSTANCE__"}}]}}"#;
+const COPY: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"check-meridian-runtime-storage-copy-__INSTANCE__","labels":{"meridian.dev/component":"storage-copy","meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"}},"spec":{"restartPolicy":"Never","automountServiceAccountToken":false,"containers":[{"name":"copy","image":"__IMAGE__","imagePullPolicy":"IfNotPresent","command":["meridian-storage","copy","check-meridian-runtime-storage-__INSTANCE__"],"securityContext":{"allowPrivilegeEscalation":false},"volumeMounts":[{"name":"from","mountPath":"/var/lib/meridian/copy/from","readOnly":true},{"name":"to","mountPath":"/var/lib/meridian/copy/to"}]}],"volumes":[{"name":"from","persistentVolumeClaim":{"claimName":"check-meridian-runtime-storage-__INSTANCE__","readOnly":true}},{"name":"to","persistentVolumeClaim":{"claimName":"check-meridian-runtime-shared-storage-__INSTANCE__"}}]}}"#;
 
 fn shared_shapes() -> Shapes {
     let mut shapes = shapes(true);
@@ -1431,14 +1431,20 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         .unwrap();
     assert_eq!(gates.len(), 1);
     assert_eq!(gates[0]["name"], "storage-copied");
+    // Item 86 (PO, 2026-11-17): the copy and the wait are the SDK's, run in
+    // the instance's own plugin image as its own user; the command's name is
+    // the PO's item 88.
+    assert_eq!(pod["spec"]["containers"][0]["image"], asked.image.as_str());
+    assert_eq!(gates[0]["image"], asked.image.as_str());
     assert_eq!(
-        gates[0]["args"],
+        gates[0]["command"],
         serde_json::json!([
-            "meridian-launcher",
-            "storage-copied",
+            "meridian-storage",
+            "copied",
             "check-meridian-runtime-storage-snaptrade-1"
         ])
     );
+    assert!(gates[0]["args"].is_null());
     assert_eq!(
         gates[0]["volumeMounts"],
         serde_json::json!([{"name": "storage", "mountPath": "/var/lib/meridian/storage", "readOnly": true}])

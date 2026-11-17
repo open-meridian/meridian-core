@@ -47,9 +47,9 @@ TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 MEMBER = re.compile(r"^  name: \S+-member$", re.M)
 LAUNCHER = "check-meridian-runtime-launcher"
 PODS = re.compile(r'^    resources: \["pods"\]$', re.M)
-# The user and group plugin images run as (the SDK image drops to 65532),
-# which an instance's copy pod runs as too (review c5c H1).
-PLUGIN_USER = 65532
+# The SDK's command an instance's own storage is copied with, in its own
+# plugin image as its own user (PO items 86 and 88).
+STORAGE_COPY = ["meridian-storage", "copy", "check-meridian-runtime-storage-__INSTANCE__"]
 PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"\]$', re.M)
 # Where the chart renders the copy pod (item 30), and only there, the one
 # pod the launcher makes: made, read and removed (review c5c L8).
@@ -365,26 +365,28 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
     volumes = {v["name"]: v.get("persistentVolumeClaim", {}) for v in spec.get("volumes", [])}
     if (copy["metadata"]["name"] != "check-meridian-runtime-storage-copy-__INSTANCE__"
             or len(spec["containers"]) != 1
-            or spec["containers"][0]["args"] != ["meridian-launcher", "copy-storage",
-                                                 "check-meridian-runtime-storage-__INSTANCE__"]
+            or spec["containers"][0].get("image") != "__IMAGE__"
+            or spec["containers"][0].get("command") != STORAGE_COPY
+            or "args" in spec["containers"][0]
             or spec.get("automountServiceAccountToken") is not False
             or volumes.get("from", {}).get("claimName") != "check-meridian-runtime-storage-__INSTANCE__"
             or volumes.get("from", {}).get("readOnly") is not True
             or volumes.get("to", {}).get("claimName") != "check-meridian-runtime-shared-storage-__INSTANCE__"
             or len(volumes) != 2):
-        wrong.append("the copy pod is not the launcher's copy-storage of the instance's own claim, "
-                     "read only, into its shared storage alone")
+        wrong.append("the copy pod is not the SDK's meridian-storage copy, in the instance's own plugin image, "
+                     "of its own claim, read only, into its shared storage alone")
     # Review c5c M1: a copy that fails ends Failed, which the next launch
     # makes again; under OnFailure it restarts for ever, Running.
     if spec.get("restartPolicy") != "Never":
         wrong.append(f"the copy pod restarts {spec.get('restartPolicy')!r}: a failed copy must end, restartPolicy Never")
-    # Review c5c H1: the copy runs as the plugins' user and group, so it
-    # reads their private files and what it writes is theirs to write on.
-    # Not root with every capability dropped.
+    # Item 86: the copy runs as the plugin's own user, its image's or the
+    # one the cluster assigns, so it reads its private files and what it
+    # writes is its own to write on; no uid pinned, which OpenShift refuses.
     held = spec.get("securityContext", {})
-    if (held.get("runAsUser"), held.get("runAsGroup"), held.get("runAsNonRoot")) != (PLUGIN_USER, PLUGIN_USER, True):
-        wrong.append(f"the copy pod runs as {held.get('runAsUser')!r}:{held.get('runAsGroup')!r} "
-                     f"(runAsNonRoot {held.get('runAsNonRoot')!r}), not as the plugins' {PLUGIN_USER}:{PLUGIN_USER}")
+    pinned = [key for key in ("runAsUser", "runAsGroup")
+              if key in held or key in spec["containers"][0].get("securityContext", {})]
+    if pinned:
+        wrong.append(f"the copy pod pins {pinned}: it runs as its plugin's own user")
     if held.get("seccompProfile", {}).get("type") != "RuntimeDefault":
         wrong.append("the copy pod's seccomp profile is not RuntimeDefault")
     box = spec["containers"][0].get("securityContext", {})
@@ -397,9 +399,10 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
     # The policy holds what the shape renders (review c5c M1, H1, L1), and
     # deletes the copy pod alone (L2).
     for held_to, what in (('object.spec.restartPolicy == "Never"', "restartPolicy Never"),
-                          (f"object.spec.securityContext.runAsUser == {PLUGIN_USER}", "the plugins' user"),
-                          (f"object.spec.securityContext.runAsGroup == {PLUGIN_USER}", "the plugins' group"),
-                          ("object.spec.securityContext.runAsNonRoot == true", "runAsNonRoot"),
+                          ('object.spec.containers[0].command == ["meridian-storage", "copy",',
+                           "the SDK's meridian-storage copy"),
+                          ('/plugins/[a-z]([-a-z0-9]{0,61}[a-z0-9])?@sha256:[0-9a-f]{64}$', "a plugin image by digest"),
+                          ("!has(object.spec.containers[0].args)", "no args beside its command"),
                           ("!has(object.spec.containers[0].securityContext.capabilities.add)", "no capability added"),
                           ("!has(object.spec.containers[0].lifecycle)", "no lifecycle hook"),
                           ("!has(object.spec.nodeName)", "no node named"),

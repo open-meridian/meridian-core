@@ -385,7 +385,7 @@ spec:
             name: {{ $name }}-template
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
 {{- $own := printf "%s-shards-" $full }}
-{{- $copyUser := include "meridian-runtime.storageCopyUser" . | fromYaml }}
+{{- $pluginImages := printf "localhost:%v/plugins/" .Values.registry.hostPort }}
 {{- $copyFsGroup := (.Values.podSecurityContext | default dict).fsGroup | default .Values.pluginStorage.fsGroup }}
 {{- $accounts := list (quote "") (quote "default") }}
 {{- with .Values.pluginArchive.serviceAccount }}
@@ -504,11 +504,13 @@ spec:
       message: under its instance's shards account the token is mounted in the sidecar's container alone
     # The one pod the launcher makes (item 30): its instance's copy of its
     # own storage claim, read only, into its shared storage, exactly as the
-    # chart's storage-copy shape -- the runtime's image and the launcher's
-    # copy-storage alone, no account's token, no secret, no host's
-    # namespace, and those two claims of the instance its label names; run
-    # once, as the plugins' user, nothing added to its container and nothing
-    # run beside its command (review c5c M1, H1, L1). The one pod it deletes
+    # chart's storage-copy shape -- a plugin image from the deployment's own
+    # registry by digest, as the launcher launches, running the SDK's
+    # `meridian-storage copy` alone (PO items 86 and 88), no account's
+    # token, no secret, no host's namespace, and those two claims of the
+    # instance its label names; run once, its user the plugin's own or the
+    # cluster's (no uid pinned), nothing added to its container and nothing
+    # run beside its command (review c5c M1, L1). The one pod it deletes
     # is a copy pod, to make one again (review c5c L2). What the cluster's
     # own admission adds to every pod before this policy reads it is let be
     # (review c5c2fold H1): DefaultTolerationSeconds' not-ready and
@@ -532,12 +534,6 @@ spec:
           object.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy" &&
           object.spec.restartPolicy == "Never" &&
           has(object.spec.securityContext) &&
-          has(object.spec.securityContext.runAsUser) &&
-          object.spec.securityContext.runAsUser == {{ $copyUser.runAsUser | int64 }} &&
-          has(object.spec.securityContext.runAsGroup) &&
-          object.spec.securityContext.runAsGroup == {{ $copyUser.runAsGroup | int64 }} &&
-          has(object.spec.securityContext.runAsNonRoot) &&
-          object.spec.securityContext.runAsNonRoot == true &&
           !has(object.spec.securityContext.seLinuxOptions) &&
           !has(object.spec.securityContext.appArmorProfile) &&
           has(object.spec.securityContext.seccompProfile) &&
@@ -569,9 +565,9 @@ spec:
           (!has(object.spec.hostPID) || !object.spec.hostPID) &&
           (!has(object.spec.hostIPC) || !object.spec.hostIPC) &&
           size(object.spec.containers) == 1 &&
-          object.spec.containers[0].image == {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }} &&
-          !has(object.spec.containers[0].command) &&
-          object.spec.containers[0].args == ["meridian-launcher", "copy-storage",
+          object.spec.containers[0].image.matches({{ printf "^%s[a-z]([-a-z0-9]{0,61}[a-z0-9])?@sha256:[0-9a-f]{64}$" $pluginImages | quote }}) &&
+          !has(object.spec.containers[0].args) &&
+          object.spec.containers[0].command == ["meridian-storage", "copy",
             {{ printf "%s-storage-" $full | quote }} + variables.instance] &&
           !has(object.spec.containers[0].env) && !has(object.spec.containers[0].envFrom) &&
           has(object.spec.containers[0].securityContext) &&
@@ -588,10 +584,6 @@ spec:
            object.spec.containers[0].securityContext.procMount == "Default") &&
           has(object.spec.containers[0].securityContext.readOnlyRootFilesystem) &&
           object.spec.containers[0].securityContext.readOnlyRootFilesystem == true &&
-          (!has(object.spec.containers[0].securityContext.runAsUser) ||
-           object.spec.containers[0].securityContext.runAsUser == {{ $copyUser.runAsUser | int64 }}) &&
-          (!has(object.spec.containers[0].securityContext.runAsGroup) ||
-           object.spec.containers[0].securityContext.runAsGroup == {{ $copyUser.runAsGroup | int64 }}) &&
           has(object.spec.volumes) && size(object.spec.volumes) == 2 &&
           object.spec.volumes.exists(v, v.name == "from" && has(v.persistentVolumeClaim) &&
             v.persistentVolumeClaim.claimName == {{ printf "%s-storage-" $full | quote }} + variables.instance &&

@@ -1063,13 +1063,23 @@ where
 
 // ── An instance's own storage, copied into its shared storage (item 30) ──
 
+/// The SDK's command an instance's own storage is copied, and waited for,
+/// with, in its own plugin image as its own user (PO items 86 and 88,
+/// 2026-11-17): `meridian-storage copy <claim>` in the copy pod,
+/// `meridian-storage copied <claim>` in its pods' init container. Its
+/// behaviour is [`copy`]'s, which its tests specify.
+pub const STORAGE_COMMAND: &str = "meridian-storage";
+
 /// The copy pod's template, filled in for a checked request: the chart's
-/// storage-copy shape, marked the launcher's, for its instance.
+/// storage-copy shape, marked the launcher's, for its instance, run in its
+/// own plugin image (item 86).
 pub fn copy_pod(
     template: &str,
     request: &CreatePluginRequest,
 ) -> Result<serde_json::Value, String> {
-    let filled = template.replace("__INSTANCE__", &request.instance_id);
+    let filled = template
+        .replace("__INSTANCE__", &request.instance_id)
+        .replace("__IMAGE__", &request.image);
     if let Some(left) = placeholder(&filled) {
         return Err(format!(
             "the storage copy template has a placeholder this does not fill: {left}"
@@ -1094,21 +1104,25 @@ pub fn copy_pod(
 
 /// The init container an instance's pods wait in until its own claim is
 /// copied into its shared storage (item 30): the copy pod's own container,
-/// as `storage-copied`, the shared storage mounted read only where the
-/// plugin mounts it, and nothing else.
+/// its plugin's image, as `meridian-storage copied` (items 86, 88), the
+/// shared storage mounted read only where the plugin mounts it, and
+/// nothing else.
 pub fn copied_gate(copy: &serde_json::Value) -> Result<serde_json::Value, String> {
     let container = &copy["spec"]["containers"][0];
-    let args = container["args"].as_array();
-    let claim = args
-        .filter(|args| {
-            args.len() == 3 && args[0] == "meridian-launcher" && args[1] == "copy-storage"
+    let command = container["command"].as_array();
+    let claim = command
+        .filter(|command| {
+            command.len() == 3
+                && command[0] == STORAGE_COMMAND
+                && command[1] == "copy"
+                && container["args"].is_null()
         })
-        .and_then(|args| args[2].as_str())
-        .ok_or("the storage copy template does not run the launcher's copy-storage")?;
+        .and_then(|command| command[2].as_str())
+        .ok_or("the storage copy template does not run meridian-storage copy")?;
     let mut gate = serde_json::json!({
         "name": "storage-copied",
         "image": container["image"],
-        "args": ["meridian-launcher", "storage-copied", claim],
+        "command": [STORAGE_COMMAND, "copied", claim],
         "securityContext": container["securityContext"],
         "volumeMounts": [{
             "name": "storage",
