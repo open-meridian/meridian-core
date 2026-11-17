@@ -13,7 +13,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
-        build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
+        build test test-store check-store-leftovers check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
 
 help:
@@ -524,7 +524,26 @@ test-store: network tests-image
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, and the upgrade preflight reads every store as ready and a newer one as blocked"
+	@$(MAKE) --no-print-directory check-store-leftovers
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, the upgrade preflight reads every store as ready and a newer one as blocked, and the tests left no schema or database behind"
+
+# PO 65 (2026-11-17): each schema and database a store test makes beside the
+# test database's own is dropped by the test that made it, a failed test's
+# too. What a run left there is listed by name, its run's figures cut off,
+# and fails it: left in a development database that outlives its runs, they
+# filled the VM's memory (`bor_fence_*` schemas and `lake2_*` databases).
+STORE_LEFTOVERS := SELECT 'database ' || datname FROM pg_database \
+	WHERE datname NOT IN ('meridian', 'postgres', 'template0', 'template1') \
+	UNION ALL SELECT 'schema ' || nspname FROM pg_namespace \
+	WHERE nspname NOT IN ('public', 'information_schema') AND nspname !~ '^pg_' ORDER BY 1
+check-store-leftovers:
+	@left=$$($(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -Atc "$(STORE_LEFTOVERS)") \
+		|| { echo "check-store-leftovers: the test database could not be read" >&2; exit 1; }; \
+	if [ -n "$$left" ]; then \
+		echo "check-store-leftovers FAILED: the store tests left $$(printf '%s\n' "$$left" | wc -l | tr -d ' ') schemas and databases behind (PO 65), by name:" >&2; \
+		printf '%s\n' "$$left" | sed -E 's/[-_][0-9]+([-_][0-9]+)*$$//' | sort | uniq -c >&2; \
+		exit 1; \
+	fi
 
 # The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
 # record and read rates and its latest read as a dataset grows, the plugin
