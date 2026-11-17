@@ -940,10 +940,11 @@ pub trait Store: Send + Sync {
     /// after the launcher answered, when the earlier pods had ended.
     fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()>;
 
-    /// The copy of an instance's live launch recorded, `PluginStorageCopied`
-    /// at `at_ns`, where it copied one and has none recorded yet, and a pod
-    /// of it was heard registered at `reported_at_ns`, after the launcher
-    /// answered (item 30): the record, or None.
+    /// The copy of an instance's latest launch that copied recorded on that
+    /// launch, `PluginStorageCopied` at `at_ns`, where none is recorded yet
+    /// and a pod of the instance was heard registered at `reported_at_ns`,
+    /// after the launcher answered (item 30) -- the launch may have stopped
+    /// before a pod of it was heard (review c5c L6): the record, or None.
     fn record_storage_copied(
         &self,
         instance_id: &str,

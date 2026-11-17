@@ -21,9 +21,9 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    archive_account, checked, claim, copy_step, identity_of, left_of, make_shards_account,
-    manifest, one_pod_as_shard, remove_shards_account_once_ended, reusable, several,
-    shards_account_of, shards_objects, shards_template, stop_launched, template_for, with_archive,
+    archive_account, checked, identity_of, left_of, make_shards_account, manifest,
+    one_pod_as_shard, remove_shards_account_once_ended, several, shards_account_of, shards_objects,
+    shards_template, shared_kept, stop_launched, storage_and_copy, template_for, with_archive,
     with_limits, with_shards, Kind, Objects, Removal, Shapes, StorageShapes, Workloads,
     CREATE_PLUGIN, REMOVE_PLUGIN,
 };
@@ -150,7 +150,12 @@ impl Launcher {
         let chosen = template_for(&request, self.development, &self.shapes)?;
         // One pod of an instance whose storage is shared since it ran as
         // several runs as one shard on it (item 30).
-        let shared = chosen.claim.is_some() && self.shared_kept(&request)?;
+        let shared = chosen.claim.is_some()
+            && tokio::runtime::Handle::current().block_on(shared_kept(
+                &Kube(&self.api),
+                &self.shapes,
+                &request,
+            ))?;
         let request = one_pod_as_shard(request, shared);
         // Several pods of the instance, where its launch asked shards or a
         // standby pod (step 3d): the chart's shape for them, sharing its
@@ -173,15 +178,39 @@ impl Launcher {
         if several(&request) {
             self.shards_account(&made, &request)?;
         }
-        if let Some(template) = chosen.claim {
-            self.storage(template, &request)?;
-        }
-        // Its own claim copied into its shared storage's shard-0/, once,
-        // before its pods start (item 30).
+        // Its storage, and its own claim copied into its shared storage's
+        // shard-0/, once, before its pods start (item 30): the copy's
+        // refusals before any claim is made (review c5c L4).
         let (made, storage_copied_from) = match chosen.claim {
-            Some(_) if several(&request) => self.copied(made, &request)?,
-            _ => (made, None),
+            Some(template) => {
+                let handle = tokio::runtime::Handle::current();
+                let pods = match self.shapes.storage.as_ref().and_then(|s| s.copy.as_ref()) {
+                    Some(_) if several(&request) => handle
+                        .block_on(self.api.pods_labelled(&format!(
+                            "{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={}",
+                            request.instance_id
+                        )))
+                        .map_err(|failed| failed.0)?,
+                    _ => serde_json::json!({"items": []}),
+                };
+                handle.block_on(storage_and_copy(
+                    &Kube(&self.api),
+                    &self.shapes,
+                    template,
+                    &pods,
+                    made,
+                    &request,
+                ))?
+            }
+            None => (made, None),
         };
+        if let Some(from) = &storage_copied_from {
+            tracing::info!(
+                instance = request.instance_id,
+                from,
+                "its own storage copied into its shared storage's shard-0/ before its pods start"
+            );
+        }
         let workload = tokio::runtime::Handle::current()
             .block_on(self.api.create_deployment(&made))
             .map_err(|failed| failed.0)?;
@@ -200,77 +229,6 @@ impl Launcher {
             workload,
             storage_copied_from: storage_copied_from.unwrap_or_default(),
         })
-    }
-
-    /// Whether the instance's shared storage is there, made by the launcher
-    /// for the same plugin (item 30): none where the chart renders none.
-    fn shared_kept(&self, request: &CreatePluginRequest) -> Result<bool, String> {
-        let Some(template) = self
-            .shapes
-            .storage
-            .as_ref()
-            .and_then(|storage| storage.shared_claim.as_deref())
-        else {
-            return Ok(false);
-        };
-        let wanted = claim(template, request)?;
-        let name = wanted["metadata"]["name"].as_str().unwrap_or_default();
-        match tokio::runtime::Handle::current()
-            .block_on(self.api.persistent_volume_claim(name))
-            .map_err(|failed| failed.0)?
-        {
-            Some(existing) => reusable(&existing, request).map(|()| true),
-            None => Ok(false),
-        }
-    }
-
-    /// The copy step of an instance of several pods keeping storage (item
-    /// 30): where the launcher kept the instance's own claim, the copy pod
-    /// made and the Deployment's pods held until it has copied.
-    fn copied(
-        &self,
-        made: serde_json::Value,
-        request: &CreatePluginRequest,
-    ) -> Result<(serde_json::Value, Option<String>), String> {
-        let Some(storage) = self.shapes.storage.as_ref() else {
-            return Ok((made, None));
-        };
-        let Some(template) = storage.copy.as_deref() else {
-            return Ok((made, None));
-        };
-        let handle = tokio::runtime::Handle::current();
-        let own = claim(&storage.claim, request)?;
-        let own = handle
-            .block_on(
-                self.api
-                    .persistent_volume_claim(own["metadata"]["name"].as_str().unwrap_or_default()),
-            )
-            .map_err(|failed| failed.0)?;
-        let pods = match &own {
-            Some(_) => handle
-                .block_on(self.api.pods_labelled(&format!(
-                    "{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={}",
-                    request.instance_id
-                )))
-                .map_err(|failed| failed.0)?,
-            None => serde_json::json!({"items": []}),
-        };
-        let (made, copied) = handle.block_on(copy_step(
-            &Kube(&self.api),
-            own.as_ref(),
-            &pods,
-            template,
-            made,
-            request,
-        ))?;
-        if let Some(from) = &copied {
-            tracing::info!(
-                instance = request.instance_id,
-                from,
-                "its own storage copied into its shared storage's shard-0/ before its pods start"
-            );
-        }
-        Ok((made, copied))
     }
 
     /// An instance of several pods' own account, Role and binding, and its
@@ -310,39 +268,6 @@ impl Launcher {
             identity = !identity.is_empty(),
             "its own account and its shards' Leases, made"
         );
-        Ok(())
-    }
-
-    /// The instance's storage, there before its Deployment is: the claim it
-    /// kept, when the same plugin launched as it before, or a new one. Never
-    /// another plugin's (decisions/028).
-    fn storage(&self, template: &str, request: &CreatePluginRequest) -> Result<(), String> {
-        let wanted = claim(template, request)?;
-        let name = wanted["metadata"]["name"].as_str().unwrap_or_default();
-        let handle = tokio::runtime::Handle::current();
-        match handle
-            .block_on(self.api.persistent_volume_claim(name))
-            .map_err(|failed| failed.0)?
-        {
-            Some(existing) => {
-                reusable(&existing, request)?;
-                tracing::info!(
-                    instance = request.instance_id,
-                    claim = name,
-                    "its storage, kept"
-                );
-            }
-            None => {
-                let made = handle
-                    .block_on(self.api.create_persistent_volume_claim(&wanted))
-                    .map_err(|failed| failed.0)?;
-                tracing::info!(
-                    instance = request.instance_id,
-                    claim = made,
-                    "its storage, made"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -488,7 +413,8 @@ fn run() -> Result<(), String> {
                 std::path::Path::new(copy::STORAGE),
                 &claim,
                 std::time::Duration::from_secs(2),
-            );
+                copy::WAIT_LIMIT,
+            )?;
             tracing::info!(claim, "its own storage is in its shared storage");
             return Ok(());
         }

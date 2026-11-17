@@ -1497,21 +1497,7 @@ async fn shards_or_a_standby_are_refused_before_the_record_where_no_lease_right_
 /// cannot be counted count as several.
 #[tokio::test(flavor = "multi_thread")]
 async fn several_pods_keeping_storage_on_several_nodes_need_a_shared_class_before_the_record() {
-    let keeping = |version: &str| {
-        let mut upload = shardable(version, &["data"]);
-        upload
-            .metadata
-            .as_mut()
-            .unwrap()
-            .declaration
-            .as_mut()
-            .unwrap()
-            .storage = Some(meridian_pb::v1::StorageDeclaration {
-            retention_days: 30,
-            ..Default::default()
-        });
-        upload
-    };
+    let keeping = |version: &str| keeping_on(version, "0.37.0");
     let on = |nodes: Result<usize, String>, enabled: bool, class: &str| {
         let nodes = Arc::new(move || nodes.clone());
         harness_several(
@@ -1524,7 +1510,108 @@ async fn several_pods_keeping_storage_on_several_nodes_need_a_shared_class_befor
             },
         )
     };
-    for nodes in [Ok(3), Err("the API server did not answer".to_string())] {
+    several_pods_keeping_storage_rest(keeping, on).await;
+}
+
+/// A version of a data plugin keeping storage, built on `sdk`.
+fn keeping_on(version: &str, sdk: &str) -> RecordPluginUploadRequest {
+    let mut upload = shardable(version, &["data"]);
+    let metadata = upload.metadata.as_mut().unwrap();
+    metadata.sdk_version = sdk.into();
+    metadata.declaration.as_mut().unwrap().storage = Some(meridian_pb::v1::StorageDeclaration {
+        retention_days: 30,
+        ..Default::default()
+    });
+    upload
+}
+
+/// PO item 77 (2026-11-17): a version keeping storage built before plugins
+/// kept it per shard -- an SDK before 0.37, or one not read as a version --
+/// is refused shards, a standby pod, and one pod on the shared storage of
+/// an instance that ran as several, before anything is recorded, naming
+/// the version; one on 0.37 or later is launched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_keeping_storage_before_sdk_0_37_never_runs_on_shared_storage() {
+    let (bus, launcher) = harness_several(
+        "conductor-1",
+        ArchiveGrant::default(),
+        crate::plugins::Several {
+            lease_right: Some(true),
+            storage: Some((true, "files".to_string())),
+            nodes: Some(Arc::new(|| Ok(3))),
+        },
+    );
+    let said = |version: &str| {
+        format!(
+            "feed-1 was asked shards or a standby pod, and its plugin keeps storage: its version \
+             {version} was built before plugins kept storage per shard; publish a version on SDK \
+             0.37 or later"
+        )
+    };
+    let asking = |version: &str, shards: u32, standby: bool| LaunchPluginRequest {
+        version: version.into(),
+        shards,
+        standby,
+        ..launching("feed-1", &["data"])
+    };
+    for (version, sdk) in [
+        ("0.1.0", "0.36.2"),
+        ("0.2.0", "an SDK"),
+        ("0.3.0", "0.37.0rc1"),
+    ] {
+        upload(&bus, keeping_on(version, sdk)).await.unwrap();
+        for (shards, standby, field) in [(2, false, "shards"), (0, true, "standby")] {
+            let refused = launch(&bus, asking(version, shards, standby))
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains("[refusal-status failed-precondition")
+                    && refused.contains(field)
+                    && refused.contains(&said(version)),
+                "{version} on {sdk}, {field}: {refused}"
+            );
+        }
+    }
+    assert!(launcher.created.lock().unwrap().is_empty());
+    assert!(
+        catalogue(&bus).await.launches.is_empty(),
+        "nothing recorded"
+    );
+    // On 0.37 or later: launched as several pods.
+    upload(&bus, keeping_on("0.4.0", "0.37.0")).await.unwrap();
+    launch(&bus, asking("0.4.0", 2, true)).await.unwrap();
+    // Stopped, the instance's storage is shared since: an older version is
+    // refused even one pod on it; 0.38 is launched as one pod.
+    let _: PluginLaunch = ask(
+        &bus,
+        STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "feed-1".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let refused = launch(&bus, asking("0.1.0", 0, false)).await.unwrap_err();
+    assert!(refused.contains(&said("0.1.0")), "{refused}");
+    upload(&bus, keeping_on("0.5.0", "0.38.1")).await.unwrap();
+    launch(&bus, asking("0.5.0", 0, false)).await.unwrap();
+}
+
+async fn several_pods_keeping_storage_rest(
+    keeping: impl Fn(&str) -> RecordPluginUploadRequest,
+    on: impl Fn(Result<usize, String>, bool, &str) -> (Arc<Bus>, Arc<Launcher>),
+) {
+    // PO items 69 and 78: three nodes counted, or nodes not counted said
+    // as "several".
+    for (nodes, runs_on) in [
+        (Ok(3), "3 nodes"),
+        (
+            Err("the API server did not answer".to_string()),
+            "several nodes",
+        ),
+    ] {
         let (bus, launcher) = on(nodes, true, "");
         upload(&bus, keeping("0.1.0")).await.unwrap();
         for (shards, standby, field) in [(2, false, "shards"), (0, true, "standby")] {
@@ -1541,7 +1628,10 @@ async fn several_pods_keeping_storage_on_several_nodes_need_a_shared_class_befor
             assert!(
                 refused.contains("[refusal-status failed-precondition")
                     && refused.contains(field)
-                    && refused.contains("pluginStorage.shared.storageClassName"),
+                    && refused.contains(&format!(
+                        "this deployment runs on {runs_on} and names none in \
+                         pluginStorage.shared.storageClassName"
+                    )),
                 "{field}: {refused}"
             );
         }

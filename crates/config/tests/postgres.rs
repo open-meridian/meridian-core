@@ -2850,9 +2850,12 @@ fn a_launchs_own_limits_are_kept_on_its_record() {
 /// instance's own claim into its shared storage is recorded once a pod of
 /// it is heard registered after the launcher answered -- its pods start
 /// only once the copy is whole -- as `PluginStorageCopied`, on the launch
-/// that copied, once per claim: an earlier pod's report records nothing, a
-/// later report nothing again, nor a later launch finding it copied; no
-/// copy pending, no record.
+/// that copied, once per launch that copied: an earlier pod's report
+/// records nothing, a later report nothing again, nor a later launch the
+/// launcher said copied none, having found it copied. A second copy, into a
+/// shared claim made again, is recorded on its own launch; and a copy whose
+/// launch stopped before a pod was heard is recorded on that launch, by
+/// its launcher, once a later launch's pod is heard (review c5c L6).
 fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
     store: &dyn Store,
 ) {
@@ -2899,8 +2902,8 @@ fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered
             .storage_copied
     };
     assert_eq!(on(store, 10), Some(copied.clone()));
-    // Stopped and launched again, the copy pod finding it copied: the
-    // launcher says the claim again, and nothing more is recorded.
+    // Stopped and launched again, the copy pod found done: the launcher
+    // says none, and nothing more is recorded.
     let stop = Ending {
         prepared_call_id: Default::default(),
         state: PluginLaunchState::Stopped,
@@ -2914,15 +2917,72 @@ fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered
     store.end_launch("feed-1", &stop).unwrap().unwrap();
     launch.launched_at_ns = 200;
     assert!(store.begin_launch(&launch, "").unwrap());
-    store
-        .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 210)
-        .unwrap();
     assert_eq!(
         store.record_storage_copied("feed-1", 220, 230).unwrap(),
         None
     );
     assert_eq!(on(store, 200), None);
+    assert_eq!(on(store, 10), Some(copied.clone()));
+    // Its shared claim made again, the copy made again: recorded on its
+    // own launch.
+    let stopped_at = |at_ns: i64| Ending {
+        at_ns,
+        ..stop.clone()
+    };
+    store
+        .end_launch("feed-1", &stopped_at(250))
+        .unwrap()
+        .unwrap();
+    launch.launched_at_ns = 300;
+    launch.launched_by = "local|bo".into();
+    assert!(store.begin_launch(&launch, "").unwrap());
+    store
+        .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 310)
+        .unwrap();
+    let again = PluginStorageCopied {
+        at_ns: 330,
+        launched_by: "local|bo".into(),
+        ..copied.clone()
+    };
+    assert_eq!(
+        store.record_storage_copied("feed-1", 320, 330).unwrap(),
+        Some(again.clone())
+    );
+    assert_eq!(on(store, 300), Some(again));
     assert_eq!(on(store, 10), Some(copied));
+    // A launch that copied, stopped before a pod of it was heard; the next
+    // finds it copied: recorded on the launch that copied, by its launcher,
+    // once the next one's pod is heard.
+    launch.instance_id = "feed-2".into();
+    launch.launched_at_ns = 10;
+    launch.launched_by = "local|ada".into();
+    assert!(store.begin_launch(&launch, "").unwrap());
+    store
+        .pend_storage_copy("feed-2", "check-meridian-runtime-storage-feed-2", 50)
+        .unwrap();
+    store
+        .end_launch("feed-2", &stopped_at(60))
+        .unwrap()
+        .unwrap();
+    launch.launched_at_ns = 100;
+    launch.launched_by = "local|bo".into();
+    assert!(store.begin_launch(&launch, "").unwrap());
+    let theirs = store.record_storage_copied("feed-2", 120, 130).unwrap();
+    assert_eq!(
+        theirs.as_ref().map(|c| (c.launched_by.as_str(), c.at_ns)),
+        Some(("local|ada", 130))
+    );
+    let on_2 = |at: i64| {
+        store
+            .launches()
+            .unwrap()
+            .into_iter()
+            .find(|held| held.instance_id == "feed-2" && held.launched_at_ns == at)
+            .unwrap()
+            .storage_copied
+    };
+    assert_eq!(on_2(10), theirs);
+    assert_eq!(on_2(100), None);
 }
 
 #[test]

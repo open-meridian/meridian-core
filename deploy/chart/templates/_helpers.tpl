@@ -948,9 +948,26 @@ spec:
   for before their plugin starts. The launcher's admission policy holds
   what it makes to exactly this shape. Takes the chart.
 */}}
+{{/*
+  The user and group an instance's storage copy runs as (item 30, review c5c
+  H1): the plugins' 65532, or podSecurityContext's own where it names them.
+  The launcher's admission policy holds the copy pod to the same.
+*/}}
+{{- define "meridian-runtime.storageCopyUser" -}}
+{{- $given := .Values.podSecurityContext | default dict -}}
+runAsUser: {{ $given.runAsUser | default 65532 | int64 }}
+runAsGroup: {{ $given.runAsGroup | default 65532 | int64 }}
+{{- end -}}
+
 {{- define "meridian-runtime.storageCopy" -}}
 {{- $full := include "meridian-runtime.fullname" . -}}
-{{- $podSecurity := .Values.podSecurityContext | default dict -}}
+{{- /* As the plugins' user and group (review c5c H1): plugin images run as
+       65532, and the SDK writes its files 0600, so the copy reads them as
+       their owner and what it writes stays theirs to write on; never root
+       with every capability dropped, which reads neither. A
+       podSecurityContext that names its own user wins, as it does for the
+       plugins' pods. */ -}}
+{{- $podSecurity := merge (deepCopy (.Values.podSecurityContext | default dict)) (include "meridian-runtime.storageCopyUser" . | fromYaml) (dict "runAsNonRoot" true "seccompProfile" (dict "type" "RuntimeDefault")) -}}
 {{- if .Values.pluginStorage.fsGroup -}}
 {{- $podSecurity = merge (deepCopy $podSecurity) (dict "fsGroup" .Values.pluginStorage.fsGroup "fsGroupChangePolicy" "OnRootMismatch") -}}
 {{- end -}}
@@ -964,7 +981,10 @@ metadata:
     meridian.dev/launched: "true"
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  restartPolicy: OnFailure
+  {{- /* A copy that fails ends Failed, which the launcher makes again at
+         the instance's next launch (review c5c M1); restarted in place it
+         would stay Running, failing, for ever. */}}
+  restartPolicy: Never
   automountServiceAccountToken: false
   {{- with $podSecurity }}
   securityContext:

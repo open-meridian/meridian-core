@@ -47,7 +47,13 @@ TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 MEMBER = re.compile(r"^  name: \S+-member$", re.M)
 LAUNCHER = "check-meridian-runtime-launcher"
 PODS = re.compile(r'^    resources: \["pods"\]$', re.M)
-PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"(, "create", "get", "delete")?\]$', re.M)
+# The user and group plugin images run as (the SDK image drops to 65532),
+# which an instance's copy pod runs as too (review c5c H1).
+PLUGIN_USER = 65532
+PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"\]$', re.M)
+# Where the chart renders the copy pod (item 30), and only there, the one
+# pod the launcher makes: made, read and removed (review c5c L8).
+PODS_COPIED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list", "create", "get", "delete"\]$', re.M)
 
 
 def documents(render: str) -> list[str]:
@@ -141,8 +147,12 @@ def ha(render: str) -> list[str]:
     # Read alone: a stopped instance's pods, ended before its account is
     # removed (review c5b L5, c5b2 H1).
     roles = named(render, "Role", LAUNCHER)
-    if not roles or not any(PODS_LISTED.search(doc) for doc in roles):
-        wrong.append("the launcher with a shards shape may not list pods, to see a stopped instance's end")
+    copies = template(render, "storage-copy.json") is not None
+    pods = PODS_COPIED if copies else PODS_LISTED
+    if not roles or not any(pods.search(doc) for doc in roles):
+        wrong.append("the launcher with a shards shape may not list pods, to see a stopped instance's end"
+                     if not copies else
+                     "the launcher with a copy pod may not list pods and make, read and remove its copy pod")
     elif any(len(PODS.findall(doc)) != 1 for doc in roles):
         wrong.append("the launcher's Role names pods more than once")
     return wrong
@@ -364,8 +374,39 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
             or len(volumes) != 2):
         wrong.append("the copy pod is not the launcher's copy-storage of the instance's own claim, "
                      "read only, into its shared storage alone")
+    # Review c5c M1: a copy that fails ends Failed, which the next launch
+    # makes again; under OnFailure it restarts for ever, Running.
+    if spec.get("restartPolicy") != "Never":
+        wrong.append(f"the copy pod restarts {spec.get('restartPolicy')!r}: a failed copy must end, restartPolicy Never")
+    # Review c5c H1: the copy runs as the plugins' user and group, so it
+    # reads their private files and what it writes is theirs to write on.
+    # Not root with every capability dropped.
+    held = spec.get("securityContext", {})
+    if (held.get("runAsUser"), held.get("runAsGroup"), held.get("runAsNonRoot")) != (PLUGIN_USER, PLUGIN_USER, True):
+        wrong.append(f"the copy pod runs as {held.get('runAsUser')!r}:{held.get('runAsGroup')!r} "
+                     f"(runAsNonRoot {held.get('runAsNonRoot')!r}), not as the plugins' {PLUGIN_USER}:{PLUGIN_USER}")
+    if held.get("seccompProfile", {}).get("type") != "RuntimeDefault":
+        wrong.append("the copy pod's seccomp profile is not RuntimeDefault")
+    box = spec["containers"][0].get("securityContext", {})
+    if (box.get("capabilities") != {"drop": ["ALL"]} or box.get("readOnlyRootFilesystem") is not True
+            or box.get("allowPrivilegeEscalation") is not False):
+        wrong.append(f"the copy container's securityContext is {box}: drop ALL and add none, a read-only root, "
+                     "no privilege escalation")
     if "the launcher's one pod copies its instance's own storage into its shared storage" not in render:
         wrong.append("the launcher's admission policy does not hold the copy pod to its shape")
+    # The policy holds what the shape renders (review c5c M1, H1, L1), and
+    # deletes the copy pod alone (L2).
+    for held_to, what in (('object.spec.restartPolicy == "Never"', "restartPolicy Never"),
+                          (f"object.spec.securityContext.runAsUser == {PLUGIN_USER}", "the plugins' user"),
+                          (f"object.spec.securityContext.runAsGroup == {PLUGIN_USER}", "the plugins' group"),
+                          ("object.spec.securityContext.runAsNonRoot == true", "runAsNonRoot"),
+                          ("!has(object.spec.containers[0].securityContext.capabilities.add)", "no capability added"),
+                          ("!has(object.spec.containers[0].lifecycle)", "no lifecycle hook"),
+                          ("!has(object.spec.nodeName)", "no node named"),
+                          ('oldObject.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy"',
+                           "a DELETE of the copy pod alone")):
+        if held_to not in render:
+            wrong.append(f"the launcher's admission policy does not hold the copy pod to {what}")
     if "check-meridian-runtime-shared-storage-' +" not in render:
         wrong.append("the plugins' storage policy does not admit a pod's own instance's shared storage")
     return wrong

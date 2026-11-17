@@ -544,8 +544,8 @@ pub fn one_pod_as_shard(mut request: CreatePluginRequest, shared: bool) -> Creat
 }
 
 /// The refusal of an instance of several pods keeping storage where the
-/// chart offers it none to share (item 30): proposed 2026-11-17 (c5c),
-/// awaiting the product owner's ruling.
+/// chart offers it none to share (item 30): approved by the product owner
+/// as item 69 (2026-11-17).
 pub fn no_shared_storage_said(instance: &str) -> String {
     format!(
         "{instance} was asked shards or a standby pod, and its plugin keeps storage: this \
@@ -730,6 +730,7 @@ pub enum Kind {
     Role,
     RoleBinding,
     Pod,
+    PersistentVolumeClaim,
 }
 
 impl Kind {
@@ -742,6 +743,7 @@ impl Kind {
             Kind::Role => ("/apis/rbac.authorization.k8s.io/v1", "roles"),
             Kind::RoleBinding => ("/apis/rbac.authorization.k8s.io/v1", "rolebindings"),
             Kind::Pod => ("/api/v1", "pods"),
+            Kind::PersistentVolumeClaim => ("/api/v1", "persistentvolumeclaims"),
         }
     }
 }
@@ -1170,7 +1172,7 @@ pub fn holding(list: &serde_json::Value, claim: &str) -> Vec<String> {
 
 /// The refusal of a first launch as several pods while the instance's
 /// earlier pods still stop, which may still write into its own claim:
-/// proposed 2026-11-17 (c5c), awaiting the product owner's ruling.
+/// approved by the product owner as item 69 (2026-11-17).
 pub fn still_stopping_said(instance: &str) -> String {
     format!(
         "{instance}'s storage is copied into its shared storage before it runs as several \
@@ -1179,38 +1181,51 @@ pub fn still_stopping_said(instance: &str) -> String {
 }
 
 /// What becomes of a copy pod already there, by its phase: kept while it
-/// runs or once it has copied, made again once it failed.
+/// runs, made again once it failed; once it has copied, kept -- done --
+/// where it copied into the shared claim there now, and made again where
+/// that claim was made since, so holds no marker (review c5c L3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyPod {
     Make,
     Keep,
+    Done,
     Remake,
 }
 
-pub fn copy_pod_now(there: Option<&serde_json::Value>) -> CopyPod {
-    match there.map(|pod| pod["status"]["phase"].as_str().unwrap_or_default()) {
-        None => CopyPod::Make,
-        Some("Failed") => CopyPod::Remake,
-        Some(_) => CopyPod::Keep,
+/// `shared_since` is the shared claim's `creationTimestamp` (RFC 3339, as
+/// the API server writes it, so ordered as text).
+pub fn copy_pod_now(there: Option<&serde_json::Value>, shared_since: &str) -> CopyPod {
+    let Some(pod) = there else {
+        return CopyPod::Make;
+    };
+    match pod["status"]["phase"].as_str().unwrap_or_default() {
+        "Failed" => CopyPod::Remake,
+        "Succeeded" => {
+            let made = pod["metadata"]["creationTimestamp"]
+                .as_str()
+                .unwrap_or_default();
+            if shared_since > made {
+                CopyPod::Remake
+            } else {
+                CopyPod::Done
+            }
+        }
+        _ => CopyPod::Keep,
     }
 }
 
-/// The copy step (item 30), before the Deployment of an instance of
-/// several pods keeping storage is made: where the launcher kept the
-/// instance's own claim -- for the same plugin, never another's -- and none
-/// of the instance's earlier pods still mounts it, the copy pod made (or
-/// kept, or made again once failed), and the Deployment's pods held until
-/// it has copied. Says which claim it copies, or none.
-pub async fn copy_step<O: Objects>(
-    api: &O,
+/// The copy step's refusals (item 30), asked before any claim is made, so
+/// a refused launch leaves its instance as it was, its storage not yet
+/// shared (review c5c L4): another plugin's claim, and the instance's
+/// earlier pods still mounting its own. The own claim's name, where there
+/// is one to copy.
+pub fn copy_refused(
     own: Option<&serde_json::Value>,
     pods: &serde_json::Value,
-    copy_template: &str,
-    manifest: serde_json::Value,
     request: &CreatePluginRequest,
-) -> Result<(serde_json::Value, Option<String>), String> {
+) -> Result<Option<String>, String> {
     let Some(own) = own else {
-        return Ok((manifest, None));
+        return Ok(None);
     };
     reusable(own, request)?;
     let claim = own["metadata"]["name"]
@@ -1220,19 +1235,48 @@ pub async fn copy_step<O: Objects>(
     if !holding(pods, &claim).is_empty() {
         return Err(still_stopping_said(&request.instance_id));
     }
+    Ok(Some(claim))
+}
+
+/// The copy step (item 30), before the Deployment of an instance of
+/// several pods keeping storage is made: where the launcher kept the
+/// instance's own claim -- for the same plugin, never another's -- and none
+/// of the instance's earlier pods still mounts it, the copy pod made (or
+/// kept, or made again once failed, or into a shared claim made since), and
+/// the Deployment's pods held until it has copied. Says which claim this
+/// launch copies; none where none is kept, or where it was copied before
+/// into the shared claim there, `shared` (review c5c L6), so the record
+/// of the copy is the launch's that copied.
+pub async fn copy_step<O: Objects>(
+    api: &O,
+    own: Option<&serde_json::Value>,
+    pods: &serde_json::Value,
+    copy_template: &str,
+    manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+    shared: &serde_json::Value,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let Some(claim) = copy_refused(own, pods, request)? else {
+        return Ok((manifest, None));
+    };
     let pod = copy_pod(copy_template, request)?;
     let name = pod["metadata"]["name"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref()) {
-        CopyPod::Keep => {}
+    let since = shared["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default();
+    let copies = match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref(), since) {
+        CopyPod::Keep => true,
+        CopyPod::Done => false,
         CopyPod::Make => {
             if !api.create(Kind::Pod, &pod).await? {
                 return Err(format!(
                     "{name} was made by another meanwhile; launch again"
                 ));
             }
+            true
         }
         CopyPod::Remake => {
             api.delete(Kind::Pod, &name).await?;
@@ -1241,10 +1285,198 @@ pub async fn copy_step<O: Objects>(
                     "{name} failed and is still being removed; launch again in a moment"
                 ));
             }
+            true
+        }
+    };
+    let manifest = with_gate(manifest, copied_gate(&pod)?)?;
+    Ok((manifest, copies.then_some(claim)))
+}
+
+/// The refusal of an instance of several pods whose shared storage, kept,
+/// was made for one node, where the chart now shares it across nodes
+/// (review c5c L5): approved by the product owner as item 81 (2026-11-17).
+pub fn not_shareable_said(instance: &str, name: &str, held: &str, wanted: &str) -> String {
+    format!(
+        "{name}, {instance}'s shared storage, was made {held}, for one node, and this \
+         deployment's chart now asks {wanted} (pluginStorage.shared.storageClassName); it is \
+         kept, and an administrator decides what becomes of it"
+    )
+}
+
+/// The instance's storage, there before its Deployment is: the claim it
+/// kept, when the same plugin launched as it before, or a new one; never
+/// another plugin's (decisions/028), nor a kept one that cannot be mounted
+/// as the chart now asks (review c5c L5). The claim as the API server
+/// holds it.
+pub async fn storage<O: Objects>(
+    api: &O,
+    template: &str,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    let wanted = claim(template, request)?;
+    let name = wanted["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(existing) = api.get(Kind::PersistentVolumeClaim, &name).await? {
+        reusable(&existing, request)?;
+        let modes = |claim: &serde_json::Value| -> Vec<String> {
+            claim["spec"]["accessModes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|mode| mode.as_str().map(String::from))
+                .collect()
+        };
+        let (held, asked) = (modes(&existing), modes(&wanted));
+        if asked.iter().any(|mode| !held.contains(mode)) {
+            return Err(not_shareable_said(
+                &request.instance_id,
+                &name,
+                &held.join(", "),
+                &asked.join(", "),
+            ));
+        }
+        tracing::info!(
+            instance = request.instance_id,
+            claim = name,
+            "its storage, kept"
+        );
+        return Ok(existing);
+    }
+    if !api.create(Kind::PersistentVolumeClaim, &wanted).await? {
+        return Err(format!(
+            "{name} was made by another meanwhile; launch again"
+        ));
+    }
+    tracing::info!(
+        instance = request.instance_id,
+        claim = name,
+        "its storage, made"
+    );
+    api.get(Kind::PersistentVolumeClaim, &name)
+        .await?
+        .ok_or_else(|| format!("{name} was made and is not there; launch again"))
+}
+
+/// The refusal of an instance of several pods whose own claim is kept
+/// where the chart renders no copy pod (review c5c L9): approved by the
+/// product owner as item 80 (2026-11-17).
+pub fn no_copy_pod_said(instance: &str, claim: &str) -> String {
+    format!(
+        "{instance} was asked shards or a standby pod, and its own storage {claim} is kept: \
+         this deployment's chart renders no pod to copy it into its shared storage \
+         (pluginStorage.shared), so it is not launched as several"
+    )
+}
+
+/// The refusal of an instance whose storage is shared since it ran as
+/// several, where the chart renders no shape mounting shared storage
+/// (review c5c L4): approved by the product owner as item 83 (2026-11-17).
+pub fn no_shared_shape_said(instance: &str) -> String {
+    format!(
+        "{instance}'s storage is shared and kept, and this deployment's chart renders no pod \
+         that mounts shared storage (pluginStorage.shared), so it is not launched"
+    )
+}
+
+/// The shared claim beside an instance's own (item 30):
+/// `<fullname>-shared-storage-<instance>` for `<fullname>-storage-<instance>`.
+fn shared_name_of(own: &str, instance: &str) -> Option<String> {
+    own.strip_suffix(&format!("-storage-{instance}"))
+        .map(|fullname| format!("{fullname}-shared-storage-{instance}"))
+}
+
+/// Whether the instance's storage is shared since it ran as several: its
+/// shared claim there, made by the launcher for the same plugin (item 30).
+/// Where the chart no longer renders shared storage, its claim is looked
+/// for by name, and an instance whose storage is shared is refused rather
+/// than run on its own claim without its shards' records (review c5c L4;
+/// item 83).
+pub async fn shared_kept<O: Objects>(
+    api: &O,
+    shapes: &Shapes,
+    request: &CreatePluginRequest,
+) -> Result<bool, String> {
+    let Some(storage) = shapes.storage.as_ref() else {
+        return Ok(false);
+    };
+    let rendered = storage.shards.is_some() && storage.shared_claim.is_some();
+    let name = match storage.shared_claim.as_deref() {
+        Some(template) => claim(template, request)?["metadata"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        None => {
+            let own = claim(&storage.claim, request)?;
+            let own = own["metadata"]["name"].as_str().unwrap_or_default();
+            match shared_name_of(own, &request.instance_id) {
+                Some(name) => name,
+                None => return Ok(false),
+            }
+        }
+    };
+    match api.get(Kind::PersistentVolumeClaim, &name).await? {
+        None => Ok(false),
+        Some(existing) => {
+            reusable(&existing, request)?;
+            if !rendered {
+                return Err(no_shared_shape_said(&request.instance_id));
+            }
+            Ok(true)
         }
     }
-    let manifest = with_gate(manifest, copied_gate(&pod)?)?;
-    Ok((manifest, Some(claim)))
+}
+
+/// An instance's storage and, for several pods keeping it, the copy of its
+/// own claim into its shared storage (item 30), in this order: the copy's
+/// refusals before any claim is made (review c5c L4); the claim kept or
+/// made ([`storage`]); then the copy step ([`copy_step`]), where the chart
+/// renders a copy pod. `pods` are the instance's launched pods, listed for
+/// a launch of several. Says which claim this launch copies, or none.
+pub async fn storage_and_copy<O: Objects>(
+    api: &O,
+    shapes: &Shapes,
+    claim_template: &str,
+    pods: &serde_json::Value,
+    manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let shaped = shapes.storage.as_ref().filter(|_| several(request));
+    let copying = shaped.and_then(|shaped| shaped.copy.as_deref());
+    let own = match shaped {
+        Some(shaped) => {
+            let own = claim(&shaped.claim, request)?;
+            let name = own["metadata"]["name"].as_str().unwrap_or_default();
+            api.get(Kind::PersistentVolumeClaim, name).await?
+        }
+        None => None,
+    };
+    // Its own claim kept, and no copy pod rendered: never started on a
+    // shard-0/ without it (review c5c L9; item 80).
+    if let (Some(own), None) = (&own, copying) {
+        return Err(no_copy_pod_said(
+            &request.instance_id,
+            own["metadata"]["name"].as_str().unwrap_or_default(),
+        ));
+    }
+    copy_refused(own.as_ref(), pods, request)?;
+    let held = storage(api, claim_template, request).await?;
+    match copying {
+        Some(copy_template) => {
+            copy_step(
+                api,
+                own.as_ref(),
+                pods,
+                copy_template,
+                manifest,
+                request,
+                &held,
+            )
+            .await
+        }
+        None => Ok((manifest, None)),
+    }
 }
 
 /// A `__NAME__` still in the text, which a newer chart's template would

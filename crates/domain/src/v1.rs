@@ -21154,8 +21154,9 @@ pub struct PluginLaunch {
     #[prost(message, optional, tag = "25")]
     pub limits: ::core::option::Option<SidecarLimits>,
     /// Step 3d, checkpoint 5, item 30: its own storage claim copied into its
-    /// shared storage's shard-0/ before this launch's pods started, once one of
-    /// them was heard registered; unset where it copied none, or not yet.
+    /// shared storage's shard-0/ before this launch's pods started, once a pod
+    /// of the instance was heard registered after it (PO item 82: once per
+    /// launch that copied); unset where it copied none, or not yet.
     #[prost(message, optional, tag = "26")]
     pub storage_copied: ::core::option::Option<PluginStorageCopied>,
 }

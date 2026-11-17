@@ -118,23 +118,6 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
 };
 
 impl PostgresStore {
-    /// The shared claim the live launch of `instance_id` copies into, from
-    /// the claim it copies (item 30); empty where it copies none.
-    fn pending_shared_claim(&self, instance_id: &str) -> Result<String> {
-        let from: Option<String> = self
-            .conn()?
-            .query_opt(
-                "SELECT storage_copied_from FROM config_plugin_launch
-                  WHERE instance_id = $1 AND state = 1",
-                &[&instance_id],
-            )
-            .map_err(unavailable)?
-            .map(|row| row.get(0));
-        Ok(from
-            .map(|from| crate::store::shared_claim_of(&from, instance_id))
-            .unwrap_or_default())
-    }
-
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
         let manager = PostgresConnectionManager::new(
@@ -1588,36 +1571,49 @@ impl Store for PostgresStore {
         reported_at_ns: i64,
         at_ns: i64,
     ) -> Result<Option<PluginStorageCopied>> {
-        // One statement: the live launch's copy, once, where a pod was
-        // heard after the launcher answered and none is recorded for it.
-        let row = self
-            .conn()?
+        // The instance's latest launch that copied, where its copy is not
+        // recorded and a pod was heard after the launcher answered: one
+        // query while none is pending (review c5c L9). Its launch may have
+        // stopped before a pod of it was heard, the next finding it copied
+        // (L6).
+        let mut conn = self.conn()?;
+        let Some(pending) = conn
+            .query_opt(
+                "SELECT l.launched_at_ns, l.storage_copied_from FROM config_plugin_launch l
+                  WHERE l.instance_id = $1 AND l.storage_copied_from <> ''
+                    AND l.storage_copied_after_ns < $2
+                    AND l.launched_at_ns = (SELECT max(launched_at_ns) FROM config_plugin_launch
+                                             WHERE instance_id = $1 AND storage_copied_from <> '')
+                    AND NOT EXISTS (SELECT 1 FROM config_plugin_storage_copied c
+                                     WHERE c.instance_id = $1
+                                       AND c.launched_at_ns = l.launched_at_ns)",
+                &[&instance_id, &reported_at_ns],
+            )
+            .map_err(unavailable)?
+        else {
+            return Ok(None);
+        };
+        let (launched_at_ns, from_claim): (i64, String) = (pending.get(0), pending.get(1));
+        let to_claim = crate::store::shared_claim_of(&from_claim, instance_id);
+        // Once, across conductors: the launch's own key.
+        let row = conn
             .query_opt(
                 "INSERT INTO config_plugin_storage_copied
                         (instance_id, launched_at_ns, from_claim, to_claim, at_ns, launched_by)
                  SELECT instance_id, launched_at_ns, storage_copied_from, $3, $4, launched_by
                    FROM config_plugin_launch
-                  WHERE instance_id = $1 AND state = 1 AND storage_copied_from <> ''
-                    AND storage_copied_after_ns < $2
-                    AND NOT EXISTS (SELECT 1 FROM config_plugin_storage_copied c
-                                     WHERE c.instance_id = $1
-                                       AND c.from_claim = config_plugin_launch.storage_copied_from)
+                  WHERE instance_id = $1 AND launched_at_ns = $2
                  ON CONFLICT (instance_id, launched_at_ns) DO NOTHING
-                 RETURNING from_claim, launched_by",
-                &[
-                    &instance_id,
-                    &reported_at_ns,
-                    &self.pending_shared_claim(instance_id)?,
-                    &at_ns,
-                ],
+                 RETURNING launched_by",
+                &[&instance_id, &launched_at_ns, &to_claim, &at_ns],
             )
             .map_err(unavailable)?;
         Ok(row.map(|row| PluginStorageCopied {
             instance_id: instance_id.to_string(),
-            to_claim: crate::store::shared_claim_of(&row.get::<_, String>(0), instance_id),
-            from_claim: row.get(0),
+            from_claim,
+            to_claim,
             at_ns,
-            launched_by: row.get(1),
+            launched_by: row.get(0),
         }))
     }
 

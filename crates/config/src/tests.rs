@@ -1774,6 +1774,64 @@ async fn reported_by(
     panic!("the report was not kept");
 }
 
+/// Review c5c L8: the conductor's trigger of the copy's record. oms-1's
+/// launch copied its own claim, the launcher answering at 50: a report from
+/// another publisher about it records nothing, nor one not registered; its
+/// own sidecar's registered report records it once, on the launch that
+/// copied (item 30).
+#[tokio::test]
+async fn a_registered_report_from_its_own_sidecar_records_the_copy() {
+    let h = harness("conductor-1");
+    let launch = meridian_domain::v1::PluginLaunch {
+        instance_id: "oms-1".into(),
+        name: "oms".into(),
+        version: "0.1.0".into(),
+        launched_by: "local|ada".into(),
+        launched_at_ns: 10,
+        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+        ..Default::default()
+    };
+    assert!(h.store.begin_launch(&launch, "").unwrap());
+    h.store
+        .pend_storage_copy("oms-1", "check-meridian-runtime-storage-oms-1", 50)
+        .unwrap();
+    let copied = || {
+        h.store
+            .launches()
+            .unwrap()
+            .into_iter()
+            .find(|held| held.instance_id == "oms-1")
+            .unwrap()
+            .storage_copied
+    };
+    reported_by(&h, "street", true, declared(), 60).await;
+    reported(&h, false, declared(), 70).await;
+    assert_eq!(copied(), None, "not its own sidecar's, or not registered");
+    reported(&h, true, declared(), 80).await;
+    // Written just after the report is kept.
+    for _ in 0..200 {
+        if copied().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let held = copied().expect("recorded once its own sidecar is heard registered");
+    assert_eq!(
+        (
+            held.from_claim.as_str(),
+            held.to_claim.as_str(),
+            held.launched_by.as_str()
+        ),
+        (
+            "check-meridian-runtime-storage-oms-1",
+            "check-meridian-runtime-shared-storage-oms-1",
+            "local|ada"
+        )
+    );
+    reported(&h, true, declared(), 90).await;
+    assert_eq!(copied(), Some(held), "once");
+}
+
 /// Set as the dashboard's form does: against the record as it was read
 /// (contract v18, W6.11).
 async fn set(
@@ -4366,9 +4424,12 @@ mod storage_copied {
     /// instance's own claim into its shared storage is recorded once a pod of
     /// it is heard registered after the launcher answered -- its pods start
     /// only once the copy is whole -- as `PluginStorageCopied`, on the launch
-    /// that copied, once per claim: an earlier pod's report records nothing, a
-    /// later report nothing again, nor a later launch finding it copied; no
-    /// copy pending, no record.
+    /// that copied, once per launch that copied: an earlier pod's report
+    /// records nothing, a later report nothing again, nor a later launch the
+    /// launcher said copied none, having found it copied. A second copy, into a
+    /// shared claim made again, is recorded on its own launch; and a copy whose
+    /// launch stopped before a pod was heard is recorded on that launch, by
+    /// its launcher, once a later launch's pod is heard (review c5c L6).
     fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
         store: &dyn Store,
     ) {
@@ -4415,8 +4476,8 @@ mod storage_copied {
                 .storage_copied
         };
         assert_eq!(on(store, 10), Some(copied.clone()));
-        // Stopped and launched again, the copy pod finding it copied: the
-        // launcher says the claim again, and nothing more is recorded.
+        // Stopped and launched again, the copy pod found done: the launcher
+        // says none, and nothing more is recorded.
         let stop = Ending {
             prepared_call_id: Default::default(),
             state: PluginLaunchState::Stopped,
@@ -4430,15 +4491,72 @@ mod storage_copied {
         store.end_launch("feed-1", &stop).unwrap().unwrap();
         launch.launched_at_ns = 200;
         assert!(store.begin_launch(&launch, "").unwrap());
-        store
-            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 210)
-            .unwrap();
         assert_eq!(
             store.record_storage_copied("feed-1", 220, 230).unwrap(),
             None
         );
         assert_eq!(on(store, 200), None);
+        assert_eq!(on(store, 10), Some(copied.clone()));
+        // Its shared claim made again, the copy made again: recorded on its
+        // own launch.
+        let stopped_at = |at_ns: i64| Ending {
+            at_ns,
+            ..stop.clone()
+        };
+        store
+            .end_launch("feed-1", &stopped_at(250))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 300;
+        launch.launched_by = "local|bo".into();
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 310)
+            .unwrap();
+        let again = PluginStorageCopied {
+            at_ns: 330,
+            launched_by: "local|bo".into(),
+            ..copied.clone()
+        };
+        assert_eq!(
+            store.record_storage_copied("feed-1", 320, 330).unwrap(),
+            Some(again.clone())
+        );
+        assert_eq!(on(store, 300), Some(again));
         assert_eq!(on(store, 10), Some(copied));
+        // A launch that copied, stopped before a pod of it was heard; the next
+        // finds it copied: recorded on the launch that copied, by its launcher,
+        // once the next one's pod is heard.
+        launch.instance_id = "feed-2".into();
+        launch.launched_at_ns = 10;
+        launch.launched_by = "local|ada".into();
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-2", "check-meridian-runtime-storage-feed-2", 50)
+            .unwrap();
+        store
+            .end_launch("feed-2", &stopped_at(60))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 100;
+        launch.launched_by = "local|bo".into();
+        assert!(store.begin_launch(&launch, "").unwrap());
+        let theirs = store.record_storage_copied("feed-2", 120, 130).unwrap();
+        assert_eq!(
+            theirs.as_ref().map(|c| (c.launched_by.as_str(), c.at_ns)),
+            Some(("local|ada", 130))
+        );
+        let on_2 = |at: i64| {
+            store
+                .launches()
+                .unwrap()
+                .into_iter()
+                .find(|held| held.instance_id == "feed-2" && held.launched_at_ns == at)
+                .unwrap()
+                .storage_copied
+        };
+        assert_eq!(on_2(10), theirs);
+        assert_eq!(on_2(100), None);
     }
 
     #[test]

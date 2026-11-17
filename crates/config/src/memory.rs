@@ -785,43 +785,32 @@ impl Store for MemoryStore {
         at_ns: i64,
     ) -> Result<Option<PluginStorageCopied>> {
         let mut state = self.state.lock().expect("store lock poisoned");
-        let Some(launched_at_ns) = state
-            .catalogue
-            .launches
-            .iter()
-            .find(|held| {
-                held.instance_id == instance_id
-                    && held.state == PluginLaunchState::Launched as i32
-                    && held.storage_copied.is_none()
-            })
-            .map(|held| held.launched_at_ns)
-        else {
-            return Ok(None);
-        };
+        // The instance's latest launch that copied, ended or not (review c5c
+        // L6), where a pod was heard after the launcher answered.
         let pending = self
             .storage_copies
             .lock()
             .expect("store lock poisoned")
-            .get(&(instance_id.to_string(), launched_at_ns))
-            .cloned();
-        let Some((from_claim, _)) = pending.filter(|(_, after)| reported_at_ns > *after) else {
+            .iter()
+            .filter(|((instance, _), _)| instance == instance_id)
+            .max_by_key(|((_, launched_at_ns), _)| *launched_at_ns)
+            .map(|((_, launched_at_ns), (from_claim, after))| {
+                (*launched_at_ns, from_claim.clone(), *after)
+            });
+        let Some((launched_at_ns, from_claim, _)) =
+            pending.filter(|(_, _, after)| reported_at_ns > *after)
+        else {
             return Ok(None);
         };
-        // Once per claim copied: a launch after, finding it copied, records
-        // none again.
-        let before = state.catalogue.launches.iter().any(|held| {
-            held.instance_id == instance_id
-                && held
-                    .storage_copied
-                    .as_ref()
-                    .is_some_and(|copied| copied.from_claim == from_claim)
-        });
-        let Some(launch) = state.catalogue.launches.iter_mut().find(|held| {
-            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
-        }) else {
+        let Some(launch) =
+            state.catalogue.launches.iter_mut().find(|held| {
+                held.instance_id == instance_id && held.launched_at_ns == launched_at_ns
+            })
+        else {
             return Ok(None);
         };
-        if before {
+        // Once per launch that copied.
+        if launch.storage_copied.is_some() {
             return Ok(None);
         }
         let copied = PluginStorageCopied {

@@ -737,8 +737,9 @@ fn keeps_storage(roles: &[String], declaration: Option<&PluginDeclaration>) -> b
         .any(|role| meridian_domain::EDGE_ROLES.contains(&role.as_str()))
 }
 
-/// The refusal wording of [`storage_refused`]: proposed 2026-11-17 (c5c),
-/// awaiting the product owner's ruling.
+/// The refusal wording of [`storage_refused`], approved by the product
+/// owner as item 69's first (2026-11-17); "several" for nodes not counted,
+/// item 78.
 fn storage_refusal_said(field: &str, instance: &str, nodes: &str) -> String {
     format!(
         "{field} was asked for {instance}, and its plugin keeps storage: its pods share it on \
@@ -776,8 +777,12 @@ fn storage_refused(
     let nodes = match several.nodes.as_ref().map(|nodes| nodes()) {
         Some(Ok(nodes)) if nodes <= 1 => return None,
         Some(Ok(nodes)) => format!("{nodes} nodes"),
-        Some(Err(failed)) => format!("nodes it could not count ({failed})"),
-        None => "nodes it could not count".to_string(),
+        // Nodes not counted are said as several (PO item 78); why, logged.
+        Some(Err(failed)) => {
+            tracing::warn!(instance, %failed, "the deployment's nodes could not be counted; said as several");
+            "several nodes".to_string()
+        }
+        None => "several nodes".to_string(),
     };
     Some(meridian_bus::refusal_with_status(
         meridian_bus::RefusalStatus::FailedPrecondition,
@@ -786,23 +791,94 @@ fn storage_refused(
     ))
 }
 
-/// Both refusals of an instance of several pods before anything is
-/// recorded: no lease right, then no storage to share.
+/// The first SDK whose plugins keep storage per shard (step 3d, item 30;
+/// PO item 77).
+const SHARD_STORAGE_SDK: (u64, u64, u64) = (0, 37, 0);
+
+/// Whether an SDK version, as the CLI read it from the built image, is
+/// [`SHARD_STORAGE_SDK`] or later: `major.minor.patch`, a release; a
+/// pre-release of a later one counts, of 0.37.0 itself not, and one not
+/// read as a version never does.
+fn keeps_storage_per_shard(sdk_version: &str) -> bool {
+    let (numbers, rest) = match sdk_version.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        Some(at) => sdk_version.split_at(at),
+        None => (sdk_version, ""),
+    };
+    let parts: Vec<Option<u64>> = numbers.split('.').map(|part| part.parse().ok()).collect();
+    let [Some(major), Some(minor), Some(patch)] = parts[..] else {
+        return false;
+    };
+    let base = (major, minor, patch);
+    base > SHARD_STORAGE_SDK || (base == SHARD_STORAGE_SDK && rest.is_empty())
+}
+
+/// The refusal of a version keeping storage built before plugins kept it
+/// per shard (PO item 77, 2026-11-17), before anything is recorded: asked
+/// shards, a standby pod, or one pod of an instance whose storage is shared
+/// since it ran as several, naming the version. `sdk_version` is what the
+/// CLI reported at upload, not proved by the image.
+fn sdk_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    shared: bool,
+    version: &PluginVersion,
+) -> Option<String> {
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else if shared {
+        "version"
+    } else {
+        return None;
+    };
+    let metadata = version.metadata.clone().unwrap_or_default();
+    if !keeps_storage(&metadata.roles, metadata.declaration.as_ref())
+        || keeps_storage_per_shard(&metadata.sdk_version)
+    {
+        return None;
+    }
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        format!(
+            "{instance} was asked shards or a standby pod, and its plugin keeps storage: its \
+             version {} was built before plugins kept storage per shard; publish a version on \
+             SDK 0.37 or later",
+            metadata.version
+        ),
+    ))
+}
+
+/// Whether the instance ran as several pods at any launch the catalogue
+/// holds, so its storage is shared since (item 30).
+fn ran_as_several(launches: &[PluginLaunch], instance: &str) -> bool {
+    launches
+        .iter()
+        .any(|held| held.instance_id == instance && (held.shards > 1 || held.standby))
+}
+
+/// The refusals of an instance of several pods, or of one on shared
+/// storage, before anything is recorded: no lease right, then no storage
+/// to share, then a version from before storage per shard.
 fn several_or_storage_refused(
     instance: &str,
     pods: (u32, bool),
+    shared: bool,
     version: &PluginVersion,
     several: &Several,
 ) -> Option<String> {
-    several_refused(instance, pods, several.lease_right).or_else(|| {
-        let metadata = version.metadata.clone().unwrap_or_default();
-        storage_refused(
-            instance,
-            pods,
-            keeps_storage(&metadata.roles, metadata.declaration.as_ref()),
-            several,
-        )
-    })
+    several_refused(instance, pods, several.lease_right)
+        .or_else(|| {
+            let metadata = version.metadata.clone().unwrap_or_default();
+            storage_refused(
+                instance,
+                pods,
+                keeps_storage(&metadata.roles, metadata.declaration.as_ref()),
+                several,
+            )
+        })
+        .or_else(|| sdk_refused(instance, pods, shared, version))
 }
 
 // ── Serving them ────────────────────────────────────────────────────────────
@@ -903,6 +979,7 @@ impl Plugins {
         if let Some(refusal) = several_or_storage_refused(
             &request.instance_id,
             (request.shards, request.standby),
+            ran_as_several(&snapshot.catalogue.launches, &request.instance_id),
             version,
             &self.several,
         ) {
@@ -1236,6 +1313,7 @@ impl Plugins {
         if let Some(refusal) = several_or_storage_refused(
             instance,
             (launch.shards, launch.standby),
+            ran_as_several(&snapshot.catalogue.launches, instance),
             version,
             &self.several,
         ) {
