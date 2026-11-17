@@ -416,3 +416,158 @@ fn a_lease_read_from_the_api_is_its_record() {
     assert_eq!(record.transitions, 3);
     assert_eq!(record.resource_version, "812");
 }
+
+// ── The client's connections through an outage (CI 43973174092) ─────────
+
+/// A way to the API server whose packets are dropped while it is cut, as
+/// the e2e's iptables rules drop them. A connection opened before the cut
+/// is lifted stays dead after it, as one whose unacked data waits on TCP's
+/// retransmission backoff does; a connection opened after it carries on.
+#[derive(Default)]
+struct Blackhole {
+    cut: std::sync::atomic::AtomicBool,
+    /// Connections numbered below this one are dead.
+    dead_below: std::sync::atomic::AtomicU64,
+    opened: std::sync::atomic::AtomicU64,
+}
+
+impl Blackhole {
+    fn passes(&self, connection: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        !self.cut.load(SeqCst) && connection >= self.dead_below.load(SeqCst)
+    }
+
+    fn cut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn lift(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.dead_below.store(self.opened.load(SeqCst), SeqCst);
+        self.cut.store(false, SeqCst);
+    }
+
+    /// Bytes from `from` to `to` while they pass; held while they do not.
+    async fn carry(
+        self: Arc<Self>,
+        connection: u64,
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            let Ok(read) = from.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            while !self.passes(connection) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if to.write_all(&buffer[..read]).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Listen in front of `api`; answers its own address.
+    async fn before(self: &Arc<Self>, api: std::net::SocketAddr) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let hole = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let connection = hole
+                    .opened
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Ok(server) = tokio::net::TcpStream::connect(api).await else {
+                    continue;
+                };
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                tokio::spawn(Arc::clone(&hole).carry(connection, client_read, server_write));
+                tokio::spawn(Arc::clone(&hole).carry(connection, server_read, client_write));
+            }
+        });
+        at
+    }
+}
+
+/// An API server answering every request with one Lease, over HTTP/2 as
+/// the cluster's does.
+async fn one_lease_api() -> std::net::SocketAddr {
+    let lease = serde_json::json!({
+        "metadata": { "resourceVersion": "7", "uid": "uid-7" },
+        "spec": { "holderIdentity": "a", "leaseDurationSeconds": 6, "leaseTransitions": 1 }
+    });
+    let router = axum::Router::new().fallback(move || {
+        let lease = lease.clone();
+        async move { axum::Json(lease) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    at
+}
+
+/// The client as the sidecar makes it, but over HTTP/2 without TLS: one
+/// connection for every request, as ALPN gives it against the API server.
+fn leases_through(at: std::net::SocketAddr, token: &std::path::Path) -> KubeLeases {
+    let timeout = Duration::from_secs(1);
+    let make = move || {
+        reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .timeout(timeout)
+            .connect_timeout(timeout)
+            .build()
+            .map_err(|failed| failed.to_string())
+    };
+    KubeLeases::through(
+        format!("http://{at}"),
+        "ns",
+        token.to_str().unwrap(),
+        Box::new(make),
+    )
+    .unwrap()
+}
+
+/// CI 43973174092: after a 15 s outage that dropped every packet, a pod's
+/// client answers again within one look of the API server being reachable
+/// -- never waiting out the dead connection's retransmissions, which left
+/// a data standby blind for 11 s. And while it answers, it keeps its one
+/// connection: no dial per request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_blackhole_a_lease_client_answers_within_one_look_of_the_lift() {
+    let token = std::env::temp_dir().join(format!("lease-token-{}", std::process::id()));
+    std::fs::write(&token, "token").unwrap();
+    let hole = Arc::new(Blackhole::default());
+    let at = hole.before(one_lease_api().await).await;
+    let leases = leases_through(at, &token);
+    for _ in 0..3 {
+        let read = leases.get("shard-proof-shard-1").await.unwrap().unwrap();
+        assert_eq!((read.holder.as_str(), read.uid.as_str()), ("a", "uid-7"));
+    }
+    assert_eq!(
+        hole.opened.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a client that answers dials once"
+    );
+    hole.cut();
+    let cut_at = Instant::now();
+    while cut_at.elapsed() < Duration::from_secs(15) {
+        let began = Instant::now();
+        assert!(leases.get("shard-proof-shard-1").await.is_err());
+        tokio::time::sleep(Duration::from_secs(1).saturating_sub(began.elapsed())).await;
+    }
+    hole.lift();
+    let lifted = Instant::now();
+    let read = leases.get("shard-proof-shard-1").await;
+    let _ = std::fs::remove_file(&token);
+    assert!(
+        read.is_ok() && lifted.elapsed() <= Duration::from_secs(1),
+        "{:?} after the lift: {read:?}",
+        lifted.elapsed()
+    );
+}

@@ -165,10 +165,14 @@ pub struct Elector<L: Leases> {
     /// Whether this member gave the lease up ([`Elector::release`]): it is
     /// stopping, and never takes or renews it again.
     gave_up: bool,
-    /// Set for a holder no epoch fences, which stops once it has gone its
-    /// renew deadline unrenewed ([`Elector::of_a_holder_that_stops`]): the
-    /// monotonic clock, read when a request has answered.
+    /// The monotonic clock, read when a request has answered: a record is
+    /// held seen, and a lapse judged, by when its read answered
+    /// ([`Elector::seen_as_answered`]). None: by when the look began.
     answered: Option<fn() -> Instant>,
+    /// Whether a look that failed leaves what was seen as it was
+    /// ([`Elector::of_a_holder_that_stops`]); else it drops it, and an
+    /// unobserved stretch is never counted toward a lapse.
+    keeps_seen: bool,
 }
 
 impl<L: Leases> Elector<L> {
@@ -183,6 +187,7 @@ impl<L: Leases> Elector<L> {
             last_other: None,
             gave_up: false,
             answered: None,
+            keeps_seen: false,
         }
     }
 
@@ -202,6 +207,17 @@ impl<L: Leases> Elector<L> {
     ///   second lapse.
     pub fn of_a_holder_that_stops(mut self, clock: fn() -> Instant) -> Self {
         self.answered = Some(clock);
+        self.keeps_seen = true;
+        self
+    }
+
+    /// A record held seen when its read answered, by `clock`, and a lapse
+    /// judged by when the look that reads it again answered -- Kubernetes'
+    /// observedTime, read after the Get (PO item 54, 2026-11-16: a data
+    /// shard's standby). A look that failed still drops what was seen (review
+    /// c5a5 F4): only [`Elector::of_a_holder_that_stops`] keeps it.
+    pub fn seen_as_answered(mut self, clock: fn() -> Instant) -> Self {
+        self.answered = Some(clock);
         self
     }
 
@@ -212,6 +228,7 @@ impl<L: Leases> Elector<L> {
     /// it no transitions to raise its epoch by and nothing to release.
     pub fn keep_seen_through_failures(&mut self, clock: fn() -> Instant) {
         self.answered = Some(clock);
+        self.keeps_seen = true;
     }
 
     /// When a record just read is held to have been seen: when its read
@@ -292,7 +309,7 @@ impl<L: Leases> Elector<L> {
     /// by an election).
     pub async fn look(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let looked = self.look_once(now, wall_ns).await;
-        if looked.is_err() && self.answered.is_none() {
+        if looked.is_err() && !self.keeps_seen {
             // Not watched while the API server did not answer (contract v30,
             // stage C): a lease's expiry is observed, and an unobserved
             // stretch is never counted as its holder's silence -- else a
@@ -317,22 +334,23 @@ impl<L: Leases> Elector<L> {
             }
             Err(failed) => {
                 // Unobserved, as in [`Elector::look`].
-                if self.answered.is_none() {
+                if !self.keeps_seen {
                     self.observed = None;
                 }
                 return Err(failed);
             }
         };
+        let at = self.seen_at(now);
         let changed = self
             .observed
             .as_ref()
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
-            self.observed = Some((current.clone(), self.seen_at(now)));
+            self.observed = Some((current.clone(), at));
         }
-        let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
+        let seen_at = self.observed.as_ref().map_or(at, |(_, at)| *at);
         let lapse = Duration::from_secs(current.duration_seconds.max(1));
-        if current.holder.is_empty() || now.duration_since(seen_at) >= lapse {
+        if current.holder.is_empty() || at.duration_since(seen_at) >= lapse {
             return Ok(None);
         }
         Ok(Some(current.holder))
@@ -361,12 +379,15 @@ impl<L: Leases> Elector<L> {
                 Wrote::Conflict => Ok(Standing::HeldBy(String::new())),
             };
         };
+        // When this read answered: what it shows is held seen from then,
+        // and a lapse is judged at then, never at when the look began.
+        let at = self.seen_at(now);
         let changed = self
             .observed
             .as_ref()
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
-            self.observed = Some((current.clone(), self.seen_at(now)));
+            self.observed = Some((current.clone(), at));
         }
         if !current.holder.is_empty() && current.holder != me {
             self.last_other = Some(current.holder.clone());
@@ -380,10 +401,10 @@ impl<L: Leases> Elector<L> {
         if self.gave_up {
             return Ok(Standing::HeldBy(current.holder));
         }
-        let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
+        let seen_at = self.observed.as_ref().map_or(at, |(_, at)| *at);
         let lapse = Duration::from_secs(current.duration_seconds.max(1));
         let mine = current.holder == me;
-        if !current.holder.is_empty() && !mine && now.duration_since(seen_at) < lapse {
+        if !current.holder.is_empty() && !mine && at.duration_since(seen_at) < lapse {
             return Ok(Standing::HeldBy(current.holder));
         }
         let record = Record {
@@ -535,10 +556,24 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// How a [`KubeLeases`] makes its client: again after a request that did
+/// not answer.
+type MakeClient = Box<dyn Fn() -> Result<reqwest::Client, String> + Send + Sync>;
+
 /// The in-cluster API, reached with the pod's own service account, for the
 /// Leases of its own namespace and nothing else.
+///
+/// **A request that did not answer closes the client's connections**: the
+/// next one dials afresh, as the kubelet closes its connections when a
+/// heartbeat fails. Its client keeps one HTTP/2 connection for every
+/// request; one whose packets were dropped stays in the pool, and the
+/// requests after it waited on TCP's retransmission backoff for up to 12 s
+/// after the API server could be reached again (CI 43973174092: a data
+/// standby blind 11 s after an outage ended took a shard 10.85 s after its
+/// holder was cut).
 pub struct KubeLeases {
-    http: reqwest::Client,
+    http: std::sync::Mutex<reqwest::Client>,
+    make: MakeClient,
     base: String,
     namespace: String,
     token_path: String,
@@ -564,18 +599,60 @@ impl KubeLeases {
             .map_err(|failed| format!("no cluster CA for the lease: {failed}"))?;
         let ca = reqwest::Certificate::from_pem(&ca)
             .map_err(|failed| format!("the cluster CA is unreadable: {failed}"))?;
-        let http = reqwest::Client::builder()
-            .add_root_certificate(ca)
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .build()
-            .map_err(|failed| failed.to_string())?;
+        let make = move || {
+            reqwest::Client::builder()
+                .add_root_certificate(ca.clone())
+                .timeout(timeout)
+                .connect_timeout(timeout)
+                .build()
+                .map_err(|failed| failed.to_string())
+        };
+        Self::through(
+            format!("https://{host}:{port}"),
+            namespace.trim(),
+            TOKEN_PATH,
+            Box::new(make),
+        )
+    }
+
+    /// The API at `base`, its client made by `make`, and made again after
+    /// a request that did not answer.
+    fn through(
+        base: String,
+        namespace: &str,
+        token_path: &str,
+        make: MakeClient,
+    ) -> Result<Self, String> {
         Ok(Self {
-            http,
-            base: format!("https://{host}:{port}"),
-            namespace: namespace.trim().to_string(),
-            token_path: TOKEN_PATH.to_string(),
+            http: std::sync::Mutex::new(make()?),
+            make,
+            base,
+            namespace: namespace.to_string(),
+            token_path: token_path.to_string(),
         })
+    }
+
+    fn client(&self) -> reqwest::Client {
+        self.http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Its connections closed: a fresh client, which dials afresh. Where one
+    /// cannot be made, the old one is kept.
+    fn dial_afresh(&self) {
+        match (self.make)() {
+            Ok(fresh) => {
+                *self
+                    .http
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh
+            }
+            Err(failed) => {
+                tracing::warn!(%failed, "the API server's client could not be made again")
+            }
+        }
     }
 
     /// The token, read at each request: a projected token is rotated under
@@ -618,19 +695,39 @@ impl KubeLeases {
         })
     }
 
+    /// One request. Where it does not answer -- it failed to send, timed
+    /// out, or was given up by its caller -- the client dials afresh for
+    /// the next.
     async fn send(
         &self,
-        request: reqwest::RequestBuilder,
+        request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
         what: &str,
     ) -> Result<(u16, String), String> {
-        let response = request
-            .bearer_auth(self.token()?)
+        let token = self.token()?;
+        let mut unanswered = Unanswered(Some(self));
+        let response = request(&self.client())
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|failed| format!("{what}: {failed}"))?;
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .map_err(|failed| format!("{what}: {failed}"))?;
+        unanswered.0 = None;
         Ok((status, body))
+    }
+}
+
+/// Dials afresh when dropped before its request answered.
+struct Unanswered<'a>(Option<&'a KubeLeases>);
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if let Some(leases) = self.0 {
+            leases.dial_afresh();
+        }
     }
 }
 
@@ -652,11 +749,9 @@ pub fn record_of(lease: &serde_json::Value) -> Record {
 impl Leases for KubeLeases {
     async fn get(&self, name: &str) -> Result<Option<Record>, String> {
         let path = self.path(Some(name));
+        let url = format!("{}{path}", self.base);
         let (status, body) = self
-            .send(
-                self.http.get(format!("{}{path}", self.base)),
-                &format!("GET {path}"),
-            )
+            .send(|http| http.get(url), &format!("GET {path}"))
             .await?;
         match status {
             404 => Ok(None),
@@ -669,12 +764,17 @@ impl Leases for KubeLeases {
 
     async fn create(&self, name: &str, record: &Record) -> Result<Wrote, String> {
         let path = self.path(None);
+        let (url, body) = (
+            format!("{}{path}", self.base),
+            self.body(name, record).to_string(),
+        );
         let (status, body) = self
             .send(
-                self.http
-                    .post(format!("{}{path}", self.base))
-                    .header("Content-Type", "application/json")
-                    .body(self.body(name, record).to_string()),
+                |http| {
+                    http.post(url)
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                },
                 &format!("POST {path}"),
             )
             .await?;
@@ -683,12 +783,17 @@ impl Leases for KubeLeases {
 
     async fn update(&self, name: &str, record: &Record) -> Result<Wrote, String> {
         let path = self.path(Some(name));
+        let (url, body) = (
+            format!("{}{path}", self.base),
+            self.body(name, record).to_string(),
+        );
         let (status, body) = self
             .send(
-                self.http
-                    .put(format!("{}{path}", self.base))
-                    .header("Content-Type", "application/json")
-                    .body(self.body(name, record).to_string()),
+                |http| {
+                    http.put(url)
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                },
                 &format!("PUT {path}"),
             )
             .await?;

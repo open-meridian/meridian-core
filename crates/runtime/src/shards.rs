@@ -269,9 +269,10 @@ impl<L: Leases + 'static> ShardSet<L> {
         Ok(set)
     }
 
-    /// One elector per shard's Lease. A holder that stops by the clock has
-    /// its standbys count a stretch they could not read toward its lapse;
-    /// one that writes on, never ([`ShardSet::writing_on`]).
+    /// One elector per shard's Lease, each holding a record seen, and a
+    /// lapse judged, by when its read answered. A holder that stops by the
+    /// clock has its standbys count a stretch they could not read toward
+    /// its lapse; one that writes on, never ([`ShardSet::writing_on`]).
     fn electors_of(&self, count: u32) -> Vec<Shared<L>> {
         (0..count)
             .map(|shard| {
@@ -283,7 +284,7 @@ impl<L: Leases + 'static> ShardSet<L> {
                     },
                 );
                 Arc::new(tokio::sync::Mutex::new(if self.writes_on {
-                    elector
+                    elector.seen_as_answered(clock)
                 } else {
                     elector.of_a_holder_that_stops(clock)
                 }))
@@ -340,8 +341,9 @@ impl<L: Leases + 'static> ShardSet<L> {
         self.settings.duration
     }
 
-    /// How often to look: a standby twice a renewal, as a store's does; a
-    /// shard every renewal.
+    /// How often to look, from one look's start to the next: a standby
+    /// twice a renewal (every 1 s at the chart's 2 s; PO item 54), as a
+    /// store's does; a shard every renewal.
     pub fn look_every(&self) -> Duration {
         match self.mine {
             None => self.settings.look_every(),
@@ -470,6 +472,9 @@ impl<L: Leases + 'static> ShardSet<L> {
     ) -> Result<Option<(Self, u32, Vec<u32>)>, String> {
         let mut said = false;
         loop {
+            // Looks start a look apart, however long one took (PO item 54):
+            // a slow read never stretches a standby's cadence.
+            let started = tokio::time::Instant::now();
             let renew = self.settings.renew;
             let stand = {
                 let look = self.look(clock(), crate::now_ns());
@@ -500,7 +505,7 @@ impl<L: Leases + 'static> ShardSet<L> {
                 Stand::Lost(why) => return Err(why),
             }
             tokio::select! {
-                _ = tokio::time::sleep(self.look_every()) => {}
+                _ = tokio::time::sleep_until(started + self.look_every()) => {}
                 _ = told(&mut stop) => return Ok(None),
             }
         }
@@ -1708,6 +1713,141 @@ pub(crate) mod tests {
                 "the release wrote nothing"
             );
         });
+    }
+
+    // ── A data standby's takeover within 10 s (PO item 54, 2026-11-16) ──
+
+    /// The fence raise at its usual cost, and more: CI 43973174092's taker
+    /// went from its take to serving in 21 ms.
+    const RAISE: Duration = Duration::from_millis(500);
+    /// Each of the standby's reads of the API server.
+    const READ: Duration = Duration::from_millis(50);
+
+    /// A data standby: when it took a shard's Lease, and when it served,
+    /// its epoch raised in `fence` at [`RAISE`]'s cost.
+    fn standing_by_fenced(
+        set: ShardSet<Link>,
+        stop: &watch::Receiver<bool>,
+        fence: &Arc<meridian_changes::shard_fence::Memory>,
+    ) -> tokio::task::JoinHandle<Option<(At, At)>> {
+        let (stop, fence) = (stop.clone(), Arc::clone(fence));
+        tokio::spawn(async move {
+            let (set, mine, _) = set.writing_on().take(stop).await.unwrap()?;
+            let took = At::now();
+            tokio::time::sleep(RAISE).await;
+            let taken = set.taken().await.expect("the take's record");
+            let taking = meridian_changes::shard_fence::Taking {
+                lease_transitions: taken.transitions,
+                lease_uid: taken.lease_uid,
+                admit: None,
+            };
+            fence.take("feed-1", mine, &taking).unwrap();
+            Some((took, At::now()))
+        })
+    }
+
+    /// Spec section 7's takeover (≤ 10 s) for a data shard, at its worst
+    /// with a standby that can read the API server: the holder renews just
+    /// before it ends; the standby's look before saw the Lease a moment
+    /// before that renewal, so it first sees it a look later, and that
+    /// read answers slowly while the reads after answer at once, so the
+    /// lapse falls just short at one look and the take waits for the next.
+    /// It takes no sooner than the lapse from that renewal, and serves,
+    /// its epoch raised, within 10 s of the end. `end` ends the holder.
+    async fn a_data_standby_at_its_worst_phase_serves_within_ten_seconds(
+        end: impl FnOnce(&Arc<Link>, tokio::task::JoinHandle<(At, Kept)>),
+    ) -> (Duration, Duration) {
+        let store = Arc::new(Memory::default());
+        let (to_a, to_c) = (Link::to(&store), Link::to(&store));
+        let fence = Arc::new(meridian_changes::shard_fence::Memory::default());
+        let (epoch, renewal) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(None)));
+        let (_stopper, stop) = watch::channel(false);
+        let t0 = At::now();
+        let a = serving_fenced(on(&to_a, 1, "a"), &stop, &fence, &epoch, &renewal);
+        // a renews at t0 + 2 s, 4 s, ...; c looks at t0 + 0.949 s + n s,
+        // each read answering 50 ms later: just before each even second.
+        tokio::time::sleep_until(t0 + secs(0.949)).await;
+        to_c.slow("", READ, false);
+        let c = standing_by_fenced(on(&to_c, 1, "c"), &stop, &fence);
+        // The holder renewed at t0 + 2 s, 1 ms after c's read; ended now,
+        // it renews no more.
+        tokio::time::sleep_until(t0 + secs(2.001)).await;
+        let renewed = store.written_at("feed-1-shard-0");
+        assert_eq!(renewed, t0 + RENEW, "the holder's renewal");
+        let ended = At::now();
+        end(&to_a, a);
+        // c's look at t0 + 2.949 s, the first to see that renewal, answers
+        // 50 ms slower than the others.
+        *to_c.slow_once.lock().unwrap() = Some(READ);
+        let (took, served) = c.await.unwrap().expect("the standby took the shard");
+        assert_eq!(store.holder("feed-1-shard-0"), "c");
+        assert!(
+            took.duration_since(renewed) >= LASTS,
+            "taken {:?} after the holder's last renewal; a lease lasts {LASTS:?}",
+            took.duration_since(renewed)
+        );
+        assert!(
+            served.duration_since(ended) <= secs(10.0),
+            "served {:?} after the holder ended",
+            served.duration_since(ended)
+        );
+        (took.duration_since(ended), served.duration_since(ended))
+    }
+
+    /// PO item 54 (Kubernetes' observedTime): a data standby holds a Lease
+    /// seen when its read answered, never when it was asked -- the renewal
+    /// it shows may have landed anywhere between -- so it takes no sooner
+    /// than the lapse from that renewal.
+    #[tokio::test(start_paused = true)]
+    async fn a_data_standby_counts_a_lease_s_lapse_from_when_its_read_answered() {
+        let store = Arc::new(Memory::default());
+        let (to_a, to_c) = (Link::to(&store), Link::to(&store));
+        let fence = Arc::new(meridian_changes::shard_fence::Memory::default());
+        let (epoch, renewal) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(None)));
+        let (_stopper, stop) = watch::channel(false);
+        let a = serving_fenced(on(&to_a, 1, "a"), &stop, &fence, &epoch, &renewal);
+        tokio::time::sleep(secs(0.1)).await;
+        let c = standing_by_fenced(on(&to_c, 1, "c"), &stop, &fence);
+        // The standby's read asked at 7.1 s answers at 8.6 s, with the
+        // holder's renewal of 8 s in it; then the holder's pod is gone.
+        tokio::time::sleep(secs(6.4)).await;
+        *to_c.slow_once.lock().unwrap() = Some(secs(1.5));
+        tokio::time::sleep(secs(2.0)).await;
+        a.abort();
+        let written_at = store.written_at("feed-1-shard-0");
+        let (took, _) = c.await.unwrap().expect("the standby took the shard");
+        assert!(
+            took.duration_since(written_at) >= LASTS,
+            "taken {:?} after its holder's last renewal; a lease lasts {LASTS:?}",
+            took.duration_since(written_at)
+        );
+    }
+
+    /// PO item 54, the cut: the holder alone cut from the API server just
+    /// after its renewal -- its every call hanging, writing on -- and its
+    /// standby, which can read, serves the shard within 10 s of the cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_data_holder_cut_just_after_its_renewal_is_served_by_its_standby_within_ten_seconds()
+    {
+        let (took, served) =
+            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(|to_a, a| {
+                to_a.slow("", secs(3_600.0), true);
+                drop(a);
+            })
+            .await;
+        // One look late to see the renewal, a lapse, one look of the
+        // grid's phase, a slow read, the take's write, the raise.
+        assert_eq!((took, served), (secs(8.048), secs(8.548)));
+    }
+
+    /// PO item 54, the kill: the holder's pod gone just after its renewal,
+    /// and its standby serves the shard within 10 s of the kill.
+    #[tokio::test(start_paused = true)]
+    async fn a_data_holder_killed_just_after_its_renewal_is_served_by_its_standby_within_ten_seconds(
+    ) {
+        let (took, served) =
+            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(|_, a| a.abort()).await;
+        assert_eq!((took, served), (secs(8.048), secs(8.548)));
     }
 
     /// Item 49 (ruled 2026-11-16; review c5a5 F3): a pod that loses its
