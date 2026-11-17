@@ -371,11 +371,59 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
     return wrong
 
 
+def env_of(container: dict, name: str):
+    for e in container.get("env", []) or []:
+        if e.get("name") == name:
+            return e.get("value")
+    return None
+
+
+def plugin_told(pod: dict, where: str) -> list[str]:
+    """PO item 73: where a pod's sidecar is told MERIDIAN_PLUGIN_SHARDS, its
+    plugin container is told the same value."""
+    containers = {c["name"]: c for c in pod.get("containers", [])}
+    said = env_of(containers.get("sidecar", {}), "MERIDIAN_PLUGIN_SHARDS")
+    plugin = containers.get("plugin")
+    if said is None or plugin is None:
+        return []
+    held = env_of(plugin, "MERIDIAN_PLUGIN_SHARDS")
+    if held != said:
+        return [f"{where}: the sidecar is told MERIDIAN_PLUGIN_SHARDS={said!r}, its plugin container {held!r}"]
+    return []
+
+
+def plugin_shards(render: str) -> list[str]:
+    """PO item 73 (2026-11-17): every plugin container is told the shard
+    count its sidecar is, in each shape that tells the sidecar: the
+    launcher's shards shapes and a sidecars[] instance of several pods. A
+    render with no such shape at all is a check that proves nothing."""
+    wrong, seen = [], 0
+    for name in ("plugin-shards.json", "plugin-shards-storage.json"):
+        shape = template(render, name)
+        if shape is not None:
+            seen += 1
+            wrong += plugin_told(shape["spec"]["template"]["spec"], f"the launcher's {name}")
+    for doc in documents(render):
+        if kind(doc) != "Deployment" or "name: MERIDIAN_PLUGIN_SHARDS" not in doc:
+            continue
+        seen += 1
+        name = re.search(r"^  name: (\S+)$", doc, re.M)
+        values = re.findall(r"- name: MERIDIAN_PLUGIN_SHARDS\n\s+value: (\S+)", doc)
+        plugin_at = re.search(r"^        - name: plugin$", doc, re.M)
+        after = re.findall(r"- name: MERIDIAN_PLUGIN_SHARDS\n\s+value: (\S+)", doc[plugin_at.start():]) if plugin_at else []
+        if plugin_at and (len(values) != 2 or len(after) != 1 or values[0] != after[0]):
+            wrong.append(f"{name.group(1) if name else 'a Deployment'}: MERIDIAN_PLUGIN_SHARDS {values}, "
+                         f"its plugin container's {after}")
+    if not seen:
+        wrong.append("no shape tells a sidecar MERIDIAN_PLUGIN_SHARDS in this render")
+    return wrong
+
+
 def main() -> int:
     render = sys.stdin.read()
     mode, rest = sys.argv[1], sys.argv[2:]
     wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio, "downward": downward,
-             "shared": shared}[mode](render, *rest)
+             "shared": shared, "plugin-shards": plugin_shards}[mode](render, *rest)
     for what in wrong:
         print(f"chart-check FAILED (step 3d, shards): {what}", file=sys.stderr)
     return 1 if wrong else 0

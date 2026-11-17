@@ -3192,6 +3192,10 @@ chart-check:
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
 		|| { echo "chart-check FAILED: the ha profile with a shared storage class did not render: $$rwx" >&2; exit 1; }; \
 	echo "$$rwx" | $(PY) tools/chart_shards.py shared files || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py plugin-shards || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py plugin-shards || exit 1; \
+	echo "$$made" | sed '/^        - name: plugin$$/,$$ s/MERIDIAN_PLUGIN_SHARDS/MERIDIAN_PLUGIN_SHARDZ/' | $(PY) tools/chart_shards.py plugin-shards 2>/dev/null \
+		&& { echo "chart-check FAILED: the PO item 73 check passed a plugin container not told its shard count, so it proves nothing" >&2; exit 1; }; \
 	echo "$$ha" | $(PY) tools/chart_shards.py shared files 2>/dev/null \
 		&& { echo "chart-check FAILED: the item 30 check found a ReadWriteMany claim where no class is named, so it proves nothing" >&2; exit 1; }; \
 	echo "$$rwx" | $(PY) tools/chart_shards.py shared 2>/dev/null \

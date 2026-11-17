@@ -393,6 +393,14 @@ spec:
             - name: MERIDIAN_LIVE_DIR
               value: /plugin/live
             {{- end }}
+            {{- if $several }}
+            {{- /* Its instance's shard count, the value and meaning its
+                   sidecar is given (PO item 73, 2026-11-17); unset, an
+                   instance of one pod. Which shard it serves it learns at
+                   registration (RegisterReply.shard). */}}
+            - name: MERIDIAN_PLUGIN_SHARDS
+              value: {{ $shards | quote }}
+            {{- end }}
             {{- if $.storage }}
             {{- /*
               Its instance's storage (decisions/028): durable, its own, and

@@ -664,6 +664,19 @@ pub fn with_shards(
     }
     env.retain(|e| e["name"] != SHARDS_ENV);
     env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
+    // And its plugin, the same value and meaning (PO item 73, 2026-11-17):
+    // which shard it serves it learns at registration.
+    if let Some(plugin) = manifest["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "plugin"))
+    {
+        if !plugin["env"].is_array() {
+            plugin["env"] = serde_json::Value::Array(Vec::new());
+        }
+        let env = plugin["env"].as_array_mut().expect("made an array");
+        env.retain(|e| e["name"] != SHARDS_ENV);
+        env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
+    }
     shards_account(&manifest, request)?;
     Ok(manifest)
 }

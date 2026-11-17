@@ -1464,3 +1464,30 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
     .unwrap_err()
     .contains("no volume named storage"));
 }
+
+/// PO item 73 (2026-11-17): the plugin's container is told its instance's
+/// shard count as its sidecar is, the value the launch asked written over
+/// the chart's 1; one pod's is left as the chart renders it.
+#[test]
+fn the_plugin_is_told_its_instance_s_shard_count_as_its_sidecar_is() {
+    let mut shape = several_pods();
+    shape["spec"]["template"]["spec"]["containers"][1]["env"] =
+        serde_json::json!([{"name": "MERIDIAN_PLUGIN_SHARDS", "value": "1"}]);
+    let made = with_shards(shape.clone(), &sharded(3, true)).unwrap();
+    let told = |made: &serde_json::Value, container: usize| -> Vec<serde_json::Value> {
+        made["spec"]["template"]["spec"]["containers"][container]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "MERIDIAN_PLUGIN_SHARDS")
+            .map(|e| e["value"].clone())
+            .collect()
+    };
+    assert_eq!(told(&made, 0), vec![serde_json::json!("3")]);
+    assert_eq!(told(&made, 1), vec![serde_json::json!("3")]);
+    // A standby alone: 1, as its sidecar.
+    let made = with_shards(shape.clone(), &sharded(0, true)).unwrap();
+    assert_eq!(told(&made, 1), vec![serde_json::json!("1")]);
+    // One pod: untouched.
+    assert_eq!(with_shards(shape.clone(), &sharded(0, false)).unwrap(), shape);
+}
