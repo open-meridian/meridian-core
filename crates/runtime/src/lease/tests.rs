@@ -512,9 +512,27 @@ async fn one_lease_api() -> std::net::SocketAddr {
     at
 }
 
+/// A token file for a test's client, removed when the test ends, passed
+/// or not.
+struct Token(std::path::PathBuf);
+
+impl Token {
+    fn new(test: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("lease-token-{test}-{}", std::process::id()));
+        std::fs::write(&path, "token").unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The client as the sidecar makes it, but over HTTP/2 without TLS: one
 /// connection for every request, as ALPN gives it against the API server.
-fn leases_through(at: std::net::SocketAddr, token: &std::path::Path) -> KubeLeases {
+fn leases_through(at: std::net::SocketAddr, token: &Token) -> KubeLeases {
     let timeout = Duration::from_secs(1);
     let make = move || {
         reqwest::Client::builder()
@@ -527,21 +545,24 @@ fn leases_through(at: std::net::SocketAddr, token: &std::path::Path) -> KubeLeas
     KubeLeases::through(
         format!("http://{at}"),
         "ns",
-        token.to_str().unwrap(),
+        token.0.to_str().unwrap(),
         Box::new(make),
     )
     .unwrap()
 }
 
+fn opened(hole: &Blackhole) -> u64 {
+    hole.opened.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// CI 43973174092: after a 15 s outage that dropped every packet, a pod's
 /// client answers again within one look of the API server being reachable
 /// -- never waiting out the dead connection's retransmissions, which left
-/// a data standby blind for 11 s. And while it answers, it keeps its one
-/// connection: no dial per request.
+/// a data standby blind for 11 s. And while it answers, before the outage
+/// and after, it keeps its one connection: no dial per request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_a_blackhole_a_lease_client_answers_within_one_look_of_the_lift() {
-    let token = std::env::temp_dir().join(format!("lease-token-{}", std::process::id()));
-    std::fs::write(&token, "token").unwrap();
+    let token = Token::new("blackhole");
     let hole = Arc::new(Blackhole::default());
     let at = hole.before(one_lease_api().await).await;
     let leases = leases_through(at, &token);
@@ -549,11 +570,7 @@ async fn after_a_blackhole_a_lease_client_answers_within_one_look_of_the_lift() 
         let read = leases.get("shard-proof-shard-1").await.unwrap().unwrap();
         assert_eq!((read.holder.as_str(), read.uid.as_str()), ("a", "uid-7"));
     }
-    assert_eq!(
-        hole.opened.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a client that answers dials once"
-    );
+    assert_eq!(opened(&hole), 1, "a client that answers dials once");
     hole.cut();
     let cut_at = Instant::now();
     while cut_at.elapsed() < Duration::from_secs(15) {
@@ -562,12 +579,55 @@ async fn after_a_blackhole_a_lease_client_answers_within_one_look_of_the_lift() 
         tokio::time::sleep(Duration::from_secs(1).saturating_sub(began.elapsed())).await;
     }
     hole.lift();
-    let lifted = Instant::now();
+    let (lifted, before) = (Instant::now(), opened(&hole));
     let read = leases.get("shard-proof-shard-1").await;
-    let _ = std::fs::remove_file(&token);
     assert!(
         read.is_ok() && lifted.elapsed() <= Duration::from_secs(1),
         "{:?} after the lift: {read:?}",
         lifted.elapsed()
+    );
+    for _ in 0..2 {
+        leases.get("shard-proof-shard-1").await.unwrap();
+    }
+    assert_eq!(
+        opened(&hole) - before,
+        1,
+        "after the lift it dials once, and keeps that connection"
+    );
+}
+
+/// Review c5a10 L1: a request on a client already replaced fails late --
+/// another request on the dead connection timed out first -- and leaves
+/// the client made since, which answers, as it is: one dial after the
+/// outage, not one per stale request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_failure_on_an_old_client_leaves_the_newer_one_that_answers() {
+    let token = Token::new("late");
+    let hole = Arc::new(Blackhole::default());
+    let at = hole.before(one_lease_api().await).await;
+    let leases = Arc::new(leases_through(at, &token));
+    leases.get("shard-proof-shard-0").await.unwrap();
+    hole.cut();
+    // Two reads on the one connection, half a second apart.
+    let first = tokio::spawn({
+        let leases = Arc::clone(&leases);
+        async move { leases.get("shard-proof-shard-0").await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = tokio::spawn({
+        let leases = Arc::clone(&leases);
+        async move { leases.get("shard-proof-shard-1").await }
+    });
+    assert!(first.await.unwrap().is_err());
+    hole.lift();
+    let before = opened(&hole);
+    leases.get("shard-proof-shard-0").await.unwrap();
+    // The second read, on the old client, fails after the new one answered.
+    assert!(second.await.unwrap().is_err());
+    leases.get("shard-proof-shard-0").await.unwrap();
+    assert_eq!(
+        opened(&hole) - before,
+        1,
+        "a stale request's failure made the client dial again"
     );
 }

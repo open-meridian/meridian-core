@@ -571,7 +571,7 @@ impl Member {
         tokio::spawn(report_forever(Arc::clone(bus), self.component));
         let api = KubeLeases::in_cluster(settings.renew)?;
         let look_every = settings.look_every();
-        let mut elector = Elector::new(api, settings);
+        let mut elector = store_elector(api, settings);
         let following = self
             .domain
             .map(|domain| tokio::spawn(follow(Arc::clone(bus), domain, self.ready_lag, None)));
@@ -620,6 +620,14 @@ impl Member {
             },
         }))
     }
+}
+
+/// A store member's elector: a record held seen, and a lapse judged, by
+/// when its read answered (review c5a10 M1; PO item 54): a read slow across
+/// the writer's renewal never lets its standby take inside the Lease. A
+/// look that failed still drops what was seen (CI 42958621081).
+pub(crate) fn store_elector<L: Leases>(api: L, settings: Settings) -> Elector<L> {
+    Elector::new(api, settings).seen_as_answered(Instant::now)
 }
 
 /// Stand by on a lease until this member holds it, or is told to stop:

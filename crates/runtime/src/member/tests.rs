@@ -1420,3 +1420,102 @@ async fn a_writers_periodic_looks_are_made_one_at_a_time() {
         "two looks were made at once"
     );
 }
+
+/// One Lease whose first read is slow: asked at once, it reads the Lease
+/// as the API server holds it `first_read_in` later, and answers then; the
+/// reads after answer at once. Says when a take was written.
+#[derive(Clone)]
+struct SlowFirstRead {
+    held: Arc<std::sync::Mutex<Option<crate::lease::Record>>>,
+    first_read_in: Duration,
+    read: Arc<AtomicBool>,
+    taken_at: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl Leases for SlowFirstRead {
+    async fn get(&self, _name: &str) -> Result<Option<crate::lease::Record>, String> {
+        if !self.read.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(self.first_read_in).await;
+        }
+        Ok(self.held.lock().unwrap().clone())
+    }
+
+    async fn create(
+        &self,
+        _name: &str,
+        _record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        Ok(crate::lease::Wrote::Conflict)
+    }
+
+    async fn update(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        let mut held = self.held.lock().unwrap();
+        let current = held.as_ref().expect("a Lease");
+        if current.resource_version != record.resource_version {
+            return Ok(crate::lease::Wrote::Conflict);
+        }
+        let mut record = record.clone();
+        record.resource_version = format!("{}x", current.resource_version);
+        *held = Some(record);
+        *self.taken_at.lock().unwrap() = Some(Instant::now());
+        Ok(crate::lease::Wrote::Done(
+            held.as_ref().unwrap().resource_version.clone(),
+        ))
+    }
+}
+
+/// Review c5a10 M1: a store's standby holds a Lease seen when its read
+/// answered, never when it was asked: its read slow across the writer's
+/// renewal, it takes no sooner than the Lease's duration after that
+/// renewal (spec section 3: "when the writer's Lease lapses"). On the real
+/// clock, at a 1 s renew and a 3 s Lease.
+#[tokio::test]
+async fn a_store_standby_whose_read_was_slow_across_a_renewal_takes_no_sooner_than_its_lapse() {
+    let record = |version: &str| crate::lease::Record {
+        holder: "bor-a_1".into(),
+        duration_seconds: 3,
+        acquire_time: crate::lease::micro_time(now_ns()),
+        renew_time: crate::lease::micro_time(now_ns()),
+        transitions: 0,
+        resource_version: version.into(),
+        uid: "uid-1".into(),
+    };
+    let api = SlowFirstRead {
+        held: Arc::new(std::sync::Mutex::new(Some(record("1")))),
+        first_read_in: Duration::from_millis(900),
+        read: Arc::default(),
+        taken_at: Arc::default(),
+    };
+    let settings = crate::lease::Settings {
+        name: "release-bor".into(),
+        holder: "bor-b_1".into(),
+        renew: Duration::from_secs(1),
+        duration: Duration::from_secs(3),
+    };
+    let look_every = settings.look_every();
+    let mut elector = store_elector(api.clone(), settings);
+    let (_tell, mut told) = tokio::sync::watch::channel(false);
+    let waiting =
+        tokio::spawn(
+            async move { stand_by(&mut elector, look_every, "bor", &mut told, None).await },
+        );
+    // The writer renews while the standby's first read is out, 100 ms
+    // before that read reads the Lease, and then renews no more.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    *api.held.lock().unwrap() = Some(record("2"));
+    let renewed = Instant::now();
+    assert!(
+        waiting.await.unwrap(),
+        "the standby never took the lapsed Lease"
+    );
+    let taken = api.taken_at.lock().unwrap().expect("a take written");
+    assert!(
+        taken.duration_since(renewed) >= Duration::from_secs(3),
+        "taken {:?} after the writer's renewal; the Lease lasts 3 s",
+        taken.duration_since(renewed)
+    );
+}

@@ -1195,15 +1195,16 @@ def standing_by(pod_name):
 
 
 def shard_said_kept(when, pod_names, began, say=False):
-    """Each pod's sidecar log, as it runs now and its run before, kept
+    """Each pod's sidecar log, its run before and as it runs now, kept
     beside the run (.e2e-shards-<n>.log, which CI keeps with
-    .e2e-cluster.log). With `say`, its lines about Leases from 30 s before
-    `began` are printed to the job log as well."""
+    .e2e-cluster.log), in the order given: the last pod's current log ends
+    the file, the tail CI prints. With `say`, its lines about Leases from
+    30 s before `began` are printed to the job log as well."""
     SHARDS_KEPT.append(when)
     name = f".e2e-shards-{len(SHARDS_KEPT)}.log"
     parts = [f"== {when}, began {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(began))}"]
     for pod_name in [p for p in pod_names if p]:
-        for previous in ((), ("--previous",)):
+        for previous in (("--previous",), ()):
             said = kubectl("logs", pod_name, "-c", "sidecar", "--timestamps", *previous, check=False)
             text = (said.stdout or said.stderr).decode(errors="replace")
             parts.append(f"== {pod_name}, sidecar{', before, if it restarted' if previous else ''}")
@@ -1334,11 +1335,7 @@ def shards_fenced(s, settled):
         s.check(serving and served <= SHARD_TAKEOVER,
                 f"shards: the standby serves the shard within {SHARD_TAKEOVER} s of the cut "
                 f"({round(served, 2)} s)")
-        # The standby's own words through the cut, kept whatever the
-        # result: its pod is killed next, and its log went with it once
-        # (CI 43973174092, PO item 54).
-        shard_said_kept("the holder alone cut", [standby, lost], began,
-                        say=not (taken and took <= SHARD_TAKEOVER and serving and served <= SHARD_TAKEOVER))
+        on_time = taken and took <= SHARD_TAKEOVER and serving and served <= SHARD_TAKEOVER
         s.check(restarts(lost) == before and (said_at(lost, LOST) or 0) < began,
                 "shards: the cut holder serves on while it cannot hear the API server")
         figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2),
@@ -1346,6 +1343,11 @@ def shards_fenced(s, settled):
     finally:
         cut_api("-D", only={lost})
     lifted, lost_at = time.time(), began + took
+    # The standby's own words through the cut, kept whatever the result,
+    # once the cut is lifted: its pod is killed next, and its log went with
+    # it once (CI 43973174092, PO item 54). The standby last, so the tail CI
+    # prints is its log.
+    shard_said_kept("the holder alone cut", [lost, standby], began, say=not on_time)
     # By the sidecar's own words, in the run it was serving in: the lease
     # lost, held by the pod that took it, standing by again -- and then
     # standing by -- and its plugin no longer answered. Judged by its log

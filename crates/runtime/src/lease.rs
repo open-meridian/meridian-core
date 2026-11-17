@@ -572,7 +572,9 @@ type MakeClient = Box<dyn Fn() -> Result<reqwest::Client, String> + Send + Sync>
 /// standby blind 11 s after an outage ended took a shard 10.85 s after its
 /// holder was cut).
 pub struct KubeLeases {
-    http: std::sync::Mutex<reqwest::Client>,
+    /// The client, and how many times it was made again: a request that
+    /// did not answer replaces only the client it went by (review c5a10 L1).
+    http: std::sync::Mutex<(u64, reqwest::Client)>,
     make: MakeClient,
     base: String,
     namespace: String,
@@ -624,7 +626,7 @@ impl KubeLeases {
         make: MakeClient,
     ) -> Result<Self, String> {
         Ok(Self {
-            http: std::sync::Mutex::new(make()?),
+            http: std::sync::Mutex::new((0, make()?)),
             make,
             base,
             namespace: namespace.to_string(),
@@ -632,23 +634,28 @@ impl KubeLeases {
         })
     }
 
-    fn client(&self) -> reqwest::Client {
+    /// The client now, and which it is.
+    fn client(&self) -> (u64, reqwest::Client) {
         self.http
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    /// Its connections closed: a fresh client, which dials afresh. Where one
-    /// cannot be made, the old one is kept.
-    fn dial_afresh(&self) {
+    /// Its connections closed: a fresh client in place of client `made`,
+    /// which dials afresh. Where `made` was replaced already -- a request
+    /// on it failed first -- the client since is kept, as is the old one
+    /// where none can be made.
+    fn dial_afresh(&self, made: u64) {
+        let mut http = self
+            .http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if http.0 != made {
+            return;
+        }
         match (self.make)() {
-            Ok(fresh) => {
-                *self
-                    .http
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh
-            }
+            Ok(fresh) => *http = (made + 1, fresh),
             Err(failed) => {
                 tracing::warn!(%failed, "the API server's client could not be made again")
             }
@@ -704,8 +711,9 @@ impl KubeLeases {
         what: &str,
     ) -> Result<(u16, String), String> {
         let token = self.token()?;
-        let mut unanswered = Unanswered(Some(self));
-        let response = request(&self.client())
+        let (made, http) = self.client();
+        let mut unanswered = Unanswered(Some((self, made)));
+        let response = request(&http)
             .bearer_auth(token)
             .send()
             .await
@@ -720,13 +728,14 @@ impl KubeLeases {
     }
 }
 
-/// Dials afresh when dropped before its request answered.
-struct Unanswered<'a>(Option<&'a KubeLeases>);
+/// Dials afresh, in place of the client its request went by, when dropped
+/// before that request answered.
+struct Unanswered<'a>(Option<(&'a KubeLeases, u64)>);
 
 impl Drop for Unanswered<'_> {
     fn drop(&mut self) {
-        if let Some(leases) = self.0 {
-            leases.dial_afresh();
+        if let Some((leases, made)) = self.0 {
+            leases.dial_afresh(made);
         }
     }
 }

@@ -302,8 +302,10 @@ impl<L: Leases + 'static> ShardSet<L> {
     /// F4; item 32's Rule), as a store's member does: a stretch in which
     /// it could not read a Lease is never its holder's silence, since that
     /// holder wrote on through it. Once the API server answers again, the
-    /// standby waits a whole lapse from its first read before it takes.
-    /// The Lease it takes is then kept as seen through a failed look, so
+    /// standby waits a whole lapse from its first read before it takes --
+    /// and so one read of the Lease failing while it waits out a lapse
+    /// costs it a whole lapse again (PO item 54, kept under A): its 10 s
+    /// takeover holds where its reads answer. The Lease it takes is then kept as seen through a failed look, so
     /// its take and its release never miss for one API error (review c5a6
     /// M1). Said before the set's first look.
     pub fn writing_on(mut self) -> Self {
@@ -1720,8 +1722,11 @@ pub(crate) mod tests {
     /// The fence raise at its usual cost, and more: CI 43973174092's taker
     /// went from its take to serving in 21 ms.
     const RAISE: Duration = Duration::from_millis(500);
-    /// Each of the standby's reads of the API server.
+    /// Each of the standby's reads of the API server, and how much slower
+    /// the one that first sees the renewal answers.
     const READ: Duration = Duration::from_millis(50);
+    /// Reads near the shard client's 1 s timeout (review c5a10 L2).
+    const SLOW_READ: Duration = Duration::from_millis(950);
 
     /// A data standby: when it took a shard's Lease, and when it served,
     /// its epoch raised in `fence` at [`RAISE`]'s cost.
@@ -1755,6 +1760,8 @@ pub(crate) mod tests {
     /// It takes no sooner than the lapse from that renewal, and serves,
     /// its epoch raised, within 10 s of the end. `end` ends the holder.
     async fn a_data_standby_at_its_worst_phase_serves_within_ten_seconds(
+        read: Duration,
+        slower: Duration,
         end: impl FnOnce(&Arc<Link>, tokio::task::JoinHandle<(At, Kept)>),
     ) -> (Duration, Duration) {
         let store = Arc::new(Memory::default());
@@ -1764,10 +1771,10 @@ pub(crate) mod tests {
         let (_stopper, stop) = watch::channel(false);
         let t0 = At::now();
         let a = serving_fenced(on(&to_a, 1, "a"), &stop, &fence, &epoch, &renewal);
-        // a renews at t0 + 2 s, 4 s, ...; c looks at t0 + 0.949 s + n s,
-        // each read answering 50 ms later: just before each even second.
-        tokio::time::sleep_until(t0 + secs(0.949)).await;
-        to_c.slow("", READ, false);
+        // a renews at t0 + 2 s, 4 s, ...; c looks at t0 + 0.999 s - read
+        // + n s, each read answering `read` later: 1 ms before each second.
+        tokio::time::sleep_until(t0 + secs(0.999) - read).await;
+        to_c.slow("", read, false);
         let c = standing_by_fenced(on(&to_c, 1, "c"), &stop, &fence);
         // The holder renewed at t0 + 2 s, 1 ms after c's read; ended now,
         // it renews no more.
@@ -1776,9 +1783,9 @@ pub(crate) mod tests {
         assert_eq!(renewed, t0 + RENEW, "the holder's renewal");
         let ended = At::now();
         end(&to_a, a);
-        // c's look at t0 + 2.949 s, the first to see that renewal, answers
-        // 50 ms slower than the others.
-        *to_c.slow_once.lock().unwrap() = Some(READ);
+        // c's look at t0 + 2.999 s - read, the first to see that renewal,
+        // answers `slower` later than the others.
+        *to_c.slow_once.lock().unwrap() = Some(slower);
         let (took, served) = c.await.unwrap().expect("the standby took the shard");
         assert_eq!(store.holder("feed-1-shard-0"), "c");
         assert!(
@@ -1829,15 +1836,21 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_data_holder_cut_just_after_its_renewal_is_served_by_its_standby_within_ten_seconds()
     {
+        let cut = |to_a: &Arc<Link>, a: tokio::task::JoinHandle<(At, Kept)>| {
+            to_a.slow("", secs(3_600.0), true);
+            drop(a);
+        };
         let (took, served) =
-            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(|to_a, a| {
-                to_a.slow("", secs(3_600.0), true);
-                drop(a);
-            })
-            .await;
+            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(READ, READ, cut).await;
         // One look late to see the renewal, a lapse, one look of the
         // grid's phase, a slow read, the take's write, the raise.
         assert_eq!((took, served), (secs(8.048), secs(8.548)));
+        // Reads near their 1 s timeout: 0.9 s more, still within 10 s with
+        // the raise at 500 ms (review c5a10 L2).
+        let (took, served) =
+            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(SLOW_READ, secs(0.04), cut)
+                .await;
+        assert_eq!((took, served), (secs(8.948), secs(9.448)));
     }
 
     /// PO item 54, the kill: the holder's pod gone just after its renewal,
@@ -1845,9 +1858,17 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_data_holder_killed_just_after_its_renewal_is_served_by_its_standby_within_ten_seconds(
     ) {
+        let kill = |_: &Arc<Link>, a: tokio::task::JoinHandle<(At, Kept)>| a.abort();
         let (took, served) =
-            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(|_, a| a.abort()).await;
+            a_data_standby_at_its_worst_phase_serves_within_ten_seconds(READ, READ, kill).await;
         assert_eq!((took, served), (secs(8.048), secs(8.548)));
+        let (took, served) = a_data_standby_at_its_worst_phase_serves_within_ten_seconds(
+            SLOW_READ,
+            secs(0.04),
+            kill,
+        )
+        .await;
+        assert_eq!((took, served), (secs(8.948), secs(9.448)));
     }
 
     /// Item 49 (ruled 2026-11-16; review c5a5 F3): a pod that loses its
