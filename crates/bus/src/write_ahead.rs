@@ -90,6 +90,11 @@ pub const AFTER_HEADER: &str = "Meridian-Write-Ahead-After";
 /// path carries one.
 pub const REFUSAL_HEADER: &str = crate::nats::REFUSAL_HEADER;
 
+/// How long the write's caller waits for its answer, ms, as the broker's
+/// request path carries it: what the lake's writer answers a held write
+/// within (step 3d; spec 6.8, the hold).
+pub const TIMEOUT_HEADER: &str = crate::nats::TIMEOUT_HEADER;
+
 /// JetStream's own: a write sent again within the stream's duplicate window
 /// is held once.
 const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";

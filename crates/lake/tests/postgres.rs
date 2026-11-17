@@ -7341,6 +7341,7 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
                     .encode_to_vec(),
                 },
                 dataset: dataset.clone(),
+                timeout_ms: None,
             }
         })
         .collect();
@@ -7636,6 +7637,7 @@ async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sen
                     .encode_to_vec(),
                 },
                 dataset: $subject.to_string(),
+                timeout_ms: None,
             });
             let mut settling = Vec::new();
             for (g, writer) in writers.iter_mut().enumerate() {
@@ -7860,6 +7862,7 @@ async fn a_range_moved_to_its_datasets_answering_group_behind_the_hot_layer_lose
                     .encode_to_vec(),
                 },
                 dataset: dataset.clone(),
+                timeout_ms: None,
             }
         })
         .collect();
@@ -8097,6 +8100,7 @@ async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_ev
                     .encode_to_vec(),
                 },
                 dataset: dataset.clone(),
+                timeout_ms: None,
             }
         })
         .collect();
@@ -8326,6 +8330,7 @@ async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
             .encode_to_vec(),
         },
         dataset: dataset.clone(),
+        timeout_ms: None,
     };
     // A row in each half; then one in the upper half alone, group 0's.
     let stream = vec![
@@ -8432,6 +8437,7 @@ async fn a_row_sent_again_unchanged_just_after_a_switch_is_answered_unchanged() 
             .encode_to_vec(),
         },
         dataset: dataset.clone(),
+        timeout_ms: None,
     };
     // A row in the upper half; the same row sent again; one in the lower.
     let stream = [
@@ -8607,6 +8613,7 @@ async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
             .encode_to_vec(),
         },
         dataset: dataset.clone(),
+        timeout_ms: None,
     };
     let count = |answered: &(Option<String>, meridian_bus::HandlerReply)| {
         let (_, payload) = answered.1.clone().expect("answered");
@@ -8761,6 +8768,7 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
             .encode_to_vec(),
         },
         dataset: dataset.clone(),
+        timeout_ms: None,
     };
     let count = |answered: &(Option<String>, meridian_bus::HandlerReply)| {
         let (_, payload) = answered.1.clone().expect("answered");
@@ -8927,6 +8935,7 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
             .encode_to_vec(),
         },
         dataset: dataset.clone(),
+        timeout_ms: None,
     };
     let count = |answered: &(Option<String>, meridian_bus::HandlerReply)| {
         let (_, payload) = answered.1.clone().expect("answered");
@@ -9015,6 +9024,121 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
         "the row held once, where its range is now"
     );
     tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
+}
+
+/// An answer that waits on another group's part is given before its caller
+/// stops waiting: past the caller's wait less the answer's way back, where
+/// that comes before the hold, it is refused OVERLOADED with a retry-after,
+/// never left to the caller's timeout (step 3d; spec 6.8, the hold;
+/// failover-repeat 43993402238, ha run 3: a price's answer could wait the
+/// hold from its take, past its caller's 5 s, and its caller heard
+/// DEADLINE_EXCEEDED). The caller's wait is the one its sidecar sent with
+/// the write (`Meridian-Timeout-Ms`), counted from when it was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_stops_waiting() {
+    use meridian_domain::v1::RecordTradesRequest;
+    use meridian_lake::partition_moves::{Asked, Ended};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{settled, taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    /// The caller's wait: shorter than the hold.
+    const WAIT_MS: u64 = 2_000;
+    let hold = meridian_changes::moves::hold();
+    assert!(std::time::Duration::from_millis(WAIT_MS) < hold);
+    // Group 1's dataset, which it answers, its upper half group 0's.
+    let a = tokio::task::block_in_place(|| across_owned("caller", true, 1));
+    let dataset = a.dataset.clone();
+    let upper = format!("{dataset}/8000-ffff");
+    let (_, high) = halves_of("caller");
+    let mover = a.mover();
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&upper));
+        let asked = Asked {
+            by_hand: true,
+            moved_by: "admin-1".into(),
+            reason: "the upper half to the group not answering its dataset".into(),
+        };
+        let ended = mover.run(&upper, 0, &asked).unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+        for store in a.zeros.iter().chain(&a.ones) {
+            store.read_owners().unwrap();
+        }
+    });
+    let lake1 = tokio::task::block_in_place(|| {
+        ha_lake_over(
+            a.one.clone() as Arc<dyn Store>,
+            a.ones[0].groups(),
+            "lake-1",
+            &dataset,
+        )
+    });
+    // A write sent now, its row in group 0's half, its caller waiting 2 s.
+    // Group 0 never takes it.
+    let sent = SystemClock.now_ns();
+    let write = Taken {
+        sequence: 1,
+        at_ns: sent,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some("_INBOX.caller.1".into()),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: sent,
+                message_id: "caller-1".into(),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![match trade(&dataset, "c1", &high, 7_001) {
+                    Observation::Trade(trade) => *trade,
+                    _ => unreachable!(),
+                }],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+        timeout_ms: Some(WAIT_MS),
+    };
+    let began = std::time::Instant::now();
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    let answers = taken_past_a_switch(&mut writer1, vec![write])
+        .await
+        .unwrap();
+    let waits = writer1.take_waits();
+    assert_eq!(
+        waits.len(),
+        1,
+        "group 1 answers once group 0's part commits"
+    );
+    let answered = settled(&lake1, STREAM, answers, waits).await;
+    let took = began.elapsed();
+    let refused = answered[0]
+        .1
+        .clone()
+        .expect_err("group 0 never committed its part");
+    assert!(
+        took < std::time::Duration::from_millis(WAIT_MS),
+        "answered {took:?} after it was sent, past its caller's {WAIT_MS} ms: {refused}"
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(WAIT_MS)
+            - meridian_changes::moves::ANSWERED_BEFORE
+            - std::time::Duration::from_millis(100),
+        "refused {took:?} after it was sent, well before its caller's wait less the way back"
+    );
+    let overloaded = format!(
+        "refusal-reason {}",
+        meridian_pb::v1::RefusalReason::Overloaded as i32
+    );
+    assert!(
+        refused.contains(&overloaded) && meridian_bus::refusal_retry_after(&refused).is_some(),
+        "OVERLOADED with a retry-after: {refused}"
+    );
+    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
 }
 
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the

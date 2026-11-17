@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use async_nats::jetstream::{self, consumer, stream};
 use meridian_bus::write_ahead::{
-    stream_subjects, AFTER_HEADER, REPLY_HEADER, STREAM, TOPIC_HEADER,
+    stream_subjects, AFTER_HEADER, REPLY_HEADER, STREAM, TIMEOUT_HEADER, TOPIC_HEADER,
 };
 use meridian_bus::{Envelope, HandlerReply};
 use prost::Message as _;
@@ -104,6 +104,40 @@ pub struct Taken {
     pub envelope: Envelope,
     /// The dataset its subject names; empty where it names none.
     pub dataset: String,
+    /// How long its caller waits for its answer, as its sidecar said it
+    /// (`Meridian-Timeout-Ms`); none where it said none.
+    pub timeout_ms: Option<u64>,
+}
+
+impl Taken {
+    /// When its answer is given by at the latest (step 3d; spec 6.8, the
+    /// hold): its caller's wait counted from when it was sent -- the earlier
+    /// of its sidecar's stamp and the stream's time for it -- less the
+    /// answer's way back ([`ANSWERED_BEFORE`]), as `moves::hold_now` bounds
+    /// a held write; none where its sidecar said no wait. `now_ns` is now on
+    /// the lake's clock.
+    ///
+    /// [`ANSWERED_BEFORE`]: meridian_changes::moves::ANSWERED_BEFORE
+    pub fn answer_by(&self, now_ns: i64) -> Option<tokio::time::Instant> {
+        let wait = Duration::from_millis(self.timeout_ms?);
+        let stamped = self
+            .envelope
+            .meta
+            .as_ref()
+            .map_or(0, |meta| meta.published_at_ns);
+        let sent = if stamped > 0 {
+            stamped.min(self.at_ns)
+        } else {
+            self.at_ns
+        };
+        let age = Duration::from_nanos(now_ns.saturating_sub(sent).max(0) as u64);
+        Some(
+            tokio::time::Instant::now()
+                + wait
+                    .saturating_sub(age)
+                    .saturating_sub(meridian_changes::moves::ANSWERED_BEFORE),
+        )
+    }
 }
 
 /// Where a writer group keeps its position in the stream (step 3d; section
@@ -138,6 +172,10 @@ pub struct Wait {
     /// The rows the write sent, which its answer accounts for (ruled
     /// 2026-11-15); none said, and the answer is held to none.
     pub sent: Sent,
+    /// When the answer is given by at the latest, refused if it must be:
+    /// before its caller stops waiting ([`Taken::answer_by`]). None, and the
+    /// hold alone bounds it.
+    pub answer_by: Option<tokio::time::Instant>,
 }
 
 /// What a write sent, as the take that answers it saw it (ruled
@@ -431,6 +469,7 @@ impl Writer {
                 .any(|write| !other_groups(groups, &write.dataset).is_empty());
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
+        let now_ns = self.lake.now_ns();
         for write in taken {
             let after_gap = write.after.and_then(|after| {
                 self.dropped
@@ -452,6 +491,7 @@ impl Writer {
                     groups: other_groups(groups, &write.dataset),
                     dataset: write.dataset.clone(),
                     sent: Sent::default(),
+                    answer_by: write.answer_by(now_ns),
                 });
             }
             sent_to.push(write.reply_to.filter(|_| answering));
@@ -539,6 +579,7 @@ fn taken(message: &jetstream::Message) -> Result<Taken, String> {
         envelope: Envelope::decode(message.payload.clone()).unwrap_or_default(),
         dataset: meridian_bus::write_ahead::dataset_of_subject(&message.subject)
             .unwrap_or_default(),
+        timeout_ms: header(TIMEOUT_HEADER).and_then(|said| said.trim().parse().ok()),
     })
 }
 
@@ -559,8 +600,9 @@ impl Writer {
 /// reached the write -- its part committed -- counting every group's part
 /// as each kept it with its rows (`lake_write_ahead_part`), its watermark
 /// read again so it names each part's partitions at their heads; past
-/// `moves.holdSeconds`, refused OVERLOADED with a retry-after, its rows
-/// committed all the same and kept by the stream.
+/// `moves.holdSeconds`, or past its caller's wait less the answer's way back
+/// where that comes first ([`Wait::answer_by`]), refused OVERLOADED with a
+/// retry-after, its rows committed all the same and kept by the stream.
 ///
 /// This group's own position is waited on too, and every position is read
 /// twice: a move's switch takes its target's position back before its
@@ -611,6 +653,12 @@ pub async fn settled(lake: &Lake, stream: &str, mut answers: Answers, waits: Vec
             grew
         };
         more(&mut groups);
+        // The hold, and never past its caller's wait less the answer's way
+        // back: past it, refused OVERLOADED with a retry-after its caller
+        // hears, never a timeout (failover-repeat 43993402238, ha run 3: a
+        // price's answer could wait the hold from its take, past its
+        // caller's 5 s; its caller heard DEADLINE_EXCEEDED).
+        let until = wait.answer_by.map_or(until, |by| by.min(until));
         let mut looked = tokio::time::Instant::now();
         let reached = loop {
             if looked.elapsed() >= Duration::from_millis(100) {
@@ -1408,6 +1456,7 @@ mod tests {
             after: None,
             envelope: Envelope::default(),
             dataset: dataset.clone(),
+            timeout_ms: None,
         };
         let (zero, one) = (Groups::new(0, 2).unwrap(), Groups::new(1, 2).unwrap());
         assert!(

@@ -2744,6 +2744,12 @@ impl Lake {
         Ok(reply)
     }
 
+    /// Now, on the lake's clock: what its write-ahead writer counts a
+    /// write's caller's wait against (step 3d; spec 6.8).
+    pub fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
+    }
+
     /// The lake's position in its write-ahead stream `stream` (the `ha`
     /// profile): where its writer goes on from.
     pub fn write_ahead_position(

@@ -27,6 +27,7 @@ fn written(sequence: u64, instance: &str, prices: Vec<Price>) -> Taken {
         after: None,
         envelope,
         dataset: String::new(),
+        timeout_ms: None,
     }
 }
 
