@@ -395,23 +395,31 @@ pub fn archive_account(template: Option<&str>, request: &CreatePluginRequest) ->
     shape["serviceAccountName"].as_str().map(String::from)
 }
 
+/// The annotations a ServiceAccount's workload identity is: GKE's, EKS's
+/// (IRSA) and Azure Workload Identity's. The launcher's admission policy
+/// admits an instance's own account carrying these alone (review c5b L2).
+pub const IDENTITY_ANNOTATIONS: [&str; 8] = [
+    "iam.gke.io/gcp-service-account",
+    "eks.amazonaws.com/role-arn",
+    "eks.amazonaws.com/audience",
+    "eks.amazonaws.com/sts-regional-endpoints",
+    "eks.amazonaws.com/token-expiration",
+    "azure.workload.identity/client-id",
+    "azure.workload.identity/tenant-id",
+    "azure.workload.identity/service-account-token-expiration",
+];
+
 /// The workload identity a ServiceAccount carries, as its annotations, to
 /// copy onto an instance's own account (item 31: the archive's bucket
-/// identity moves onto it) -- `iam.gke.io/gcp-service-account`,
-/// `eks.amazonaws.com/role-arn` and the like. What a tool or the cluster
-/// keeps on an account of its own (`kubectl.kubernetes.io/`,
-/// `meta.helm.sh/`, `kubernetes.io/`) is not identity, and is left.
+/// identity moves onto it): those of [`IDENTITY_ANNOTATIONS`] alone. What a
+/// tool, the cluster or anyone else keeps on the account is not identity,
+/// and is left (review c5b L2).
 pub fn identity_of(account: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     account["metadata"]["annotations"]
         .as_object()
         .into_iter()
         .flatten()
-        .filter(|(key, value)| {
-            value.is_string()
-                && !["kubectl.kubernetes.io/", "meta.helm.sh/", "kubernetes.io/"]
-                    .iter()
-                    .any(|kept| key.starts_with(kept))
-        })
+        .filter(|(key, value)| value.is_string() && IDENTITY_ANNOTATIONS.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
@@ -861,6 +869,45 @@ pub async fn remove_shards_account<O: Objects>(
         }
     }
     Ok(removed)
+}
+
+/// Remove an instance's account, Role and binding once its pods have ended
+/// (review c5b L5): removed while they run, its sidecars' tokens die with
+/// the account, so none can release its shard's Lease and a launch after
+/// waits out a whole lapse. `ended` says whether the instance has no
+/// workload left -- a Deployment deleted in the foreground is there until
+/// its pods have gone -- and is asked every `every`, for `within` at most.
+/// Each ask, and the removal after it, is made holding `launching`, which a
+/// launch holds while it makes the account and its Deployment, so a launch
+/// between never loses the account it made. Says what it removed, or None
+/// where the pods had not ended in time: the account is then kept, and a
+/// later launch of the instance writes it over.
+pub async fn remove_shards_account_once_ended<O, F, Ended>(
+    api: &O,
+    account: &str,
+    launching: &tokio::sync::Mutex<()>,
+    mut ended: F,
+    every: std::time::Duration,
+    within: std::time::Duration,
+) -> Result<Option<Vec<Kind>>, String>
+where
+    O: Objects,
+    F: FnMut() -> Ended,
+    Ended: std::future::Future<Output = Result<bool, String>>,
+{
+    let until = tokio::time::Instant::now() + within;
+    loop {
+        {
+            let _launching = launching.lock().await;
+            if ended().await? {
+                return remove_shards_account(api, account).await.map(Some);
+            }
+        }
+        if tokio::time::Instant::now() >= until {
+            return Ok(None);
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// A `__NAME__` still in the text, which a newer chart's template would

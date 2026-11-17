@@ -886,6 +886,21 @@ pluginStorage:
 # instance's pod runs as, so no key is ever handed to a plugin. `objectLock`
 # says the bucket was made with object lock in compliance mode, which alone
 # lets a hold need records that cannot be altered.
+#
+# An allowed instance of several pods -- shards, or a standby pod -- runs
+# instead under an account of its own, `<fullname>-shards-<instance>`
+# (`<release>-meridian-runtime-shards-<instance>` unless fullnameOverride is
+# set), which the launcher makes carrying `serviceAccount`'s workload-identity
+# annotations. A cloud trusts an account by its name, so the bucket's identity
+# has to trust those accounts as well as `serviceAccount`:
+#   - EKS, IAM roles for service accounts: in the role's trust policy, a
+#     StringLike condition on the token's `sub` of
+#     `system:serviceaccount:<namespace>:<fullname>-shards-*`;
+#   - GKE Workload Identity: `roles/iam.workloadIdentityUser` on the Google
+#     service account for the namespace's principal set, or a binding for
+#     each instance's account;
+#   - Azure Workload Identity: a federated identity credential for each
+#     instance's account; EKS Pod Identity: an association for each.
 pluginArchive:
   path: ""
   existingClaim: ""

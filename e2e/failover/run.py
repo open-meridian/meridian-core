@@ -1460,8 +1460,10 @@ def shards(s):
     s.check(names == [f"{SHARDED}-shard-{n}" for n in range(SHARDS)],
             f"accounts: its Role names exactly its {SHARDS} shards' Leases ({names})")
     for held, what in (shard_accounts.rights(kubectl, NAMESPACE, FULL, SHARDED, SHARDS, "another-1", f"{FULL}-lake")
-                       + shard_accounts.admission(kubectl, NAMESPACE, FULL)
-                       + shard_accounts.deployments(kubectl, NAMESPACE, FULL, SHARDED)):
+                       + shard_accounts.admission(kubectl, NAMESPACE, FULL, SHARDED)
+                       + shard_accounts.deployments(kubectl, NAMESPACE, FULL, SHARDED)
+                       + shard_accounts.kept(kubectl, SHARDED, SHARDS)
+                       + shard_accounts.lease_deletes(kubectl, SHARDED, f"{FULL}-lake")):
         s.check(held, what)
     # The epoch fence (item 32): through an outage of the API server, and
     # with the holder alone cut from it. Its holders as they stand after.

@@ -338,7 +338,10 @@ spec:
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
 # the launcher's account does to a Deployment, a claim, or an instance's own
 # account, Role or binding (item 31), it is one the launcher made, and of
-# exactly the shape it makes.
+# exactly the shape it makes. And nobody deletes a shard's Lease
+# (`<instance>-shard-<n>`), a cluster administrator included: its
+# leaseTransitions fence the shard's writes, so it is kept, and goes only
+# with its namespace (PO item 57).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -361,28 +364,55 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["roles", "rolebindings"]
+      - apiGroups: ["coordination.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["leases"]
   matchConditions:
-    - name: the-launcher
+    # The launcher's every act on what it makes; a Lease's delete by anyone.
+    - name: the-launcher-or-a-lease
       expression: >-
         request.userInfo.username ==
-        "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}"
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}" ||
+        request.resource.resource == "leases"
+    # But for Kubernetes' own namespace controller and garbage collector --
+    # under the controller manager's own name where it runs without an
+    # account per controller -- so deleting the namespace completes.
+    - name: not-the-namespace-or-garbage-collector
+      expression: >-
+        !(request.userInfo.username in [
+          "system:serviceaccount:kube-system:namespace-controller",
+          "system:serviceaccount:kube-system:generic-garbage-collector",
+          "system:kube-controller-manager"])
   variables:
-    # The instance an object is made for, by its label, and that instance's
-    # own account (item 31): `<fullname>-shards-<instance>`.
-    - name: instance
+    # The instance an object is made for, by its label -- an instance's name
+    # alone, a host label, else none (review c5b L3: it is read into a
+    # pattern) -- and that instance's own account (item 31):
+    # `<fullname>-shards-<instance>`.
+    - name: labelled
       expression: >-
         request.operation == "DELETE" || !has(object.metadata.labels)
         ? "" : object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: instance
+      expression: >-
+        variables.labelled.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
+        ? variables.labelled : ""
     - name: own
       expression: >-
         {{ $own | quote }} + variables.instance
   validations:
+    # Made by the launcher, as it was before a write and is after it: an
+    # update never makes another's its own (review c5b L1).
     - expression: >-
-        request.operation == "DELETE"
-        ? has(oldObject.metadata.labels) &&
-          oldObject.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
-        : has(object.metadata.labels) &&
-          object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
+        request.resource.resource == "leases" ||
+        (
+          (request.operation == "CREATE" ||
+           (has(oldObject.metadata.labels) &&
+            oldObject.metadata.labels[?"meridian.dev/launched"].orValue("") == "true")) &&
+          (request.operation == "DELETE" ||
+           (has(object.metadata.labels) &&
+            object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"))
+        )
       message: the launcher touches only the Deployments it launched and the storage it made
     # Which account a launched plugin's pods run as (step 3d; review of
     # 95d68904, S2): Kubernetes asks nobody whether a pod may use an
@@ -469,6 +499,27 @@ spec:
           (!has(object.imagePullSecrets) || size(object.imagePullSecrets) == 0)
         )
       message: the launcher's ServiceAccount carries no secrets
+    # Its annotations, an archive's workload identity alone (review c5b L2;
+    # the launcher's IDENTITY_ANNOTATIONS).
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "serviceaccounts" ||
+        !has(object.metadata.annotations) ||
+        object.metadata.annotations.all(key, key in [
+          "iam.gke.io/gcp-service-account",
+          "eks.amazonaws.com/role-arn",
+          "eks.amazonaws.com/audience",
+          "eks.amazonaws.com/sts-regional-endpoints",
+          "eks.amazonaws.com/token-expiration",
+          "azure.workload.identity/client-id",
+          "azure.workload.identity/tenant-id",
+          "azure.workload.identity/service-account-token-expiration"])
+      message: "PLACEHOLDER L2: the launcher's ServiceAccount carries workload-identity annotations alone"
+    # A shard's Lease, by anyone (PO item 57).
+    - expression: >-
+        request.resource.resource != "leases" ||
+        !oldObject.metadata.name.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?-shard-[0-9]+$")
+      message: "PLACEHOLDER 57: a plugin shard's Lease is never deleted: it goes only with its namespace"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

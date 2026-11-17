@@ -1049,6 +1049,7 @@ pub(crate) mod tests {
                     transitions: 0,
                     resource_version: "1".into(),
                     uid,
+                    metadata: serde_json::Value::Null,
                 },
             );
             drop(leases);

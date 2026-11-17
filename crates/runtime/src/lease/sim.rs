@@ -47,6 +47,7 @@ fn from_json(value: &Value) -> Record {
             .unwrap_or_default()
             .into(),
         uid: value["uid"].as_str().unwrap_or_default().into(),
+        metadata: Value::Null,
     }
 }
 

@@ -288,14 +288,40 @@ impl ApiServer {
 
     /// Delete a Deployment in this namespace; false when it was not there.
     pub async fn delete_deployment(&self, name: &str) -> Result<bool, ClusterError> {
+        self.delete_deployment_as(name, None).await
+    }
+
+    /// Delete a Deployment in this namespace in the foreground: it is there,
+    /// being deleted, until its pods have gone, so a read of it says whether
+    /// they have ended. False when it was not there.
+    pub async fn delete_deployment_after_its_pods(&self, name: &str) -> Result<bool, ClusterError> {
+        self.delete_deployment_as(name, Some("Foreground")).await
+    }
+
+    async fn delete_deployment_as(
+        &self,
+        name: &str,
+        propagation: Option<&str>,
+    ) -> Result<bool, ClusterError> {
         let path = format!(
             "/apis/apps/v1/namespaces/{}/deployments/{name}",
             self.namespace
         );
-        let response = self
+        let mut request = self
             .http
             .delete(format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token);
+        if let Some(propagation) = propagation {
+            let options = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": propagation,
+            });
+            request = request
+                .header("Content-Type", "application/json")
+                .body(options.to_string());
+        }
+        let response = request
             .send()
             .await
             .map_err(|failed| ClusterError(format!("DELETE {path}: {failed}")))?;

@@ -904,24 +904,128 @@ fn a_launch_at_another_count_writes_the_role_again_and_keeps_every_lease() {
     });
 }
 
+/// Review c5b L5: stopping removes an instance's account, Role and binding
+/// only once its pods have ended -- never while one runs, whose sidecar
+/// releases its shard's Lease with that account's token as it stops -- and
+/// never while a launch holds the launcher; pods that never end leave the
+/// account kept, for a later launch to write over. Its Leases are kept
+/// throughout.
+#[test]
+fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
+    const ACCOUNT: &str = "check-meridian-runtime-shards-snaptrade-1";
+    let paused = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    paused.block_on(async {
+        let api = Cluster::default();
+        let launching = tokio::sync::Mutex::new(());
+        let every = std::time::Duration::from_secs(1);
+        make_shards_account(&api, &objects(2)).await.unwrap();
+        // Its pods end at the fourth look; until then the account is there.
+        let looks = std::sync::atomic::AtomicU32::new(0);
+        let ended = || {
+            let look = looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let there = api.of(Kind::ServiceAccount, ACCOUNT).is_some();
+            async move {
+                assert!(there, "the account was removed before its pods ended");
+                Ok(look >= 3)
+            }
+        };
+        let within = std::time::Duration::from_secs(60);
+        let removed =
+            remove_shards_account_once_ended(&api, ACCOUNT, &launching, ended, every, within)
+                .await
+                .unwrap();
+        assert_eq!(
+            removed,
+            Some(vec![Kind::RoleBinding, Kind::Role, Kind::ServiceAccount])
+        );
+        assert_eq!(looks.load(std::sync::atomic::Ordering::SeqCst), 4);
+        for shard in 0..2 {
+            assert!(api
+                .of(Kind::Lease, &format!("snaptrade-1-shard-{shard}"))
+                .is_some());
+        }
+        // Pods that never end: the account kept, once the time is up.
+        make_shards_account(&api, &objects(2)).await.unwrap();
+        let began = tokio::time::Instant::now();
+        let kept = remove_shards_account_once_ended(
+            &api,
+            ACCOUNT,
+            &launching,
+            || async { Ok(false) },
+            every,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept, None);
+        assert!(began.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_some());
+        // A launch holding the launcher: nothing asked, nothing removed,
+        // until it lets go.
+        let held = launching.lock().await;
+        let removing = remove_shards_account_once_ended(
+            &api,
+            ACCOUNT,
+            &launching,
+            || async { Ok(true) },
+            every,
+            within,
+        );
+        tokio::pin!(removing);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut removing)
+                .await
+                .is_err(),
+            "removed while a launch held the launcher"
+        );
+        assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_some());
+        drop(held);
+        assert!(removing.await.unwrap().is_some());
+        assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_none());
+    });
+}
+
+/// Review c5b L2: the workload-identity annotations the launcher copies
+/// are the ones its admission policy admits on an instance's own account.
+#[test]
+fn the_identity_the_launcher_copies_is_the_identity_its_policy_admits() {
+    let chart = include_str!("../../../../deploy/chart/templates/launcher.yaml");
+    for key in IDENTITY_ANNOTATIONS {
+        assert!(
+            chart.contains(&format!("\"{key}\"")),
+            "the policy admits no {key}"
+        );
+    }
+}
+
 /// Item 31: a bucket archive's workload identity moves onto the instance's
-/// own account -- its annotations, not a tool's or the cluster's -- and the
-/// pods stay under that account; one pod is run under the archive's, as
-/// before.
+/// own account -- its workload-identity annotations alone, never a tool's,
+/// the cluster's or anyone else's (review c5b L2) -- and the pods stay under
+/// that account; one pod is run under the archive's, as before.
 #[test]
 fn a_bucket_archive_s_identity_moves_onto_an_instance_s_own_account() {
     let archive = serde_json::json!({"metadata": {"name": "archive-writer", "annotations": {
         "eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/archive",
+        "eks.amazonaws.com/sts-regional-endpoints": "true",
         "iam.gke.io/gcp-service-account": "archive@p.iam.gserviceaccount.com",
+        "azure.workload.identity/client-id": "00000000-0000-0000-0000-000000000001",
         "kubectl.kubernetes.io/last-applied-configuration": "{}",
         "meta.helm.sh/release-name": "check",
-        "kubernetes.io/enforce-mountable-secrets": "true"
+        "kubernetes.io/enforce-mountable-secrets": "true",
+        "argocd.argoproj.io/tracking-id": "check:/ServiceAccount:meridian/archive-writer",
+        "example.com/anything": "else"
     }}});
     let identity = identity_of(&archive);
     assert_eq!(
         identity.keys().collect::<Vec<_>>(),
         [
+            "azure.workload.identity/client-id",
             "eks.amazonaws.com/role-arn",
+            "eks.amazonaws.com/sts-regional-endpoints",
             "iam.gke.io/gcp-service-account"
         ]
     );

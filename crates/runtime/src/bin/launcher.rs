@@ -22,9 +22,9 @@ use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
     archive_account, checked, claim, identity_of, make_shards_account, manifest,
-    remove_shards_account, reusable, several, shards_account_of, shards_objects, shards_template,
-    template_for, with_archive, with_limits, with_shards, Kind, Objects, Shapes, StorageShapes,
-    CREATE_PLUGIN, REMOVE_PLUGIN,
+    remove_shards_account_once_ended, reusable, several, shards_account_of, shards_objects,
+    shards_template, template_for, with_archive, with_limits, with_shards, Kind, Objects, Shapes,
+    StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -77,6 +77,12 @@ impl Objects for Kube<'_> {
     }
 }
 
+/// How often a stopped instance of several pods is looked at for its pods
+/// having ended, and for how long, before its own account is removed
+/// (review c5b L5): well past a pod's grace period to stop.
+const ENDED_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+const ENDED_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
+
 struct Launcher {
     api: ApiServer,
     /// The chart's shapes: the plugin's, the live one on a development
@@ -84,6 +90,10 @@ struct Launcher {
     shapes: Shapes,
     development: bool,
     registry: String,
+    /// Held by a launch while it makes an instance's account and its
+    /// Deployment, and by a stopped instance's account's removal while it
+    /// looks and removes: a launch between never loses what it made.
+    launching: tokio::sync::Mutex<()>,
 }
 
 impl Launcher {
@@ -104,6 +114,8 @@ impl Launcher {
 
     fn create(&self, request: CreatePluginRequest) -> Result<CreatePluginReply, String> {
         checked(&request, &self.registry)?;
+        // On a handler's blocking thread, as every ask of the cluster here.
+        let _launching = self.launching.blocking_lock();
         // Any workload for the instance, the chart's own included: two would
         // share a name, a hostname and a credential.
         if let Some(there) = self.existing(&request.instance_id, "")?.first() {
@@ -273,30 +285,79 @@ impl Launcher {
         Ok(())
     }
 
-    fn remove(&self, request: RemovePluginRequest) -> Result<RemovePluginReply, String> {
+    fn remove(self: &Arc<Self>, request: RemovePluginRequest) -> Result<RemovePluginReply, String> {
+        let handle = tokio::runtime::Handle::current();
         let mine = self.existing(&request.instance_id, &format!("{LAUNCHED_SELECTOR},"))?;
+        // An instance of several pods has its own account (item 31).
+        let account = match shards_account_of(self.shapes.shards.as_deref(), &request.instance_id) {
+            Some(account) => handle
+                .block_on(Kube(&self.api).get(Kind::ServiceAccount, &account))?
+                .map(|_| account),
+            None => None,
+        };
         let mut removed = false;
-        for workload in mine {
-            removed |= tokio::runtime::Handle::current()
-                .block_on(self.api.delete_deployment(&workload))
-                .map_err(|failed| failed.0)?;
+        for workload in &mine {
+            // Its pods' sidecars release their shards' Leases as they stop,
+            // with its account's token: deleted in the foreground, its
+            // Deployment is there until they have ended (review c5b L5).
+            removed |= match account {
+                Some(_) => handle.block_on(self.api.delete_deployment_after_its_pods(workload)),
+                None => handle.block_on(self.api.delete_deployment(workload)),
+            }
+            .map_err(|failed| failed.0)?;
             tracing::info!(instance = request.instance_id, workload, "a plugin removed");
         }
-        // Its own account, Role and binding, where it was several pods;
-        // never its Leases (item 31).
-        if let Some(account) =
-            shards_account_of(self.shapes.shards.as_deref(), &request.instance_id)
-        {
-            let gone = tokio::runtime::Handle::current()
-                .block_on(remove_shards_account(&Kube(&self.api), &account))?;
-            if !gone.is_empty() {
-                tracing::info!(
-                    instance = request.instance_id,
-                    account,
-                    removed = ?gone,
-                    "its own account removed; its Leases kept"
+        // Its own account, Role and binding, once its pods have ended;
+        // never its Leases (item 31). The stop is answered meanwhile.
+        if let Some(account) = account {
+            let launcher = Arc::clone(self);
+            let instance = request.instance_id;
+            handle.spawn(async move {
+                let selector = format!("{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={instance}");
+                let api = &launcher.api;
+                let ended = || {
+                    let selector = selector.clone();
+                    async move {
+                        let left = api
+                            .deployments(&selector)
+                            .await
+                            .map_err(|failed| failed.0)?;
+                        Ok(left["items"]
+                            .as_array()
+                            .is_none_or(|items| items.is_empty()))
+                    }
+                };
+                let kube = Kube(api);
+                let removing = remove_shards_account_once_ended(
+                    &kube,
+                    &account,
+                    &launcher.launching,
+                    ended,
+                    ENDED_EVERY,
+                    ENDED_WITHIN,
                 );
-            }
+                match removing.await {
+                    Ok(Some(gone)) => tracing::info!(
+                        instance,
+                        account,
+                        removed = ?gone,
+                        "its pods ended; its own account removed, its Leases kept"
+                    ),
+                    Ok(None) => tracing::warn!(
+                        instance,
+                        account,
+                        "its pods had not ended in {ENDED_WITHIN:?}; its own account is kept, \
+                         for a later launch of it to write over"
+                    ),
+                    Err(failed) => tracing::warn!(
+                        instance,
+                        account,
+                        %failed,
+                        "its own account could not be removed; it is kept, for a later launch of \
+                         it to write over"
+                    ),
+                }
+            });
         }
         Ok(RemovePluginReply { removed })
     }
@@ -362,6 +423,7 @@ fn run() -> Result<(), String> {
         },
         development,
         registry,
+        launching: tokio::sync::Mutex::new(()),
     });
 
     tokio::runtime::Builder::new_multi_thread()

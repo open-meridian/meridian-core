@@ -92,6 +92,12 @@ pub struct Record {
     /// again has another (step 3d, checkpoint 5, review c5a2 N5). Empty
     /// before a read.
     pub uid: String,
+    /// The Lease's `metadata` as read, less the fields the API server keeps
+    /// itself (`managedFields`); `Null` before a read. Written back with
+    /// every write: a PUT replaces the whole object, so a take, a renew or a
+    /// release keeps the labels, annotations and owners the chart or the
+    /// launcher gave it -- Helm's `keep` among them (review c5b M1).
+    pub metadata: serde_json::Value,
 }
 
 /// What a write of a Lease answered.
@@ -390,6 +396,7 @@ impl<L: Leases> Elector<L> {
                 transitions: 0,
                 resource_version: String::new(),
                 uid: String::new(),
+                metadata: serde_json::Value::Null,
             };
             return match self.api.create(&self.settings.name, &record).await? {
                 Wrote::Done(version) => {
@@ -445,6 +452,7 @@ impl<L: Leases> Elector<L> {
             },
             resource_version: current.resource_version.clone(),
             uid: current.uid.clone(),
+            metadata: current.metadata.clone(),
         };
         match self.api.update(&self.settings.name, &record).await? {
             Wrote::Done(version) => {
@@ -705,10 +713,20 @@ impl KubeLeases {
         }
     }
 
+    /// The Lease as written: its metadata as read, but for its name, its
+    /// namespace and the version the write is conditional on; its spec the
+    /// record's.
     fn body(&self, name: &str, record: &Record) -> serde_json::Value {
-        let mut metadata = serde_json::json!({ "name": name, "namespace": self.namespace });
-        if !record.resource_version.is_empty() {
-            metadata["resourceVersion"] = serde_json::json!(record.resource_version);
+        let mut metadata = record.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert("name".into(), serde_json::json!(name));
+        metadata.insert("namespace".into(), serde_json::json!(self.namespace));
+        if record.resource_version.is_empty() {
+            metadata.remove("resourceVersion");
+        } else {
+            metadata.insert(
+                "resourceVersion".into(),
+                serde_json::json!(record.resource_version),
+            );
         }
         serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -774,6 +792,14 @@ pub fn record_of(lease: &serde_json::Value) -> Record {
         transitions: spec["leaseTransitions"].as_u64().unwrap_or(0),
         resource_version: text(&lease["metadata"]["resourceVersion"]),
         uid: text(&lease["metadata"]["uid"]),
+        metadata: match &lease["metadata"] {
+            serde_json::Value::Object(read) => {
+                let mut kept = read.clone();
+                kept.remove("managedFields");
+                serde_json::Value::Object(kept)
+            }
+            _ => serde_json::Value::Null,
+        },
     }
 }
 

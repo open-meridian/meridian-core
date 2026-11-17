@@ -631,3 +631,125 @@ async fn a_late_failure_on_an_old_client_leaves_the_newer_one_that_answers() {
         "a stale request's failure made the client dial again"
     );
 }
+
+// ── What a write keeps of the Lease (review c5b M1) ──────────────────────
+
+/// An API server keeping one Lease as Kubernetes does: a PUT replaces the
+/// whole object, conditional on its resourceVersion, and what the server
+/// keeps itself (`managedFields`) is kept where a write leaves it out.
+/// Answers its address and every PUT body it was sent.
+async fn a_kept_lease_api(
+    lease: serde_json::Value,
+) -> (std::net::SocketAddr, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let held = Arc::new(Mutex::new(lease));
+    let puts = Arc::new(Mutex::new(Vec::new()));
+    let (serving, sent) = (Arc::clone(&held), Arc::clone(&puts));
+    let router =
+        axum::Router::new().fallback(move |method: axum::http::Method, body: axum::body::Bytes| {
+            let (held, sent) = (Arc::clone(&serving), Arc::clone(&sent));
+            async move {
+                use axum::http::StatusCode;
+                let mut held = held.lock().unwrap();
+                if method != axum::http::Method::PUT {
+                    return (StatusCode::OK, axum::Json(held.clone()));
+                }
+                let mut written: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                sent.lock().unwrap().push(written.clone());
+                let version = held["metadata"]["resourceVersion"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                if written["metadata"]["resourceVersion"].as_str() != Some(version.as_str()) {
+                    return (StatusCode::CONFLICT, axum::Json(serde_json::json!({})));
+                }
+                let next = (version.parse::<u64>().unwrap() + 1).to_string();
+                let metadata = &mut written["metadata"];
+                metadata["resourceVersion"] = serde_json::json!(next);
+                metadata["uid"] = held["metadata"]["uid"].clone();
+                if metadata.get("managedFields").is_none() {
+                    metadata["managedFields"] = held["metadata"]["managedFields"].clone();
+                }
+                *held = written;
+                (StatusCode::OK, axum::Json(held.clone()))
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    (at, puts)
+}
+
+/// Review c5b M1: a take, and a release after it, write the Lease back as
+/// it was read but for its spec -- its labels, its annotations (Helm's
+/// `keep` among them, so an upgrade that drops the shard keeps its Lease)
+/// and its owners all kept -- never a bare name, which a PUT takes as the
+/// whole object and so strips them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_take_and_a_release_keep_the_lease_s_labels_annotations_and_owners() {
+    let labels = serde_json::json!({
+        "meridian.dev/instance": "feed-1",
+        "meridian.dev/launched": "true",
+        "app.kubernetes.io/managed-by": "Helm",
+    });
+    let annotations = serde_json::json!({
+        "helm.sh/resource-policy": "keep",
+        "meta.helm.sh/release-name": "r",
+        "meta.helm.sh/release-namespace": "ns",
+    });
+    let owners = serde_json::json!([{
+        "apiVersion": "v1", "kind": "ConfigMap", "name": "owner", "uid": "owner-uid",
+    }]);
+    let (at, puts) = a_kept_lease_api(serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {
+            "name": "feed-1-shard-0", "namespace": "ns", "uid": "uid-1", "resourceVersion": "4",
+            "creationTimestamp": "2026-11-16T00:00:00Z",
+            "labels": labels, "annotations": annotations, "ownerReferences": owners,
+            "managedFields": [{"manager": "helm", "operation": "Update"}],
+        },
+        "spec": {},
+    }))
+    .await;
+    let token = Token::new("kept");
+    let settings = Settings {
+        name: "feed-1-shard-0".into(),
+        holder: "feed-1-a".into(),
+        renew: Duration::from_secs(2),
+        duration: Duration::from_secs(6),
+    };
+    let mut elector = Elector::new(leases_through(at, &token), settings).makes_none();
+    assert_eq!(
+        elector.look(Instant::now(), 1_000_000_000).await,
+        Ok(Standing::Held)
+    );
+    elector.release(2_000_000_000).await;
+    let puts = puts.lock().unwrap().clone();
+    assert_eq!(puts.len(), 2, "a take and a release: {puts:#?}");
+    for (put, what) in puts.iter().zip(["the take", "the release"]) {
+        let metadata = &put["metadata"];
+        assert_eq!(
+            metadata["labels"], labels,
+            "{what} kept its labels: {put:#}"
+        );
+        assert_eq!(
+            metadata["annotations"], annotations,
+            "{what} kept its annotations: {put:#}"
+        );
+        assert_eq!(
+            metadata["ownerReferences"], owners,
+            "{what} kept its owners: {put:#}"
+        );
+        assert!(
+            metadata.get("managedFields").is_none(),
+            "{what} left the server's own fields to it: {put:#}"
+        );
+        assert_eq!(
+            metadata["uid"], "uid-1",
+            "{what} names the Lease it read: {put:#}"
+        );
+    }
+    assert_eq!(puts[0]["spec"]["holderIdentity"], "feed-1-a");
+    assert_eq!(puts[0]["spec"]["leaseTransitions"], 1);
+    assert_eq!(puts[1]["spec"]["holderIdentity"], "");
+}

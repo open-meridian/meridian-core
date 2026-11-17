@@ -1072,6 +1072,7 @@ async fn a_standby_told_to_stop_between_looks_stops_at_once_and_one_never_told_t
         transitions: 0,
         resource_version: "7".into(),
         uid: "uid-1".into(),
+        metadata: serde_json::Value::Null,
     });
     let waiting = tokio::spawn(async move {
         stand_by(
@@ -1196,6 +1197,7 @@ async fn a_standby_leaves_a_free_lease_to_a_newer_member_of_its_group() {
         transitions: 1,
         resource_version: "1".into(),
         uid: "uid-1".into(),
+        metadata: serde_json::Value::Null,
     });
     for n in 2..12u64 {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1298,6 +1300,7 @@ async fn a_stop_after_a_take_whose_answer_was_lost_gives_the_lease_up() {
             transitions: 3,
             resource_version: "7".into(),
             uid: "uid-1".into(),
+            metadata: serde_json::Value::Null,
         }))),
     };
     let mut elector = Elector::new(
@@ -1483,6 +1486,7 @@ async fn a_store_standby_whose_read_was_slow_across_a_renewal_takes_no_sooner_th
         transitions: 0,
         resource_version: version.into(),
         uid: "uid-1".into(),
+        metadata: serde_json::Value::Null,
     };
     let api = SlowFirstRead {
         held: Arc::new(std::sync::Mutex::new(Some(record("1")))),
