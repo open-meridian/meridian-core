@@ -41,6 +41,8 @@ r2d2_postgres.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+# The schemas and databases its tests make, dropped with them (PO 65).
+meridian-changes = { path = "../changes", features = ["scratch"] }
 async-trait.workspace = true
 postgres.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

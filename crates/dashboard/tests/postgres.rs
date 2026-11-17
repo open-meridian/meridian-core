@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use meridian_changes::scratch::Scratch;
 use meridian_dashboard::accounts::{self, Accounts as _, LocalAccount};
 use meridian_dashboard::database::{Database, Unverified};
 use meridian_dashboard::delegation::{
@@ -28,22 +29,19 @@ fn base_url() -> String {
     )
 }
 
-/// A schema of this test's own, and the URL that reaches it.
-fn scratch(tag: &str) -> String {
+/// A schema of this test's own, and the URL that reaches it: dropped with
+/// the URL's last clone (PO 65).
+fn scratch(tag: &str) -> Scratch {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let name = format!("dashboard_{tag}_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    format!("{}?options=-c%20search_path%3D{name}", base_url())
+    Scratch::schema(&base_url(), &name)
 }
 
-fn migrated(tag: &str) -> (Database, String) {
+fn migrated(tag: &str) -> (Database, Scratch) {
     let url = scratch(tag);
     let database = Database::connect(&url, 2).expect("connects");
     assert!(
@@ -107,7 +105,7 @@ fn a_database_from_before_the_history_is_brought_up_to_date() {
 
 #[test]
 fn the_local_accounts_are_listed_by_name_with_their_display_names_and_nothing_else() {
-    let (database, _) = migrated("people");
+    let (database, _schema) = migrated("people");
     let store = accounts::InPostgres::on(database);
     for (name, display) in [("bob", ""), ("Ada", "Ada Park")] {
         store
@@ -397,7 +395,7 @@ fn a_delegation_is_made_renewed_in_place_and_narrowed_as_it_was_asked() {
 
 #[test]
 fn a_refresh_token_is_spent_once_whichever_replica_asks() {
-    let (database, _) = migrated("spent");
+    let (database, _schema) = migrated("spent");
     let one = delegation::InPostgres::on(database.clone());
     let other = delegation::InPostgres::on(database);
     one.register(&client("mdc_a", T0), 10).unwrap();

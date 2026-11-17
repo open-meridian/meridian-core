@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use meridian_changes::scratch::Scratch;
 use meridian_config::store::{
     ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
 };
@@ -39,25 +40,17 @@ fn base_url() -> String {
     )
 }
 
-/// A migrated store in a schema of this test's own.
-fn store(tag: &str) -> PostgresStore {
-    store_at(tag).0
-}
-
-/// The same, and the URL that reaches its schema, to read its tables as a
-/// database dump would.
-fn store_at(tag: &str) -> (PostgresStore, String) {
+/// A migrated store in a schema of this test's own, and the URL that
+/// reaches its schema, to read its tables as a database dump would. The
+/// schema is dropped with the URL's last clone (PO 65).
+fn store_at(tag: &str) -> (PostgresStore, Scratch) {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let name = format!("config_{tag}_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let store = PostgresStore::connect(&url, 4).expect("connects");
     assert!(
         store.verify().is_err(),
@@ -93,7 +86,7 @@ fn admin_permission(id: &str, group: &str) -> Permission {
 
 #[test]
 fn a_fresh_store_has_deployment_admin_and_nobody_holding_it() {
-    let store = store("fresh");
+    let (store, _schema) = store_at("fresh");
     let snapshot = store.snapshot().unwrap();
     let built_in = |id: &str| {
         snapshot
@@ -120,7 +113,7 @@ fn a_fresh_store_has_deployment_admin_and_nobody_holding_it() {
 
 #[test]
 fn what_is_written_is_what_a_snapshot_reads_back() {
-    let store = store("roundtrip");
+    let (store, _schema) = store_at("roundtrip");
     let account = AccountRecord {
         account_id: "ACC-1".into(),
         name: "Growth".into(),
@@ -222,7 +215,7 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
 #[test]
 fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
     // W6.4: a link naming a new account creates it and links it in one step.
-    let store = store("account_and_link");
+    let (store, _schema) = store_at("account_and_link");
     let account = AccountRecord {
         account_id: "ACC-NEW".into(),
         name: "Fidelity Brokerage".into(),
@@ -256,7 +249,7 @@ fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
 
 #[test]
 fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
-    let store = store("shape");
+    let (store, _schema) = store_at("shape");
     store.put_user_group(&user_group("UG-1", "ada")).unwrap();
     store
         .put_account_group(&AccountGroup {
@@ -280,7 +273,7 @@ fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
 
 #[test]
 fn the_latest_sign_in_stands_even_if_an_older_one_arrives_later() {
-    let store = store("signin");
+    let (store, _schema) = store_at("signin");
     let at = |when: i64, group: &str| SignInRecord {
         subject: "ada".into(),
         display_name: "Ada".into(),
@@ -297,7 +290,7 @@ fn the_latest_sign_in_stands_even_if_an_older_one_arrives_later() {
 #[test]
 fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
     // design/a-misspelt-administrators-group (ruled 2026-10-10; H1, 586).
-    let store = store("misspelt");
+    let (store, _schema) = store_at("misspelt");
     let mut wizard = user_group("UG-wizard", "");
     wizard.logins.clear();
     wizard.directory_groups = vec!["meridain-admins".into()];
@@ -333,7 +326,7 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
         "a named login holds it now"
     );
 
-    let fresh = store_at("presented").0;
+    let (fresh, _fresh_schema) = store_at("presented");
     assert!(fresh
         .install_first_admin(
             &wizard,
@@ -365,7 +358,8 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
 
 #[test]
 fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
-    let store = Arc::new(store("race"));
+    let (store, _schema) = store_at("race");
+    let store = Arc::new(store);
     let threads: Vec<_> = (0..2)
         .map(|n| {
             let store = Arc::clone(&store);
@@ -393,7 +387,8 @@ fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
 
 #[test]
 fn two_concurrent_withdrawals_cannot_leave_no_admin() {
-    let store = Arc::new(store("lastadmin"));
+    let (store, _schema) = store_at("lastadmin");
+    let store = Arc::new(store);
     for n in 0..2 {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
         store.put_user_group(&group).unwrap();
@@ -478,7 +473,7 @@ fn launch(instance: &str) -> PluginLaunch {
 
 #[test]
 fn a_version_is_recorded_once_and_read_back_whole() {
-    let store = store("versions");
+    let (store, _schema) = store_at("versions");
     assert!(store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap());
@@ -496,7 +491,7 @@ fn a_version_is_recorded_once_and_read_back_whole() {
 fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
     // Contract v25 (W8.1): the texts in the same transaction as the version.
     use meridian_domain::v1::DocumentationText;
-    let store = store("documentation");
+    let (store, _schema) = store_at("documentation");
     let text = |section: &str, markdown: &str| DocumentationText {
         section: section.into(),
         markdown: markdown.into(),
@@ -541,7 +536,7 @@ fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
 #[test]
 fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
     // Contract v25 (W8.15): the retirement written once beside the version.
-    let store = store("retire");
+    let (store, _schema) = store_at("retire");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -591,7 +586,7 @@ fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
 #[test]
 fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
     // Contract v25 (W3.28).
-    let store = store("licensed");
+    let (store, _schema) = store_at("licensed");
     assert!(store.licensed_schemes().unwrap().is_empty());
     let author = meridian_config::Author {
         by: "local|ada".into(),
@@ -610,7 +605,7 @@ fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
 #[test]
 fn each_routing_change_is_its_own_row_read_back_in_order() {
     // Contract v26 (W12.6, migration 0023).
-    let store = store("routing");
+    let (store, _schema) = store_at("routing");
     assert!(store.model_routing_changes().unwrap().is_empty());
     let author = meridian_config::Author {
         by: "local|ada".into(),
@@ -633,7 +628,7 @@ fn each_routing_change_is_its_own_row_read_back_in_order() {
 
 #[test]
 fn one_live_launch_per_instance_and_it_ends_once() {
-    let store = store("launches");
+    let (store, _schema) = store_at("launches");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -786,7 +781,8 @@ fn a_launch_keeps_its_stamp_and_note_and_those_before_v17_a_gap_record() {
 
 #[test]
 fn two_launches_of_one_instance_at_once_admit_one() {
-    let store = Arc::new(store("race"));
+    let (store, _schema) = store_at("race");
+    let store = Arc::new(store);
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -806,7 +802,7 @@ fn two_launches_of_one_instance_at_once_admit_one() {
 
 #[test]
 fn a_live_launch_is_read_back_as_live() {
-    let store = store("live");
+    let (store, _schema) = store_at("live");
     assert!(store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap());
@@ -844,7 +840,7 @@ fn declaration(name: &str, kind: SettingType, secret: bool) -> SettingDeclaratio
 
 #[test]
 fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
-    let store = store("declared");
+    let (store, _schema) = store_at("declared");
     store
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "snaptrade-1".into(),
@@ -1147,11 +1143,7 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
         .unwrap()
         .as_nanos();
     let name = format!("config_tagged_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     // The store as the release before this one left it: every migration up
@@ -1317,11 +1309,7 @@ fn an_account_from_before_its_attributes_reads_back_with_none() {
         .unwrap()
         .as_nanos();
     let name = format!("config_before_attributes_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     let before: Vec<_> = meridian_config::migrations::MIGRATIONS
@@ -1380,11 +1368,7 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
         .unwrap()
         .as_nanos();
     let name = format!("config_upgrade_{nanos}_{seq}");
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
 
     // The release before: migrations 1 to 8, and a deployment admin.
     let mut before = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -1486,11 +1470,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
     // two changes to poll_minutes and a secret set, recorded without values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_backfill_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -1785,11 +1765,7 @@ fn migration_12_redacts_what_a_secret_settings_records_hold() {
     // was ruled: its records, a backfilled one among them, hold its values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_redact_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -1880,11 +1856,7 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
     // sidecar has reported but a launch names.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_per_role_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -2217,7 +2189,7 @@ fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
     use meridian_domain::v1::DatasetEntitlement;
     use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence};
 
-    let store = store("data");
+    let (store, _schema) = store_at("data");
     let catalogue = Catalogue {
         datasets: vec![DatasetDeclaration {
             key: "daily".into(),
@@ -2269,7 +2241,7 @@ fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
 fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
     // Contract v22 (W11.20 to W11.22): the conductor's records.
     use meridian_pb::v1::{ConnectivityLink, VenueAccountMapping};
-    let store = store("connectivity");
+    let (store, _schema) = store_at("connectivity");
     store
         .put_account(&AccountRecord {
             account_id: "ACC-1".into(),
@@ -2355,7 +2327,7 @@ fn the_registries_state_is_kept_whole() {
     use meridian_domain::v1::{
         PluginListing, PluginPull, PluginUsageReport, PullAcknowledgement, SentPluginUsageReport,
     };
-    let store = store("registries");
+    let (store, _schema) = store_at("registries");
     assert_eq!(store.registry_catalogue().unwrap(), None);
     let held = HeldCatalogue {
         listings: vec![PluginListing {
@@ -2530,7 +2502,7 @@ fn the_registries_state_is_kept_whole() {
 /// read of the catalogue starts from -- takes.
 fn catalogue_in_the_store(tag: &str) -> (f64, f64, std::time::Duration) {
     use meridian_domain::v1::{PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion};
-    let store = store(tag);
+    let (store, _schema) = store_at(tag);
     let started = std::time::Instant::now();
     for n in 0..100 {
         for v in 0..20 {
@@ -2787,7 +2759,7 @@ fn an_administrative_acts_record_is_kept_as_written() {
 /// 300 times: one launch in the snapshot, all 300 in its history.
 #[test]
 fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_own() {
-    let store = store("latest_launch");
+    let (store, _schema) = store_at("latest_launch");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -2826,7 +2798,7 @@ fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_
 /// that asked none reads none.
 #[test]
 fn a_launchs_own_limits_are_kept_on_its_record() {
-    let store = store("launch_limits");
+    let (store, _schema) = store_at("launch_limits");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();

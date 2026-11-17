@@ -17,6 +17,7 @@ use meridian_bor::service::*;
 use meridian_bor::store::{BreaksRead, PositionsRead, Scope, Store};
 use meridian_bor::PostgresStore;
 use meridian_bus::{Bus, Envelope, MemoryBackend, Stamp};
+use meridian_changes::scratch::Scratch;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::*;
 use prost::Message;
@@ -1395,15 +1396,9 @@ fn small() -> Arc<PostgresStore> {
 }
 
 /// A store over a schema of its own, so a takeover raises no other test's
-/// epoch.
-fn isolated() -> (String, Arc<PostgresStore>) {
-    let schema = unique("bor_fence").replace('-', "_");
-    let mut admin = postgres::Client::connect(&url(), postgres::NoTls).expect("the test database");
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("a schema of its own");
-    let joined = if url().contains('?') { "&" } else { "?" };
-    let url = format!("{}{joined}options=-csearch_path%3D{schema}", url());
+/// epoch. The schema is dropped with the last clone of its URL (PO 65).
+fn isolated() -> (Scratch, Arc<PostgresStore>) {
+    let url = Scratch::schema(&url(), &unique("bor_fence").replace('-', "_"));
     let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&meridian_clock::SystemClock)
@@ -2043,8 +2038,8 @@ fn a_break(account: &str) -> RecordBreakRequest {
 async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_behind_it() {
     use meridian_bus::read_after::{answered_by_primary, begin_read, Reads};
     use meridian_pb::v1::{PartitionSequence, Watermark};
-    let (_, primary) = blocking(isolated);
-    let (_, replica) = blocking(isolated);
+    let (_primary_schema, primary) = blocking(isolated);
+    let (_replica_schema, replica) = blocking(isolated);
     let (bus, primary) = wired_with(primary);
     let (replica_bus, replica) = wired_with(replica);
     let account = unique("ACC-LAG");
@@ -2763,7 +2758,7 @@ async fn m11_a_named_read_follows_its_account_to_the_database_it_moved_to_meanwh
     use meridian_changes::groups::Groups;
     use meridian_changes::moves::points;
     use meridian_domain::v1::MoveAccountRequest;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -2893,7 +2888,7 @@ async fn m11_a_partition_is_moved_home_only_once_every_member_seen_runs_the_swee
     use meridian_bor::spread::Spread;
     use meridian_changes::groups::{owner, Groups};
     use meridian_changes::members::revision;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -3031,7 +3026,7 @@ async fn m11_a_move_by_hand_to_another_database_waits_for_the_rollout() {
     use meridian_changes::groups::Groups;
     use meridian_changes::members::revision;
     use meridian_domain::v1::{MoveAccountReply, MoveAccountRequest};
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -4401,7 +4396,7 @@ fn the_pre_check_routes_by_the_record_and_leaves_an_unplaced_account_unrouted() 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_groups_keep_their_partitions_in_two_databases() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -4515,7 +4510,7 @@ async fn two_groups_keep_their_partitions_in_two_databases() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_account_moved_between_databases_is_copied_and_replays_the_same() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -4697,7 +4692,7 @@ async fn an_account_moved_between_databases_is_copied_and_replays_the_same() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_account_whose_copy_differs_from_its_source_is_not_moved_and_its_finding_kept() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -5690,7 +5685,7 @@ async fn a_book_partition_moved_between_databases_under_load_is_copied_and_switc
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
     use meridian_pb::v1::{PartitionSequence, Watermark};
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -6671,7 +6666,7 @@ async fn a_raised_database_count_writes_where_each_head_is_and_moves_each_partit
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::{owner, Groups};
     use meridian_pb::v1::{PartitionSequence, Watermark};
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -6858,10 +6853,11 @@ async fn a_raised_database_count_writes_where_each_head_is_and_moves_each_partit
 /// Two databases, a member of each of two writer groups over both, and the
 /// control group's mover over both: the review's cross-database harness.
 struct TwoDatabases {
-    urls: Vec<String>,
     zero: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     one: (Arc<Bus>, Arc<meridian_bor::spread::Spread>),
     mover: meridian_bor::partition_moves::Mover,
+    // Last, so the schemas are dropped after the stores over them.
+    urls: Vec<Scratch>,
 }
 
 fn two_databases() -> TwoDatabases {
@@ -6874,7 +6870,7 @@ fn two_databases() -> TwoDatabases {
 fn two_databases_snapshotting(interval: Option<u64>) -> TwoDatabases {
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = (0..2)
+    let urls: Vec<Scratch> = (0..2)
         .map(|_| {
             let (url, migrated) = isolated();
             migrated.make_partitions(8).unwrap();
@@ -6980,7 +6976,7 @@ async fn write_once(bus: &Bus, account: &str, n: u64) -> Result<(), String> {
 }
 
 /// `partition`'s heads in each database, furthest on first.
-fn heads_of(urls: &[String], partition: &str) -> Vec<meridian_bor::postgres::Tip> {
+fn heads_of(urls: &[Scratch], partition: &str) -> Vec<meridian_bor::postgres::Tip> {
     urls.iter()
         .map(|url| {
             PostgresStore::connect(url, 1)
@@ -7602,7 +7598,7 @@ async fn review_c7_an_account_moved_back_to_a_partition_it_left_moves() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn review_elle_an_account_between_its_close_and_its_open_reads_whole() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -7730,7 +7726,7 @@ async fn review_elle_an_account_between_its_close_and_its_open_reads_whole() {
 async fn review_a2_a_group_writing_away_follows_that_databases_timeline() {
     use meridian_changes::groups::Groups;
     use meridian_changes::timeline::Timeline;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -7796,7 +7792,7 @@ async fn review_a2_a_group_writing_away_follows_that_databases_timeline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m9_a_groups_own_heads_never_name_an_owner_its_database_does_not_write() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -7859,7 +7855,7 @@ async fn m9_a_groups_own_heads_never_name_an_owner_its_database_does_not_write()
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn m9_an_account_between_its_close_and_its_open_is_in_a_read_of_every_account_once() {
     use meridian_changes::groups::Groups;
-    let urls: Vec<String> = blocking(|| {
+    let urls: Vec<Scratch> = blocking(|| {
         (0..2)
             .map(|_| {
                 let (url, migrated) = isolated();
@@ -8345,7 +8341,7 @@ async fn m12_a_write_held_between_two_databases_is_answered_before_its_callers_d
 #[test]
 fn t_a_writer_told_to_stop_stops_only_for_another_groups_writer_serving_anew() {
     use meridian_changes::members::Watch;
-    let store = isolated().1;
+    let (_schema, store) = isolated();
     let revision = meridian_changes::members::revision("0.1.900", 1, 2, Some(4));
     let other = meridian_changes::members::revision("0.1.901", 1, 2, Some(4));
     let hour = 3_600_000_000_000_i64;
@@ -8426,7 +8422,7 @@ fn t_a_writer_told_to_stop_stops_only_for_another_groups_writer_serving_anew() {
 /// start, and a writer told to stop stopped for a member serving nothing.
 #[test]
 fn t_a_member_started_again_says_nothing_of_the_process_before() {
-    let store = isolated().1;
+    let (_schema, store) = isolated();
     let revision = meridian_changes::members::revision("0.1.900", 1, 2, Some(4));
     let mode = |member: &str| {
         store

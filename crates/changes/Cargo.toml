@@ -27,5 +27,10 @@ rustls.workspace = true
 tokio-postgres-rustls.workspace = true
 webpki-roots.workspace = true
 
+[features]
+# A store test's schemas and databases, dropped with it (`scratch`, PO 65):
+# tests only, turned on by the stores' dev-dependencies.
+scratch = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -46,6 +46,8 @@ pub mod integrity;
 pub mod members;
 pub mod moves;
 pub mod records;
+#[cfg(feature = "scratch")]
+pub mod scratch;
 pub mod serving;
 pub mod shard_fence;
 pub mod timeline;
