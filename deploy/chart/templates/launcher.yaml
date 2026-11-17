@@ -524,9 +524,10 @@ spec:
     # node is evicted (c5c86 L1). Its confinement is the chart's and no
     # other (review c5c2fold L1, c5c86 M1): RuntimeDefault seccomp at the
     # pod, nothing of the container's own, no extra groups, sysctls, claims,
-    # affinity or ports (c5c86 L3); never root -- runAsNonRoot, no uid
-    # named -- and every capability dropped; its two mounts whole, each at
-    # its own path, so the command never runs from the shared claim.
+    # affinity or ports (c5c86 L3); never root -- runAsNonRoot, and no uid
+    # or gid 0 named (c5c89 L2) -- and every capability dropped; its two
+    # mounts whole, each at its own path, so the command never runs from
+    # the shared claim.
     - expression: >-
         request.resource.resource != "pods" ||
         (
@@ -589,6 +590,12 @@ spec:
            !object.spec.containers[0].securityContext.privileged) &&
           has(object.spec.containers[0].securityContext.runAsNonRoot) &&
           object.spec.containers[0].securityContext.runAsNonRoot == true &&
+          (!has(object.spec.containers[0].securityContext.runAsUser) ||
+           object.spec.containers[0].securityContext.runAsUser > 0) &&
+          (!has(object.spec.containers[0].securityContext.runAsGroup) ||
+           object.spec.containers[0].securityContext.runAsGroup > 0) &&
+          (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser > 0) &&
+          (!has(object.spec.securityContext.runAsGroup) || object.spec.securityContext.runAsGroup > 0) &&
           has(object.spec.containers[0].securityContext.capabilities) &&
           has(object.spec.containers[0].securityContext.capabilities.drop) &&
           "ALL" in object.spec.containers[0].securityContext.capabilities.drop &&
@@ -617,7 +624,8 @@ spec:
     # The one change it makes to a claim (item 89): its instance's shared
     # claim marked as holding the copy of its own claim, once a copy pod
     # said so -- that annotation alone added, nothing else of the claim
-    # changed.
+    # changed: no owner given it and no finalizer changed, so it is never
+    # deleted by another's hand (review c5c89 M1; decisions/028).
     - expression: >-
         request.resource.resource != "persistentvolumeclaims" ||
         request.operation != "UPDATE" ||
@@ -626,6 +634,8 @@ spec:
           object.metadata.name == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance &&
           object.spec == oldObject.spec &&
           object.metadata.labels == oldObject.metadata.labels &&
+          object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+          object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
           has(object.metadata.annotations) &&
           object.metadata.annotations[?"meridian.dev/storage-copied"].orValue("") ==
             {{ printf "%s-storage-" $full | quote }} + variables.instance &&

@@ -407,6 +407,13 @@ message CreatePluginReply {
   // empty where it copies none. The instance's pods start once the copy has
   // finished.
   string storage_copied_from = 2;
+
+  // Step 3d, checkpoint 5, PO item 91: true where the launcher made the
+  // instance's pods on its shared storage -- several pods, or one pod as one
+  // shard of storage shared since it ran as several; false where they run on
+  // its own claim, or it keeps none. Kept on the launch's record, so only a
+  // later launch on its own claim keeps a copy unrecorded.
+  bool ran_shared = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

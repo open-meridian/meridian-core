@@ -22,10 +22,10 @@ use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
     archive_account, checked, identity_of, left_of, make_shards_account, manifest,
-    one_pod_as_shard, remove_shards_account_once_ended, several, shards_account_of, shards_objects,
-    shards_template, shared_kept, stop_launched, storage_and_copy, template_for, with_archive,
-    with_limits, with_shards, Kind, Objects, Removal, Shapes, StorageShapes, Workloads,
-    CREATE_PLUGIN, REMOVE_PLUGIN,
+    one_pod_as_shard, remove_shards_account_once_ended, runs_shared, several, shards_account_of,
+    shards_objects, shards_template, shared_kept, stop_launched, storage_and_copy, template_for,
+    with_archive, with_limits, with_shards, Kind, Objects, Removal, Shapes, StorageShapes,
+    Workloads, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -148,6 +148,18 @@ impl Launcher {
             ));
         }
         let chosen = template_for(&request, self.development, &self.shapes)?;
+        // The instance's launched pods, where the chart renders a copy pod:
+        // none may still mount its own claim while one is made (item 69;
+        // review c5c89 M3).
+        let pods = match self.shapes.storage.as_ref().and_then(|s| s.copy.as_ref()) {
+            Some(_) if chosen.claim.is_some() => tokio::runtime::Handle::current()
+                .block_on(self.api.pods_labelled(&format!(
+                    "{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={}",
+                    request.instance_id
+                )))
+                .map_err(|failed| failed.0)?,
+            _ => serde_json::json!({"items": []}),
+        };
         // One pod of an instance whose storage is shared since it ran as
         // several runs as one shard on it (item 30).
         let shared = chosen.claim.is_some()
@@ -155,6 +167,7 @@ impl Launcher {
                 &Kube(&self.api),
                 &self.shapes,
                 &request,
+                &pods,
                 meridian_runtime::now_ns(),
             ))?;
         let request = one_pod_as_shard(request, shared);
@@ -162,6 +175,9 @@ impl Launcher {
         // standby pod (step 3d): the chart's shape for them, sharing its
         // storage where its plugin keeps some (item 30).
         let chosen = shards_template(chosen, &request, &self.shapes)?;
+        // Told to the conductor, which keeps it on the launch's record (PO
+        // item 91).
+        let ran_shared = runs_shared(chosen.claim, &request);
         // Its archive beside its storage, where a deployment admin allowed
         // it one (W8.7, contract v16).
         let edge = self
@@ -185,15 +201,6 @@ impl Launcher {
         let (made, storage_copied_from) = match chosen.claim {
             Some(template) => {
                 let handle = tokio::runtime::Handle::current();
-                let pods = match self.shapes.storage.as_ref().and_then(|s| s.copy.as_ref()) {
-                    Some(_) if several(&request) => handle
-                        .block_on(self.api.pods_labelled(&format!(
-                            "{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={}",
-                            request.instance_id
-                        )))
-                        .map_err(|failed| failed.0)?,
-                    _ => serde_json::json!({"items": []}),
-                };
                 handle.block_on(storage_and_copy(
                     &Kube(&self.api),
                     &self.shapes,
@@ -225,11 +232,13 @@ impl Launcher {
             shards = request.shards,
             standby = request.standby,
             storage_copied_from = storage_copied_from.as_deref().unwrap_or_default(),
+            ran_shared,
             "a plugin created"
         );
         Ok(CreatePluginReply {
             workload,
             storage_copied_from: storage_copied_from.unwrap_or_default(),
+            ran_shared,
         })
     }
 

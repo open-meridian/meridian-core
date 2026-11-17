@@ -292,6 +292,10 @@ impl Store for Shared {
             .pend_storage_copy(instance_id, from_claim, after_ns)
     }
 
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()> {
+        self.inner.keep_ran_shared(instance_id)
+    }
+
     fn record_storage_copied(
         &self,
         instance_id: &str,

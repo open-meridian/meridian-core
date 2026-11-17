@@ -411,6 +411,9 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
                           # capability dropped, each mount at its own path,
                           # evicted from a lost node, no ports.
                           ("object.spec.containers[0].securityContext.runAsNonRoot == true", "never root"),
+                          # Review c5c89 L2, L3: no uid or gid 0 named.
+                          ("object.spec.containers[0].securityContext.runAsUser > 0", "no uid 0 named"),
+                          ("object.spec.securityContext.runAsGroup > 0", "no gid 0 named"),
                           ('"ALL" in object.spec.containers[0].securityContext.capabilities.drop',
                            "every capability dropped"),
                           ('m.mountPath == "/var/lib/meridian/copy/to"', "the shared claim at its own path"),
@@ -420,6 +423,11 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
                           # claim as holding its copy.
                           ('object.metadata.annotations.all(k, k == "meridian.dev/storage-copied" ||',
                            "a claim marked as holding its copy, and nothing else of it changed"),
+                          # Review c5c89 M1: no owner and no finalizer changed.
+                          ("object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])",
+                           "a claim's owners unchanged as it is marked"),
+                          ("object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([])",
+                           "a claim's finalizers unchanged as it is marked"),
                           ("!has(object.spec.containers[0].lifecycle)", "no lifecycle hook"),
                           ("!has(object.spec.nodeName)", "no node named"),
                           ('oldObject.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy"',

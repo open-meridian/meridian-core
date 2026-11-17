@@ -1565,6 +1565,17 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE config_plugin_launch SET ran_shared = true
+                  WHERE instance_id = $1 AND state = 1",
+                &[&instance_id],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
     fn record_storage_copied(
         &self,
         instance_id: &str,
@@ -1575,9 +1586,9 @@ impl Store for PostgresStore {
         // recorded and a pod was heard after the launcher answered: one
         // query while none is pending (review c5c L9). Its launch may have
         // stopped before a pod of it was heard, the next finding it copied
-        // (L6) -- a launch of several pods, on the shared storage; never one
-        // of one pod since, which may run on its own claim with no marker
-        // written (item 89, review c5c86 L3).
+        // (L6) -- a launch on the shared storage; never one since that ran
+        // on its own claim with no marker written (item 89, review c5c86
+        // L3), nor failed (PO item 91, review c5c89 M4).
         let mut conn = self.conn()?;
         let Some(pending) = conn
             .query_opt(
@@ -1592,7 +1603,8 @@ impl Store for PostgresStore {
                     AND NOT EXISTS (SELECT 1 FROM config_plugin_launch later
                                      WHERE later.instance_id = $1
                                        AND later.launched_at_ns > l.launched_at_ns
-                                       AND later.shards <= 1 AND NOT later.standby)",
+                                       AND later.shards <= 1 AND NOT later.standby
+                                       AND NOT later.ran_shared AND later.state <> 3)",
                 &[&instance_id, &reported_at_ns],
             )
             .map_err(unavailable)?

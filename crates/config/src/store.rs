@@ -940,11 +940,18 @@ pub trait Store: Send + Sync {
     /// after the launcher answered, when the earlier pods had ended.
     fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()>;
 
+    /// That the launcher ran an instance's live launch on its shared
+    /// storage, as its reply said (PO item 91): kept on the launch.
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()>;
+
     /// The copy of an instance's latest launch that copied recorded on that
     /// launch, `PluginStorageCopied` at `at_ns`, where none is recorded yet
     /// and a pod of the instance was heard registered at `reported_at_ns`,
     /// after the launcher answered (item 30) -- the launch may have stopped
     /// before a pod of it was heard (review c5c L6): the record, or None.
+    /// None while a later launch, not failed, ran on the instance's own
+    /// claim: its pods say nothing of the copy (item 89; PO item 91, review
+    /// c5c89 M4).
     fn record_storage_copied(
         &self,
         instance_id: &str,

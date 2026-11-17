@@ -3009,6 +3009,85 @@ fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered
     );
 }
 
+/// Review c5c89 M4 and PO item 91 (2026-11-17): only a later launch that
+/// ran on the instance's own claim keeps an earlier launch's copy
+/// unrecorded. One that failed ran nothing, and one that ran as one shard on
+/// the shared storage (`ran_shared`) waited for the copy: the copy is
+/// recorded once a pod is heard, and once only.
+fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(store: &dyn Store) {
+    let ended = |at_ns: i64, state: PluginLaunchState| Ending {
+        prepared_call_id: Default::default(),
+        state,
+        by: "local|ada".into(),
+        delegation: String::new(),
+        client: String::new(),
+        note: String::new(),
+        at_ns,
+        failure: if state == PluginLaunchState::Failed {
+            "refused".into()
+        } else {
+            String::new()
+        },
+    };
+    let copied_by = |instance: &str, later: &dyn Fn(&dyn Store)| {
+        let mut first = launch(instance);
+        first.launched_by = "local|ada".into();
+        first.launched_at_ns = 10;
+        first.shards = 2;
+        assert!(store.begin_launch(&first, "").unwrap());
+        store
+            .pend_storage_copy(
+                instance,
+                &format!("check-meridian-runtime-storage-{instance}"),
+                50,
+            )
+            .unwrap();
+        store
+            .end_launch(instance, &ended(60, PluginLaunchState::Stopped))
+            .unwrap()
+            .unwrap();
+        let mut next = launch(instance);
+        next.launched_by = "local|bo".into();
+        next.launched_at_ns = 100;
+        next.shards = 0;
+        assert!(store.begin_launch(&next, "").unwrap());
+        later(store);
+        store
+            .record_storage_copied(instance, 120, 130)
+            .unwrap()
+            .map(|copied| (copied.launched_by, copied.at_ns))
+    };
+    // A later launch of one pod that failed.
+    assert_eq!(
+        copied_by("feed-4", &|store| {
+            store
+                .end_launch("feed-4", &ended(110, PluginLaunchState::Failed))
+                .unwrap()
+                .unwrap();
+        }),
+        Some(("local|ada".to_string(), 130)),
+        "a failed later launch ran nothing"
+    );
+    // A later launch of one pod, run as one shard on the shared storage.
+    assert_eq!(
+        copied_by("feed-5", &|store| store.keep_ran_shared("feed-5").unwrap()),
+        Some(("local|ada".to_string(), 130)),
+        "a later launch on the shared storage"
+    );
+    assert_eq!(
+        store.record_storage_copied("feed-5", 140, 150).unwrap(),
+        None,
+        "once"
+    );
+    // A later launch of one pod on its own claim: nothing.
+    assert_eq!(copied_by("feed-6", &|_| {}), None, "on its own claim");
+}
+
+#[test]
+fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
+    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store("storage-copied-91"));
+}
+
 #[test]
 fn the_storage_copy_is_recorded_once_in_postgres() {
     a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store(

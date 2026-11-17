@@ -1112,6 +1112,12 @@ impl Plugins {
     /// recorded once a pod of it is heard registered after now, when the
     /// copy is whole.
     fn pend_copy(&self, instance: &str, made: &CreatePluginReply) -> Result<(), String> {
+        // Run on its shared storage, kept on the launch (PO item 91).
+        if made.ran_shared {
+            self.store
+                .keep_ran_shared(instance)
+                .map_err(|f| f.to_string())?;
+        }
         if made.storage_copied_from.is_empty() {
             return Ok(());
         }

@@ -21243,6 +21243,13 @@ pub struct CreatePluginReply {
     /// finished.
     #[prost(string, tag = "2")]
     pub storage_copied_from: ::prost::alloc::string::String,
+    /// Step 3d, checkpoint 5, PO item 91: true where the launcher made the
+    /// instance's pods on its shared storage -- several pods, or one pod as one
+    /// shard of storage shared since it ran as several; false where they run on
+    /// its own claim, or it keeps none. Kept on the launch's record, so only a
+    /// later launch on its own claim keeps a copy unrecorded.
+    #[prost(bool, tag = "3")]
+    pub ran_shared: bool,
 }
 /// A deployment admin allows an edge instance an archive, or changes its
 /// bound, from its Manage page; the conductor records it and restarts the

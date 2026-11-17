@@ -543,6 +543,14 @@ pub fn one_pod_as_shard(mut request: CreatePluginRequest, shared: bool) -> Creat
     request
 }
 
+/// Whether a launch, as the launcher runs it ([`one_pod_as_shard`],
+/// [`shards_template`]), runs on its instance's shared storage: several
+/// pods keeping storage, or one pod as one shard of storage shared since
+/// (PO item 91).
+pub fn runs_shared(claim: Option<&str>, request: &CreatePluginRequest) -> bool {
+    claim.is_some() && several(request)
+}
+
 /// The refusal of an instance of several pods keeping storage where the
 /// chart offers it none to share (item 30): approved by the product owner
 /// as item 69 (2026-11-17).
@@ -1209,7 +1217,8 @@ pub const COPIED_BEFORE: &str = "copied before";
 pub const COPIED_ANNOTATION: &str = "meridian.dev/storage-copied";
 /// On a copy pod: made where the shared claim held no marker -- made with
 /// it, or after a copy that ended `unmarked` -- so it is the first to write
-/// one (item 89, review c5c86 L3).
+/// one (item 89, review c5c86 L3). What was true as it was made: it never
+/// overrides what the pod said as it ended (review c5c89 M5).
 pub const UNMARKED_ANNOTATION: &str = "meridian.dev/storage-unmarked";
 
 /// What the copy pod there says of its instance's shared claim (item 89;
@@ -1223,12 +1232,13 @@ pub enum CopyPod {
     /// The marker is there: the shared claim says so, or the copy pod
     /// ended `copied` or `copied before`.
     Copied,
-    /// No marker: the copy pod ended `unmarked`; or it was made where none
-    /// was and ended, or never ran, short of `marking`; or it was made
-    /// before this shared claim, so wrote nothing into it.
+    /// No marker: the copy pod failed saying `unmarked`, and nothing else
+    /// (PO item 89; review c5c89 M5).
     Unmarked,
-    /// Not known: none there, or one that ended at `marking` or without a
-    /// word. Its marker is read by a copy pod made again.
+    /// Not known: none there; one that failed saying anything but
+    /// `unmarked`, or nothing; one that succeeded without `copied`; one
+    /// Pending past its wait; or one made before this shared claim (stale).
+    /// Its marker is read by a copy pod made again.
     Unknown,
     /// On a lost node: Unknown, or being removed (review c5c86 M2), which
     /// the API server keeps until its node answers or it is force-deleted.
@@ -1256,23 +1266,22 @@ pub fn copy_pod_now(
     let made = pod["metadata"]["creationTimestamp"]
         .as_str()
         .unwrap_or_default();
+    // Made before this shared claim: it says nothing of it (stale).
     if shared["metadata"]["creationTimestamp"]
         .as_str()
         .unwrap_or_default()
         > made
     {
-        return CopyPod::Unmarked;
+        return CopyPod::Unknown;
     }
     let said = pod["status"]["containerStatuses"][0]["state"]["terminated"]["message"]
         .as_str()
         .unwrap_or_default();
-    let made_unmarked = pod["metadata"]["annotations"][UNMARKED_ANNOTATION] == "true";
     match phase {
         "Succeeded" if said == COPIED || said == COPIED_BEFORE => CopyPod::Copied,
         "Running" => CopyPod::Copying,
         "Pending" if !past_the_wait(pod, now_ns) => CopyPod::Copying,
         "Failed" if said == UNMARKED => CopyPod::Unmarked,
-        "Failed" | "Pending" if made_unmarked && said != MARKING => CopyPod::Unmarked,
         _ => CopyPod::Unknown,
     }
 }
@@ -1541,18 +1550,19 @@ fn shared_name_of(own: &str, instance: &str) -> Option<String> {
 /// than run on its own claim without its shards' records (review c5c L4;
 /// item 83).
 ///
-/// Not shared yet where its own claim is kept and its copy never came
-/// (review c5c2fold M2): no pod of it has run on the shared claim, which
-/// they start on only once the copy is whole, so one pod runs on its own
-/// claim as it did. That is a copy pod that failed, one Pending past its
-/// pods' wait (removed here, so it never copies under a pod on the own
-/// claim), or one that copied into a shared claim made since. One that
-/// copied, runs, waits within the wait, is being removed or is not there
-/// -- removed once it copied -- leaves the storage shared.
+/// Not shared yet where its own claim is kept and its copy pod failed
+/// saying `unmarked` (review c5c2fold M2; PO item 89): no pod of it has run
+/// on the shared claim, which they start on only once the copy is whole, so
+/// one pod runs on its own claim as it did. One that copied, runs or waits
+/// within the wait leaves the storage shared; anything else is read again
+/// ([`copied_or_copying`]). `pods` are the instance's launched pods: none
+/// of them may still mount its own claim while a copy pod is made (item 69;
+/// review c5c89 M3).
 pub async fn shared_kept<O: Objects>(
     api: &O,
     shapes: &Shapes,
     request: &CreatePluginRequest,
+    pods: &serde_json::Value,
     now_ns: i64,
 ) -> Result<bool, String> {
     let Some(storage) = shapes.storage.as_ref() else {
@@ -1580,22 +1590,27 @@ pub async fn shared_kept<O: Objects>(
             if !rendered {
                 return Err(no_shared_shape_said(&request.instance_id));
             }
-            copied_or_copying(api, storage, request, &existing, now_ns).await
+            copied_or_copying(api, storage, request, &existing, pods, now_ns).await
         }
     }
 }
 
 /// Whether an instance's shared claim, there, holds its storage now or will
 /// once its copy pod ends ([`shared_kept`]; item 89, review c5c86 M3): the
-/// copy pod read ([`copy_pod_now`]). Copied or copying, shared; unmarked,
-/// not -- no marker, so no shard ever ran on it (item 83) -- and a copy pod
-/// that never ran removed; not known, the copy pod made again to read the
-/// marker, and the launch refused until it ends.
+/// copy pod read ([`copy_pod_now`]). Copied or copying, shared; failed
+/// `unmarked`, not -- no marker, so no shard ever ran on it (item 83) --
+/// and the failed pod left as it is, nothing running in it; not known, the
+/// copy pod made again to read the marker, once none of the instance's
+/// `pods` still mounts its own claim (item 69; review c5c89 M3), and the
+/// launch refused until it ends. A pod removed to be made again is gone
+/// before anything is answered (review c5c89 M2): one still there refuses
+/// the launch ([`make_copy`]).
 async fn copied_or_copying<O: Objects>(
     api: &O,
     storage: &StorageShapes,
     request: &CreatePluginRequest,
     shared: &serde_json::Value,
+    pods: &serde_json::Value,
     now_ns: i64,
 ) -> Result<bool, String> {
     let Some(copy_template) = storage.copy.as_deref() else {
@@ -1618,21 +1633,11 @@ async fn copied_or_copying<O: Objects>(
             mark_copied(api, shared, own).await;
             Ok(true)
         }
-        CopyPod::Unmarked => {
-            if there
-                .as_ref()
-                .is_some_and(|p| p["status"]["phase"] == "Pending")
-            {
-                api.delete(Kind::Pod, &name).await?;
-                tracing::info!(
-                    instance = request.instance_id,
-                    pod = name,
-                    "its copy pod never ran: removed, and its own storage kept"
-                );
-            }
-            Ok(false)
-        }
+        CopyPod::Unmarked => Ok(false),
         CopyPod::Unknown | CopyPod::Lost => {
+            if !holding(pods, own).is_empty() {
+                return Err(still_stopping_said(&request.instance_id));
+            }
             make_copy(api, there.as_ref(), &pod, request).await?;
             Err(reading_copy_said(&request.instance_id))
         }
