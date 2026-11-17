@@ -24,9 +24,9 @@ ACCOUNT = "the launcher's ServiceAccount carries no secrets"
 DEPLOYMENT = "a launched plugin runs under no account, its instance's shards account or the archive's"
 TOKEN = "under its instance's shards account the token is mounted in the sidecar's container alone"
 LAUNCHED = "the launcher touches only the Deployments it launched and the storage it made"
-# Proposed (review c5b L2; PO item 57), pending the PO's word.
-IDENTITY = "PLACEHOLDER L2: the launcher's ServiceAccount carries workload-identity annotations alone"
-KEPT = "PLACEHOLDER 57: a plugin shard's Lease is never deleted: it goes only with its namespace"
+# Review c5b L2 and PO item 57 (PO item 61, 2026-11-17).
+IDENTITY = "the launcher's ServiceAccount carries workload-identity annotations alone"
+KEPT = "a plugin shard's Lease is never deleted: it goes only with its namespace"
 
 # An instance nothing runs as, for what the policy is asked to make.
 PROOF = "account-proof"
@@ -255,18 +255,29 @@ def kept(kubectl, instance: str, shards: int):
     return held
 
 
+# Kubernetes' garbage collector, which deletes a shard's Lease only while
+# its namespace is being deleted (review c5b2 M1).
+COLLECTOR = "system:serviceaccount:kube-system:generic-garbage-collector"
+
+
 def lease_deletes(kubectl, instance: str, store: str):
     """Nobody deletes a shard's Lease, a cluster administrator included (PO
     item 57): asked as this run's own account, by a server-side dry run, in
-    the policy's words; a store's Lease is no shard's, and is not held."""
-    def deleted(name):
-        done = kubectl("delete", "lease", name, "--dry-run=server", check=False, quiet=True)
+    the policy's words; nor the garbage collector while the namespace lives,
+    as it would for an owner planted on the Lease (review c5b2 M1). A
+    store's Lease is no shard's, and is not held."""
+    def deleted(name, *by):
+        done = kubectl("delete", "lease", name, "--dry-run=server", *by, check=False, quiet=True)
         return done.returncode == 0, (done.stderr or b"").decode(errors="replace").strip()[-400:]
 
     refused, why = deleted(f"{instance}-shard-0")
     held = [(not refused and KEPT in why,
              f"accounts: deleting {instance}-shard-0 is refused, a cluster administrator's too, "
              f"in the policy's words ({why})")]
+    refused, why = deleted(f"{instance}-shard-0", f"--as={COLLECTOR}")
+    held.append((not refused and KEPT in why,
+                 f"accounts: the garbage collector may not delete {instance}-shard-0 while its namespace "
+                 f"lives, in the policy's words ({why})"))
     admitted, why = deleted(store)
     held.append((admitted, f"accounts: the guard holds shard Leases alone: {store} is not held ({why})"))
     return held

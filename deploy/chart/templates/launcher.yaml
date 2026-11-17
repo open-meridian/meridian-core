@@ -189,6 +189,12 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["create", "get", "update", "delete"]
+  # Read alone: a stopped instance's pods, ended before their account is
+  # removed, so each sidecar releases its shard's Lease with a live token
+  # (review c5b L5, c5b2 H1).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
   {{- end }}
   {{- if or $shards (include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher)) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
@@ -339,7 +345,8 @@ spec:
 # the launcher's account does to a Deployment, a claim, or an instance's own
 # account, Role or binding (item 31), it is one the launcher made, and of
 # exactly the shape it makes. And nobody deletes a shard's Lease
-# (`<instance>-shard-<n>`), a cluster administrator included: its
+# (`<instance>-shard-<n>`), a cluster administrator included, short of
+# acting as one of Kubernetes' own controllers or removing this policy: its
 # leaseTransitions fence the shard's writes, so it is kept, and goes only
 # with its namespace (PO item 57).
 apiVersion: admissionregistration.k8s.io/v1
@@ -375,15 +382,6 @@ spec:
         request.userInfo.username ==
         "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}" ||
         request.resource.resource == "leases"
-    # But for Kubernetes' own namespace controller and garbage collector --
-    # under the controller manager's own name where it runs without an
-    # account per controller -- so deleting the namespace completes.
-    - name: not-the-namespace-or-garbage-collector
-      expression: >-
-        !(request.userInfo.username in [
-          "system:serviceaccount:kube-system:namespace-controller",
-          "system:serviceaccount:kube-system:generic-garbage-collector",
-          "system:kube-controller-manager"])
   variables:
     # The instance an object is made for, by its label -- an instance's name
     # alone, a host label, else none (review c5b L3: it is read into a
@@ -514,12 +512,25 @@ spec:
           "azure.workload.identity/client-id",
           "azure.workload.identity/tenant-id",
           "azure.workload.identity/service-account-token-expiration"])
-      message: "PLACEHOLDER L2: the launcher's ServiceAccount carries workload-identity annotations alone"
-    # A shard's Lease, by anyone (PO item 57).
+      message: the launcher's ServiceAccount carries workload-identity annotations alone
+    # A shard's Lease, by anyone (PO item 57) -- but Kubernetes' own
+    # namespace controller and garbage collector, under the controller
+    # manager's own name where it runs without an account per controller,
+    # while the namespace is being deleted, so that completes. Never
+    # otherwise: an owner planted on a Lease would have the garbage
+    # collector delete it (review c5b2 M1).
     - expression: >-
         request.resource.resource != "leases" ||
-        !oldObject.metadata.name.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?-shard-[0-9]+$")
-      message: "PLACEHOLDER 57: a plugin shard's Lease is never deleted: it goes only with its namespace"
+        !oldObject.metadata.name.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?-shard-[0-9]+$") ||
+        (
+          request.userInfo.username in [
+            "system:serviceaccount:kube-system:namespace-controller",
+            "system:serviceaccount:kube-system:generic-garbage-collector",
+            "system:kube-controller-manager"] &&
+          namespaceObject != null &&
+          has(namespaceObject.metadata.deletionTimestamp)
+        )
+      message: "a plugin shard's Lease is never deleted: it goes only with its namespace"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

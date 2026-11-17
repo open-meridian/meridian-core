@@ -1209,7 +1209,10 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	    echo "e2e-cluster-failover: the namespace is left for reading. Remove it with:" >&2; \
 	    echo "  kubectl delete namespace $(E2E_FAILOVER_NAMESPACE)" >&2; \
 	  else \
-	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait >/dev/null 2>&1; \
+	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait --timeout=600s >/dev/null 2>&1 || { \
+	      echo "e2e-cluster-failover: the namespace was not deleted within 600 s; a shard's Lease kept past its namespace's deletion would leave it so (PO item 57). Its conditions:" >&2; \
+	      kubectl get namespace $(E2E_FAILOVER_NAMESPACE) -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2; \
+	      held=1; }; \
 	  fi; \
 	  exit $$held
 
@@ -3152,19 +3155,21 @@ chart-check:
 		&& echo "$$ha" | grep -q 'request.resource.resource == "leases"' \
 		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:namespace-controller",' \
 		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:generic-garbage-collector",' \
+		&& echo "$$ha" | grep -q 'has(namespaceObject.metadata.deletionTimestamp)' \
 		&& echo "$$ha" | grep -q 'oldObject.metadata.name.matches("^\[a-z\]' \
 		&& echo "$$ha" | grep -q '(request.operation == "CREATE" ||$$' \
 		&& echo "$$ha" | grep -q 'object.metadata.annotations.all(key, key in \[' \
 		&& echo "$$ha" | grep -q 'variables.labelled.matches(' \
-		|| { echo "chart-check FAILED: the launcher's admission policy does not refuse a shard Lease's delete with the namespace controller and garbage collector exempt (PO item 57), or does not hold an update to what the launcher made, an account's annotations or an instance label to their shape (review c5b L1-L3)" >&2; exit 1; }; \
+		|| { echo "chart-check FAILED: the launcher's admission policy does not refuse a shard Lease's delete with the namespace controller and garbage collector exempt while the namespace is deleted alone (PO item 57, review c5b2 M1), or does not hold an update to what the launcher made, an account's annotations or an instance label to their shape (review c5b L1-L3)" >&2; exit 1; }; \
 	archive="$$(sed -n '/^# An archive for an edge plugin/,/^pluginArchive:/p' deploy/chart/values.yaml)"; \
 	echo "$$archive" | grep -q '<fullname>-shards-<instance>' \
 		&& echo "$$archive" | grep -q 'StringLike' \
 		&& echo "$$archive" | grep -q 'system:serviceaccount:<namespace>:<fullname>-shards-\*' \
-		&& echo "$$archive" | grep -q 'principal set' \
+		&& echo "$$archive" | grep -qF 'svc.id.goog[<namespace>/<fullname>-shards-<instance>]' \
+		&& ! echo "$$archive" | grep -q 'principal set' \
 		&& echo "$$archive" | grep -q 'Azure' \
 		&& echo "$$archive" | grep -q 'Pod Identity' \
-		|| { echo "chart-check FAILED: values.yaml's pluginArchive does not name the <fullname>-shards-<instance> accounts a bucket's identity must trust, and each cloud's step (PO item 60)" >&2; exit 1; }; \
+		|| { echo "chart-check FAILED: values.yaml's pluginArchive does not name the <fullname>-shards-<instance> accounts a bucket's identity must trust, and each cloud's step, GKE's a binding per account (PO items 60, 63)" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=true 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: a sharded instance rendered with storage of its own, which is one pod's" >&2; exit 1; }; \
 	echo "$$said" | grep -q "storage is one pod's" \

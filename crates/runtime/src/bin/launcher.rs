@@ -21,7 +21,7 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    archive_account, checked, claim, identity_of, make_shards_account, manifest,
+    archive_account, checked, claim, identity_of, make_shards_account, manifest, none_left,
     remove_shards_account_once_ended, reusable, several, shards_account_of, shards_objects,
     shards_template, template_for, with_archive, with_limits, with_shards, Kind, Objects, Shapes,
     StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
@@ -296,19 +296,18 @@ impl Launcher {
             None => None,
         };
         let mut removed = false;
+        // Gone at once, so a launch straight after -- a restart with an
+        // archive, a move to another version -- finds none (review c5b2 H1).
         for workload in &mine {
-            // Its pods' sidecars release their shards' Leases as they stop,
-            // with its account's token: deleted in the foreground, its
-            // Deployment is there until they have ended (review c5b L5).
-            removed |= match account {
-                Some(_) => handle.block_on(self.api.delete_deployment_after_its_pods(workload)),
-                None => handle.block_on(self.api.delete_deployment(workload)),
-            }
-            .map_err(|failed| failed.0)?;
+            removed |= handle
+                .block_on(self.api.delete_deployment(workload))
+                .map_err(|failed| failed.0)?;
             tracing::info!(instance = request.instance_id, workload, "a plugin removed");
         }
-        // Its own account, Role and binding, once its pods have ended;
-        // never its Leases (item 31). The stop is answered meanwhile.
+        // Its own account, Role and binding, once its pods have ended --
+        // their sidecars release their shards' Leases as they stop, with its
+        // token (review c5b L5) -- and while no launch of it has been made
+        // since; never its Leases (item 31). The stop is answered meanwhile.
         if let Some(account) = account {
             let launcher = Arc::clone(self);
             let instance = request.instance_id;
@@ -318,13 +317,15 @@ impl Launcher {
                 let ended = || {
                     let selector = selector.clone();
                     async move {
-                        let left = api
+                        let deployments = api
                             .deployments(&selector)
                             .await
                             .map_err(|failed| failed.0)?;
-                        Ok(left["items"]
-                            .as_array()
-                            .is_none_or(|items| items.is_empty()))
+                        let pods = api
+                            .pods_labelled(&selector)
+                            .await
+                            .map_err(|failed| failed.0)?;
+                        Ok(none_left(&deployments, &pods))
                     }
                 };
                 let kube = Kube(api);

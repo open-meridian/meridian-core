@@ -871,12 +871,23 @@ pub async fn remove_shards_account<O: Objects>(
     Ok(removed)
 }
 
+/// Whether nothing of a stopped instance is left: no Deployment of it -- a
+/// launch made since has one -- and none of its pods, which go on after
+/// their Deployment is deleted until each has stopped (review c5b2 H1).
+/// Each a list as the API answers it.
+pub fn none_left(deployments: &serde_json::Value, pods: &serde_json::Value) -> bool {
+    [deployments, pods].iter().all(|list| {
+        list["items"]
+            .as_array()
+            .is_none_or(|items| items.is_empty())
+    })
+}
+
 /// Remove an instance's account, Role and binding once its pods have ended
 /// (review c5b L5): removed while they run, its sidecars' tokens die with
 /// the account, so none can release its shard's Lease and a launch after
-/// waits out a whole lapse. `ended` says whether the instance has no
-/// workload left -- a Deployment deleted in the foreground is there until
-/// its pods have gone -- and is asked every `every`, for `within` at most.
+/// waits out a whole lapse. `ended` says whether nothing of the instance is
+/// left ([`none_left`]), and is asked every `every`, for `within` at most.
 /// Each ask, and the removal after it, is made holding `launching`, which a
 /// launch holds while it makes the account and its Deployment, so a launch
 /// between never loses the account it made. Says what it removed, or None

@@ -989,6 +989,23 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
     });
 }
 
+/// Review c5b2 H1: a stopped instance's Deployment is deleted at once, so a
+/// launch straight after finds none; what is left of it is its pods, still
+/// stopping, and its account waits for them -- and for no launch of it to
+/// have been made since.
+#[test]
+fn a_stopped_instance_is_ended_once_neither_its_deployment_nor_its_pods_are_left() {
+    let none = serde_json::json!({"items": []});
+    let one = serde_json::json!({"items": [{"metadata": {"name": "x"}}]});
+    assert!(none_left(&none, &none));
+    assert!(
+        !none_left(&none, &one),
+        "its pods still stopping after their Deployment went"
+    );
+    assert!(!none_left(&one, &none), "a launch of it made since");
+    assert!(!none_left(&one, &one));
+}
+
 /// Review c5b L2: the workload-identity annotations the launcher copies
 /// are the ones its admission policy admits on an instance's own account.
 #[test]

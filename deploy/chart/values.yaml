@@ -897,8 +897,9 @@ pluginStorage:
 #     StringLike condition on the token's `sub` of
 #     `system:serviceaccount:<namespace>:<fullname>-shards-*`;
 #   - GKE Workload Identity: `roles/iam.workloadIdentityUser` on the Google
-#     service account for the namespace's principal set, or a binding for
-#     each instance's account;
+#     service account, bound for each allowed instance's account alone,
+#     `serviceAccount:<project>.svc.id.goog[<namespace>/<fullname>-shards-<instance>]`
+#     -- never the namespace as a whole, which every pod in it would share;
 #   - Azure Workload Identity: a federated identity credential for each
 #     instance's account; EKS Pod Identity: an association for each.
 pluginArchive:
