@@ -1359,6 +1359,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap();
@@ -1381,6 +1382,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap_err();
@@ -1399,6 +1401,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap_err()
@@ -1427,6 +1430,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        true,
         NOW,
     ))
     .unwrap();
@@ -1474,6 +1478,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
     // Launched again while it copies, or once it has: the pod kept.
     let mut running = pod.clone();
     running["status"]["phase"] = "Running".into();
+    running["metadata"]["creationTimestamp"] = "2026-11-17T10:00:05Z".into();
     cluster.put(Kind::Pod, running);
     let version = cluster
         .of(Kind::Pod, "check-meridian-runtime-storage-copy-snaptrade-1")
@@ -1487,6 +1492,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap();
@@ -1502,6 +1508,8 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
     // (review c5c L6).
     let mut done = pod.clone();
     done["status"]["phase"] = "Succeeded".into();
+    done["status"]["containerStatuses"] =
+        serde_json::json!([{"state": {"terminated": {"exitCode": 0, "message": "copied"}}}]);
     done["metadata"]["creationTimestamp"] = "2026-11-17T10:00:05Z".into();
     cluster.put(Kind::Pod, done);
     let version = cluster
@@ -1516,6 +1524,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap();
@@ -1541,6 +1550,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared_claim("2026-11-17T11:00:00Z"),
+        false,
         NOW,
     ))
     .unwrap();
@@ -1564,6 +1574,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap();
@@ -1580,6 +1591,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_pods(),
         &asked,
         &shared,
+        false,
         NOW,
     ))
     .unwrap_err()
@@ -1734,7 +1746,9 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         NOW,
     ))
     .unwrap();
-    assert_eq!(copied.as_deref(), Some(own_name));
+    // Kept, so its copy pod is made to read the marker, which an earlier
+    // copy may have written: no copy reported (item 89, review c5c86 L3).
+    assert_eq!(copied, None);
     assert_eq!(
         cluster
             .of(Kind::PersistentVolumeClaim, shared_name)
@@ -1830,6 +1844,7 @@ fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
             several_with_storage(),
             &asked,
             &shared,
+            false,
             NOW,
         ))
     };
@@ -1842,10 +1857,8 @@ fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
         let cluster = Cluster::default();
         cluster.put(Kind::Pod, copy_pod_held(made, phase, unschedulable.clone()));
         let (_, copied) = step(&cluster).unwrap();
-        assert_eq!(
-            copied.as_deref(),
-            Some("check-meridian-runtime-storage-snaptrade-1")
-        );
+        // Reported by the launch that made it (item 89, review c5c86 L3).
+        assert_eq!(copied, None);
         assert_eq!(
             cluster.of(Kind::Pod, name).unwrap()["status"]["phase"],
             phase,
@@ -1860,10 +1873,8 @@ fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
         copy_pod_held("2026-11-17T11:00:00Z", "Pending", unschedulable.clone()),
     );
     let (_, copied) = step(&cluster).unwrap();
-    assert_eq!(
-        copied.as_deref(),
-        Some("check-meridian-runtime-storage-snaptrade-1")
-    );
+    // Made again to read the marker: not known to be the first to write it.
+    assert_eq!(copied, None);
     assert!(
         cluster.of(Kind::Pod, name).unwrap()["status"].is_null(),
         "Pending past the wait: made again"
@@ -1895,13 +1906,13 @@ fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
 }
 
 /// Review c5c2fold M2: a copy that never succeeds leaves the instance as it
-/// was. Where its own claim is kept and its copy pod failed (or never ran
-/// within the wait), its storage is not shared yet: one pod runs on its
-/// own claim, ungated, and no copy pod is made for it -- a Pending one is
-/// removed, so it never copies under a pod on its own claim. Shared where
-/// the copy pod has copied into the shared claim there, runs or waits
-/// within the wait, or is not there (removed after it copied); and where
-/// no own claim is kept.
+/// was. Where its own claim is kept and its copy pod ended `unmarked` (or,
+/// made where no marker was, never ran within the wait), its storage is not
+/// shared yet: one pod runs on its own claim, ungated, and no copy pod is
+/// made for it -- a Pending one is removed, so it never copies under a pod
+/// on its own claim. Shared where the copy pod ended `copied`, runs or
+/// waits within the wait; and where no own claim is kept. What is not known
+/// is read ([`item_89_the_copy_pod_says_how_its_copy_ended`]).
 #[test]
 fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
     let mut full = shared_shapes();
@@ -1924,30 +1935,18 @@ fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
     let none = serde_json::json!({});
     for (case, pod, shared) in [
         (
-            "failed",
-            Some(copy_pod_held(
-                "2026-11-17T10:00:01Z",
-                "Failed",
-                none.clone(),
-            )),
+            "failed unmarked",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "unmarked")),
             false,
         ),
         (
-            "Pending past the wait",
-            Some(copy_pod_held(
-                "2026-11-17T11:00:00Z",
-                "Pending",
-                none.clone(),
-            )),
+            "made unmarked, Pending past the wait",
+            Some(unmarked_pending()),
             false,
         ),
         (
             "copied",
-            Some(copy_pod_held(
-                "2026-11-17T10:00:01Z",
-                "Succeeded",
-                none.clone(),
-            )),
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Succeeded", "copied")),
             true,
         ),
         (
@@ -1968,7 +1967,6 @@ fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
             )),
             true,
         ),
-        ("not there", None, true),
     ] {
         let cluster = with(pod);
         assert_eq!(
@@ -1977,11 +1975,12 @@ fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
             "{case}"
         );
     }
-    // Failed: one pod on its own claim, ungated, the failed pod left as it was.
-    let cluster = with(Some(copy_pod_held(
+    // Failed unmarked: one pod on its own claim, ungated, the failed pod
+    // left as it was.
+    let cluster = with(Some(copy_pod_said(
         "2026-11-17T10:00:01Z",
         "Failed",
-        none.clone(),
+        "unmarked",
     )));
     let version = cluster.of(Kind::Pod, name).unwrap()["metadata"]["resourceVersion"].clone();
     let shared = block(shared_kept(&cluster, &full, &one, NOW)).unwrap();
@@ -2005,12 +2004,9 @@ fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
         "no copy pod made for one pod on its own claim"
     );
     assert!(cluster.of(Kind::PersistentVolumeClaim, own_name).is_some());
-    // Pending past the wait: removed, so it never copies under that pod.
-    let cluster = with(Some(copy_pod_held(
-        "2026-11-17T11:00:00Z",
-        "Pending",
-        none.clone(),
-    )));
+    // Made unmarked and Pending past the wait: removed, so it never copies
+    // under that pod.
+    let cluster = with(Some(unmarked_pending()));
     assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(false));
     assert!(cluster.of(Kind::Pod, name).is_none());
     // No own claim kept: shared, whatever its copy pod.
@@ -2051,4 +2047,215 @@ fn the_plugin_is_told_its_instance_s_shard_count_as_its_sidecar_is() {
         with_shards(shape.clone(), &sharded(0, false)).unwrap(),
         shape
     );
+}
+
+/// A copy pod made where no marker was, never run, Pending past the wait.
+fn unmarked_pending() -> serde_json::Value {
+    let mut pod = copy_pod_held("2026-11-17T11:00:00Z", "Pending", serde_json::json!({}));
+    pod["metadata"]["annotations"]["meridian.dev/storage-unmarked"] = "true".into();
+    pod
+}
+
+/// A copy pod held as the API server holds it, ended saying `said` (PO
+/// item 89, revised: its termination message).
+fn copy_pod_said(made: &str, phase: &str, said: &str) -> serde_json::Value {
+    copy_pod_held(
+        made,
+        phase,
+        serde_json::json!({"containerStatuses": [{"name": "copy",
+            "state": {"terminated": {"exitCode": i32::from(phase != "Succeeded"), "message": said}}}]}),
+    )
+}
+
+/// PO item 89 (revised, 2026-11-17; review c5c86 M2, M3, L3): the launcher
+/// reads how the copy ended from what the copy pod said, never from its
+/// absence or its phase alone. `unmarked` (no marker; or a pod made where
+/// none was, that never reached `marking`) leaves one pod on its own claim;
+/// `copied` or `copied before` shares it, kept on the shared claim; anything
+/// else is not known, so the copy pod is made again to read the marker and
+/// the launch refused meanwhile. A launch reports a copy only where its copy
+/// pod is the first to write the marker. A copy pod on a lost node is named,
+/// with its node.
+#[test]
+fn item_89_the_copy_pod_says_how_its_copy_ended() {
+    let mut full = shared_shapes();
+    full.storage.as_mut().unwrap().claim = OWN.into();
+    full.storage.as_mut().unwrap().shared_claim = Some(SHARED.into());
+    let one = request();
+    let name = "check-meridian-runtime-storage-copy-snaptrade-1";
+    let own_name = "check-meridian-runtime-storage-snaptrade-1";
+    let shared_name = "check-meridian-runtime-shared-storage-snaptrade-1";
+    let with = |pod: Option<serde_json::Value>, lost: bool| {
+        let cluster = Cluster {
+            on_a_lost_node: lost,
+            ..Cluster::default()
+        };
+        cluster.put(Kind::PersistentVolumeClaim, claim(OWN, &one).unwrap());
+        let mut shared = claim(SHARED, &one).unwrap();
+        shared["metadata"]["creationTimestamp"] = "2026-11-17T10:00:00Z".into();
+        cluster.put(Kind::PersistentVolumeClaim, shared);
+        if let Some(pod) = pod {
+            cluster.put(Kind::Pod, pod);
+        }
+        cluster
+    };
+    let annotated = |cluster: &Cluster| {
+        cluster
+            .of(Kind::PersistentVolumeClaim, shared_name)
+            .unwrap()["metadata"]["annotations"]["meridian.dev/storage-copied"]
+            .clone()
+    };
+    // One pod. Copied, either way: shared, and kept on the shared claim.
+    for said in ["copied", "copied before"] {
+        let cluster = with(
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Succeeded", said)),
+            false,
+        );
+        assert_eq!(
+            block(shared_kept(&cluster, &full, &one, NOW)),
+            Ok(true),
+            "{said}"
+        );
+        assert_eq!(
+            annotated(&cluster),
+            own_name,
+            "{said}: kept on the shared claim"
+        );
+        // ... so it holds once the copy pod is gone.
+        block(cluster.delete(Kind::Pod, name)).unwrap();
+        assert_eq!(
+            block(shared_kept(&cluster, &full, &one, NOW)),
+            Ok(true),
+            "{said}, gone"
+        );
+        assert!(
+            cluster.of(Kind::Pod, name).is_none(),
+            "{said}: no copy made again"
+        );
+    }
+    // Unmarked: one pod on its own claim (item 83 kept: no marker, so no
+    // shard ever started on the shared claim).
+    let cluster = with(
+        Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "unmarked")),
+        false,
+    );
+    assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(false));
+    assert!(annotated(&cluster).is_null());
+    // A pod made where no marker was, that never ran or failed before
+    // `marking`: unmarked too.
+    for (phase, made, said) in [
+        ("Pending", "2026-11-17T11:00:00Z", ""),
+        ("Failed", "2026-11-17T10:00:01Z", ""),
+    ] {
+        let mut pod = copy_pod_said(made, phase, said);
+        pod["metadata"]["annotations"]["meridian.dev/storage-unmarked"] = "true".into();
+        let cluster = with(Some(pod), false);
+        assert_eq!(
+            block(shared_kept(&cluster, &full, &one, NOW)),
+            Ok(false),
+            "{phase}, made unmarked"
+        );
+    }
+    // Not known -- none there, failed after `marking` or without a word,
+    // succeeded without one, never ran -- so read: the copy pod made again,
+    // the launch refused meanwhile.
+    for (case, pod) in [
+        ("not there", None),
+        (
+            "failed marking",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "marking")),
+        ),
+        (
+            "failed, no word",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "")),
+        ),
+        (
+            "succeeded, no word",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Succeeded", "")),
+        ),
+        (
+            "never ran",
+            Some(copy_pod_said("2026-11-17T11:00:00Z", "Pending", "")),
+        ),
+    ] {
+        let cluster = with(pod, false);
+        let said = block(shared_kept(&cluster, &full, &one, NOW)).unwrap_err();
+        assert_eq!(
+            said, "reading snaptrade-1's copy; launch again once it ends",
+            "{case}"
+        );
+        let made = cluster.of(Kind::Pod, name).expect("made again");
+        assert!(made["status"].is_null(), "{case}: made again");
+        assert!(
+            made["metadata"]["annotations"]["meridian.dev/storage-unmarked"].is_null(),
+            "{case}"
+        );
+    }
+    // On a lost node: named, with its node, and kept.
+    let mut lost = copy_pod_said("2026-11-17T10:00:01Z", "Running", "");
+    lost["metadata"]["deletionTimestamp"] = "2026-11-17T11:58:00Z".into();
+    lost["spec"]["nodeName"] = "node-b".into();
+    let cluster = with(Some(lost), true);
+    let said = block(shared_kept(&cluster, &full, &one, NOW)).unwrap_err();
+    assert!(said.contains(name) && said.contains("node-b"), "{said}");
+    assert!(!cluster.of(Kind::Pod, name).unwrap()["status"].is_null());
+    // Several pods (L3): a copy reported only where this launch's copy pod
+    // is the first to write the marker -- the shared claim made now, or an
+    // unmarked copy there -- and that pod made knowing it.
+    let asked = sharded(2, true);
+    let several = |cluster: &Cluster| {
+        block(storage_and_copy(
+            cluster,
+            &full,
+            SHARED,
+            &pod_list(&[]),
+            several_with_storage(),
+            &asked,
+            NOW,
+        ))
+        .map(|(_, copied)| copied)
+    };
+    let fresh = Cluster::default();
+    fresh.put(Kind::PersistentVolumeClaim, claim(OWN, &asked).unwrap());
+    assert_eq!(
+        several(&fresh),
+        Ok(Some(own_name.to_string())),
+        "the shared claim made now"
+    );
+    assert_eq!(
+        fresh.of(Kind::Pod, name).unwrap()["metadata"]["annotations"]
+            ["meridian.dev/storage-unmarked"],
+        "true"
+    );
+    let cluster = with(
+        Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "unmarked")),
+        false,
+    );
+    assert_eq!(
+        several(&cluster),
+        Ok(Some(own_name.to_string())),
+        "unmarked there"
+    );
+    for (case, pod) in [
+        ("not there", None),
+        (
+            "failed marking",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Failed", "marking")),
+        ),
+        (
+            "copied",
+            Some(copy_pod_said("2026-11-17T10:00:01Z", "Succeeded", "copied")),
+        ),
+        (
+            "copied before",
+            Some(copy_pod_said(
+                "2026-11-17T10:00:01Z",
+                "Succeeded",
+                "copied before",
+            )),
+        ),
+    ] {
+        let cluster = with(pod, false);
+        assert_eq!(several(&cluster), Ok(None), "{case}: no copy reported");
+    }
 }

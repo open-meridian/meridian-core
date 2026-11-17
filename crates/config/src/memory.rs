@@ -802,6 +802,17 @@ impl Store for MemoryStore {
         else {
             return Ok(None);
         };
+        // A later launch of one pod may run on its own claim, its pods
+        // heard with no marker written: they say nothing of the copy (item
+        // 89, review c5c86 L3).
+        if state.catalogue.launches.iter().any(|held| {
+            held.instance_id == instance_id
+                && held.launched_at_ns > launched_at_ns
+                && held.shards <= 1
+                && !held.standby
+        }) {
+            return Ok(None);
+        }
         let Some(launch) =
             state.catalogue.launches.iter_mut().find(|held| {
                 held.instance_id == instance_id && held.launched_at_ns == launched_at_ns

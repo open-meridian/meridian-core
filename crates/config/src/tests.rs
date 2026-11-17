@@ -4540,6 +4540,9 @@ mod storage_copied {
             .unwrap();
         launch.launched_at_ns = 100;
         launch.launched_by = "local|bo".into();
+        // As several pods: on the shared storage, so its pod is heard only once
+        // the marker is there.
+        launch.shards = 2;
         assert!(store.begin_launch(&launch, "").unwrap());
         let theirs = store.record_storage_copied("feed-2", 120, 130).unwrap();
         assert_eq!(
@@ -4557,6 +4560,27 @@ mod storage_copied {
         };
         assert_eq!(on_2(10), theirs);
         assert_eq!(on_2(100), None);
+        // A launch that copied, whose copy never wrote the marker, stopped; the
+        // next as one pod, on its own claim: its pod heard says nothing of the
+        // copy, so none is recorded (item 89, review c5c86 L3).
+        launch.instance_id = "feed-3".into();
+        launch.launched_at_ns = 10;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-3", "check-meridian-runtime-storage-feed-3", 50)
+            .unwrap();
+        store
+            .end_launch("feed-3", &stopped_at(60))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 100;
+        launch.shards = 0;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        assert_eq!(
+            store.record_storage_copied("feed-3", 120, 130).unwrap(),
+            None,
+            "a later launch of one pod"
+        );
     }
 
     #[test]

@@ -416,6 +416,10 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
                           ('m.mountPath == "/var/lib/meridian/copy/to"', "the shared claim at its own path"),
                           ("has(t.tolerationSeconds)", "tolerations that end"),
                           ("!has(object.spec.containers[0].ports)", "no ports"),
+                          # Item 89: a claim changed only to mark the shared
+                          # claim as holding its copy.
+                          ('object.metadata.annotations.all(k, k == "meridian.dev/storage-copied" ||',
+                           "a claim marked as holding its copy, and nothing else of it changed"),
                           ("!has(object.spec.containers[0].lifecycle)", "no lifecycle hook"),
                           ("!has(object.spec.nodeName)", "no node named"),
                           ('oldObject.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy"',

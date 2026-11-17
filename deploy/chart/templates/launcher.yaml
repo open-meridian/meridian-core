@@ -213,7 +213,9 @@ rules:
   {{- if .Values.pluginStorage.enabled }}
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get"]
+    # update: an instance's shared claim marked as holding its copy (item
+    # 89), which its admission policy holds it to.
+    verbs: ["create", "get", "update"]
   {{- end }}
   {{- if $shards }}
   # An instance of several pods' own account, its Role naming its shards'
@@ -612,6 +614,28 @@ spec:
              (m.name == "to" && m.mountPath == "/var/lib/meridian/copy/to")))
         )
       message: the launcher's one pod copies its instance's own storage into its shared storage, as the chart's shape
+    # The one change it makes to a claim (item 89): its instance's shared
+    # claim marked as holding the copy of its own claim, once a copy pod
+    # said so -- that annotation alone added, nothing else of the claim
+    # changed.
+    - expression: >-
+        request.resource.resource != "persistentvolumeclaims" ||
+        request.operation != "UPDATE" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance &&
+          object.spec == oldObject.spec &&
+          object.metadata.labels == oldObject.metadata.labels &&
+          has(object.metadata.annotations) &&
+          object.metadata.annotations[?"meridian.dev/storage-copied"].orValue("") ==
+            {{ printf "%s-storage-" $full | quote }} + variables.instance &&
+          object.metadata.annotations.all(k, k == "meridian.dev/storage-copied" ||
+            (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations &&
+             oldObject.metadata.annotations[k] == object.metadata.annotations[k])) &&
+          (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k,
+            k in object.metadata.annotations))
+        )
+      message: the launcher changes a claim it made only to mark its instance's shared claim as holding its copy
     # An instance's own account (item 31), of exactly the shape the launcher
     # makes: the Role's one rule, `get` and `update` on Leases named
     # `<instance>-shard-<n>` alone, the instance read from its label; the

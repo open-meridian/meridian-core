@@ -1194,50 +1194,86 @@ pub fn still_stopping_said(instance: &str) -> String {
     )
 }
 
-/// What becomes of a copy pod already there, by its phase: kept while it
-/// runs, made again once it failed; once it has copied, kept -- done --
-/// where it copied into the shared claim there now, and made again where
-/// that claim was made since, so holds no marker (review c5c L3). One that
-/// never ends is made again too, as the instance's pods say once they stop
-/// waiting (review c5c2fold M1): Pending past their wait
-/// ([`copy::WAIT_LIMIT`]), Unknown on a lost node, or being removed -- each
-/// asked to go, and made again once the API server has removed it, which
-/// for a pod on a lost node is not until the node returns or the pod is
-/// force-deleted; until then the launch is refused, saying so (review
-/// c5c86 M2, held for the product owner). One Running is kept however
-/// long, a copy of much storage.
+/// The words the SDK's `meridian-storage copy` ends with, its termination
+/// message, each written before the step it names (PO item 89, revised,
+/// 2026-11-17): no marker found, before anything is copied; the marker
+/// about to be written; copied; the marker there already, nothing written.
+pub const UNMARKED: &str = "unmarked";
+pub const MARKING: &str = "marking";
+pub const COPIED: &str = "copied";
+pub const COPIED_BEFORE: &str = "copied before";
+
+/// On an instance's shared claim: the own claim copied into it, kept once
+/// the launcher has read a copy pod that ended `copied` or `copied before`,
+/// so it holds once that pod is gone (item 89).
+pub const COPIED_ANNOTATION: &str = "meridian.dev/storage-copied";
+/// On a copy pod: made where the shared claim held no marker -- made with
+/// it, or after a copy that ended `unmarked` -- so it is the first to write
+/// one (item 89, review c5c86 L3).
+pub const UNMARKED_ANNOTATION: &str = "meridian.dev/storage-unmarked";
+
+/// What the copy pod there says of its instance's shared claim (item 89;
+/// review c5c86 M3): read from what it said as it ended, never from its
+/// absence or its phase alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyPod {
-    Make,
-    Keep,
-    Done,
-    Remake,
+    /// Copying: Pending within its pods' wait ([`copy::WAIT_LIMIT`]), or
+    /// Running however long, a copy of much storage.
+    Copying,
+    /// The marker is there: the shared claim says so, or the copy pod
+    /// ended `copied` or `copied before`.
+    Copied,
+    /// No marker: the copy pod ended `unmarked`; or it was made where none
+    /// was and ended, or never ran, short of `marking`; or it was made
+    /// before this shared claim, so wrote nothing into it.
+    Unmarked,
+    /// Not known: none there, or one that ended at `marking` or without a
+    /// word. Its marker is read by a copy pod made again.
+    Unknown,
+    /// On a lost node: Unknown, or being removed (review c5c86 M2), which
+    /// the API server keeps until its node answers or it is force-deleted.
+    Lost,
 }
 
-/// `shared_since` is the shared claim's `creationTimestamp` (RFC 3339, as
-/// the API server writes it, so ordered as text).
-/// `now_ns` is the moment of the launch.
-pub fn copy_pod_now(there: Option<&serde_json::Value>, shared_since: &str, now_ns: i64) -> CopyPod {
-    let Some(pod) = there else {
-        return CopyPod::Make;
-    };
-    if !pod["metadata"]["deletionTimestamp"].is_null() {
-        return CopyPod::Remake;
+/// The copy pod `there` read against the shared claim `shared` (its
+/// `creationTimestamp` RFC 3339, as the API server writes it, so ordered
+/// as text), at `now_ns`, the moment of the launch.
+pub fn copy_pod_now(
+    there: Option<&serde_json::Value>,
+    shared: &serde_json::Value,
+    now_ns: i64,
+) -> CopyPod {
+    if !shared["metadata"]["annotations"][COPIED_ANNOTATION].is_null() {
+        return CopyPod::Copied;
     }
-    match pod["status"]["phase"].as_str().unwrap_or_default() {
-        "Failed" | "Unknown" => CopyPod::Remake,
-        "Pending" if past_the_wait(pod, now_ns) => CopyPod::Remake,
-        "Succeeded" => {
-            let made = pod["metadata"]["creationTimestamp"]
-                .as_str()
-                .unwrap_or_default();
-            if shared_since > made {
-                CopyPod::Remake
-            } else {
-                CopyPod::Done
-            }
-        }
-        _ => CopyPod::Keep,
+    let Some(pod) = there else {
+        return CopyPod::Unknown;
+    };
+    let phase = pod["status"]["phase"].as_str().unwrap_or_default();
+    if !pod["metadata"]["deletionTimestamp"].is_null() || phase == "Unknown" {
+        return CopyPod::Lost;
+    }
+    let made = pod["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default();
+    if shared["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default()
+        > made
+    {
+        return CopyPod::Unmarked;
+    }
+    let said = pod["status"]["containerStatuses"][0]["state"]["terminated"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    let made_unmarked = pod["metadata"]["annotations"][UNMARKED_ANNOTATION] == "true";
+    match phase {
+        "Succeeded" if said == COPIED || said == COPIED_BEFORE => CopyPod::Copied,
+        "Running" => CopyPod::Copying,
+        "Pending" if !past_the_wait(pod, now_ns) => CopyPod::Copying,
+        "Failed" if said == UNMARKED => CopyPod::Unmarked,
+        "Failed" | "Pending" if made_unmarked && said != MARKING => CopyPod::Unmarked,
+        _ => CopyPod::Unknown,
     }
 }
 
@@ -1279,12 +1315,14 @@ pub fn copy_refused(
 /// The copy step (item 30), before the Deployment of an instance of
 /// several pods keeping storage is made: where the launcher kept the
 /// instance's own claim -- for the same plugin, never another's -- and none
-/// of the instance's earlier pods still mounts it, the copy pod made (or
-/// kept, or made again once failed, or into a shared claim made since), and
-/// the Deployment's pods held until it has copied. Says which claim this
-/// launch copies; none where none is kept, or where it was copied before
-/// into the shared claim there, `shared` (review c5c L6), so the record
-/// of the copy is the launch's that copied.
+/// of the instance's earlier pods still mounts it, the copy pod read
+/// ([`copy_pod_now`]) and kept, or made (again) to copy or to read the
+/// marker, and the Deployment's pods held until the marker is there. Says
+/// which claim this launch copies only where its copy pod is the first to
+/// write the marker -- the shared claim `fresh`, made by this launch, or an
+/// unmarked copy there -- so the conductor's record of the copy is a copy's
+/// that copied, never one that found it `copied before` (item 89, review
+/// c5c86 L3).
 #[allow(clippy::too_many_arguments)]
 pub async fn copy_step<O: Objects>(
     api: &O,
@@ -1294,6 +1332,7 @@ pub async fn copy_step<O: Objects>(
     manifest: serde_json::Value,
     request: &CreatePluginRequest,
     shared: &serde_json::Value,
+    fresh: bool,
     now_ns: i64,
 ) -> Result<(serde_json::Value, Option<String>), String> {
     let Some(claim) = copy_refused(own, pods, request)? else {
@@ -1304,32 +1343,96 @@ pub async fn copy_step<O: Objects>(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let since = shared["metadata"]["creationTimestamp"]
-        .as_str()
-        .unwrap_or_default();
-    let copies = match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref(), since, now_ns) {
-        CopyPod::Keep => true,
-        CopyPod::Done => false,
-        CopyPod::Make => {
-            if !api.create(Kind::Pod, &pod).await? {
-                return Err(format!(
-                    "{name} was made by another meanwhile; launch again"
-                ));
-            }
+    let there = api.get(Kind::Pod, &name).await?;
+    let now = match copy_pod_now(there.as_ref(), shared, now_ns) {
+        CopyPod::Lost => CopyPod::Lost,
+        _ if fresh => CopyPod::Unmarked,
+        now => now,
+    };
+    let copies = match now {
+        CopyPod::Copying => false,
+        CopyPod::Copied => {
+            mark_copied(api, shared, &claim).await;
+            false
+        }
+        CopyPod::Unmarked => {
+            let mut first = pod.clone();
+            first["metadata"]["annotations"][UNMARKED_ANNOTATION] = "true".into();
+            make_copy(api, there.as_ref(), &first, request).await?;
             true
         }
-        CopyPod::Remake => {
-            api.delete(Kind::Pod, &name).await?;
-            if !api.create(Kind::Pod, &pod).await? {
-                return Err(format!(
-                    "{name} failed and is still being removed; launch again in a moment"
-                ));
-            }
-            true
+        CopyPod::Unknown | CopyPod::Lost => {
+            make_copy(api, there.as_ref(), &pod, request).await?;
+            false
         }
     };
     let manifest = with_gate(manifest, copied_gate(&pod)?)?;
     Ok((manifest, copies.then_some(claim)))
+}
+
+/// The copy pod `pod` made, the one `there` removed first. One being
+/// removed from a lost node stays until that node answers or an
+/// administrator force-deletes it (review c5c86 M2): the launch is refused,
+/// naming it and its node.
+async fn make_copy<O: Objects>(
+    api: &O,
+    there: Option<&serde_json::Value>,
+    pod: &serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<(), String> {
+    let name = pod["metadata"]["name"].as_str().unwrap_or_default();
+    if let Some(there) = there {
+        let lost = !there["metadata"]["deletionTimestamp"].is_null()
+            || there["status"]["phase"] == "Unknown";
+        api.delete(Kind::Pod, name).await?;
+        if let Some(still) = api.get(Kind::Pod, name).await? {
+            return Err(if lost {
+                lost_copy_said(&request.instance_id, name, &still)
+            } else {
+                format!("{name} is still being removed; launch again in a moment")
+            });
+        }
+    }
+    if !api.create(Kind::Pod, pod).await? {
+        return Err(format!(
+            "{name} was made by another meanwhile; launch again"
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of a launch whose copy pod is being removed from a node
+/// that does not answer (review c5c86 M2).
+pub fn lost_copy_said(instance: &str, name: &str, pod: &serde_json::Value) -> String {
+    let node = pod["spec"]["nodeName"].as_str().unwrap_or("no node");
+    format!(
+        "{name}, {instance}'s storage copy, is still being removed from {node}, which has not \
+         said it stopped; once an administrator has confirmed {node} is down and force-deleted \
+         {name}, launch again"
+    )
+}
+
+/// The refusal of a launch of one pod while its copy pod reads whether its
+/// copy was made (item 89).
+pub fn reading_copy_said(instance: &str) -> String {
+    format!("reading {instance}'s copy; launch again once it ends")
+}
+
+/// The shared claim `shared` marked as holding `from`'s copy, where it is
+/// not yet: kept so once the copy pod is gone (item 89). Best effort: the
+/// copy pod still says so where the write is refused.
+async fn mark_copied<O: Objects>(api: &O, shared: &serde_json::Value, from: &str) {
+    if !shared["metadata"]["annotations"][COPIED_ANNOTATION].is_null() {
+        return;
+    }
+    let mut marked = shared.clone();
+    marked["metadata"]["annotations"][COPIED_ANNOTATION] = from.into();
+    if let Err(failed) = api.replace(Kind::PersistentVolumeClaim, &marked).await {
+        tracing::warn!(
+            claim = shared["metadata"]["name"].as_str().unwrap_or_default(),
+            "its copy was not kept on it: {failed}"
+        );
+    }
 }
 
 /// The refusal of an instance of several pods whose shared storage, kept,
@@ -1483,7 +1586,11 @@ pub async fn shared_kept<O: Objects>(
 }
 
 /// Whether an instance's shared claim, there, holds its storage now or will
-/// once its copy pod ends ([`shared_kept`], review c5c2fold M2).
+/// once its copy pod ends ([`shared_kept`]; item 89, review c5c86 M3): the
+/// copy pod read ([`copy_pod_now`]). Copied or copying, shared; unmarked,
+/// not -- no marker, so no shard ever ran on it (item 83) -- and a copy pod
+/// that never ran removed; not known, the copy pod made again to read the
+/// marker, and the launch refused until it ends.
 async fn copied_or_copying<O: Objects>(
     api: &O,
     storage: &StorageShapes,
@@ -1499,34 +1606,36 @@ async fn copied_or_copying<O: Objects>(
     if api.get(Kind::PersistentVolumeClaim, own).await?.is_none() {
         return Ok(true);
     }
-    let name = copy_pod(copy_template, request)?["metadata"]["name"]
+    let pod = copy_pod(copy_template, request)?;
+    let name = pod["metadata"]["name"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let Some(pod) = api.get(Kind::Pod, &name).await? else {
-        return Ok(true);
-    };
-    let since = shared["metadata"]["creationTimestamp"]
-        .as_str()
-        .unwrap_or_default();
-    if copy_pod_now(Some(&pod), since, now_ns) != CopyPod::Remake {
-        return Ok(true);
-    }
-    let removing = !pod["metadata"]["deletionTimestamp"].is_null();
-    match pod["status"]["phase"].as_str().unwrap_or_default() {
-        // It may still run, on a node out of reach.
-        "Unknown" | "Running" => Ok(true),
-        _ if removing => Ok(true),
-        "Pending" => {
-            api.delete(Kind::Pod, &name).await?;
-            tracing::info!(
-                instance = request.instance_id,
-                pod = name,
-                "its copy pod never ran within its pods' wait: removed, and its own storage kept"
-            );
+    let there = api.get(Kind::Pod, &name).await?;
+    match copy_pod_now(there.as_ref(), shared, now_ns) {
+        CopyPod::Copying => Ok(true),
+        CopyPod::Copied => {
+            mark_copied(api, shared, own).await;
+            Ok(true)
+        }
+        CopyPod::Unmarked => {
+            if there
+                .as_ref()
+                .is_some_and(|p| p["status"]["phase"] == "Pending")
+            {
+                api.delete(Kind::Pod, &name).await?;
+                tracing::info!(
+                    instance = request.instance_id,
+                    pod = name,
+                    "its copy pod never ran: removed, and its own storage kept"
+                );
+            }
             Ok(false)
         }
-        _ => Ok(false),
+        CopyPod::Unknown | CopyPod::Lost => {
+            make_copy(api, there.as_ref(), &pod, request).await?;
+            Err(reading_copy_said(&request.instance_id))
+        }
     }
 }
 
@@ -1564,6 +1673,15 @@ pub async fn storage_and_copy<O: Objects>(
         ));
     }
     copy_refused(own.as_ref(), pods, request)?;
+    // Made by this launch: no marker in it yet (item 89).
+    let wanted = claim(claim_template, request)?;
+    let fresh = api
+        .get(
+            Kind::PersistentVolumeClaim,
+            wanted["metadata"]["name"].as_str().unwrap_or_default(),
+        )
+        .await?
+        .is_none();
     let held = storage(api, claim_template, request).await?;
     match copying {
         Some(copy_template) => {
@@ -1575,6 +1693,7 @@ pub async fn storage_and_copy<O: Objects>(
                 manifest,
                 request,
                 &held,
+                fresh,
                 now_ns,
             )
             .await

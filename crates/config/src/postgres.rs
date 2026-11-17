@@ -1575,7 +1575,9 @@ impl Store for PostgresStore {
         // recorded and a pod was heard after the launcher answered: one
         // query while none is pending (review c5c L9). Its launch may have
         // stopped before a pod of it was heard, the next finding it copied
-        // (L6).
+        // (L6) -- a launch of several pods, on the shared storage; never one
+        // of one pod since, which may run on its own claim with no marker
+        // written (item 89, review c5c86 L3).
         let mut conn = self.conn()?;
         let Some(pending) = conn
             .query_opt(
@@ -1586,7 +1588,11 @@ impl Store for PostgresStore {
                                              WHERE instance_id = $1 AND storage_copied_from <> '')
                     AND NOT EXISTS (SELECT 1 FROM config_plugin_storage_copied c
                                      WHERE c.instance_id = $1
-                                       AND c.launched_at_ns = l.launched_at_ns)",
+                                       AND c.launched_at_ns = l.launched_at_ns)
+                    AND NOT EXISTS (SELECT 1 FROM config_plugin_launch later
+                                     WHERE later.instance_id = $1
+                                       AND later.launched_at_ns > l.launched_at_ns
+                                       AND later.shards <= 1 AND NOT later.standby)",
                 &[&instance_id, &reported_at_ns],
             )
             .map_err(unavailable)?
