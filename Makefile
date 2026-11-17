@@ -3170,8 +3170,9 @@ chart-check:
 	echo "$$alone" | grep -q '^  name: check-meridian-runtime-shard-leases$$' \
 		&& echo "$$alone" | grep -q "a plugin shard's Lease is never deleted: it goes only with its namespace" \
 		|| { echo "chart-check FAILED: a sharded sidecars[] entry's Leases render without their delete guard where the launcher does not (PO item 57, review c5b2 L2)" >&2; exit 1; }; \
-	$(HELM_TEMPLATE) check deploy/chart $$base --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null \
-		| grep -q 'check-meridian-runtime-shard-leases' \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: the default profile with ValidatingAdmissionPolicy did not render: $$plain" >&2; exit 1; }; \
+	echo "$$plain" | grep -q 'check-meridian-runtime-shard-leases' \
 		&& { echo "chart-check FAILED: the shard Leases' delete guard renders where no shard Lease does" >&2; exit 1; }; \
 	archive="$$(sed -n '/^# An archive for an edge plugin/,/^pluginArchive:/p' deploy/chart/values.yaml)"; \
 	echo "$$archive" | grep -q '<fullname>-shards-<instance>' \

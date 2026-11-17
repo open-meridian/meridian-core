@@ -871,51 +871,132 @@ pub async fn remove_shards_account<O: Objects>(
     Ok(removed)
 }
 
-/// Whether nothing of a stopped instance is left: no Deployment of it -- a
-/// launch made since has one -- and none of its pods, which go on after
-/// their Deployment is deleted until each has stopped (review c5b2 H1).
-/// Each a list as the API answers it.
-pub fn none_left(deployments: &serde_json::Value, pods: &serde_json::Value) -> bool {
-    [deployments, pods].iter().all(|list| {
-        list["items"]
-            .as_array()
-            .is_none_or(|items| items.is_empty())
-    })
+/// What is left of a stopped instance (review c5b2 H1, c5b3 L2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// Nothing: no Deployment of it, and none of its pods.
+    Nothing,
+    /// Its pods, still stopping after their Deployment was deleted.
+    Pods,
+    /// A Deployment of it: a launch made since the stop.
+    Relaunched,
+}
+
+/// What became of a stopped instance's account (review c5b L5, c5b3 L2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// Removed once its pods had ended: what was removed.
+    Removed(Vec<Kind>),
+    /// Kept: a launch of the instance made since writes it over, and is
+    /// the account's now.
+    Relaunched,
+    /// Kept: its pods had not ended in time; a later launch writes it over.
+    Stopping,
+}
+
+/// The cluster's workloads, as far as stopping an instance needs them; the
+/// real one is the in-cluster API server, and tests stand one in memory.
+pub trait Workloads: Send + Sync {
+    /// The Deployments carrying `selector`, as a list.
+    fn deployments(
+        &self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, String>> + Send;
+    /// The pods carrying `selector`, as a list.
+    fn pods(
+        &self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Delete a Deployment at once, its pods left to stop on their own:
+    /// false where it was not there.
+    fn delete_deployment(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+}
+
+fn launched_of(instance: &str) -> String {
+    format!(
+        "{},{}={instance}",
+        crate::launched::LAUNCHED_SELECTOR,
+        crate::launched::INSTANCE_LABEL
+    )
+}
+
+fn names(list: &serde_json::Value) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["metadata"]["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// Stop an instance the launcher launched: each of its Deployments deleted
+/// at once, so a launch straight after -- a restart with an archive, a move
+/// to another version -- finds none (review c5b2 H1); its pods stop on their
+/// own. Says which were deleted.
+pub async fn stop_launched<W: Workloads>(api: &W, instance: &str) -> Result<Vec<String>, String> {
+    let mut deleted = Vec::new();
+    for name in names(&api.deployments(&launched_of(instance)).await?) {
+        if api.delete_deployment(&name).await? {
+            deleted.push(name);
+        }
+    }
+    Ok(deleted)
+}
+
+/// What is left of a stopped instance the launcher launched: a Deployment
+/// of it is a launch made since; else its pods, until each has stopped.
+pub async fn left_of<W: Workloads>(api: &W, instance: &str) -> Result<Left, String> {
+    let selector = launched_of(instance);
+    if !names(&api.deployments(&selector).await?).is_empty() {
+        return Ok(Left::Relaunched);
+    }
+    if !names(&api.pods(&selector).await?).is_empty() {
+        return Ok(Left::Pods);
+    }
+    Ok(Left::Nothing)
 }
 
 /// Remove an instance's account, Role and binding once its pods have ended
 /// (review c5b L5): removed while they run, its sidecars' tokens die with
 /// the account, so none can release its shard's Lease and a launch after
-/// waits out a whole lapse. `ended` says whether nothing of the instance is
-/// left ([`none_left`]), and is asked every `every`, for `within` at most.
-/// Each ask, and the removal after it, is made holding `launching`, which a
-/// launch holds while it makes the account and its Deployment, so a launch
-/// between never loses the account it made. Says what it removed, or None
-/// where the pods had not ended in time: the account is then kept, and a
-/// later launch of the instance writes it over.
-pub async fn remove_shards_account_once_ended<O, F, Ended>(
+/// waits out a whole lapse. `left` says what is left of the instance
+/// ([`left_of`]), and is asked every `every`, for `within` at most; a
+/// launch of it made since ends the wait at once, the account the new
+/// launch's (review c5b3 L2). Each ask, and the removal after it, is made
+/// holding `launching`, which a launch holds while it makes the account and
+/// its Deployment, so a launch between never loses the account it made.
+pub async fn remove_shards_account_once_ended<O, F, Asked>(
     api: &O,
     account: &str,
     launching: &tokio::sync::Mutex<()>,
-    mut ended: F,
+    mut left: F,
     every: std::time::Duration,
     within: std::time::Duration,
-) -> Result<Option<Vec<Kind>>, String>
+) -> Result<Removal, String>
 where
     O: Objects,
-    F: FnMut() -> Ended,
-    Ended: std::future::Future<Output = Result<bool, String>>,
+    F: FnMut() -> Asked,
+    Asked: std::future::Future<Output = Result<Left, String>>,
 {
     let until = tokio::time::Instant::now() + within;
     loop {
         {
             let _launching = launching.lock().await;
-            if ended().await? {
-                return remove_shards_account(api, account).await.map(Some);
+            match left().await? {
+                Left::Nothing => {
+                    return remove_shards_account(api, account)
+                        .await
+                        .map(Removal::Removed)
+                }
+                Left::Relaunched => return Ok(Removal::Relaunched),
+                Left::Pods => {}
             }
         }
         if tokio::time::Instant::now() >= until {
-            return Ok(None);
+            return Ok(Removal::Stopping);
         }
         tokio::time::sleep(every).await;
     }

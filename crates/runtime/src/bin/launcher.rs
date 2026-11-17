@@ -21,10 +21,10 @@ use meridian_domain::v1::{
 use meridian_first_run::cluster::ApiServer;
 use meridian_runtime::launched::{DATASETS_ANNOTATION, INSTANCE_LABEL, LAUNCHED_SELECTOR};
 use meridian_runtime::launcher::{
-    archive_account, checked, claim, identity_of, make_shards_account, manifest, none_left,
+    archive_account, checked, claim, identity_of, left_of, make_shards_account, manifest,
     remove_shards_account_once_ended, reusable, several, shards_account_of, shards_objects,
-    shards_template, template_for, with_archive, with_limits, with_shards, Kind, Objects, Shapes,
-    StorageShapes, CREATE_PLUGIN, REMOVE_PLUGIN,
+    shards_template, stop_launched, template_for, with_archive, with_limits, with_shards, Kind,
+    Objects, Removal, Shapes, StorageShapes, Workloads, CREATE_PLUGIN, REMOVE_PLUGIN,
 };
 use meridian_runtime::{bus_from_env, required, shutdown, var, Ready};
 use prost::Message;
@@ -82,6 +82,27 @@ impl Objects for Kube<'_> {
 /// (review c5b L5): well past a pod's grace period to stop.
 const ENDED_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 const ENDED_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl Workloads for Kube<'_> {
+    async fn deployments(&self, selector: &str) -> Result<serde_json::Value, String> {
+        self.0
+            .deployments(selector)
+            .await
+            .map_err(|failed| failed.0)
+    }
+    async fn pods(&self, selector: &str) -> Result<serde_json::Value, String> {
+        self.0
+            .pods_labelled(selector)
+            .await
+            .map_err(|failed| failed.0)
+    }
+    async fn delete_deployment(&self, name: &str) -> Result<bool, String> {
+        self.0
+            .delete_deployment(name)
+            .await
+            .map_err(|failed| failed.0)
+    }
+}
 
 struct Launcher {
     api: ApiServer,
@@ -287,7 +308,6 @@ impl Launcher {
 
     fn remove(self: &Arc<Self>, request: RemovePluginRequest) -> Result<RemovePluginReply, String> {
         let handle = tokio::runtime::Handle::current();
-        let mine = self.existing(&request.instance_id, &format!("{LAUNCHED_SELECTOR},"))?;
         // An instance of several pods has its own account (item 31).
         let account = match shards_account_of(self.shapes.shards.as_deref(), &request.instance_id) {
             Some(account) => handle
@@ -295,56 +315,44 @@ impl Launcher {
                 .map(|_| account),
             None => None,
         };
-        let mut removed = false;
         // Gone at once, so a launch straight after -- a restart with an
         // archive, a move to another version -- finds none (review c5b2 H1).
-        for workload in &mine {
-            removed |= handle
-                .block_on(self.api.delete_deployment(workload))
-                .map_err(|failed| failed.0)?;
+        let gone = handle.block_on(stop_launched(&Kube(&self.api), &request.instance_id))?;
+        for workload in &gone {
             tracing::info!(instance = request.instance_id, workload, "a plugin removed");
         }
+        let removed = !gone.is_empty();
         // Its own account, Role and binding, once its pods have ended --
         // their sidecars release their shards' Leases as they stop, with its
-        // token (review c5b L5) -- and while no launch of it has been made
-        // since; never its Leases (item 31). The stop is answered meanwhile.
+        // token (review c5b L5) -- unless a launch of it is made first, whose
+        // account it is then; never its Leases (item 31). The stop is
+        // answered meanwhile.
         if let Some(account) = account {
             let launcher = Arc::clone(self);
             let instance = request.instance_id;
             handle.spawn(async move {
-                let selector = format!("{LAUNCHED_SELECTOR},{INSTANCE_LABEL}={instance}");
-                let api = &launcher.api;
-                let ended = || {
-                    let selector = selector.clone();
-                    async move {
-                        let deployments = api
-                            .deployments(&selector)
-                            .await
-                            .map_err(|failed| failed.0)?;
-                        let pods = api
-                            .pods_labelled(&selector)
-                            .await
-                            .map_err(|failed| failed.0)?;
-                        Ok(none_left(&deployments, &pods))
-                    }
-                };
-                let kube = Kube(api);
+                let kube = Kube(&launcher.api);
                 let removing = remove_shards_account_once_ended(
                     &kube,
                     &account,
                     &launcher.launching,
-                    ended,
+                    || left_of(&kube, &instance),
                     ENDED_EVERY,
                     ENDED_WITHIN,
                 );
                 match removing.await {
-                    Ok(Some(gone)) => tracing::info!(
+                    Ok(Removal::Removed(gone)) => tracing::info!(
                         instance,
                         account,
                         removed = ?gone,
                         "its pods ended; its own account removed, its Leases kept"
                     ),
-                    Ok(None) => tracing::warn!(
+                    Ok(Removal::Relaunched) => tracing::info!(
+                        instance,
+                        account,
+                        "launched again; its own account is the new launch's"
+                    ),
+                    Ok(Removal::Stopping) => tracing::warn!(
                         instance,
                         account,
                         "its pods had not ended in {ENDED_WITHIN:?}; its own account is kept, \

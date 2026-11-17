@@ -930,7 +930,7 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
             let there = api.of(Kind::ServiceAccount, ACCOUNT).is_some();
             async move {
                 assert!(there, "the account was removed before its pods ended");
-                Ok(look >= 3)
+                Ok(if look >= 3 { Left::Nothing } else { Left::Pods })
             }
         };
         let within = std::time::Duration::from_secs(60);
@@ -940,7 +940,7 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
                 .unwrap();
         assert_eq!(
             removed,
-            Some(vec![Kind::RoleBinding, Kind::Role, Kind::ServiceAccount])
+            Removal::Removed(vec![Kind::RoleBinding, Kind::Role, Kind::ServiceAccount])
         );
         assert_eq!(looks.load(std::sync::atomic::Ordering::SeqCst), 4);
         for shard in 0..2 {
@@ -955,13 +955,13 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
             &api,
             ACCOUNT,
             &launching,
-            || async { Ok(false) },
+            || async { Ok(Left::Pods) },
             every,
             std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
-        assert_eq!(kept, None);
+        assert_eq!(kept, Removal::Stopping);
         assert!(began.elapsed() >= std::time::Duration::from_secs(5));
         assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_some());
         // A launch holding the launcher: nothing asked, nothing removed,
@@ -971,7 +971,7 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
             &api,
             ACCOUNT,
             &launching,
-            || async { Ok(true) },
+            || async { Ok(Left::Nothing) },
             every,
             within,
         );
@@ -984,26 +984,119 @@ fn stopping_removes_an_instance_s_account_once_its_pods_have_ended() {
         );
         assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_some());
         drop(held);
-        assert!(removing.await.unwrap().is_some());
+        assert!(matches!(removing.await.unwrap(), Removal::Removed(_)));
         assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_none());
     });
 }
 
-/// Review c5b2 H1: a stopped instance's Deployment is deleted at once, so a
-/// launch straight after finds none; what is left of it is its pods, still
-/// stopping, and its account waits for them -- and for no launch of it to
-/// have been made since.
+/// A namespace's Deployments and pods, in memory, as far as [`Workloads`]
+/// needs them: a Deployment deleted goes at once, its pods stay until
+/// they are let go, as the API server keeps them under a background delete.
+#[derive(Default)]
+struct Pods {
+    deployments: std::sync::Mutex<Vec<String>>,
+    pods: std::sync::Mutex<Vec<String>>,
+}
+
+fn list(names: &[String]) -> serde_json::Value {
+    serde_json::json!({"items": names.iter().map(|name| serde_json::json!({"metadata": {"name": name}})).collect::<Vec<_>>()})
+}
+
+impl Workloads for Pods {
+    async fn deployments(&self, selector: &str) -> Result<serde_json::Value, String> {
+        assert_eq!(
+            selector,
+            "meridian.dev/launched=true,meridian.dev/instance=snaptrade-1"
+        );
+        Ok(list(&self.deployments.lock().unwrap()))
+    }
+    async fn pods(&self, selector: &str) -> Result<serde_json::Value, String> {
+        assert_eq!(
+            selector,
+            "meridian.dev/launched=true,meridian.dev/instance=snaptrade-1"
+        );
+        Ok(list(&self.pods.lock().unwrap()))
+    }
+    async fn delete_deployment(&self, name: &str) -> Result<bool, String> {
+        let mut held = self.deployments.lock().unwrap();
+        let there = held.iter().any(|held| held == name);
+        held.retain(|held| held != name);
+        Ok(there)
+    }
+}
+
+/// Review c5b2 H1 (and c5b3 L3): a stop deletes the instance's Deployment
+/// at once, so a launch straight after finds none; what is left is its
+/// pods, still stopping, until they end -- and a launch made since is
+/// what is left once it is made.
 #[test]
-fn a_stopped_instance_is_ended_once_neither_its_deployment_nor_its_pods_are_left() {
-    let none = serde_json::json!({"items": []});
-    let one = serde_json::json!({"items": [{"metadata": {"name": "x"}}]});
-    assert!(none_left(&none, &none));
-    assert!(
-        !none_left(&none, &one),
-        "its pods still stopping after their Deployment went"
-    );
-    assert!(!none_left(&one, &none), "a launch of it made since");
-    assert!(!none_left(&one, &one));
+fn a_stopped_instance_leaves_its_pods_until_they_end_and_no_deployment() {
+    block(async {
+        let api = Pods::default();
+        *api.deployments.lock().unwrap() = vec!["r-plugin-snaptrade-1".into()];
+        *api.pods.lock().unwrap() = vec![
+            "r-plugin-snaptrade-1-a".into(),
+            "r-plugin-snaptrade-1-b".into(),
+        ];
+        assert_eq!(
+            left_of(&api, "snaptrade-1").await.unwrap(),
+            Left::Relaunched
+        );
+        assert_eq!(
+            stop_launched(&api, "snaptrade-1").await.unwrap(),
+            ["r-plugin-snaptrade-1"]
+        );
+        assert!(
+            api.deployments.lock().unwrap().is_empty(),
+            "a launch straight after a stop finds no Deployment of it"
+        );
+        assert_eq!(left_of(&api, "snaptrade-1").await.unwrap(), Left::Pods);
+        api.pods.lock().unwrap().clear();
+        assert_eq!(left_of(&api, "snaptrade-1").await.unwrap(), Left::Nothing);
+        // Launched again.
+        *api.deployments.lock().unwrap() = vec!["r-plugin-snaptrade-1".into()];
+        assert_eq!(
+            left_of(&api, "snaptrade-1").await.unwrap(),
+            Left::Relaunched
+        );
+    });
+}
+
+/// Review c5b3 L2: a launch of the instance made since its stop ends the
+/// wait at once, the account kept as the new launch's -- no polling to the
+/// end of the wait, and no warning of pods that never ended.
+#[test]
+fn a_relaunch_ends_the_wait_to_remove_a_stopped_instance_s_account() {
+    const ACCOUNT: &str = "check-meridian-runtime-shards-snaptrade-1";
+    let paused = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    paused.block_on(async {
+        let api = Cluster::default();
+        make_shards_account(&api, &objects(2)).await.unwrap();
+        let launching = tokio::sync::Mutex::new(());
+        let looks = std::sync::atomic::AtomicU32::new(0);
+        let began = tokio::time::Instant::now();
+        let removal = remove_shards_account_once_ended(
+            &api,
+            ACCOUNT,
+            &launching,
+            || {
+                looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(Left::Relaunched) }
+            },
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(removal, Removal::Relaunched);
+        assert_eq!(looks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(began.elapsed(), std::time::Duration::ZERO);
+        assert!(api.of(Kind::ServiceAccount, ACCOUNT).is_some());
+    });
 }
 
 /// Review c5b L2: the workload-identity annotations the launcher copies
