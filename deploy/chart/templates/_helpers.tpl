@@ -988,7 +988,11 @@ spec:
       image: "__IMAGE__"
       imagePullPolicy: IfNotPresent
       command: ["meridian-storage", "copy", "{{ $full }}-storage-__INSTANCE__"]
+      {{- /* Never root (review c5c86 M1, L2): the plugin image's own
+             numeric user, or the cluster's, and no uid named, so restricted
+             Pod Security and OpenShift's restricted-v2 both admit it. */}}
       securityContext:
+        runAsNonRoot: true
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:

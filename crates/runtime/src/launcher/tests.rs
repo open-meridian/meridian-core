@@ -781,10 +781,14 @@ fn an_instance_of_several_pods_is_given_an_account_naming_its_own_shards_leases_
 }
 
 /// The API server's objects, in memory, as far as [`Objects`] needs them.
+/// A delete removes the object at once, unless `on_a_lost_node`: then a pod
+/// is kept, Terminating, as a real API server keeps one whose kubelet never
+/// confirms it stopped (review c5c86 M4).
 #[derive(Default)]
 struct Cluster {
     held: std::sync::Mutex<std::collections::HashMap<(Kind, String), serde_json::Value>>,
     versions: std::sync::atomic::AtomicU64,
+    on_a_lost_node: bool,
 }
 
 impl Cluster {
@@ -827,12 +831,20 @@ impl Objects for Cluster {
         Ok(())
     }
     async fn delete(&self, kind: Kind, name: &str) -> Result<bool, String> {
-        Ok(self
-            .held
-            .lock()
-            .unwrap()
-            .remove(&(kind, name.to_string()))
-            .is_some())
+        let mut held = self.held.lock().unwrap();
+        let key = (kind, name.to_string());
+        if self.on_a_lost_node && kind == Kind::Pod {
+            return Ok(match held.get_mut(&key) {
+                Some(pod) => {
+                    if pod["metadata"]["deletionTimestamp"].is_null() {
+                        pod["metadata"]["deletionTimestamp"] = "2026-11-17T12:00:00Z".into();
+                    }
+                    true
+                }
+                None => false,
+            });
+        }
+        Ok(held.remove(&key).is_some())
     }
 }
 
@@ -1204,7 +1216,10 @@ fn the_account_stopping_removes_is_the_shards_shape_s_for_the_instance() {
 
 // ── Item 30: one shared claim per instance, a folder per shard ─────────────
 
-const COPY: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"check-meridian-runtime-storage-copy-__INSTANCE__","labels":{"meridian.dev/component":"storage-copy","meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"}},"spec":{"restartPolicy":"Never","automountServiceAccountToken":false,"containers":[{"name":"copy","image":"__IMAGE__","imagePullPolicy":"IfNotPresent","command":["meridian-storage","copy","check-meridian-runtime-storage-__INSTANCE__"],"securityContext":{"allowPrivilegeEscalation":false},"volumeMounts":[{"name":"from","mountPath":"/var/lib/meridian/copy/from","readOnly":true},{"name":"to","mountPath":"/var/lib/meridian/copy/to"}]}],"volumes":[{"name":"from","persistentVolumeClaim":{"claimName":"check-meridian-runtime-storage-__INSTANCE__","readOnly":true}},{"name":"to","persistentVolumeClaim":{"claimName":"check-meridian-runtime-shared-storage-__INSTANCE__"}}]}}"#;
+/// The chart's copy pod as the ha profile renders it (templates/_helpers.tpl,
+/// storageCopy); chart-check holds it equal (tools/chart_shards.py
+/// copy-fixture, review c5c86 M4).
+const COPY: &str = r#"{"apiVersion":"v1","kind":"Pod","metadata":{"labels":{"app.kubernetes.io/instance":"check","app.kubernetes.io/managed-by":"Helm","app.kubernetes.io/name":"meridian-runtime","app.kubernetes.io/version":"0.1.0","meridian.dev/component":"storage-copy","meridian.dev/instance":"__INSTANCE__","meridian.dev/launched":"true"},"name":"check-meridian-runtime-storage-copy-__INSTANCE__"},"spec":{"automountServiceAccountToken":false,"containers":[{"command":["meridian-storage","copy","check-meridian-runtime-storage-__INSTANCE__"],"image":"__IMAGE__","imagePullPolicy":"IfNotPresent","name":"copy","resources":{"limits":{"memory":"256Mi"},"requests":{"cpu":"50m","memory":"64Mi"}},"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true},"volumeMounts":[{"mountPath":"/var/lib/meridian/copy/from","name":"from","readOnly":true},{"mountPath":"/var/lib/meridian/copy/to","name":"to"}]}],"restartPolicy":"Never","securityContext":{"fsGroup":65532,"fsGroupChangePolicy":"OnRootMismatch","seccompProfile":{"type":"RuntimeDefault"}},"volumes":[{"name":"from","persistentVolumeClaim":{"claimName":"check-meridian-runtime-storage-__INSTANCE__","readOnly":true}},{"name":"to","persistentVolumeClaim":{"claimName":"check-meridian-runtime-shared-storage-__INSTANCE__"}}]}}"#;
 
 fn shared_shapes() -> Shapes {
     let mut shapes = shapes(true);
@@ -1445,6 +1460,13 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         ])
     );
     assert!(gates[0]["args"].is_null());
+    // The gate is confined as the chart's copy container is (review c5c86
+    // M4: COPY is the chart's render, which chart-check holds it to).
+    let box_ = &pod["spec"]["containers"][0]["securityContext"];
+    assert_eq!(gates[0]["securityContext"], *box_);
+    assert_eq!(box_["runAsNonRoot"], true);
+    assert_eq!(box_["readOnlyRootFilesystem"], true);
+    assert_eq!(box_["capabilities"]["drop"], serde_json::json!(["ALL"]));
     assert_eq!(
         gates[0]["volumeMounts"],
         serde_json::json!([{"name": "storage", "mountPath": "/var/lib/meridian/storage", "readOnly": true}])
@@ -1785,10 +1807,12 @@ fn shared_storage_is_never_left_behind_by_a_chart_without_its_shapes() {
     );
 }
 
-/// Review c5c2fold M1: a copy pod that never ends -- Pending past the
-/// copy's wait (unschedulable, say), Unknown on a lost node, or being
-/// removed -- is made again at the next launch, as the wait's message
-/// says; one Pending within the wait, or Running however long, is kept.
+/// Review c5c2fold M1: a copy pod Pending past the copy's wait
+/// (unschedulable, say) is made again at the next launch, as the wait's
+/// message says; one Pending within the wait, or Running however long, is
+/// kept. One on a lost node -- Unknown, or being removed -- stays
+/// Terminating on a real API server, so is not made again (review c5c86
+/// M2, M4): the launch is refused, saying so.
 #[test]
 fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
     let asked = sharded(2, true);
@@ -1828,31 +1852,45 @@ fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
             "{phase} since {made}: kept"
         );
     }
-    // Made again: Pending an hour, past the wait; Unknown; being removed.
+    // Made again: Pending an hour, past the wait, on no node, which the
+    // API server removes at once.
+    let cluster = Cluster::default();
+    cluster.put(
+        Kind::Pod,
+        copy_pod_held("2026-11-17T11:00:00Z", "Pending", unschedulable.clone()),
+    );
+    let (_, copied) = step(&cluster).unwrap();
+    assert_eq!(
+        copied.as_deref(),
+        Some("check-meridian-runtime-storage-snaptrade-1")
+    );
+    assert!(
+        cluster.of(Kind::Pod, name).unwrap()["status"].is_null(),
+        "Pending past the wait: made again"
+    );
+    // On a lost node -- Unknown, or being removed -- the API server keeps
+    // it Terminating, so it is not made again: the launch is refused,
+    // saying so (review c5c86 M2, M4). What becomes of it is held for the
+    // product owner's ruling.
     let mut removing = copy_pod_held("2026-11-17T11:55:00Z", "Running", serde_json::json!({}));
     removing["metadata"]["deletionTimestamp"] = "2026-11-17T11:58:00Z".into();
     for (case, held) in [
-        (
-            "Pending past the wait",
-            copy_pod_held("2026-11-17T11:00:00Z", "Pending", unschedulable.clone()),
-        ),
         (
             "Unknown",
             copy_pod_held("2026-11-17T11:55:00Z", "Unknown", serde_json::json!({})),
         ),
         ("being removed", removing),
     ] {
-        let cluster = Cluster::default();
+        let cluster = Cluster {
+            on_a_lost_node: true,
+            ..Cluster::default()
+        };
         cluster.put(Kind::Pod, held);
-        let (_, copied) = step(&cluster).unwrap();
-        assert_eq!(
-            copied.as_deref(),
-            Some("check-meridian-runtime-storage-snaptrade-1")
-        );
-        assert!(
-            cluster.of(Kind::Pod, name).unwrap()["status"].is_null(),
-            "{case}: made again"
-        );
+        let said = step(&cluster).unwrap_err();
+        assert!(said.contains("still being removed"), "{case}: {said}");
+        let kept = cluster.of(Kind::Pod, name).unwrap();
+        assert!(!kept["status"].is_null(), "{case}: not made again");
+        assert!(!kept["metadata"]["deletionTimestamp"].is_null(), "{case}");
     }
 }
 

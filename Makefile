@@ -3188,6 +3188,10 @@ chart-check:
 	echo "$$said" | grep -q "storage is one pod's" \
 		|| { echo "chart-check FAILED: a sharded instance with storage was refused without saying why: $$said" >&2; exit 1; }; \
 	echo "$$ha" | $(PY) tools/chart_shards.py shared || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py copy-fixture crates/runtime/src/launcher/tests.rs || exit 1; \
+	echo "$$ha" | sed 's/runAsNonRoot\\":true/runAsNonRoot\\":false/' \
+		| $(PY) tools/chart_shards.py copy-fixture crates/runtime/src/launcher/tests.rs 2>/dev/null \
+		&& { echo "chart-check FAILED: the copy-fixture check passed a copy pod other than the launcher tests' COPY, so it proves nothing" >&2; exit 1; }; \
 	rwx="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set pluginStorage.shared.storageClassName=files \
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
 		|| { echo "chart-check FAILED: the ha profile with a shared storage class did not render: $$rwx" >&2; exit 1; }; \

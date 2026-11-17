@@ -391,9 +391,12 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
         wrong.append("the copy pod's seccomp profile is not RuntimeDefault")
     box = spec["containers"][0].get("securityContext", {})
     if (box.get("capabilities") != {"drop": ["ALL"]} or box.get("readOnlyRootFilesystem") is not True
-            or box.get("allowPrivilegeEscalation") is not False):
+            or box.get("allowPrivilegeEscalation") is not False or box.get("runAsNonRoot") is not True):
         wrong.append(f"the copy container's securityContext is {box}: drop ALL and add none, a read-only root, "
-                     "no privilege escalation")
+                     "no privilege escalation, never root")
+    mounts = {m["name"]: m.get("mountPath") for m in spec["containers"][0].get("volumeMounts", [])}
+    if mounts != {"from": "/var/lib/meridian/copy/from", "to": "/var/lib/meridian/copy/to"}:
+        wrong.append(f"the copy container mounts {mounts}, not its two claims at their own paths")
     if "the launcher's one pod copies its instance's own storage into its shared storage" not in render:
         wrong.append("the launcher's admission policy does not hold the copy pod to its shape")
     # The policy holds what the shape renders (review c5c M1, H1, L1), and
@@ -404,6 +407,15 @@ def shared(render: str, rwx_class: str = "") -> list[str]:
                           ('/plugins/[a-z]([-a-z0-9]{0,61}[a-z0-9])?@sha256:[0-9a-f]{64}$', "a plugin image by digest"),
                           ("!has(object.spec.containers[0].args)", "no args beside its command"),
                           ("!has(object.spec.containers[0].securityContext.capabilities.add)", "no capability added"),
+                          # Review c5c86 M1, L1, L3: never root, every
+                          # capability dropped, each mount at its own path,
+                          # evicted from a lost node, no ports.
+                          ("object.spec.containers[0].securityContext.runAsNonRoot == true", "never root"),
+                          ('"ALL" in object.spec.containers[0].securityContext.capabilities.drop',
+                           "every capability dropped"),
+                          ('m.mountPath == "/var/lib/meridian/copy/to"', "the shared claim at its own path"),
+                          ("has(t.tolerationSeconds)", "tolerations that end"),
+                          ("!has(object.spec.containers[0].ports)", "no ports"),
                           ("!has(object.spec.containers[0].lifecycle)", "no lifecycle hook"),
                           ("!has(object.spec.nodeName)", "no node named"),
                           ('oldObject.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy"',
@@ -463,11 +475,27 @@ def plugin_shards(render: str) -> list[str]:
     return wrong
 
 
+def copy_fixture(render: str, tests: str) -> list[str]:
+    """Review c5c86 M4: the launcher's unit tests build the copy pod and its
+    pods' gate from `COPY` in `tests`, which is the chart's own render of the
+    copy pod, so what they show holds of what the chart makes."""
+    rendered = template(render, "storage-copy.json")
+    if rendered is None:
+        return ["the render has no copy pod to hold the launcher's tests to"]
+    with open(tests, encoding="utf-8") as source:
+        held = re.search(r'^const COPY: &str = r#"(.*)"#;$', source.read(), re.M)
+    if not held:
+        return [f"{tests} has no COPY to hold to the chart's copy pod"]
+    if json.loads(held.group(1)) != rendered:
+        return [f"{tests}'s COPY is not the chart's copy pod as rendered: make it the render's again"]
+    return []
+
+
 def main() -> int:
     render = sys.stdin.read()
     mode, rest = sys.argv[1], sys.argv[2:]
     wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio, "downward": downward,
-             "shared": shared, "plugin-shards": plugin_shards}[mode](render, *rest)
+             "shared": shared, "plugin-shards": plugin_shards, "copy-fixture": copy_fixture}[mode](render, *rest)
     for what in wrong:
         print(f"chart-check FAILED (step 3d, shards): {what}", file=sys.stderr)
     return 1 if wrong else 0

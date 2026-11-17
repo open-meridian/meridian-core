@@ -389,39 +389,6 @@ impl Launcher {
 fn run() -> Result<(), String> {
     // Every path this member needs, probed from inside its pod: what
     // `meridian status` and `doctor` read (step 3b).
-    // The copy pod of an instance's own storage into its shared storage,
-    // and its pods' wait for it (item 30): the claim copied is the one
-    // argument.
-    match std::env::args().nth(1).as_deref() {
-        Some("copy-storage") => {
-            let claim = std::env::args()
-                .nth(2)
-                .ok_or("copy-storage names the claim it copies")?;
-            use meridian_runtime::launcher::copy;
-            let copied = copy::copy(
-                std::path::Path::new(copy::FROM),
-                std::path::Path::new(copy::TO),
-                &claim,
-            )?;
-            tracing::info!(claim, ?copied, "copied into the shared storage's shard-0/");
-            return Ok(());
-        }
-        Some("storage-copied") => {
-            let claim = std::env::args()
-                .nth(2)
-                .ok_or("storage-copied names the claim it waits on")?;
-            use meridian_runtime::launcher::copy;
-            copy::wait(
-                std::path::Path::new(copy::STORAGE),
-                &claim,
-                std::time::Duration::from_secs(2),
-                copy::WAIT_LIMIT,
-            )?;
-            tracing::info!(claim, "its own storage is in its shared storage");
-            return Ok(());
-        }
-        _ => {}
-    }
     if std::env::args().nth(1).as_deref() == Some("probe") {
         return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
             component: "launcher",

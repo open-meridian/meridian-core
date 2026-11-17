@@ -1200,8 +1200,12 @@ pub fn still_stopping_said(instance: &str) -> String {
 /// that claim was made since, so holds no marker (review c5c L3). One that
 /// never ends is made again too, as the instance's pods say once they stop
 /// waiting (review c5c2fold M1): Pending past their wait
-/// ([`copy::WAIT_LIMIT`]), Unknown on a lost node, or being removed. One
-/// Running is kept however long, a copy of much storage.
+/// ([`copy::WAIT_LIMIT`]), Unknown on a lost node, or being removed -- each
+/// asked to go, and made again once the API server has removed it, which
+/// for a pod on a lost node is not until the node returns or the pod is
+/// force-deleted; until then the launch is refused, saying so (review
+/// c5c86 M2, held for the product owner). One Running is kept however
+/// long, a copy of much storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyPod {
     Make,
