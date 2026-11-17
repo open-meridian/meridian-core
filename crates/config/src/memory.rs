@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState,
-    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
+    PluginStorageCopied, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_domain::v1::VenueCatalogue;
@@ -49,6 +49,9 @@ pub struct MemoryStore {
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
     launch_notes: Mutex<Vec<LaunchNote>>,
+    /// The claim each launch copies into its instance's shared storage, by
+    /// instance and launch, and from when its pods' reports count (item 30).
+    storage_copies: Mutex<std::collections::BTreeMap<(String, i64), (String, i64)>>,
     /// Each move of raw records (W4.13), numbered from 1 in order.
     moves: Mutex<Vec<RecordedMove>>,
     /// Each licence and entitlement change, in order (contract v18).
@@ -147,6 +150,7 @@ impl MemoryStore {
             plugin_usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
+            storage_copies: Mutex::default(),
             moves: Mutex::new(Vec::new()),
             licences: Mutex::new(Vec::new()),
             entitlements: Mutex::new(Vec::new()),
@@ -755,6 +759,80 @@ impl Store for MemoryStore {
                 at_ns: launch.launched_at_ns,
             });
         Ok(true)
+    }
+
+    fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()> {
+        let state = self.state.lock().expect("store lock poisoned");
+        let Some(launch) = state.catalogue.launches.iter().find(|held| {
+            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+        }) else {
+            return Ok(());
+        };
+        self.storage_copies
+            .lock()
+            .expect("store lock poisoned")
+            .insert(
+                (instance_id.to_string(), launch.launched_at_ns),
+                (from_claim.to_string(), after_ns),
+            );
+        Ok(())
+    }
+
+    fn record_storage_copied(
+        &self,
+        instance_id: &str,
+        reported_at_ns: i64,
+        at_ns: i64,
+    ) -> Result<Option<PluginStorageCopied>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let Some(launched_at_ns) = state
+            .catalogue
+            .launches
+            .iter()
+            .find(|held| {
+                held.instance_id == instance_id
+                    && held.state == PluginLaunchState::Launched as i32
+                    && held.storage_copied.is_none()
+            })
+            .map(|held| held.launched_at_ns)
+        else {
+            return Ok(None);
+        };
+        let pending = self
+            .storage_copies
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(instance_id.to_string(), launched_at_ns))
+            .cloned();
+        let Some((from_claim, _)) = pending.filter(|(_, after)| reported_at_ns > *after) else {
+            return Ok(None);
+        };
+        // Once per claim copied: a launch after, finding it copied, records
+        // none again.
+        let before = state.catalogue.launches.iter().any(|held| {
+            held.instance_id == instance_id
+                && held
+                    .storage_copied
+                    .as_ref()
+                    .is_some_and(|copied| copied.from_claim == from_claim)
+        });
+        let Some(launch) = state.catalogue.launches.iter_mut().find(|held| {
+            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+        }) else {
+            return Ok(None);
+        };
+        if before {
+            return Ok(None);
+        }
+        let copied = PluginStorageCopied {
+            instance_id: instance_id.to_string(),
+            to_claim: crate::store::shared_claim_of(&from_claim, instance_id),
+            from_claim,
+            at_ns,
+            launched_by: launch.launched_by.clone(),
+        };
+        launch.storage_copied = Some(copied.clone());
+        Ok(Some(copied))
     }
 
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {

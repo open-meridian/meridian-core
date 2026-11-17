@@ -3244,8 +3244,26 @@ pub fn serve_with(
             // clear its own record naming the re-declaration (W6.11).
             let now = noting.clock.now_ns();
             let catalogued = Arc::clone(&noting);
+            // A pod of it heard registered: where its launch copied its own
+            // storage into its shared storage, the copy is whole, and
+            // recorded now, once (item 30).
+            let heard_registered = (report.registered && own).then_some(report.reported_at_ns);
             let keeping = move || -> Result<Vec<String>, crate::StoreError> {
                 store.record_plugin(&plugin)?;
+                if let Some(reported_at_ns) = heard_registered {
+                    if let Some(copied) = store.record_storage_copied(
+                        &plugin.plugin_instance_id,
+                        reported_at_ns,
+                        now,
+                    )? {
+                        tracing::info!(
+                            instance = copied.instance_id,
+                            from = copied.from_claim,
+                            to = copied.to_claim,
+                            "its own storage copied into its shared storage's shard-0/, recorded"
+                        );
+                    }
+                }
                 let changed = match &catalogue {
                     Some(catalogue) => {
                         store.record_catalogue(&plugin.plugin_instance_id, catalogue, now)?

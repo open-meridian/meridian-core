@@ -75,6 +75,10 @@ const WANTS_KEPT: usize = 4_096;
 pub struct Shards {
     /// The shard this sidecar is: the `n` of the Lease it holds.
     mine: u32,
+    /// How many shards its instance runs, as its launch set them (1 for a
+    /// standby pod alone): what its plugin is told at registration with
+    /// [`Shards::mine`] (item 30).
+    count: u32,
     live: RwLock<BTreeSet<u32>>,
     changed: watch::Sender<u64>,
     wants: Mutex<Wants>,
@@ -139,6 +143,7 @@ impl Shards {
     pub fn new(mine: u32) -> Self {
         Self {
             mine,
+            count: mine + 1,
             live: RwLock::new(BTreeSet::from([mine])),
             changed: watch::channel(0).0,
             wants: Mutex::default(),
@@ -149,6 +154,17 @@ impl Shards {
 
     pub fn mine(&self) -> u32 {
         self.mine
+    }
+
+    /// Of `count` shards, as the instance's launch set them (item 30).
+    pub fn of(mut self, count: u32) -> Self {
+        self.count = count.max(self.mine + 1);
+        self
+    }
+
+    /// How many shards the instance runs (item 30).
+    pub fn count(&self) -> u32 {
+        self.count
     }
 
     /// The live shards, this one among them.

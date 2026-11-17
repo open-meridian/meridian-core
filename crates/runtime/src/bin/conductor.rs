@@ -404,12 +404,7 @@ fn run() -> Result<(), String> {
             archive,
             local_registry,
             registries,
-            // Whether an instance of several pods has a lease right to run
-            // under (step 3d): as the chart's values state it; unsaid
-            // where the chart handed none.
-            meridian_runtime::resilience::values_from_env()
-                .filter(|values| values.stated)
-                .map(|values| values.lease_right()),
+            several_pods(),
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing
@@ -843,5 +838,35 @@ fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
             meridian_runtime::component_logins_on_brought(&serving)
         }
         None => Ok(()),
+    }
+}
+
+/// What an instance of several pods may run under (step 3d), as the
+/// chart's values state it -- unsaid where the chart handed none: a lease
+/// right to run under, and for a plugin keeping storage, a ReadWriteMany
+/// class to share it on, or one node (checkpoint 5, item 30), counted at
+/// the launch from the nodes the release's pods run on, as the resilience
+/// profile counts them.
+fn several_pods() -> meridian_config::Several {
+    let Some(values) = meridian_runtime::resilience::values_from_env().filter(|v| v.stated) else {
+        return meridian_config::Several::default();
+    };
+    let nodes: Arc<dyn Fn() -> Result<usize, String> + Send + Sync> = Arc::new(|| {
+        let api = meridian_first_run::cluster::ApiServer::in_cluster(clock())
+            .map_err(|failed| failed.0)?;
+        let list = tokio::runtime::Handle::current()
+            .block_on(api.pods())
+            .map_err(|failed| failed.0)?;
+        Ok(meridian_runtime::resilience::pods_of(&list)
+            .into_iter()
+            .filter(|pod| !pod.node.is_empty())
+            .map(|pod| pod.node)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len())
+    });
+    meridian_config::Several {
+        lease_right: Some(values.lease_right()),
+        storage: Some((values.plugin_storage, values.shared_storage_class.clone())),
+        nodes: Some(nodes),
     }
 }

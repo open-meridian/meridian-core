@@ -1220,6 +1220,15 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 })),
                 "shards": launch.shards,
                 "standby": launch.standby,
+                // Its own storage copied into its shared storage before it
+                // first ran as several pods (item 30; item 70); null for
+                // none.
+                "storage_copied": launch.storage_copied.as_ref().map(|c| serde_json::json!({
+                    "from_claim": c.from_claim,
+                    "to_claim": c.to_claim,
+                    "at_ns": c.at_ns,
+                    "launched_by": c.launched_by,
+                })),
             })
         })
         .collect();

@@ -6529,6 +6529,12 @@ pub struct PluginReport {
     /// platform.
     #[prost(message, repeated, tag = "23")]
     pub model_tokens: ::prost::alloc::vec::Vec<::meridian_pb::v1::ModelTokenCount>,
+    /// Step 3d, checkpoint 5, item 30: the shard whose Lease the reporting
+    /// pod's sidecar holds; 0 for an instance of one pod, and for a pod holding
+    /// none, whose plugin is not registered. Each shard keeps its own storage,
+    /// so what the instance holds (stored) is the sum of its shards' reports.
+    #[prost(uint32, tag = "24")]
+    pub shard: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -21147,6 +21153,11 @@ pub struct PluginLaunch {
     /// none, and on every launch before it.
     #[prost(message, optional, tag = "25")]
     pub limits: ::core::option::Option<SidecarLimits>,
+    /// Step 3d, checkpoint 5, item 30: its own storage claim copied into its
+    /// shared storage's shard-0/ before this launch's pods started, once one of
+    /// them was heard registered; unset where it copied none, or not yet.
+    #[prost(message, optional, tag = "26")]
+    pub storage_copied: ::core::option::Option<PluginStorageCopied>,
 }
 /// The conductor to the launcher: create this plugin, in the chart's plugin
 /// shape and no other.
@@ -21196,11 +21207,41 @@ pub struct CreatePluginRequest {
     #[prost(bool, tag = "11")]
     pub standby: bool,
 }
+/// Step 3d, checkpoint 5, item 30 (approved 2026-11-17, item 68): an
+/// instance's own storage claim copied into its shared storage's shard-0/
+/// before its first launch as several pods, as its own record
+/// (decisions/031). Recorded by the conductor when it first hears one of the
+/// instance's pods registered after the launch that copied: the pods start
+/// only once the copy is whole, so `at_ns` is a true "copied by". A failed
+/// copy leaves none; the old claim is kept as it was.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginStorageCopied {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// `<fullname>-storage-<instance>`, the instance's own claim, kept.
+    #[prost(string, tag = "2")]
+    pub from_claim: ::prost::alloc::string::String,
+    /// `<fullname>-shared-storage-<instance>`, into its folder shard-0/.
+    #[prost(string, tag = "3")]
+    pub to_claim: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub at_ns: i64,
+    /// Who made the launch that copied.
+    #[prost(string, tag = "5")]
+    pub launched_by: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreatePluginReply {
     /// The workload the launcher made, which it alone may later remove.
     #[prost(string, tag = "1")]
     pub workload: ::prost::alloc::string::String,
+    /// Step 3d, checkpoint 5, item 30: the instance's own storage claim the
+    /// launcher copies into its shared storage's shard-0/ before its first
+    /// launch as several pods, `<fullname>-storage-<instance>`, kept as it was;
+    /// empty where it copies none. The instance's pods start once the copy has
+    /// finished.
+    #[prost(string, tag = "2")]
+    pub storage_copied_from: ::prost::alloc::string::String,
 }
 /// A deployment admin allows an edge instance an archive, or changes its
 /// bound, from its Manage page; the conductor records it and restarts the

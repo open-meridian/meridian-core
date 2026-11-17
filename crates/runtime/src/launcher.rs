@@ -118,6 +118,13 @@ pub struct StorageShapes {
     pub live: Option<String>,
     pub claim: String,
     pub edge_roles: Vec<String>,
+    /// Where the chart renders shards and standby pods: their shape
+    /// mounting the instance's shared storage, the shared claim it mounts,
+    /// and the pod that copies the instance's own claim into it (step 3d,
+    /// checkpoint 5, item 30).
+    pub shards: Option<String>,
+    pub shared_claim: Option<String>,
+    pub copy: Option<String>,
 }
 
 /// What a request is made from: the Deployment's template, and the claim's
@@ -515,17 +522,44 @@ pub fn with_limits(
 pub const SHARDS_ENV: &str = crate::shards::SHARDS_ENV;
 
 /// Whether a request asks for several pods of its instance: shards above
-/// one, or a standby pod.
+/// one, or a standby pod -- or, once [`one_pod_as_shard`] has said so, one
+/// shard on its instance's shared storage.
 pub fn several(request: &CreatePluginRequest) -> bool {
-    request.shards > 1 || request.standby
+    request.shards >= 1 || request.standby
+}
+
+/// A request as the launcher runs it: shards 1 alone is one pod, as 0 is
+/// (contract v30: "0 and 1 each one pod"); and an instance of one pod whose
+/// storage is shared since it ran as several -- `shared` -- runs as one
+/// shard of one on it, so it reaches every shard's records and writes its
+/// own under `shard-0/` (item 30; accepted under A 2026-11-17).
+pub fn one_pod_as_shard(mut request: CreatePluginRequest, shared: bool) -> CreatePluginRequest {
+    if request.shards == 1 && !request.standby {
+        request.shards = 0;
+    }
+    if shared && request.shards == 0 && !request.standby {
+        request.shards = 1;
+    }
+    request
+}
+
+/// The refusal of an instance of several pods keeping storage where the
+/// chart offers it none to share (item 30): proposed 2026-11-17 (c5c),
+/// awaiting the product owner's ruling.
+pub fn no_shared_storage_said(instance: &str) -> String {
+    format!(
+        "{instance} was asked shards or a standby pod, and its plugin keeps storage: this \
+         deployment's chart offers no shared storage (pluginStorage.shared.storageClassName)"
+    )
 }
 
 /// The template an instance launched with shards or a standby pod is made
 /// from (step 3d; the resilience spec's section 7): the chart's shards
-/// shape in place of `chosen`, which is kept for any other request. Refused
-/// where the chart renders none, for more shards than a declaration may
-/// name, for a live instance, and for one given storage of its own: a
-/// claim is one pod's.
+/// shape in place of `chosen`, which is kept for any other request; for a
+/// plugin keeping storage, the shape mounting its instance's shared
+/// storage, and the shared claim (item 30). Refused where the chart renders
+/// none, for more shards than a declaration may name, and for a live
+/// instance.
 pub fn shards_template<'a>(
     chosen: Chosen<'a>,
     request: &CreatePluginRequest,
@@ -548,10 +582,17 @@ pub fn shards_template<'a>(
         ));
     }
     if chosen.claim.is_some() {
-        return Err(format!(
-            "{id} was asked shards or a standby pod, and its plugin keeps storage of its own: \
-             an instance's storage is one pod's, so it runs as one pod"
-        ));
+        // Its pods share one claim, a folder per shard (item 30).
+        let storage = shapes.storage.as_ref();
+        return match storage.and_then(|storage| {
+            Some((storage.shards.as_deref()?, storage.shared_claim.as_deref()?))
+        }) {
+            Some((workload, claim)) => Ok(Chosen {
+                workload,
+                claim: Some(claim),
+            }),
+            None => Err(no_shared_storage_said(id)),
+        };
     }
     let workload = shapes.shards.as_deref().ok_or_else(|| {
         format!(
@@ -667,13 +708,15 @@ pub fn shards_account_of(template: Option<&str>, instance: &str) -> Option<Strin
         .then(|| account.to_string())
 }
 
-/// What the launcher keeps for an instance of several pods (item 31).
+/// What the launcher keeps for an instance of several pods (item 31), and
+/// the one pod it makes, copying an instance's own storage (item 30).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Lease,
     ServiceAccount,
     Role,
     RoleBinding,
+    Pod,
 }
 
 impl Kind {
@@ -685,6 +728,7 @@ impl Kind {
             Kind::ServiceAccount => ("/api/v1", "serviceaccounts"),
             Kind::Role => ("/apis/rbac.authorization.k8s.io/v1", "roles"),
             Kind::RoleBinding => ("/apis/rbac.authorization.k8s.io/v1", "rolebindings"),
+            Kind::Pod => ("/api/v1", "pods"),
         }
     }
 }
@@ -1002,6 +1046,194 @@ where
     }
 }
 
+// ── An instance's own storage, copied into its shared storage (item 30) ──
+
+/// The copy pod's template, filled in for a checked request: the chart's
+/// storage-copy shape, marked the launcher's, for its instance.
+pub fn copy_pod(
+    template: &str,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    let filled = template.replace("__INSTANCE__", &request.instance_id);
+    if let Some(left) = placeholder(&filled) {
+        return Err(format!(
+            "the storage copy template has a placeholder this does not fill: {left}"
+        ));
+    }
+    let pod: serde_json::Value = serde_json::from_str(&filled)
+        .map_err(|failed| format!("the storage copy template is not JSON: {failed}"))?;
+    let labels = &pod["metadata"]["labels"];
+    if pod["kind"] != "Pod"
+        || labels["meridian.dev/launched"] != "true"
+        || labels["meridian.dev/component"] != "storage-copy"
+        || labels["meridian.dev/instance"] != request.instance_id.as_str()
+    {
+        return Err(
+            "the storage copy template does not mark what it makes as the launcher's copy, for \
+             its instance"
+                .into(),
+        );
+    }
+    Ok(pod)
+}
+
+/// The init container an instance's pods wait in until its own claim is
+/// copied into its shared storage (item 30): the copy pod's own container,
+/// as `storage-copied`, the shared storage mounted read only where the
+/// plugin mounts it, and nothing else.
+pub fn copied_gate(copy: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let container = &copy["spec"]["containers"][0];
+    let args = container["args"].as_array();
+    let claim = args
+        .filter(|args| {
+            args.len() == 3 && args[0] == "meridian-launcher" && args[1] == "copy-storage"
+        })
+        .and_then(|args| args[2].as_str())
+        .ok_or("the storage copy template does not run the launcher's copy-storage")?;
+    let mut gate = serde_json::json!({
+        "name": "storage-copied",
+        "image": container["image"],
+        "args": ["meridian-launcher", "storage-copied", claim],
+        "securityContext": container["securityContext"],
+        "volumeMounts": [{
+            "name": "storage",
+            "mountPath": copy::STORAGE,
+            "readOnly": true,
+        }],
+    });
+    for field in ["imagePullPolicy", "resources"] {
+        if !container[field].is_null() {
+            gate[field] = container[field].clone();
+        }
+    }
+    Ok(gate)
+}
+
+/// The Deployment with `gate` before its containers: its pods start once
+/// the copy is whole. Refused for a shape with no storage to mount.
+pub fn with_gate(
+    mut manifest: serde_json::Value,
+    gate: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let pod = &mut manifest["spec"]["template"]["spec"];
+    let mounts_storage = pod["volumes"]
+        .as_array()
+        .is_some_and(|volumes| volumes.iter().any(|v| v["name"] == "storage"));
+    if !mounts_storage {
+        return Err("the shards storage template has no volume named storage to wait on".into());
+    }
+    match pod["initContainers"].as_array_mut() {
+        Some(held) => held.push(gate),
+        None => pod["initContainers"] = serde_json::Value::Array(vec![gate]),
+    }
+    Ok(manifest)
+}
+
+/// The pods of a list still running, or yet to, that mount `claim` --
+/// but the copy's own: an instance's earlier pods, which may still write
+/// their last records into it.
+pub fn holding(list: &serde_json::Value, claim: &str) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|pod| pod["metadata"]["labels"]["meridian.dev/component"] != "storage-copy")
+        .filter(|pod| {
+            !matches!(
+                pod["status"]["phase"].as_str(),
+                Some("Succeeded" | "Failed")
+            )
+        })
+        .filter(|pod| {
+            pod["spec"]["volumes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| v["persistentVolumeClaim"]["claimName"] == claim)
+        })
+        .filter_map(|pod| pod["metadata"]["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// The refusal of a first launch as several pods while the instance's
+/// earlier pods still stop, which may still write into its own claim:
+/// proposed 2026-11-17 (c5c), awaiting the product owner's ruling.
+pub fn still_stopping_said(instance: &str) -> String {
+    format!(
+        "{instance}'s storage is copied into its shared storage before it runs as several \
+         pods, and its earlier pods are still stopping; launch it again once they have"
+    )
+}
+
+/// What becomes of a copy pod already there, by its phase: kept while it
+/// runs or once it has copied, made again once it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyPod {
+    Make,
+    Keep,
+    Remake,
+}
+
+pub fn copy_pod_now(there: Option<&serde_json::Value>) -> CopyPod {
+    match there.map(|pod| pod["status"]["phase"].as_str().unwrap_or_default()) {
+        None => CopyPod::Make,
+        Some("Failed") => CopyPod::Remake,
+        Some(_) => CopyPod::Keep,
+    }
+}
+
+/// The copy step (item 30), before the Deployment of an instance of
+/// several pods keeping storage is made: where the launcher kept the
+/// instance's own claim -- for the same plugin, never another's -- and none
+/// of the instance's earlier pods still mounts it, the copy pod made (or
+/// kept, or made again once failed), and the Deployment's pods held until
+/// it has copied. Says which claim it copies, or none.
+pub async fn copy_step<O: Objects>(
+    api: &O,
+    own: Option<&serde_json::Value>,
+    pods: &serde_json::Value,
+    copy_template: &str,
+    manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let Some(own) = own else {
+        return Ok((manifest, None));
+    };
+    reusable(own, request)?;
+    let claim = own["metadata"]["name"]
+        .as_str()
+        .ok_or("the instance's own claim has no name")?
+        .to_string();
+    if !holding(pods, &claim).is_empty() {
+        return Err(still_stopping_said(&request.instance_id));
+    }
+    let pod = copy_pod(copy_template, request)?;
+    let name = pod["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref()) {
+        CopyPod::Keep => {}
+        CopyPod::Make => {
+            if !api.create(Kind::Pod, &pod).await? {
+                return Err(format!(
+                    "{name} was made by another meanwhile; launch again"
+                ));
+            }
+        }
+        CopyPod::Remake => {
+            api.delete(Kind::Pod, &name).await?;
+            if !api.create(Kind::Pod, &pod).await? {
+                return Err(format!(
+                    "{name} failed and is still being removed; launch again in a moment"
+                ));
+            }
+        }
+    }
+    let manifest = with_gate(manifest, copied_gate(&pod)?)?;
+    Ok((manifest, Some(claim)))
+}
+
 /// A `__NAME__` still in the text, which a newer chart's template would
 /// have and this launcher would not know to fill.
 fn placeholder(text: &str) -> Option<&str> {
@@ -1019,6 +1251,8 @@ fn placeholder(text: &str) -> Option<&str> {
     }
     None
 }
+
+pub mod copy;
 
 #[cfg(test)]
 mod tests;

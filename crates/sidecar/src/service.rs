@@ -664,6 +664,12 @@ impl SidecarService for Sidecar {
             // what it expected to be. Learning it is not declaring it.
             instance_id: self.identity.instance_id.clone(),
             roles: self.identity.roles.clone(),
+            // Which shard of its instance it serves and of how many, where
+            // this sidecar holds a shard's Lease (item 30): the pods are
+            // identical, so it learns here where its storage is its own.
+            // 0 and 0 for an instance of one pod.
+            shard: self.shards.as_ref().map_or(0, |shards| shards.mine()),
+            shards: self.shards.as_ref().map_or(0, |shards| shards.count()),
         }))
     }
 
@@ -1082,6 +1088,38 @@ mod tests {
                 .await
                 .admitted
         );
+    }
+
+    /// Item 30 (approved 2026-11-15, numbers 2026-11-17): a plugin learns
+    /// at registration which shard of its instance it serves and of how
+    /// many -- the pods are identical -- and an instance of one pod is told
+    /// 0 and 0; its report names the shard too.
+    #[tokio::test]
+    async fn a_shard_s_plugin_is_told_its_shard_and_the_count_at_registration() {
+        let one = sidecar()
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(one.admitted);
+        assert_eq!((one.shard, one.shards), (0, 0));
+        let shard = sidecar().as_shard(Arc::new(crate::shards::Shards::new(1).of(3)));
+        let told = shard
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(told.admitted);
+        assert_eq!((told.shard, told.shards), (1, 3));
+        assert_eq!(shard.report(0).shard, 1);
+        // A standby alone is shard 0 of 1.
+        let standby = sidecar().as_shard(Arc::new(crate::shards::Shards::new(0).of(1)));
+        let told = standby
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((told.shard, told.shards), (0, 1));
     }
 
     async fn admitted_sidecar() -> Sidecar {

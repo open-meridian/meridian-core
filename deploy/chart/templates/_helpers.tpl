@@ -902,6 +902,107 @@ spec:
 {{- end -}}
 
 {{/*
+  The storage an instance of several pods shares (step 3d, checkpoint 5,
+  item 30): `<fullname>-shared-storage-<instance>`, a folder per shard,
+  mounted by every pod of the instance. ReadWriteMany in
+  pluginStorage.shared.storageClassName where one is named; with none, the
+  conductor admits such an instance on one node alone, where a
+  ReadWriteOnce claim in pluginStorage.storageClassName reaches every pod.
+  Takes a dict: top, instance, plugin (the launcher's placeholders).
+*/}}
+{{- define "meridian-runtime.sharedStorage" -}}
+{{- $top := .top -}}
+{{- $shared := $top.Values.pluginStorage.shared | default dict -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-shared-storage-{{ .instance }}
+  labels:
+    meridian.dev/component: plugin-storage
+    meridian.dev/instance: {{ .instance | quote }}
+    meridian.dev/launched: "true"
+    meridian.dev/plugin: {{ .plugin | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+spec:
+  {{- with $shared.storageClassName }}
+  accessModes: [ReadWriteMany]
+  storageClassName: {{ . | quote }}
+  {{- else }}
+  accessModes: [ReadWriteOnce]
+  {{- with $top.Values.pluginStorage.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $shared.size | default "10Gi" | quote }}
+{{- end -}}
+
+{{/*
+  The pod the launcher copies an instance's own storage claim into its
+  shared storage's `shard-0/` with, once, before its first launch as
+  several pods (step 3d, checkpoint 5, item 30): the runtime's image, the
+  launcher's `copy-storage`, the instance's own claim read only and its
+  shared claim, and nothing else -- no account's token, no secret. It
+  writes a marker once the copy is whole, which the instance's pods wait
+  for before their plugin starts. The launcher's admission policy holds
+  what it makes to exactly this shape. Takes the chart.
+*/}}
+{{- define "meridian-runtime.storageCopy" -}}
+{{- $full := include "meridian-runtime.fullname" . -}}
+{{- $podSecurity := .Values.podSecurityContext | default dict -}}
+{{- if .Values.pluginStorage.fsGroup -}}
+{{- $podSecurity = merge (deepCopy $podSecurity) (dict "fsGroup" .Values.pluginStorage.fsGroup "fsGroupChangePolicy" "OnRootMismatch") -}}
+{{- end -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $full }}-storage-copy-__INSTANCE__
+  labels:
+    meridian.dev/component: storage-copy
+    meridian.dev/instance: "__INSTANCE__"
+    meridian.dev/launched: "true"
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  restartPolicy: OnFailure
+  automountServiceAccountToken: false
+  {{- with $podSecurity }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: copy
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args: ["meridian-launcher", "copy-storage", "{{ $full }}-storage-__INSTANCE__"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: from
+          mountPath: /var/lib/meridian/copy/from
+          readOnly: true
+        - name: to
+          mountPath: /var/lib/meridian/copy/to
+      resources:
+        {{- toYaml .Values.resources | nindent 8 }}
+  volumes:
+    - name: from
+      persistentVolumeClaim:
+        claimName: {{ $full }}-storage-__INSTANCE__
+        readOnly: true
+    - name: to
+      persistentVolumeClaim:
+        claimName: {{ $full }}-shared-storage-__INSTANCE__
+{{- end -}}
+
+{{/*
   Whether a backup dumps the database (backup.database; task
   kernel/a-deployment-is-backed-up-and-restored, approved 2026-10-11): `auto`
   when empty, which the backup's script reads as the database this chart
@@ -1630,6 +1731,12 @@ Takes the chart.
 {{- $_ := set $said "database" (dict "brought" (dict "enabled" $brought "standbys" (int (include "meridian-runtime.databaseStandbys" .)) "readReplicas" (int (include "meridian-runtime.databaseReadReplicas" .)))) -}}
 {{- $_ := set $said "broker" (dict "replicas" (int (include "meridian-runtime.brokerReplicas" .)) "jetstream" (dict "replicas" (int (include "meridian-runtime.jetstreamReplicas" .)))) -}}
 {{- $_ := set $said "zones" (.Values.zones | default list) -}}
+{{- /* Whether edge plugins keep storage, and the ReadWriteMany class an
+       instance of several pods shares it on (step 3d, checkpoint 5, item
+       30): the conductor refuses such a launch on several nodes where none
+       is named, before the record. A class's name, never an address. */ -}}
+{{- $ps := .Values.pluginStorage | default dict -}}
+{{- $_ := set $said "pluginStorage" (dict "enabled" ($ps.enabled | default false) "shared" (dict "storageClassName" (dig "shared" "storageClassName" "" $ps))) -}}
 {{- $b := .Values.backup | default dict -}}
 {{- $_ := set $said "backup" (dict "schedule" ($b.schedule | default "") "walArchive" (dict "enabled" (dig "walArchive" "enabled" false $b))) -}}
 {{- $_ := set $said "analytics" (dict "coordinator" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "coordinator" "replicaCount" nil .Values.analytics) "what" "analytics.coordinator.replicaCount")))) "worker" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "worker" "replicaCount" nil .Values.analytics) "what" "analytics.worker.replicaCount"))))) -}}

@@ -1339,6 +1339,10 @@ pub(crate) struct Manage<'a> {
     /// switched from or to (contract v30; the resilience spec's section 8):
     /// its Summary says "switched to backup source".
     pub switched: Vec<meridian_domain::v1::SourceSwitched>,
+    /// Its own storage copied into its shared storage before it first ran
+    /// as several pods, where recorded (step 3d, checkpoint 5, item 30):
+    /// its Summary says so, and that the old claim is kept.
+    pub copied: Option<&'a meridian_domain::v1::PluginStorageCopied>,
 }
 
 pub mod setting_up;
@@ -1494,6 +1498,17 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         "not known: it was not launched from the catalogue",
     );
     // A stopped instance (contract v25): stopped, by whom and when.
+    // Its own storage copied into its shared storage (item 30; the wording
+    // approved 2026-11-17, item 69).
+    let copied = manage.copied.map_or(String::new(), |copied| {
+        format!(
+            "<p data-storage-copied>Its storage was copied from {} into {}, folder shard-0/, on \
+             {}. The old claim is kept.</p>",
+            escape(&copied.from_claim),
+            escape(&copied.to_claim),
+            &crate::terminal::rfc3339(copied.at_ns)[..10]
+        )
+    });
     let stopped = manage.stopped.map_or(String::new(), |launch| {
         format!(
             "<dt>Stopped</dt><dd data-stopped>{} by {}</dd>",
@@ -1603,7 +1618,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{switched}{seen}{tokens}{latency}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{switched}{seen}{tokens}{latency}</dl>{copied}{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );

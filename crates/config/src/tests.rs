@@ -4126,6 +4126,7 @@ async fn a_relaunched_instance_is_held_to_its_running_version_s_uploaded_declara
             "meridian.v1.CreatePluginReply".into(),
             CreatePluginReply {
                 workload: "plugin-oms-1".into(),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
@@ -4343,4 +4344,107 @@ async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
     assert_eq!(back.version, 3);
     assert_eq!(back.routes[1].implementation, "built-in");
     assert_eq!(h.store.model_routing_changes().unwrap().len(), 2);
+}
+
+/// Item 30: the storage copy's record, on the memory store (the Postgres
+/// store's in tests/postgres.rs).
+mod storage_copied {
+    use crate::store::{Ending, Store};
+    use meridian_domain::v1::{PluginLaunch, PluginLaunchState};
+
+    fn launch(instance: &str) -> PluginLaunch {
+        PluginLaunch {
+            instance_id: instance.into(),
+            name: "snaptrade".into(),
+            version: "0.1.0".into(),
+            state: PluginLaunchState::Launched as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Item 30 (approved 2026-11-17, item 68): the launcher's copy of an
+    /// instance's own claim into its shared storage is recorded once a pod of
+    /// it is heard registered after the launcher answered -- its pods start
+    /// only once the copy is whole -- as `PluginStorageCopied`, on the launch
+    /// that copied, once per claim: an earlier pod's report records nothing, a
+    /// later report nothing again, nor a later launch finding it copied; no
+    /// copy pending, no record.
+    fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+        store: &dyn Store,
+    ) {
+        use meridian_domain::v1::PluginStorageCopied;
+        let mut launch = launch("feed-1");
+        launch.launched_by = "local|ada".into();
+        launch.launched_at_ns = 10;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        assert_eq!(
+            store.record_storage_copied("feed-1", 100, 100).unwrap(),
+            None
+        );
+        store
+            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 50)
+            .unwrap();
+        assert_eq!(
+            store.record_storage_copied("feed-1", 50, 60).unwrap(),
+            None,
+            "a report from before the launcher answered is an earlier pod's"
+        );
+        let copied = PluginStorageCopied {
+            instance_id: "feed-1".into(),
+            from_claim: "check-meridian-runtime-storage-feed-1".into(),
+            to_claim: "check-meridian-runtime-shared-storage-feed-1".into(),
+            at_ns: 70,
+            launched_by: "local|ada".into(),
+        };
+        assert_eq!(
+            store.record_storage_copied("feed-1", 51, 70).unwrap(),
+            Some(copied.clone())
+        );
+        assert_eq!(
+            store.record_storage_copied("feed-1", 80, 90).unwrap(),
+            None,
+            "once"
+        );
+        let on = |store: &dyn Store, at: i64| {
+            store
+                .launches()
+                .unwrap()
+                .into_iter()
+                .find(|held| held.instance_id == "feed-1" && held.launched_at_ns == at)
+                .unwrap()
+                .storage_copied
+        };
+        assert_eq!(on(store, 10), Some(copied.clone()));
+        // Stopped and launched again, the copy pod finding it copied: the
+        // launcher says the claim again, and nothing more is recorded.
+        let stop = Ending {
+            prepared_call_id: Default::default(),
+            state: PluginLaunchState::Stopped,
+            by: "local|ada".into(),
+            delegation: String::new(),
+            client: String::new(),
+            note: String::new(),
+            at_ns: 150,
+            failure: String::new(),
+        };
+        store.end_launch("feed-1", &stop).unwrap().unwrap();
+        launch.launched_at_ns = 200;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 210)
+            .unwrap();
+        assert_eq!(
+            store.record_storage_copied("feed-1", 220, 230).unwrap(),
+            None
+        );
+        assert_eq!(on(store, 200), None);
+        assert_eq!(on(store, 10), Some(copied));
+    }
+
+    #[test]
+    fn the_storage_copy_is_recorded_once_in_memory() {
+        a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+            &crate::MemoryStore::new(),
+        );
+    }
 }

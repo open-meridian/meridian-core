@@ -18,7 +18,8 @@ use meridian_domain::v1::VenueCatalogue;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     KnownPluginRoles, LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginCatalogue,
-    PluginLaunch, PluginLaunchState, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
+    PluginLaunch, PluginLaunchState, PluginStorageCopied, PluginVersion, SettingLastChange,
+    SignInRecord, UserGroup,
 };
 use meridian_pb::v1::{
     Catalogue, ConnectivityLink, DatasetLicence, MoveOutcome, SettingDeclaration, StoredSpan,
@@ -934,6 +935,22 @@ pub trait Store: Send + Sync {
     /// (contract v17).
     fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool>;
 
+    /// The claim the launcher copies into an instance's shared storage for
+    /// its live launch (item 30), and from when its pods' reports count:
+    /// after the launcher answered, when the earlier pods had ended.
+    fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()>;
+
+    /// The copy of an instance's live launch recorded, `PluginStorageCopied`
+    /// at `at_ns`, where it copied one and has none recorded yet, and a pod
+    /// of it was heard registered at `reported_at_ns`, after the launcher
+    /// answered (item 30): the record, or None.
+    fn record_storage_copied(
+        &self,
+        instance_id: &str,
+        reported_at_ns: i64,
+        at_ns: i64,
+    ) -> Result<Option<PluginStorageCopied>>;
+
     /// End an instance's live launch, returning it as ended, or None when
     /// none was live; a stop's note kept with it.
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>>;
@@ -1307,4 +1324,13 @@ pub struct HeldCatalogue {
     /// every starter pack as last pulled, at its latest published
     /// revision, a withdrawn one kept with its withdrawal.
     pub packs: Vec<meridian_domain::v1::PluginPack>,
+}
+
+/// The shared claim an instance's own claim is copied into (item 30):
+/// `<fullname>-shared-storage-<instance>` beside `<fullname>-storage-<instance>`.
+pub fn shared_claim_of(from_claim: &str, instance_id: &str) -> String {
+    match from_claim.strip_suffix(&format!("-storage-{instance_id}")) {
+        Some(fullname) => format!("{fullname}-shared-storage-{instance_id}"),
+        None => String::new(),
+    }
 }

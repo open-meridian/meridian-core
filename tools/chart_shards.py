@@ -47,7 +47,7 @@ TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 MEMBER = re.compile(r"^  name: \S+-member$", re.M)
 LAUNCHER = "check-meridian-runtime-launcher"
 PODS = re.compile(r'^    resources: \["pods"\]$', re.M)
-PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"\]$', re.M)
+PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"(, "create", "get", "delete")?\]$', re.M)
 
 
 def documents(render: str) -> list[str]:
@@ -311,10 +311,71 @@ def downward(render: str) -> list[str]:
     return wrong
 
 
+def template(render: str, name: str):
+    """The launcher's template `name` from its ConfigMap, as JSON; None
+    where the render has none."""
+    line = re.search(r"^  " + re.escape(name) + r": (\".*\")$", render, re.M)
+    return json.loads(json.loads(line.group(1))) if line else None
+
+
+def shared(render: str, rwx_class: str = "") -> list[str]:
+    """Item 30: where shards and standby pods render and edge plugins keep
+    storage, the launcher holds a shape sharing an instance's storage, the
+    shared claim -- ReadWriteMany in the named class alone, else
+    ReadWriteOnce -- and the copy pod, each of its exact shape; its policy
+    holds the copy pod, and the plugins' storage policy admits the shared
+    claim of a pod's own instance."""
+    wrong = []
+    claim = template(render, "shared-claim.json")
+    shape = template(render, "plugin-shards-storage.json")
+    copy = template(render, "storage-copy.json")
+    if claim is None or shape is None or copy is None:
+        return ["the launcher has no shared claim, shards storage shape or copy pod (item 30)"]
+    if claim["metadata"]["name"] != "check-meridian-runtime-shared-storage-__INSTANCE__":
+        wrong.append(f"the shared claim is named {claim['metadata']['name']}")
+    modes, held = claim["spec"].get("accessModes"), claim["spec"].get("storageClassName", "")
+    if rwx_class:
+        if modes != ["ReadWriteMany"] or held != rwx_class:
+            wrong.append(f"the shared claim is {modes} in {held!r}, not ReadWriteMany in {rwx_class!r}")
+    elif modes != ["ReadWriteOnce"]:
+        wrong.append(f"with no class named the shared claim is {modes}: ReadWriteMany renders only with the class set")
+    pod = shape["spec"]["template"]["spec"]
+    claims = [v["persistentVolumeClaim"]["claimName"] for v in pod.get("volumes", []) if "persistentVolumeClaim" in v]
+    if claims != ["check-meridian-runtime-shared-storage-__INSTANCE__"]:
+        wrong.append(f"the shards storage shape mounts {claims}, not the instance's shared storage alone")
+    plugin = [c for c in pod["containers"] if c["name"] == "plugin"]
+    if not plugin or not any(m["name"] == "storage" for m in plugin[0].get("volumeMounts", [])):
+        wrong.append("the shards storage shape mounts no storage in the plugin's container")
+    for c in pod["containers"]:
+        if c["name"] != "plugin" and any(m["name"] == "storage" for m in c.get("volumeMounts", [])):
+            wrong.append(f"the shards storage shape mounts storage in {c['name']}")
+    if pod.get("initContainers"):
+        wrong.append("the shards storage shape renders an init container; the launcher adds the copy's alone")
+    spec = copy["spec"]
+    volumes = {v["name"]: v.get("persistentVolumeClaim", {}) for v in spec.get("volumes", [])}
+    if (copy["metadata"]["name"] != "check-meridian-runtime-storage-copy-__INSTANCE__"
+            or len(spec["containers"]) != 1
+            or spec["containers"][0]["args"] != ["meridian-launcher", "copy-storage",
+                                                 "check-meridian-runtime-storage-__INSTANCE__"]
+            or spec.get("automountServiceAccountToken") is not False
+            or volumes.get("from", {}).get("claimName") != "check-meridian-runtime-storage-__INSTANCE__"
+            or volumes.get("from", {}).get("readOnly") is not True
+            or volumes.get("to", {}).get("claimName") != "check-meridian-runtime-shared-storage-__INSTANCE__"
+            or len(volumes) != 2):
+        wrong.append("the copy pod is not the launcher's copy-storage of the instance's own claim, "
+                     "read only, into its shared storage alone")
+    if "the launcher's one pod copies its instance's own storage into its shared storage" not in render:
+        wrong.append("the launcher's admission policy does not hold the copy pod to its shape")
+    if "check-meridian-runtime-shared-storage-' +" not in render:
+        wrong.append("the plugins' storage policy does not admit a pod's own instance's shared storage")
+    return wrong
+
+
 def main() -> int:
     render = sys.stdin.read()
     mode, rest = sys.argv[1], sys.argv[2:]
-    wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio, "downward": downward}[mode](render, *rest)
+    wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio, "downward": downward,
+             "shared": shared}[mode](render, *rest)
     for what in wrong:
         print(f"chart-check FAILED (step 3d, shards): {what}", file=sys.stderr)
     return 1 if wrong else 0

@@ -143,6 +143,13 @@ fn conductor(bus: &Bus) {
                     }),
                     shards: 2,
                     standby: true,
+                    storage_copied: Some(meridian_domain::v1::PluginStorageCopied {
+                        instance_id: "snaptrade-1".into(),
+                        from_claim: "r-storage-snaptrade-1".into(),
+                        to_claim: "r-shared-storage-snaptrade-1".into(),
+                        at_ns: 1_790_380_800_000_000_000,
+                        launched_by: "local|ada".into(),
+                    }),
                     ..Default::default()
                 }],
             }
@@ -816,6 +823,17 @@ async fn the_catalogue_launching_and_stopping() {
     );
     assert_eq!(listed["launches"][0]["shards"], 2);
     assert_eq!(listed["launches"][0]["standby"], true);
+    // Item 30 (item 70): its own storage's copy into its shared storage,
+    // read by `meridian plugin list`; null where none was copied.
+    assert_eq!(
+        listed["launches"][0]["storage_copied"],
+        serde_json::json!({
+            "from_claim": "r-storage-snaptrade-1",
+            "to_claim": "r-shared-storage-snaptrade-1",
+            "at_ns": 1_790_380_800_000_000_000_i64,
+            "launched_by": "local|ada",
+        })
+    );
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",

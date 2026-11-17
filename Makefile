@@ -3186,7 +3186,18 @@ chart-check:
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=true 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: a sharded instance rendered with storage of its own, which is one pod's" >&2; exit 1; }; \
 	echo "$$said" | grep -q "storage is one pod's" \
-		|| { echo "chart-check FAILED: a sharded instance with storage was refused without saying why: $$said" >&2; exit 1; }
+		|| { echo "chart-check FAILED: a sharded instance with storage was refused without saying why: $$said" >&2; exit 1; }; \
+	echo "$$ha" | $(PY) tools/chart_shards.py shared || exit 1; \
+	rwx="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set pluginStorage.shared.storageClassName=files \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: the ha profile with a shared storage class did not render: $$rwx" >&2; exit 1; }; \
+	echo "$$rwx" | $(PY) tools/chart_shards.py shared files || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py shared files 2>/dev/null \
+		&& { echo "chart-check FAILED: the item 30 check found a ReadWriteMany claim where no class is named, so it proves nothing" >&2; exit 1; }; \
+	echo "$$rwx" | $(PY) tools/chart_shards.py shared 2>/dev/null \
+		&& { echo "chart-check FAILED: the item 30 check passed a ReadWriteMany claim as the one-node claim, so it proves nothing" >&2; exit 1; }; \
+	echo "$$rwx" | grep -qF 'pluginStorage\":{\"enabled\":true,\"shared\":{\"storageClassName\":\"files\"}}' \
+		|| { echo "chart-check FAILED: the conductor is not told the shared storage class it refuses several pods keeping storage on several nodes without (item 30)" >&2; exit 1; }
 	@# Step 3b part 2: resilience.profile. `tolerant`, the default, is one of
 	@# everything: one broker server as a StatefulSet, the database alone on
 	@# postgres:16-alpine with page checksums at initdb, one dashboard. `ha`

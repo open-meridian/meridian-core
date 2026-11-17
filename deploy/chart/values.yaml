@@ -858,6 +858,25 @@ pluginStorage:
   # non-root user can write it. Empty where the cluster assigns its own, as
   # OpenShift does; podSecurityContext.fsGroup, when set, wins.
   fsGroup: 65532
+  # An instance launched as several pods -- shards, or a standby pod (step
+  # 3d) -- shares one claim, `<release>-meridian-runtime-shared-storage-
+  # <instance>`, mounted by every pod of the instance: shard n writes only
+  # under `shard-<n>/`, and any pod reads every shard's, so a standby that
+  # takes a shard carries on its records and a ref from any shard resolves
+  # from any pod. On several nodes that takes a ReadWriteMany storage class
+  # (a cloud's file store, CephFS, NFS, Longhorn's RWX), named here; empty
+  # offers none, and the conductor refuses such a launch on several nodes
+  # naming this value. A deployment on one node needs none: the claim is
+  # then ReadWriteOnce, in storageClassName above, which every pod on the
+  # node mounts. An instance that ran as one pod has its own claim copied
+  # into the shared claim's `shard-0/` before its first launch as several
+  # pods; its own claim is kept as it was, and the launcher never deletes
+  # either.
+  shared:
+    storageClassName: ""
+    # The instance's, all its shards together, requested once when it is
+    # made.
+    size: 10Gi
 
 # An archive for an edge plugin's older records (contract v16;
 # spec/an-edge-plugins-older-records-move-to-the-archive): past a kind's

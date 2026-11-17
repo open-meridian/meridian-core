@@ -40,8 +40,13 @@
 {{- if gt $shards 64 -}}
 {{- fail (printf "%s is given %d shards; at most 64 (PluginDeclaration.most_shards)" .instance $shards) -}}
 {{- end -}}
-{{- if and $several .storage -}}
-{{- fail (printf "%s is given shards or a standby pod and its own storage: an instance's storage is one pod's" .instance) -}}
+{{- /* A launched instance of several pods keeping storage shares one claim,
+       its shared storage (item 30), which the launcher makes, copying the
+       instance's own claim into it first where one is kept. A sidecars[]
+       instance has no launcher to copy its own claim, so its storage stays
+       one pod's. */ -}}
+{{- if and $several .storage (not .launched) -}}
+{{- fail (printf "%s is given shards or a standby pod and its own storage: a sidecars[] instance's storage is one pod's; launch it from the catalogue to run it as several pods on shared storage (pluginStorage.shared.storageClassName)" .instance) -}}
 {{- end -}}
 {{- if and $several .live -}}
 {{- fail (printf "%s is given shards or a standby pod and the live shape: a live instance is one pod" .instance) -}}
@@ -468,7 +473,13 @@ spec:
         {{- if and .storage .plugin }}
         - name: storage
           persistentVolumeClaim:
+            {{- if $several }}
+            {{- /* Several pods of the instance share its storage, a folder
+                   per shard (step 3d, checkpoint 5, item 30). */}}
+            claimName: {{ include "meridian-runtime.fullname" $top }}-shared-storage-{{ .instance }}
+            {{- else }}
             claimName: {{ include "meridian-runtime.fullname" $top }}-storage-{{ .instance }}
+            {{- end }}
         {{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- /*

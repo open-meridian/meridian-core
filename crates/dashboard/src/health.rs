@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use meridian_bus::Bus;
 use meridian_domain::v1::PluginReport;
+use meridian_pb::v1::StoredSpan;
 use prost::Message;
 
 use crate::clock::SECOND_NS;
@@ -24,9 +25,40 @@ pub const PLUGIN_REPORT: &str = "platform.deployment.event.plugin-report";
 /// anything: three of its 30-second reports missed.
 pub const SILENT_NS: i64 = 90 * SECOND_NS;
 
+/// Each instance's shards' storage: by instance, then shard, when its last
+/// registered report was made and what it said it stores (item 30).
+type ShardsStored = BTreeMap<String, BTreeMap<u32, (i64, Vec<StoredSpan>)>>;
+
 #[derive(Debug, Default)]
 pub struct Health {
     heard: Mutex<BTreeMap<String, PluginReport>>,
+    /// What each shard of an instance keeps, by instance and shard, as its
+    /// last registered report said, and when (step 3d, checkpoint 5, item
+    /// 30): each shard writes its own folder of the instance's storage.
+    shards: Mutex<ShardsStored>,
+}
+
+/// An instance's shards' storage summed, kind by kind: the records and
+/// bytes added, the span from the earliest first to the latest last.
+fn summed<'a>(each: impl Iterator<Item = &'a Vec<StoredSpan>>) -> Vec<StoredSpan> {
+    let mut kinds: BTreeMap<String, StoredSpan> = BTreeMap::new();
+    for span in each.flatten() {
+        let held = kinds
+            .entry(span.record_kind.clone())
+            .or_insert_with(|| StoredSpan {
+                record_kind: span.record_kind.clone(),
+                ..Default::default()
+            });
+        held.record_count += span.record_count;
+        held.bytes += span.bytes;
+        if span.first_received_ns != 0
+            && (held.first_received_ns == 0 || span.first_received_ns < held.first_received_ns)
+        {
+            held.first_received_ns = span.first_received_ns;
+        }
+        held.last_received_ns = held.last_received_ns.max(span.last_received_ns);
+    }
+    kinds.into_values().collect()
 }
 
 impl Health {
@@ -42,13 +74,46 @@ impl Health {
         if publisher != report.plugin_instance_id {
             return;
         }
+        // A registered plugin's storage, kept by its shard (item 30); a pod
+        // holding no shard has no plugin registered, and adds nothing.
+        if report.registered {
+            self.shards
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(report.plugin_instance_id.clone())
+                .or_default()
+                .insert(report.shard, (report.reported_at_ns, report.stored.clone()));
+        }
         self.heard()
             .insert(report.plugin_instance_id.clone(), report);
     }
 
-    /// Every plugin heard from, by instance.
+    /// Every plugin heard from, by instance: its last report, with what it
+    /// stores summed over its shards that reported within [`SILENT_NS`] of
+    /// it (item 30); a shard retired, or a pod gone, falls out after that.
     pub fn view(&self) -> BTreeMap<String, PluginReport> {
-        self.heard().clone()
+        let mut view = self.heard().clone();
+        let shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (instance, report) in &mut view {
+            let Some(held) = shards.get(instance) else {
+                continue;
+            };
+            let latest = held
+                .values()
+                .map(|(at, _)| *at)
+                .max()
+                .unwrap_or_default()
+                .max(report.reported_at_ns);
+            report.stored = summed(
+                held.values()
+                    .filter(|(at, _)| latest - *at <= SILENT_NS)
+                    .map(|(_, stored)| stored),
+            );
+        }
+        view
     }
 }
 
@@ -159,6 +224,76 @@ mod tests {
         assert!(health.view().is_empty(), "another sidecar's word about it");
         health.hear("snaptrade-1", report("snaptrade-1", false));
         assert!(!health.view()["snaptrade-1"].healthy);
+    }
+
+    fn span(kind: &str, count: u64, first: i64, last: i64, bytes: u64) -> StoredSpan {
+        StoredSpan {
+            record_kind: kind.into(),
+            record_count: count,
+            first_received_ns: first,
+            last_received_ns: last,
+            bytes,
+        }
+    }
+
+    /// Item 30: each shard keeps its own storage, so what an instance holds
+    /// is its shards' reports summed, not whichever pod spoke last; a pod
+    /// holding no shard, and a shard silent past SILENT_NS, add nothing.
+    #[test]
+    fn what_an_instance_stores_is_its_shards_summed() {
+        let health = Health::default();
+        let shard = |n: u32, at: i64, stored: Vec<StoredSpan>| PluginReport {
+            shard: n,
+            reported_at_ns: at,
+            stored,
+            ..report("feed-1", true)
+        };
+        health.hear(
+            "feed-1",
+            shard(0, T0, vec![span("responses", 3, T0 - 30, T0 - 10, 100)]),
+        );
+        health.hear(
+            "feed-1",
+            shard(
+                1,
+                T0 + 1,
+                vec![
+                    span("responses", 2, T0 - 50, T0 - 20, 40),
+                    span("quotes", 1, T0 - 5, T0 - 5, 0),
+                ],
+            ),
+        );
+        // A standby: shard 0 as it holds none, its plugin not registered.
+        health.hear(
+            "feed-1",
+            PluginReport {
+                registered: false,
+                reported_at_ns: T0 + 2,
+                ..report("feed-1", true)
+            },
+        );
+        let stored = &health.view()["feed-1"].stored;
+        assert_eq!(
+            stored,
+            &vec![
+                span("quotes", 1, T0 - 5, T0 - 5, 0),
+                span("responses", 5, T0 - 50, T0 - 10, 140),
+            ],
+            "the instance's shards summed, the standby adding nothing"
+        );
+        // Shard 1 retired: silent past SILENT_NS, it is no longer counted.
+        health.hear(
+            "feed-1",
+            shard(
+                0,
+                T0 + SILENT_NS + 2,
+                vec![span("responses", 4, T0 - 30, T0 + 9, 120)],
+            ),
+        );
+        assert_eq!(
+            health.view()["feed-1"].stored,
+            vec![span("responses", 4, T0 - 30, T0 + 9, 120)]
+        );
     }
 
     #[test]

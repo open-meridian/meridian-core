@@ -77,6 +77,7 @@ pub(crate) fn harness_with(platform: Arc<Platform>, store: Arc<dyn crate::Store>
             "meridian.v1.CreatePluginReply".into(),
             CreatePluginReply {
                 workload: format!("plugin-{}", request.instance_id),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))

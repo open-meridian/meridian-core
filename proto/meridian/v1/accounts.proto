@@ -870,6 +870,12 @@ message PluginReport {
   // A single role, before a plugin could hold several.
   reserved 2;
   reserved "role";
+
+  // Step 3d, checkpoint 5, item 30: the shard whose Lease the reporting
+  // pod's sidecar holds; 0 for an instance of one pod, and for a pod holding
+  // none, whose plugin is not registered. Each shard keeps its own storage,
+  // so what the instance holds (stored) is the sum of its shards' reports.
+  uint32 shard = 24;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

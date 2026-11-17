@@ -103,11 +103,36 @@ struct Plugins {
     registries: Option<Arc<crate::registries::Hold>>,
     /// The starter packs whose install is under way (W8.18, v28).
     packs: packs::Jobs,
-    /// Whether the deployment renders the lease right an instance of
-    /// several pods runs under (step 3d; the resilience spec's section 7):
-    /// where a store runs a standby. None where the deployment does not
-    /// say, and the launcher's own refusal stands.
-    lease_right: Option<bool>,
+    /// What the deployment says an instance of several pods may run under
+    /// (step 3d; the resilience spec's section 7; checkpoint 5, item 30).
+    several: Several,
+}
+
+/// What the deployment says an instance of several pods -- shards, or a
+/// standby pod -- may run under (step 3d): each none where it does not say,
+/// and the launcher's own refusal stands.
+#[derive(Clone, Default)]
+pub struct Several {
+    /// Whether it renders the lease right such an instance runs under:
+    /// where a store runs a standby.
+    pub lease_right: Option<bool>,
+    /// Whether edge plugins keep storage (`pluginStorage.enabled`), and the
+    /// ReadWriteMany class an instance of several pods shares it on
+    /// (`pluginStorage.shared.storageClassName`; item 30), empty for none.
+    pub storage: Option<(bool, String)>,
+    /// The nodes the deployment's pods run on, read at the launch that
+    /// needs it: on one, a ReadWriteOnce claim reaches every pod (item 30).
+    pub nodes: Option<Arc<dyn Fn() -> Result<usize, String> + Send + Sync>>,
+}
+
+impl Several {
+    /// A deployment that says its lease right alone.
+    pub fn leased(lease_right: Option<bool>) -> Self {
+        Self {
+            lease_right,
+            ..Self::default()
+        }
+    }
 }
 
 mod catalogue;
@@ -701,6 +726,85 @@ fn several_refused(
     ))
 }
 
+/// Whether a plugin of `roles` declaring `declaration` keeps storage of its
+/// own, as the launcher gives it: one asking for it, or uploaded with no
+/// declaration, before v11 (W8.3, contract v11), that holds an edge role
+/// (decisions/028).
+fn keeps_storage(roles: &[String], declaration: Option<&PluginDeclaration>) -> bool {
+    let asks = declaration.is_none_or(|declaration| declaration.storage.is_some());
+    asks && meridian_domain::roles_now(roles)
+        .iter()
+        .any(|role| meridian_domain::EDGE_ROLES.contains(&role.as_str()))
+}
+
+/// The refusal wording of [`storage_refused`]: proposed 2026-11-17 (c5c),
+/// awaiting the product owner's ruling.
+fn storage_refusal_said(field: &str, instance: &str, nodes: &str) -> String {
+    format!(
+        "{field} was asked for {instance}, and its plugin keeps storage: its pods share it on \
+         several nodes only through a ReadWriteMany storage class, and this deployment runs on \
+         {nodes} and names none in pluginStorage.shared.storageClassName"
+    )
+}
+
+/// A launch asking several pods of an instance whose plugin keeps storage,
+/// refused where the deployment offers no ReadWriteMany class for them to
+/// share it on and runs on several nodes (step 3d, checkpoint 5, item 30;
+/// approved 2026-11-15): before anything is recorded, naming the field
+/// asked and `pluginStorage.shared.storageClassName`. On one node a
+/// ReadWriteOnce claim reaches every pod, so none is needed; nodes that
+/// could not be counted count as several.
+fn storage_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    keeps: bool,
+    several: &Several,
+) -> Option<String> {
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else {
+        return None;
+    };
+    let Some((enabled, class)) = &several.storage else {
+        return None;
+    };
+    if !keeps || !enabled || !class.is_empty() {
+        return None;
+    }
+    let nodes = match several.nodes.as_ref().map(|nodes| nodes()) {
+        Some(Ok(nodes)) if nodes <= 1 => return None,
+        Some(Ok(nodes)) => format!("{nodes} nodes"),
+        Some(Err(failed)) => format!("nodes it could not count ({failed})"),
+        None => "nodes it could not count".to_string(),
+    };
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        storage_refusal_said(field, instance, &nodes),
+    ))
+}
+
+/// Both refusals of an instance of several pods before anything is
+/// recorded: no lease right, then no storage to share.
+fn several_or_storage_refused(
+    instance: &str,
+    pods: (u32, bool),
+    version: &PluginVersion,
+    several: &Several,
+) -> Option<String> {
+    several_refused(instance, pods, several.lease_right).or_else(|| {
+        let metadata = version.metadata.clone().unwrap_or_default();
+        storage_refused(
+            instance,
+            pods,
+            keeps_storage(&metadata.roles, metadata.declaration.as_ref()),
+            several,
+        )
+    })
+}
+
 // ── Serving them ────────────────────────────────────────────────────────────
 
 impl Plugins {
@@ -796,10 +900,11 @@ impl Plugins {
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
         }
-        if let Some(refusal) = several_refused(
+        if let Some(refusal) = several_or_storage_refused(
             &request.instance_id,
             (request.shards, request.standby),
-            self.lease_right,
+            version,
+            &self.several,
         ) {
             return Err(refusal);
         }
@@ -874,6 +979,10 @@ impl Plugins {
             create,
         ) {
             Ok(made) => {
+                // Its own storage being copied into its shared storage
+                // (item 30): recorded once a pod of it is heard registered
+                // after now, when the copy is whole.
+                self.pend_copy(&request.instance_id, &made)?;
                 tracing::info!(
                     instance = launched.instance_id,
                     plugin = launched.name,
@@ -898,6 +1007,19 @@ impl Plugins {
                 ))
             }
         }
+    }
+
+    /// The claim the launcher said it copies into the instance's shared
+    /// storage (item 30), kept on its live launch: `PluginStorageCopied` is
+    /// recorded once a pod of it is heard registered after now, when the
+    /// copy is whole.
+    fn pend_copy(&self, instance: &str, made: &CreatePluginReply) -> Result<(), String> {
+        if made.storage_copied_from.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .pend_storage_copy(instance, &made.storage_copied_from, self.clock.now_ns())
+            .map_err(|f| f.to_string())
     }
 
     /// What the launcher is asked to make for an instance of a recorded
@@ -1111,9 +1233,12 @@ impl Plugins {
         // Several pods it could not be made as again, on a deployment that
         // has since left its lease right: refused before its running
         // workload is removed, so it is not stopped to no end.
-        if let Some(refusal) =
-            several_refused(instance, (launch.shards, launch.standby), self.lease_right)
-        {
+        if let Some(refusal) = several_or_storage_refused(
+            instance,
+            (launch.shards, launch.standby),
+            version,
+            &self.several,
+        ) {
             return Err(refusal);
         }
         let _: RemovePluginReply = self
@@ -1141,6 +1266,7 @@ impl Plugins {
             create,
         ) {
             Ok(made) => {
+                self.pend_copy(instance, &made)?;
                 tracing::info!(
                     instance,
                     workload = made.workload,
@@ -1415,13 +1541,19 @@ pub fn serve_plugins_and_registries(
     registries: Option<Arc<crate::registries::Hold>>,
 ) {
     serve_plugins_on(
-        bus, store, clock, registry, archive, local, registries, None,
+        bus,
+        store,
+        clock,
+        registry,
+        archive,
+        local,
+        registries,
+        Several::default(),
     )
 }
 
-/// [`serve_plugins_and_registries`], on a deployment that says whether it
-/// renders the lease right an instance of several pods runs under (step
-/// 3d): `lease_right`, none where the deployment does not say.
+/// [`serve_plugins_and_registries`], on a deployment that says what an
+/// instance of several pods may run under (step 3d): [`Several`].
 #[allow(clippy::too_many_arguments)]
 pub fn serve_plugins_on(
     bus: Arc<Bus>,
@@ -1431,7 +1563,7 @@ pub fn serve_plugins_on(
     archive: ArchiveGrant,
     local: Option<Arc<dyn LocalRegistry>>,
     registries: Option<Arc<crate::registries::Hold>>,
-    lease_right: Option<bool>,
+    several: Several,
 ) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
@@ -1442,7 +1574,7 @@ pub fn serve_plugins_on(
         local,
         registries,
         packs: packs::Jobs::default(),
-        lease_right,
+        several,
     });
     // A pack install a restart interrupted, carried on (616).
     plugins.resume_pack_jobs();

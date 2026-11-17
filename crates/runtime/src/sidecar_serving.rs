@@ -104,7 +104,7 @@ pub async fn serve_as_shards<L: Leases + 'static>(
                     of = count,
                     "this pod holds a shard's lease"
                 );
-                let held = Arc::new(meridian_sidecar::shards::Shards::new(mine));
+                let held = Arc::new(meridian_sidecar::shards::Shards::new(mine).of(count));
                 held.set_live(others);
                 // A refusal heard was the last serving's, whose bus is gone.
                 meridian_sidecar::shards::clear_fenced();

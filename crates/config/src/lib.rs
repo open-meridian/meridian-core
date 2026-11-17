@@ -46,7 +46,7 @@ pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use plugins::serve_plugins;
 pub use plugins::serve_plugins_with;
 pub use plugins::{
-    serve_plugins_and_registries, serve_plugins_on, serve_plugins_reaching, LocalRegistry,
+    serve_plugins_and_registries, serve_plugins_on, serve_plugins_reaching, LocalRegistry, Several,
 };
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;

@@ -183,6 +183,12 @@ pub struct Values {
     /// The book's partitions (`bor.partitions`; step 3d), where stated; 0
     /// where not known.
     pub book_partitions: u32,
+    /// Whether edge plugins keep storage (`pluginStorage.enabled`).
+    pub plugin_storage: bool,
+    /// The ReadWriteMany class an instance of several pods shares its
+    /// storage on (`pluginStorage.shared.storageClassName`; step 3d,
+    /// checkpoint 5, item 30); empty where none is offered.
+    pub shared_storage_class: String,
 }
 
 impl Values {
@@ -257,6 +263,12 @@ impl Values {
                 })
                 .collect(),
             book_partitions: count(&said["bor"]["partitions"]),
+            plugin_storage: said["pluginStorage"]["enabled"].as_bool().unwrap_or(false),
+            shared_storage_class: said["pluginStorage"]["shared"]["storageClassName"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         })
     }
 
@@ -306,6 +318,8 @@ impl Values {
             analytics_workers: of("analytics-worker").count() as u32,
             writer_groups: BTreeMap::new(),
             book_partitions: 0,
+            plugin_storage: false,
+            shared_storage_class: String::new(),
         }
     }
 }

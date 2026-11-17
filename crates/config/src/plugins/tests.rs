@@ -57,6 +57,20 @@ fn harness_on(
     archive: ArchiveGrant,
     lease_right: Option<bool>,
 ) -> (Arc<Bus>, Arc<Launcher>) {
+    harness_several(
+        conductor,
+        archive,
+        crate::plugins::Several::leased(lease_right),
+    )
+}
+
+/// The plugins' service on a deployment that says what an instance of
+/// several pods may run under (step 3d, item 30).
+fn harness_several(
+    conductor: &str,
+    archive: ArchiveGrant,
+    several: crate::plugins::Several,
+) -> (Arc<Bus>, Arc<Launcher>) {
     let bus = Arc::new(Bus::single(
         conductor,
         Arc::new(MemoryBackend::new()),
@@ -70,7 +84,7 @@ fn harness_on(
         archive,
         None,
         None,
-        lease_right,
+        several,
     );
     let launcher = Arc::new(Launcher::default());
     let creating = Arc::clone(&launcher);
@@ -83,7 +97,11 @@ fn harness_on(
         creating.created.lock().unwrap().push(request);
         Ok((
             "meridian.v1.CreatePluginReply".into(),
-            CreatePluginReply { workload }.encode_to_vec(),
+            CreatePluginReply {
+                workload,
+                ..Default::default()
+            }
+            .encode_to_vec(),
         ))
     });
     let removing = Arc::clone(&launcher);
@@ -850,6 +868,7 @@ fn harness_releasing() -> (Arc<Bus>, Arc<Releasing>, Arc<MemoryStore>) {
             "meridian.v1.CreatePluginReply".into(),
             CreatePluginReply {
                 workload: format!("plugin-{}", request.instance_id),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
@@ -1467,6 +1486,88 @@ async fn shards_or_a_standby_are_refused_before_the_record_where_no_lease_right_
     )
     .await
     .unwrap();
+}
+
+/// Item 30 (approved 2026-11-15): an instance of several pods whose plugin
+/// keeps storage shares it through a ReadWriteMany class; with none named,
+/// a deployment on several nodes refuses such a launch before the record,
+/// FAILED_PRECONDITION naming the field asked and
+/// `pluginStorage.shared.storageClassName`. One node needs none; a class
+/// named, a plugin keeping none, or storage off are not refused; nodes that
+/// cannot be counted count as several.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_pods_keeping_storage_on_several_nodes_need_a_shared_class_before_the_record() {
+    let keeping = |version: &str| {
+        let mut upload = shardable(version, &["data"]);
+        upload
+            .metadata
+            .as_mut()
+            .unwrap()
+            .declaration
+            .as_mut()
+            .unwrap()
+            .storage = Some(meridian_pb::v1::StorageDeclaration {
+            retention_days: 30,
+            ..Default::default()
+        });
+        upload
+    };
+    let on = |nodes: Result<usize, String>, enabled: bool, class: &str| {
+        let nodes = Arc::new(move || nodes.clone());
+        harness_several(
+            "conductor-1",
+            ArchiveGrant::default(),
+            crate::plugins::Several {
+                lease_right: Some(true),
+                storage: Some((enabled, class.to_string())),
+                nodes: Some(nodes),
+            },
+        )
+    };
+    for nodes in [Ok(3), Err("the API server did not answer".to_string())] {
+        let (bus, launcher) = on(nodes, true, "");
+        upload(&bus, keeping("0.1.0")).await.unwrap();
+        for (shards, standby, field) in [(2, false, "shards"), (0, true, "standby")] {
+            let refused = launch(
+                &bus,
+                LaunchPluginRequest {
+                    shards,
+                    standby,
+                    ..launching("feed-1", &["data"])
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                refused.contains("[refusal-status failed-precondition")
+                    && refused.contains(field)
+                    && refused.contains("pluginStorage.shared.storageClassName"),
+                "{field}: {refused}"
+            );
+        }
+        assert!(launcher.created.lock().unwrap().is_empty());
+        assert!(
+            catalogue(&bus).await.launches.is_empty(),
+            "nothing recorded"
+        );
+        // One pod keeps its own storage as ever.
+        launch(&bus, launching("feed-1", &["data"])).await.unwrap();
+    }
+    let several = LaunchPluginRequest {
+        shards: 2,
+        standby: true,
+        ..launching("feed-1", &["data"])
+    };
+    // One node, a class named, storage off: launched.
+    for (nodes, enabled, class) in [(1, true, ""), (3, true, "files"), (3, false, "")] {
+        let (bus, _launcher) = on(Ok(nodes), enabled, class);
+        upload(&bus, keeping("0.1.0")).await.unwrap();
+        launch(&bus, several.clone()).await.unwrap();
+    }
+    // A plugin keeping no storage needs none, on any number of nodes.
+    let (bus, _launcher) = on(Ok(3), true, "");
+    upload(&bus, shardable("0.1.0", &["data"])).await.unwrap();
+    launch(&bus, several).await.unwrap();
 }
 
 /// Review finding 11 (accepted 2026-11-15): each shard holds at least one

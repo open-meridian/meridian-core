@@ -376,10 +376,11 @@ impl Plugins {
         // Its shards and standby pod are kept: refused, before anything is
         // removed, where the deployment has since left the lease right
         // they run under.
-        if let Some(refusal) = super::several_refused(
+        if let Some(refusal) = super::several_or_storage_refused(
             &request.instance_id,
             (running.shards, running.standby),
-            self.lease_right,
+            &version,
+            &self.several,
         ) {
             return Err(refusal);
         }
@@ -454,7 +455,8 @@ impl Plugins {
             "meridian.v1.CreatePluginRequest",
             create,
         ) {
-            Ok(_) => {
+            Ok(made) => {
+                self.pend_copy(&request.instance_id, &made)?;
                 tracing::info!(
                     instance = moved.instance_id,
                     from = format!("{} {}", running.name, running.version),

@@ -203,6 +203,10 @@ impl Sidecar {
             refused_grants,
             last_refusal_reason,
             reported_at_ns: now_ns,
+            // The shard this pod holds, where it holds one (item 30): each
+            // shard keeps its own storage, so the instance's `stored` is the
+            // sum of its shards' reports.
+            shard: self.shards.as_ref().map_or(0, |shards| shards.mine()),
             // What it declared, for the conductor to check a setting against
             // and tell a secret by (W6.11). Declarations, never values.
             declared_settings: registration

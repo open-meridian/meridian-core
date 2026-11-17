@@ -92,6 +92,36 @@
       "shards" 1
       "standby" true) -}}
 {{- end }}
+{{/*
+  And where edge plugins keep storage, the same shape mounting the
+  instance's shared storage, a folder per shard; the claim it mounts,
+  `shared-claim.json`; and the pod that copies an instance's own claim
+  into its `shard-0/` once, before its first launch as several pods (step
+  3d, checkpoint 5, item 30).
+*/}}
+{{- $shardsStorage := "" -}}
+{{- $sharedClaim := "" -}}
+{{- $storageCopy := "" -}}
+{{- if and $shards .Values.pluginStorage.enabled -}}
+{{- $shardsStorage = include "meridian-runtime.plugin" (dict
+      "top" .
+      "name" (printf "%s-plugin-__INSTANCE__" $full)
+      "instance" "__INSTANCE__"
+      "roles" "__ROLES__"
+      "brokerSecret" (printf "%s-launched" $broker)
+      "brokerKey" "__INSTANCE__.url"
+      "plugin" (dict "image" "__IMAGE__")
+      "imageTag" ""
+      "launched" true
+      "shards" 1
+      "standby" true
+      "storage" true) -}}
+{{- $sharedClaim = include "meridian-runtime.sharedStorage" (dict
+      "top" .
+      "instance" "__INSTANCE__"
+      "plugin" "__PLUGIN__") -}}
+{{- $storageCopy = include "meridian-runtime.storageCopy" . -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -109,6 +139,11 @@ data:
   {{- end }}
   {{- if $archive }}
   archive.json: {{ $archive | fromYaml | toJson | quote }}
+  {{- end }}
+  {{- if $shardsStorage }}
+  plugin-shards-storage.json: {{ $shardsStorage | fromYaml | toJson | quote }}
+  shared-claim.json: {{ $sharedClaim | fromYaml | toJson | quote }}
+  storage-copy.json: {{ $storageCopy | fromYaml | toJson | quote }}
   {{- end }}
   {{- if .Values.development }}
   {{- /*
@@ -192,9 +227,13 @@ rules:
   # Read alone: a stopped instance's pods, ended before their account is
   # removed, so each sidecar releases its shard's Lease with a live token
   # (review c5b L5, c5b2 H1).
+  # And where edge plugins keep storage, the one pod it makes, which copies
+  # an instance's own storage claim into its shared storage once (item 30):
+  # made, read and removed, held by its policy below to exactly the chart's
+  # shape.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["list"]
+    verbs: {{ if $shardsStorage }}["list", "create", "get", "delete"]{{ else }}["list"]{{ end }}
   {{- end }}
   {{- if or $shards (include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher)) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
@@ -245,7 +284,7 @@ spec:
         meridian.dev/component: launcher
       annotations:
         # A new template is a new launcher, so it never fills in an old one.
-        checksum/template: {{ printf "%s%s%s%s" $shape $storage $claim $archive | sha256sum }}
+        checksum/template: {{ printf "%s%s%s%s%s%s%s%s" $shape $storage $claim $archive $shards $shardsStorage $sharedClaim $storageCopy | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "launcher" "values" $.Values.launcher "account" true) | nindent 6 }}
@@ -274,6 +313,16 @@ spec:
             # where the deployment runs standbys.
             - name: MERIDIAN_LAUNCHER_SHARDS_TEMPLATE
               value: /etc/meridian/launcher/plugin-shards.json
+            {{- end }}
+            {{- if $shardsStorage }}
+            # Its shape keeping storage, the shared claim it mounts and the
+            # pod that copies an instance's own claim into it (item 30).
+            - name: MERIDIAN_LAUNCHER_SHARDS_STORAGE_TEMPLATE
+              value: /etc/meridian/launcher/plugin-shards-storage.json
+            - name: MERIDIAN_LAUNCHER_SHARED_CLAIM_TEMPLATE
+              value: /etc/meridian/launcher/shared-claim.json
+            - name: MERIDIAN_LAUNCHER_STORAGE_COPY_TEMPLATE
+              value: /etc/meridian/launcher/storage-copy.json
             {{- end }}
             {{- if .Values.development }}
             # A development deployment: the launcher makes the live shape
@@ -368,6 +417,12 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["roles", "rolebindings"]
+      # The pod that copies an instance's own storage into its shared
+      # storage (item 30), the one pod it makes.
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["pods"]
   matchConditions:
     - name: the-launcher
       expression: >-
@@ -428,7 +483,13 @@ spec:
         (
           has(object.spec.template.spec.automountServiceAccountToken) &&
           object.spec.template.spec.automountServiceAccountToken == false &&
-          !has(object.spec.template.spec.initContainers) &&
+          (!has(object.spec.template.spec.initContainers) ||
+           object.spec.template.spec.initContainers.all(c, !has(c.volumeMounts) ||
+             c.volumeMounts.all(m,
+               !has(object.spec.template.spec.volumes) ||
+               !object.spec.template.spec.volumes.exists(v,
+                 v.name == m.name && has(v.projected) && has(v.projected.sources) &&
+                 v.projected.sources.exists(s, has(s.serviceAccountToken)))))) &&
           !has(object.spec.template.spec.ephemeralContainers) &&
           object.spec.template.spec.containers.all(c,
             c.name == "sidecar" || !has(c.volumeMounts) ||
@@ -439,6 +500,49 @@ spec:
                 v.projected.sources.exists(s, has(s.serviceAccountToken)))))
         )
       message: under its instance's shards account the token is mounted in the sidecar's container alone
+    # The one pod the launcher makes (item 30): its instance's copy of its
+    # own storage claim, read only, into its shared storage, exactly as the
+    # chart's storage-copy shape -- the runtime's image and the launcher's
+    # copy-storage alone, no account's token, no secret, no host's
+    # namespace, and those two claims of the instance its label names.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "pods" ||
+        (
+          request.operation == "CREATE" &&
+          variables.instance != "" &&
+          object.metadata.name == {{ printf "%s-storage-copy-" $full | quote }} + variables.instance &&
+          object.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy" &&
+          object.spec.restartPolicy == "OnFailure" &&
+          has(object.spec.automountServiceAccountToken) &&
+          object.spec.automountServiceAccountToken == false &&
+          (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == "default") &&
+          !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
+          (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
+          (!has(object.spec.hostPID) || !object.spec.hostPID) &&
+          (!has(object.spec.hostIPC) || !object.spec.hostIPC) &&
+          size(object.spec.containers) == 1 &&
+          object.spec.containers[0].image == {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }} &&
+          !has(object.spec.containers[0].command) &&
+          object.spec.containers[0].args == ["meridian-launcher", "copy-storage",
+            {{ printf "%s-storage-" $full | quote }} + variables.instance] &&
+          !has(object.spec.containers[0].env) && !has(object.spec.containers[0].envFrom) &&
+          has(object.spec.containers[0].securityContext) &&
+          has(object.spec.containers[0].securityContext.allowPrivilegeEscalation) &&
+          object.spec.containers[0].securityContext.allowPrivilegeEscalation == false &&
+          (!has(object.spec.containers[0].securityContext.privileged) ||
+           !object.spec.containers[0].securityContext.privileged) &&
+          has(object.spec.volumes) && size(object.spec.volumes) == 2 &&
+          object.spec.volumes.exists(v, v.name == "from" && has(v.persistentVolumeClaim) &&
+            v.persistentVolumeClaim.claimName == {{ printf "%s-storage-" $full | quote }} + variables.instance &&
+            has(v.persistentVolumeClaim.readOnly) && v.persistentVolumeClaim.readOnly == true) &&
+          object.spec.volumes.exists(v, v.name == "to" && has(v.persistentVolumeClaim) &&
+            v.persistentVolumeClaim.claimName == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance) &&
+          has(object.spec.containers[0].volumeMounts) &&
+          object.spec.containers[0].volumeMounts.all(m,
+            (m.name == "from" && has(m.readOnly) && m.readOnly == true) || m.name == "to")
+        )
+      message: the launcher's one pod copies its instance's own storage into its shared storage, as the chart's shape
     # An instance's own account (item 31), of exactly the shape the launcher
     # makes: the Role's one rule, `get` and `update` on Leases named
     # `<instance>-shard-<n>` alone, the instance read from its label; the
