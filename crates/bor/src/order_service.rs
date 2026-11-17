@@ -1002,14 +1002,23 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             };
             // A repeat under the same key, after a lost reply, is answered
             // as already recorded and mints no second charge, as a
-            // value-date roll's is (step 3d, PO item 74).
+            // value-date roll's is (step 3d, PO item 74). The key is looked
+            // up only in an account the sender's scope holds: a charge
+            // outside it is kept unplaced naming no account, keyed or not,
+            // never answered with the account's charge nor refused naming
+            // it (review c5k, L3).
+            let key = if orders::fact_in_scope(&ctx, &account) {
+                request.idempotency_key.as_str()
+            } else {
+                ""
+            };
             act(
                 &bus2,
                 store.as_ref(),
                 &envelope,
                 ctx,
                 &account,
-                &request.idempotency_key,
+                key,
                 "meridian.v1.FactReply",
                 &|book, head, ctx| {
                     let made = orders::report_charge(book, head, ctx, &request)?;

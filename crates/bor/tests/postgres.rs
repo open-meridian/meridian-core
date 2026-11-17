@@ -798,6 +798,129 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
     assert_eq!(before.executions, after.executions);
 }
 
+/// Step 3d, PO item 74 (review c5k, L4): a charge reported again under its
+/// key, after a lost reply, is answered from the book's own key index in
+/// Postgres, and no second charge is minted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_reported_again_under_its_key_is_recorded_once_in_postgres() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let account = unique("ACC");
+    let scope = Some(vec![account.clone()]);
+    send_order(
+        &bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        &SetAccountAttributeRequest {
+            account_id: account.clone(),
+            attribute: Some(set_account_attribute_request::Attribute::WaitsForCompliance(false)),
+            reason: "no compliance plugin in this test".into(),
+        },
+        Some(PERSON),
+        None,
+    )
+    .await
+    .unwrap();
+    let order = OrderReply::decode(
+        &send_order(
+            &bus,
+            PROPOSE_ORDER,
+            &ProposeOrderRequest {
+                account_id: account.clone(),
+                instrument_id: "INS-AAPL".into(),
+                side: Side::Buy as i32,
+                quantity: d("10"),
+                order_type: OrderType::Limit as i32,
+                limit_price: usd("227.50"),
+                time_in_force: TimeInForce::Day as i32,
+                ..Default::default()
+            },
+            Some(PERSON),
+            None,
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .order
+    .unwrap();
+    send_order(
+        &bus,
+        RELEASE_ORDER,
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        Some(PERSON),
+        scope.clone(),
+    )
+    .await
+    .unwrap();
+    let placement = PlacementReply::decode(
+        &send_order(
+            &bus,
+            CREATE_PLACEMENT,
+            &CreatePlacementRequest {
+                order_id: order.order_id.clone(),
+                connectivity_instance_id: "operations-test-1".into(),
+                quantity: d("10"),
+                ..Default::default()
+            },
+            Some(PERSON),
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .placement
+    .unwrap();
+    let on = placement.placement_id.clone();
+    let charge = |amount: &str, key: &str| ReportChargeRequest {
+        placement_id: on.clone(),
+        fee: Some(Fee {
+            kind: FeeKind::Commission as i32,
+            amount: usd(amount),
+            ..Default::default()
+        }),
+        trade_date: "2026-10-13".into(),
+        settlement_date: "2026-10-14".into(),
+        idempotency_key: key.into(),
+        ..Default::default()
+    };
+    let report = |request: ReportChargeRequest| {
+        let (bus, scope) = (bus.clone(), scope.clone());
+        async move {
+            send_order(&bus, REPORT_CHARGE, &request, None, scope)
+                .await
+                .map(|reply| FactReply::decode(&reply[..]).unwrap())
+        }
+    };
+    let entries = || blocking(|| store.journal(&account).unwrap().len());
+    let key = format!("charge:{}|{on}", unique("venue"));
+    let before = entries();
+    let first = report(charge("1.00", &key)).await.unwrap();
+    assert_eq!(entries(), before + 1);
+
+    // The same key again: the first's answer, no second charge.
+    let again = report(charge("1.00", &key)).await.unwrap();
+    assert_eq!(again, first);
+    assert_eq!(entries(), before + 1);
+
+    // The same key with other content: refused, nothing applied.
+    let conflict = report(charge("2.00", &key)).await.unwrap_err();
+    assert!(conflict.contains("[refusal-reason 10]"), "{conflict}");
+    assert_eq!(entries(), before + 1);
+
+    // A new key: a second charge.
+    let second = report(charge("1.00", &format!("{key}-2"))).await.unwrap();
+    assert_ne!(
+        second.charge.unwrap().charge_id,
+        first.charge.unwrap().charge_id
+    );
+    assert_eq!(entries(), before + 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn instructions_stand_in_their_partitions_and_a_day_order_comes_due() {
     use meridian_bor::order_service::*;

@@ -2925,6 +2925,47 @@ async fn a_charge_reported_again_under_its_key_is_recorded_once() {
     assert_eq!(w.store.journal(ACC).unwrap().len(), before + 4);
 }
 
+/// Review c5k, L3: a charge sent under a recorded key by an instance whose
+/// scope does not hold the placement's account is kept unplaced, naming no
+/// account, as it is without a key; it is neither answered with the
+/// account's charge nor refused naming the account.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_outside_its_senders_scope_is_kept_unplaced_whatever_its_key() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let placement = place(&w, &order.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let on = placement.placement_id.as_str();
+    let key = format!("charge:6311|{on}");
+    report_charge(&w, &charge_on(on, "1.37", &key))
+        .await
+        .unwrap();
+    let before = w.store.journal(ACC).unwrap().len();
+    let elsewhere = As {
+        scope: Some(vec![OTHER]),
+        ..venue()
+    };
+    for amount in ["1.37", "2.00"] {
+        let reply = send_from(
+            &w.bus,
+            REPORT_CHARGE,
+            "meridian.v1.ReportChargeRequest",
+            &charge_on(on, amount, &key),
+            &elsewhere,
+        )
+        .await
+        .map(|reply| FactReply::decode(&reply[..]).unwrap())
+        .unwrap_or_else(|refused| panic!("{amount}: {refused}"));
+        assert!(reply.charge.is_none(), "{amount}: answered with the charge");
+        let kept = reply.unplaced.expect("kept unplaced");
+        assert!(kept.account_id.is_empty(), "{amount}: {}", kept.account_id);
+    }
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before);
+}
+
 // ── Contract v23: an FX order's quote currency (W11.1) ──────────────────────
 
 fn fx_market(quote: &str) -> ProposeOrderRequest {
