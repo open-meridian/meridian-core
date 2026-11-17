@@ -255,9 +255,9 @@ pub struct Writer {
     from: Option<u64>,
     dropped: Vec<Dropped>,
     valid: BTreeMap<String, i64>,
-    /// When it last passed a write whose rows were another group's: a
-    /// move's switch may take its place back to before it, for as long as
-    /// the hold (step 3d; spec 6.1 and 6.8).
+    /// When it last passed a write whose rows were, in whole or in part,
+    /// another group's: a move's switch may take its place back to before
+    /// it, for as long as the hold (step 3d; spec 6.1 and 6.8).
     passed_at: Option<tokio::time::Instant>,
 }
 
@@ -293,7 +293,10 @@ impl Writer {
 
     /// Whether a move's switch may yet take the writer's place back (step
     /// 3d; spec 6.1 and 6.8): within the hold of a write it passed, its
-    /// rows another group's. A switch takes the target's place back to its
+    /// rows another group's -- all of them, or the rest of a write it took
+    /// whose dataset has a range another group owns, the group answering
+    /// that dataset among such takers (failover-repeat 43993402238, ha).
+    /// A switch takes the target's place back to its
     /// source's committed place, and owes the target only the writes the
     /// source had not committed: those the source's batch was held on, for
     /// at most the hold. Never otherwise, so an idle writer asks nothing.
@@ -413,7 +416,19 @@ impl Writer {
             .into_iter()
             .filter(|write| ours(groups, write))
             .collect();
-        let passed = taken.len() < all;
+        // Passed: a write left whole to its owner, or one taken whose
+        // dataset has a range another group owns -- this group commits its
+        // own rows of it and moves its place past the rest. A switch of
+        // that range to this group takes the place back to before the write
+        // (failover-repeat 43993402238, ha run 3: the group answering the
+        // driver's dataset took a price whose range was group 0's; the
+        // range switched to it 16 ms after the price reached the stream,
+        // and with no write after it, the group found its place taken back
+        // only when the next came, 6 s on).
+        let passed = taken.len() < all
+            || taken
+                .iter()
+                .any(|write| !other_groups(groups, &write.dataset).is_empty());
         let mut sent_to = Vec::with_capacity(taken.len());
         let mut writes = Vec::with_capacity(taken.len());
         for write in taken {

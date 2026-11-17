@@ -8832,6 +8832,191 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
     tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
+/// The same, where the switch's target is the group answering the dataset
+/// (failover-repeat 43993402238, ha run 3: "lake range
+/// drive-data:drive/8000-ffff to group 1, from database 0 to database 1: no
+/// write refused while it moved", a price refused DEADLINE_EXCEEDED at 5 s).
+/// Group 1 answers the driver's dataset -- it owns the dataset's own
+/// partition -- so it took the price, its range then group 0's, rather than
+/// pass it: it committed its place past the price with none of its rows and
+/// waited to answer on group 0's part. The range's switch to it committed
+/// 16 ms after the price reached the stream and took its place back; with
+/// no write after, its writer found that only when the next write came, 6 s
+/// on, and the answer waited past its caller. The target takes the write
+/// again from the place the switch took back, with no write after it, and
+/// the answer is given within the hold, counting its row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_is_taken_again() {
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
+    use meridian_lake::partition_moves::{Asked, Ended};
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{
+        read, settled, taken_past_a_switch, Read, Stall, Taken, Writer,
+    };
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    /// The stream's leader, stood in: it holds the two writes.
+    struct Two;
+    impl meridian_lake::write_ahead::Leader for Two {
+        async fn last(&mut self) -> Result<u64, String> {
+            Ok(2)
+        }
+    }
+    // Group 1's dataset, which it answers, split at its home (database 1);
+    // the upper half moved to group 0 in database 0 first, nothing writing:
+    // the shape CI moved it back from. Every member reads it, as its sweep
+    // does.
+    let a = tokio::task::block_in_place(|| across_owned("answering", true, 1));
+    let dataset = a.dataset.clone();
+    let upper = format!("{dataset}/8000-ffff");
+    let (_, high) = halves_of("answering");
+    let mover = Arc::new(a.mover());
+    let asked = || Asked {
+        by_hand: true,
+        moved_by: "admin-1".into(),
+        reason: "the upper half, out and back to the group answering its dataset".into(),
+    };
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&upper));
+        let ended = mover.run(&upper, 0, &asked()).unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+        for store in a.zeros.iter().chain(&a.ones) {
+            store.read_owners().unwrap();
+        }
+    });
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake_over(
+                a.zero.clone() as Arc<dyn Store>,
+                a.zeros[0].groups(),
+                "lake-0",
+                &dataset,
+            ),
+            ha_lake_over(
+                a.one.clone() as Arc<dyn Store>,
+                a.ones[0].groups(),
+                "lake-1",
+                &dataset,
+            ),
+        )
+    });
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.answering.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("answering-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&dataset, &format!("q{n}"), &high, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+    };
+    let count = |answered: &(Option<String>, meridian_bus::HandlerReply)| {
+        let (_, payload) = answered.1.clone().expect("answered");
+        let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+        (reply.recorded, reply.restated, reply.unchanged)
+    };
+    let mut writer0 = tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM)).unwrap();
+    let mut writer1 = tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM)).unwrap();
+    // A first write, its row group 0's: committed there, taken by group 1
+    // with none of its rows.
+    taken_past_a_switch(&mut writer0, vec![write(1)])
+        .await
+        .unwrap();
+    writer0.take_waits();
+    taken_past_a_switch(&mut writer1, vec![write(1)])
+        .await
+        .unwrap();
+    writer1.take_waits();
+    // The second, taken by group 1 first, its row still group 0's: its
+    // answer waits on group 0's part, on a task of its own as the writer's.
+    let answers = taken_past_a_switch(&mut writer1, vec![write(2)])
+        .await
+        .unwrap();
+    let waits = writer1.take_waits();
+    assert_eq!(waits.len(), 1, "group 1 answers its dataset's write");
+    // The upper half's switch back to group 1 commits: group 1's place is
+    // taken back to group 0's, 1.
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&upper));
+        let ended = mover.run(&upper, 1, &asked()).unwrap();
+        assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    });
+    let began = tokio::time::Instant::now();
+    let settling = {
+        let lake1 = lake1.clone();
+        tokio::spawn(async move { settled(&lake1, STREAM, answers, waits).await })
+    };
+    // Group 0, its batch held by the switch till now, passes the write.
+    taken_past_a_switch(&mut writer0, vec![write(2)])
+        .await
+        .unwrap();
+    writer0.take_waits();
+    // No write comes after it. Group 1's reader, delivered nothing, finds
+    // its place taken back and takes the stream again from there.
+    let hold = meridian_changes::moves::hold();
+    let mut quiet =
+        futures_util::stream::pending::<Result<async_nats::jetstream::Message, String>>();
+    let mut stall = Stall::new(meridian_lake::write_ahead::STALL_AFTER);
+    let next = writer1.next();
+    let said =
+        tokio::time::timeout(hold, read(&mut quiet, &mut stall, next, &mut Two, &writer1)).await;
+    assert!(
+        matches!(said, Ok(Read::TakenBack)),
+        "group 1, which answers the dataset, never found its place taken back within the hold: \
+         {said:?}"
+    );
+    tokio::task::block_in_place(|| writer1.reread()).unwrap();
+    assert_eq!(writer1.next(), 2, "taken back to group 0's place");
+    let again = taken_past_a_switch(&mut writer1, vec![write(2)])
+        .await
+        .unwrap();
+    let waits = writer1.take_waits();
+    let again = settled(&lake1, STREAM, again, waits).await;
+    assert_eq!(
+        count(&again[0]),
+        (1, 0, 0),
+        "taken again, its row committed"
+    );
+    let answered = settling.await.unwrap();
+    assert!(
+        began.elapsed() < hold,
+        "answered {:?} after the switch, past the hold",
+        began.elapsed()
+    );
+    assert_eq!(
+        count(&answered[0]),
+        (1, 0, 0),
+        "the first take's answer, given once group 1 committed its row"
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| a.rows(1, &upper))
+            .iter()
+            .filter(|(_, key)| key == "q2")
+            .count(),
+        1,
+        "the row held once, where its range is now"
+    );
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
+}
+
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
 /// group answering it waits until the other group's consumer has committed
 /// its part -- its position in the stream past the write -- and answers
