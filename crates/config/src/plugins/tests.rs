@@ -1597,6 +1597,67 @@ async fn a_version_keeping_storage_before_sdk_0_37_never_runs_on_shared_storage(
     assert!(refused.contains(&said("0.1.0")), "{refused}");
     upload(&bus, keeping_on("0.5.0", "0.38.1")).await.unwrap();
     launch(&bus, asking("0.5.0", 0, false)).await.unwrap();
+    // Its latest launch one pod, its storage still shared since it ran as
+    // several: an older version is refused one pod on it again (review
+    // c5c2fold M3), whatever launched last.
+    let _: PluginLaunch = ask(
+        &bus,
+        STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "feed-1".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let refused = launch(&bus, asking("0.1.0", 0, false)).await.unwrap_err();
+    assert!(refused.contains(&said("0.1.0")), "{refused}");
+    // An instance that never ran as several runs any version as one pod.
+    upload(&bus, keeping_on("0.6.0", "0.36.2")).await.unwrap();
+    launch(
+        &bus,
+        LaunchPluginRequest {
+            version: "0.6.0".into(),
+            ..launching("feed-2", &["data"])
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Item 77's version read (review c5c2fold L5): 0.37.0 or later, as PEP
+/// 440 and semver write it -- a post-release, build metadata and a leading
+/// v alike; a pre-release of 0.37.0 itself, or of an earlier one, never;
+/// nor one not read as a version.
+#[test]
+fn an_sdk_version_reads_as_pep_440_and_semver_write_it() {
+    for (version, per_shard) in [
+        ("0.37.0", true),
+        ("0.38.1", true),
+        ("1.0.0", true),
+        ("0.37.0.post1", true),
+        ("0.37.0-post1", true),
+        ("0.37.0+build.5", true),
+        ("v0.37.0", true),
+        ("0.38.0.dev1", true),
+        ("0.38.0rc1", true),
+        ("0.38.0-rc.1", true),
+        ("0.37.0rc1", false),
+        ("0.37.0.dev3", false),
+        ("0.37.0-rc.1", false),
+        ("0.36.9", false),
+        ("0.36.9.post1", false),
+        ("0.37", false),
+        ("an SDK", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            super::keeps_storage_per_shard(version),
+            per_shard,
+            "{version}"
+        );
+    }
 }
 
 async fn several_pods_keeping_storage_rest(

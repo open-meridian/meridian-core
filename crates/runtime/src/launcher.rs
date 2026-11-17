@@ -1183,7 +1183,11 @@ pub fn still_stopping_said(instance: &str) -> String {
 /// What becomes of a copy pod already there, by its phase: kept while it
 /// runs, made again once it failed; once it has copied, kept -- done --
 /// where it copied into the shared claim there now, and made again where
-/// that claim was made since, so holds no marker (review c5c L3).
+/// that claim was made since, so holds no marker (review c5c L3). One that
+/// never ends is made again too, as the instance's pods say once they stop
+/// waiting (review c5c2fold M1): Pending past their wait
+/// ([`copy::WAIT_LIMIT`]), Unknown on a lost node, or being removed. One
+/// Running is kept however long, a copy of much storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyPod {
     Make,
@@ -1194,12 +1198,17 @@ pub enum CopyPod {
 
 /// `shared_since` is the shared claim's `creationTimestamp` (RFC 3339, as
 /// the API server writes it, so ordered as text).
-pub fn copy_pod_now(there: Option<&serde_json::Value>, shared_since: &str) -> CopyPod {
+/// `now_ns` is the moment of the launch.
+pub fn copy_pod_now(there: Option<&serde_json::Value>, shared_since: &str, now_ns: i64) -> CopyPod {
     let Some(pod) = there else {
         return CopyPod::Make;
     };
+    if !pod["metadata"]["deletionTimestamp"].is_null() {
+        return CopyPod::Remake;
+    }
     match pod["status"]["phase"].as_str().unwrap_or_default() {
-        "Failed" => CopyPod::Remake,
+        "Failed" | "Unknown" => CopyPod::Remake,
+        "Pending" if past_the_wait(pod, now_ns) => CopyPod::Remake,
         "Succeeded" => {
             let made = pod["metadata"]["creationTimestamp"]
                 .as_str()
@@ -1212,6 +1221,17 @@ pub fn copy_pod_now(there: Option<&serde_json::Value>, shared_since: &str) -> Co
         }
         _ => CopyPod::Keep,
     }
+}
+
+/// Whether a copy pod was made longer ago than its instance's pods wait for
+/// it: made at a time the API server wrote, before `now_ns` by more than
+/// [`copy::WAIT_LIMIT`].
+fn past_the_wait(pod: &serde_json::Value, now_ns: i64) -> bool {
+    let limit = i64::try_from(copy::WAIT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
+    pod["metadata"]["creationTimestamp"]
+        .as_str()
+        .and_then(meridian_config::registries::verify::rfc3339_ns)
+        .is_some_and(|made| now_ns.saturating_sub(made) > limit)
 }
 
 /// The copy step's refusals (item 30), asked before any claim is made, so
@@ -1247,6 +1267,7 @@ pub fn copy_refused(
 /// launch copies; none where none is kept, or where it was copied before
 /// into the shared claim there, `shared` (review c5c L6), so the record
 /// of the copy is the launch's that copied.
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_step<O: Objects>(
     api: &O,
     own: Option<&serde_json::Value>,
@@ -1255,6 +1276,7 @@ pub async fn copy_step<O: Objects>(
     manifest: serde_json::Value,
     request: &CreatePluginRequest,
     shared: &serde_json::Value,
+    now_ns: i64,
 ) -> Result<(serde_json::Value, Option<String>), String> {
     let Some(claim) = copy_refused(own, pods, request)? else {
         return Ok((manifest, None));
@@ -1267,7 +1289,7 @@ pub async fn copy_step<O: Objects>(
     let since = shared["metadata"]["creationTimestamp"]
         .as_str()
         .unwrap_or_default();
-    let copies = match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref(), since) {
+    let copies = match copy_pod_now(api.get(Kind::Pod, &name).await?.as_ref(), since, now_ns) {
         CopyPod::Keep => true,
         CopyPod::Done => false,
         CopyPod::Make => {
@@ -1328,8 +1350,12 @@ pub async fn storage<O: Objects>(
                 .filter_map(|mode| mode.as_str().map(String::from))
                 .collect()
         };
+        // Kept for one node where the chart now asks it shared across
+        // nodes (item 81); kept ReadWriteMany, it mounts as ever, whatever
+        // the chart asks now (review c5c2fold L4).
         let (held, asked) = (modes(&existing), modes(&wanted));
-        if asked.iter().any(|mode| !held.contains(mode)) {
+        let many = "ReadWriteMany".to_string();
+        if asked.contains(&many) && !held.contains(&many) {
             return Err(not_shareable_said(
                 &request.instance_id,
                 &name,
@@ -1393,10 +1419,20 @@ fn shared_name_of(own: &str, instance: &str) -> Option<String> {
 /// for by name, and an instance whose storage is shared is refused rather
 /// than run on its own claim without its shards' records (review c5c L4;
 /// item 83).
+///
+/// Not shared yet where its own claim is kept and its copy never came
+/// (review c5c2fold M2): no pod of it has run on the shared claim, which
+/// they start on only once the copy is whole, so one pod runs on its own
+/// claim as it did. That is a copy pod that failed, one Pending past its
+/// pods' wait (removed here, so it never copies under a pod on the own
+/// claim), or one that copied into a shared claim made since. One that
+/// copied, runs, waits within the wait, is being removed or is not there
+/// -- removed once it copied -- leaves the storage shared.
 pub async fn shared_kept<O: Objects>(
     api: &O,
     shapes: &Shapes,
     request: &CreatePluginRequest,
+    now_ns: i64,
 ) -> Result<bool, String> {
     let Some(storage) = shapes.storage.as_ref() else {
         return Ok(false);
@@ -1423,8 +1459,56 @@ pub async fn shared_kept<O: Objects>(
             if !rendered {
                 return Err(no_shared_shape_said(&request.instance_id));
             }
-            Ok(true)
+            copied_or_copying(api, storage, request, &existing, now_ns).await
         }
+    }
+}
+
+/// Whether an instance's shared claim, there, holds its storage now or will
+/// once its copy pod ends ([`shared_kept`], review c5c2fold M2).
+async fn copied_or_copying<O: Objects>(
+    api: &O,
+    storage: &StorageShapes,
+    request: &CreatePluginRequest,
+    shared: &serde_json::Value,
+    now_ns: i64,
+) -> Result<bool, String> {
+    let Some(copy_template) = storage.copy.as_deref() else {
+        return Ok(true);
+    };
+    let own = claim(&storage.claim, request)?;
+    let own = own["metadata"]["name"].as_str().unwrap_or_default();
+    if api.get(Kind::PersistentVolumeClaim, own).await?.is_none() {
+        return Ok(true);
+    }
+    let name = copy_pod(copy_template, request)?["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let Some(pod) = api.get(Kind::Pod, &name).await? else {
+        return Ok(true);
+    };
+    let since = shared["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default();
+    if copy_pod_now(Some(&pod), since, now_ns) != CopyPod::Remake {
+        return Ok(true);
+    }
+    let removing = !pod["metadata"]["deletionTimestamp"].is_null();
+    match pod["status"]["phase"].as_str().unwrap_or_default() {
+        // It may still run, on a node out of reach.
+        "Unknown" | "Running" => Ok(true),
+        _ if removing => Ok(true),
+        "Pending" => {
+            api.delete(Kind::Pod, &name).await?;
+            tracing::info!(
+                instance = request.instance_id,
+                pod = name,
+                "its copy pod never ran within its pods' wait: removed, and its own storage kept"
+            );
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -1441,6 +1525,7 @@ pub async fn storage_and_copy<O: Objects>(
     pods: &serde_json::Value,
     manifest: serde_json::Value,
     request: &CreatePluginRequest,
+    now_ns: i64,
 ) -> Result<(serde_json::Value, Option<String>), String> {
     let shaped = shapes.storage.as_ref().filter(|_| several(request));
     let copying = shaped.and_then(|shaped| shaped.copy.as_deref());
@@ -1472,6 +1557,7 @@ pub async fn storage_and_copy<O: Objects>(
                 manifest,
                 request,
                 &held,
+                now_ns,
             )
             .await
         }

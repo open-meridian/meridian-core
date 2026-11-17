@@ -386,6 +386,7 @@ spec:
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
 {{- $own := printf "%s-shards-" $full }}
 {{- $copyUser := include "meridian-runtime.storageCopyUser" . | fromYaml }}
+{{- $copyFsGroup := (.Values.podSecurityContext | default dict).fsGroup | default .Values.pluginStorage.fsGroup }}
 {{- $accounts := list (quote "") (quote "default") }}
 {{- with .Values.pluginArchive.serviceAccount }}
 {{- $accounts = append $accounts (quote .) }}
@@ -508,7 +509,14 @@ spec:
     # namespace, and those two claims of the instance its label names; run
     # once, as the plugins' user, nothing added to its container and nothing
     # run beside its command (review c5c M1, H1, L1). The one pod it deletes
-    # is a copy pod, to make one again (review c5c L2).
+    # is a copy pod, to make one again (review c5c L2). What the cluster's
+    # own admission adds to every pod before this policy reads it is let be
+    # (review c5c2fold H1): DefaultTolerationSeconds' not-ready and
+    # unreachable tolerations alone, and a globalDefault PriorityClass's
+    # name, never a system- one. Its confinement is the chart's and no other
+    # (review c5c2fold L1): RuntimeDefault seccomp at the pod, nothing of the
+    # container's own, no extra groups, sysctls, claims or affinity, its
+    # mounts whole.
     - expression: >-
         request.resource.resource != "pods" ||
         (
@@ -532,10 +540,23 @@ spec:
           object.spec.securityContext.runAsNonRoot == true &&
           !has(object.spec.securityContext.seLinuxOptions) &&
           !has(object.spec.securityContext.appArmorProfile) &&
-          (!has(object.spec.securityContext.seccompProfile) ||
-           object.spec.securityContext.seccompProfile.type == "RuntimeDefault") &&
-          !has(object.spec.nodeName) && !has(object.spec.tolerations) &&
-          !has(object.spec.priorityClassName) && !has(object.spec.runtimeClassName) &&
+          has(object.spec.securityContext.seccompProfile) &&
+          object.spec.securityContext.seccompProfile.type == "RuntimeDefault" &&
+          !has(object.spec.securityContext.supplementalGroups) &&
+          !has(object.spec.securityContext.sysctls) &&
+          {{- if $copyFsGroup }}
+          (!has(object.spec.securityContext.fsGroup) ||
+           object.spec.securityContext.fsGroup == {{ $copyFsGroup | int64 }}) &&
+          {{- else }}
+          !has(object.spec.securityContext.fsGroup) &&
+          {{- end }}
+          !has(object.spec.nodeName) && !has(object.spec.affinity) && !has(object.spec.resourceClaims) &&
+          (!has(object.spec.tolerations) || object.spec.tolerations.all(t,
+            has(t.key) && t.key in ["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"] &&
+            has(t.operator) && t.operator == "Exists" && has(t.effect) && t.effect == "NoExecute" &&
+            !has(t.value))) &&
+          (!has(object.spec.priorityClassName) || !object.spec.priorityClassName.startsWith("system-")) &&
+          !has(object.spec.runtimeClassName) &&
           !has(object.spec.hostUsers) &&
           !has(object.spec.containers[0].lifecycle) &&
           !has(object.spec.containers[0].livenessProbe) && !has(object.spec.containers[0].readinessProbe) &&
@@ -560,6 +581,11 @@ spec:
            !object.spec.containers[0].securityContext.privileged) &&
           (!has(object.spec.containers[0].securityContext.capabilities) ||
            !has(object.spec.containers[0].securityContext.capabilities.add)) &&
+          !has(object.spec.containers[0].securityContext.seccompProfile) &&
+          !has(object.spec.containers[0].securityContext.seLinuxOptions) &&
+          !has(object.spec.containers[0].securityContext.appArmorProfile) &&
+          (!has(object.spec.containers[0].securityContext.procMount) ||
+           object.spec.containers[0].securityContext.procMount == "Default") &&
           has(object.spec.containers[0].securityContext.readOnlyRootFilesystem) &&
           object.spec.containers[0].securityContext.readOnlyRootFilesystem == true &&
           (!has(object.spec.containers[0].securityContext.runAsUser) ||
@@ -574,7 +600,8 @@ spec:
             v.persistentVolumeClaim.claimName == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance) &&
           has(object.spec.containers[0].volumeMounts) &&
           object.spec.containers[0].volumeMounts.all(m,
-            (m.name == "from" && has(m.readOnly) && m.readOnly == true) || m.name == "to")
+            !has(m.subPath) && !has(m.subPathExpr) && !has(m.mountPropagation) &&
+            ((m.name == "from" && has(m.readOnly) && m.readOnly == true) || m.name == "to"))
         )
       message: the launcher's one pod copies its instance's own storage into its shared storage, as the chart's shape
     # An instance's own account (item 31), of exactly the shape the launcher

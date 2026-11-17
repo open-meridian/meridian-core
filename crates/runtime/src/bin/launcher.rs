@@ -155,6 +155,7 @@ impl Launcher {
                 &Kube(&self.api),
                 &self.shapes,
                 &request,
+                meridian_runtime::now_ns(),
             ))?;
         let request = one_pod_as_shard(request, shared);
         // Several pods of the instance, where its launch asked shards or a
@@ -200,6 +201,7 @@ impl Launcher {
                     &pods,
                     made,
                     &request,
+                    meridian_runtime::now_ns(),
                 ))?
             }
             None => (made, None),

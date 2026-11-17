@@ -379,7 +379,7 @@ impl Plugins {
         if let Some(refusal) = super::several_or_storage_refused(
             &request.instance_id,
             (running.shards, running.standby),
-            super::ran_as_several(&snapshot.catalogue.launches, &request.instance_id),
+            || super::ran_as_several(self.store.as_ref(), &request.instance_id),
             &version,
             &self.several,
         ) {

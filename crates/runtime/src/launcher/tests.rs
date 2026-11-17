@@ -1225,6 +1225,19 @@ fn several_with_storage() -> serde_json::Value {
     made
 }
 
+/// The moment the copy tests launch at: 2026-11-17T12:00:00Z.
+const NOW: i64 = 1_794_916_800_000_000_000;
+
+/// The instance's copy pod as the API server holds it: made at `made`, in
+/// `phase`, with `status` beside it.
+fn copy_pod_held(made: &str, phase: &str, status: serde_json::Value) -> serde_json::Value {
+    let mut pod = copy_pod(COPY, &sharded(2, true)).unwrap();
+    pod["metadata"]["creationTimestamp"] = made.into();
+    pod["status"] = status;
+    pod["status"]["phase"] = phase.into();
+    pod
+}
+
 /// The instance's own claim, as the launcher made it for `plugin`.
 fn own_claim(plugin: &str) -> serde_json::Value {
     serde_json::json!({"metadata": {"name": "check-meridian-runtime-storage-snaptrade-1", "labels": {
@@ -1331,6 +1344,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap();
     assert_eq!(copied, None);
@@ -1352,6 +1366,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap_err();
     assert_eq!(
@@ -1369,6 +1384,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap_err()
     .contains("holds the records of elsewhere"));
@@ -1396,6 +1412,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap();
     assert_eq!(
@@ -1442,6 +1459,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap();
     assert_eq!(
@@ -1470,6 +1488,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap();
     assert_eq!(copied, None);
@@ -1494,6 +1513,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared_claim("2026-11-17T11:00:00Z"),
+        NOW,
     ))
     .unwrap();
     assert_eq!(
@@ -1516,6 +1536,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_with_storage(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap();
     assert!(cluster
@@ -1531,6 +1552,7 @@ fn the_instances_own_claim_is_copied_once_before_its_pods_start() {
         several_pods(),
         &asked,
         &shared,
+        NOW,
     ))
     .unwrap_err()
     .contains("no volume named storage"));
@@ -1563,6 +1585,7 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         &none,
         several_with_storage(),
         &request(),
+        NOW,
     ))
     .unwrap();
     assert_eq!(copied, None);
@@ -1581,6 +1604,7 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         &none,
         several_with_storage(),
         &asked,
+        NOW,
     ))
     .unwrap();
     assert_eq!(copied, None);
@@ -1605,6 +1629,7 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         &stopping,
         several_with_storage(),
         &asked,
+        NOW,
     ))
     .unwrap_err();
     assert_eq!(refused, still_stopping_said("snaptrade-1"));
@@ -1622,6 +1647,7 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         &none,
         several_with_storage(),
         &asked,
+        NOW,
     ))
     .unwrap();
     assert_eq!(copied.as_deref(), Some(own_name));
@@ -1649,6 +1675,7 @@ fn a_launch_s_storage_and_copy_run_in_order() {
         &none,
         several_with_storage(),
         &asked,
+        NOW,
     ))
     .unwrap_err();
     assert_eq!(
@@ -1658,6 +1685,34 @@ fn a_launch_s_storage_and_copy_run_in_order() {
     assert!(cluster
         .of(Kind::Pod, "check-meridian-runtime-storage-copy-snaptrade-1")
         .is_none());
+    // A shared claim kept ReadWriteMany where the chart now asks
+    // ReadWriteOnce (one node, no class named) mounts as it is: kept, not
+    // refused (review c5c2fold L4; item 81 is the other way round).
+    let cluster = Cluster::default();
+    cluster.put(Kind::PersistentVolumeClaim, claim(OWN, &asked).unwrap());
+    cluster.put(Kind::PersistentVolumeClaim, claim(SHARED, &asked).unwrap());
+    let one_node = SHARED.replace(
+        "\"ReadWriteMany\"],\"storageClassName\":\"files\"",
+        "\"ReadWriteOnce\"]",
+    );
+    assert!(one_node.contains("ReadWriteOnce"));
+    let (_, copied) = block(storage_and_copy(
+        &cluster,
+        &shapes,
+        &one_node,
+        &none,
+        several_with_storage(),
+        &asked,
+        NOW,
+    ))
+    .unwrap();
+    assert_eq!(copied.as_deref(), Some(own_name));
+    assert_eq!(
+        cluster
+            .of(Kind::PersistentVolumeClaim, shared_name)
+            .unwrap()["spec"]["accessModes"],
+        serde_json::json!(["ReadWriteMany"])
+    );
 }
 
 /// PO items 80 and 83 (2026-11-17; review c5c L9 and L4): with its own
@@ -1682,6 +1737,7 @@ fn shared_storage_is_never_left_behind_by_a_chart_without_its_shapes() {
         &pod_list(&[]),
         several_with_storage(),
         &asked,
+        NOW,
     ))
     .unwrap_err();
     assert_eq!(refused, no_copy_pod_said("snaptrade-1", own_name));
@@ -1704,13 +1760,13 @@ fn shared_storage_is_never_left_behind_by_a_chart_without_its_shapes() {
     full.storage.as_mut().unwrap().shared_claim = Some(SHARED.into());
     let one = request();
     let cluster = Cluster::default();
-    assert_eq!(block(shared_kept(&cluster, &full, &one)), Ok(false));
+    assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(false));
     cluster.put(Kind::PersistentVolumeClaim, claim(SHARED, &one).unwrap());
-    assert_eq!(block(shared_kept(&cluster, &full, &one)), Ok(true));
+    assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(true));
     // ... and refused where it renders none.
     let mut plain = shapes(true);
     plain.storage.as_mut().unwrap().claim = OWN.into();
-    let refused = block(shared_kept(&cluster, &plain, &one)).unwrap_err();
+    let refused = block(shared_kept(&cluster, &plain, &one, NOW)).unwrap_err();
     assert_eq!(
         refused,
         "snaptrade-1's storage is shared and kept, and this deployment's chart renders no pod \
@@ -1718,9 +1774,209 @@ fn shared_storage_is_never_left_behind_by_a_chart_without_its_shapes() {
     );
     // Never shared: launched on its own claim as ever.
     assert_eq!(
-        block(shared_kept(&Cluster::default(), &plain, &one)),
+        block(shared_kept(&Cluster::default(), &plain, &one, NOW)),
         Ok(false)
     );
+}
+
+/// Review c5c2fold M1: a copy pod that never ends -- Pending past the
+/// copy's wait (unschedulable, say), Unknown on a lost node, or being
+/// removed -- is made again at the next launch, as the wait's message
+/// says; one Pending within the wait, or Running however long, is kept.
+#[test]
+fn a_copy_pod_that_never_ends_is_made_again_after_the_wait() {
+    let asked = sharded(2, true);
+    let own = own_claim("snaptrade");
+    let shared = shared_claim("2026-11-17T10:00:00Z");
+    let name = "check-meridian-runtime-storage-copy-snaptrade-1";
+    let unschedulable = serde_json::json!({"conditions": [{"type": "PodScheduled",
+        "status": "False", "reason": "Unschedulable"}]});
+    let step = |cluster: &Cluster| {
+        block(copy_step(
+            cluster,
+            Some(&own),
+            &pod_list(&[]),
+            COPY,
+            several_with_storage(),
+            &asked,
+            &shared,
+            NOW,
+        ))
+    };
+    // Kept: Pending ten minutes, within the wait; Running an hour, a copy
+    // of much storage.
+    for (made, phase) in [
+        ("2026-11-17T11:50:00Z", "Pending"),
+        ("2026-11-17T11:00:00Z", "Running"),
+    ] {
+        let cluster = Cluster::default();
+        cluster.put(Kind::Pod, copy_pod_held(made, phase, unschedulable.clone()));
+        let (_, copied) = step(&cluster).unwrap();
+        assert_eq!(
+            copied.as_deref(),
+            Some("check-meridian-runtime-storage-snaptrade-1")
+        );
+        assert_eq!(
+            cluster.of(Kind::Pod, name).unwrap()["status"]["phase"],
+            phase,
+            "{phase} since {made}: kept"
+        );
+    }
+    // Made again: Pending an hour, past the wait; Unknown; being removed.
+    let mut removing = copy_pod_held("2026-11-17T11:55:00Z", "Running", serde_json::json!({}));
+    removing["metadata"]["deletionTimestamp"] = "2026-11-17T11:58:00Z".into();
+    for (case, held) in [
+        (
+            "Pending past the wait",
+            copy_pod_held("2026-11-17T11:00:00Z", "Pending", unschedulable.clone()),
+        ),
+        (
+            "Unknown",
+            copy_pod_held("2026-11-17T11:55:00Z", "Unknown", serde_json::json!({})),
+        ),
+        ("being removed", removing),
+    ] {
+        let cluster = Cluster::default();
+        cluster.put(Kind::Pod, held);
+        let (_, copied) = step(&cluster).unwrap();
+        assert_eq!(
+            copied.as_deref(),
+            Some("check-meridian-runtime-storage-snaptrade-1")
+        );
+        assert!(
+            cluster.of(Kind::Pod, name).unwrap()["status"].is_null(),
+            "{case}: made again"
+        );
+    }
+}
+
+/// Review c5c2fold M2: a copy that never succeeds leaves the instance as it
+/// was. Where its own claim is kept and its copy pod failed (or never ran
+/// within the wait), its storage is not shared yet: one pod runs on its
+/// own claim, ungated, and no copy pod is made for it -- a Pending one is
+/// removed, so it never copies under a pod on its own claim. Shared where
+/// the copy pod has copied into the shared claim there, runs or waits
+/// within the wait, or is not there (removed after it copied); and where
+/// no own claim is kept.
+#[test]
+fn a_copy_that_never_succeeds_leaves_the_instance_on_its_own_claim() {
+    let mut full = shared_shapes();
+    full.storage.as_mut().unwrap().claim = OWN.into();
+    full.storage.as_mut().unwrap().shared_claim = Some(SHARED.into());
+    let one = request();
+    let name = "check-meridian-runtime-storage-copy-snaptrade-1";
+    let own_name = "check-meridian-runtime-storage-snaptrade-1";
+    let with = |pod: Option<serde_json::Value>| {
+        let cluster = Cluster::default();
+        cluster.put(Kind::PersistentVolumeClaim, claim(OWN, &one).unwrap());
+        let mut shared = claim(SHARED, &one).unwrap();
+        shared["metadata"]["creationTimestamp"] = "2026-11-17T10:00:00Z".into();
+        cluster.put(Kind::PersistentVolumeClaim, shared);
+        if let Some(pod) = pod {
+            cluster.put(Kind::Pod, pod);
+        }
+        cluster
+    };
+    let none = serde_json::json!({});
+    for (case, pod, shared) in [
+        (
+            "failed",
+            Some(copy_pod_held(
+                "2026-11-17T10:00:01Z",
+                "Failed",
+                none.clone(),
+            )),
+            false,
+        ),
+        (
+            "Pending past the wait",
+            Some(copy_pod_held(
+                "2026-11-17T11:00:00Z",
+                "Pending",
+                none.clone(),
+            )),
+            false,
+        ),
+        (
+            "copied",
+            Some(copy_pod_held(
+                "2026-11-17T10:00:01Z",
+                "Succeeded",
+                none.clone(),
+            )),
+            true,
+        ),
+        (
+            "copying",
+            Some(copy_pod_held(
+                "2026-11-17T11:00:00Z",
+                "Running",
+                none.clone(),
+            )),
+            true,
+        ),
+        (
+            "waiting within the wait",
+            Some(copy_pod_held(
+                "2026-11-17T11:55:00Z",
+                "Pending",
+                none.clone(),
+            )),
+            true,
+        ),
+        ("not there", None, true),
+    ] {
+        let cluster = with(pod);
+        assert_eq!(
+            block(shared_kept(&cluster, &full, &one, NOW)),
+            Ok(shared),
+            "{case}"
+        );
+    }
+    // Failed: one pod on its own claim, ungated, the failed pod left as it was.
+    let cluster = with(Some(copy_pod_held(
+        "2026-11-17T10:00:01Z",
+        "Failed",
+        none.clone(),
+    )));
+    let version = cluster.of(Kind::Pod, name).unwrap()["metadata"]["resourceVersion"].clone();
+    let shared = block(shared_kept(&cluster, &full, &one, NOW)).unwrap();
+    let asked = one_pod_as_shard(one.clone(), shared);
+    assert!(!several(&asked));
+    let (made, copied) = block(storage_and_copy(
+        &cluster,
+        &full,
+        OWN,
+        &pod_list(&[]),
+        several_with_storage(),
+        &asked,
+        NOW,
+    ))
+    .unwrap();
+    assert_eq!(copied, None);
+    assert!(made["spec"]["template"]["spec"]["initContainers"].is_null());
+    assert_eq!(
+        cluster.of(Kind::Pod, name).unwrap()["metadata"]["resourceVersion"],
+        version,
+        "no copy pod made for one pod on its own claim"
+    );
+    assert!(cluster.of(Kind::PersistentVolumeClaim, own_name).is_some());
+    // Pending past the wait: removed, so it never copies under that pod.
+    let cluster = with(Some(copy_pod_held(
+        "2026-11-17T11:00:00Z",
+        "Pending",
+        none.clone(),
+    )));
+    assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(false));
+    assert!(cluster.of(Kind::Pod, name).is_none());
+    // No own claim kept: shared, whatever its copy pod.
+    let cluster = Cluster::default();
+    cluster.put(Kind::PersistentVolumeClaim, claim(SHARED, &one).unwrap());
+    cluster.put(
+        Kind::Pod,
+        copy_pod_held("2026-11-17T10:00:01Z", "Failed", none),
+    );
+    assert_eq!(block(shared_kept(&cluster, &full, &one, NOW)), Ok(true));
 }
 
 /// PO item 73 (2026-11-17): the plugin's container is told its instance's

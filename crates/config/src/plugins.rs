@@ -796,48 +796,65 @@ fn storage_refused(
 const SHARD_STORAGE_SDK: (u64, u64, u64) = (0, 37, 0);
 
 /// Whether an SDK version, as the CLI read it from the built image, is
-/// [`SHARD_STORAGE_SDK`] or later: `major.minor.patch`, a release; a
-/// pre-release of a later one counts, of 0.37.0 itself not, and one not
+/// [`SHARD_STORAGE_SDK`] or later: `major.minor.patch`, as PEP 440 and
+/// semver write it (review c5c2fold L5) -- a leading `v` and build metadata
+/// (`+...`) read past, a post-release (`.post1`, `-post1`) as its release;
+/// a pre-release of a later one counts, of 0.37.0 itself not, and one not
 /// read as a version never does.
 fn keeps_storage_per_shard(sdk_version: &str) -> bool {
-    let (numbers, rest) = match sdk_version.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        Some(at) => sdk_version.split_at(at),
-        None => (sdk_version, ""),
+    let version = sdk_version.strip_prefix(['v', 'V']).unwrap_or(sdk_version);
+    let version = version.split('+').next().unwrap_or_default();
+    let (numbers, rest) = match version.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        Some(at) => version.split_at(at),
+        None => (version, ""),
+    };
+    // PEP 440's separator before a suffix (`0.37.0.post1`) is the suffix's.
+    let (numbers, rest) = match numbers.strip_suffix('.') {
+        Some(numbers) => (numbers, &version[numbers.len()..]),
+        None => (numbers, rest),
     };
     let parts: Vec<Option<u64>> = numbers.split('.').map(|part| part.parse().ok()).collect();
     let [Some(major), Some(minor), Some(patch)] = parts[..] else {
         return false;
     };
+    let released = rest.is_empty()
+        || rest
+            .trim_start_matches(['.', '-', '_'])
+            .strip_prefix("post")
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
     let base = (major, minor, patch);
-    base > SHARD_STORAGE_SDK || (base == SHARD_STORAGE_SDK && rest.is_empty())
+    base > SHARD_STORAGE_SDK || (base == SHARD_STORAGE_SDK && released)
 }
 
 /// The refusal of a version keeping storage built before plugins kept it
 /// per shard (PO item 77, 2026-11-17), before anything is recorded: asked
 /// shards, a standby pod, or one pod of an instance whose storage is shared
 /// since it ran as several, naming the version. `sdk_version` is what the
-/// CLI reported at upload, not proved by the image.
+/// CLI reported at upload, not proved by the image. `shared` is asked only
+/// for one pod of such a version (a read of every launch).
 fn sdk_refused(
     instance: &str,
     (shards, standby): (u32, bool),
-    shared: bool,
+    shared: impl FnOnce() -> Result<bool, String>,
     version: &PluginVersion,
 ) -> Option<String> {
-    let field = if shards > 1 {
-        "shards"
-    } else if standby {
-        "standby"
-    } else if shared {
-        "version"
-    } else {
-        return None;
-    };
     let metadata = version.metadata.clone().unwrap_or_default();
     if !keeps_storage(&metadata.roles, metadata.declaration.as_ref())
         || keeps_storage_per_shard(&metadata.sdk_version)
     {
         return None;
     }
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else {
+        match shared() {
+            Ok(true) => "version",
+            Ok(false) => return None,
+            Err(failed) => return Some(failed),
+        }
+    };
     Some(meridian_bus::refusal_with_status(
         meridian_bus::RefusalStatus::FailedPrecondition,
         &[field.to_string()],
@@ -850,12 +867,16 @@ fn sdk_refused(
     ))
 }
 
-/// Whether the instance ran as several pods at any launch the catalogue
-/// holds, so its storage is shared since (item 30).
-fn ran_as_several(launches: &[PluginLaunch], instance: &str) -> bool {
-    launches
+/// Whether the instance ran as several pods at any launch ever made, so its
+/// storage is shared since (item 30): read from every launch, live or
+/// ended, never the snapshot's latest alone, which a later launch of one
+/// pod hides (review c5c2fold M3).
+fn ran_as_several(store: &dyn Store, instance: &str) -> Result<bool, String> {
+    Ok(store
+        .launches()
+        .map_err(|failed| failed.to_string())?
         .iter()
-        .any(|held| held.instance_id == instance && (held.shards > 1 || held.standby))
+        .any(|held| held.instance_id == instance && (held.shards > 1 || held.standby)))
 }
 
 /// The refusals of an instance of several pods, or of one on shared
@@ -864,7 +885,7 @@ fn ran_as_several(launches: &[PluginLaunch], instance: &str) -> bool {
 fn several_or_storage_refused(
     instance: &str,
     pods: (u32, bool),
-    shared: bool,
+    shared: impl FnOnce() -> Result<bool, String>,
     version: &PluginVersion,
     several: &Several,
 ) -> Option<String> {
@@ -979,7 +1000,7 @@ impl Plugins {
         if let Some(refusal) = several_or_storage_refused(
             &request.instance_id,
             (request.shards, request.standby),
-            ran_as_several(&snapshot.catalogue.launches, &request.instance_id),
+            || ran_as_several(self.store.as_ref(), &request.instance_id),
             version,
             &self.several,
         ) {
@@ -1313,7 +1334,7 @@ impl Plugins {
         if let Some(refusal) = several_or_storage_refused(
             instance,
             (launch.shards, launch.standby),
-            ran_as_several(&snapshot.catalogue.launches, instance),
+            || ran_as_several(self.store.as_ref(), instance),
             version,
             &self.several,
         ) {
