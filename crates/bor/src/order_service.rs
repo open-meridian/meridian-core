@@ -1000,13 +1000,16 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     )
                 }
             };
+            // A repeat under the same key, after a lost reply, is answered
+            // as already recorded and mints no second charge, as a
+            // value-date roll's is (step 3d, PO item 74).
             act(
                 &bus2,
                 store.as_ref(),
                 &envelope,
                 ctx,
                 &account,
-                "",
+                &request.idempotency_key,
                 "meridian.v1.FactReply",
                 &|book, head, ctx| {
                     let made = orders::report_charge(book, head, ctx, &request)?;

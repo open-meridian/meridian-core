@@ -11341,6 +11341,8 @@ pub struct ReportChargeRequest {
     pub settlement_date: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
     pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
+    #[prost(string, tag = "6")]
+    pub idempotency_key: ::prost::alloc::string::String,
 }
 /// W11.14. Late fact only; does not tie out is never acknowledged.
 #[derive(Clone, PartialEq, ::prost::Message)]

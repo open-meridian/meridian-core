@@ -4428,7 +4428,11 @@ pub fn report_charge(
     );
     acts.extend(crate::booking::held_alerts_for(ctx, book, &after));
     acts.extend(after);
-    let mut plan = Plan::new("charge-recorded", venue_actor(ctx), acts);
+    // Under its key, so a repeat after a lost reply is answered as already
+    // recorded and mints no second charge, as a roll's is (step 3d, PO
+    // item 74).
+    let mut plan =
+        Plan::new("charge-recorded", venue_actor(ctx), acts).key(&request.idempotency_key);
     // A fee in a currency is a cash line in it, opening or relieving lots
     // by option (c)'s rule (contract v24, W11.13).
     let amount = fee

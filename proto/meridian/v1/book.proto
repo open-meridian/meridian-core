@@ -2825,6 +2825,7 @@ message ReportChargeRequest {
   string trade_date = 3;
   string settlement_date = 4;
   RawRecordRef raw_record = 5;
+  string idempotency_key = 6;
 }
 
 // W11.14. Late fact only; does not tie out is never acknowledged.

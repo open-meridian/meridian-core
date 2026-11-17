@@ -16932,6 +16932,19 @@
       "store": "bor"
     },
     {
+      "name": "meridian.v1.ReportChargeRequest.idempotency_key",
+      "type": "text",
+      "empty": "empty is none: the fact is applied once by its message identifier alone",
+      "intent": "lets the report be retried after a lost reply and applied once",
+      "meaning": "the plugin's own key for the report; a second with the same key and the same content is answered as the first was, no second charge recorded; one with other content is refused REFUSAL_REASON_IDEMPOTENCY_CONFLICT",
+      "not_meaning": "the envelope's message identifier; or the venue's charge or fill ID, from which the plugin may derive it",
+      "filled": "as-reported",
+      "filled_by": "connectivity",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
       "name": "meridian.v1.ReportValueDateRollRequest.venue_account_code",
       "type": "text",
       "empty": "never empty",
@@ -58616,9 +58629,9 @@
     {
       "name": "meridian.v1.PluginLaunch.storage_copied",
       "type": "message PluginStorageCopied",
-      "empty": "unset where the launch copied no storage, or not yet: until one of its pods is heard registered",
+      "empty": "unset where the launch copied no storage, or not yet: until a pod of the instance is heard registered after it",
       "intent": "records that the instance's own storage claim was copied into its shared storage before this launch's pods started",
-      "meaning": "the PluginStorageCopied record of this launch, its own record (decisions/031), kept once per claim copied",
+      "meaning": "the PluginStorageCopied record of this launch, its own record (decisions/031), kept once per launch that copied",
       "not_meaning": "that the old claim was removed: it is kept as it was",
       "filled": "decided",
       "filled_by": "conductor",
@@ -58725,6 +58738,19 @@
       "intent": "tells the conductor the instance's own claim the launcher copies into its shared storage (item 30)",
       "meaning": "<fullname>-storage-<instance>, copied into the shared storage's shard-0/ before the instance's pods start, by a copy pod the launcher makes; the conductor records PluginStorageCopied once a pod is heard registered after",
       "not_meaning": "that the copy is whole yet",
+      "filled": "decided",
+      "filled_by": "launcher",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.CreatePluginReply.ran_shared",
+      "type": "boolean",
+      "empty": "false: the launch ran on the instance's own claim, or it keeps no storage",
+      "intent": "tells the conductor whether the launcher ran the launch on the instance's shared storage (PO item 91)",
+      "meaning": "true where the launcher made the instance's pods on its shared storage: several pods, or one pod as one shard of storage shared since it ran as several; kept on the launch's record, so only a later launch on the instance's own claim, not failed, keeps an earlier copy unrecorded",
+      "not_meaning": "that the copy is whole yet: those pods start once it is",
       "filled": "decided",
       "filled_by": "launcher",
       "since": "v30",
