@@ -211,10 +211,10 @@ rules:
     # the broker reads (contract v18, W10.1).
     verbs: ["create", "get", "list", "delete", "patch"]
   {{- if .Values.pluginStorage.enabled }}
+  # update: an instance's shared claim marked as holding its copy (item 89),
+  # which its admission policy holds it to; never delete (decisions/028).
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    # update: an instance's shared claim marked as holding its copy (item
-    # 89), which its admission policy holds it to.
     verbs: ["create", "get", "update"]
   {{- end }}
   {{- if $shards }}

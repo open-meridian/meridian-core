@@ -2527,8 +2527,8 @@ chart-check:
 	launcher="$$(doc Role check-meridian-runtime-launcher)"; \
 	[ -n "$$launcher" ] && [ "$$(echo "$$launcher" | grep -c 'resources:')" = 2 ] \
 		&& echo "$$launcher" | grep -q 'resources: \["deployments"\]' \
-		&& echo "$$launcher" | grep -A1 'resources: \["persistentvolumeclaims"\]' | grep -q 'verbs: \["create", "get"\]$$' \
-		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019) and make and read edge plugins' storage, never delete it (decisions/028):" >&2; echo "$$launcher" >&2; exit 1; }; \
+		&& echo "$$launcher" | grep -A1 'resources: \["persistentvolumeclaims"\]' | grep -q 'verbs: \["create", "get", "update"\]$$' \
+		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019) and make, read and mark edge plugins' storage, never delete it (decisions/028):" >&2; echo "$$launcher" >&2; exit 1; }; \
 	template="$$(doc ConfigMap check-meridian-runtime-launcher-template)"; \
 	echo "$$template" | grep -q 'meridian.dev/launched' && echo "$$template" | grep -q 'check-meridian-runtime-broker-launched' \
 		|| { echo "chart-check FAILED: the launcher's template does not mark its workloads, or takes their credential from anywhere but the launched plugins' Secret" >&2; exit 1; }; \
