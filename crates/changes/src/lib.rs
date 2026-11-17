@@ -93,6 +93,23 @@ pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
     Ok(config)
 }
 
+/// How many connections a store's pool keeps open while it is idle (PO 67,
+/// 2026-11-17). Each one is a database backend held for nothing while the
+/// store is quiet, and the desktop footprint (ruling 1058) counts them. A
+/// pool still opens more, up to its size, as they are wanted, and each it
+/// opens reads the database's timeline first ([`timeline::Watching`]).
+pub const IDLE_CONNECTIONS: u32 = 2;
+
+/// A store's pool of at most `size` connections, keeping
+/// [`IDLE_CONNECTIONS`] open while idle (fewer where it is smaller). Before
+/// PO 67 a pool kept its whole size open from its start.
+pub fn pool<M: r2d2::ManageConnection>(size: u32) -> r2d2::Builder<M> {
+    let size = size.max(1);
+    r2d2::Pool::builder()
+        .max_size(size)
+        .min_idle(Some(IDLE_CONNECTIONS.min(size)))
+}
+
 /// Where a store's members ask a partition's changes after a sequence.
 pub fn read_changes_topic(domain: &str) -> String {
     format!("platform.{domain}.internal.read-changes")
