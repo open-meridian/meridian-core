@@ -344,11 +344,8 @@ spec:
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
 # the launcher's account does to a Deployment, a claim, or an instance's own
 # account, Role or binding (item 31), it is one the launcher made, and of
-# exactly the shape it makes. And nobody deletes a shard's Lease
-# (`<instance>-shard-<n>`), a cluster administrator included, short of
-# acting as one of Kubernetes' own controllers or removing this policy: its
-# leaseTransitions fence the shard's writes, so it is kept, and goes only
-# with its namespace (PO item 57).
+# exactly the shape it makes. Its shards' Leases are held by a policy of
+# their own (shard-leases.yaml).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -371,17 +368,11 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["roles", "rolebindings"]
-      - apiGroups: ["coordination.k8s.io"]
-        apiVersions: ["v1"]
-        operations: ["DELETE"]
-        resources: ["leases"]
   matchConditions:
-    # The launcher's every act on what it makes; a Lease's delete by anyone.
-    - name: the-launcher-or-a-lease
+    - name: the-launcher
       expression: >-
         request.userInfo.username ==
-        "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}" ||
-        request.resource.resource == "leases"
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}"
   variables:
     # The instance an object is made for, by its label -- an instance's name
     # alone, a host label, else none (review c5b L3: it is read into a
@@ -402,7 +393,6 @@ spec:
     # Made by the launcher, as it was before a write and is after it: an
     # update never makes another's its own (review c5b L1).
     - expression: >-
-        request.resource.resource == "leases" ||
         (
           (request.operation == "CREATE" ||
            (has(oldObject.metadata.labels) &&
@@ -513,24 +503,6 @@ spec:
           "azure.workload.identity/tenant-id",
           "azure.workload.identity/service-account-token-expiration"])
       message: the launcher's ServiceAccount carries workload-identity annotations alone
-    # A shard's Lease, by anyone (PO item 57) -- but Kubernetes' own
-    # namespace controller and garbage collector, under the controller
-    # manager's own name where it runs without an account per controller,
-    # while the namespace is being deleted, so that completes. Never
-    # otherwise: an owner planted on a Lease would have the garbage
-    # collector delete it (review c5b2 M1).
-    - expression: >-
-        request.resource.resource != "leases" ||
-        !oldObject.metadata.name.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?-shard-[0-9]+$") ||
-        (
-          request.userInfo.username in [
-            "system:serviceaccount:kube-system:namespace-controller",
-            "system:serviceaccount:kube-system:generic-garbage-collector",
-            "system:kube-controller-manager"] &&
-          namespaceObject != null &&
-          has(namespaceObject.metadata.deletionTimestamp)
-        )
-      message: "a plugin shard's Lease is never deleted: it goes only with its namespace"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

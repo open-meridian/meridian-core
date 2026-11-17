@@ -371,6 +371,19 @@ spec:
           env:
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ $top.Values.sidecar.address | quote }}
+            {{- /*
+              Where it runs and as which account, from the downward API (PO
+              item 64): what the SDK names when the archive's bucket refuses
+              the account (item 60).
+            */}}
+            - name: MERIDIAN_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MERIDIAN_POD_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             {{- if $.live }}
             - name: MERIDIAN_LIVE_DIR
               value: /plugin/live

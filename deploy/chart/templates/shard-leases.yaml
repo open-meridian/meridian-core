@@ -1,0 +1,72 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  A plugin shard's Lease, `<instance>-shard-<n>`, is never deleted, a
+  cluster administrator's delete included (PO item 57): its leaseTransitions
+  fence the shard's writes, so it is kept, and goes only with its namespace.
+  Rendered wherever shard Leases are: a sidecars[] instance of several pods
+  (item 31), and a launcher with a shape for them; where the cluster has
+  ValidatingAdmissionPolicy (Kubernetes 1.30 and later). Short of acting as
+  one of Kubernetes' own controllers while the namespace is deleted, only
+  removing this policy or its binding gets past it (review c5b2 L2, Info 1).
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $held := false }}
+{{- range .Values.sidecars }}
+{{- if or (gt (int (.shards | default 1)) 1) .standby }}
+{{- $held = true }}
+{{- end }}
+{{- end }}
+{{- if and .Values.launcher.enabled .Values.registry.enabled (not .Values.broker.existingSecret) }}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" }}
+{{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) }}
+{{- $held = true }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and $held (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $full }}-shard-leases
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["coordination.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["leases"]
+  validations:
+    # By anyone -- but Kubernetes' own namespace controller and garbage
+    # collector, under the controller manager's own name where it runs
+    # without an account per controller, while the namespace is being
+    # deleted, so that completes. Never otherwise: an owner planted on a
+    # Lease would have the garbage collector delete it (review c5b2 M1).
+    - expression: >-
+        !oldObject.metadata.name.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?-shard-[0-9]+$") ||
+        (
+          request.userInfo.username in [
+            "system:serviceaccount:kube-system:namespace-controller",
+            "system:serviceaccount:kube-system:generic-garbage-collector",
+            "system:kube-controller-manager"] &&
+          namespaceObject != null &&
+          has(namespaceObject.metadata.deletionTimestamp)
+        )
+      message: "a plugin shard's Lease is never deleted: it goes only with its namespace"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $full }}-shard-leases
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $full }}-shard-leases
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}

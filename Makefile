@@ -3121,6 +3121,8 @@ chart-check:
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
 		|| { echo "chart-check FAILED: the ha profile did not render: $$ha" >&2; exit 1; }; \
 	echo "$$ha" | $(PY) tools/chart_shards.py ha || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py downward || exit 1; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set development=true 2>/dev/null | $(PY) tools/chart_shards.py downward || exit 1; \
 	echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName in' \
 		&& echo "$$ha" | grep -q '\["", "default"\] ||' \
 		&& echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName == variables.own' \
@@ -3138,6 +3140,7 @@ chart-check:
 		|| { echo "chart-check FAILED: a sidecars[] entry with shards and a standby did not render: $$made" >&2; exit 1; }; \
 	echo "$$made" | $(PY) tools/chart_shards.py sharded feed-1 3 2 || exit 1; \
 	echo "$$made" | $(PY) tools/chart_shards.py trio feed-1 2 || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py downward || exit 1; \
 	echo "$$made" | grep -q "name: check-meridian-runtime-member$$" \
 		&& { echo "chart-check FAILED: a sharded sidecars[] entry alone renders the members' account, the stores' alone (item 31)" >&2; exit 1; }; \
 	withstores="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false --set resilience.profile=ha 2>&1)" \
@@ -3152,7 +3155,7 @@ chart-check:
 			&& { echo "chart-check FAILED: the item 31 check passed a render with a violation planted ($$plant), so it proves nothing" >&2; exit 1; }; \
 	done; \
 	echo "$$ha" | grep -q 'operations: \["DELETE"\]' \
-		&& echo "$$ha" | grep -q 'request.resource.resource == "leases"' \
+		&& echo "$$ha" | grep -q '^  name: check-meridian-runtime-shard-leases$$' \
 		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:namespace-controller",' \
 		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:generic-garbage-collector",' \
 		&& echo "$$ha" | grep -q 'has(namespaceObject.metadata.deletionTimestamp)' \
@@ -3161,6 +3164,15 @@ chart-check:
 		&& echo "$$ha" | grep -q 'object.metadata.annotations.all(key, key in \[' \
 		&& echo "$$ha" | grep -q 'variables.labelled.matches(' \
 		|| { echo "chart-check FAILED: the launcher's admission policy does not refuse a shard Lease's delete with the namespace controller and garbage collector exempt while the namespace is deleted alone (PO item 57, review c5b2 M1), or does not hold an update to what the launcher made, an account's annotations or an instance label to their shape (review c5b L1-L3)" >&2; exit 1; }; \
+	alone="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false --set launcher.enabled=false \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry without the launcher did not render: $$alone" >&2; exit 1; }; \
+	echo "$$alone" | grep -q '^  name: check-meridian-runtime-shard-leases$$' \
+		&& echo "$$alone" | grep -q "a plugin shard's Lease is never deleted: it goes only with its namespace" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry's Leases render without their delete guard where the launcher does not (PO item 57, review c5b2 L2)" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null \
+		| grep -q 'check-meridian-runtime-shard-leases' \
+		&& { echo "chart-check FAILED: the shard Leases' delete guard renders where no shard Lease does" >&2; exit 1; }; \
 	archive="$$(sed -n '/^# An archive for an edge plugin/,/^pluginArchive:/p' deploy/chart/values.yaml)"; \
 	echo "$$archive" | grep -q '<fullname>-shards-<instance>' \
 		&& echo "$$archive" | grep -q 'StringLike' \

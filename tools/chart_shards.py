@@ -23,10 +23,17 @@ mount sits in, or what a setting's value is, so these checks read the shape:
             kept; and the members' account, Role and binding -- the
             stores' alone -- never a plugin's.
 
+  downward  every plugin container, the launcher's shapes and each
+            sidecars[] Deployment's alike, told its namespace and account by
+            the downward API: MERIDIAN_POD_NAMESPACE (metadata.namespace)
+            and MERIDIAN_POD_SERVICE_ACCOUNT (spec.serviceAccountName)
+            (PO item 64).
+
 Usage:  helm template ... | python3 tools/chart_shards.py default
         helm template ... | python3 tools/chart_shards.py ha
         helm template ... | python3 tools/chart_shards.py sharded feed-1 3 2
         helm template ... | python3 tools/chart_shards.py trio feed-1 2
+        helm template ... | python3 tools/chart_shards.py downward
 Exit:   0 as it should be, 1 naming what is not
 """
 
@@ -38,6 +45,9 @@ import sys
 
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 MEMBER = re.compile(r"^  name: \S+-member$", re.M)
+LAUNCHER = "check-meridian-runtime-launcher"
+PODS = re.compile(r'^    resources: \["pods"\]$', re.M)
+PODS_LISTED = re.compile(r'^    resources: \["pods"\]\n    verbs: \["list"\]$', re.M)
 
 
 def documents(render: str) -> list[str]:
@@ -62,6 +72,8 @@ def default(render: str) -> list[str]:
             wrong.append(f"the default profile renders {word}: standbys are configuration")
     if "plugin.json:" not in render:
         wrong.append("the default profile renders no launcher template to hold this check to")
+    if any(PODS.search(doc) for doc in named(render, "Role", LAUNCHER)):
+        wrong.append("the default profile gives the launcher a right on pods: it has no shards shape to stop")
     return wrong
 
 
@@ -121,11 +133,19 @@ def ha(render: str) -> list[str]:
     if not line or "MERIDIAN_LAUNCHER_SHARDS_TEMPLATE" not in render:
         return ["the ha profile gives the launcher no shape for shards and standby pods"]
     shape = json.loads(json.loads(line.group(1)))
-    return [
+    wrong = [
         f"the launcher's shards shape: {what}"
         for what in shape_wrong(shape["spec"]["template"]["spec"], shape["spec"].get("strategy", {}), True, None,
                                 "__INSTANCE__")
     ]
+    # Read alone: a stopped instance's pods, ended before its account is
+    # removed (review c5b L5, c5b2 H1).
+    roles = named(render, "Role", LAUNCHER)
+    if not roles or not any(PODS_LISTED.search(doc) for doc in roles):
+        wrong.append("the launcher with a shards shape may not list pods, to see a stopped instance's end")
+    elif any(len(PODS.findall(doc)) != 1 for doc in roles):
+        wrong.append("the launcher's Role names pods more than once")
+    return wrong
 
 
 def scalar(text: str):
@@ -258,10 +278,43 @@ def trio(render: str, instance: str, shards: str) -> list[str]:
     return wrong
 
 
+DOWNWARD = {"MERIDIAN_POD_NAMESPACE": "metadata.namespace",
+            "MERIDIAN_POD_SERVICE_ACCOUNT": "spec.serviceAccountName"}
+
+
+def downward(render: str) -> list[str]:
+    wrong, shapes = [], 0
+    # The launcher's shapes, each a JSON Deployment in its ConfigMap.
+    for key, text in re.findall(r"^  (plugin[-a-z]*\.json): (\".*\")$", render, re.M):
+        shape = json.loads(json.loads(text))
+        for container in shape["spec"]["template"]["spec"]["containers"]:
+            if container["name"] != "plugin":
+                continue
+            shapes += 1
+            told = {e["name"]: e.get("valueFrom", {}).get("fieldRef", {}).get("fieldPath")
+                    for e in container.get("env", [])}
+            for name, path in DOWNWARD.items():
+                if told.get(name) != path:
+                    wrong.append(f"the launcher's {key}: its plugin container is not told {name} from {path}")
+    # The chart's own sidecars[] Deployments, read as they render.
+    for doc in documents(render):
+        if kind(doc) != "Deployment" or not re.search(r"^        - name: plugin$", doc, re.M):
+            continue
+        shapes += 1
+        name = re.search(r"^  name: (\S+)$", doc, re.M).group(1)
+        for env, path in DOWNWARD.items():
+            if not re.search(rf"^            - name: {env}\n              valueFrom:\n                fieldRef:\n"
+                             rf"                  fieldPath: {re.escape(path)}$", doc, re.M):
+                wrong.append(f"{name}: its plugin container is not told {env} from {path}")
+    if not shapes:
+        wrong.append("the render has no plugin container to hold this check to")
+    return wrong
+
+
 def main() -> int:
     render = sys.stdin.read()
     mode, rest = sys.argv[1], sys.argv[2:]
-    wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio}[mode](render, *rest)
+    wrong = {"default": default, "ha": ha, "sharded": sharded, "trio": trio, "downward": downward}[mode](render, *rest)
     for what in wrong:
         print(f"chart-check FAILED (step 3d, shards): {what}", file=sys.stderr)
     return 1 if wrong else 0

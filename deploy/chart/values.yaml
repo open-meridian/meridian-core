@@ -889,9 +889,10 @@ pluginStorage:
 #
 # An allowed instance of several pods -- shards, or a standby pod -- runs
 # instead under an account of its own, `<fullname>-shards-<instance>`
-# (`<release>-meridian-runtime-shards-<instance>` unless fullnameOverride is
-# set), which the launcher makes carrying `serviceAccount`'s workload-identity
-# annotations. A cloud trusts an account by its name, so the bucket's identity
+# (`<release>-meridian-runtime-shards-<instance>` unless nameOverride or
+# fullnameOverride is set), which the launcher makes carrying
+# `serviceAccount`'s workload-identity annotations. A cloud trusts an
+# account by its name, so the bucket's identity
 # has to trust those accounts as well as `serviceAccount`:
 #   - EKS, IAM roles for service accounts: in the role's trust policy, a
 #     StringLike condition on the token's `sub` of
