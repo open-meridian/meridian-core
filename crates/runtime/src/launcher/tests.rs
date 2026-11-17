@@ -578,10 +578,11 @@ fn a_launch_with_shards_or_a_standby_is_a_pod_each_and_its_sidecars_are_told_the
             serde_json::json!({"maxSurge": 1, "maxUnavailable": 1 + u32::from(standby)}),
             "{shards} shards, standby {standby}"
         );
-        // The plugin's container is told nothing.
+        // The plugin's container is told the same count, and nothing else
+        // (PO item 73, 2026-11-17).
         assert_eq!(
             made["spec"]["template"]["spec"]["containers"][1]["env"],
-            serde_json::json!([])
+            serde_json::json!([{"name": "MERIDIAN_PLUGIN_SHARDS", "value": told}])
         );
     }
 }
@@ -1489,5 +1490,8 @@ fn the_plugin_is_told_its_instance_s_shard_count_as_its_sidecar_is() {
     let made = with_shards(shape.clone(), &sharded(0, true)).unwrap();
     assert_eq!(told(&made, 1), vec![serde_json::json!("1")]);
     // One pod: untouched.
-    assert_eq!(with_shards(shape.clone(), &sharded(0, false)).unwrap(), shape);
+    assert_eq!(
+        with_shards(shape.clone(), &sharded(0, false)).unwrap(),
+        shape
+    );
 }

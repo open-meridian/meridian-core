@@ -116,7 +116,7 @@ and source shown). It changes nothing: a change it names is made by meridian upg
 zone, lag behind its writer in ms, partitions and restarts), each partition of the lake and the \
 book with its writer and epoch, and a page of the history, newest first: each takeover of a \
 writer, integrity finding and switch of a default read's source (cursor: next_cursor from the \
-page before), the book's own among them. Answers \
+page before), the book's own among them, and each plugin shard's take with its epoch. Answers \
 `unchanged`.",
         true,
         history_schema,
@@ -352,6 +352,13 @@ pub fn resilience_json(r: &ReadResilienceReply) -> Value {
             }
             if let Some(partition) = partition {
                 said["partition"] = json!(partition);
+            }
+            // A plugin shard's take carries its epoch as a field, the
+            // record's own name (the CLI's follow-up, 2026-11-17).
+            if let Some(meridian_domain::v1::resilience_history_item::Item::ShardTookOver(took)) =
+                &item.item
+            {
+                said["epoch"] = json!(took.epoch);
             }
             said
         }).collect::<Vec<_>>(),
@@ -680,5 +687,33 @@ mod tests {
         });
         assert_eq!(moved["closing_sequence"], 81_240);
         assert_eq!(moved["to_partition"], "P1");
+    }
+
+    /// A plugin shard's take carries its epoch as a field, the record's own
+    /// name, beside its words (the CLI's follow-up, 2026-11-17): `meridian
+    /// doctor` reads it rather than parsing the words. Nothing else gains it.
+    #[test]
+    fn a_shards_take_carries_its_epoch() {
+        use meridian_domain::v1::resilience_history_item::Item;
+        use meridian_domain::v1::ResilienceHistoryItem;
+        let took = ResilienceHistoryItem {
+            item: Some(Item::ShardTookOver(meridian_domain::v1::ShardTookOver {
+                instance: "kraken-1".into(),
+                shard: 1,
+                holder: "pod-b".into(),
+                epoch: 7,
+                took_over_at_ns: 1,
+                ..Default::default()
+            })),
+        };
+        let read = resilience_json(&ReadResilienceReply {
+            history: vec![took, ResilienceHistoryItem::default()],
+            ..Default::default()
+        });
+        let item = &read["history"][0];
+        assert_eq!(item["epoch"], 7, "{item}");
+        assert_eq!(item["component"], "kraken-1", "{item}");
+        assert_eq!(item["partition"], "shard 1", "{item}");
+        assert!(read["history"][1].get("epoch").is_none(), "{read}");
     }
 }

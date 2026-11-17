@@ -837,36 +837,43 @@ async fn resilience_profile(State(app): State<Arc<App>>, headers: HeaderMap) -> 
     }
 }
 
+/// A refusal framed with a status, as that status, its words and the fields
+/// it named; none where it carries no status.
+fn status_refused(detail: &str) -> Option<Response> {
+    use meridian_bus::RefusalStatus;
+    let (status, fields, words) = meridian_bus::read_refusal_status(detail)?;
+    let status = match status {
+        RefusalStatus::InvalidArgument => StatusCode::UNPROCESSABLE_ENTITY,
+        RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
+        RefusalStatus::NotFound => StatusCode::NOT_FOUND,
+        RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
+        RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    // The fields the store named, as a tool's refusal carries them in its
+    // details (`fields: [{path}]`, accepted 2026-11-15; review finding 12):
+    // none named, no key.
+    if fields.is_empty() {
+        return Some(refused(status, words));
+    }
+    let fields: Vec<serde_json::Value> = fields
+        .iter()
+        .map(|path| serde_json::json!({ "path": path }))
+        .collect();
+    Some(json(
+        status,
+        serde_json::json!({ "error": words, "fields": fields }),
+    ))
+}
+
 /// A store's refusal of an act sent from the terminal, as its status, its
 /// words and the fields it named: a refusal for load 429 with `retry_after_seconds` in the body
 /// and a Retry-After header; one carrying a status, that status; any other
 /// refusal of the store's own 409; anything else -- nothing serving, a
 /// timeout -- 502.
 fn store_refused(detail: String) -> Response {
-    use meridian_bus::RefusalStatus;
     use meridian_pb::v1::RefusalReason;
-    if let Some((status, fields, words)) = meridian_bus::read_refusal_status(&detail) {
-        let status = match status {
-            RefusalStatus::InvalidArgument => StatusCode::UNPROCESSABLE_ENTITY,
-            RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
-            RefusalStatus::NotFound => StatusCode::NOT_FOUND,
-            RefusalStatus::FailedPrecondition => StatusCode::CONFLICT,
-            RefusalStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        // The fields the store named, as a tool's refusal carries them in
-        // its details (`fields: [{path}]`, accepted 2026-11-15; review
-        // finding 12): none named, no key.
-        if fields.is_empty() {
-            return refused(status, words);
-        }
-        let fields: Vec<serde_json::Value> = fields
-            .iter()
-            .map(|path| serde_json::json!({ "path": path }))
-            .collect();
-        return json(
-            status,
-            serde_json::json!({ "error": words, "fields": fields }),
-        );
+    if let Some(refusal) = status_refused(&detail) {
+        return refusal;
     }
     match meridian_bus::read_refusal(&detail) {
         Some((reason, words))
@@ -1348,6 +1355,15 @@ async fn launch(
         Duration::from_secs(40),
     )
     .await;
+    // A refusal framed with a status (a storage refusal, shards past
+    // most_shards) as a store's refusal of any other terminal act: its
+    // status, its words and the fields it named (the CLI's follow-up,
+    // 2026-11-17).
+    if let Err(reason) = &launched {
+        if let Some(refusal) = status_refused(reason) {
+            return refusal;
+        }
+    }
     match launched {
         Ok(launch) => json(
             StatusCode::CREATED,

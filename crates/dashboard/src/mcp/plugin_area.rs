@@ -228,7 +228,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_catalogue",
         "Read the plugin catalogue",
-        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop. A page at a time (next_cursor): the versions by name, then the launches as they were made; one plugin's alone by name, one version of it by name and version, or the launches alone (launches_only).",
+        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop; its shards and standby pod, and its own storage copied into its shared storage before it first ran as several pods (storage_copied, null for none). A page at a time (next_cursor): the versions by name, then the launches as they were made; one plugin's alone by name, one version of it by name and version, or the launches alone (launches_only).",
         true,
         Gate::DeploymentAdmin,
         catalogue_schema,
@@ -834,6 +834,18 @@ fn launch_json(launch: &PluginLaunch) -> Value {
             "in_flight": l.in_flight,
             "requests_per_second": l.requests_per_second,
             "answer_mib": l.answer_mib,
+        })),
+        // Its shards and standby pod (contract v30, W8.3) and its own
+        // storage copied into its shared storage before it first ran as
+        // several pods (item 30; item 70), null for none: what the
+        // catalogue's JSON says of it.
+        "shards": launch.shards,
+        "standby": launch.standby,
+        "storage_copied": launch.storage_copied.as_ref().map(|c| json!({
+            "from_claim": c.from_claim,
+            "to_claim": c.to_claim,
+            "at_ns": c.at_ns,
+            "launched_by": c.launched_by,
         })),
     })
 }

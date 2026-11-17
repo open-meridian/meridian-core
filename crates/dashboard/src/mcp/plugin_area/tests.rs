@@ -334,3 +334,41 @@ fn a_secret_is_refused_by_name_and_the_instructions_say_both_exceptions() {
         );
     }
 }
+
+/// Item 30 (item 70; the CLI's follow-up, 2026-11-17): a launch read
+/// through a tool says what the catalogue's JSON says of it, its shards,
+/// its standby pod and its own storage's copy into its shared storage,
+/// null where none was copied.
+#[test]
+fn a_launch_read_by_a_tool_says_its_pods_and_its_storage_copy_as_the_catalogue_does() {
+    let copied = meridian_domain::v1::PluginLaunch {
+        instance_id: "kraken-1".into(),
+        shards: 2,
+        standby: true,
+        storage_copied: Some(meridian_domain::v1::PluginStorageCopied {
+            instance_id: "kraken-1".into(),
+            from_claim: "r-storage-kraken-1".into(),
+            to_claim: "r-shared-storage-kraken-1".into(),
+            at_ns: 1_790_380_800_000_000_000,
+            launched_by: "local|ada".into(),
+        }),
+        ..Default::default()
+    };
+    let said = super::launch_json(&copied);
+    assert_eq!(said["shards"], 2, "{said}");
+    assert_eq!(said["standby"], true, "{said}");
+    assert_eq!(
+        said["storage_copied"],
+        serde_json::json!({
+            "from_claim": "r-storage-kraken-1",
+            "to_claim": "r-shared-storage-kraken-1",
+            "at_ns": 1_790_380_800_000_000_000_i64,
+            "launched_by": "local|ada",
+        }),
+        "{said}"
+    );
+    let one = super::launch_json(&meridian_domain::v1::PluginLaunch::default());
+    assert_eq!(one["storage_copied"], serde_json::Value::Null, "{one}");
+    assert_eq!(one["shards"], 0, "{one}");
+    assert_eq!(one["standby"], false, "{one}");
+}

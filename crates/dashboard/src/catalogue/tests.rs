@@ -217,6 +217,22 @@ fn conductor(bus: &Bus) {
         if request.approved_roles != vec!["custody".to_string()] {
             return Err("the approval names roles none, and snaptrade 0.1.0 declares custody; an approval of something other than what runs is no approval".into());
         }
+        // The conductor's refusals framed with a status and the fields
+        // they name (item 30's storage refusal; shards past most_shards).
+        if request.shards > 2 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["shards".to_string()],
+                "shards is 3, and snaptrade 0.1.0 allows at most 2 pod(s) of one instance (its most_shards)",
+            ));
+        }
+        if request.shards == 2 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::FailedPrecondition,
+                &["shards".to_string()],
+                "shards was asked for snaptrade-2, and its pods keep storage on 3 nodes",
+            ));
+        }
         Ok((
             "meridian.v1.PluginLaunch".into(),
             PluginLaunch {
@@ -860,6 +876,38 @@ async fn the_catalogue_launching_and_stopping() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("declares custody"), "showing both: {body}");
+    // A refusal framed with a status: that status, its words alone and the
+    // fields it names, as a store's refusal of any other terminal act (the
+    // CLI's follow-up, 2026-11-17): 409 for a precondition, 422 for an
+    // argument, never the bus's framing.
+    let sharded = |shards: u32| {
+        serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
+                           "approved_roles": ["custody"], "shards": shards})
+        .to_string()
+    };
+    for (shards, expected, words) in [
+        (2, StatusCode::CONFLICT, "its pods keep storage on 3 nodes"),
+        (3, StatusCode::UNPROCESSABLE_ENTITY, "at most 2 pod(s)"),
+    ] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/plugins/launch",
+            Some(&h.ada),
+            &sharded(shards),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            said["fields"],
+            serde_json::json!([{"path": "shards"}]),
+            "{body}"
+        );
+        let error = said["error"].as_str().unwrap();
+        assert!(error.contains(words), "{body}");
+        assert!(!error.contains("[refusal-"), "the bus's framing: {body}");
+    }
 
     let (status, _, body) = send(
         &h,
