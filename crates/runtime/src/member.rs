@@ -2074,9 +2074,11 @@ async fn read_gap(
                 partition,
             );
         }
-        // Behind the writer's retention: a reader holds the partition again
-        // from its head, as a standby's reload does.
-        Err(failed) if meridian_changes::is_behind(&failed) && following.is_some() => {
+        // Behind the writer's retention: the partition held again from the
+        // page heard, by a reader and a standby alike -- a standby left with
+        // the gap open was unready until a takeover or an epoch rise, the gap
+        // read again every second (review-c5i L2).
+        Err(failed) if meridian_changes::is_behind(&failed) => {
             if let Some(following) = following {
                 following.apply.reset(partition);
             }

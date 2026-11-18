@@ -451,6 +451,9 @@ struct Shape {
     /// Read-backs refused: every read of one change, as a writer's reads
     /// time out under load, while its catch-ups and `control` answer.
     refuse_read_backs: bool,
+    /// The lowest sequence the record keeps, where it is past 1: a read
+    /// after a sequence below it is behind the writer's retention.
+    lowest_kept: u64,
     /// Nothing answered, `control` included: the database failing over.
     down: bool,
     /// The lake's record: each change's digest its body's alone.
@@ -576,6 +579,13 @@ impl ChangeLog for Record {
                 shape.asked.push((partition.to_string(), after));
             } else if shape.refuse_read_backs {
                 return Err(ReadError::Unavailable("the read timed out".into()));
+            }
+            if shape.lowest_kept > 1 {
+                meridian_changes::check_kept(
+                    after,
+                    shape.lowest_kept,
+                    shape.heads.get(partition).copied().unwrap_or(0),
+                )?;
             }
             if catching_up && shape.hang.contains(partition) {
                 drop(shape);
@@ -1078,6 +1088,29 @@ async fn a_page_heard_while_its_partition_is_read_back_is_read_once_it_is_checke
     })
     .await;
     until("ready once read", || ready() && said().lag_ms() < 1_000).await;
+    following.abort();
+}
+
+/// A standby whose gap is behind its writer's retention holds the partition
+/// again from the page heard, as a reader does, and is ready: never left
+/// unready until a takeover or an epoch rise, the gap read again and warned
+/// of every second (review-c5i L2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_standby_behind_its_writers_retention_holds_from_the_page_heard_and_is_ready() {
+    let record = Record::of(&[("P0", 2)]);
+    let (bus, following) = standing_by_on("member-test-standby-behind", &record).await;
+    record.head("P0", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P0", 3)]);
+    until("ready", ready).await;
+    // The writer keeps 6 on: 4 and 5 missed past its retention, 7 heard.
+    record.shape(|shape| shape.lowest_kept = 6);
+    record.head("P0", 7);
+    meridian_changes::publish(&bus, "book", 6, &[record.change("P0", 7)]);
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    until("ready, held from the page heard", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
     following.abort();
 }
 
