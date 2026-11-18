@@ -3077,25 +3077,24 @@ fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(store: &dyn Stor
 }
 
 /// A store whose launches' version is there: Postgres holds every launch to
-/// a version recorded first.
-fn store_with_version(tag: &str) -> PostgresStore {
-    let store = store(tag);
+/// a version recorded first. Its schema answered first, dropped after the
+/// store (PO 65).
+fn store_with_version(tag: &str) -> (Scratch, PostgresStore) {
+    let (schema, store) = store_at(tag);
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
-    store
+    (schema, store)
 }
 
 #[test]
 fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
-    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store_with_version(
-        "storage_copied_91",
-    ));
+    let (_schema, store) = store_with_version("storage_copied_91");
+    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store);
 }
 
 #[test]
 fn the_storage_copy_is_recorded_once_in_postgres() {
-    a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
-        &store_with_version("storage_copied"),
-    );
+    let (_schema, store) = store_with_version("storage_copied");
+    a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store);
 }
