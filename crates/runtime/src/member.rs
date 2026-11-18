@@ -1943,6 +1943,25 @@ struct Behind<'a> {
     unchecked_since: &'a mut Option<Instant>,
 }
 
+/// `partition` handed to the read-back, the member behind since its gap was
+/// found where it had one: the read-back's own wait measured from now, the
+/// lag fell to nothing, and the member said it was ready while it held what
+/// the record lost and the read-back went unanswered -- a gap the reconcile
+/// then ended at the record's head, below where the partition stood, gone
+/// too (review-c5i L1).
+fn hand_to_read_back(
+    unchecked: &mut std::collections::BTreeSet<String>,
+    unchecked_since: &mut Option<Instant>,
+    gaps: &HashMap<String, Gap>,
+    partition: &str,
+) {
+    unchecked.insert(partition.to_string());
+    let since = gaps
+        .get(partition)
+        .map_or_else(Instant::now, |gap| gap.since);
+    *unchecked_since = Some(unchecked_since.map_or(since, |was| was.min(since)));
+}
+
 /// A gap still open read again as the writer answers: from `held` where its
 /// partition stands to `to`; or, where the partition is not yet held -- first
 /// heard, its page refused -- the partition held from the record's head, as
@@ -2022,24 +2041,30 @@ async fn read_gap(
             behind.at.insert(partition.to_string(), reached.head);
             if reached.head < heard {
                 tracing::warn!(domain, partition, head = reached.head, heard, "the record's head is below a page heard: what this member applied is read back from the record");
-                behind.unchecked.insert(partition.to_string());
-                behind.unchecked_since.get_or_insert_with(Instant::now);
+                hand_to_read_back(
+                    behind.unchecked,
+                    behind.unchecked_since,
+                    behind.gaps,
+                    partition,
+                );
+            } else {
+                behind.gaps.remove(partition);
             }
-            behind.gaps.remove(partition);
         }
         // The record no longer reaches what this member applied, or no
         // longer holds the change it last applied: read it back (contract
-        // v30, stage C; review-c5i M1). The gap is then the read-back's: its
-        // own since measures the wait, and the gap's is let go -- left set,
-        // it outlived a read-back that found the record holding all this
-        // member applied, and the member's lag grew from it for good,
-        // silently (failover-repeat 43146764089, ha run 1: the lake's reader
-        // unready after the apiserver class, no warning said).
+        // v30, stage C; review-c5i M1), the member behind since the gap was
+        // found ([`hand_to_read_back`]). The gap is kept, and read again
+        // once the read-back has ended it at the record's head, where the
+        // record holds what was applied.
         Err(failed) if failed.starts_with(DIVERGED) || failed.starts_with(LINEAGE) => {
             tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
-            behind.unchecked.insert(partition.to_string());
-            behind.unchecked_since.get_or_insert_with(Instant::now);
-            behind.gaps.remove(partition);
+            hand_to_read_back(
+                behind.unchecked,
+                behind.unchecked_since,
+                behind.gaps,
+                partition,
+            );
         }
         // Behind the writer's retention: a reader holds the partition again
         // from its head, as a standby's reload does.
@@ -2163,8 +2188,7 @@ async fn reconcile(
                     // and applied meanwhile (review-c5i M1).
                     Err(failed) if failed.starts_with(DIVERGED) || failed.starts_with(LINEAGE) => {
                         tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be caught up: what this member applied is read back from the record");
-                        unchecked.insert(partition.clone());
-                        unchecked_since.get_or_insert_with(Instant::now);
+                        hand_to_read_back(unchecked, unchecked_since, gaps, &partition);
                         if !progressed {
                             continue;
                         }

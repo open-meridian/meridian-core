@@ -446,6 +446,9 @@ struct Shape {
     hang: std::collections::HashSet<String>,
     /// The partitions a catch-up of was refused.
     refused: std::collections::HashSet<String>,
+    /// Read-backs refused: every read of one change, as a writer's reads
+    /// time out under load, while its catch-ups and `control` answer.
+    refuse_read_backs: bool,
     /// Nothing answered, `control` included: the database failing over.
     down: bool,
     /// The lake's record: each change's digest its body's alone.
@@ -567,6 +570,9 @@ impl ChangeLog for Record {
                 });
             }
             let catching_up = most == meridian_changes::PAGE_MOST;
+            if !catching_up && shape.refuse_read_backs {
+                return Err(ReadError::Unavailable("the read timed out".into()));
+            }
             if catching_up && shape.hang.contains(partition) {
                 drop(shape);
                 std::thread::sleep(Duration::from_secs(6));
@@ -966,6 +972,49 @@ async fn a_gap_read_to_a_records_head_below_the_page_heard_holds_the_records_hea
         ready() && said().lag_ms() < 1_000
     })
     .await;
+}
+
+/// A gap handed to the read-back keeps its wait in the member's lag: a gap
+/// past the bound whose catch-up found the record's head below what the
+/// reader applied leaves it unready while the read-back goes unanswered,
+/// never ready as though it had just fallen behind -- holding what the
+/// record lost (review-c5i L1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_handed_to_the_read_back_keeps_the_reader_unready_while_it_goes_unanswered() {
+    let record = Record::of(&[("P0", 3)]);
+    let (bus, followed, _) = reading("member-test-gap-read-back", &record, &[("P0", 3)]).await;
+    record.head("P0", 4);
+    meridian_changes::publish(&bus, "book", 3, &[record.change("P0", 4)]);
+    until("4 applied", || followed.heads().get("P0") == Some(&4)).await;
+    // 5 and 6 missed, 7 heard, its catch-up refused: a gap past the bound.
+    record.refuse("P0", true);
+    record.head("P0", 7);
+    meridian_changes::publish(&bus, "book", 6, &[record.change("P0", 7)]);
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert!(!ready(), "ready with a gap past its bound");
+    // The record's head falls below what the reader applied, and its
+    // read-backs go unanswered: the gap, read again, is the read-back's.
+    record.shape(|shape| {
+        shape.refuse_read_backs = true;
+        shape.refusing.clear();
+        shape.heads.insert("P0".into(), 3);
+    });
+    let until_at = Instant::now() + Duration::from_millis(2_500);
+    while Instant::now() < until_at {
+        assert!(
+            !ready(),
+            "ready at {} ms of lag, its gap handed to a read-back unanswered",
+            said().lag_ms()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The read-back answered: 4 lost, the partition reloaded at 3.
+    record.shape(|shape| shape.refuse_read_backs = false);
+    until("P0 reloaded at 3", || {
+        followed.heads().get("P0") == Some(&3)
+    })
+    .await;
+    until("ready once reloaded", || ready() && said().lag_ms() < 1_000).await;
 }
 
 /// Each partition's gap is its own, and the lag is the oldest still open:
