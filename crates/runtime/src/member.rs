@@ -1786,7 +1786,7 @@ async fn follow(
                                 // read's timeout, and the member is never held
                                 // ready past its bound meanwhile (review-delta
                                 // A1).
-                                minding(
+                                let reconciled = minding(
                                     since.or(Some(proved)),
                                     bound,
                                     reconcile(
@@ -1805,6 +1805,18 @@ async fn follow(
                                     ),
                                 )
                                 .await;
+                                // The primary's heads unread: the proof of
+                                // being behind carried on, as the writer's
+                                // silence is, so the lag counts it and the
+                                // next tick reconciles again (review c5w
+                                // R1) -- never ready while proven behind.
+                                if !reconciled {
+                                    unanswered_since = Some(
+                                        unanswered_since.map_or(behind_from, |since| {
+                                            since.min(behind_from)
+                                        }),
+                                    );
+                                }
                             }
                         }
                         // A gap still open is read again as the writer
@@ -2222,6 +2234,9 @@ async fn read_gap(
 /// (review-c5c-ci1 M3: a stale one read back as kept, and the reader held
 /// what the record had lost, ready).
 ///
+/// Says whether it read the primary's heads: where it could not, nothing
+/// was reconciled, and its caller carries `behind_from` on (review c5w R1).
+///
 /// [`Reads::left_behind`]: meridian_bus::read_after::Reads::left_behind
 async fn reconcile(
     bus: &Bus,
@@ -2229,7 +2244,7 @@ async fn reconcile(
     following: &Following,
     behind_from: Instant,
     behind: &mut Behind<'_>,
-) {
+) -> bool {
     let Behind {
         at,
         applied,
@@ -2244,17 +2259,17 @@ async fn reconcile(
     let primary = Arc::clone(&following.primary);
     let heads = match tokio::task::spawn_blocking(move || primary.all_heads()).await {
         Ok(Some(heads)) => heads,
-        Ok(None) => return,
+        Ok(None) => return true,
         Err(failed) => {
             tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
-            return;
+            return false;
         }
     };
     let heads = match heads {
         Ok(heads) => heads,
         Err(failed) => {
             tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
-            return;
+            return false;
         }
     };
     for (partition, head) in heads {
@@ -2332,6 +2347,7 @@ async fn reconcile(
         following.followed.set(&partition, reached);
     }
     said().set_partitions(at.keys().cloned().collect());
+    true
 }
 
 /// Whether a reader is held behind on purpose: TEST ONLY, by the file

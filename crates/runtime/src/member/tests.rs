@@ -2003,6 +2003,112 @@ async fn a_reader_left_behind_is_behind_from_when_the_read_came() {
     }
 }
 
+/// A reconcile that cannot read the primary's heads carries its proof of
+/// being behind on (review c5w R1): a read left behind, its bound waited,
+/// and the primary's heads unread once -- the reader unready within a tick
+/// of the answer, its lag at least the bound, never ready while proven
+/// behind until another read is left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconcile_that_cannot_read_the_primarys_heads_keeps_the_reader_behind() {
+    struct Refusing {
+        record: Arc<Record>,
+        refusals: std::sync::atomic::AtomicU32,
+    }
+    impl meridian_bus::read_after::Position for Refusing {
+        fn heads(&self, partitions: &[String]) -> Result<HashMap<String, u64>, String> {
+            let shape = self.record.shape.lock().unwrap();
+            Ok(partitions
+                .iter()
+                .filter_map(|p| shape.heads.get(p).map(|h| (p.clone(), *h)))
+                .collect())
+        }
+        fn all_heads(&self) -> Option<Result<HashMap<String, u64>, String>> {
+            let refused = self
+                .refusals
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refused {
+                return Some(Err("the database is failing over".into()));
+            }
+            let shape = self.record.shape.lock().unwrap();
+            Some(Ok(shape
+                .heads
+                .iter()
+                .map(|(p, h)| (p.clone(), *h))
+                .collect()))
+        }
+    }
+    let bound = Duration::from_secs(3);
+    let record = Record::of(&[("P0", 3)]);
+    let primary = Arc::new(Refusing {
+        record: record.clone(),
+        refusals: Default::default(),
+    });
+    let bus = Arc::new(Bus::single(
+        "member-test-heads-unread",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    meridian_changes::serve(&bus, record.domain(), record.clone());
+    let member = Member::reader_of("bor", record.domain(), bound);
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 3)]);
+    member
+        .read(
+            &bus,
+            followed.clone(),
+            Arc::new(Applied::default()),
+            primary.clone(),
+        )
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, record.domain())
+    })
+    .await;
+    until("ready", ready).await;
+    // 4 to 6 committed, their pages lost, P0's catch-ups answered too
+    // late; and the primary's heads unread once, as it fails over.
+    record.shape(|shape| {
+        shape.heads.insert("P0".into(), 6);
+        shape.hang.insert("P0".into());
+    });
+    primary.refusals.store(1, Ordering::SeqCst);
+    let naming = meridian_pb::v1::Watermark {
+        partitions: vec![meridian_pb::v1::PartitionSequence {
+            partition: "P0".into(),
+            sequence: 6,
+        }],
+    };
+    let reads = bus.clone();
+    let came = Instant::now();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming)
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::FromPrimary));
+    let answered = Instant::now();
+    while ready() {
+        assert!(
+            answered.elapsed() < ASK_EVERY + Duration::from_millis(1_500),
+            "ready {} ms after a read that waited its {} ms bound proved it behind, the \
+             primary's heads unread (refusals left: {})",
+            answered.elapsed().as_millis(),
+            bound.as_millis(),
+            primary.refusals.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let lag = Duration::from_millis(said().lag_ms());
+    assert!(
+        lag + Duration::from_millis(500) >= came.elapsed().min(bound),
+        "lag {} ms, {} ms after the read came",
+        lag.as_millis(),
+        came.elapsed().as_millis()
+    );
+}
+
 /// A gap recorded by a reconcile is behind from the evidence of its own
 /// partition, never from another partition's older gap: once that gap
 /// closes, the lag is the new gap's (review-delta A2: the new gap took the
