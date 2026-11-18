@@ -736,38 +736,48 @@ impl PostgresStore {
     /// (step 3d).
     fn head(&self, tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
         self.owned(dataset)?;
-        let epoch = self.epoch_now()?;
-        let begun = tx
-            .execute(
-                "INSERT INTO lake_partition (dataset, head, epoch, origin) VALUES ($1, 0, $2, $3)
-                 ON CONFLICT DO NOTHING",
-                &[&dataset, &(epoch as i64), &meridian_changes::origin()],
-            )
-            .map_err(unavailable)?;
-        if begun == 1 {
-            // The group's own epoch: the control partition's for group 0,
-            // its own row past it (step 3d).
-            let anchor: Option<i64> = if self.groups.holds_control() {
-                tx.query_opt(
-                    "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
-                    &[],
-                )
-            } else {
-                tx.query_opt(
-                    "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
-                    &[&(self.groups.mine() as i32)],
-                )
-            }
-            .map_err(unavailable)?
-            .map(|row| row.get(0));
-            self.fence.admits(anchor.unwrap_or(0) as u64)?;
-        }
-        let row = tx
-            .query_one(
+        self.epoch_now()?;
+        let held = |tx: &mut Transaction<'_>| {
+            tx.query_opt(
                 "SELECT head, epoch, closed_at FROM lake_partition WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
-            .map_err(unavailable)?;
+            .map_err(unavailable)
+        };
+        let row = match held(tx)? {
+            Some(row) => row,
+            None => {
+                // The group's own epoch first -- the control partition's
+                // for group 0, its own row past it (step 3d) -- held shared,
+                // then the dataset begun under it: never under an epoch the
+                // writer's own raise, still committing, may yet lose
+                // (review c5r3, L2).
+                let anchor: Option<i64> = if self.groups.holds_control() {
+                    tx.query_opt(
+                        "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
+                        &[],
+                    )
+                } else {
+                    tx.query_opt(
+                        "SELECT epoch FROM lake_writer_group WHERE writer_group = $1 FOR SHARE",
+                        &[&(self.groups.mine() as i32)],
+                    )
+                }
+                .map_err(unavailable)?
+                .map(|row| row.get(0));
+                let anchor = anchor.unwrap_or(0);
+                self.fence.admits(anchor as u64)?;
+                tx.execute(
+                    "INSERT INTO lake_partition (dataset, head, epoch, origin) VALUES ($1, 0, $2, $3)
+                     ON CONFLICT DO NOTHING",
+                    &[&dataset, &anchor, &meridian_changes::origin()],
+                )
+                .map_err(unavailable)?;
+                held(tx)?.ok_or_else(|| {
+                    StoreError::Unavailable(format!("range {dataset} was not begun: ask again"))
+                })?
+            }
+        };
         // A move's pointer: never written under, never a fence (C3).
         if row.get::<_, i64>(1) == meridian_changes::moves::POINTER_EPOCH {
             return Err(StoreError::Held(format!(
