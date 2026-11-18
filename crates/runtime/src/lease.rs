@@ -475,7 +475,19 @@ impl<L: Leases> Elector<L> {
             }
             Wrote::Conflict => {
                 self.renewed_at = None;
-                Ok(Standing::HeldBy(current.holder))
+                // Written meanwhile: this member's own renewal landing late,
+                // or another member's take. Read again, within the caller's
+                // bound as the first read was, so a writer whose lease was
+                // taken steps down in this renewal, never one renew later
+                // still ready (review c5i L4). Where that read fails, or
+                // names this member or nobody, the first read's holder
+                // stands.
+                match self.api.get(&self.settings.name).await {
+                    Ok(Some(again)) if !again.holder.is_empty() && again.holder != me => {
+                        Ok(Standing::HeldBy(again.holder))
+                    }
+                    _ => Ok(Standing::HeldBy(current.holder)),
+                }
             }
         }
     }

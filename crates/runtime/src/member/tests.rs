@@ -2524,6 +2524,9 @@ struct Unreliable {
     /// and are never answered.
     writes_late: Arc<AtomicU64>,
     late_by: Duration,
+    /// Writes before which a standby's take lands, after the read they
+    /// were made from: each is refused as written meanwhile.
+    taken_before_write: Arc<AtomicU64>,
     /// How long a read's answer and a write's request each take.
     latency: Duration,
     landed: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
@@ -2578,6 +2581,14 @@ impl Leases for Unreliable {
         if met(&self.writes_unanswered) {
             tokio::time::sleep(Duration::from_secs(60)).await;
             return Err("operation timed out".into());
+        }
+        if met(&self.taken_before_write) {
+            let mut held = self.held.lock().unwrap();
+            let current = held.as_mut().unwrap();
+            current.holder = "bor-b_1".into();
+            current.transitions += 1;
+            current.resource_version =
+                (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
         }
         tokio::time::sleep(self.latency).await;
         if met(&self.writes_late) {
@@ -2838,5 +2849,43 @@ async fn a_renewal_landing_late_is_no_other_holder_and_the_writer_renews_on() {
     assert!(
         longest < Duration::from_secs(6),
         "the Lease went {longest:?} between renewals that landed"
+    );
+}
+
+/// A renewal refused because a standby's take landed between its read and
+/// its write steps the writer down within that renewal (review c5i L4): it
+/// reads the Lease again within the renewal's bound, finds another member
+/// named, and never writes on, ready, to its next renewal (section 2: a
+/// writer is ready only while it holds its lease).
+#[tokio::test(start_paused = true)]
+async fn a_renewal_refused_by_a_standbys_take_steps_the_writer_down_within_that_renewal() {
+    let api = Unreliable {
+        latency: Duration::from_millis(100),
+        ..Unreliable::default()
+    };
+    let elector = holding_on(&api).await;
+    api.taken_before_write.store(1, Ordering::SeqCst);
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<(Duration, String)>::new()));
+    let said = Arc::clone(&stepped);
+    let renewing = tokio::spawn(renew_while_writing(
+        Arc::new(tokio::sync::Mutex::new(elector)),
+        "bor",
+        move |_, why| {
+            said.lock()
+                .unwrap()
+                .push((began.elapsed(), why.to_string()))
+        },
+    ));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    renewing.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(stepped.len(), 1, "stepped down {stepped:?}");
+    let (at, why) = &stepped[0];
+    assert!(why.contains("bor-b_1"), "stepped down saying {why:?}");
+    assert!(
+        *at < Duration::from_secs(4),
+        "stepped down {at:?} after it began holding, its first renewal begun at 2 s and \
+         bounded by 2 s: a renew late, ready meanwhile"
     );
 }
