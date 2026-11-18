@@ -2768,6 +2768,28 @@ async fn a_planned_stop_never_clears_a_lease_another_took_and_ends_within_the_le
     );
 }
 
+/// A planned stop that waits for a renewal in flight still ends within the
+/// Lease's duration from the stop, never a renew more (review c5i L5): its
+/// bound is set before it takes the elector, as a step-down's is, so the
+/// chart's termination grace covers it.
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_behind_a_renewal_in_flight_ends_within_the_lease_from_the_stop() {
+    let api = Unreliable::default();
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    api.writes_unanswered.store(1_000, Ordering::SeqCst);
+    let renewing = tokio::spawn(renew_while_writing(Arc::clone(&elector), "bor", |_, _| {}));
+    // The renewal begun at 2 s holds the elector, unanswered, to its bound.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let began = tokio::time::Instant::now();
+    release_on_stop(&elector, "bor").await;
+    renewing.abort();
+    assert!(
+        began.elapsed() <= Duration::from_secs(6),
+        "the stop took {:?} to give the Lease up, past its 6 s from the stop",
+        began.elapsed()
+    );
+}
+
 /// A writer stepping down whose first read of its Lease failed tries again
 /// within its bound ([`STEP_DOWN_RELEASE`]): one failed request never
 /// leaves the Lease to lapse.

@@ -1012,8 +1012,13 @@ pub(crate) async fn release_on_stop<L: Leases>(
     elector: &tokio::sync::Mutex<Elector<L>>,
     component: &str,
 ) {
+    // Bounded from the stop, set before the elector is taken, as a
+    // step-down's bound is (review c5i L5): a renewal in flight holds the
+    // elector up to a renew, and a bound begun after that wait ended a
+    // renew past the lease's duration, and past the termination grace.
+    let stopped = tokio::time::Instant::now();
     let mut elector = elector.lock().await;
-    let until = tokio::time::Instant::now() + elector.settings().duration;
+    let until = stopped + elector.settings().duration;
     let released = tokio::time::timeout_at(
         until,
         elector.release_if_mine_by(now_ns(), until, RELEASE_TRIED_EVERY),
