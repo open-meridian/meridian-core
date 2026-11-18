@@ -532,6 +532,7 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- if .top.Values.zones }}
   - maxSkew: 1
     topologyKey: topology.kubernetes.io/zone
@@ -540,8 +541,28 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- end }}
 {{- end }}
+{{- end -}}
+
+{{/*
+A required spread counts its own revision's pods alone (found by CI run
+44343480916, where the book's writer and standby ran on one node and one
+zone). A spread is judged only as a pod is scheduled, over every pod its
+selector matches, the revision being rolled away included. A rollout's
+last new pod, scheduled while the old pod it replaces still counted, found
+one pod on every node -- the old revision's two and the new revision's
+first -- so any node passed, the new first's own among them; the old pods
+then stopped and left the set's two members together. Kubernetes' answer is
+`matchLabelKeys` on the Deployment's `pod-template-hash`: the spread then
+holds among the pods of one revision, which are the pods left when its
+rollout ends. A StatefulSet's pods carry no such label and the key is
+ignored for them; they are replaced in place, never beside the old.
+*/}}
+{{- define "meridian-runtime.spreadPerRevision" -}}
+matchLabelKeys:
+  - pod-template-hash
 {{- end -}}
 
 {{/*
@@ -640,6 +661,7 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- end }}
 {{- end -}}
 

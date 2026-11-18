@@ -3097,6 +3097,30 @@ chart-check:
 		&& { echo "chart-check FAILED: a conductor standby rendered with a generated key no second node can mount" >&2; exit 1; }; \
 	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
 		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
+	@# A required spread holds through a rollout (CI run 44343480916: the
+	@# book's writer and standby on one node and in one zone, so a paused
+	@# node and a stopped one took both). A spread is judged as a pod is
+	@# scheduled, over every pod its selector matches, the revision being
+	@# rolled away included: a rollout's last new pod, scheduled while the
+	@# old pod it replaces still counted, found one pod on every node and
+	@# might join the new revision's first. So every `DoNotSchedule` spread
+	@# the ha profile renders, with zones and without, counts its own
+	@# revision alone (matchLabelKeys: pod-template-hash); and the check is
+	@# shown to find a spread without it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k --set resilience.profile=ha"; \
+	judge='function shut() { if (need && !has) bad++; need = 0; has = 0; open = 0 } { match($$0, /^ */); ind = RLENGTH } open && ind <= at && $$0 !~ /^ *$$/ { shut() } /^ *- maxSkew:/ { open = 1; at = ind } open && /whenUnsatisfiable: DoNotSchedule/ { need = 1; found++ } open && /^ *- pod-template-hash$$/ { has = 1 } END { shut(); print found + 0, bad + 0 }'; \
+	for zones in "" "--set zones={zone-a,zone-b,zone-c}"; do \
+		made="$$($(HELM_TEMPLATE) check deploy/chart $$base $$zones 2>&1)" \
+			|| { echo "chart-check FAILED: the ha profile did not render ($$zones): $$made" >&2; exit 1; }; \
+		said="$$(echo "$$made" | awk "$$judge")"; \
+		[ "$${said%% *}" -ge 6 ] \
+			|| { echo "chart-check FAILED: the ha profile ($$zones) renders $${said%% *} required spreads; each of the six stores has one at least" >&2; exit 1; }; \
+		[ "$${said##* }" = 0 ] \
+			|| { echo "chart-check FAILED: $${said##* } of the ha profile's $${said%% *} required spreads ($$zones) count the pods of a revision being rolled away (no matchLabelKeys: pod-template-hash): a rollout can leave a writer and its standby on one node" >&2; exit 1; }; \
+	done; \
+	said="$$(echo "$$made" | awk '/^ *- pod-template-hash$$/ && !gone { gone = 1; next } { print }' | awk "$$judge")"; \
+	[ "$${said##* }" = 1 ] \
+		|| { echo "chart-check FAILED: the required-spread check does not find a spread whose matchLabelKeys is taken away ($$said)" >&2; exit 1; }
 	@# Step 3d (the resilience spec's section 7): a plugin instance as
 	@# shards with a standby pod. The default renders no lease right and the
 	@# launcher no shape for them (standbys are configuration, ruling 1052);
