@@ -1759,25 +1759,41 @@ async fn follow(
                             // Held behind on purpose (TEST ONLY): what it
                             // lacks is read once it is let go.
                             let held = held_on_purpose();
-                            let left_behind = !held && bus.reads_after().left_behind(domain);
-                            if again || (!held && read_back) || left_behind {
+                            let left_behind = if held {
+                                None
+                            } else {
+                                bus.reads_after().left_behind(domain)
+                            };
+                            if again || (!held && read_back) || left_behind.is_some() {
                                 // A read left behind proves the reader behind
-                                // now: minded from then, never held ready while
-                                // the reconcile reads (review-c5m2 2).
+                                // from when that read came, which waited its
+                                // bound (review-delta A3): minded from then,
+                                // never held ready while the reconcile reads
+                                // (review-c5m2 2).
                                 let proved = Instant::now();
-                                let since = behind_since(
-                                    &gaps,
-                                    &at,
-                                    [unanswered, unchecked_since, left_behind.then_some(proved)],
-                                );
+                                let evidence = [unanswered, unchecked_since, left_behind];
+                                let since = behind_since(&gaps, &at, evidence);
+                                // A gap the reconcile records is behind from
+                                // this evidence alone, never from another
+                                // partition's gap (review-delta A2).
+                                let behind_from = evidence
+                                    .into_iter()
+                                    .flatten()
+                                    .min()
+                                    .unwrap_or(proved);
+                                // Minded from now where nothing says it was
+                                // behind before: every catch-up may wait its
+                                // read's timeout, and the member is never held
+                                // ready past its bound meanwhile (review-delta
+                                // A1).
                                 minding(
-                                    since,
+                                    since.or(Some(proved)),
                                     bound,
                                     reconcile(
                                         &bus,
                                         domain,
                                         following,
-                                        since.unwrap_or(proved),
+                                        behind_from,
                                         &mut Behind {
                                             at: &mut at,
                                             applied: &mut applied,
@@ -2633,8 +2649,11 @@ async fn read_to_head(
         let mut next = after;
         for change in &page.changes {
             if change.sequence <= next {
+                // Refused, as a change that does not verify is: said at
+                // error, never at debug behind a timeout warned of before
+                // (review-delta A4).
                 return Err(format!(
-                    "change {} came after {next}: out of order",
+                    "{REFUSED}: change {} came after {next}: out of order",
                     change.sequence
                 ));
             }
