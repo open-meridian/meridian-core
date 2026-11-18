@@ -1476,10 +1476,12 @@ async fn follow(
     let mut unchecked_since: Option<Instant> = None;
     // Behind since a page was missed and not yet read, each partition's
     // own gap; unanswered since the writer last failed to answer. The lag
-    // is the longest. A gap is let go once its partition holds the page
-    // that found it, however it came to -- read from the writer here, by
-    // the reconcile, or a read-back's reload -- never left to grow the
-    // member's lag for good (CI 44187810396).
+    // is the longest. A gap is let go once its partition holds the latest
+    // page heard past it, or the record's head where the record no longer
+    // reaches that page, however it came to -- read from the writer here,
+    // by the reconcile, or a read-back's reload -- and is read again each
+    // time the writer answers: never left to grow the member's lag for good
+    // (CI 44187810396; review-c5c-ci1).
     let mut gaps: HashMap<String, Gap> = HashMap::new();
     let mut unanswered_since: Option<Instant> = None;
     // Whether the writer has answered yet: a reader reconciles with the
@@ -1628,8 +1630,20 @@ async fn follow(
                             let held = held_on_purpose();
                             let left_behind = !held && bus.reads_after().left_behind(domain);
                             if again || (!held && read_back) || left_behind {
-                                reconcile(&bus, domain, following, &unchecked, &mut at, &mut applied, &mut chains)
-                                    .await;
+                                reconcile(
+                                    &bus,
+                                    domain,
+                                    following,
+                                    &mut Behind {
+                                        at: &mut at,
+                                        applied: &mut applied,
+                                        chains: &mut chains,
+                                        gaps: &mut gaps,
+                                        unchecked: &mut unchecked,
+                                        unchecked_since: &mut unchecked_since,
+                                    },
+                                )
+                                .await;
                             }
                         }
                         // A gap still open is read again as the writer
@@ -1839,11 +1853,16 @@ async fn reconcile(
     bus: &Bus,
     domain: &'static str,
     following: &Following,
-    unchecked: &std::collections::BTreeSet<String>,
-    at: &mut HashMap<String, u64>,
-    applied: &mut HashMap<String, Applied>,
-    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    behind: &mut Behind<'_>,
 ) {
+    let Behind {
+        at,
+        applied,
+        chains,
+        gaps,
+        unchecked,
+        ..
+    } = behind;
     // Read off the runtime's own threads: a store's record is read blocking
     // (the book's and the lake's Postgres clients refuse to be driven from
     // an async task; CI 42878357895).
@@ -1864,6 +1883,9 @@ async fn reconcile(
         }
     };
     for (partition, head) in heads {
+        // A gap ends at the record's head at the latest: a page past it was
+        // lost with the record's tail (review-c5c-ci1 M1).
+        Gap::ends_at(gaps, &partition, head);
         if unchecked.contains(&partition) {
             continue;
         }
@@ -2018,6 +2040,11 @@ impl Lineage<'_> {
             };
             unchecked.remove(&partition);
             let (kept, head) = found;
+            // Kept or reloaded, the partition holds all the record does to
+            // its head, and a gap found before ends there at the latest: a
+            // page past it was lost with the record's tail, and is never
+            // waited for (review-c5c-ci1 M1).
+            Gap::ends_at(gaps, &partition, head);
             if kept {
                 continue;
             }
@@ -2036,9 +2063,6 @@ impl Lineage<'_> {
             }
             chains.remove(&partition);
             applied.remove(&partition);
-            // Reloaded at the record's head: all the record holds is held,
-            // and a gap found before ends here.
-            Gap::ends_at(gaps, &partition, head);
             at.insert(partition, head);
         }
     }

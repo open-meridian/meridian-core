@@ -742,6 +742,34 @@ async fn a_gap_whose_catch_up_failed_is_read_again_while_the_writer_answers() {
     .await;
 }
 
+/// A gap whose pages the record lost -- a failover that lost a committed
+/// tail -- ends at the record's head: a reader holding all the record holds
+/// is not behind, and is ready, though the new writer has not yet written
+/// that far again (review-c5c-ci1 M1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_whose_pages_the_record_lost_ends_at_the_records_head() {
+    let record = Record::of(&[("P0", 2)]);
+    let (bus, followed, _) = reading("member-test-gap-lost", &record, &[("P0", 2)]).await;
+    record.head("P0", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P0", 3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+    record.refuse("P0", true);
+    record.head("P0", 6);
+    meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+    // Behind by the gap, unread: unready.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    held_unready(&followed, "P0", 3, Duration::from_millis(500)).await;
+    // The database failed over and lost 4 to 6; the writer raised its epoch
+    // and has written nothing since.
+    record.lose("P0", 4, 3);
+    record.shape(|shape| shape.control_epoch = 3);
+    until("ready at the record's head", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+    assert_eq!(followed.heads().get("P0"), Some(&3));
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");
