@@ -2713,27 +2713,36 @@ fn an_administrative_acts_record_is_kept_as_written() {
     // or a removal of a row, whoever asks; the store only ever adds to them.
     let (_store, url) = store_at("append_only");
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
-    let guarded: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-              WHERE t.tgname = 'config_append_only'
-                AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    let tables: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_tables WHERE schemaname = current_schema()
-                AND (tablename LIKE 'config\\_%\\_change'
-                     OR tablename IN ('config_record_move', 'config_plugin_storage_copied'))",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert!(tables >= 15, "the change tables are there: {tables}");
+    // The tables kept as written, and the tables guarded, are the same
+    // tables: none listed is unguarded, and none guarded is unlisted
+    // (review-c5c-ci1 L3: two counts matched where one table of each would
+    // have).
+    let mut tables = |sql: &str| -> Vec<String> {
+        client
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    let kept_as_written = tables(
+        "SELECT tablename::text FROM pg_tables WHERE schemaname = current_schema()
+            AND (tablename LIKE 'config\\_%\\_change'
+                 OR tablename IN ('config_record_move', 'config_plugin_storage_copied'))
+          ORDER BY 1",
+    );
+    let guarded = tables(
+        "SELECT c.relname::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+          WHERE t.tgname = 'config_append_only'
+            AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+          ORDER BY 1",
+    );
+    assert!(
+        kept_as_written.len() >= 15,
+        "the change tables are there: {kept_as_written:?}"
+    );
     assert_eq!(
-        guarded, tables,
+        guarded, kept_as_written,
         "every change table, the moves and the storage copies are append-only"
     );
 
@@ -2744,9 +2753,19 @@ fn an_administrative_acts_record_is_kept_as_written() {
             &[],
         )
         .expect("a record is added");
+    client
+        .execute(
+            "INSERT INTO config_plugin_storage_copied
+                    (instance_id, launched_at_ns, from_claim, to_claim, at_ns, launched_by)
+             VALUES ('PLG-1', 1, 'claim-a', 'claim-b', 2, 'local|alice')",
+            &[],
+        )
+        .expect("a storage copy is recorded");
     for refused in [
         "UPDATE config_hold_change SET days = 1",
         "DELETE FROM config_hold_change",
+        "UPDATE config_plugin_storage_copied SET to_claim = 'claim-c'",
+        "DELETE FROM config_plugin_storage_copied",
     ] {
         let failed = client.execute(refused, &[]).expect_err(refused);
         assert_eq!(
