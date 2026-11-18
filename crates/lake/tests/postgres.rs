@@ -11093,7 +11093,9 @@ fn a_range_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_
     // Group 1's writer takes over while the gate waits: moved under its
     // epoch.
     let taking = {
-        let url = url.clone();
+        // Its text: a thread a failed test leaves running never holds the
+        // Scratch past the test (review c5p L2).
+        let url = url.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             PostgresStore::connect(&url, 2)

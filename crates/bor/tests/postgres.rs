@@ -5335,7 +5335,9 @@ async fn a_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_
     // Group 1's writer takes over while the gate waits: moved under its
     // epoch.
     let taking = {
-        let url = url.clone();
+        // Its text: a thread a failed test leaves running never holds the
+        // Scratch past the test (review c5p L2).
+        let url = url.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let one = PostgresStore::connect(&url, 2)
@@ -5590,7 +5592,9 @@ async fn a_book_partition_move_aborts_for_lag_timeout_and_digest_and_the_source_
     std::fs::remove_file(&lag_file).unwrap();
     // Timeout: the source's batch in flight holds the lock past the bound.
     let in_flight = std::thread::spawn({
-        let url = url.clone();
+        // Its text: a thread a failed test leaves running never holds the
+        // Scratch past the test (review c5p L2).
+        let url = url.to_string();
         move || {
             let mut batch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
             let key = meridian_bor::postgres::partition_lock_key("P4");
