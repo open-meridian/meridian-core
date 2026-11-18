@@ -1116,9 +1116,10 @@ async fn renew_while_writing<L, D>(
                 )
             }
             // A write came between this renewal's read, which named this
-            // writer, and its own: its last renewal, cut at its bound and
-            // landing late, or a standby's take. Unrenewed, and read again
-            // at the next renewal, which says which.
+            // writer, and its own, and the lease read again within the
+            // renewal named this writer or nobody, or was not answered
+            // (review-c5i L4): its last renewal, cut at its bound and landing
+            // late. Unrenewed, and read again at the next renewal.
             Ok(Standing::HeldBy(_)) => {
                 if unrenewed_since.is_none() {
                     tracing::warn!(
