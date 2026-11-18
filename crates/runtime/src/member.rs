@@ -1586,6 +1586,9 @@ async fn follow(
     // primary the first time it does, and again after each time it did not.
     let mut answered = false;
     let mut ask = tokio::time::interval(ASK_EVERY);
+    // A tick held past the next by a read waits a second after it, never a
+    // burst of the ticks missed meanwhile (review-c5i M2).
+    ask.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             heard = tail.recv() => {
@@ -1619,10 +1622,14 @@ async fn follow(
                     unchecked.insert(partition.clone());
                 }
                 if unchecked.contains(&partition) {
+                    let since = behind_since(&gaps, &at, [unanswered_since, unchecked_since, Some(Instant::now())]);
                     let check = Lineage { bus: &bus, domain, following: following.as_ref() };
-                    check
-                        .read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps)
-                        .await;
+                    minding(
+                        since,
+                        bound,
+                        check.read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps),
+                    )
+                    .await;
                     if unchecked.is_empty() {
                         unchecked_since = None;
                     }
@@ -1669,21 +1676,26 @@ async fn follow(
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
                         Gap::found(&mut gaps, &partition, Some(held), page.head);
-                        read_gap(
-                            &bus,
-                            domain,
-                            following.as_ref(),
-                            &partition,
-                            held,
-                            page.head,
-                            &mut Behind {
-                                at: &mut at,
-                                applied: &mut applied,
-                                chains: &mut chains,
-                                gaps: &mut gaps,
-                                unchecked: &mut unchecked,
-                                unchecked_since: &mut unchecked_since,
-                            },
+                        let since = behind_since(&gaps, &at, [unanswered_since, unchecked_since]);
+                        minding(
+                            since,
+                            bound,
+                            read_gap(
+                                &bus,
+                                domain,
+                                following.as_ref(),
+                                &partition,
+                                held,
+                                page.head,
+                                &mut Behind {
+                                    at: &mut at,
+                                    applied: &mut applied,
+                                    chains: &mut chains,
+                                    gaps: &mut gaps,
+                                    unchecked: &mut unchecked,
+                                    unchecked_since: &mut unchecked_since,
+                                },
+                            ),
                         )
                         .await;
                     }
@@ -1712,15 +1724,20 @@ async fn follow(
                         let read_back = !unchecked.is_empty();
                         if read_back {
                             unchecked_since.get_or_insert_with(Instant::now);
+                            let since = behind_since(&gaps, &at, [unanswered_since, unchecked_since]);
                             let check = Lineage { bus: &bus, domain, following: following.as_ref() };
-                            check
-                                .read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps)
-                                .await;
+                            minding(
+                                since,
+                                bound,
+                                check.read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps),
+                            )
+                            .await;
                         }
                         if unchecked.is_empty() {
                             unchecked_since = None;
                         }
-                        let again = unanswered_since.take().is_some() || !answered;
+                        let unanswered = unanswered_since.take();
+                        let again = unanswered.is_some() || !answered;
                         answered = true;
                         if let Some(following) = &following {
                             // Held behind on purpose (TEST ONLY): what it
@@ -1728,18 +1745,23 @@ async fn follow(
                             let held = held_on_purpose();
                             let left_behind = !held && bus.reads_after().left_behind(domain);
                             if again || (!held && read_back) || left_behind {
-                                reconcile(
-                                    &bus,
-                                    domain,
-                                    following,
-                                    &mut Behind {
-                                        at: &mut at,
-                                        applied: &mut applied,
-                                        chains: &mut chains,
-                                        gaps: &mut gaps,
-                                        unchecked: &mut unchecked,
-                                        unchecked_since: &mut unchecked_since,
-                                    },
+                                let since = behind_since(&gaps, &at, [unanswered, unchecked_since]);
+                                minding(
+                                    since,
+                                    bound,
+                                    reconcile(
+                                        &bus,
+                                        domain,
+                                        following,
+                                        &mut Behind {
+                                            at: &mut at,
+                                            applied: &mut applied,
+                                            chains: &mut chains,
+                                            gaps: &mut gaps,
+                                            unchecked: &mut unchecked,
+                                            unchecked_since: &mut unchecked_since,
+                                        },
+                                    ),
                                 )
                                 .await;
                             }
@@ -1749,34 +1771,52 @@ async fn follow(
                         // read timed out under load -- is otherwise read
                         // again only by its partition's next page, which a
                         // partition seldom written may not send for hours
-                        // (review-c5c-ci1 M2).
+                        // (review-c5c-ci1 M2). The gap read least recently
+                        // goes first, and none is begun a second into the
+                        // pass: a read that times out holds the loop 5 s,
+                        // and reading every gap held it 5 s a gap, the tail
+                        // undrained (review-c5i M2).
                         if !(following.is_some() && held_on_purpose()) {
-                            let open: Vec<(String, u64, u64)> = gaps
+                            let mut open: Vec<(Option<Instant>, String, u64, u64)> = gaps
                                 .iter()
                                 .filter(|(partition, _)| !unchecked.contains(*partition))
                                 .filter_map(|(partition, gap)| {
                                     let held = at.get(partition).copied()?;
-                                    gap.open(Some(held)).then(|| (partition.clone(), held, gap.to))
+                                    gap.open(Some(held))
+                                        .then(|| (gap.tried, partition.clone(), held, gap.to))
                                 })
                                 .collect();
-                            for (partition, held, to) in open {
-                                read_gap(
-                                    &bus,
-                                    domain,
-                                    following.as_ref(),
-                                    &partition,
-                                    held,
-                                    to,
-                                    &mut Behind {
-                                        at: &mut at,
-                                        applied: &mut applied,
-                                        chains: &mut chains,
-                                        gaps: &mut gaps,
-                                        unchecked: &mut unchecked,
-                                        unchecked_since: &mut unchecked_since,
-                                    },
+                            open.sort();
+                            let pass = Instant::now();
+                            for (_, partition, held, to) in open {
+                                if pass.elapsed() >= ASK_EVERY {
+                                    break;
+                                }
+                                let since = behind_since(&gaps, &at, [unchecked_since]);
+                                minding(
+                                    since,
+                                    bound,
+                                    read_gap(
+                                        &bus,
+                                        domain,
+                                        following.as_ref(),
+                                        &partition,
+                                        held,
+                                        to,
+                                        &mut Behind {
+                                            at: &mut at,
+                                            applied: &mut applied,
+                                            chains: &mut chains,
+                                            gaps: &mut gaps,
+                                            unchecked: &mut unchecked,
+                                            unchecked_since: &mut unchecked_since,
+                                        },
+                                    ),
                                 )
                                 .await;
+                                if let Some(gap) = gaps.get_mut(&partition) {
+                                    gap.tried = Some(Instant::now());
+                                }
                             }
                             said().set_partitions(at.keys().cloned().collect());
                         }
@@ -1789,13 +1829,8 @@ async fn follow(
                     }
                 }
                 gaps.retain(|partition, gap| gap.open(at.get(partition).copied()));
-                let gap_since = gaps.values().map(|gap| gap.since).min();
-                let lag = [gap_since, unanswered_since, unchecked_since]
-                    .into_iter()
-                    .flatten()
-                    .map(|since| since.elapsed().as_millis() as u64)
-                    .max()
-                    .unwrap_or(0);
+                let lag = behind_since(&gaps, &at, [unanswered_since, unchecked_since])
+                    .map_or(0, |since| since.elapsed().as_millis() as u64);
                 said().set_lag_ms(lag);
                 crate::mark_ready(Duration::from_millis(lag) < bound);
             }
@@ -1809,6 +1844,8 @@ async fn follow(
 struct Gap {
     since: Instant,
     to: u64,
+    /// When it was last read again, as the writer answered.
+    tried: Option<Instant>,
 }
 
 impl Gap {
@@ -1826,6 +1863,7 @@ impl Gap {
                     Gap {
                         since: Instant::now(),
                         to,
+                        tried: None,
                     },
                 );
             }
@@ -1848,6 +1886,47 @@ impl Gap {
     /// tick, the member ready with the page refused).
     fn open(&self, held: Option<u64>) -> bool {
         held.is_none_or(|held| held < self.to)
+    }
+}
+
+/// Since when a follower has been behind, the longest it has been: its
+/// oldest gap still open, or since each of `also` -- its writer unanswered, a
+/// partition left to read back. Its lag is the time since.
+fn behind_since(
+    gaps: &HashMap<String, Gap>,
+    at: &HashMap<String, u64>,
+    also: impl IntoIterator<Item = Option<Instant>>,
+) -> Option<Instant> {
+    gaps.iter()
+        .filter(|(partition, gap)| gap.open(at.get(*partition).copied()))
+        .map(|(_, gap)| gap.since)
+        .chain(also.into_iter().flatten())
+        .min()
+}
+
+/// A read awaited within the follow loop, the member's readiness kept to its
+/// lag meanwhile: behind since `since`, it says it is unready once that
+/// passes its `bound`, and its lag each second after, not once the read ends
+/// -- a read timing out held the loop, and the member said it was ready, as
+/// the last tick left it, for seconds past its bound (review-c5i M2).
+async fn minding<T>(
+    since: Option<Instant>,
+    bound: Duration,
+    read: impl std::future::Future<Output = T>,
+) -> T {
+    let Some(since) = since else {
+        return read.await;
+    };
+    tokio::pin!(read);
+    let mut every = tokio::time::interval_at((since + bound).into(), ASK_EVERY);
+    loop {
+        tokio::select! {
+            done = &mut read => return done,
+            _ = every.tick() => {
+                said().set_lag_ms(since.elapsed().as_millis() as u64);
+                crate::mark_ready(false);
+            }
+        }
     }
 }
 

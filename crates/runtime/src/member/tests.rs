@@ -441,6 +441,11 @@ struct Shape {
     script: std::collections::VecDeque<bool>,
     /// The partitions whose catch-ups are refused.
     refusing: std::collections::HashSet<String>,
+    /// The partitions whose catch-ups are answered too late, past the
+    /// follower's wait, as a writer's reads are under load.
+    hang: std::collections::HashSet<String>,
+    /// The partitions a catch-up of was refused.
+    refused: std::collections::HashSet<String>,
     /// Nothing answered, `control` included: the database failing over.
     down: bool,
 }
@@ -541,12 +546,18 @@ impl ChangeLog for Record {
                 });
             }
             let catching_up = most == meridian_changes::PAGE_MOST;
+            if catching_up && shape.hang.contains(partition) {
+                drop(shape);
+                std::thread::sleep(Duration::from_secs(6));
+                return Err(ReadError::Unavailable("the read timed out".into()));
+            }
             if catching_up {
                 let answered = match shape.script.pop_front() {
                     Some(answered) => answered,
                     None => !shape.refusing.contains(partition),
                 };
                 if !answered {
+                    shape.refused.insert(partition.to_string());
                     return Err(ReadError::Unavailable("the read timed out".into()));
                 }
             }
@@ -859,6 +870,87 @@ async fn a_readers_lag_is_its_oldest_gap_still_open() {
     meridian_changes::publish(&bus, "book", 5, &[record.change("P1", 6)]);
     until("P1 read", || followed.heads().get("P1") == Some(&6)).await;
     until("ready once both are read", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+}
+
+/// A reader whose gaps are read again while each read times out -- the
+/// writer answers its asks, its catch-ups too late, as under load -- says it
+/// is unready once its oldest gap passes its bound, not once the reads end;
+/// and reading them again holds the follow loop for a second and one read at
+/// the most, so a page of another partition that follows on is applied
+/// meanwhile (review-c5i M2: the retry pass held the loop 5 s a gap, the
+/// member ready as the last tick left it for 26 s, the tail undrained).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_whose_gap_reads_time_out_turns_unready_within_its_bound_and_follows_on() {
+    let quiet: Vec<String> = (0..5).map(|n| format!("P{n}")).collect();
+    let mut start: Vec<(&str, u64)> = quiet.iter().map(|p| (p.as_str(), 2)).collect();
+    start.push(("P9", 2));
+    let record = Record::of(&start);
+    let (bus, followed, _) = reading("member-test-gaps-timing-out", &record, &start).await;
+    until("ready", ready).await;
+    // A page missed of each of five partitions, each catch-up refused at
+    // once: five gaps open. From now each catch-up times out.
+    for partition in &quiet {
+        record.refuse(partition, true);
+        record.head(partition, 4);
+        meridian_changes::publish(&bus, "book", 3, &[record.change(partition, 4)]);
+    }
+    let opened = Instant::now();
+    until("five gaps open", || {
+        let shape = record.shape.lock().unwrap();
+        quiet
+            .iter()
+            .all(|partition| shape.refused.contains(partition))
+    })
+    .await;
+    record.shape(|shape| shape.hang = quiet.iter().cloned().collect());
+    // Unready within its bound (a second) and a tick, never as the last tick
+    // left it.
+    let bound = Duration::from_secs(1);
+    while ready() {
+        assert!(
+            opened.elapsed() < bound + ASK_EVERY + Duration::from_millis(500),
+            "ready {} ms after five gaps opened, its bound {} ms",
+            opened.elapsed().as_millis(),
+            bound.as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A page of P9 that follows on, heard while the gaps are read again:
+    // applied within a tick and one read timing out.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    record.head("P9", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P9", 3)]);
+    while followed.heads().get("P9") != Some(&3) {
+        assert!(
+            opened.elapsed() < Duration::from_secs(8),
+            "P9's page not applied {} ms after the gaps opened",
+            opened.elapsed().as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!ready(), "ready with five gaps unread");
+    // The writer answers again: every gap read, once the read in flight has
+    // timed out, and ready.
+    record.shape(|shape| {
+        shape.hang.clear();
+        shape.refusing.clear();
+    });
+    let answering = Instant::now();
+    while !quiet
+        .iter()
+        .all(|partition| followed.heads().get(partition) == Some(&4))
+    {
+        assert!(
+            answering.elapsed() < Duration::from_secs(10),
+            "gaps unread: {:?}",
+            followed.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until("ready once caught up", || {
         ready() && said().lag_ms() < 1_000
     })
     .await;
