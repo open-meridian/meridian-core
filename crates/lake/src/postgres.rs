@@ -5186,7 +5186,30 @@ fn raise(
         }
         Some(_) => {}
     }
+    // A dataset a batch of a group past the first began in the meantime,
+    // under its row's old epoch held shared: that batch has committed once
+    // the row is updated above, and a statement now reads it, so it is
+    // raised with the rest, never left under the epoch the takeover fenced
+    // (review-delta B1). Group 0's batch holds the control partition shared
+    // and is serialised before the first statement.
+    let begun: Vec<String> = tx
+        .query(
+            "SELECT dataset, writer_group FROM lake_partition
+              WHERE NOT (dataset = ANY($1)) ORDER BY dataset FOR UPDATE",
+            &[&datasets],
+        )?
+        .iter()
+        .filter(|row| groups.is_none_or(|groups| owned_in_row(groups, row)))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    if !begun.is_empty() {
+        tx.execute(
+            "UPDATE lake_partition SET epoch = $1 WHERE dataset = ANY($2) AND epoch <> $3",
+            &[&epoch, &begun, &meridian_changes::moves::POINTER_EPOCH],
+        )?;
+    }
     let mut partitions = datasets;
+    partitions.extend(begun);
     if holds_control {
         partitions.push(meridian_changes::CONTROL.to_string());
     }

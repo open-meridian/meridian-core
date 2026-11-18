@@ -11883,6 +11883,106 @@ fn a_raise_on_a_new_timeline_is_the_writers_epoch_before_its_commit_can_be_read(
         .unwrap();
 }
 
+/// A dataset a group past the first begins while its group's takeover is
+/// raising (review-delta B1): the raise has read the ranges it raises and
+/// waits before it raises the group's own row, and the old writer, its row
+/// not raised yet, begins a dataset under its old epoch and commits. The
+/// takeover raises that dataset too, so the new writer can write it. The
+/// raise is held before its group's row by a statement trigger waiting on
+/// an advisory lock this test holds.
+#[test]
+fn a_dataset_begun_while_a_takeover_raises_is_raised_with_the_rest() {
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-raise-begun");
+    let store = |group: u32| {
+        Arc::new(
+            PostgresStore::connect(&url, 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap()),
+        )
+    };
+    let (zero, old) = (store(0), store(1));
+    zero.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let was = old.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let begun = (0..)
+        .map(|n| unique(&format!("coinbase-1:begun{n}")))
+        .find(|dataset| owner(dataset, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-BTC");
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hold = 0x6335_7742_i64;
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION held_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               PERFORM pg_advisory_xact_lock({hold});
+               RETURN NULL;
+             END $$;
+             CREATE TRIGGER held_raise BEFORE INSERT OR UPDATE ON lake_writer_group
+               FOR EACH STATEMENT EXECUTE FUNCTION held_raise();"
+        ))
+        .unwrap();
+    admin
+        .execute("SELECT pg_advisory_lock($1)", &[&hold])
+        .unwrap();
+    let new = store(1);
+    let taking = Arc::clone(&new);
+    let takeover = std::thread::spawn(move || taking.take_over(&TookOver::unnamed(LEASE_FREE)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while admin
+        .query_one(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+               AND classid = 0 AND objid = $1::bigint::oid AND objsubid = 1",
+            &[&hold],
+        )
+        .unwrap()
+        .get::<_, i64>(0)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the raise never reached its group's row"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The old writer begins a dataset meanwhile, under its row's epoch,
+    // and commits: nothing the raise holds yet waits it.
+    let beginning = {
+        let (old, begun, subject) = (Arc::clone(&old), begun.clone(), subject.clone());
+        std::thread::spawn(move || {
+            old.record(
+                &begun,
+                vec![close(&begun, "a", &subject, "2026-10-01", 1)],
+                10,
+            )
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !beginning.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let committed_first = beginning.is_finished();
+    admin
+        .execute("SELECT pg_advisory_unlock($1)", &[&hold])
+        .unwrap();
+    assert!(committed_first, "the begin waited on the raise");
+    beginning.join().unwrap().unwrap();
+    let raised = takeover.join().unwrap().unwrap();
+    assert!(raised > was);
+    assert_eq!(
+        new.range_tip(&begun).unwrap().unwrap().epoch,
+        raised,
+        "the dataset begun while the takeover raised is left under the fenced epoch"
+    );
+    new.record(
+        &begun,
+        vec![close(&begun, "b", &subject, "2026-10-02", 2)],
+        20,
+    )
+    .unwrap();
+}
+
 /// A dataset begun while the writer's own raise on a new timeline waits at
 /// its commit, and the raise's commit fails (review c5r3, L2): the dataset
 /// is begun under the epoch the writer kept, never the raise's, so the
