@@ -444,6 +444,8 @@ struct Shape {
     /// The partitions whose catch-ups are answered too late, past the
     /// follower's wait, as a writer's reads are under load.
     hang: std::collections::HashSet<String>,
+    /// When each catch-up answered too late was begun.
+    hung: Vec<Instant>,
     /// The partitions a catch-up of was refused.
     refused: std::collections::HashSet<String>,
     /// Each catch-up asked: its partition, and the sequence it read after.
@@ -591,6 +593,7 @@ impl ChangeLog for Record {
                 )?;
             }
             if catching_up && shape.hang.contains(partition) {
+                shape.hung.push(Instant::now());
                 drop(shape);
                 std::thread::sleep(Duration::from_secs(6));
                 return Err(ReadError::Unavailable("the read timed out".into()));
@@ -1393,6 +1396,49 @@ async fn a_reader_whose_gap_reads_time_out_turns_unready_within_its_bound_and_fo
         ready() && said().lag_ms() < 1_000
     })
     .await;
+}
+
+/// A tick held past the next by a gap's read waits a second after it, never
+/// begins another read at once: the tick missed meanwhile fired as the read
+/// timed out and began the next, and where a page was heard meanwhile, the
+/// loop took it after the second read in about half the runs -- a tick and
+/// two reads, not one (c30d-c5j: "P9's page not applied 8031 ms after the
+/// gaps opened").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_held_past_the_next_by_a_read_waits_a_second_after_it() {
+    let start = [("P0", 2)];
+    let record = Record::of(&start);
+    let (bus, _, _) = reading("member-test-tick-held", &record, &start).await;
+    until("ready", ready).await;
+    // A page of P0 missed, its catch-up refused at once: a gap open. From
+    // now each catch-up times out.
+    record.refuse("P0", true);
+    record.head("P0", 4);
+    meridian_changes::publish(&bus, "book", 3, &[record.change("P0", 4)]);
+    until("the gap open", || {
+        record.shape.lock().unwrap().refused.contains("P0")
+    })
+    .await;
+    record.shape(|shape| {
+        shape.hang.insert("P0".to_string());
+    });
+    let hanging = Instant::now();
+    while record.shape.lock().unwrap().hung.len() < 2 {
+        assert!(
+            hanging.elapsed() < Duration::from_secs(10),
+            "the gap not read twice in {} ms",
+            hanging.elapsed().as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let hung = record.shape.lock().unwrap().hung.clone();
+    // A read waits 5 s; the next tick a second after it.
+    let apart = hung[1] - hung[0];
+    assert!(
+        apart >= Duration::from_secs(5) + ASK_EVERY - Duration::from_millis(300),
+        "the next read begun {} ms after the last, which waited 5000 ms",
+        apart.as_millis()
+    );
 }
 
 #[test]

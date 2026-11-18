@@ -1593,7 +1593,8 @@ async fn follow(
     let mut answered = false;
     let mut ask = tokio::time::interval(ASK_EVERY);
     // A tick held past the next by a read waits a second after it, never a
-    // burst of the ticks missed meanwhile (review-c5i M2).
+    // burst of the ticks missed meanwhile (review-c5i M2): reset as the held
+    // tick ends, below, since Delay still fires the tick missed at once.
     ask.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -1720,6 +1721,7 @@ async fn follow(
                 said().set_partitions(at.keys().cloned().collect());
             }
             _ = ask.tick() => {
+                let ticked = Instant::now();
                 match ask_writer(&bus, domain).await {
                     Ok(epoch) => {
                         // The writer's epoch rose -- a takeover, or a new
@@ -1856,6 +1858,13 @@ async fn follow(
                     .map_or(0, |since| since.elapsed().as_millis() as u64);
                 said().set_lag_ms(lag);
                 crate::mark_ready(Duration::from_millis(lag) < bound);
+                // Held past the next tick by a read: the next a second from
+                // now. Fired at once, it began another read before a page
+                // heard meanwhile was taken from the tail, and held the loop a
+                // tick and two reads (c30d-c5j).
+                if ticked.elapsed() >= ASK_EVERY {
+                    ask.reset();
+                }
             }
         }
     }
