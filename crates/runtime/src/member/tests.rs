@@ -328,6 +328,95 @@ async fn an_instrument_reader_started_before_its_writer_served_catches_up() {
     assert_eq!(*applied.changes.lock().unwrap(), vec![4]);
 }
 
+/// A writer's log of `P0` that, while `down`, answers nobody -- its control
+/// partition included -- as a writer does while its database fails over.
+struct Down {
+    head: AtomicU64,
+    down: AtomicBool,
+}
+
+impl ChangeLog for Down {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(ReadError::Unavailable(
+                "the database is failing over".into(),
+            ));
+        }
+        Log {
+            head: AtomicU64::new(self.head.load(Ordering::SeqCst)),
+        }
+        .read_changes(partition, after, most)
+    }
+}
+
+/// A page missed while the writer could not be read leaves a gap; once the
+/// writer answers again and the reader's reconciling with the primary reads
+/// what it missed, the partition is caught up and follows on, and the gap is
+/// let go -- never left to grow the reader's lag for good (CI 44187810396,
+/// the ha failover run: the lake's reader, a page missed in the db-primary
+/// class unread, then caught up by the reconcile, stayed unready until the
+/// apiserver class waited out every member ready).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_caught_up_by_the_reconcile_leaves_no_lag() {
+    let bus = Arc::new(Bus::single(
+        "member-test-gap-reconciled",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let log = Arc::new(Down {
+        head: AtomicU64::new(2),
+        down: AtomicBool::new(false),
+    });
+    meridian_changes::serve(&bus, "book", log.clone());
+    let applied = Arc::new(Applied::default());
+    let primary = log.clone();
+    let heads = meridian_bus::read_after::AllHeads(move || {
+        Ok(std::collections::BTreeMap::from([(
+            "P0".to_string(),
+            primary.head.load(Ordering::SeqCst),
+        )]))
+    });
+    let member = Member::reader_of("bor", "book", Duration::from_secs(1));
+    let followed = crate::member::Followed::from_heads([("P0".to_string(), 2)]);
+    member
+        .read(&bus, followed.clone(), applied.clone(), Arc::new(heads))
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    log.head.store(3, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 2, &[change(3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+
+    // The writer cannot be read: 4 and 5 missed, 6 heard, its gap unread,
+    // and the writer's asks unanswered.
+    log.down.store(true, Ordering::SeqCst);
+    log.head.store(6, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 5, &[change(6)]);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(followed.heads().get("P0"), Some(&3), "the gap not yet read");
+
+    // It answers again: the reconcile reads 4 to 6, and 7 follows on.
+    log.down.store(false, Ordering::SeqCst);
+    until("6 read by the reconcile", || {
+        followed.heads().get("P0") == Some(&6)
+    })
+    .await;
+    log.head.store(7, Ordering::SeqCst);
+    meridian_changes::publish(&bus, "book", 6, &[change(7)]);
+    until("7 applied", || followed.heads().get("P0") == Some(&7)).await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5, 6, 7]);
+    // Caught up: its lag is gone, and it is ready again.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    until("no lag once caught up", || said().lag_ms() < 1_000).await;
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");

@@ -1474,9 +1474,13 @@ async fn follow(
     let mut unchecked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Behind since a partition was left to read back.
     let mut unchecked_since: Option<Instant> = None;
-    // Behind since a page was missed and not yet read; unanswered since the
-    // writer last failed to answer. The lag is the longer.
-    let mut gap_since: Option<Instant> = None;
+    // Behind since a page was missed and not yet read, each partition's
+    // own gap; unanswered since the writer last failed to answer. The lag
+    // is the longest. A gap is let go once its partition holds the page
+    // that found it, however it came to -- read from the writer here, by
+    // the reconcile, or a read-back's reload -- never left to grow the
+    // member's lag for good (CI 44187810396).
+    let mut gaps: HashMap<String, Gap> = HashMap::new();
     let mut unanswered_since: Option<Instant> = None;
     // Whether the writer has answered yet: a reader reconciles with the
     // primary the first time it does, and again after each time it did not.
@@ -1539,7 +1543,7 @@ async fn follow(
                 if contiguous {
                     if let Err(failed) = verified(domain, &mut chains, &page.changes) {
                         tracing::error!(domain, partition, %failed, "a change did not verify; not followed");
-                        gap_since.get_or_insert_with(Instant::now);
+                        Gap::found(&mut gaps, &partition, at.get(&partition).copied().unwrap_or(0), page.head);
                         continue;
                     }
                 }
@@ -1564,7 +1568,7 @@ async fn follow(
                     }
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
-                        gap_since.get_or_insert_with(Instant::now);
+                        Gap::found(&mut gaps, &partition, held, page.head);
                         let applying = following.as_ref().map(|f| f.apply.as_ref());
                         match catch_up(&bus, domain, &partition, held, &mut chains, applying).await {
                             Ok((head, last)) => {
@@ -1572,7 +1576,7 @@ async fn follow(
                                     applied.insert(partition.clone(), last);
                                 }
                                 at.insert(partition.clone(), head.max(page.head));
-                                gap_since = None;
+                                gaps.remove(&partition);
                             }
                             // The record no longer reaches what this member
                             // applied: read it back (contract v30, stage C).
@@ -1588,7 +1592,7 @@ async fn follow(
                                 tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
                                 unchecked.insert(partition.clone());
                                 unchecked_since.get_or_insert_with(Instant::now);
-                                gap_since = None;
+                                gaps.remove(&partition);
                             }
                             // Behind the writer's retention: a reader holds
                             // the partition again from its head, as a
@@ -1598,7 +1602,7 @@ async fn follow(
                                     following.apply.reset(&partition);
                                 }
                                 at.insert(partition.clone(), page.head);
-                                gap_since = None;
+                                gaps.remove(&partition);
                             }
                             Err(failed) => tracing::warn!(domain, partition, %failed, "a page missed could not be read"),
                         }
@@ -1656,6 +1660,8 @@ async fn follow(
                         unanswered_since.get_or_insert_with(Instant::now);
                     }
                 }
+                gaps.retain(|partition, gap| gap.open(at.get(partition).copied()));
+                let gap_since = gaps.values().map(|gap| gap.since).min();
                 let lag = [gap_since, unanswered_since, unchecked_since]
                     .into_iter()
                     .flatten()
@@ -1666,6 +1672,35 @@ async fn follow(
                 crate::mark_ready(Duration::from_millis(lag) < bound);
             }
         }
+    }
+}
+
+/// A page of a partition missed and not yet read: since when, where the
+/// partition stood when it was found, and the head of the latest page heard
+/// past it.
+struct Gap {
+    since: Instant,
+    from: u64,
+    to: u64,
+}
+
+impl Gap {
+    /// A page heard past where `partition` stands: its gap opened, or the
+    /// one open reaching to this page too.
+    fn found(gaps: &mut HashMap<String, Gap>, partition: &str, from: u64, to: u64) {
+        let gap = gaps.entry(partition.to_string()).or_insert(Gap {
+            since: Instant::now(),
+            from,
+            to,
+        });
+        gap.to = gap.to.max(to);
+    }
+
+    /// Still open where its partition now stands at `held`: not yet at the
+    /// page that found it, and not reloaded below where it stood (a
+    /// read-back's reload at the record's head holds the record's all).
+    fn open(&self, held: Option<u64>) -> bool {
+        held.is_some_and(|held| held >= self.from && held < self.to)
     }
 }
 
