@@ -506,6 +506,9 @@ test: tests-image
 # The store's tests need a database. A build stage has none, and a lightweight
 # in-process substitute is exactly what must not exist: a store that behaves
 # differently in development is a store nobody has tested.
+#
+# A failed run is checked for leftovers too, a failed test's being what PO 65
+# is about (review c5p M2).
 test-store: network tests-image
 	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
@@ -513,19 +516,21 @@ test-store: network tests-image
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers; exit 1; }
 	@# The lake's speed check's figures, on every run, passing or not.
 	@grep -h 'SPEED lake' .test-store.log || echo "test-store: the lake's speed check said nothing"
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: scratch:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers; exit 1; }
 	@$(MAKE) --no-print-directory check-store-leftovers
-	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, the upgrade preflight reads every store as ready and a newer one as blocked, and the tests left no schema or database behind"
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, the upgrade preflight reads every store as ready and a newer one as blocked, a failed test's schemas and databases are dropped as it unwinds, and the tests left no schema or database behind"
 
 # PO 65 (2026-11-17): each schema and database a store test makes beside the
 # test database's own is dropped by the test that made it, a failed test's
