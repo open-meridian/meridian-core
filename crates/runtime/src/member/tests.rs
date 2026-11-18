@@ -1184,6 +1184,26 @@ fn a_gap_read_again_and_again_is_warned_of_once() {
     });
 }
 
+/// A read minded for a gap long open says the lag once a tick, never every
+/// tick missed since the gap passed its bound: a gap open two minutes said
+/// it some 115 times at once, and each of them wrote the member's readiness
+/// file, on every read of the gap (review-c5m2 1).
+#[tokio::test(start_paused = true)]
+async fn a_read_minded_for_a_gap_long_open_says_its_lag_once_a_tick() {
+    let before = MINDED.with(|minded| minded.get());
+    minding(
+        Some(Instant::now() - Duration::from_secs(120)),
+        Duration::from_secs(5),
+        tokio::time::sleep(Duration::from_millis(1_500)),
+    )
+    .await;
+    let said = MINDED.with(|minded| minded.get()) - before;
+    assert!(
+        said <= 3,
+        "said its lag {said} times in a read of 1.5 s, a tick a second"
+    );
+}
+
 /// Each partition's gap is its own, and the lag is the oldest still open:
 /// one partition caught up leaves the lag the other's, and the reader is
 /// ready only once both are read (CI 44187810396; review-c5c-ci1 L2).

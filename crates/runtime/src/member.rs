@@ -1958,15 +1958,27 @@ async fn minding<T>(
     };
     tokio::pin!(read);
     let mut every = tokio::time::interval_at((since + bound).into(), ASK_EVERY);
+    // Once a tick from now, never every tick missed since the bound passed:
+    // a gap open long is read each second, and each tick missed was said at
+    // once, the readiness file written each time (review-c5m2 1).
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             done = &mut read => return done,
             _ = every.tick() => {
+                #[cfg(test)]
+                MINDED.with(|minded| minded.set(minded.get() + 1));
                 said().set_lag_ms(since.elapsed().as_millis() as u64);
                 crate::mark_ready(false);
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`minding`] said its lag, on this thread (tests only).
+    static MINDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// What a follower holds and is behind on, each partition's: where it
