@@ -574,6 +574,28 @@ impl Fence {
         self.epoch.store(epoch, Ordering::SeqCst);
     }
 
+    /// Adopt `epoch`, which this writer raised in the transaction `commit`
+    /// commits, before that commit can be read; where it fails, the epoch
+    /// held before is kept (PR CI 44283011761). A commit of this writer's
+    /// own that waits behind the raise's locks reads the raised head row
+    /// the moment it lands: adopted only after, that commit was refused as
+    /// fenced by a newer writer, and the member stepped down from its own
+    /// raise.
+    pub fn adopt_committing<T, E>(
+        &self,
+        epoch: u64,
+        commit: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let before = self.epoch.swap(epoch, Ordering::SeqCst);
+        let committed = commit();
+        if committed.is_err() {
+            let _ = self
+                .epoch
+                .compare_exchange(epoch, before, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        committed
+    }
+
     /// Adopt `epoch` where nothing was adopted yet, and answer the one held.
     pub fn adopt_once(&self, epoch: u64) -> u64 {
         match self

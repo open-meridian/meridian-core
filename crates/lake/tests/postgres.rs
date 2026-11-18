@@ -11679,3 +11679,149 @@ fn a_lease_made_again_is_taken_past_the_old_lease_s_floor() {
     let late = store.take_shard(took(&instance, 1), &again(1));
     assert!(matches!(late, Err(StoreError::ShardFenced(_))), "{late:?}");
 }
+
+/// PR CI 44283011761 (reconfigure, groups lowered, tolerant): the store's
+/// own raise on a new database timeline is its epoch from the moment the
+/// raise can be read. Its writer's start-up follow raised the epoch while
+/// another of its commits waited behind the raise's locks; that commit read
+/// the raised head before the store had adopted it, was refused as fenced
+/// by a newer writer, and the member stepped down two seconds after it said
+/// it served -- the second group's writer, serving on until it did, had
+/// already stopped, and a price write was told "nothing serves".
+///
+/// Held here at the raise's commit, by a deferred trigger waiting on an
+/// advisory lock this test holds: the writer's epoch is the raised one
+/// before the raise commits; a batch waiting behind it commits under it
+/// once it does; and a raise whose commit fails leaves the epoch the
+/// writer had.
+#[test]
+fn a_raise_on_a_new_timeline_is_the_writers_epoch_before_its_commit_can_be_read() {
+    use meridian_changes::timeline::Timeline;
+    let (url, writer) = isolated("lake-raise-held");
+    let writer = Arc::new(writer);
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "a", &subject, "2026-10-01", 1)],
+            10,
+        )
+        .unwrap();
+    assert_eq!(writer.follow_timeline().unwrap(), Timeline::First);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hold = 0x6335_7232_i64;
+    // A raise's commit waits on `hold`; a commit that changes no epoch does
+    // not. And one marked to fail, fails.
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE raise_fails (fails boolean NOT NULL);
+             INSERT INTO raise_fails VALUES (false);
+             CREATE FUNCTION held_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               PERFORM pg_advisory_xact_lock({hold});
+               IF (SELECT fails FROM raise_fails) THEN
+                 RAISE EXCEPTION 'the raise''s commit fails';
+               END IF;
+               RETURN NULL;
+             END $$;
+             CREATE CONSTRAINT TRIGGER held_raise AFTER UPDATE ON lake_change_head
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+               WHEN (NEW.epoch <> OLD.epoch) EXECUTE FUNCTION held_raise();"
+        ))
+        .unwrap();
+    let moved = |admin: &mut postgres::Client, to: &str| {
+        admin
+            .execute(
+                "UPDATE lake_change_head SET database_identity = $1 WHERE partition = 'control'",
+                &[&to],
+            )
+            .unwrap();
+    };
+    let waiting_on_hold = |admin: &mut postgres::Client| -> i64 {
+        admin
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                   AND classid = 0 AND objid = $1::bigint::oid AND objsubid = 1",
+                &[&hold],
+            )
+            .unwrap()
+            .get(0)
+    };
+    // A failover's new timeline, the raise held at its commit.
+    moved(&mut admin, "another/00000002");
+    admin
+        .execute("SELECT pg_advisory_lock($1)", &[&hold])
+        .unwrap();
+    let following = Arc::clone(&writer);
+    let raise = std::thread::spawn(move || following.follow_timeline());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while waiting_on_hold(&mut admin) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the raise never reached its commit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        writer.epoch(),
+        2,
+        "the raise can be read the moment it commits, and the writer's epoch was not yet its own"
+    );
+    // A batch of the writer's waits behind the raise's locks.
+    let recording = Arc::clone(&writer);
+    let (recorded_dataset, recorded_subject) = (dataset.clone(), subject.clone());
+    let batch = std::thread::spawn(move || {
+        recording.record(
+            &recorded_dataset,
+            vec![close(
+                &recorded_dataset,
+                "b",
+                &recorded_subject,
+                "2026-10-02",
+                2,
+            )],
+            20,
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    admin
+        .execute("SELECT pg_advisory_unlock($1)", &[&hold])
+        .unwrap();
+    assert_eq!(raise.join().unwrap().unwrap(), Timeline::Moved(2));
+    let committed = batch.join().unwrap();
+    assert!(
+        committed.is_ok(),
+        "a batch behind the writer's own raise was refused: {committed:?}"
+    );
+    let epochs: Vec<u64> = every_change(&writer, &dataset, meridian_changes::PAGE_MOST)
+        .iter()
+        .map(|c| c.epoch)
+        .collect();
+    assert_eq!(epochs, vec![1, 2]);
+    // Another new timeline, its raise's commit failing: the writer keeps
+    // the epoch it had, and its next batch commits under it.
+    admin
+        .execute("UPDATE raise_fails SET fails = true", &[])
+        .unwrap();
+    moved(&mut admin, "yet another/00000003");
+    assert!(
+        writer.follow_timeline().is_err(),
+        "the raise's commit failed"
+    );
+    assert_eq!(writer.epoch(), 2);
+    admin
+        .execute("UPDATE raise_fails SET fails = false", &[])
+        .unwrap();
+    admin
+        .execute("UPDATE lake_change_head SET database_identity = 'another/00000002' WHERE partition = 'control'", &[])
+        .unwrap();
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "c", &subject, "2026-10-03", 3)],
+            30,
+        )
+        .unwrap();
+}

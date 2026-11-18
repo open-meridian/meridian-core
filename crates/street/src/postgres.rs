@@ -152,10 +152,9 @@ impl PostgresStore {
             return Ok(Timeline::Same);
         }
         let (found, identity) = CHANGES
-            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .follow_timeline(&mut **conn, &self.fence, meridian_changes::member())
             .map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
-            self.fence.adopt(epoch);
             tracing::warn!(
                 epoch,
                 identity,

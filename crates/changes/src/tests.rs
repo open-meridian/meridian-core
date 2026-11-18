@@ -129,6 +129,26 @@ fn a_fence_admits_its_own_epoch_alone() {
     assert!(fence.admits(4).is_ok());
 }
 
+/// PR CI 44283011761: a writer's own raise is its epoch while the raise
+/// commits; a commit that fails leaves the epoch it had, and never undoes
+/// an epoch adopted since.
+#[test]
+fn a_fence_holds_its_own_raise_while_it_commits_and_keeps_its_epoch_where_it_fails() {
+    let fence = Fence::new();
+    fence.adopt(3);
+    let held = fence.adopt_committing(4, || Ok::<u64, ()>(fence.epoch()));
+    assert_eq!(held, Ok(4), "the raise is the epoch while it commits");
+    assert_eq!(fence.epoch(), 4);
+    assert!(fence.admits(4).is_ok());
+    assert_eq!(fence.adopt_committing(5, || Err::<(), ()>(())), Err(()));
+    assert_eq!(fence.epoch(), 4, "a raise not committed is not the epoch");
+    let _ = fence.adopt_committing(6, || {
+        fence.adopt(7);
+        Err::<(), ()>(())
+    });
+    assert_eq!(fence.epoch(), 7, "an epoch adopted since is kept");
+}
+
 #[test]
 fn topics_are_the_component_topics_approved() {
     assert_eq!(

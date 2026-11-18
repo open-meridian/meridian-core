@@ -431,9 +431,13 @@ impl PostgresStore {
             |tx| raise(tx, &by, groups),
         )
         .map_err(unavailable)?;
-        tx.commit().map_err(unavailable)?;
+        // Its own raise is its epoch before the raise can be read.
+        match &found {
+            Timeline::Moved(epoch) => self.fence.adopt_committing(*epoch, || tx.commit()),
+            _ => tx.commit(),
+        }
+        .map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
-            self.fence.adopt(epoch);
             tracing::warn!(
                 epoch,
                 identity,
