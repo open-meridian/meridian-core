@@ -2708,9 +2708,9 @@ fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence
 
 #[test]
 fn an_administrative_acts_record_is_kept_as_written() {
-    // Audit logging (ruling 1084; step 3b part 4): every change table, and
-    // the moves, refuses a change or a removal of a row, whoever asks; the
-    // store only ever adds to them.
+    // Audit logging (ruling 1084; step 3b part 4): every change table, the
+    // moves, and the storage copies (item 30, migration 33) refuse a change
+    // or a removal of a row, whoever asks; the store only ever adds to them.
     let (_store, url) = store_at("append_only");
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
     let guarded: i64 = client
@@ -2725,7 +2725,8 @@ fn an_administrative_acts_record_is_kept_as_written() {
     let tables: i64 = client
         .query_one(
             "SELECT count(*) FROM pg_tables WHERE schemaname = current_schema()
-                AND (tablename LIKE 'config\\_%\\_change' OR tablename = 'config_record_move')",
+                AND (tablename LIKE 'config\\_%\\_change'
+                     OR tablename IN ('config_record_move', 'config_plugin_storage_copied'))",
             &[],
         )
         .unwrap()
@@ -2733,7 +2734,7 @@ fn an_administrative_acts_record_is_kept_as_written() {
     assert!(tables >= 15, "the change tables are there: {tables}");
     assert_eq!(
         guarded, tables,
-        "every change table and the moves are append-only"
+        "every change table, the moves and the storage copies are append-only"
     );
 
     client
@@ -3083,14 +3084,26 @@ fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(store: &dyn Stor
     assert_eq!(copied_by("feed-6", &|_| {}), None, "on its own claim");
 }
 
+/// A store whose launches' version is there: Postgres holds every launch to
+/// a version recorded first.
+fn store_with_version(tag: &str) -> PostgresStore {
+    let store = store(tag);
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    store
+}
+
 #[test]
 fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
-    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store("storage-copied-91"));
+    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store_with_version(
+        "storage_copied_91",
+    ));
 }
 
 #[test]
 fn the_storage_copy_is_recorded_once_in_postgres() {
-    a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store(
-        "storage-copied",
-    ));
+    a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+        &store_with_version("storage_copied"),
+    );
 }
