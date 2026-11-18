@@ -1995,7 +1995,17 @@ async fn read_gap(
     behind: &mut Behind<'_>,
 ) {
     let applying = following.map(|f| f.apply.as_ref());
-    let (reached, read) = catch_up(bus, domain, partition, held, behind.chains, applying).await;
+    let last = behind.applied.get(partition).cloned();
+    let (reached, read) = catch_up(
+        bus,
+        domain,
+        partition,
+        held,
+        last.as_ref(),
+        behind.chains,
+        applying,
+    )
+    .await;
     // What it applied before any failure is held: the partition stands there.
     if let Some(last) = reached.last {
         behind.applied.insert(partition.to_string(), last);
@@ -2008,14 +2018,15 @@ async fn read_gap(
                 .insert(partition.to_string(), reached.head.max(heard));
             behind.gaps.remove(partition);
         }
-        // The record no longer reaches what this member applied: read it
-        // back (contract v30, stage C). The gap is then the read-back's: its
+        // The record no longer reaches what this member applied, or no
+        // longer holds the change it last applied: read it back (contract
+        // v30, stage C; review-c5i M1). The gap is then the read-back's: its
         // own since measures the wait, and the gap's is let go -- left set,
         // it outlived a read-back that found the record holding all this
         // member applied, and the member's lag grew from it for good,
         // silently (failover-repeat 43146764089, ha run 1: the lake's reader
         // unready after the apiserver class, no warning said).
-        Err(failed) if failed.starts_with(DIVERGED) => {
+        Err(failed) if failed.starts_with(DIVERGED) || failed.starts_with(LINEAGE) => {
             tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
             behind.unchecked.insert(partition.to_string());
             behind.unchecked_since.get_or_insert_with(Instant::now);
@@ -2084,7 +2095,7 @@ async fn reconcile(
         chains,
         gaps,
         unchecked,
-        ..
+        unchecked_since,
     } = behind;
     // Read off the runtime's own threads: a store's record is read blocking
     // (the book's and the lake's Postgres clients refuse to be driven from
@@ -2115,11 +2126,13 @@ async fn reconcile(
         let reached = match at.get(&partition).copied() {
             Some(held) if held >= head => continue,
             Some(held) => {
+                let last = applied.get(&partition).cloned();
                 let (reached, read) = catch_up(
                     bus,
                     domain,
                     &partition,
                     held,
+                    last.as_ref(),
                     chains,
                     Some(following.apply.as_ref()),
                 )
@@ -2135,6 +2148,18 @@ async fn reconcile(
                         chains.remove(&partition);
                         applied.remove(&partition);
                         head
+                    }
+                    // The record no longer holds what it applied: the
+                    // read-back decides first, held as far as it was read
+                    // and applied meanwhile (review-c5i M1).
+                    Err(failed) if failed.starts_with(DIVERGED) || failed.starts_with(LINEAGE) => {
+                        tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be caught up: what this member applied is read back from the record");
+                        unchecked.insert(partition.clone());
+                        unchecked_since.get_or_insert_with(Instant::now);
+                        if !progressed {
+                            continue;
+                        }
+                        reached.head
                     }
                     Err(failed) => {
                         tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be read");
@@ -2203,6 +2228,12 @@ fn applied_of(change: &meridian_changes::Change) -> Applied {
 /// The words a catch-up refuses with where the record's head is below what
 /// the follower holds: the record lost what it applied.
 const DIVERGED: &str = "the record's head is below what this member applied";
+
+/// The words a catch-up refuses with where the record no longer holds the
+/// change the follower last applied, as a change of a higher epoch than it
+/// showed: a database failover lost a tail it applied, and the writer took
+/// those sequences again.
+const LINEAGE: &str = "the record no longer holds the change this member last applied";
 
 /// Changes followers of this process dropped, held past what the record
 /// holds after a database failover or restore lost them (contract v30,
@@ -2385,11 +2416,24 @@ struct Reached {
 /// and the book's chain at that page, never the chain ahead of where it
 /// stands (review-c5c-ci1 M4: the next catch-up, from where it stood,
 /// refused for good as not following).
+///
+/// A page of a higher epoch than the record is known to hold what this
+/// member applied through -- `applied`, the change it last applied, or one
+/// this catch-up applied -- is applied only once the record is read back to
+/// hold that change still, as Kafka's follower asks its leader where its
+/// last epoch ends before it fetches on (KIP-101, KIP-279), and the page is
+/// read again from there. Where the record does not hold it, the catch-up
+/// stops before the page, refused with [`LINEAGE`]: a database failover lost
+/// a tail it applied, and the read-back drops it. Applied across, it kept
+/// a change the record lost, the read-back after found the record holding
+/// what it applied last and kept it all, and the lake's reader, checked by
+/// digests alone, held it for good (review-c5i M1).
 async fn catch_up(
     bus: &Bus,
     domain: &str,
     partition: &str,
     from: u64,
+    applied: Option<&Applied>,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
     apply: Option<&dyn Apply>,
 ) -> (Reached, Result<(), String>) {
@@ -2397,20 +2441,35 @@ async fn catch_up(
         head: from,
         last: None,
     };
-    let read = read_to_head(bus, domain, partition, from, chains, apply, &mut reached).await;
+    let read = read_to_head(
+        bus,
+        domain,
+        partition,
+        from,
+        applied,
+        chains,
+        apply,
+        &mut reached,
+    )
+    .await;
     (reached, read)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_to_head(
     bus: &Bus,
     domain: &str,
     partition: &str,
     from: u64,
+    applied: Option<&Applied>,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
     apply: Option<&dyn Apply>,
     reached: &mut Reached,
 ) -> Result<(), String> {
     let mut after = from;
+    // The epoch through which the record is known to hold what this member
+    // applied: the change it last applied's, at first.
+    let mut known = applied.map(|(_, epoch, _)| *epoch);
     loop {
         let asked = meridian_changes::ReadChangesRequest {
             partition: partition.to_string(),
@@ -2444,11 +2503,26 @@ async fn read_to_head(
             }
             next = change.sequence;
         }
+        let rising = page.changes.iter().map(|change| change.epoch).max();
+        if let (Some(through), Some(rising)) = (known, rising) {
+            if rising > through {
+                let last = reached.last.as_ref().or(applied);
+                let (kept, head) = holds(bus, domain, partition, after, last).await?;
+                if !kept {
+                    return Err(format!(
+                        "{LINEAGE}: {after} at epoch {through}, the record's head {head} at epoch {rising}"
+                    ));
+                }
+                known = Some(rising);
+                continue;
+            }
+        }
         verified(domain, chains, &page.changes)?;
         if let Some(apply) = apply {
             apply.apply(partition, &page.changes);
         }
         after = next;
+        known = known.max(rising);
         if let Some(change) = page.changes.last() {
             reached.head = after;
             reached.last = Some(applied_of(change));

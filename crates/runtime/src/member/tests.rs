@@ -424,8 +424,8 @@ async fn a_gap_caught_up_by_the_reconcile_leaves_no_lag() {
 /// answers with; and the catch-ups it refuses -- the reads of a whole page
 /// (`page_size` 0, which a read-back's and an ask's never are), as a
 /// writer's read times out under load -- while it answers everything else.
-/// Its changes are chained, as the book's journal is, and a catch-up reads
-/// one to a page.
+/// Its changes are chained, as the book's journal is, or each digested alone,
+/// as the lake's rows are; and a catch-up reads one to a page.
 struct Record {
     shape: Mutex<Shape>,
 }
@@ -448,6 +448,8 @@ struct Shape {
     refused: std::collections::HashSet<String>,
     /// Nothing answered, `control` included: the database failing over.
     down: bool,
+    /// The lake's record: each change's digest its body's alone.
+    lake: bool,
 }
 
 impl Record {
@@ -461,6 +463,21 @@ impl Record {
                 ..Shape::default()
             }),
         })
+    }
+
+    /// The lake's record, each change's digest its body's alone.
+    fn lake_of(heads: &[(&str, u64)]) -> Arc<Self> {
+        let record = Self::of(heads);
+        record.shape(|shape| shape.lake = true);
+        record
+    }
+
+    fn domain(&self) -> &'static str {
+        if self.shape.lock().unwrap().lake {
+            "lake"
+        } else {
+            "book"
+        }
     }
 
     fn shape(&self, change: impl FnOnce(&mut Shape)) {
@@ -494,14 +511,18 @@ impl Record {
     }
 
     fn change(&self, partition: &str, sequence: u64) -> Change {
-        let (lost_from, epoch) = {
+        let (lost_from, epoch, lake) = {
             let shape = self.shape.lock().unwrap();
-            (shape.lost_from, shape.epoch)
+            (shape.lost_from, shape.epoch, shape.lake)
         };
         let body = |sequence: u64| vec![if sequence >= lost_from { 2 } else { 1 }; 16];
         let mut digest = Vec::new();
-        for at in 1..=sequence {
-            digest = meridian_changes::integrity::chained(&digest, &body(at));
+        if lake {
+            digest = meridian_changes::integrity::digest(&body(sequence));
+        } else {
+            for at in 1..=sequence {
+                digest = meridian_changes::integrity::chained(&digest, &body(at));
+            }
         }
         Change {
             partition: partition.into(),
@@ -584,8 +605,9 @@ impl ChangeLog for Record {
     }
 }
 
-/// A book reader of `record`, started at `start`, ready while its lag is
-/// under a second, once the writer has its interest and has been asked.
+/// A reader of `record` -- the book's, or the lake's -- started at `start`,
+/// ready while its lag is under a second, once the writer has its interest
+/// and has been asked.
 async fn reading(
     name: &str,
     record: &Arc<Record>,
@@ -596,16 +618,18 @@ async fn reading(
         Arc::new(meridian_bus::MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    meridian_changes::serve(&bus, "book", record.clone());
+    let domain = record.domain();
+    meridian_changes::serve(&bus, domain, record.clone());
     let applied = Arc::new(Applied::default());
-    let member = Member::reader_of("bor", "book", Duration::from_secs(1));
+    let component = if domain == "lake" { "lake" } else { "bor" };
+    let member = Member::reader_of(component, domain, Duration::from_secs(1));
     let followed =
         crate::member::Followed::from_heads(start.iter().map(|(p, h)| (p.to_string(), *h)));
     member
         .read(&bus, followed.clone(), applied.clone(), record.primary())
         .unwrap();
     until("the reader's interest", || {
-        meridian_changes::followed(&bus, "book")
+        meridian_changes::followed(&bus, domain)
     })
     .await;
     // Reconciled with its primary as its writer first answered.
@@ -873,6 +897,42 @@ async fn a_standby_whose_first_page_heard_does_not_verify_is_ready_once_it_holds
     })
     .await;
     following.abort();
+}
+
+/// A lake reader whose catch-up crosses into the epoch of a writer that took
+/// over after a database failover lost a tail the reader applied drops what
+/// it applied of the lost tail: the catch-up stops at the higher epoch and
+/// the record is read back first, never applying the new writer's changes
+/// over the lost one, which a later read-back would find kept -- the lake's
+/// changes checked by their digests alone, no chain to refuse them (review-c5i
+/// M1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lake_readers_catch_up_across_a_lost_tail_drops_what_the_record_lost() {
+    let record = Record::lake_of(&[("P0", 5)]);
+    let (bus, followed, applied) = reading("member-test-lake-lineage", &record, &[("P0", 5)]).await;
+    record.head("P0", 6);
+    meridian_changes::publish(&bus, "lake", 5, &[record.change("P0", 6)]);
+    until("6 applied", || followed.heads().get("P0") == Some(&6)).await;
+    // 7 missed; 8's page, of the writer's epoch then, still on its way.
+    let late = record.change("P0", 8);
+    // The lake's database failed over and lost 6 on; the writer took over at
+    // a raised epoch and wrote 6 to 12 again, before the reader asked it.
+    let dropped = DROPPED.load(Ordering::SeqCst);
+    record.lose("P0", 6, 3);
+    record.head("P0", 12);
+    meridian_changes::publish(&bus, "lake", 7, &[late]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    record.shape(|shape| shape.control_epoch = 3);
+    until(
+        "the lost 6 dropped, P0 reloaded at the record's head",
+        || {
+            applied.resets.lock().unwrap().contains(&"P0".to_string())
+                && followed.heads().get("P0") == Some(&12)
+        },
+    )
+    .await;
+    assert!(DROPPED.load(Ordering::SeqCst) > dropped);
+    until("ready once reloaded", || ready() && said().lag_ms() < 1_000).await;
 }
 
 /// Each partition's gap is its own, and the lag is the oldest still open:
