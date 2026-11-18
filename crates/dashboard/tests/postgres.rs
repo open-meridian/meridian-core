@@ -41,7 +41,10 @@ fn scratch(tag: &str) -> Scratch {
     Scratch::schema(&base_url(), &name)
 }
 
-fn migrated(tag: &str) -> (Database, Scratch) {
+/// A schema of this test's own and the dashboard's tables migrated in it:
+/// the schema answered first, so a test's binding drops it after the
+/// database (review c5p L3).
+fn migrated(tag: &str) -> (Scratch, Database) {
     let url = scratch(tag);
     let database = Database::connect(&url, 2).expect("connects");
     assert!(
@@ -55,7 +58,7 @@ fn migrated(tag: &str) -> (Database, Scratch) {
         .migrate(&meridian_clock::SystemClock)
         .expect("migrating twice is a no-op");
     database.verify().expect("recognised after migrating");
-    (database, url)
+    (url, database)
 }
 
 fn count(url: &str, table: &str) -> i64 {
@@ -105,7 +108,7 @@ fn a_database_from_before_the_history_is_brought_up_to_date() {
 
 #[test]
 fn the_local_accounts_are_listed_by_name_with_their_display_names_and_nothing_else() {
-    let (database, _schema) = migrated("people");
+    let (_schema, database) = migrated("people");
     let store = accounts::InPostgres::on(database);
     for (name, display) in [("bob", ""), ("Ada", "Ada Park")] {
         store
@@ -129,7 +132,7 @@ fn the_local_accounts_are_listed_by_name_with_their_display_names_and_nothing_el
 
 #[test]
 fn a_schema_newer_than_this_binary_is_refused_not_waited_for() {
-    let (database, url) = migrated("ahead");
+    let (url, database) = migrated("ahead");
     postgres::Client::connect(&url, postgres::NoTls)
         .unwrap()
         .execute(
@@ -144,7 +147,7 @@ fn a_schema_newer_than_this_binary_is_refused_not_waited_for() {
 #[test]
 fn the_terminal_sessions_from_before_delegations_leave_no_table() {
     // Retired at contract v15: a database migrated before keeps none.
-    let (_, url) = migrated("retired");
+    let (url, _) = migrated("retired");
     for table in [
         "dashboard_terminal_session",
         "dashboard_terminal_session_gone",
@@ -168,7 +171,7 @@ fn the_terminal_sessions_from_before_delegations_leave_no_table() {
 fn a_browser_session_survives_a_restart_and_ends_on_every_replica() {
     use meridian_dashboard::session::{self, Sessions, IDLE_NS, RECHECK_NS};
     use std::sync::Arc;
-    let (database, url) = migrated("browser_sessions");
+    let (url, database) = migrated("browser_sessions");
     let replica = || Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), T0);
     let first = replica();
     let key = first.start("ada", "Ada", vec!["traders".into()], T0);
@@ -212,7 +215,7 @@ fn a_restart_more_than_30_minutes_after_the_last_use_keeps_a_browser_signed_in()
     // Ruling 854: the dashboard's time away is nobody's idleness.
     use meridian_dashboard::session::{self, Sessions, IDLE_NS};
     use std::sync::Arc;
-    let (database, url) = migrated("browser_sessions_away");
+    let (url, database) = migrated("browser_sessions_away");
     let at = |now: i64| Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), now);
     let before = at(T0);
     let key = before.start("ada", "Ada", vec![], T0);
@@ -239,7 +242,7 @@ fn a_plugin_pages_session_is_kept_by_hash_and_ends_with_the_browsers() {
     // browser's row.
     use meridian_dashboard::session::{self, Sessions};
     use std::sync::Arc;
-    let (database, url) = migrated("plugin_sessions");
+    let (url, database) = migrated("plugin_sessions");
     let sessions = Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), T0);
     let key = sessions.start("ada", "Ada", vec![], T0);
     let browser = meridian_dashboard::terminal::hashed(&key);
@@ -331,7 +334,7 @@ fn token(fingerprint: &str, kind: Kind, delegation_id: &str, client_id: &str, un
 
 #[test]
 fn a_delegation_is_made_renewed_in_place_and_narrowed_as_it_was_asked() {
-    let (database, url) = migrated("granted");
+    let (url, database) = migrated("granted");
     let store = delegation::InPostgres::on(database);
     assert!(store.register(&client("mdc_a", T0), 10).unwrap());
     let narrowed = Covers {
@@ -395,7 +398,7 @@ fn a_delegation_is_made_renewed_in_place_and_narrowed_as_it_was_asked() {
 
 #[test]
 fn a_refresh_token_is_spent_once_whichever_replica_asks() {
-    let (database, _schema) = migrated("spent");
+    let (_schema, database) = migrated("spent");
     let one = delegation::InPostgres::on(database.clone());
     let other = delegation::InPostgres::on(database);
     one.register(&client("mdc_a", T0), 10).unwrap();
@@ -429,7 +432,7 @@ fn a_refresh_token_is_spent_once_whichever_replica_asks() {
 
 #[test]
 fn holders_last_use_refusals_groups_and_the_sweep() {
-    let (database, url) = migrated("delegation_sweep");
+    let (url, database) = migrated("delegation_sweep");
     let store = delegation::InPostgres::on(database);
     store.register(&client("mdc_a", T0), 10).unwrap();
     store.register(&client("mdc_b", T0), 10).unwrap();
@@ -508,7 +511,7 @@ fn on_a_runtime<T>(work: impl std::future::Future<Output = T>) -> T {
 
 #[test]
 fn a_delegation_stands_across_a_restart_and_no_token_is_kept() {
-    let (database, url) = migrated("delegation_restart");
+    let (url, database) = migrated("delegation_restart");
     let delegations = Delegations::keeping(std::sync::Arc::new(delegation::InPostgres::on(
         database.clone(),
     )));
@@ -629,7 +632,7 @@ fn notice(id: &str, subject: &str, ticket_id: &str, at: i64) -> tickets::Notice 
 #[test]
 fn tickets_are_kept_folded_by_key_noted_and_changed_as_the_memory_store_does_it() {
     use tickets::TicketStore as _;
-    let (database, url) = migrated("tickets");
+    let (url, database) = migrated("tickets");
     let store = tickets::InPostgres::on(database);
 
     let first = ticket("TKT-01", "break-1", T0);
@@ -741,7 +744,7 @@ fn service_accounts_are_kept_each_change_its_own_record_as_the_memory_store_does
         Change, InPostgres, Notice, RunsAs, ServiceAccount, ServiceAccountStore as _, Setting,
         State,
     };
-    let (database, url) = migrated("service_accounts");
+    let (url, database) = migrated("service_accounts");
     let store = InPostgres::on(database);
     let id = "SA-01JAD000000000000000000001";
     let mut account = ServiceAccount {
@@ -854,7 +857,7 @@ fn service_accounts_are_kept_each_change_its_own_record_as_the_memory_store_does
 fn a_thing_in_flight_put_on_one_copy_is_spent_once_on_another() {
     use meridian_dashboard::in_flight::{kind, InFlightStore, InPostgres, Marked};
     use serde_json::json;
-    let (database, url) = migrated("in_flight");
+    let (url, database) = migrated("in_flight");
     let one = InPostgres::on(database.clone());
     let other = InPostgres::on(database.clone());
     one.put(
