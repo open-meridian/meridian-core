@@ -1569,45 +1569,23 @@ async fn follow(
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
                         Gap::found(&mut gaps, &partition, Some(held), page.head);
-                        let applying = following.as_ref().map(|f| f.apply.as_ref());
-                        match catch_up(&bus, domain, &partition, held, &mut chains, applying).await {
-                            Ok((head, last)) => {
-                                if let Some(last) = last {
-                                    applied.insert(partition.clone(), last);
-                                }
-                                at.insert(partition.clone(), head.max(page.head));
-                                gaps.remove(&partition);
-                            }
-                            // The record no longer reaches what this member
-                            // applied: read it back (contract v30, stage C).
-                            // The gap is then the read-back's: its own
-                            // since measures the wait, and the gap's is let
-                            // go -- left set, it outlived a read-back that
-                            // found the record holding all this member
-                            // applied, and the member's lag grew from it for
-                            // good, silently (failover-repeat 43146764089,
-                            // ha run 1: the lake's reader unready after the
-                            // apiserver class, no warning said).
-                            Err(failed) if failed.starts_with(DIVERGED) => {
-                                tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
-                                unchecked.insert(partition.clone());
-                                unchecked_since.get_or_insert_with(Instant::now);
-                                gaps.remove(&partition);
-                            }
-                            // Behind the writer's retention: a reader holds
-                            // the partition again from its head, as a
-                            // standby's reload does.
-                            Err(failed) if meridian_changes::is_behind(&failed) && following.is_some() => {
-                                if let Some(following) = &following {
-                                    following.apply.reset(&partition);
-                                }
-                                chains.remove(&partition);
-                                applied.remove(&partition);
-                                at.insert(partition.clone(), page.head);
-                                gaps.remove(&partition);
-                            }
-                            Err(failed) => tracing::warn!(domain, partition, %failed, "a page missed could not be read"),
-                        }
+                        read_gap(
+                            &bus,
+                            domain,
+                            following.as_ref(),
+                            &partition,
+                            held,
+                            page.head,
+                            &mut Behind {
+                                at: &mut at,
+                                applied: &mut applied,
+                                chains: &mut chains,
+                                gaps: &mut gaps,
+                                unchecked: &mut unchecked,
+                                unchecked_since: &mut unchecked_since,
+                            },
+                        )
+                        .await;
                     }
                 }
                 if let (Some(following), Some(head)) = (&following, at.get(&partition)) {
@@ -1653,6 +1631,42 @@ async fn follow(
                                 reconcile(&bus, domain, following, &unchecked, &mut at, &mut applied, &mut chains)
                                     .await;
                             }
+                        }
+                        // A gap still open is read again as the writer
+                        // answers: a catch-up that failed while it did -- a
+                        // read timed out under load -- is otherwise read
+                        // again only by its partition's next page, which a
+                        // partition seldom written may not send for hours
+                        // (review-c5c-ci1 M2).
+                        if !(following.is_some() && held_on_purpose()) {
+                            let open: Vec<(String, u64, u64)> = gaps
+                                .iter()
+                                .filter(|(partition, _)| !unchecked.contains(*partition))
+                                .filter_map(|(partition, gap)| {
+                                    let held = at.get(partition).copied()?;
+                                    gap.open(Some(held)).then(|| (partition.clone(), held, gap.to))
+                                })
+                                .collect();
+                            for (partition, held, to) in open {
+                                read_gap(
+                                    &bus,
+                                    domain,
+                                    following.as_ref(),
+                                    &partition,
+                                    held,
+                                    to,
+                                    &mut Behind {
+                                        at: &mut at,
+                                        applied: &mut applied,
+                                        chains: &mut chains,
+                                        gaps: &mut gaps,
+                                        unchecked: &mut unchecked,
+                                        unchecked_since: &mut unchecked_since,
+                                    },
+                                )
+                                .await;
+                            }
+                            said().set_partitions(at.keys().cloned().collect());
                         }
                     }
                     Err(failed) => {
@@ -1719,6 +1733,74 @@ impl Gap {
     /// end.
     fn open(&self, held: Option<u64>) -> bool {
         held.is_some_and(|held| held < self.to)
+    }
+}
+
+/// What a follower holds and is behind on, each partition's: where it
+/// stands, the change it last applied, the book's chain, its gaps, and the
+/// partitions left to read back, since when.
+struct Behind<'a> {
+    at: &'a mut HashMap<String, u64>,
+    applied: &'a mut HashMap<String, Applied>,
+    chains: &'a mut HashMap<String, meridian_changes::integrity::Chain>,
+    gaps: &'a mut HashMap<String, Gap>,
+    unchecked: &'a mut std::collections::BTreeSet<String>,
+    unchecked_since: &'a mut Option<Instant>,
+}
+
+/// A gap of `partition` read from the writer, from `held` where it stands
+/// to its end, `heard` the head of the latest page heard past it: read
+/// and let go; handed to the read-back where the record no longer reaches
+/// what was applied; held again from `heard` past the writer's retention;
+/// or left open, to be read again.
+async fn read_gap(
+    bus: &Bus,
+    domain: &'static str,
+    following: Option<&Following>,
+    partition: &str,
+    held: u64,
+    heard: u64,
+    behind: &mut Behind<'_>,
+) {
+    let applying = following.map(|f| f.apply.as_ref());
+    match catch_up(bus, domain, partition, held, behind.chains, applying).await {
+        Ok((head, last)) => {
+            if let Some(last) = last {
+                behind.applied.insert(partition.to_string(), last);
+            }
+            behind.at.insert(partition.to_string(), head.max(heard));
+            behind.gaps.remove(partition);
+        }
+        // The record no longer reaches what this member applied: read it
+        // back (contract v30, stage C). The gap is then the read-back's: its
+        // own since measures the wait, and the gap's is let go -- left set,
+        // it outlived a read-back that found the record holding all this
+        // member applied, and the member's lag grew from it for good,
+        // silently (failover-repeat 43146764089, ha run 1: the lake's reader
+        // unready after the apiserver class, no warning said).
+        Err(failed) if failed.starts_with(DIVERGED) => {
+            tracing::warn!(domain, partition, %failed, "a page missed could not be caught up: what this member applied is read back from the record");
+            behind.unchecked.insert(partition.to_string());
+            behind.unchecked_since.get_or_insert_with(Instant::now);
+            behind.gaps.remove(partition);
+        }
+        // Behind the writer's retention: a reader holds the partition again
+        // from its head, as a standby's reload does.
+        Err(failed) if meridian_changes::is_behind(&failed) && following.is_some() => {
+            if let Some(following) = following {
+                following.apply.reset(partition);
+            }
+            behind.chains.remove(partition);
+            behind.applied.remove(partition);
+            behind.at.insert(partition.to_string(), heard);
+            behind.gaps.remove(partition);
+        }
+        Err(failed) => {
+            tracing::warn!(domain, partition, %failed, "a page missed could not be read")
+        }
+    }
+    if let (Some(following), Some(head)) = (following, behind.at.get(partition)) {
+        following.followed.set(partition, *head);
     }
 }
 

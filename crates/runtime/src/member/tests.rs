@@ -714,6 +714,34 @@ async fn a_reader_drops_what_the_reconcile_applied_once_the_record_lost_it() {
     assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
 }
 
+/// A gap whose catch-up failed while the writer still answers -- a read
+/// timed out under load -- keeps the reader unready, by the gap alone, and is
+/// read again: never left until its partition's next page, which a quiet
+/// partition may not send for hours (review-c5c-ci1 M2, L2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_whose_catch_up_failed_is_read_again_while_the_writer_answers() {
+    let record = Record::of(&[("P0", 3)]);
+    let (bus, followed, applied) = reading("member-test-gap-again", &record, &[("P0", 3)]).await;
+    record.refuse("P0", true);
+    record.head("P0", 6);
+    meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+    // Every ask answered, nothing else behind: unready by the gap alone.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    held_unready(&followed, "P0", 3, Duration::from_secs(1)).await;
+    assert!(said().lag_ms() >= 1_000);
+    // The writer reads it now; nothing more is written.
+    record.refuse("P0", false);
+    until("4 to 6 read again", || {
+        followed.heads().get("P0") == Some(&6)
+    })
+    .await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![4, 5, 6]);
+    until("ready once caught up", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");
