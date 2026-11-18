@@ -1635,6 +1635,14 @@ async fn follow(
                     }
                     if unchecked.contains(&partition) {
                         unchecked_since.get_or_insert_with(Instant::now);
+                        // Not taken, and a gap: read once the read-back
+                        // finds the record holding what it applied, never
+                        // left unread until the partition's next page, the
+                        // member ready while behind (review-c5i L3).
+                        let held = at.get(&partition).copied();
+                        if held.is_none_or(|held| page.head > held) {
+                            Gap::found(&mut gaps, &partition, held, page.head);
+                        }
                         continue;
                     }
                 }

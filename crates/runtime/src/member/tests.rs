@@ -446,6 +446,8 @@ struct Shape {
     hang: std::collections::HashSet<String>,
     /// The partitions a catch-up of was refused.
     refused: std::collections::HashSet<String>,
+    /// Each catch-up asked: its partition, and the sequence it read after.
+    asked: Vec<(String, u64)>,
     /// Read-backs refused: every read of one change, as a writer's reads
     /// time out under load, while its catch-ups and `control` answer.
     refuse_read_backs: bool,
@@ -570,7 +572,9 @@ impl ChangeLog for Record {
                 });
             }
             let catching_up = most == meridian_changes::PAGE_MOST;
-            if !catching_up && shape.refuse_read_backs {
+            if catching_up {
+                shape.asked.push((partition.to_string(), after));
+            } else if shape.refuse_read_backs {
                 return Err(ReadError::Unavailable("the read timed out".into()));
             }
             if catching_up && shape.hang.contains(partition) {
@@ -1015,6 +1019,66 @@ async fn a_gap_handed_to_the_read_back_keeps_the_reader_unready_while_it_goes_un
     })
     .await;
     until("ready once reloaded", || ready() && said().lag_ms() < 1_000).await;
+}
+
+/// A standby on `record`, ready while its lag is under a second, once the
+/// writer has its interest.
+async fn standing_by_on(
+    name: &str,
+    record: &Arc<Record>,
+) -> (Arc<Bus>, tokio::task::JoinHandle<()>) {
+    let bus = Arc::new(Bus::single(
+        name,
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    meridian_changes::serve(&bus, "book", record.clone());
+    let following = tokio::spawn(follow(
+        Arc::clone(&bus),
+        "book",
+        Duration::from_secs(1),
+        None,
+    ));
+    until("the standby's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    (bus, following)
+}
+
+/// A page heard while its partition is left to read back is not taken, and
+/// is a gap: read once the read-back finds the record holding what the
+/// follower applied, never left unread -- the member ready, lag 0, behind --
+/// until the partition's next page (review-c5i L3; a standby, which never
+/// reconciles).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_heard_while_its_partition_is_read_back_is_read_once_it_is_checked() {
+    let record = Record::of(&[("P0", 2)]);
+    let (bus, following) = standing_by_on("member-test-heard-unchecked", &record).await;
+    record.head("P0", 4);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P0", 3)]);
+    meridian_changes::publish(&bus, "book", 3, &[record.change("P0", 4)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A new writer, at a raised epoch, wrote 5 after 4; read-backs go
+    // unanswered: P0 is left to read back, its page of 5 not taken.
+    record.shape(|shape| shape.refuse_read_backs = true);
+    record.lose("P0", 5, 3);
+    record.head("P0", 5);
+    meridian_changes::publish(&bus, "book", 4, &[record.change("P0", 5)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The read-back answered, the record holding 4: 5 read from the writer.
+    record.shape(|shape| shape.refuse_read_backs = false);
+    until("5 read from the writer", || {
+        record
+            .shape
+            .lock()
+            .unwrap()
+            .asked
+            .contains(&("P0".to_string(), 4))
+    })
+    .await;
+    until("ready once read", || ready() && said().lag_ms() < 1_000).await;
+    following.abort();
 }
 
 /// Each partition's gap is its own, and the lag is the oldest still open:
