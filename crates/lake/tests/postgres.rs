@@ -11008,7 +11008,9 @@ fn an_epoch_an_earlier_range_move_made_with_no_takeover_is_recorded_before_anyth
 /// recorded with why, and started again it adopts that epoch. A store a
 /// tool opens at one group, its epoch adopted at its first batch, takes
 /// nothing over: group 1's writer, still writing, is not fenced by it
-/// (ruled 2026-11-18).
+/// (ruled 2026-11-18). The one writer's takeover is: group 1's writer, not
+/// stopped yet, begins no dataset under its old epoch and sees the takeover
+/// in its own group's row (review c5r3, M1).
 #[test]
 fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
     use meridian_changes::groups::{owner, Groups};
@@ -11047,8 +11049,9 @@ fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
         still.is_ok(),
         "a tool's store fenced group 1's writer: {still:?}"
     );
-    drop((one, zero, mover, tool));
-    // Lowered: the first group's writer alone, started again, no lease.
+    drop((zero, mover, tool));
+    // Lowered: the first group's writer alone, started again, no lease;
+    // group 1's writer not stopped yet.
     let alone = PostgresStore::connect(&url, 2)
         .unwrap()
         .with_groups(Groups::new(0, 1).unwrap());
@@ -11062,6 +11065,31 @@ fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
         recorded.is_ok(),
         "the one writer left was refused what group 1 held: {recorded:?}"
     );
+    // Group 1's writer, still running, is fenced by the takeover in its own
+    // group's row too (review c5r3, M1): it begins no dataset under its old
+    // epoch, its epoch's watch sees the takeover, and the one writer writes
+    // the dataset it would have begun.
+    let begun = (0..)
+        .map(|n| unique(&format!("coinbase-1:lake-lowered-new{n}")))
+        .find(|dataset| owner(dataset, 2) == 1)
+        .unwrap();
+    let stale = one.record(&begun, vec![trade(&begun, "stale", &subject, 31)], 3_100);
+    assert!(
+        matches!(stale, Err(meridian_lake::store::StoreError::Fenced(_))),
+        "group 1's writer began a dataset under the epoch taken over: {stale:?}"
+    );
+    assert!(
+        one.head_epoch().unwrap() > one.epoch(),
+        "group 1's writer does not see the takeover: its row {} and its epoch {}",
+        one.head_epoch().unwrap(),
+        one.epoch()
+    );
+    let taken = alone.record(&begun, vec![trade(&begun, "alone", &subject, 32)], 3_200);
+    assert!(
+        taken.is_ok(),
+        "the one writer was refused a dataset group 1's writer began: {taken:?}"
+    );
+    drop(one);
     assert!(epoch > held, "taken over past group 1's {held}: {epoch}");
     assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
     let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -11906,3 +11934,4 @@ fn a_raise_on_a_new_timeline_is_the_writers_epoch_before_its_commit_can_be_read(
         )
         .unwrap();
 }
+

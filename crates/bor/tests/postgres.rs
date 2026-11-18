@@ -5075,7 +5075,9 @@ async fn a_move_to_a_group_whose_writer_has_not_taken_over_commits_nothing_at_an
 /// groups' adopt does, recorded with why, and started again it adopts that
 /// epoch. A store a tool opens at one group, its epoch adopted at its first
 /// act, takes nothing over: group 1's writer, still writing, is not fenced
-/// by it (ruled 2026-11-18).
+/// by it (ruled 2026-11-18). The one writer's takeover is: group 1's
+/// writer, not stopped yet, sees it in its own group's row (review c5r3,
+/// M1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
     use meridian_bor::partition_moves::rebalance;
@@ -5145,6 +5147,16 @@ async fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline(
         "the one writer left was refused what group 1 held: {recorded:?}"
     );
     blocking(|| {
+        // Group 1's writer, not stopped yet, sees the takeover in its own
+        // group's row (review c5r3, M1): its epoch's watch steps it down.
+        let (row, mine) = (
+            Store::head_epoch(one_store.as_ref()).unwrap(),
+            Store::epoch(one_store.as_ref()),
+        );
+        assert!(
+            row > mine,
+            "group 1's writer does not see the takeover: its row {row} and its epoch {mine}"
+        );
         assert!(epoch > held, "taken over past group 1's {held}: {epoch}");
         assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
         let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();

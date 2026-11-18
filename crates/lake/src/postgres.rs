@@ -5108,7 +5108,8 @@ impl Store for PostgresStore {
 /// Raise the epoch of the `control` partition and of every dataset's head
 /// in `tx` -- with several writer groups (step 3d), of `groups`' group's
 /// datasets and its own epoch alone, past every epoch the lake holds; with
-/// `None`, of every group's, as a new database timeline does -- and record
+/// `None`, or at one writer group, of every group's, as a new database
+/// timeline does -- and record
 /// who raised it and why (step 3b, `WriterTookOver`): answer the epoch. What
 /// a takeover does, and a writer on a new database timeline (contract v30,
 /// stage C).
@@ -5156,8 +5157,15 @@ fn raise(
     )?;
     match groups {
         // Every group's own epoch with the rest: each writer past the first
-        // is fenced, and takes its datasets over again as it starts.
+        // is fenced, and takes its datasets over again as it starts. At one
+        // writer group too (review c5r3, M1): a writer of a group the count
+        // was lowered past, not stopped yet, is fenced by its own group's
+        // row -- it begins no dataset under its old epoch -- and its
+        // epoch's watch sees the takeover.
         None => {
+            tx.execute("UPDATE lake_writer_group SET epoch = $1", &[&epoch])?;
+        }
+        Some(groups) if !groups.several() => {
             tx.execute("UPDATE lake_writer_group SET epoch = $1", &[&epoch])?;
         }
         Some(groups) if !groups.holds_control() => {

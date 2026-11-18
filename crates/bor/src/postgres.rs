@@ -3712,7 +3712,8 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
 }
 
 /// Raise the epoch of every partition `groups`' group owns in `tx` -- every
-/// partition, with one group -- past every epoch the book holds, and record
+/// partition and every group's own row, with one group -- past every epoch
+/// the book holds, and record
 /// who raised it and why (step 3b, `WriterTookOver`): answer the epoch. What
 /// a takeover does, and a writer on a new database timeline (contract v30,
 /// stage C). Another group's partitions keep theirs (step 3d).
@@ -3754,6 +3755,13 @@ fn raise(
              ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
             &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
         )?;
+    }
+    // At one writer group, every group's row with the rest (review c5r3,
+    // M1), as the lake's raise on a new timeline does: a writer of a group
+    // the count was lowered past, not stopped yet, sees the takeover in its
+    // own group's row, and its epoch's watch steps it down.
+    if !groups.several() {
+        tx.execute("UPDATE book_writer_group SET epoch = $1", &[&epoch])?;
     }
     // Who raised it and why, in the same transaction (step 3b).
     tx.execute(
