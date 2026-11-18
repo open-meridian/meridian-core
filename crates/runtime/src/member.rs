@@ -1758,7 +1758,15 @@ async fn follow(
                             let held = held_on_purpose();
                             let left_behind = !held && bus.reads_after().left_behind(domain);
                             if again || (!held && read_back) || left_behind {
-                                let since = behind_since(&gaps, &at, [unanswered, unchecked_since]);
+                                // A read left behind proves the reader behind
+                                // now: minded from then, never held ready while
+                                // the reconcile reads (review-c5m2 2).
+                                let proved = Instant::now();
+                                let since = behind_since(
+                                    &gaps,
+                                    &at,
+                                    [unanswered, unchecked_since, left_behind.then_some(proved)],
+                                );
                                 minding(
                                     since,
                                     bound,
@@ -1766,6 +1774,7 @@ async fn follow(
                                         &bus,
                                         domain,
                                         following,
+                                        since.unwrap_or(proved),
                                         &mut Behind {
                                             at: &mut at,
                                             applied: &mut applied,
@@ -2183,6 +2192,7 @@ async fn reconcile(
     bus: &Bus,
     domain: &'static str,
     following: &Following,
+    behind_from: Instant,
     behind: &mut Behind<'_>,
 ) {
     let Behind {
@@ -2256,9 +2266,19 @@ async fn reconcile(
                         }
                         reached.head
                     }
+                    // Held as far as it was read and applied, and a gap to
+                    // the primary's head, behind since `behind_from`: read
+                    // again as the writer answers, the member unready while
+                    // it is open -- never behind with no gap, its lag 0, ready
+                    // until another read was left behind or the partition's
+                    // next page came (review-c5m2 2).
                     Err(failed) => {
                         tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be read");
-                        // Held as far as it was read and applied.
+                        let stands = if progressed { reached.head } else { held };
+                        Gap::found(gaps, &partition, Some(stands), head);
+                        if let Some(gap) = gaps.get_mut(&partition) {
+                            gap.since = gap.since.min(behind_from);
+                        }
                         if !progressed {
                             continue;
                         }

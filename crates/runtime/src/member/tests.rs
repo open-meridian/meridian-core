@@ -1729,6 +1729,65 @@ impl ChangeLog for Rotten {
     }
 }
 
+/// A reader a read proved behind its primary, whose catch-up of what it
+/// lacks then fails, is unready within its bound and a tick of the proof, and
+/// stays so while the partition is unread; it reads it once the writer answers,
+/// though no later page of it is heard. Without a gap recorded the partition
+/// was behind with none, lag 0, and the reader ready, until another read was
+/// left behind or the partition's next page came (review-c5m2 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_proved_behind_whose_catch_up_fails_is_unready_until_it_reads_what_it_lacks() {
+    let record = Record::of(&[("P0", 3)]);
+    let (bus, followed, _) = reading("member-test-proved-behind", &record, &[("P0", 3)]).await;
+    until("ready", ready).await;
+    // 4 to 6 committed, their pages lost; P0's catch-ups answered too late.
+    record.shape(|shape| {
+        shape.heads.insert("P0".into(), 6);
+        shape.hang.insert("P0".into());
+    });
+    let naming = meridian_pb::v1::Watermark {
+        partitions: vec![meridian_pb::v1::PartitionSequence {
+            partition: "P0".into(),
+            sequence: 6,
+        }],
+    };
+    let reads = bus.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming)
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::FromPrimary));
+    let proved = Instant::now();
+    while ready() {
+        assert!(
+            proved.elapsed() < Duration::from_secs(1) + ASK_EVERY + Duration::from_millis(1_000),
+            "ready {} ms after a read proved it behind, P0 unread",
+            proved.elapsed().as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Past the catch-up's own wait, and its failure: still unready.
+    held_unready(&followed, "P0", 3, Duration::from_secs(6)).await;
+    // The writer answers: P0 read, no page of it published.
+    record.shape(|shape| shape.hang.clear());
+    let answering = Instant::now();
+    while followed.heads().get("P0") != Some(&6) {
+        assert!(
+            answering.elapsed() < Duration::from_secs(12),
+            "P0 never read: {:?}",
+            followed.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until("ready once caught up", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+}
+
 /// A reader whose last applied change the record can no longer read back
 /// (its digest no longer matches) once the epoch rises holds the partition
 /// from the record's head, never asking for ever and staying behind
