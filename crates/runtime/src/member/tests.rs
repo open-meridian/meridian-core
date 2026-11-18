@@ -458,6 +458,9 @@ struct Shape {
     down: bool,
     /// The lake's record: each change's digest its body's alone.
     lake: bool,
+    /// Catch-ups answered with changes whose bodies no longer match their
+    /// digests: bit rot.
+    rotten: bool,
 }
 
 impl Record {
@@ -607,13 +610,20 @@ impl ChangeLog for Record {
                 shape.epoch,
             )
         };
+        let rotten = most == meridian_changes::PAGE_MOST && self.shape.lock().unwrap().rotten;
         let changes = ((after + 1)..=head)
             .take(if most == meridian_changes::PAGE_MOST {
                 1
             } else {
                 most
             })
-            .map(|sequence| self.change(partition, sequence))
+            .map(|sequence| {
+                let mut change = self.change(partition, sequence);
+                if rotten {
+                    change.body[0] ^= 0xff;
+                }
+                change
+            })
             .collect();
         Ok(ReadChangesReply {
             changes,
@@ -1202,6 +1212,60 @@ async fn a_read_minded_for_a_gap_long_open_says_its_lag_once_a_tick() {
         said <= 3,
         "said its lag {said} times in a read of 1.5 s, a tick a second"
     );
+}
+
+/// A gap warned of once for a read that timed out is warned of again when a
+/// later read is refused by a digest -- a change corrupt, which section 9
+/// says, never at debug behind the timeout before it (review-c5m2 5).
+#[test]
+fn a_gap_whose_reads_turn_from_timing_out_to_refused_is_warned_of_again() {
+    let warned = Warned::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let warned = warned.clone();
+                move || warned.clone()
+            })
+            .finish(),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || std::mem::forget(tracing::dispatcher::set_default(&dispatch)))
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let record = Record::lake_of(&[("P0", 3)]);
+        let (bus, followed, _) = reading("member-test-gap-rotten", &record, &[("P0", 3)]).await;
+        record.refuse("P0", true);
+        record.head("P0", 6);
+        meridian_changes::publish(&bus, "lake", 5, &[record.change("P0", 6)]);
+        until("refused", || {
+            record.shape.lock().unwrap().refused.contains("P0")
+        })
+        .await;
+        // From now its reads are answered, each change rotten.
+        record.shape(|shape| {
+            shape.refusing.clear();
+            shape.rotten = true;
+        });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert_eq!(
+            followed.heads().get("P0"),
+            Some(&3),
+            "a rotten change taken"
+        );
+        assert_eq!(warned.count("the read timed out"), 1);
+        assert!(
+            warned.count("does not match its digest") >= 1,
+            "a change refused by its digest never warned of"
+        );
+        assert!(
+            warned.count("does not match its digest") <= 1,
+            "a change refused by its digest warned of at each read"
+        );
+    });
 }
 
 /// Each partition's gap is its own, and the lag is the oldest still open:

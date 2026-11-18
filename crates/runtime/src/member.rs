@@ -1868,16 +1868,21 @@ struct Gap {
     to: u64,
     /// When it was last read again, as the writer answered.
     tried: Option<Instant>,
-    /// Whether a read of it that failed has been warned of: once a gap, as
-    /// an unanswered writer is, not at each read again (review-c5i L6).
-    warned: bool,
+    /// What a read of it that failed was last warned of -- a change refused
+    /// by its digest or chain (true), or a read that failed otherwise: once
+    /// a kind, as an unanswered writer is, not at each read again (review-c5i
+    /// L6), and again when the kind changes (review-c5m2 5).
+    warned: Option<bool>,
 }
 
 impl Gap {
-    /// A read of `partition`'s gap that failed, warned of the first time
-    /// only, and at debug after: a gap that will not close -- a chain or a
-    /// digest refused, a writer that keeps timing out -- is read again each
-    /// second the writer answers.
+    /// A read of `partition`'s gap that failed, said the first time its
+    /// kind is met, and at debug after: a gap that will not close -- a chain
+    /// or a digest refused, a writer that keeps timing out -- is read again
+    /// each second the writer answers. A change refused ([`REFUSED`]) is
+    /// said at error, after a timeout warned of too: a change corrupt is
+    /// found and said (section 9), never at debug behind the failure before
+    /// it (review-c5m2 5).
     fn failed(
         gaps: &mut HashMap<String, Gap>,
         domain: &str,
@@ -1885,11 +1890,14 @@ impl Gap {
         failed: &str,
         what: &str,
     ) {
-        let warned = gaps
+        let refused = failed.starts_with(REFUSED);
+        let said = gaps
             .get_mut(partition)
-            .is_some_and(|gap| std::mem::replace(&mut gap.warned, true));
-        if warned {
+            .and_then(|gap| gap.warned.replace(refused));
+        if said == Some(refused) {
             tracing::debug!(domain, partition, %failed, "{what}");
+        } else if refused {
+            tracing::error!(domain, partition, %failed, "{what}");
         } else {
             tracing::warn!(domain, partition, %failed, "{what}");
         }
@@ -1910,7 +1918,7 @@ impl Gap {
                         since: Instant::now(),
                         to,
                         tried: None,
-                        warned: false,
+                        warned: None,
                     },
                 );
             }
@@ -2350,6 +2358,10 @@ const DIVERGED: &str = "the record's head is below what this member applied";
 /// those sequences again.
 const LINEAGE: &str = "the record no longer holds the change this member last applied";
 
+/// A catch-up's page refused by a change's digest, or the book's chain: a
+/// change corrupt, said as such ([`Gap::failed`]; review-c5m2 5).
+const REFUSED: &str = "a change did not verify";
+
 /// Changes followers of this process dropped, held past what the record
 /// holds after a database failover or restore lost them (contract v30,
 /// stage C): what `status` says of the lost committed tail.
@@ -2632,7 +2644,7 @@ async fn read_to_head(
                 continue;
             }
         }
-        verified(domain, chains, &page.changes)?;
+        verified(domain, chains, &page.changes).map_err(|failed| format!("{REFUSED}: {failed}"))?;
         if let Some(apply) = apply {
             apply.apply(partition, &page.changes);
         }
