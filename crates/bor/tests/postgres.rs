@@ -8152,8 +8152,11 @@ async fn m12_a_partition_the_size_ci_moves_switches_between_databases_inside_a_s
     // account's rows in the target are the source's, and each is read once.
     let seen = Arc::new(std::sync::Mutex::new(None));
     {
+        // The URLs' text: the armed point's closure stays in a static map
+        // past a failed test, and a Scratch there would never be dropped
+        // (review c5p L1).
         let (urls, accounts, counted, seen) = (
-            h.urls.clone(),
+            h.urls.iter().map(|url| url.to_string()).collect::<Vec<_>>(),
             accounts.clone(),
             counted.clone(),
             Arc::clone(&seen),
