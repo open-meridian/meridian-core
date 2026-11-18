@@ -1983,8 +1983,8 @@ async fn read_again(
 /// A gap of `partition` read from the writer, from `held` where it stands
 /// to its end, `heard` the head of the latest page heard past it: read
 /// and let go; handed to the read-back where the record no longer reaches
-/// what was applied; held again from `heard` past the writer's retention;
-/// or left open, to be read again.
+/// what was applied, or the page heard; held again from `heard` past the
+/// writer's retention; or left open, to be read again.
 async fn read_gap(
     bus: &Bus,
     domain: &'static str,
@@ -2012,10 +2012,19 @@ async fn read_gap(
         behind.at.insert(partition.to_string(), reached.head);
     }
     match read {
+        // Held at the record's head, never at the page heard past it: where
+        // the record's head is below that page, the record lost it -- a
+        // failover -- or its writer answers behind, and the read-back
+        // decides. Held at the page heard, the partition claimed changes it
+        // did not hold, and its reads were answered from without them
+        // (review-c5i M4).
         Ok(()) => {
-            behind
-                .at
-                .insert(partition.to_string(), reached.head.max(heard));
+            behind.at.insert(partition.to_string(), reached.head);
+            if reached.head < heard {
+                tracing::warn!(domain, partition, head = reached.head, heard, "the record's head is below a page heard: what this member applied is read back from the record");
+                behind.unchecked.insert(partition.to_string());
+                behind.unchecked_since.get_or_insert_with(Instant::now);
+            }
             behind.gaps.remove(partition);
         }
         // The record no longer reaches what this member applied, or no

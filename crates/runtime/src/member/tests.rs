@@ -935,6 +935,39 @@ async fn a_lake_readers_catch_up_across_a_lost_tail_drops_what_the_record_lost()
     until("ready once reloaded", || ready() && said().lag_ms() < 1_000).await;
 }
 
+/// A gap read to a record's head below the page heard past it holds the
+/// partition at the record's head, never at the page heard: the record lost
+/// that page, or its writer answers behind, and the reader's reads are never
+/// held to changes it does not hold (review-c5i M4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_read_to_a_records_head_below_the_page_heard_holds_the_records_head() {
+    let record = Record::of(&[("P0", 5)]);
+    let (bus, followed, applied) =
+        reading("member-test-gap-below-heard", &record, &[("P0", 5)]).await;
+    record.head("P0", 9);
+    let heard = [record.change("P0", 8), record.change("P0", 9)];
+    // The record's head 7 as the gap is read.
+    record.head("P0", 7);
+    meridian_changes::publish(&bus, "book", 7, &heard);
+    until("6 and 7 read", || {
+        *applied.changes.lock().unwrap() == vec![6, 7]
+    })
+    .await;
+    let until_at = Instant::now() + Duration::from_millis(2_500);
+    while Instant::now() < until_at {
+        assert_eq!(
+            followed.heads().get("P0"),
+            Some(&7),
+            "held past the record's head"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until("ready at the record's head", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+}
+
 /// Each partition's gap is its own, and the lag is the oldest still open:
 /// one partition caught up leaves the lag the other's, and the reader is
 /// ready only once both are read (CI 44187810396; review-c5c-ci1 L2).
