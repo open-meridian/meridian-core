@@ -1744,9 +1744,12 @@ impl Gap {
     }
 
     /// Still open where its partition now stands at `held`: not yet at its
-    /// end.
+    /// end, or not yet held at all -- a partition first heard whose page did
+    /// not verify is not followed, and the member stays behind, unready,
+    /// until a page of it is held (review-c5c-ci1 L1: let go at the next
+    /// tick, the member ready with the page refused).
     fn open(&self, held: Option<u64>) -> bool {
-        held.is_some_and(|held| held < self.to)
+        held.is_none_or(|held| held < self.to)
     }
 }
 
