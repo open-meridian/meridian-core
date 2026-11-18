@@ -19,6 +19,8 @@ target/
 
 # Written by `make test-store` when it fails.
 .test-store.log
+# What the test database held before `make test-store`'s run.
+.test-store-before
 .interop.log
 .interop.positions
 .e2e-book.before
