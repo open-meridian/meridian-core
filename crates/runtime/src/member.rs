@@ -1877,7 +1877,8 @@ async fn follow(
                 // Held past the next tick by a read: the next a second from
                 // now. Fired at once, it began another read before a page
                 // heard meanwhile was taken from the tail, and held the loop a
-                // tick and two reads (c30d-c5j).
+                // tick and two reads, past review-c5i M2's pass of a second
+                // and one read.
                 if ticked.elapsed() >= ASK_EVERY {
                     ask.reset();
                 }

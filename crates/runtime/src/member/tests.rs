@@ -1424,8 +1424,8 @@ async fn a_reader_whose_gap_reads_time_out_turns_unready_within_its_bound_and_fo
 /// begins another read at once: the tick missed meanwhile fired as the read
 /// timed out and began the next, and where a page was heard meanwhile, the
 /// loop took it after the second read in about half the runs -- a tick and
-/// two reads, not one (c30d-c5j: "P9's page not applied 8031 ms after the
-/// gaps opened").
+/// two reads, not one, past review-c5i M2's pass of a second and one read
+/// ("P9's page not applied 8031 ms after the gaps opened").
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tick_held_past_the_next_by_a_read_waits_a_second_after_it() {
     let start = [("P0", 2)];
