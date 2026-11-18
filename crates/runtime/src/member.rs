@@ -1777,12 +1777,17 @@ async fn read_gap(
     behind: &mut Behind<'_>,
 ) {
     let applying = following.map(|f| f.apply.as_ref());
-    match catch_up(bus, domain, partition, held, behind.chains, applying).await {
-        Ok((head, last)) => {
-            if let Some(last) = last {
-                behind.applied.insert(partition.to_string(), last);
-            }
-            behind.at.insert(partition.to_string(), head.max(heard));
+    let (reached, read) = catch_up(bus, domain, partition, held, behind.chains, applying).await;
+    // What it applied before any failure is held: the partition stands there.
+    if let Some(last) = reached.last {
+        behind.applied.insert(partition.to_string(), last);
+        behind.at.insert(partition.to_string(), reached.head);
+    }
+    match read {
+        Ok(()) => {
+            behind
+                .at
+                .insert(partition.to_string(), reached.head.max(heard));
             behind.gaps.remove(partition);
         }
         // The record no longer reaches what this member applied: read it
@@ -1892,7 +1897,7 @@ async fn reconcile(
         let reached = match at.get(&partition).copied() {
             Some(held) if held >= head => continue,
             Some(held) => {
-                match catch_up(
+                let (reached, read) = catch_up(
                     bus,
                     domain,
                     &partition,
@@ -1900,14 +1905,13 @@ async fn reconcile(
                     chains,
                     Some(following.apply.as_ref()),
                 )
-                .await
-                {
-                    Ok((reached, last)) => {
-                        if let Some(last) = last {
-                            applied.insert(partition.clone(), last);
-                        }
-                        reached.max(held)
-                    }
+                .await;
+                let progressed = reached.last.is_some();
+                if let Some(last) = reached.last {
+                    applied.insert(partition.clone(), last);
+                }
+                match read {
+                    Ok(()) => reached.head.max(held),
                     Err(failed) if meridian_changes::is_behind(&failed) => {
                         following.apply.reset(&partition);
                         chains.remove(&partition);
@@ -1916,7 +1920,11 @@ async fn reconcile(
                     }
                     Err(failed) => {
                         tracing::warn!(domain, partition, %failed, "a partition behind the primary could not be read");
-                        continue;
+                        // Held as far as it was read and applied.
+                        if !progressed {
+                            continue;
+                        }
+                        reached.head
                     }
                 }
             }
@@ -2122,37 +2130,69 @@ async fn holds(
     Ok((kept, reply.head))
 }
 
-/// Read a partition's changes after `after` from the writer, page by page,
-/// to its head.
-/// Each change verified by its digest, and the book's by its chain too.
+/// Each change verified by its digest, and the book's by its chain too: the
+/// chain moved only where every change verifies, so a page refused leaves
+/// it where the partition stands (review-c5c-ci1 M4, L1).
 fn verified(
     domain: &str,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
     changes: &[meridian_changes::Change],
 ) -> Result<(), String> {
+    let mut moved: HashMap<String, meridian_changes::integrity::Chain> = HashMap::new();
     for change in changes {
         if domain == "book" {
-            chains
+            moved
                 .entry(change.partition.clone())
-                .or_default()
+                .or_insert_with(|| chains.get(&change.partition).cloned().unwrap_or_default())
                 .follow(change)?;
         } else {
             meridian_changes::integrity::verify(change)?;
         }
     }
+    chains.extend(moved);
     Ok(())
 }
 
+/// How far a catch-up came: where the partition stands, and the change it
+/// last applied, where it applied any.
+struct Reached {
+    head: u64,
+    last: Option<Applied>,
+}
+
+/// Read a partition's changes after `from` from the writer, page by page,
+/// to its head, each page verified and applied before the next is read.
+/// How far it came is answered whether or not it reached the head: a page
+/// applied, then a read that failed, leaves the partition, its last change
+/// and the book's chain at that page, never the chain ahead of where it
+/// stands (review-c5c-ci1 M4: the next catch-up, from where it stood,
+/// refused for good as not following).
 async fn catch_up(
     bus: &Bus,
     domain: &str,
     partition: &str,
-    mut after: u64,
+    from: u64,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
     apply: Option<&dyn Apply>,
-) -> Result<(u64, Option<Applied>), String> {
-    let mut last = None;
-    let from = after;
+) -> (Reached, Result<(), String>) {
+    let mut reached = Reached {
+        head: from,
+        last: None,
+    };
+    let read = read_to_head(bus, domain, partition, from, chains, apply, &mut reached).await;
+    (reached, read)
+}
+
+async fn read_to_head(
+    bus: &Bus,
+    domain: &str,
+    partition: &str,
+    from: u64,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    apply: Option<&dyn Apply>,
+    reached: &mut Reached,
+) -> Result<(), String> {
+    let mut after = from;
     loop {
         let asked = meridian_changes::ReadChangesRequest {
             partition: partition.to_string(),
@@ -2176,24 +2216,28 @@ async fn catch_up(
         if after == from && page.head < from {
             return Err(format!("{DIVERGED}: head {}, applied {from}", page.head));
         }
-        verified(domain, chains, &page.changes)?;
+        let mut next = after;
         for change in &page.changes {
-            if change.sequence <= after {
+            if change.sequence <= next {
                 return Err(format!(
-                    "change {} came after {after}: out of order",
+                    "change {} came after {next}: out of order",
                     change.sequence
                 ));
             }
-            after = change.sequence;
+            next = change.sequence;
         }
+        verified(domain, chains, &page.changes)?;
         if let Some(apply) = apply {
             apply.apply(partition, &page.changes);
         }
+        after = next;
         if let Some(change) = page.changes.last() {
-            last = Some(applied_of(change));
+            reached.head = after;
+            reached.last = Some(applied_of(change));
         }
         if page.changes.is_empty() || after >= page.head {
-            return Ok((after.max(page.head), last));
+            reached.head = after.max(page.head);
+            return Ok(());
         }
     }
 }

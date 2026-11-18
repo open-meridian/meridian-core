@@ -770,6 +770,27 @@ async fn a_gap_whose_pages_the_record_lost_ends_at_the_records_head() {
     assert_eq!(followed.heads().get("P0"), Some(&3));
 }
 
+/// A book's catch-up cut short after a page it applied follows on from that
+/// page: the journal's chain moved only with what was applied, never ahead
+/// of where the partition stands (review-c5c-ci1 M4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_book_catch_up_cut_short_follows_on_from_what_it_applied() {
+    let record = Record::of(&[("P0", 2)]);
+    let (bus, followed, applied) = reading("member-test-cut-short", &record, &[("P0", 2)]).await;
+    record.head("P0", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P0", 3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+    // 4 and 5 missed, 6 heard: 4's page read, 5's refused once.
+    record.shape(|shape| shape.script.extend([true, false]));
+    record.head("P0", 6);
+    meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    record.head("P0", 7);
+    meridian_changes::publish(&bus, "book", 6, &[record.change("P0", 7)]);
+    until("7 read", || followed.heads().get("P0") == Some(&7)).await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5, 6, 7]);
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");
