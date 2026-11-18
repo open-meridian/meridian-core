@@ -1777,12 +1777,12 @@ async fn follow(
                         // and reading every gap held it 5 s a gap, the tail
                         // undrained (review-c5i M2).
                         if !(following.is_some() && held_on_purpose()) {
-                            let mut open: Vec<(Option<Instant>, String, u64, u64)> = gaps
+                            let mut open: Vec<(Option<Instant>, String, Option<u64>, u64)> = gaps
                                 .iter()
                                 .filter(|(partition, _)| !unchecked.contains(*partition))
                                 .filter_map(|(partition, gap)| {
-                                    let held = at.get(partition).copied()?;
-                                    gap.open(Some(held))
+                                    let held = at.get(partition).copied();
+                                    gap.open(held)
                                         .then(|| (gap.tried, partition.clone(), held, gap.to))
                                 })
                                 .collect();
@@ -1796,7 +1796,7 @@ async fn follow(
                                 minding(
                                     since,
                                     bound,
-                                    read_gap(
+                                    read_again(
                                         &bus,
                                         domain,
                                         following.as_ref(),
@@ -1882,8 +1882,9 @@ impl Gap {
     /// Still open where its partition now stands at `held`: not yet at its
     /// end, or not yet held at all -- a partition first heard whose page did
     /// not verify is not followed, and the member stays behind, unready,
-    /// until a page of it is held (review-c5c-ci1 L1: let go at the next
-    /// tick, the member ready with the page refused).
+    /// until it is held (review-c5c-ci1 L1: let go at the next tick, the
+    /// member ready with the page refused), from the record's head as the
+    /// writer answers (review-c5i M3).
     fn open(&self, held: Option<u64>) -> bool {
         held.is_none_or(|held| held < self.to)
     }
@@ -1940,6 +1941,43 @@ struct Behind<'a> {
     gaps: &'a mut HashMap<String, Gap>,
     unchecked: &'a mut std::collections::BTreeSet<String>,
     unchecked_since: &'a mut Option<Instant>,
+}
+
+/// A gap still open read again as the writer answers: from `held` where its
+/// partition stands to `to`; or, where the partition is not yet held -- first
+/// heard, its page refused -- the partition held from the record's head, as
+/// one first heard is held from its page's: what a reader held of it dropped,
+/// no change applied and no chain, so the next change is taken as it is.
+/// Never left waiting for a page of it that verifies, which a partition
+/// seldom written may not send for hours, the member unready meanwhile and a
+/// drain of the writer's node refused by its budget (review-c5i M3).
+async fn read_again(
+    bus: &Bus,
+    domain: &'static str,
+    following: Option<&Following>,
+    partition: &str,
+    held: Option<u64>,
+    to: u64,
+    behind: &mut Behind<'_>,
+) {
+    if let Some(held) = held {
+        return read_gap(bus, domain, following, partition, held, to, behind).await;
+    }
+    let head = match holds(bus, domain, partition, i64::MAX as u64, None).await {
+        Ok((_, head)) => head,
+        Err(failed) => {
+            tracing::warn!(domain, partition, %failed, "a partition first heard whose page was refused could not be held from the record's head");
+            return;
+        }
+    };
+    if let Some(following) = following {
+        following.apply.reset(partition);
+        following.followed.set(partition, head);
+    }
+    behind.chains.remove(partition);
+    behind.applied.remove(partition);
+    behind.gaps.remove(partition);
+    behind.at.insert(partition.to_string(), head);
 }
 
 /// A gap of `partition` read from the writer, from `held` where it stands

@@ -802,31 +802,77 @@ async fn a_book_catch_up_cut_short_follows_on_from_what_it_applied() {
     assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5, 6, 7]);
 }
 
-/// A partition first heard whose page does not verify is not followed, and
-/// the reader stays behind, unready, until a page of it does (step 3b's
-/// integrity at rest; review-c5c-ci1 L1).
+/// A partition first heard whose page does not verify is not followed: the
+/// reader is behind on it until it is held, never ready with it unheld
+/// (step 3b's integrity at rest; review-c5c-ci1 L1), and it is held from the
+/// record's head as the writer answers, as one first heard is held from its
+/// page's -- what it held of it dropped, nothing applied -- never left waiting
+/// for a page of it that verifies (review-c5i M3).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partition_first_heard_whose_page_does_not_verify_keeps_the_reader_unready() {
+async fn a_partition_first_heard_whose_page_does_not_verify_is_held_from_the_records_head() {
     let record = Record::of(&[("P0", 2)]);
-    let (bus, followed, _) = reading("member-test-unverified", &record, &[("P0", 2)]).await;
+    let (bus, followed, applied) = reading("member-test-unverified", &record, &[("P0", 2)]).await;
+    record.head("P1", 2);
     let mut broken = record.change("P1", 2);
     broken.digest = vec![9; 32];
     meridian_changes::publish(&bus, "book", 0, &[record.change("P1", 1), broken]);
-    tokio::time::sleep(Duration::from_millis(2_200)).await;
-    let until_at = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until_at {
-        assert_eq!(followed.heads().get("P1"), None);
-        assert!(!ready(), "ready with P1's page refused");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // A page of it that verifies is held, and it is ready again.
-    record.head("P1", 3);
-    meridian_changes::publish(&bus, "book", 2, &[record.change("P1", 3)]);
-    until("P1 held", || followed.heads().get("P1") == Some(&3)).await;
+    until("P1 held from the record's head", || {
+        followed.heads().get("P1") == Some(&2)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P1".to_string()]);
+    assert!(applied.changes.lock().unwrap().is_empty());
     until("ready once P1 is held", || {
         ready() && said().lag_ms() < 1_000
     })
     .await;
+    // And followed on from there, its next change taken as it is.
+    record.head("P1", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P1", 3)]);
+    until("P1's next page applied", || {
+        followed.heads().get("P1") == Some(&3)
+    })
+    .await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3]);
+}
+
+/// A standby, which never reconciles, whose first page heard of a partition
+/// does not verify holds the partition from the record's head as its writer
+/// answers, and is ready again within a few ticks: never unready for good
+/// for want of a page of it that verifies, which a partition seldom written
+/// may not send for hours, a drain of its writer's node refused meanwhile
+/// (review-c5i M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_standby_whose_first_page_heard_does_not_verify_is_ready_once_it_holds_the_records_head()
+{
+    let bus = Arc::new(Bus::single(
+        "member-test-standby-unverified",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let record = Record::of(&[("P1", 2)]);
+    meridian_changes::serve(&bus, "book", record.clone());
+    let following = tokio::spawn(follow(
+        Arc::clone(&bus),
+        "book",
+        Duration::from_secs(1),
+        None,
+    ));
+    until("the standby's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    until("ready", ready).await;
+    let mut broken = record.change("P1", 2);
+    broken.digest = vec![9; 32];
+    meridian_changes::publish(&bus, "book", 0, &[record.change("P1", 1), broken]);
+    // Past its bound and a tick: ready, P1 held.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    until("ready with P1 held from the record's head", || {
+        ready() && said().partitions().contains(&"P1".to_string())
+    })
+    .await;
+    following.abort();
 }
 
 /// Each partition's gap is its own, and the lag is the oldest still open:
