@@ -11000,6 +11000,87 @@ fn an_epoch_an_earlier_range_move_made_with_no_takeover_is_recorded_before_anyth
     drop(zero);
 }
 
+/// Writer groups lowered from two to one in tolerant -- no lease taken, no
+/// new database timeline raising every epoch -- and the one writer left
+/// writes what group 1 held (the reconfigure check's "groups lowered";
+/// c5r2's second finding): at its start it takes over every range held at
+/// an epoch not the control partition's, as several groups' adopt does,
+/// recorded with why, and started again it adopts that epoch. A store a
+/// tool opens at one group, its epoch adopted at its first batch, takes
+/// nothing over: group 1's writer, still writing, is not fenced by it
+/// (ruled 2026-11-18).
+#[test]
+fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
+    use meridian_changes::groups::{owner, Groups};
+    let (url, dataset, subject, zero, mover) = lake_raised_to_two("lake-lowered-same");
+    let one = PostgresStore::connect(&url, 4)
+        .unwrap()
+        .with_groups(Groups::new(1, 2).unwrap());
+    let held = one.adopt().unwrap();
+    mover.rebalance();
+    one.read_owners().unwrap();
+    one.record(&dataset, vec![trade(&dataset, "one", &subject, 20)], 2_000)
+        .unwrap();
+    assert_eq!(
+        zero.range_tip(&dataset).unwrap().unwrap().writer_group,
+        Some(1)
+    );
+    // A tool's store at one group, adopting at its first batch: group 1's
+    // writer goes on writing.
+    let tool = PostgresStore::connect(&url, 2).unwrap();
+    let elsewhere = (0..)
+        .map(|n| unique(&format!("coinbase-1:lake-lowered-tool{n}")))
+        .find(|dataset| owner(dataset, 2) == 0)
+        .unwrap();
+    tool.record(
+        &elsewhere,
+        vec![trade(&elsewhere, "tool", &subject, 25)],
+        2_500,
+    )
+    .unwrap();
+    let still = one.record(
+        &dataset,
+        vec![trade(&dataset, "still", &subject, 26)],
+        2_600,
+    );
+    assert!(
+        still.is_ok(),
+        "a tool's store fenced group 1's writer: {still:?}"
+    );
+    drop((one, zero, mover, tool));
+    // Lowered: the first group's writer alone, started again, no lease.
+    let alone = PostgresStore::connect(&url, 2)
+        .unwrap()
+        .with_groups(Groups::new(0, 1).unwrap());
+    let epoch = alone.adopt().unwrap();
+    let recorded = alone.record(
+        &dataset,
+        vec![trade(&dataset, "alone", &subject, 30)],
+        3_000,
+    );
+    assert!(
+        recorded.is_ok(),
+        "the one writer left was refused what group 1 held: {recorded:?}"
+    );
+    assert!(epoch > held, "taken over past group 1's {held}: {epoch}");
+    assert_eq!(unrecorded_lake_epochs(&url), Vec::<String>::new());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let why: String = admin
+        .query_one(
+            "SELECT why FROM lake_writer_took_over WHERE epoch = $1",
+            &[&(epoch as i64)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(why, meridian_changes::groups::ASSIGNED);
+    // Started again with every range its own: adopted, not raised again.
+    drop(alone);
+    let again = PostgresStore::connect(&url, 2)
+        .unwrap()
+        .with_groups(Groups::new(0, 1).unwrap());
+    assert_eq!(again.adopt().unwrap(), epoch);
+}
+
 /// A range's move by hand to a writer group whose writer has not taken
 /// over in its database waits at the gate, and aborts for lag past
 /// moves.switchSeconds with nothing held: the source still owns it, and

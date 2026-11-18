@@ -109,7 +109,8 @@ pub struct PostgresStore {
     /// Its writer group and the lake's count (step 3d; section 6.1): the
     /// datasets it may commit to, and those it raises the epoch of.
     groups: meridian_changes::groups::Groups,
-    /// One adoption at once where it may raise the epoch (several groups).
+    /// One adoption at once where it may raise the epoch (several groups,
+    /// or one group's writer at its start).
     adopting: std::sync::Mutex<()>,
     /// Whether its writer group leads a database past the first (step 3d;
     /// section 6.4): it follows that database's timeline, as group 0 does
@@ -576,11 +577,80 @@ impl PostgresStore {
         Ok(found)
     }
 
+    /// The writer's epoch, adopted from the `control` partition (step 3a)
+    /// -- with several writer groups, its group's, or its datasets taken
+    /// over where they were assigned to it (step 3d) -- where `starting`, at
+    /// the writer's start, else at a store's first batch ([`Self::epoch_now`]).
+    fn adopt_epoch(&self, starting: bool) -> Result<u64> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE lake_change_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
+            &[&meridian_changes::origin()],
+        )
+        .map_err(unavailable)?;
+        if !self.groups.several() {
+            let epoch: i64 = conn
+                .query_one(
+                    "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .get(0);
+            // One group, its writer starting (ruled 2026-11-18): a range
+            // held at an epoch not the control partition's was another
+            // group's before the count was lowered, and is this writer's
+            // now. It takes them over, as several groups' adopt does, so
+            // it writes them under its own epoch and the writer that held
+            // them is fenced. Never at a store's first batch: a store a
+            // tool opens at one group takes nothing over.
+            let _alone = starting.then(|| self.adopting.lock().expect("adopting poisoned"));
+            if starting && self.fence.epoch() == 0 {
+                let held_apart: bool = conn
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM lake_partition
+                                         WHERE epoch <> $1 AND epoch <> $2)",
+                        &[&epoch, &meridian_changes::moves::POINTER_EPOCH],
+                    )
+                    .map_err(unavailable)?
+                    .get(0);
+                if held_apart {
+                    drop(conn);
+                    return self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED));
+                }
+            }
+            return Ok(self.fence.adopt_once(epoch as u64));
+        }
+        // Several groups (step 3d; section 6.1): the group's own epoch,
+        // where every dataset it owns holds it and no other group's does;
+        // else its datasets were assigned to it -- the count changed -- and
+        // it takes them over, so the writer that held them is fenced.
+        let _alone = self.adopting.lock().expect("adopting poisoned");
+        if self.fence.epoch() != 0 {
+            return Ok(self.fence.epoch());
+        }
+        let (anchor, mine, others) = epochs_of(&mut *conn, self.groups)?;
+        match anchor {
+            Some(epoch) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                // An epoch no takeover recorded -- one an earlier release's
+                // move made for this group (the book's CI 43820357549) --
+                // recorded now as this member's, before anything is
+                // recorded under it (review t7, M1).
+                record_adopted(&mut conn, self.groups, epoch).map_err(unavailable)?;
+                drop(conn);
+                Ok(self.fence.adopt_once(epoch))
+            }
+            _ => {
+                drop(conn);
+                self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED))
+            }
+        }
+    }
+
     /// The writer's epoch, adopted at its first batch where it was not
     /// started as one.
     fn epoch_now(&self) -> Result<u64> {
         match self.fence.epoch() {
-            0 => self.adopt(),
+            0 => self.adopt_epoch(false),
             epoch => Ok(epoch),
         }
     }
@@ -4803,46 +4873,7 @@ impl Store for PostgresStore {
     }
 
     fn adopt(&self) -> Result<u64> {
-        let mut conn = self.conn()?;
-        conn.execute(
-            "UPDATE lake_change_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
-            &[&meridian_changes::origin()],
-        )
-        .map_err(unavailable)?;
-        if !self.groups.several() {
-            let epoch: i64 = conn
-                .query_one(
-                    "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
-                    &[],
-                )
-                .map_err(unavailable)?
-                .get(0);
-            return Ok(self.fence.adopt_once(epoch as u64));
-        }
-        // Several groups (step 3d; section 6.1): the group's own epoch,
-        // where every dataset it owns holds it and no other group's does;
-        // else its datasets were assigned to it -- the count changed -- and
-        // it takes them over, so the writer that held them is fenced.
-        let _alone = self.adopting.lock().expect("adopting poisoned");
-        if self.fence.epoch() != 0 {
-            return Ok(self.fence.epoch());
-        }
-        let (anchor, mine, others) = epochs_of(&mut *conn, self.groups)?;
-        match anchor {
-            Some(epoch) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
-                // An epoch no takeover recorded -- one an earlier release's
-                // move made for this group (the book's CI 43820357549) --
-                // recorded now as this member's, before anything is
-                // recorded under it (review t7, M1).
-                record_adopted(&mut conn, self.groups, epoch).map_err(unavailable)?;
-                drop(conn);
-                Ok(self.fence.adopt_once(epoch))
-            }
-            _ => {
-                drop(conn);
-                self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED))
-            }
-        }
+        self.adopt_epoch(true)
     }
 
     fn epoch(&self) -> u64 {

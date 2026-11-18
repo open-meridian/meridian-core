@@ -1262,8 +1262,11 @@ pub trait Store: Send + Sync {
     fn assessments(&self) -> Result<Vec<Assessment>>;
 
     /// The writer's epoch, adopted from the `control` partition where none
-    /// was yet (step 3a): what a starting lake does before its first batch,
-    /// and what a store not started as a writer does at its first.
+    /// was yet (step 3a): what a starting lake does before its first batch;
+    /// a store not started as a writer adopts its own at its first. At one
+    /// writer group, a starting writer takes over every range held at
+    /// another epoch, as several groups' does (ruled 2026-11-18): the count
+    /// was lowered.
     fn adopt(&self) -> Result<u64>;
 
     /// The epoch this store's batches commit under; 0 before it adopted one.

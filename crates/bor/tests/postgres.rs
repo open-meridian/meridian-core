@@ -5067,6 +5067,117 @@ async fn a_move_to_a_group_whose_writer_has_not_taken_over_commits_nothing_at_an
     blocking(move || drop((zero, one, zero_store, one_store, mover, migrated)));
 }
 
+/// Writer groups lowered from two to one in tolerant -- no lease taken, no
+/// new database timeline raising every epoch -- and the one writer left
+/// writes what group 1 held (the reconfigure check's "groups lowered";
+/// c5r2's second finding, the book's side): at its start it takes over
+/// every partition held at an epoch not the control partition's, as several
+/// groups' adopt does, recorded with why, and started again it adopts that
+/// epoch. A store a tool opens at one group, its epoch adopted at its first
+/// act, takes nothing over: group 1's writer, still writing, is not fenced
+/// by it (ruled 2026-11-18).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_count_lowered_to_one_writes_what_group_one_held_on_the_same_timeline() {
+    use meridian_bor::partition_moves::rebalance;
+    use meridian_bor::store::placement_of;
+    use meridian_changes::groups::{owner, Groups};
+    let (url, migrated) = blocking(isolated);
+    let (broker, zero, zero_store, mover) = blocking(|| raised_to_two(&url, 15));
+    let (one, one_store) = blocking(|| group_member(&url, &broker, 1, 2, 8));
+    let held = blocking(|| Store::adopt(one_store.as_ref())).unwrap();
+    blocking(|| rebalance(&zero, zero_store.as_ref(), &mover));
+    let in_p4 = |tag: &str| {
+        (0..)
+            .map(|n| unique(&format!("ACC-LOWERED-{tag}-{n}")))
+            .find(|a| placement_of(a, 8) == "P4")
+            .unwrap()
+    };
+    let (first, second, third) = (in_p4("one"), in_p4("still"), in_p4("alone"));
+    blocking(|| one_store.place_first(&first, &first)).unwrap();
+    open(&one, &first, "INS-AAPL").await;
+    blocking(|| {
+        assert_eq!(zero_store.tip("P4").unwrap().unwrap().writer_group, Some(1));
+    });
+    // A tool's store at one group, adopting at its first act: group 1's
+    // writer goes on writing.
+    let elsewhere = (0..)
+        .map(|n| unique(&format!("ACC-LOWERED-TOOL-{n}")))
+        .find(|a| owner(&placement_of(a, 8), 2) == 0)
+        .unwrap();
+    blocking(|| {
+        let tool = PostgresStore::connect(&url, 2).unwrap().with_partitions(8);
+        let _ = Store::act(&tool, &elsewhere, "", "k", b"x", &mut |_, _| {
+            Err(meridian_bor::store::StoreError::Invalid(
+                "a tool's act, never decided".into(),
+            ))
+        });
+    });
+    blocking(|| one_store.place_first(&second, &second)).unwrap();
+    let still = send(
+        &one,
+        RECORD_OPENING_BALANCE,
+        &opening(&second, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await;
+    assert!(
+        still.is_ok(),
+        "a tool's store fenced group 1's writer: {still:?}"
+    );
+    // Lowered: the first group's writer alone, started again, no lease.
+    let lowered = Arc::new(GroupsBroker {
+        inner: MemoryBackend::new(),
+        groups: Default::default(),
+        handed: AtomicU64::new(0),
+    });
+    let (alone, alone_store) = blocking(|| group_member(&url, &lowered, 0, 1, 8));
+    let epoch = blocking(|| Store::adopt(alone_store.as_ref())).unwrap();
+    blocking(|| alone_store.place_first(&third, &third)).unwrap();
+    let recorded = send(
+        &alone,
+        RECORD_OPENING_BALANCE,
+        &opening(&third, "INS-AAPL"),
+        Some(PERSON),
+    )
+    .await;
+    assert!(
+        recorded.is_ok(),
+        "the one writer left was refused what group 1 held: {recorded:?}"
+    );
+    blocking(|| {
+        assert!(epoch > held, "taken over past group 1's {held}: {epoch}");
+        assert_eq!(unrecorded_epochs(&url), Vec::<String>::new());
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let why: String = admin
+            .query_one(
+                "SELECT why FROM book_writer_took_over WHERE epoch = $1",
+                &[&(epoch as i64)],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(why, meridian_changes::groups::ASSIGNED);
+        // Started again with every partition its own: adopted, not raised
+        // again.
+        let again = PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(0, 1).unwrap())
+            .with_partitions(8);
+        assert_eq!(Store::adopt(&again).unwrap(), epoch);
+    });
+    blocking(move || {
+        drop((
+            zero,
+            one,
+            alone,
+            zero_store,
+            one_store,
+            alone_store,
+            mover,
+            migrated,
+        ))
+    });
+}
+
 /// The book at `url` started at one writer group -- every head pinned to
 /// group 0, its writer's takeover recorded -- then raised to two: group 0's
 /// writer started again, its epoch adopted, and its mover, whose switch is

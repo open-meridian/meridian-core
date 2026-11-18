@@ -790,7 +790,10 @@ pub trait Store: Send + Sync {
 
     /// The writer's epoch, adopted from the `control` partition where none
     /// was yet (step 3a): what a starting book does before its first
-    /// command, and what a store not started as a writer does at its first.
+    /// command; a store not started as a writer adopts its own at its
+    /// first. At one writer group, a starting writer takes over every
+    /// partition held at another epoch, as several groups' does (ruled
+    /// 2026-11-18): the count was lowered.
     fn adopt(&self) -> Result<u64>;
 
     /// The epoch this store's commands commit under; 0 before it adopted one.
