@@ -463,6 +463,9 @@ struct Shape {
     /// Catch-ups answered with changes whose bodies no longer match their
     /// digests: bit rot.
     rotten: bool,
+    /// Catch-ups answered with the change read after, not the one after
+    /// it: a page out of order.
+    disordered: bool,
 }
 
 impl Record {
@@ -614,6 +617,15 @@ impl ChangeLog for Record {
             )
         };
         let rotten = most == meridian_changes::PAGE_MOST && self.shape.lock().unwrap().rotten;
+        if most == meridian_changes::PAGE_MOST && self.shape.lock().unwrap().disordered {
+            return Ok(ReadChangesReply {
+                changes: vec![self.change(partition, after.max(1))],
+                head,
+                lowest_kept: 1,
+                epoch,
+                after_sequence: after,
+            });
+        }
         let changes = ((after + 1)..=head)
             .take(if most == meridian_changes::PAGE_MOST {
                 1
@@ -646,6 +658,16 @@ async fn reading(
     record: &Arc<Record>,
     start: &[(&str, u64)],
 ) -> (Arc<Bus>, Arc<Followed>, Arc<Applied>) {
+    reading_within(name, record, start, Duration::from_secs(1)).await
+}
+
+/// [`reading`], ready while its lag is under `bound`.
+async fn reading_within(
+    name: &str,
+    record: &Arc<Record>,
+    start: &[(&str, u64)],
+    bound: Duration,
+) -> (Arc<Bus>, Arc<Followed>, Arc<Applied>) {
     let bus = Arc::new(Bus::single(
         name,
         Arc::new(meridian_bus::MemoryBackend::new()),
@@ -655,7 +677,7 @@ async fn reading(
     meridian_changes::serve(&bus, domain, record.clone());
     let applied = Arc::new(Applied::default());
     let component = if domain == "lake" { "lake" } else { "bor" };
-    let member = Member::reader_of(component, domain, Duration::from_secs(1));
+    let member = Member::reader_of(component, domain, bound);
     let followed =
         crate::member::Followed::from_heads(start.iter().map(|(p, h)| (p.to_string(), *h)));
     member
@@ -1896,6 +1918,212 @@ async fn a_reader_proved_behind_whose_catch_up_fails_is_unready_until_it_reads_w
         ready() && said().lag_ms() < 1_000
     })
     .await;
+}
+
+/// A reader whose writer's epoch rose, read back clean with no gap, then
+/// reconciling with a primary ahead of it while every catch-up times out,
+/// is unready within its bound and a tick of the reconcile's start: never
+/// held ready, as the last tick left it, while each partition's catch-up
+/// waits out its read (review-delta A1: ready some 20 s).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconcile_after_a_takeover_whose_catch_ups_time_out_turns_the_reader_unready() {
+    let quiet: Vec<String> = (0..4).map(|n| format!("P{n}")).collect();
+    let start: Vec<(&str, u64)> = quiet.iter().map(|p| (p.as_str(), 2)).collect();
+    let record = Record::of(&start);
+    let (_bus, _, _) = reading("member-test-reconcile-minded", &record, &start).await;
+    until("ready", ready).await;
+    // A new writer, at a raised epoch, committed 3 and 4 of each partition
+    // before this reader asked it: the primary is ahead, no page heard, no
+    // gap; and every catch-up is answered too late.
+    record.shape(|shape| {
+        for partition in &quiet {
+            shape.heads.insert(partition.clone(), 4);
+            shape.hang.insert(partition.clone());
+        }
+        shape.control_epoch = 3;
+    });
+    let raised = Instant::now();
+    until("the reconcile's first catch-up", || {
+        !record.shape.lock().unwrap().hung.is_empty()
+    })
+    .await;
+    let reconciling = record.shape.lock().unwrap().hung[0];
+    let bound = Duration::from_secs(1);
+    while ready() {
+        assert!(
+            reconciling.elapsed() < bound + ASK_EVERY + Duration::from_millis(1_000),
+            "ready {} ms into a reconcile whose catch-ups time out, {} ms after the epoch rose",
+            reconciling.elapsed().as_millis(),
+            raised.elapsed().as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A reader a read left behind is behind from when that read came, which
+/// waited out the reader's bound before it was answered from the primary:
+/// unready within a tick of the answer, never a whole bound after the
+/// follower next asks (review-delta A3: about two bounds and a tick).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_left_behind_is_behind_from_when_the_read_came() {
+    let bound = Duration::from_secs(3);
+    let record = Record::of(&[("P0", 3)]);
+    let (bus, _, _) =
+        reading_within("member-test-left-behind-came", &record, &[("P0", 3)], bound).await;
+    until("ready", ready).await;
+    // 4 to 6 committed, their pages lost; P0's catch-ups answered too late.
+    record.shape(|shape| {
+        shape.heads.insert("P0".into(), 6);
+        shape.hang.insert("P0".into());
+    });
+    let naming = meridian_pb::v1::Watermark {
+        partitions: vec![meridian_pb::v1::PartitionSequence {
+            partition: "P0".into(),
+            sequence: 6,
+        }],
+    };
+    let reads = bus.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming)
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::FromPrimary));
+    let answered = Instant::now();
+    while ready() {
+        assert!(
+            answered.elapsed() < ASK_EVERY + Duration::from_millis(1_000),
+            "ready {} ms after a read that waited its {} ms bound proved it behind",
+            answered.elapsed().as_millis(),
+            bound.as_millis()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A gap recorded by a reconcile is behind from the evidence of its own
+/// partition, never from another partition's older gap: once that gap
+/// closes, the lag is the new gap's (review-delta A2: the new gap took the
+/// other's age).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_a_reconcile_records_is_never_backdated_to_another_partitions() {
+    let record = Record::of(&[("P0", 3), ("Q0", 3)]);
+    let (bus, followed, _) = reading(
+        "member-test-gap-not-backdated",
+        &record,
+        &[("P0", 3), ("Q0", 3)],
+    )
+    .await;
+    until("ready", ready).await;
+    // Q0's gap, open from now: a page missed, its catch-ups refused.
+    record.refuse("Q0", true);
+    record.head("Q0", 6);
+    meridian_changes::publish(&bus, "book", 5, &[record.change("Q0", 6)]);
+    let q_opened = Instant::now();
+    until("Q0's gap open", || {
+        record.shape.lock().unwrap().refused.contains("Q0")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    // A read of P0 left behind, P0's catch-ups answered too late: the
+    // reconcile records P0's gap.
+    record.shape(|shape| {
+        shape.heads.insert("P0".into(), 6);
+        shape.hang.insert("P0".into());
+    });
+    let naming = meridian_pb::v1::Watermark {
+        partitions: vec![meridian_pb::v1::PartitionSequence {
+            partition: "P0".into(),
+            sequence: 6,
+        }],
+    };
+    let reads = bus.clone();
+    let p_came = Instant::now();
+    let held = tokio::task::spawn_blocking(move || {
+        reads
+            .reads_after()
+            .hold("platform.book.query.list-orders", &naming)
+    })
+    .await
+    .unwrap();
+    assert_eq!(held, Ok(meridian_bus::read_after::Held::FromPrimary));
+    until("P0's catch-up", || {
+        !record.shape.lock().unwrap().hung.is_empty()
+    })
+    .await;
+    // Q0 answers again and is read; P0's stays unread.
+    record.refuse("Q0", false);
+    let answering = Instant::now();
+    while followed.heads().get("Q0") != Some(&6) {
+        assert!(
+            answering.elapsed() < Duration::from_secs(15),
+            "Q0 never read: {:?}",
+            followed.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(ASK_EVERY + Duration::from_millis(200)).await;
+    let lag = Duration::from_millis(said().lag_ms());
+    assert!(
+        lag <= p_came.elapsed() + Duration::from_millis(500),
+        "lag {} ms once Q0 was read: P0 was proved behind {} ms ago, Q0's gap opened {} ms ago",
+        lag.as_millis(),
+        p_came.elapsed().as_millis(),
+        q_opened.elapsed().as_millis()
+    );
+}
+
+/// A gap whose read timed out and was warned of, then is answered with a
+/// page out of order, says that refusal at error: never at debug behind
+/// the timeout before it (review-delta A4). Its runtime's threads, the
+/// blocking pool's too, log to this test alone.
+#[test]
+fn a_page_out_of_order_after_a_timeout_is_said_at_error() {
+    let warned = Warned::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let warned = warned.clone();
+                move || warned.clone()
+            })
+            .finish(),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || std::mem::forget(tracing::dispatcher::set_default(&dispatch)))
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let record = Record::of(&[("P0", 3)]);
+        let (bus, _, _) = reading("member-test-out-of-order", &record, &[("P0", 3)]).await;
+        record.refuse("P0", true);
+        record.head("P0", 6);
+        meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+        until("read and refused", || {
+            record.shape.lock().unwrap().refused.contains("P0")
+        })
+        .await;
+        // Answered from now, out of order.
+        record.shape(|shape| {
+            shape.refusing.clear();
+            shape.disordered = true;
+        });
+        let asked = record.shape.lock().unwrap().asked.len();
+        until("read again", || {
+            record.shape.lock().unwrap().asked.len() > asked + 1
+        })
+        .await;
+        let said = String::from_utf8_lossy(&warned.0.lock().unwrap()).to_string();
+        let at_error = said
+            .lines()
+            .filter(|line| line.contains("ERROR") && line.contains("out of order"))
+            .count();
+        assert_eq!(at_error, 1, "{said}");
+    });
 }
 
 /// A reader whose last applied change the record can no longer read back
