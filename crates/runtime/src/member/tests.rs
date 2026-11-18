@@ -1114,6 +1114,76 @@ async fn a_standby_behind_its_writers_retention_holds_from_the_page_heard_and_is
     following.abort();
 }
 
+/// What a test's runtime warned of, each line as written.
+#[derive(Clone, Default)]
+struct Warned(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Warned {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Warned {
+    fn count(&self, words: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains(words))
+            .count()
+    }
+}
+
+/// A gap that will not close -- its catch-up refused each time it is read
+/// again -- is warned of once, not each second the writer answers (review-c5i
+/// L6). Its runtime's threads, the blocking pool's too, log to this test
+/// alone.
+#[test]
+fn a_gap_read_again_and_again_is_warned_of_once() {
+    let warned = Warned::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let warned = warned.clone();
+                move || warned.clone()
+            })
+            .finish(),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || std::mem::forget(tracing::dispatcher::set_default(&dispatch)))
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let record = Record::of(&[("P0", 3)]);
+        let (bus, _, _) = reading("member-test-gap-warned", &record, &[("P0", 3)]).await;
+        record.refuse("P0", true);
+        record.head("P0", 6);
+        meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+        // Read on the tail and again at each of three ticks or more.
+        until("read again", || {
+            record.shape.lock().unwrap().refused.contains("P0")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        let asked = record
+            .shape
+            .lock()
+            .unwrap()
+            .asked
+            .iter()
+            .filter(|(partition, _)| partition == "P0")
+            .count();
+        assert!(asked >= 3, "read {asked} times");
+        assert_eq!(warned.count("a page missed could not be read"), 1);
+    });
+}
+
 /// Each partition's gap is its own, and the lag is the oldest still open:
 /// one partition caught up leaves the lag the other's, and the reader is
 /// ready only once both are read (CI 44187810396; review-c5c-ci1 L2).

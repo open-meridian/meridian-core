@@ -1854,9 +1854,33 @@ struct Gap {
     to: u64,
     /// When it was last read again, as the writer answered.
     tried: Option<Instant>,
+    /// Whether a read of it that failed has been warned of: once a gap, as
+    /// an unanswered writer is, not at each read again (review-c5i L6).
+    warned: bool,
 }
 
 impl Gap {
+    /// A read of `partition`'s gap that failed, warned of the first time
+    /// only, and at debug after: a gap that will not close -- a chain or a
+    /// digest refused, a writer that keeps timing out -- is read again each
+    /// second the writer answers.
+    fn failed(
+        gaps: &mut HashMap<String, Gap>,
+        domain: &str,
+        partition: &str,
+        failed: &str,
+        what: &str,
+    ) {
+        let warned = gaps
+            .get_mut(partition)
+            .is_some_and(|gap| std::mem::replace(&mut gap.warned, true));
+        if warned {
+            tracing::debug!(domain, partition, %failed, "{what}");
+        } else {
+            tracing::warn!(domain, partition, %failed, "{what}");
+        }
+    }
+
     /// A page heard past where `partition` stands at `held`, its head `to`:
     /// the gap still open reaching to this page too, or one opened from
     /// now -- never a gap let go meanwhile, its since and its end another
@@ -1872,6 +1896,7 @@ impl Gap {
                         since: Instant::now(),
                         to,
                         tried: None,
+                        warned: false,
                     },
                 );
             }
@@ -1993,7 +2018,13 @@ async fn read_again(
     let head = match holds(bus, domain, partition, i64::MAX as u64, None).await {
         Ok((_, head)) => head,
         Err(failed) => {
-            tracing::warn!(domain, partition, %failed, "a partition first heard whose page was refused could not be held from the record's head");
+            Gap::failed(
+                behind.gaps,
+                domain,
+                partition,
+                &failed,
+                "a partition first heard whose page was refused could not be held from the record's head",
+            );
             return;
         }
     };
@@ -2087,9 +2118,13 @@ async fn read_gap(
             behind.at.insert(partition.to_string(), heard);
             behind.gaps.remove(partition);
         }
-        Err(failed) => {
-            tracing::warn!(domain, partition, %failed, "a page missed could not be read")
-        }
+        Err(failed) => Gap::failed(
+            behind.gaps,
+            domain,
+            partition,
+            &failed,
+            "a page missed could not be read",
+        ),
     }
     if let (Some(following), Some(head)) = (following, behind.at.get(partition)) {
         following.followed.set(partition, *head);
