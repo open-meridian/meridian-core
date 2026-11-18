@@ -1601,6 +1601,8 @@ async fn follow(
                                 if let Some(following) = &following {
                                     following.apply.reset(&partition);
                                 }
+                                chains.remove(&partition);
+                                applied.remove(&partition);
                                 at.insert(partition.clone(), page.head);
                                 gaps.remove(&partition);
                             }
@@ -1648,7 +1650,7 @@ async fn follow(
                             let held = held_on_purpose();
                             let left_behind = !held && bus.reads_after().left_behind(domain);
                             if again || (!held && read_back) || left_behind {
-                                reconcile(&bus, domain, following, &unchecked, &mut at, &mut chains)
+                                reconcile(&bus, domain, following, &unchecked, &mut at, &mut applied, &mut chains)
                                     .await;
                             }
                         }
@@ -1744,7 +1746,11 @@ impl Gap {
 ///   lost the page.
 ///
 /// A partition still to be read back (`unchecked`) is left: what the reader
-/// holds of it is not yet known to be the record's.
+/// holds of it is not yet known to be the record's. What it applies is the
+/// change last applied of the partition, as the tail's is, so a later
+/// read-back checks it; one held again from the head applied none
+/// (review-c5c-ci1 M3: a stale one read back as kept, and the reader held
+/// what the record had lost, ready).
 ///
 /// [`Reads::left_behind`]: meridian_bus::read_after::Reads::left_behind
 async fn reconcile(
@@ -1753,6 +1759,7 @@ async fn reconcile(
     following: &Following,
     unchecked: &std::collections::BTreeSet<String>,
     at: &mut HashMap<String, u64>,
+    applied: &mut HashMap<String, Applied>,
     chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
 ) {
     // Read off the runtime's own threads: a store's record is read blocking
@@ -1791,9 +1798,16 @@ async fn reconcile(
                 )
                 .await
                 {
-                    Ok((reached, _)) => reached.max(held),
+                    Ok((reached, last)) => {
+                        if let Some(last) = last {
+                            applied.insert(partition.clone(), last);
+                        }
+                        reached.max(held)
+                    }
                     Err(failed) if meridian_changes::is_behind(&failed) => {
                         following.apply.reset(&partition);
+                        chains.remove(&partition);
+                        applied.remove(&partition);
                         head
                     }
                     Err(failed) => {
@@ -1804,6 +1818,8 @@ async fn reconcile(
             }
             None => {
                 following.apply.reset(&partition);
+                chains.remove(&partition);
+                applied.remove(&partition);
                 head
             }
         };
@@ -1948,8 +1964,9 @@ impl Lineage<'_> {
 
 /// Whether the record still holds what a follower stands at in a partition,
 /// and its head: the change it last applied read back from the writer, the
-/// same sequence, epoch and body; or where it applied none, the record's
-/// head not below where it stands. Past the record's retention, not held.
+/// same sequence, epoch and body, and the record's head not below where it
+/// stands; or where it applied none, that head alone. Past the record's
+/// retention, not held.
 async fn holds(
     bus: &Bus,
     domain: &str,
@@ -1986,11 +2003,14 @@ async fn holds(
         Err(failed) => return Err(failed),
     };
     let kept = match applied {
-        Some((sequence, epoch, digest)) => reply.changes.first().is_some_and(|change| {
-            change.sequence == *sequence
-                && change.epoch == *epoch
-                && meridian_changes::integrity::digest(&change.body) == *digest
-        }),
+        Some((sequence, epoch, digest)) => {
+            reply.head >= at
+                && reply.changes.first().is_some_and(|change| {
+                    change.sequence == *sequence
+                        && change.epoch == *epoch
+                        && meridian_changes::integrity::digest(&change.body) == *digest
+                })
+        }
         None => reply.head >= at,
     };
     Ok((kept, reply.head))

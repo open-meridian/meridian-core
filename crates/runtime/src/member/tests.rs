@@ -676,6 +676,44 @@ async fn a_gap_found_again_after_a_reload_below_it_keeps_the_reader_unready() {
     .await;
 }
 
+/// What the reconcile read and applied is what a later read-back checks: a
+/// reader caught up by it, whose record then lost the changes it read,
+/// drops them when the epoch rises -- never holding a change the record
+/// does not, ready while diverged (review-c5c-ci1 M3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_drops_what_the_reconcile_applied_once_the_record_lost_it() {
+    let record = Record::of(&[("P0", 2)]);
+    let (bus, followed, applied) =
+        reading("member-test-reconciled-lost", &record, &[("P0", 2)]).await;
+    record.head("P0", 3);
+    meridian_changes::publish(&bus, "book", 2, &[record.change("P0", 3)]);
+    until("3 applied", || followed.heads().get("P0") == Some(&3)).await;
+    // The writer cannot be read: 4 and 5 missed, 6 heard, unread.
+    record.shape(|shape| shape.down = true);
+    record.head("P0", 6);
+    meridian_changes::publish(&bus, "book", 5, &[record.change("P0", 6)]);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // It answers again: the reconcile reads 4 to 6.
+    record.shape(|shape| shape.down = false);
+    until("6 read by the reconcile", || {
+        followed.heads().get("P0") == Some(&6)
+    })
+    .await;
+    assert_eq!(*applied.changes.lock().unwrap(), vec![3, 4, 5, 6]);
+
+    // The database failed over and lost 5 and 6; the writer, at a raised
+    // epoch, writes 5 again, another change.
+    record.lose("P0", 5, 3);
+    record.shape(|shape| shape.control_epoch = 3);
+    record.head("P0", 5);
+    meridian_changes::publish(&bus, "book", 4, &[record.change("P0", 5)]);
+    until("P0 held at the record's 5", || {
+        followed.heads().get("P0") == Some(&5)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");
