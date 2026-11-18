@@ -2059,3 +2059,315 @@ async fn a_store_standby_whose_read_was_slow_across_a_renewal_takes_no_sooner_th
         taken.duration_since(renewed)
     );
 }
+
+/// One Lease as the API server keeps it, each write conditional on the
+/// version read, with the API server's failures put in by the test, each
+/// counted down as it is met: reads that fail, writes that fail unwritten,
+/// writes never answered and never written, and writes written whose
+/// answer never comes (a request in flight past its bound). Says when each
+/// write landed.
+#[derive(Clone, Default)]
+struct Unreliable {
+    held: Arc<std::sync::Mutex<Option<crate::lease::Record>>>,
+    reads_failing: Arc<AtomicU64>,
+    writes_failing: Arc<AtomicU64>,
+    writes_unanswered: Arc<AtomicU64>,
+    answers_lost: Arc<AtomicU64>,
+    /// Writes that land `late_by` after they were sent, past their bound,
+    /// and are never answered.
+    writes_late: Arc<AtomicU64>,
+    late_by: Duration,
+    /// How long a read's answer and a write's request each take.
+    latency: Duration,
+    landed: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+}
+
+/// Whether one more of `failures` is met now, counting it down.
+fn met(failures: &AtomicU64) -> bool {
+    failures
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+}
+
+impl Leases for Unreliable {
+    async fn get(&self, _name: &str) -> Result<Option<crate::lease::Record>, String> {
+        if met(&self.reads_failing) {
+            return Err("error sending request for url".into());
+        }
+        let read = self.held.lock().unwrap().clone();
+        tokio::time::sleep(self.latency).await;
+        Ok(read)
+    }
+
+    async fn create(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        let mut held = self.held.lock().unwrap();
+        if held.is_some() {
+            return Ok(crate::lease::Wrote::Conflict);
+        }
+        let mut record = record.clone();
+        record.resource_version = "1".into();
+        *held = Some(record);
+        self.landed
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        Ok(crate::lease::Wrote::Done("1".into()))
+    }
+
+    async fn update(
+        &self,
+        _name: &str,
+        record: &crate::lease::Record,
+    ) -> Result<crate::lease::Wrote, String> {
+        if met(&self.writes_failing) {
+            return Err("error sending request for url".into());
+        }
+        if met(&self.writes_unanswered) {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return Err("operation timed out".into());
+        }
+        tokio::time::sleep(self.latency).await;
+        if met(&self.writes_late) {
+            let (late, record) = (self.clone(), record.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(late.late_by).await;
+                let _ = late.write(&record);
+            });
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return Err("operation timed out".into());
+        }
+        let Some(next) = self.write(record) else {
+            return Ok(crate::lease::Wrote::Conflict);
+        };
+        if met(&self.answers_lost) {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return Err("operation timed out".into());
+        }
+        Ok(crate::lease::Wrote::Done(next))
+    }
+}
+
+impl Unreliable {
+    /// The write, conditional on its version: the version now, or None.
+    fn write(&self, record: &crate::lease::Record) -> Option<String> {
+        let next = {
+            let mut held = self.held.lock().unwrap();
+            let current = held.as_ref()?;
+            if current.resource_version != record.resource_version {
+                return None;
+            }
+            let next = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
+            let mut record = record.clone();
+            record.resource_version = next.clone();
+            *held = Some(record);
+            next
+        };
+        self.landed
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        Some(next)
+    }
+
+    fn holder(&self) -> String {
+        self.held.lock().unwrap().as_ref().unwrap().holder.clone()
+    }
+}
+
+/// A writer of `api`'s Lease, renewing every 2 s a Lease of 6 s (the
+/// chart's defaults), holding it.
+async fn holding_on(api: &Unreliable) -> Elector<Unreliable> {
+    let mut elector = Elector::new(
+        api.clone(),
+        crate::lease::Settings {
+            name: "release-bor".into(),
+            holder: "bor-a_1".into(),
+            renew: Duration::from_secs(2),
+            duration: Duration::from_secs(6),
+        },
+    );
+    assert_eq!(
+        elector.look(Instant::now(), now_ns()).await,
+        Ok(Standing::Held)
+    );
+    elector
+}
+
+/// One renewal the API server never answers is followed by the next at
+/// once, so the Lease is never a whole duration unrenewed under a writer
+/// serving (the spec's section 2: Patroni's rule, loop_wait + 2 x
+/// retry_timeout <= ttl). Tried `renew` after the one that gave up, the
+/// next landed a whole Lease after the last, and a standby looking took it
+/// as lapsed (c5c-ci1's local reconfigure on 9479a69c: the conductor's
+/// writer fbt2r, a renewal unanswered at 01:32:03, its next refused at
+/// 01:32:06 by its standby's take, recorded "the writer's lease lapsed").
+#[tokio::test(start_paused = true)]
+async fn a_renewal_never_answered_is_followed_at_once_and_the_lease_never_goes_its_duration_unrenewed(
+) {
+    let api = Unreliable::default();
+    let elector = holding_on(&api).await;
+    api.writes_unanswered.store(1, Ordering::SeqCst);
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let said = Arc::clone(&stepped);
+    let renewing = tokio::spawn(renew_while_writing(
+        Arc::new(tokio::sync::Mutex::new(elector)),
+        "bor",
+        move |_, why| said.lock().unwrap().push(why.to_string()),
+    ));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    renewing.abort();
+    assert_eq!(*stepped.lock().unwrap(), Vec::<String>::new());
+    let landed = api.landed.lock().unwrap().clone();
+    assert!(landed.len() >= 6, "renewed {} times in 20 s", landed.len());
+    let longest = landed.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(
+        longest < Duration::from_secs(6),
+        "the Lease went {longest:?} between renewals that landed: its whole duration, so a \
+         standby takes it as lapsed under a writer serving"
+    );
+}
+
+/// A planned stop gives the Lease up although the renewal before it
+/// failed: what that look left seen is never what a release rests on
+/// (reconfigure, "ha databases added": the book's group-1 writer, stopped at
+/// 01:31:39, still named on its Lease at 01:32:04, the API server failing
+/// reads from 01:32:02; its standby took it as lapsed at 01:32:11).
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_gives_the_lease_up_after_a_renewal_that_failed() {
+    let api = Unreliable::default();
+    let mut elector = holding_on(&api).await;
+    api.reads_failing.store(1, Ordering::SeqCst);
+    assert!(elector.look(Instant::now(), now_ns()).await.is_err());
+    release_on_stop(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert_eq!(
+        api.holder(),
+        "",
+        "the stop left its Lease to lapse: its standby waits it out"
+    );
+}
+
+/// The same where the renewal before it was written and its answer lost,
+/// as a renewal cut at its bound is: the release is written on what is
+/// there now, never on the version that renewal left seen.
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_gives_the_lease_up_after_a_renewal_whose_answer_was_lost() {
+    let api = Unreliable::default();
+    let mut elector = holding_on(&api).await;
+    api.answers_lost.store(1, Ordering::SeqCst);
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        elector.look(Instant::now(), now_ns())
+    )
+    .await
+    .is_err());
+    release_on_stop(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert_eq!(
+        api.holder(),
+        "",
+        "the stop left its Lease to lapse: its standby waits it out"
+    );
+}
+
+/// A planned stop whose release the API server failed tries it again while
+/// the Lease lasts: one failed request never leaves the Lease to lapse.
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_whose_release_failed_tries_it_again() {
+    let api = Unreliable::default();
+    let elector = holding_on(&api).await;
+    api.writes_failing.store(1, Ordering::SeqCst);
+    release_on_stop(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert_eq!(
+        api.holder(),
+        "",
+        "the stop left its Lease to lapse: its standby waits it out"
+    );
+}
+
+/// A planned stop never clears a Lease another member took, and gives up
+/// trying within the Lease's duration where the API server never answers:
+/// past it, the Lease has lapsed on its own.
+#[tokio::test(start_paused = true)]
+async fn a_planned_stop_never_clears_a_lease_another_took_and_ends_within_the_lease() {
+    let api = Unreliable::default();
+    let elector = holding_on(&api).await;
+    {
+        let mut held = api.held.lock().unwrap();
+        let current = held.as_mut().unwrap();
+        current.holder = "bor-c_1".into();
+        current.resource_version = "9".into();
+    }
+    release_on_stop(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert_eq!(
+        api.holder(),
+        "bor-c_1",
+        "a Lease another member took was cleared"
+    );
+
+    let api = Unreliable::default();
+    let elector = holding_on(&api).await;
+    api.writes_unanswered.store(1_000, Ordering::SeqCst);
+    let began = tokio::time::Instant::now();
+    release_on_stop(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert!(
+        began.elapsed() <= Duration::from_secs(6),
+        "it waited {:?} to give the Lease up",
+        began.elapsed()
+    );
+}
+
+/// A writer stepping down whose first read of its Lease failed tries again
+/// within its bound ([`STEP_DOWN_RELEASE`]): one failed request never
+/// leaves the Lease to lapse.
+#[tokio::test(start_paused = true)]
+async fn a_writer_stepping_down_whose_first_read_failed_gives_its_lease_up_within_the_bound() {
+    let api = Unreliable::default();
+    let elector = holding_on(&api).await;
+    api.reads_failing.store(1, Ordering::SeqCst);
+    let began = tokio::time::Instant::now();
+    let_go_stepping_down(&tokio::sync::Mutex::new(elector), "bor").await;
+    assert!(began.elapsed() <= STEP_DOWN_RELEASE);
+    assert_eq!(
+        api.holder(),
+        "",
+        "the step-down left its Lease to lapse: its standby waits it out"
+    );
+}
+
+/// A renewal cut at its bound whose write lands late, between the next
+/// renewal's read and its write, refuses that write as written meanwhile:
+/// the Lease still names this writer, which renews on, never stepping down
+/// as though another held it ("another member (<its own name>) holds the
+/// lease": the conductor's writer in c5c-ci1's local reconfigure).
+#[tokio::test(start_paused = true)]
+async fn a_renewal_landing_late_is_no_other_holder_and_the_writer_renews_on() {
+    let api = Unreliable {
+        latency: Duration::from_millis(300),
+        late_by: Duration::from_millis(1_900),
+        ..Unreliable::default()
+    };
+    let elector = holding_on(&api).await;
+    api.writes_late.store(1, Ordering::SeqCst);
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let said = Arc::clone(&stepped);
+    let renewing = tokio::spawn(renew_while_writing(
+        Arc::new(tokio::sync::Mutex::new(elector)),
+        "bor",
+        move |_, why| said.lock().unwrap().push(why.to_string()),
+    ));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    renewing.abort();
+    assert_eq!(*stepped.lock().unwrap(), Vec::<String>::new());
+    assert_eq!(api.holder(), "bor-a_1");
+    let landed = api.landed.lock().unwrap().clone();
+    let longest = landed.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(
+        longest < Duration::from_secs(6),
+        "the Lease went {longest:?} between renewals that landed"
+    );
+}

@@ -374,6 +374,11 @@ pub type NewerLook = dyn Fn() -> Result<bool, String> + Send + Sync;
 /// ends (ruled 2026-11-16): past it, the lease lapses on its own.
 pub const STEP_DOWN_RELEASE: Duration = Duration::from_secs(1);
 
+/// How soon a release the API server failed is tried again, within its
+/// bound: a request refused at once (the API server restarting, its
+/// connection reset) is asked again, rather than leaving the lease to lapse.
+pub const RELEASE_TRIED_EVERY: Duration = Duration::from_millis(200);
+
 /// What a standby's lag is held under by default where the chart says
 /// nothing: five seconds, a tail far behind any healthy writer's.
 pub const READY_LAG_DEFAULT_MS: u64 = 5_000;
@@ -964,67 +969,10 @@ impl Holding {
                     }
                 }
             });
-            // The API server lost (contract v30, stage C; the resilience
-            // spec's section 2, approved 2026-11-10): a renewal that fails --
-            // the API server not answering -- never moves this writer. It
-            // keeps writing, and stays ready, while its commits pass the
-            // epoch, as Patroni's failsafe_mode keeps a primary through its
-            // store's outage: nobody can take a lease the API server cannot
-            // grant, and a takeover that did would raise the epoch, which
-            // refuses this writer's next commit (and the loop above finds).
-            // Each renewal gives up within one renew.
-            let mut unrenewed_since: Option<Instant> = None;
-            loop {
-                tokio::time::sleep(renew).await;
-                if meridian_changes::fenced_seen() {
-                    let_go_stepping_down(&elector, component).await;
-                    step_down(
-                        component,
-                        "a commit of this writer was refused by a newer epoch",
-                    );
-                }
-                // Given up on a planned stop: not looked at again, so a
-                // member still stopping is never told another holds it, and
-                // steps down only once a commit of its own is refused.
-                if elector.lock().await.gave_up() {
-                    continue;
-                }
-                let looked = tokio::time::timeout(renew, async {
-                    elector.lock().await.look(Instant::now(), now_ns()).await
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(format!(
-                        "the API server did not answer within {} s",
-                        renew.as_secs()
-                    ))
-                });
-                match looked {
-                    Ok(Standing::Held) => {
-                        if let Some(since) = unrenewed_since.take() {
-                            tracing::info!(
-                                component,
-                                unrenewed_s = since.elapsed().as_secs(),
-                                "the lease is renewed again; this writer wrote on under its epoch meanwhile"
-                            );
-                        }
-                    }
-                    Ok(Standing::HeldBy(holder)) => step_down(
-                        component,
-                        &format!("another member ({holder}) holds the lease"),
-                    ),
-                    Err(failed) => {
-                        if unrenewed_since.is_none() {
-                            tracing::warn!(
-                                component,
-                                %failed,
-                                "the lease could not be renewed: writing on under the epoch, which refuses this writer's commits if another takes over"
-                            );
-                        }
-                        unrenewed_since.get_or_insert_with(Instant::now);
-                    }
-                }
-            }
+            renew_while_writing(elector, component, |component, why| {
+                step_down(component, why)
+            })
+            .await;
         });
     }
 
@@ -1042,10 +990,149 @@ impl Holding {
     }
 
     /// Give the lease up on a planned stop: the standby takes over at its
-    /// next look rather than after the lease lapses.
+    /// next look rather than after the lease lapses ([`release_on_stop`]).
     pub async fn release(&self) {
         if let Some(elector) = &self.elector {
-            elector.lock().await.release(now_ns()).await;
+            release_on_stop(elector, self.component).await;
+        }
+    }
+}
+
+/// A writer's lease given up on a planned stop ([`Holding::release`]): read
+/// again and released where it still names this member, by a write
+/// conditional on the version read, a request that failed tried again
+/// every [`RELEASE_TRIED_EVERY`] for as long as the lease lasts unrenewed --
+/// past that it has lapsed on its own. Never on what its last renewal left
+/// seen: a renewal that failed left nothing, and one whose answer was lost
+/// left a version gone, and either stop left the lease to lapse, said
+/// nowhere (reconfigure, "ha databases added", c5c-ci1's local run on
+/// 9479a69c: the book's group-1 writer, stopped at 01:31:39, still named on
+/// its lease at 01:32:04; its standby took it as lapsed at 01:32:11).
+pub(crate) async fn release_on_stop<L: Leases>(
+    elector: &tokio::sync::Mutex<Elector<L>>,
+    component: &str,
+) {
+    let mut elector = elector.lock().await;
+    let until = tokio::time::Instant::now() + elector.settings().duration;
+    let released = tokio::time::timeout_at(
+        until,
+        elector.release_if_mine_by(now_ns(), until, RELEASE_TRIED_EVERY),
+    )
+    .await;
+    match released {
+        Ok(Ok(true)) => tracing::info!(component, "stopping: the lease is released"),
+        Ok(Ok(false)) => {}
+        Ok(Err(failed)) => {
+            tracing::warn!(component, %failed, "stopping: the lease could not be released; it lapses on its own")
+        }
+        Err(_) => tracing::warn!(
+            component,
+            "stopping: the lease was not released within its duration; it lapses on its own"
+        ),
+    }
+}
+
+/// A writer's renewals of the lease it holds, from its take until it steps
+/// down with `down`: [`Holding::keep`]'s half that keeps the lease.
+///
+/// A renewal is begun every renew from when the one before it began, and
+/// each gives up within one renew: one the API server never answered is
+/// followed by the next at once, so two are tried within the renew and two
+/// more renews after the last that landed -- the spec's Patroni rule
+/// (`loop_wait + 2 x retry_timeout <= ttl`, section 2), which the chart
+/// holds the lease's duration to. Begun a renew after the one that gave
+/// up, the next landed a whole lease after the last, and a standby looking
+/// took the lease as lapsed under a writer serving (c5c-ci1's local
+/// reconfigure on 9479a69c: the conductor's writer, a renewal unanswered at
+/// 01:32:03, its next refused at 01:32:06 by its standby's take, recorded
+/// "the writer's lease lapsed").
+async fn renew_while_writing<L, D>(
+    elector: Arc<tokio::sync::Mutex<Elector<L>>>,
+    component: &'static str,
+    down: D,
+) where
+    L: Leases + 'static,
+    D: Fn(&'static str, &str) + Send + Sync + 'static,
+{
+    let (renew, me) = {
+        let elector = elector.lock().await;
+        (elector.settings().renew, elector.settings().holder.clone())
+    };
+    // The API server lost (contract v30, stage C; the resilience spec's
+    // section 2, approved 2026-11-10): a renewal that fails -- the API
+    // server not answering -- never moves this writer. It keeps writing,
+    // and stays ready, while its commits pass the epoch, as Patroni's
+    // failsafe_mode keeps a primary through its store's outage: nobody can
+    // take a lease the API server cannot grant, and a takeover that did
+    // would raise the epoch, which refuses this writer's next commit (and
+    // the epoch's own loop finds). Each renewal gives up within one renew.
+    let mut unrenewed_since: Option<Instant> = None;
+    let mut next = tokio::time::Instant::now() + renew;
+    loop {
+        tokio::time::sleep_until(next).await;
+        next = tokio::time::Instant::now() + renew;
+        if meridian_changes::fenced_seen() {
+            let_go_stepping_down(&elector, component).await;
+            return down(
+                component,
+                "a commit of this writer was refused by a newer epoch",
+            );
+        }
+        // Given up on a planned stop: not looked at again, so a member
+        // still stopping is never told another holds it, and steps down
+        // only once a commit of its own is refused.
+        if elector.lock().await.gave_up() {
+            continue;
+        }
+        let looked = tokio::time::timeout(renew, async {
+            elector.lock().await.look(Instant::now(), now_ns()).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "the API server did not answer within {} s",
+                renew.as_secs()
+            ))
+        });
+        match looked {
+            Ok(Standing::Held) => {
+                if let Some(since) = unrenewed_since.take() {
+                    tracing::info!(
+                        component,
+                        unrenewed_s = since.elapsed().as_secs(),
+                        "the lease is renewed again; this writer wrote on under its epoch meanwhile"
+                    );
+                }
+            }
+            Ok(Standing::HeldBy(holder)) if holder != me => {
+                return down(
+                    component,
+                    &format!("another member ({holder}) holds the lease"),
+                )
+            }
+            // A write came between this renewal's read, which named this
+            // writer, and its own: its last renewal, cut at its bound and
+            // landing late, or a standby's take. Unrenewed, and read again
+            // at the next renewal, which says which.
+            Ok(Standing::HeldBy(_)) => {
+                if unrenewed_since.is_none() {
+                    tracing::warn!(
+                        component,
+                        "the lease could not be renewed: written meanwhile; read again at the next renewal"
+                    );
+                }
+                unrenewed_since.get_or_insert_with(Instant::now);
+            }
+            Err(failed) => {
+                if unrenewed_since.is_none() {
+                    tracing::warn!(
+                        component,
+                        %failed,
+                        "the lease could not be renewed: writing on under the epoch, which refuses this writer's commits if another takes over"
+                    );
+                }
+                unrenewed_since.get_or_insert_with(Instant::now);
+            }
         }
     }
 }
@@ -1054,7 +1141,13 @@ impl Holding {
 /// [`STEP_DOWN_RELEASE`]: read again, and released only where it still
 /// names this member (`release_if_mine`).
 async fn give_up_if_mine<L: Leases>(elector: &mut Elector<L>, component: &str) {
-    match tokio::time::timeout(STEP_DOWN_RELEASE, elector.release_if_mine(now_ns())).await {
+    let until = tokio::time::Instant::now() + STEP_DOWN_RELEASE;
+    match tokio::time::timeout_at(
+        until,
+        elector.release_if_mine_by(now_ns(), until, RELEASE_TRIED_EVERY),
+    )
+    .await
+    {
         Ok(Ok(true)) => tracing::info!(component, "stopping: the lease given up"),
         Ok(Ok(false)) => {}
         Ok(Err(failed)) => {
@@ -1077,8 +1170,13 @@ pub async fn let_go_stepping_down<L: Leases>(
     elector: &tokio::sync::Mutex<Elector<L>>,
     component: &str,
 ) {
-    let released = tokio::time::timeout(STEP_DOWN_RELEASE, async {
-        elector.lock().await.release_if_mine(now_ns()).await
+    let until = tokio::time::Instant::now() + STEP_DOWN_RELEASE;
+    let released = tokio::time::timeout_at(until, async {
+        elector
+            .lock()
+            .await
+            .release_if_mine_by(now_ns(), until, RELEASE_TRIED_EVERY)
+            .await
     })
     .await;
     match released {

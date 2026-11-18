@@ -527,11 +527,45 @@ impl<L: Leases> Elector<L> {
     pub async fn release_if_mine(&mut self, wall_ns: i64) -> Result<bool, String> {
         self.gave_up = true;
         self.renewed_at = None;
+        Ok(self.release_once(wall_ns).await? == Released::Yes)
+    }
+
+    /// [`Elector::release_if_mine`], tried again until it is written or the
+    /// lease names another member or nobody: a read or a write the API
+    /// server failed, and a write another came before -- this member's own
+    /// renewal whose answer was lost, landing late -- each tried again
+    /// `every` after, while `until` allows. Says whether it was released,
+    /// or why not where `until` came first. Bounded by the caller: a request
+    /// out at `until` is the caller's to cut.
+    pub async fn release_if_mine_by(
+        &mut self,
+        wall_ns: i64,
+        until: tokio::time::Instant,
+        every: Duration,
+    ) -> Result<bool, String> {
+        self.gave_up = true;
+        self.renewed_at = None;
+        loop {
+            let why = match self.release_once(wall_ns).await {
+                Ok(Released::Yes) => return Ok(true),
+                Ok(Released::NotMine) => return Ok(false),
+                Ok(Released::Raced) => "another write came first".to_string(),
+                Err(failed) => failed,
+            };
+            if tokio::time::Instant::now() + every >= until {
+                return Err(why);
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// One read, and one release written on it where it names this member.
+    async fn release_once(&self, wall_ns: i64) -> Result<Released, String> {
         let Some(current) = self.api.get(&self.settings.name).await? else {
-            return Ok(false);
+            return Ok(Released::NotMine);
         };
         if current.holder != self.settings.holder {
-            return Ok(false);
+            return Ok(Released::NotMine);
         }
         let record = Record {
             holder: String::new(),
@@ -539,11 +573,22 @@ impl<L: Leases> Elector<L> {
             renew_time: micro_time(wall_ns),
             ..current
         };
-        Ok(matches!(
-            self.api.update(&self.settings.name, &record).await?,
-            Wrote::Done(_)
-        ))
+        Ok(match self.api.update(&self.settings.name, &record).await? {
+            Wrote::Done(_) => Released::Yes,
+            Wrote::Conflict => Released::Raced,
+        })
     }
+}
+
+/// What one release found ([`Elector::release_if_mine`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Released {
+    /// Written: the lease names nobody.
+    Yes,
+    /// It names another member or nobody, or is not there: left alone.
+    NotMine,
+    /// Another write came between the read and the release.
+    Raced,
 }
 
 /// Whether two records are the same holding unrenewed: any write, a renew
