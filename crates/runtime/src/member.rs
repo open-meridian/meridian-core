@@ -1521,7 +1521,7 @@ async fn follow(
                 if unchecked.contains(&partition) {
                     let check = Lineage { bus: &bus, domain, following: following.as_ref() };
                     check
-                        .read_back(&mut unchecked, &mut at, &mut applied, &mut chains)
+                        .read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps)
                         .await;
                     if unchecked.is_empty() {
                         unchecked_since = None;
@@ -1543,7 +1543,7 @@ async fn follow(
                 if contiguous {
                     if let Err(failed) = verified(domain, &mut chains, &page.changes) {
                         tracing::error!(domain, partition, %failed, "a change did not verify; not followed");
-                        Gap::found(&mut gaps, &partition, at.get(&partition).copied().unwrap_or(0), page.head);
+                        Gap::found(&mut gaps, &partition, at.get(&partition).copied(), page.head);
                         continue;
                     }
                 }
@@ -1568,7 +1568,7 @@ async fn follow(
                     }
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
-                        Gap::found(&mut gaps, &partition, held, page.head);
+                        Gap::found(&mut gaps, &partition, Some(held), page.head);
                         let applying = following.as_ref().map(|f| f.apply.as_ref());
                         match catch_up(&bus, domain, &partition, held, &mut chains, applying).await {
                             Ok((head, last)) => {
@@ -1634,7 +1634,7 @@ async fn follow(
                             unchecked_since.get_or_insert_with(Instant::now);
                             let check = Lineage { bus: &bus, domain, following: following.as_ref() };
                             check
-                                .read_back(&mut unchecked, &mut at, &mut applied, &mut chains)
+                                .read_back(&mut unchecked, &mut at, &mut applied, &mut chains, &mut gaps)
                                 .await;
                         }
                         if unchecked.is_empty() {
@@ -1675,32 +1675,48 @@ async fn follow(
     }
 }
 
-/// A page of a partition missed and not yet read: since when, where the
-/// partition stood when it was found, and the head of the latest page heard
-/// past it.
+/// A page of a partition missed and not yet read: since when, and the head
+/// of the latest page heard past it -- where the gap ends, unless the
+/// record no longer reaches that far.
 struct Gap {
     since: Instant,
-    from: u64,
     to: u64,
 }
 
 impl Gap {
-    /// A page heard past where `partition` stands: its gap opened, or the
-    /// one open reaching to this page too.
-    fn found(gaps: &mut HashMap<String, Gap>, partition: &str, from: u64, to: u64) {
-        let gap = gaps.entry(partition.to_string()).or_insert(Gap {
-            since: Instant::now(),
-            from,
-            to,
-        });
-        gap.to = gap.to.max(to);
+    /// A page heard past where `partition` stands at `held`, its head `to`:
+    /// the gap still open reaching to this page too, or one opened from
+    /// now -- never a gap let go meanwhile, its since and its end another
+    /// gap's (review-c5c-ci1 H1: one found again after a reload below it
+    /// was let go as below it, the reader ready while behind).
+    fn found(gaps: &mut HashMap<String, Gap>, partition: &str, held: Option<u64>, to: u64) {
+        match gaps.get_mut(partition) {
+            Some(gap) if gap.open(held) => gap.to = gap.to.max(to),
+            _ => {
+                gaps.insert(
+                    partition.to_string(),
+                    Gap {
+                        since: Instant::now(),
+                        to,
+                    },
+                );
+            }
+        }
     }
 
-    /// Still open where its partition now stands at `held`: not yet at the
-    /// page that found it, and not reloaded below where it stood (a
-    /// read-back's reload at the record's head holds the record's all).
+    /// The record's head of `partition` learnt: its gap ends there at the
+    /// latest, a page past it lost with the record's tail. A partition
+    /// held at it holds all the record does, however it came to.
+    fn ends_at(gaps: &mut HashMap<String, Gap>, partition: &str, head: u64) {
+        if let Some(gap) = gaps.get_mut(partition) {
+            gap.to = gap.to.min(head);
+        }
+    }
+
+    /// Still open where its partition now stands at `held`: not yet at its
+    /// end.
     fn open(&self, held: Option<u64>) -> bool {
-        held.is_some_and(|held| held >= self.from && held < self.to)
+        held.is_some_and(|held| held < self.to)
     }
 }
 
@@ -1871,6 +1887,7 @@ impl Lineage<'_> {
         at: &mut HashMap<String, u64>,
         applied: &mut HashMap<String, Applied>,
         chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+        gaps: &mut HashMap<String, Gap>,
     ) {
         let domain = self.domain;
         for partition in unchecked.clone() {
@@ -1921,6 +1938,9 @@ impl Lineage<'_> {
             }
             chains.remove(&partition);
             applied.remove(&partition);
+            // Reloaded at the record's head: all the record holds is held,
+            // and a gap found before ends here.
+            Gap::ends_at(gaps, &partition, head);
             at.insert(partition, head);
         }
     }

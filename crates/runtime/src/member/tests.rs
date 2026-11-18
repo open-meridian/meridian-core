@@ -417,6 +417,265 @@ async fn a_gap_caught_up_by_the_reconcile_leaves_no_lag() {
     until("no lag once caught up", || said().lag_ms() < 1_000).await;
 }
 
+/// A writer's record the test shapes, partition by partition, as a database
+/// failover and a loaded writer shape it: each partition's head; the epoch
+/// now and the sequence from which each change was written again under it
+/// (a tail the failover lost, taken again); the epoch its `control`
+/// answers with; and the catch-ups it refuses -- the reads of a whole page
+/// (`page_size` 0, which a read-back's and an ask's never are), as a
+/// writer's read times out under load -- while it answers everything else.
+/// Its changes are chained, as the book's journal is, and a catch-up reads
+/// one to a page.
+struct Record {
+    shape: Mutex<Shape>,
+}
+
+#[derive(Default)]
+struct Shape {
+    heads: HashMap<String, u64>,
+    epoch: u64,
+    lost_from: u64,
+    control_epoch: u64,
+    /// Catch-ups answered (true) or refused (false) in turn, before
+    /// `refusing` says.
+    script: std::collections::VecDeque<bool>,
+    /// The partitions whose catch-ups are refused.
+    refusing: std::collections::HashSet<String>,
+    /// Nothing answered, `control` included: the database failing over.
+    down: bool,
+}
+
+impl Record {
+    fn of(heads: &[(&str, u64)]) -> Arc<Self> {
+        Arc::new(Self {
+            shape: Mutex::new(Shape {
+                heads: heads.iter().map(|(p, h)| (p.to_string(), *h)).collect(),
+                epoch: 2,
+                lost_from: u64::MAX,
+                control_epoch: 2,
+                ..Shape::default()
+            }),
+        })
+    }
+
+    fn shape(&self, change: impl FnOnce(&mut Shape)) {
+        change(&mut self.shape.lock().unwrap());
+    }
+
+    fn head(&self, partition: &str, head: u64) {
+        self.shape(|shape| {
+            shape.heads.insert(partition.to_string(), head);
+        });
+    }
+
+    fn refuse(&self, partition: &str, refused: bool) {
+        self.shape(|shape| {
+            if refused {
+                shape.refusing.insert(partition.to_string());
+            } else {
+                shape.refusing.remove(partition);
+            }
+        });
+    }
+
+    /// The database lost `partition`'s changes from `from` on and the writer
+    /// took over at `epoch`: its head back below them.
+    fn lose(&self, partition: &str, from: u64, epoch: u64) {
+        self.shape(|shape| {
+            shape.heads.insert(partition.to_string(), from - 1);
+            shape.lost_from = from;
+            shape.epoch = epoch;
+        });
+    }
+
+    fn change(&self, partition: &str, sequence: u64) -> Change {
+        let (lost_from, epoch) = {
+            let shape = self.shape.lock().unwrap();
+            (shape.lost_from, shape.epoch)
+        };
+        let body = |sequence: u64| vec![if sequence >= lost_from { 2 } else { 1 }; 16];
+        let mut digest = Vec::new();
+        for at in 1..=sequence {
+            digest = meridian_changes::integrity::chained(&digest, &body(at));
+        }
+        Change {
+            partition: partition.into(),
+            sequence,
+            epoch: if sequence >= lost_from { epoch } else { 2 },
+            origin: "DEP-1".into(),
+            committed_at_ns: sequence as i64,
+            kind: "entry".into(),
+            body: body(sequence),
+            digest,
+        }
+    }
+
+    fn primary(self: &Arc<Self>) -> Arc<dyn meridian_bus::read_after::Position> {
+        let record = Arc::clone(self);
+        Arc::new(meridian_bus::read_after::AllHeads(move || {
+            let shape = record.shape.lock().unwrap();
+            Ok(shape.heads.iter().map(|(p, h)| (p.clone(), *h)).collect())
+        }))
+    }
+}
+
+impl ChangeLog for Record {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most: usize,
+    ) -> Result<ReadChangesReply, ReadError> {
+        let (head, epoch) = {
+            let mut shape = self.shape.lock().unwrap();
+            if shape.down {
+                return Err(ReadError::Unavailable(
+                    "the database is failing over".into(),
+                ));
+            }
+            if partition == meridian_changes::CONTROL {
+                return Ok(ReadChangesReply {
+                    head: 0,
+                    epoch: shape.control_epoch,
+                    ..Default::default()
+                });
+            }
+            let catching_up = most == meridian_changes::PAGE_MOST;
+            if catching_up {
+                let answered = match shape.script.pop_front() {
+                    Some(answered) => answered,
+                    None => !shape.refusing.contains(partition),
+                };
+                if !answered {
+                    return Err(ReadError::Unavailable("the read timed out".into()));
+                }
+            }
+            (
+                shape.heads.get(partition).copied().unwrap_or(0),
+                shape.epoch,
+            )
+        };
+        let changes = ((after + 1)..=head)
+            .take(if most == meridian_changes::PAGE_MOST {
+                1
+            } else {
+                most
+            })
+            .map(|sequence| self.change(partition, sequence))
+            .collect();
+        Ok(ReadChangesReply {
+            changes,
+            head,
+            lowest_kept: 1,
+            epoch,
+            after_sequence: after,
+        })
+    }
+}
+
+/// A book reader of `record`, started at `start`, ready while its lag is
+/// under a second, once the writer has its interest and has been asked.
+async fn reading(
+    name: &str,
+    record: &Arc<Record>,
+    start: &[(&str, u64)],
+) -> (Arc<Bus>, Arc<Followed>, Arc<Applied>) {
+    let bus = Arc::new(Bus::single(
+        name,
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    meridian_changes::serve(&bus, "book", record.clone());
+    let applied = Arc::new(Applied::default());
+    let member = Member::reader_of("bor", "book", Duration::from_secs(1));
+    let followed =
+        crate::member::Followed::from_heads(start.iter().map(|(p, h)| (p.to_string(), *h)));
+    member
+        .read(&bus, followed.clone(), applied.clone(), record.primary())
+        .unwrap();
+    until("the reader's interest", || {
+        meridian_changes::followed(&bus, "book")
+    })
+    .await;
+    // Reconciled with its primary as its writer first answered.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    (bus, followed, applied)
+}
+
+/// Whether this process's member says it is ready.
+fn ready() -> bool {
+    SERVING.load(Ordering::SeqCst)
+}
+
+/// Neither ready nor moved from `head` of `partition`, sampled for `long`.
+async fn held_unready(followed: &Followed, partition: &str, head: u64, long: Duration) {
+    let until = Instant::now() + long;
+    while Instant::now() < until {
+        assert_eq!(
+            followed.heads().get(partition),
+            Some(&head),
+            "{partition} moved"
+        );
+        assert!(
+            !ready(),
+            "ready at {} ms of lag, {partition} held at {head} with a gap unread",
+            said().lag_ms()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A gap whose partition a read-back reloaded below where the gap was found
+/// stays the partition's until a page heard past the reload is read: the
+/// reload holds the record as it then stood, and the new writer's later
+/// pages, missed and unread, leave the reader behind -- never ready while it
+/// lacks them (review-c5c-ci1 H1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_found_again_after_a_reload_below_it_keeps_the_reader_unready() {
+    let record = Record::of(&[("P0", 3)]);
+    let (bus, followed, applied) = reading("member-test-gap-reloaded", &record, &[("P0", 3)]).await;
+    record.head("P0", 5);
+    meridian_changes::publish(
+        &bus,
+        "book",
+        3,
+        &[record.change("P0", 4), record.change("P0", 5)],
+    );
+    until("5 applied", || followed.heads().get("P0") == Some(&5)).await;
+
+    // 6 and 7 missed, 8 heard; its catch-up refused: the gap opens at 5.
+    record.refuse("P0", true);
+    record.head("P0", 8);
+    meridian_changes::publish(&bus, "book", 7, &[record.change("P0", 8)]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The database failed over and lost 4 to 8; the new writer writes 4
+    // again, its page read back at once from the tail: the partition is
+    // reloaded at the record's head, 4.
+    record.lose("P0", 4, 3);
+    record.head("P0", 4);
+    meridian_changes::publish(&bus, "book", 3, &[record.change("P0", 4)]);
+    until("P0 reloaded at 4", || {
+        followed.heads().get("P0") == Some(&4)
+    })
+    .await;
+    assert_eq!(*applied.resets.lock().unwrap(), vec!["P0".to_string()]);
+    // It writes 5 to 7: 5 and 6 missed, 7 heard, its catch-up refused.
+    record.head("P0", 7);
+    meridian_changes::publish(&bus, "book", 6, &[record.change("P0", 7)]);
+    // Behind by 5 to 7, unread: unready, past its bound and a tick.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    held_unready(&followed, "P0", 4, Duration::from_secs(2)).await;
+    // Read once the writer answers the catch-up.
+    record.refuse("P0", false);
+    record.head("P0", 8);
+    meridian_changes::publish(&bus, "book", 7, &[record.change("P0", 8)]);
+    until("8 read", || followed.heads().get("P0") == Some(&8)).await;
+    until("ready once caught up", || {
+        ready() && said().lag_ms() < 1_000
+    })
+    .await;
+}
+
 #[test]
 fn a_member_with_no_lease_writes_at_once() {
     let member = Member::sole("street");
