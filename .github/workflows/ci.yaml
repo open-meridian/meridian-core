@@ -889,20 +889,25 @@ jobs:
           # Step 3b's runs: the profile, and the agents (in three zones).
           PROFILE: ${{ matrix.profile || 'tolerant' }}
           AGENTS: ${{ matrix.agents || 0 }}
+        # Teed to a file the steps after it keep, its exit status unchanged.
         run: |
+          set -o pipefail
           zones=""
           if [ "$AGENTS" != 0 ]; then zones="zone-a zone-b zone-c"; fi
           make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"} \
-            PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones"
+            PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones" 2>&1 | tee "$RUNNER_TEMP/make.log"
 
-      # The watchdog's last samples in the job's log, and its file in an
-      # upload of its own before any other, so a hang in a later upload
-      # cannot lose it. Whatever the make did, and on a timeout too.
+      # The watchdog's last samples in the job's log, and the make's last
+      # lines and FAILED lines in the step summary, each kept in an upload
+      # of its own before any other, so a hang in a later upload cannot lose
+      # them. Whatever the make did, and on a timeout too.
       - name: Say what the watchdog saw
         if: always()
         timeout-minutes: 1
         working-directory: workspace/meridian-core
-        run: tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+        run: |
+          tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+          tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
 
       - name: Keep what the watchdog saw
         if: always()
@@ -911,7 +916,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-watchdog
-          path: ${{ runner.temp }}/watchdog.log
+          path: |
+            ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/make-tail.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -1195,16 +1202,22 @@ jobs:
         env:
           DOCKER_BUILDKIT: "1"
           BUILDX_BUILDER: default
-        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled
+        # Teed to a file the steps after it keep, its exit status unchanged.
+        run: |
+          set -o pipefail
+          make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled 2>&1 | tee "$RUNNER_TEMP/make.log"
 
-      # The watchdog's last samples in the job's log, and its file in an
-      # upload of its own before any other, so a hang in a later upload
-      # cannot lose it. Whatever the make did, and on a timeout too.
+      # The watchdog's last samples in the job's log, and the make's last
+      # lines and FAILED lines in the step summary, each kept in an upload
+      # of its own before any other, so a hang in a later upload cannot lose
+      # them. Whatever the make did, and on a timeout too.
       - name: Say what the watchdog saw
         if: always()
         timeout-minutes: 1
         working-directory: workspace/meridian-core
-        run: tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+        run: |
+          tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+          tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
 
       - name: Keep what the watchdog saw
         if: always()
@@ -1213,7 +1226,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-cluster-arm64-watchdog
-          path: ${{ runner.temp }}/watchdog.log
+          path: |
+            ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/make-tail.log
           if-no-files-found: warn
           retention-days: 14
 

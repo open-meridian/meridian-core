@@ -12,6 +12,14 @@
 #
 #   ci-watchdog.sh start <file>   start the sampler, detached, and return
 #   ci-watchdog.sh tail <file>    the file's last 40 lines
+#   ci-watchdog.sh make-tail <make-log> <out>
+#                                 the make's last 200 lines and the e2e's
+#                                 FAILED lines (its own .e2e-*.log files in
+#                                 the working directory too) into <out>, and
+#                                 into the step summary: a fourth run on
+#                                 2026-11-19 failed its make at 5.7 minutes
+#                                 and hung in the logs' upload after it, so
+#                                 why it failed is kept before that upload
 #
 # Each sample: the time and load; `free -m`; `df -h` of / and of Docker's
 # root; the five processes holding the most memory; `docker stats
@@ -26,8 +34,8 @@
 
 set -euo pipefail
 
-usage() { echo "usage: $0 start|tail <file>" >&2; exit 2; }
-[ $# -eq 2 ] || usage
+usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out>" >&2; exit 2; }
+[ $# -eq 2 ] || { [ $# -eq 3 ] && [ "$1" = make-tail ]; } || usage
 cmd=$1 file=$2
 every=${WATCHDOG_EVERY:-5}
 
@@ -96,6 +104,19 @@ case $cmd in
       tail -n 40 "$file"
     else
       echo "ci-watchdog: $file is missing or empty; the sampler never started or wrote nothing"
+    fi
+    ;;
+  make-tail)
+    out=$3
+    {
+      echo "== FAILED lines: the make's, then the e2e's own logs'"
+      grep -h -E 'FAILED' "$file" .e2e-*.log 2>/dev/null | tail -n 100 || true
+      echo "== the make's last 200 lines"
+      if [ -s "$file" ]; then tail -n 200 "$file"; else echo "(no make output at $file)"; fi
+    } >"$out"
+    cat "$out"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      { echo "### What the make said, before any upload"; echo '```'; cat "$out"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
     fi
     ;;
   *) usage ;;
