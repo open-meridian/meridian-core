@@ -815,20 +815,22 @@ fn run() -> Result<(), String> {
         }
         // A rollout keeps the store's public topics served (stage T).
         // Fenced meanwhile -- the count lowered, another group's writer
-        // taking its partitions over before it serves -- it writes nothing
-        // more and answers each request "ask again" until its serve-on
-        // ends (ruled 2026-11-18, item 110). One that already hands every
-        // write on, with no lease, goes on handing them on.
-        let refusing = bus.clone();
+        // taking its partitions over before it serves -- it commits nothing
+        // more through any database, at the fence, and answers each request
+        // "ask again" until its serve-on ends (ruled 2026-11-18, item 110;
+        // review-c5n2 M2). One that already hands every write on, with no
+        // lease, goes on handing them on.
+        let stopping = every_database.clone();
         holding
             .serve_on_until_another_group_serves(
                 groups.mine(),
                 groups.count(),
                 meridian_runtime::now_ns(),
                 another_serves,
+                &bus,
                 move || {
-                    if !refusing.writes_nothing_here() {
-                        refusing.refuse_from_here();
+                    for store in &stopping {
+                        store.stop_committing();
                     }
                 },
             )

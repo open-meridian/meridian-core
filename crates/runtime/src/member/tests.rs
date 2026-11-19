@@ -3772,3 +3772,140 @@ async fn a_writer_fenced_by_another_group_ends_once_its_own_groups_successor_tak
     );
     assert!(!serving.is_finished(), "its serve-on ended");
 }
+
+/// A writer fenced while it serves on stops writing at the fence itself,
+/// before its lease is given up -- up to 1 s -- not after it (review-c5n2
+/// M2): meanwhile its handlers ran, and its commits to partitions nobody
+/// raised were admitted.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_stops_before_its_lease_is_given_up() {
+    let api = Unreliable {
+        latency: Duration::from_millis(400),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let landed_before = api.landed.lock().unwrap().len();
+    let began = tokio::time::Instant::now();
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        |_, _| {},
+    ));
+    let refused_at = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
+    let refusing = Arc::clone(&refused_at);
+    let _serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                move || *refusing.lock().unwrap() = Some(tokio::time::Instant::now()),
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    watching.abort();
+    let refused = refused_at
+        .lock()
+        .unwrap()
+        .expect("fenced while serving on, it never stopped");
+    let released = *api
+        .landed
+        .lock()
+        .unwrap()
+        .get(landed_before)
+        .expect("the lease was never given up");
+    assert_eq!(api.holder(), "", "the lease was not given up");
+    assert!(
+        refused < released,
+        "it stopped {:?} after it began, its lease given up {:?} after: it wrote on while it let go",
+        refused - began,
+        released - began
+    );
+    assert!(
+        refused - began < Duration::from_millis(2_100),
+        "it stopped {:?} after it began, its epoch's look finding 6 at 2 s",
+        refused - began
+    );
+}
+
+/// A writer fenced while it serves on commits nothing more through any of
+/// its databases from the fence -- a partition nobody raised included, its
+/// head still at the writer's epoch -- as a writer told to stop with no
+/// lease does, and refuses its topics to be asked again (review-c5n2 M2;
+/// item 110): before, only the commits whose partitions were raised were
+/// refused, and every task of the store went on writing up to 20 s.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_database() {
+    let holding = Holding {
+        elector: None,
+        component: "bor",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    holding.keep_or(|| 5, move || Ok(reading.load(Ordering::SeqCst)), |_, _| {});
+    let bus = Arc::new(Bus::single(
+        "member-test-fenced",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    // Each database's fence, at the writer's epoch.
+    let fences = Arc::new([
+        meridian_changes::Fence::new(),
+        meridian_changes::Fence::new(),
+    ]);
+    for fence in fences.iter() {
+        fence.adopt(5);
+    }
+    let (stopping, refusing) = (Arc::clone(&fences), Arc::clone(&bus));
+    let _serving = tokio::spawn(async move {
+        holding
+            .serve_on_until_another_group_serves(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                &refusing,
+                move || {
+                    for fence in stopping.iter() {
+                        fence.stop();
+                    }
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!bus.refuses_from_here(), "it refused before any fence");
+    assert_eq!(fences[1].admits(5), Ok(()), "it stopped before any fence");
+    // Another group's writer raised the epoch of one of its partitions.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for fence in fences.iter() {
+        assert_eq!(
+            fence.admits(5),
+            Err(meridian_changes::Fenced {
+                mine: meridian_changes::Fenced::STOPPED,
+                head: 5,
+            }),
+            "fenced while serving on, a commit to a partition nobody raised was admitted"
+        );
+    }
+    assert!(
+        bus.refuses_from_here(),
+        "fenced while serving on, it never refused its topics"
+    );
+}

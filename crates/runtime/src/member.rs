@@ -419,6 +419,26 @@ impl ServingOn {
         served
     }
 
+    /// This writer is fenced, seen now. Serving on, it writes nothing more
+    /// and refuses its topics from here -- `refuse`, run once -- at the
+    /// fence itself, before its lease is given up, up to
+    /// [`STEP_DOWN_RELEASE`] (review-c5n2 M2): its handlers and its
+    /// commits through every database, the epoch refusing only those of
+    /// partitions raised, were let run meanwhile. Not serving on, nothing.
+    fn fence(&self, component: &str) {
+        if *self.0.at.borrow() != SERVING_ON {
+            return;
+        }
+        let refuse = self.0.refuse.lock().expect("serving on poisoned").take();
+        if let Some(refuse) = refuse {
+            tracing::warn!(
+                component,
+                "fenced while serving on, told to stop: committing nothing more, and answering \"ask again\" until another writer group's writer serves or the serve-on's bound"
+            );
+            refuse();
+        }
+    }
+
     /// This writer is fenced, and about to step down. Not serving on:
     /// nothing, at once. Serving on: its topics are refused from here, and
     /// this waits for the serve-on's own end -- or, where it holds a lease,
@@ -436,14 +456,7 @@ impl ServingOn {
         if *at.borrow_and_update() != SERVING_ON {
             return;
         }
-        let refuse = self.0.refuse.lock().expect("serving on poisoned").take();
-        if let Some(refuse) = refuse {
-            tracing::warn!(
-                component,
-                "fenced while serving on, told to stop: writing nothing more, and answering \"ask again\" until another writer group's writer serves or the serve-on's bound"
-            );
-            refuse();
-        }
+        self.fence(component);
         let Some(elector) = elector else {
             let _ = at.wait_for(|at| *at == SERVED_ON).await;
             return;
@@ -491,9 +504,10 @@ async fn successor<L: Leases>(
     }
 }
 
-/// A writer fenced, before it steps down: its lease given up where it
-/// still names it (ruled 2026-11-16), then its serve-on waited out where
-/// it serves on, told to stop (ruled 2026-11-18, item 110;
+/// A writer fenced, before it steps down: serving on, told to stop, its
+/// commits stopped and its topics refused at once ([`ServingOn::fence`]);
+/// its lease given up where it still names it (ruled 2026-11-16); then its
+/// serve-on waited out where it serves on (ruled 2026-11-18, item 110;
 /// [`ServingOn`]) -- unless its own writer group's successor holds the
 /// lease.
 async fn fenced_stepping_down<L: Leases>(
@@ -501,6 +515,7 @@ async fn fenced_stepping_down<L: Leases>(
     elector: Option<&tokio::sync::Mutex<Elector<L>>>,
     component: &str,
 ) {
+    serving_on.fence(component);
     if let Some(elector) = elector {
         let_go_stepping_down(elector, component).await;
     }
@@ -1141,21 +1156,27 @@ impl Holding {
 
     /// [`serve_on_until_another_group_serves`] for this writer, told to
     /// stop at `told_at_ns`, and known to its fence's step-downs (ruled
-    /// 2026-11-18, item 110; [`ServingOn`]): fenced meanwhile, it is not
-    /// ready, `refuse` is run -- its store's topics refused from here, to
-    /// be asked again -- and it ends when this does, not at the fence.
-    pub async fn serve_on_until_another_group_serves<F, R>(
+    /// 2026-11-18, item 110; [`ServingOn`]): fenced meanwhile, at the fence
+    /// it is not ready, commits nothing more -- `stop_committing`, every
+    /// database's ([`meridian_changes::Fence::stop`]), as a writer with no
+    /// lease told to stop does (review-c5n2 M2) -- and refuses its store's
+    /// topics from here, to be asked again ([`Bus::refuse_from_here`]),
+    /// unless it already hands every write on, with no lease; and it ends
+    /// when this does, not at the fence.
+    pub async fn serve_on_until_another_group_serves<F, S>(
         &self,
         mine: u32,
         count: u32,
         told_at_ns: i64,
         look: F,
-        refuse: R,
+        bus: &Arc<Bus>,
+        stop_committing: S,
     ) -> ServedOn
     where
         F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
-        R: FnOnce() + Send + 'static,
+        S: FnOnce() + Send + 'static,
     {
+        let bus = Arc::clone(bus);
         self.serving_on
             .within(
                 mine,
@@ -1164,7 +1185,10 @@ impl Holding {
                 look,
                 move || {
                     crate::mark_ready(false);
-                    refuse()
+                    stop_committing();
+                    if !bus.writes_nothing_here() {
+                        bus.refuse_from_here();
+                    }
                 },
                 SERVES_ON_AT_MOST,
                 SERVES_ON_LOOKS_EVERY,
