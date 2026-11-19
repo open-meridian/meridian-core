@@ -5374,6 +5374,13 @@ fn epochs_of(
         .map_err(unavailable)?
     {
         let (group, epoch): (i32, i64) = (row.get(0), row.get(1));
+        // A group's row past the count is no live group's: a takeover at the
+        // count raises it with its own (review c5w's residual), so read as
+        // another's it would have the writer that took over take over again
+        // at every restart (review c5s, L1).
+        if group as u32 >= groups.count() {
+            continue;
+        }
         if group as u32 == groups.mine() {
             anchor = Some(epoch as u64);
         } else {
