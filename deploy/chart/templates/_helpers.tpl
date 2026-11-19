@@ -330,7 +330,31 @@ drain the writes it held, so it is refused. */ -}}
 {{- if gt (int $groups) 64 -}}
 {{- fail (printf "%s.writerGroups is %v; at most 64" .component $groups) -}}
 {{- end -}}
+{{- $most := int (include "meridian-runtime.maxWriterGroups" .) -}}
+{{- if gt (int $groups) $most -}}
+{{- fail (printf "%s.writerGroups is %v and %s.maxWriterGroups %d; at most %d. Raise %s.maxWriterGroups to %v first: the database's connections are counted at it, so raising it restarts the database once, and a count within it never does." .component $groups .component $most $most .component $groups) -}}
+{{- end -}}
 {{- int $groups -}}
+{{- end -}}
+
+{{/*
+The most writer groups a store allows (PO items 104 and 106, 2026-11-18;
+`lake.maxWriterGroups`, `bor.maxWriterGroups`): 2 by default, 1 to 64. The
+database's connections are counted at it (databaseConnections), so
+`<store>.writerGroups` changed within it never changes max_connections nor
+the database's pods and never restarts the database; raising it does, once.
+A count above it is refused. Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.maxWriterGroups" -}}
+{{- $most := 2 -}}
+{{- if hasKey .values "maxWriterGroups" -}}{{- $most = index .values "maxWriterGroups" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $most)) -}}
+{{- fail (printf "%s.maxWriterGroups is %v; a whole number of writer groups from 1, the most %s.writerGroups may be (2, the default), its database's connections counted at it" .component $most .component) -}}
+{{- end -}}
+{{- if gt (int $most) 64 -}}
+{{- fail (printf "%s.maxWriterGroups is %v; at most 64" .component $most) -}}
+{{- end -}}
+{{- int $most -}}
 {{- end -}}
 
 {{/*
@@ -1056,7 +1080,9 @@ The connections the deployment's own pods and jobs hold on the brought
 database at most, counted from what this chart deploys (ruled 2026-11-08):
 each store member -- the instrument store, the conductor's configuration
 store, the street store, the book and the lake, writer and standby, and
-during a rollout the one more a standby's surge starts -- holds its pool of
+during a rollout the one more a standby's surge starts, the lake's and the
+book's for each of the most writer groups the store allows
+(<store>.maxWriterGroups, not <store>.writerGroups) -- holds its pool of
 8 and 2 beside it (its change log's tail, a scrub or a probe); each
 dashboard copy its pool of 4 and 1 beside it; and the jobs that may run at
 once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
@@ -1076,9 +1102,11 @@ stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
 {{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
 {{- $members = add1 $members -}}
 {{- end -}}
-{{- /* Each writer group's members (step 3d). */ -}}
+{{- /* Each writer group's members (step 3d), counted at the most groups
+       the store allows (PO items 104 and 106), so a count changed within
+       it never changes max_connections and never restarts the database. */ -}}
 {{- if has $component (list "lake" "bor") -}}
-{{- $members = mul $members (int (include "meridian-runtime.writerGroups" (dict "top" $ "component" $component "values" $values))) -}}
+{{- $members = mul $members (int (include "meridian-runtime.maxWriterGroups" (dict "top" $ "component" $component "values" $values))) -}}
 {{- end -}}
 {{- $each := 10 -}}
 {{- if and $writeAhead (eq $component "lake") }}{{ $each = 12 }}{{ end -}}

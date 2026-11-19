@@ -3354,37 +3354,75 @@ chart-check:
 	true
 	@# The brought database's max_connections, counted from what the chart
 	@# deploys (ruled 2026-11-08): each store member's pool and what is
-	@# beside it, the lake's write-ahead writer's in ha (stage E), a
-	@# rollout's surge, the dashboard's copies, the jobs, the superuser's and
-	@# Patroni's reserve, and a quarter's room -- 82 tolerant, 220 ha --
+	@# beside it, the lake's and the book's for each of the 2 writer groups
+	@# they allow by default (PO items 104 and 106), the lake's write-ahead
+	@# writer's in ha (stage E), a rollout's surge, the dashboard's copies, the jobs, the superuser's and
+	@# Patroni's reserve, and a quarter's room -- 107 tolerant, 303 ha --
 	@# given to the server alone and under Patroni and to the preflight's
 	@# memory judge; one set below what the pods hold is refused, saying how
 	@# many they hold. Its memory in ha is the judge's count of it with a
-	@# quarter's room, 1280Mi, given to the members and to the judge.
+	@# quarter's room, 1728Mi, given to the members and to the judge.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	echo "$$plain" | grep -q -- "- max_connections=82$$" \
-		|| { echo "chart-check FAILED: the tolerant database is not given max_connections=82, the count of what the chart deploys" >&2; exit 1; }; \
-	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "82"' \
-		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 82 connections" >&2; exit 1; }; \
+	echo "$$plain" | grep -q -- "- max_connections=107$$" \
+		|| { echo "chart-check FAILED: the tolerant database is not given max_connections=107, the count of what the chart deploys" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "107"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 107 connections" >&2; exit 1; }; \
 	patroni="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha 2>/dev/null)"; \
-	echo "$$patroni" | grep -q "^ *max_connections: 220$$" \
-		|| { echo "chart-check FAILED: the ha database is not given max_connections: 220 under Patroni" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q 'max_connections\\":220' \
-		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 220" >&2; exit 1; }; \
-	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1280Mi"' \
-		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1280Mi" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q "^ *memory: 1280Mi$$" \
-		|| { echo "chart-check FAILED: the ha database is not given the 1280Mi the memory judge counts at 220 connections" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *max_connections: 303$$" \
+		|| { echo "chart-check FAILED: the ha database is not given max_connections: 303 under Patroni" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q 'max_connections\\":303' \
+		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 303" >&2; exit 1; }; \
+	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1728Mi"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1728Mi" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *memory: 1728Mi$$" \
+		|| { echo "chart-check FAILED: the ha database is not given the 1728Mi the memory judge counts at 303 connections" >&2; exit 1; }; \
 	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1Gi"' \
 		|| { echo "chart-check FAILED: the tolerant database's memory is not its own 1Gi" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha --set database.brought.maxConnections=100 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: database.brought.maxConnections=100 rendered under ha, below what its pods hold" >&2; exit 1; }; \
-	echo "$$said" | grep -q "hold up to 172 connections" \
+	echo "$$said" | grep -q "hold up to 238 connections" \
 		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
 		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }
+	@# A writer-group count changed within its store's most (PO items 104
+	@# and 106, 2026-11-18: lake.maxWriterGroups and bor.maxWriterGroups, 2
+	@# by default, 1 to 64) never restarts the database: its
+	@# max_connections, and the ha members' memory counted from it, are
+	@# counted at the most groups each store allows, so two renders
+	@# differing only in writerGroups give the same database StatefulSet,
+	@# tolerant and ha, at the default most and at one raised. A count above
+	@# its store's most is refused, naming the value and the one restart
+	@# raising it takes; a most of 0 or above 64 is refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
+	db() { awk '/^---/{if(d~/\nkind: StatefulSet\n/ && d~/\n  name: check-meridian-runtime-database\n/)printf "%s",d; d="\n"; next} {d=d $$0 "\n"} END{if(d~/\nkind: StatefulSet\n/ && d~/\n  name: check-meridian-runtime-database\n/)printf "%s",d}'; }; \
+	for profile in "" "$$ha"; do \
+		one="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile 2>/dev/null | db)"; \
+		[ "$$(echo "$$one" | grep -c 'max_connections')" -ge 1 ] \
+			|| { echo "chart-check FAILED: no database StatefulSet giving max_connections found in the $${profile:+ha }render, so the comparison below proves nothing" >&2; exit 1; }; \
+		two="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --set lake.writerGroups=2 --set bor.writerGroups=2 2>/dev/null | db)"; \
+		[ "$$one" = "$$two" ] \
+			|| { echo "chart-check FAILED: lake.writerGroups and bor.writerGroups raised from 1 to 2, within their most, change the $${profile:+ha }database's StatefulSet, so the change restarts the database (PO item 104):" >&2; diff <(echo "$$one") <(echo "$$two") >&2; exit 1; }; \
+		most="--set lake.maxWriterGroups=4 --set bor.maxWriterGroups=4"; \
+		low="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile $$most 2>/dev/null | db)"; \
+		high="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile $$most --set lake.writerGroups=4 --set bor.writerGroups=3 2>/dev/null | db)"; \
+		[ -n "$$low" ] && [ "$$low" = "$$high" ] \
+			|| { echo "chart-check FAILED: at a most of 4, writer groups raised from 1 to 4 and 3 change the $${profile:+ha }database's StatefulSet (PO item 104)" >&2; exit 1; }; \
+		[ "$$low" != "$$one" ] \
+			|| { echo "chart-check FAILED: a most of 4 writer groups gives the $${profile:+ha }database the same StatefulSet as the default 2, so the most counts nothing" >&2; exit 1; }; \
+	done; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=3 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: lake.writerGroups=3 rendered above lake.maxWriterGroups, 2 by default" >&2; exit 1; }; \
+	echo "$$said" | grep -q "lake.writerGroups is 3 and lake.maxWriterGroups 2" && echo "$$said" | grep -q "restarts the database once" \
+		|| { echo "chart-check FAILED: a count above its store's most was refused without naming lake.maxWriterGroups and the restart raising it takes: $$said" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=3 --set bor.maxWriterGroups=3 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: bor.writerGroups=3 did not render at bor.maxWriterGroups=3" >&2; exit 1; }; \
+	for refused in "bor.maxWriterGroups=0" "lake.maxWriterGroups=65"; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$refused rendered; a store's most writer groups is 1 to 64" >&2; exit 1; }; \
+	done; true
 	@# Patroni's REST API over TLS whenever internal TLS is on (ruled
 	@# 2026-11-08): served with the database's certificate, each member
 	@# reached by its own Service's name (one per member, which the

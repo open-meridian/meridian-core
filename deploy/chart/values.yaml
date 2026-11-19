@@ -109,14 +109,17 @@ database:
     # readReplicas: 0
     # Its max_connections, counted from what this chart deploys (ruled
     # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
-    # standby and a rollout's surge, and in ha 2 more for each lake member's
-    # write-ahead writer (stage E); each dashboard copy's 4 and 1; 6 for
-    # jobs; 4 kept for the superuser and Patroni; a quarter over that. 82
-    # tolerant, 220 ha. Set it to override; below what the pods hold is
+    # standby and a rollout's surge, the lake's and the book's for each of
+    # the most writer groups they allow (lake.maxWriterGroups,
+    # bor.maxWriterGroups: PO items 104 and 106, so a writerGroups change
+    # within it never restarts the database), and in ha 2 more for each lake
+    # member's write-ahead writer (stage E); each dashboard copy's 4 and 1;
+    # 6 for jobs; 4 kept for the superuser and Patroni; a quarter over that.
+    # 107 tolerant, 303 ha. Set it to override; below what the pods hold is
     # refused. Each connection may take work_mem (4 MiB) under load, which
     # the preflight counts against the memory limit above. With standbys
     # the limit is the preflight's own count -- shared buffers and work_mem
-    # for every connection allowed -- with a quarter's room, 1280Mi at 220,
+    # for every connection allowed -- with a quarter's room, 1728Mi at 303,
     # or the limit above where that is more.
     # maxConnections:
     # The image the members run under Patroni: postgres:16-alpine's server
@@ -369,6 +372,14 @@ bor:
   # with its own Lease and standby (standby counts per group). Every member
   # serves the public writes and hands each to the group owning it.
   writerGroups: 1
+  # The most writer groups the book allows (PO items 104 and 106): 2, as by
+  # default, 1 to 64; a writerGroups above it is refused. The database's
+  # connections are counted at it, so writerGroups changed within it never
+  # changes the database's max_connections and never restarts it; raising
+  # it restarts the database once. Each group it allows counts 10
+  # connections for each of its members (12 for the lake's in ha): writer,
+  # standby and a rollout's surge.
+  maxWriterGroups: 2
   # A database per writer group (step 3d; the resilience spec's section
   # 6.4): 1, as by default, every group on the one database. Above it,
   # writer group g writes to database g mod the count, at most one per
@@ -455,6 +466,14 @@ lake:
   # with its own Lease and standby (standby counts per group). Every member
   # serves the public writes and hands each to the group owning it.
   writerGroups: 1
+  # The most writer groups the lake allows (PO items 104 and 106): 2, as by
+  # default, 1 to 64; a writerGroups above it is refused. The database's
+  # connections are counted at it, so writerGroups changed within it never
+  # changes the database's max_connections and never restarts it; raising
+  # it restarts the database once. Each group it allows counts 10
+  # connections for each of its members (12 for the lake's in ha): writer,
+  # standby and a rollout's surge.
+  maxWriterGroups: 2
   # A database per writer group (step 3d; the resilience spec's section
   # 6.4): 1, as by default, every group on the one database. Above it,
   # writer group g writes to database g mod the count, at most one per

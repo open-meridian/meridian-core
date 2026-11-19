@@ -51,19 +51,21 @@ fn memory_past_its_limit_warns_and_connections_near_the_max_warn() {
 
 /// Ruled 2026-11-08, built in contract v30's stage E: the brought ha
 /// database's memory is what this judge counts at the max_connections the
-/// chart derives with the lake's write-ahead writer counted -- 220, Postgres's
-/// default shared buffers and work memory -- with a quarter's room, rounded
-/// up to 64 MiB: 1280Mi (the chart's databaseMemoryLimit). Before, 1 GiB
-/// held 213 connections' count at 96%; at 220 it would hold 98%.
+/// chart derives with the lake's write-ahead writer counted, and since PO
+/// items 104 and 106 the lake's and the book's members at the most writer
+/// groups they allow, 2 by default -- 303, Postgres's default shared buffers
+/// and work memory -- with a quarter's room, rounded up to 64 MiB: 1728Mi
+/// (the chart's databaseMemoryLimit). Before stage E, 1 GiB held 213
+/// connections' count at 96%.
 #[test]
 fn the_ha_databases_memory_is_this_judges_count_with_a_quarters_room() {
-    let counted = 128 * MIB + 4 * MIB * 220;
-    assert_eq!(counted, 1008 * MIB);
+    let counted = 128 * MIB + 4 * MIB * 303;
+    assert_eq!(counted, 1340 * MIB);
     let limit = (counted * 5 / 4).div_ceil(64 * MIB) * 64 * MIB;
-    assert_eq!(limit, 1280 * MIB, "the chart's 1280Mi");
-    let judged = judge_memory(128 * MIB, 4 * MIB, 220, Some(limit));
+    assert_eq!(limit, 1728 * MIB, "the chart's 1728Mi");
+    let judged = judge_memory(128 * MIB, 4 * MIB, 303, Some(limit));
     assert_eq!(judged.verdict, Verdict::Ready);
-    assert!(judged.why.contains("(79%)"), "{}", judged.why);
+    assert!(judged.why.contains("(78%)"), "{}", judged.why);
     let before = judge_memory(128 * MIB, 4 * MIB, 213, Some(GIB));
     assert!(before.why.contains("(96%)"), "{}", before.why);
 }
