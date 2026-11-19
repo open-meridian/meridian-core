@@ -4901,33 +4901,34 @@ impl Store for PostgresStore {
     }
 
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        // A deposed writer stopped mid-batch holds the rows it took.
-        if self.groups.several() {
-            // Only its own group's deposed writer, by its datasets' locks:
-            // another group's writer holds its own.
-            end_deposed_holders(&mut tx, self.groups).map_err(unavailable)?;
-        } else {
-            meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
-                .map_err(unavailable)?;
+        // Ended as a deadlock's victim (SQLSTATE 40P01) -- a batch of a
+        // group the count was lowered past, not stopped yet, holding its
+        // group's row while it waits for one this takeover holds -- it is
+        // tried again: nothing of it committed, and the batch it waited on
+        // goes on and ends (review c5s, L8).
+        let mut attempt = 0;
+        loop {
+            let mut conn = self.conn()?;
+            match self.take_over_once(&mut conn, by) {
+                Err(failed)
+                    if attempt < TAKE_OVER_DEADLOCKS_AT_MOST
+                        && failed.code()
+                            == Some(&postgres::error::SqlState::T_R_DEADLOCK_DETECTED) =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        %failed,
+                        attempt,
+                        "the lake's takeover was ended by a deadlock; tried again"
+                    );
+                }
+                taken => {
+                    let epoch = taken.map_err(unavailable)?;
+                    self.fence.adopt(epoch);
+                    return Ok(epoch);
+                }
+            }
         }
-        let epoch = raise(&mut tx, by, Some(self.groups)).map_err(unavailable)?;
-        // A group past the first leading its database writes that
-        // database's control partition under its own epoch: raised with
-        // its takeover, so its deposed leader is fenced there at once, not
-        // only after the next look at the timeline (the review's M1).
-        if self.leads_database && !self.groups.holds_control() {
-            tx.execute(
-                "UPDATE lake_change_head SET epoch = $1
-                  WHERE partition = 'control' AND epoch < $1",
-                &[&(epoch as i64)],
-            )
-            .map_err(unavailable)?;
-        }
-        tx.commit().map_err(unavailable)?;
-        self.fence.adopt(epoch);
-        Ok(epoch)
     }
 
     fn follow_timeline(&self) -> Result<meridian_changes::timeline::Timeline> {
@@ -5584,6 +5585,47 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
     // statement_timeout is answered with this component's own refusal for
     // load (the resilience spec's section 10a).
     StoreError::Unavailable(meridian_changes::serving::described(&failed))
+}
+
+/// How many times a takeover ended by a deadlock is tried again (review
+/// c5s, L8): each is a batch of a group past the count meeting it, so a few.
+const TAKE_OVER_DEADLOCKS_AT_MOST: u32 = 5;
+
+impl PostgresStore {
+    /// One attempt at a takeover (`take_over`), in one transaction: the epoch
+    /// raised, not yet adopted.
+    fn take_over_once(
+        &self,
+        conn: &mut postgres::Client,
+        by: &meridian_changes::TookOver,
+    ) -> std::result::Result<u64, postgres::Error> {
+        let mut tx = conn.transaction()?;
+        // A deposed writer stopped mid-batch holds the rows it took.
+        if self.groups.several() {
+            // Only its own group's deposed writer, by its datasets' locks:
+            // another group's writer holds its own.
+            end_deposed_holders(&mut tx, self.groups)?;
+        } else {
+            meridian_changes::end_deposed_writers(
+                &mut tx,
+                &["lake_change_head", "lake_partition"],
+            )?;
+        }
+        let epoch = raise(&mut tx, by, Some(self.groups))?;
+        // A group past the first leading its database writes that
+        // database's control partition under its own epoch: raised with
+        // its takeover, so its deposed leader is fenced there at once, not
+        // only after the next look at the timeline (the review's M1).
+        if self.leads_database && !self.groups.holds_control() {
+            tx.execute(
+                "UPDATE lake_change_head SET epoch = $1
+                  WHERE partition = 'control' AND epoch < $1",
+                &[&(epoch as i64)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(epoch)
+    }
 }
 
 /// Where a range's head is, over the lake's several databases (step 3d;
