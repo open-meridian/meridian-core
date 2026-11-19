@@ -44,10 +44,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The run's tier (the PO's ruling of 2026-11-08): a pull request runs the
-  # fast tier and the jobs the paths it touches select; the merge queue,
-  # and a run by hand, run everything, every job that ran before the tiers
-  # (tools/ci_tier.py, whose `check` the checks stage runs, and whose
+  # The run's tier (the PO's ruling of 2026-11-08): a pull request into main
+  # runs the fast tier and the jobs the paths it touches select; the merge
+  # queue, a pull request into a stage branch (which has no merge queue,
+  # ruling 205), and a run by hand, run everything, every job that ran
+  # before the tiers (tools/ci_tier.py, whose `check` the checks stage runs, and whose
   # `table` lists every job by event). What each tiered job runs comes from
   # here; a run whose plan cannot be read fails its tiered jobs rather than
   # skipping them, and the aggregate ci-local fails a run that is not a pull
@@ -79,8 +80,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} | tee -a "$GITHUB_OUTPUT"
+          python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} ${BASE_REF:+--base-ref "$BASE_REF"} | tee -a "$GITHUB_OUTPUT"
           { echo "## This run's tier ($EVENT)"; echo; python3 tools/ci_tier.py table; } >> "$GITHUB_STEP_SUMMARY"
 
   # The two stages that need no image: beside the builds, not after them.
