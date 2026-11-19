@@ -227,6 +227,21 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Whether a range's row here is a move's pointer naming writer group
+    /// `group`: beside it, a switch between databases may keep, under the
+    /// group's key, the place it takes the range's rows from (the review of
+    /// item 191's finding 4).
+    pub fn points_to(&self, group: u32) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM lake_partition WHERE writer_group = $1 AND epoch = $2 LIMIT 1",
+                &[&(group as i32), &meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .is_some())
+    }
+
     /// Every range's row here: its group as named, its head, and whether
     /// it is written (not a move's pointer).
     #[allow(clippy::type_complexity)]
@@ -374,6 +389,11 @@ impl PostgresStore {
         locked: &mut Option<(std::time::Instant, Option<std::time::Instant>)>,
     ) -> Result<Switched> {
         let began = std::time::Instant::now();
+        // The groups' places in the write-ahead stream the writer takes
+        // from now, never in one made before it under its name (item 191);
+        // none in `tolerant`, which has no stream (the review's finding 2).
+        let stream = self.stream_key()?;
+        let identity = stream.as_ref().map(|(_, identity)| *identity);
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
         let same = std::ptr::eq(self, to);
         let timed_out = |failed: &postgres::Error| {
@@ -439,12 +459,19 @@ impl PostgresStore {
         });
         // The source group's committed place in the write-ahead stream, as
         // its batches -- which take this row -- left it.
-        let theirs_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, from);
-        let ours_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, target);
-        let at = match stream_position(&mut tx, &theirs_key)? {
-            Some(at) => Some(at),
-            None if !same => stream_position(&mut *to.conn()?, &theirs_key)?,
+        let theirs_key = stream
+            .as_ref()
+            .map(|(key, _)| crate::write_ahead::group_key(key, from));
+        let ours_key = stream
+            .as_ref()
+            .map(|(key, _)| crate::write_ahead::group_key(key, target));
+        let at = match &theirs_key {
             None => None,
+            Some(theirs_key) => match stream_position(&mut tx, theirs_key)? {
+                Some(at) => Some(at),
+                None if !same => stream_position(&mut *to.conn()?, theirs_key)?,
+                None => None,
+            },
         };
         if same {
             let mut target_digest = source.held_digest.clone();
@@ -462,20 +489,33 @@ impl PostgresStore {
             let epoch = group_epoch(&mut tx, target)?;
             // In `ha`, the target takes the range's rows from the source's
             // committed stream position (spec 6.1; see `take_back`).
-            if from != target {
-                take_back(&mut tx, &ours_key, at)?;
+            if let Some(ours_key) = ours_key.as_deref().filter(|_| from != target) {
+                take_back(&mut tx, ours_key, at)?;
             }
-            // Where the source stood, kept with the range (`taken_from`):
-            // what the target leaves uncounted of the writes it takes again.
-            let taken_from = at.filter(|_| from != target).map(|at| at.sequence as i64);
-            let switched = tx
-                .execute(
+            // Where the source stood, kept with the range (`taken_from`), in
+            // the stream it stood in (`taken_in`; item 202): what the target
+            // leaves uncounted of the writes it takes again. 0 where the
+            // source has no place in the stream: none of them is the
+            // source's, and every row is counted. Nothing in `tolerant`.
+            let switched = match identity.filter(|_| from != target) {
+                Some(taken_in) => tx.execute(
                     "UPDATE lake_partition
-                        SET writer_group = $2, epoch = $3, taken_from = coalesce($4, taken_from)
+                        SET writer_group = $2, epoch = $3, taken_from = $4, taken_in = $5
                       WHERE dataset = $1",
-                    &[&partition, &(target as i32), &(epoch as i64), &taken_from],
-                )
-                .and_then(|_| tx.commit());
+                    &[
+                        &partition,
+                        &(target as i32),
+                        &(epoch as i64),
+                        &at.map_or(0, |at| at.sequence as i64),
+                        &taken_in,
+                    ],
+                ),
+                None => tx.execute(
+                    "UPDATE lake_partition SET writer_group = $2, epoch = $3 WHERE dataset = $1",
+                    &[&partition, &(target as i32), &(epoch as i64)],
+                ),
+            }
+            .and_then(|_| tx.commit());
             return match switched {
                 Ok(_) => {
                     self.groups.assign(partition, Some(target));
@@ -519,10 +559,11 @@ impl PostgresStore {
         // key): what the sweep takes it back to where the target's open was
         // owed (the review's C3 and C4). Its own source's, where this source
         // is a pointer already, the open owed.
-        let kept = if source.epoch == meridian_changes::moves::POINTER {
-            stream_position(&mut tx, &ours_key)?
-        } else {
-            None
+        let kept = match ours_key.as_deref() {
+            Some(ours_key) if source.epoch == meridian_changes::moves::POINTER => {
+                stream_position(&mut tx, ours_key)?
+            }
+            _ => None,
         };
         let keep = if from != target { at } else { None };
         let let_go = |tx: &mut postgres::Transaction<'_>| -> Result<()> {
@@ -531,8 +572,8 @@ impl PostgresStore {
                 &[&crate::range::dataset_of(partition), &partition],
             )
             .map_err(unavailable)?;
-            match keep {
-                Some(at) => tx.execute(
+            match (keep, ours_key.as_deref()) {
+                (Some(at), Some(ours_key)) => tx.execute(
                     "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
                      VALUES ($1, $2, $3, $4)
                      ON CONFLICT (stream) DO UPDATE SET sequence = EXCLUDED.sequence,
@@ -544,11 +585,11 @@ impl PostgresStore {
                         &meridian_changes::now_ns(),
                     ],
                 ),
-                None if kept.is_some() => tx.execute(
+                (None, Some(ours_key)) if kept.is_some() => tx.execute(
                     "DELETE FROM lake_write_ahead WHERE stream = $1",
                     &[&ours_key],
                 ),
-                None => Ok(0),
+                _ => Ok(0),
             }
             .map_err(unavailable)?;
             tx.execute(
@@ -570,7 +611,11 @@ impl PostgresStore {
                 partition,
                 closing,
                 target,
-                kept.map(|kept| (ours_key.as_str(), Some(kept))),
+                ours_key
+                    .as_deref()
+                    .zip(kept)
+                    .zip(identity)
+                    .map(|((key, kept), identity)| (key, Some(kept), identity)),
             )?;
             let_go(&mut tx)?;
             if let Err(failed) = tx.commit() {
@@ -619,10 +664,14 @@ impl PostgresStore {
             );
             return Ok(Switched::LetGo { closing, epoch });
         }
-        match to.open_moved_in(self, partition, closing, target, Some((&ours_key, at))) {
+        let taken_back = ours_key
+            .as_deref()
+            .zip(identity)
+            .map(|(key, identity)| (key, at, identity));
+        match to.open_moved_in(self, partition, closing, target, taken_back) {
             Ok(epoch) => {
                 // Taken back: the point kept beside the pointer let go.
-                if at.is_some() {
+                if let (Some(_), Some(ours_key)) = (at, ours_key.as_deref()) {
                     if let Err(failed) = self.conn().and_then(|mut conn| {
                         conn.execute(
                             "DELETE FROM lake_write_ahead WHERE stream = $1",
@@ -675,16 +724,23 @@ fn range_digest(
 
 /// Each of `ranges` that last moved to its group from another, with the
 /// stream sequence its source had committed through then
-/// (`lake_partition.taken_from`).
+/// (`lake_partition.taken_from`), where that is a place in the write-ahead
+/// stream `stream`, the one the lake's writer takes from
+/// (`lake_partition.taken_in`; item 202): a place in another stream, or
+/// with none (`tolerant`), leaves nothing uncounted.
 pub(crate) fn taken_from_of(
     client: &mut impl GenericClient,
     ranges: &[String],
+    stream: Option<i64>,
 ) -> Result<BTreeMap<String, u64>> {
+    let Some(stream) = stream else {
+        return Ok(BTreeMap::new());
+    };
     Ok(client
         .query(
             "SELECT dataset, taken_from FROM lake_partition
-              WHERE dataset = ANY($1) AND taken_from IS NOT NULL",
-            &[&ranges],
+              WHERE dataset = ANY($1) AND taken_from IS NOT NULL AND taken_in = $2",
+            &[&ranges, &stream],
         )
         .map_err(unavailable)?
         .iter()
@@ -711,8 +767,13 @@ fn stream_position(
 
 /// A move's target's place in the write-ahead stream, under `key`, taken
 /// back to the source's `source` where that is earlier, else back by one
-/// write (spec 6.1). Nothing where it holds none: its first start takes from
-/// the stream's first.
+/// write (spec 6.1). Where the source has no place in the stream, to before
+/// the stream's first write (the review of item 191's finding 3): none of
+/// the range's writes in it were committed by the source, and the target
+/// takes them all again. A target with no place is given one there too: it
+/// takes from the stream's first write all the same, with no run counted
+/// before it, and a batch it took on its view from before the switch --
+/// its `after` none -- is refused.
 ///
 /// The step back by one where the two are equal (or the target's is
 /// earlier) is deliberate, not an off-by-one: it is a compare-and-set
@@ -723,31 +784,38 @@ fn stream_position(
 /// place and the ranges' owners again before its next batch and never takes
 /// the range's rows on a view that still names the source. Left equal, a
 /// stale target would go on skipping them. The write it steps back over is
-/// taken again: an idempotent repeat.
+/// taken again: an idempotent repeat. A place before the stream's first
+/// write is sequence 0 at the switch's time, so a target there already is
+/// moved all the same; the writer reads no time from it.
 fn take_back(
     client: &mut impl GenericClient,
     key: &str,
     source: Option<WriteAheadPosition>,
 ) -> Result<()> {
-    let Some(row) = client
+    let held = client
         .query_opt(
             "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
             &[&key],
         )
         .map_err(unavailable)?
-    else {
-        return Ok(());
-    };
-    let (sequence, at_ns): (i64, i64) = (row.get(0), row.get(1));
-    let (back, back_at) = match source {
-        Some(at) if (at.sequence as i64) < sequence => (at.sequence as i64, at.at_ns),
-        _ => ((sequence - 1).max(0), at_ns),
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)));
+    let now = meridian_changes::now_ns();
+    let (back, back_at) = match (held, source) {
+        (Some((sequence, _)), Some(at)) if (at.sequence as i64) < sequence => {
+            (at.sequence as i64, at.at_ns)
+        }
+        (Some((sequence, at_ns)), Some(_)) if sequence > 1 => (sequence - 1, at_ns),
+        // Before the stream's first write: the source has no place in it,
+        // the target none, or one back at the first.
+        _ => (0, now),
     };
     client
         .execute(
-            "UPDATE lake_write_ahead SET sequence = $2, at_ns = $3, committed_at_ns = $4
-              WHERE stream = $1",
-            &[&key, &back, &back_at, &meridian_changes::now_ns()],
+            "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (stream) DO UPDATE SET sequence = EXCLUDED.sequence,
+                at_ns = EXCLUDED.at_ns, committed_at_ns = EXCLUDED.committed_at_ns",
+            &[&key, &back, &back_at, &now],
         )
         .map_err(unavailable)?;
     Ok(())
@@ -832,9 +900,10 @@ impl PostgresStore {
         lineage(&mut *self.conn()?, partition)
     }
 
-    /// [`taken_from_of`], in this database.
+    /// [`taken_from_of`], in this database, in the stream its writer takes
+    /// from.
     pub fn taken_from(&self, ranges: &[String]) -> Result<BTreeMap<String, u64>> {
-        taken_from_of(&mut *self.conn()?, ranges)
+        taken_from_of(&mut *self.conn()?, ranges, self.stream_identity())
     }
 
     pub fn moved_by_hand(&self) -> Result<BTreeMap<String, u32>> {
@@ -1063,7 +1132,8 @@ impl PostgresStore {
     /// the source's close `closing` (step 3d; section 6.8): as `from`'s
     /// database holds it, whole (the review's M4), named writer group
     /// `target`'s at its epoch here; in the same transaction, where given,
-    /// the target's write-ahead position taken back to the source's (C4).
+    /// the target's write-ahead position taken back to the source's (C4),
+    /// both places in the stream whose identity is given (item 202).
     /// Answers the epoch.
     pub fn open_moved_in(
         &self,
@@ -1071,7 +1141,7 @@ impl PostgresStore {
         partition: &str,
         closing: u64,
         target: u32,
-        taken_back: Option<(&str, Option<WriteAheadPosition>)>,
+        taken_back: Option<(&str, Option<WriteAheadPosition>, i64)>,
     ) -> Result<u64> {
         self.moved_in(from, partition, closing, target, None, taken_back)
     }
@@ -1104,7 +1174,7 @@ impl PostgresStore {
         closing: u64,
         group: u32,
         epoch: Option<i64>,
-        taken_back: Option<(&str, Option<WriteAheadPosition>)>,
+        taken_back: Option<(&str, Option<WriteAheadPosition>, i64)>,
     ) -> Result<u64> {
         use std::io::{Read, Write};
         let mut row = Vec::new();
@@ -1144,16 +1214,20 @@ impl PostgresStore {
             &[&partition, &(closing as i64), &epoch, &(group as i32)],
         )
         .map_err(unavailable)?;
-        if let Some((key, at)) = taken_back {
+        if let Some((key, at, identity)) = taken_back {
             take_back(&mut tx, key, at)?;
-            // Where the source stood, kept with the range (`taken_from`).
-            if let Some(at) = at {
-                tx.execute(
-                    "UPDATE lake_partition SET taken_from = $2 WHERE dataset = $1",
-                    &[&partition, &(at.sequence as i64)],
-                )
-                .map_err(unavailable)?;
-            }
+            // Where the source stood, kept with the range (`taken_from`), in
+            // the stream it stood in (`taken_in`; item 202): 0 where it has
+            // no place in it.
+            tx.execute(
+                "UPDATE lake_partition SET taken_from = $2, taken_in = $3 WHERE dataset = $1",
+                &[
+                    &partition,
+                    &at.map_or(0, |at| at.sequence as i64),
+                    &identity,
+                ],
+            )
+            .map_err(unavailable)?;
         }
         tx.commit().map_err(unavailable)?;
         Ok(epoch.max(0) as u64)

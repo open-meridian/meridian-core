@@ -1108,6 +1108,8 @@ impl Lake {
     pub fn with_stream(&self, identity: i64) {
         self.stream
             .store(identity, std::sync::atomic::Ordering::SeqCst);
+        // A move's switch keeps its places in this stream (item 191).
+        self.store.in_stream(identity);
     }
 
     fn stream_identity(&self) -> i64 {
@@ -2750,6 +2752,19 @@ impl Lake {
         stream: &str,
     ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
         self.store.write_ahead_position(stream)
+    }
+
+    /// The places a lake before item 191 kept of its write-ahead stream by
+    /// its name alone, `from`, carried to its key with its identity, `to`,
+    /// where they were taken in this stream ([`Store::write_ahead_carried`];
+    /// the review of item 191's finding 1).
+    pub fn write_ahead_carried(
+        &self,
+        from: &str,
+        to: &str,
+        made_ns: i64,
+    ) -> Result<bool, crate::store::StoreError> {
+        self.store.write_ahead_carried(from, to, made_ns)
     }
 
     /// The ranges' writer groups read again into this member's view (step

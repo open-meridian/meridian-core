@@ -176,6 +176,17 @@ fn run() -> Result<(), String> {
     } else {
         every_database.push(Arc::new(connect(0, &url)?));
     }
+    // In `ha`, no range's switch until the writer has read the write-ahead
+    // stream's identity: the groups' places are kept by it (item 191). In
+    // `tolerant`, none: a switch reads and writes no place in a stream
+    // (item 191's review, finding 2).
+    for store in &every_database {
+        if write_ahead_on() {
+            store.stream_not_read();
+        } else {
+            meridian_lake::Store::in_stream(&**store, meridian_lake::postgres::NO_STREAM);
+        }
+    }
     let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
         tracing::info!(
             databases = databases.count(),
@@ -443,6 +454,21 @@ fn run() -> Result<(), String> {
             move || writing.epoch(),
             move || watched.head_epoch().map_err(|failed| failed.to_string()),
         );
+        // Its partitions in its report, as its record lists them, and its
+        // control partition: what a standby following it names (CI
+        // 44556229125: a writer named none).
+        let listing = Arc::clone(&record);
+        holding.report_partitions(move || {
+            listing
+                .heads()
+                .map(|heads| {
+                    heads
+                        .into_keys()
+                        .chain([meridian_changes::CONTROL.to_string()])
+                        .collect()
+                })
+                .map_err(|failed| failed.to_string())
+        });
         // A new database timeline raises the epoch (contract v30, stage C):
         // the hot layer let go of what the record may have lost.
         let following = Arc::clone(&store);

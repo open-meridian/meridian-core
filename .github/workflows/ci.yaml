@@ -44,10 +44,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The run's tier (the PO's ruling of 2026-11-08): a pull request runs the
-  # fast tier and the jobs the paths it touches select; the merge queue,
-  # and a run by hand, run everything, every job that ran before the tiers
-  # (tools/ci_tier.py, whose `check` the checks stage runs, and whose
+  # The run's tier (the PO's ruling of 2026-11-08): a pull request into main
+  # runs the fast tier and the jobs the paths it touches select; the merge
+  # queue, a pull request into a stage branch (which has no merge queue,
+  # ruling 205), and a run by hand, run everything, every job that ran
+  # before the tiers (tools/ci_tier.py, whose `check` the checks stage runs, and whose
   # `table` lists every job by event). What each tiered job runs comes from
   # here; a run whose plan cannot be read fails its tiered jobs rather than
   # skipping them, and the aggregate ci-local fails a run that is not a pull
@@ -79,8 +80,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} | tee -a "$GITHUB_OUTPUT"
+          python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} ${BASE_REF:+--base-ref "$BASE_REF"} | tee -a "$GITHUB_OUTPUT"
           { echo "## This run's tier ($EVENT)"; echo; python3 tools/ci_tier.py table; } >> "$GITHUB_STEP_SUMMARY"
 
   # The two stages that need no image: beside the builds, not after them.
@@ -666,7 +668,9 @@ jobs:
     # plan says none, so a plan that could not be read fails it.
     if: ${{ !cancelled() && needs.tier.outputs.harness_any != 'false' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Half again its slowest green group's run, 11.6 minutes over 25 runs
+    # (2026-11-19), so a runner that dies frees the queue soon.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.tier.outputs.harness) }}
@@ -770,7 +774,9 @@ jobs:
     # that could not be read fails it too.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ matrix.timeout || 45 }}
+    # Each run's limit is the plan's (tools/ci_tier.py CLUSTERS), from its
+    # slowest green run; 20 minutes for the base installs.
+    timeout-minutes: ${{ matrix.timeout || 20 }}
     strategy:
       fail-fast: false
       # The plan's runs (tools/ci_tier.py CLUSTERS): every one on the queue;
@@ -865,6 +871,14 @@ jobs:
         with:
           version: ${{ (matrix.target == 'e2e-cluster-upgrade' || matrix.target == 'e2e-cluster-reconfigure') && 'v4.2.3' || 'v3.16.2' }}
 
+      # What the runner had left, every five seconds, to a file outside the
+      # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
+      # runner six minutes into the make below, with no log text at all.
+      - name: Start the watchdog
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: tools/ci-watchdog.sh start "$RUNNER_TEMP/watchdog.log"
+
       - name: make e2e-cluster-k3d
         working-directory: workspace/meridian-core
         env:
@@ -877,11 +891,38 @@ jobs:
           # Step 3b's runs: the profile, and the agents (in three zones).
           PROFILE: ${{ matrix.profile || 'tolerant' }}
           AGENTS: ${{ matrix.agents || 0 }}
+        # Teed to a file the steps after it keep, its exit status unchanged.
         run: |
+          set -o pipefail
           zones=""
           if [ "$AGENTS" != 0 ]; then zones="zone-a zone-b zone-c"; fi
           make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"} \
-            PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones"
+            PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones" 2>&1 | tee "$RUNNER_TEMP/make.log"
+
+      # The watchdog's last samples in the job's log, and the make's last
+      # lines and FAILED lines in the step summary, each kept in an upload
+      # of its own before any other, so a hang in a later upload cannot lose
+      # them. Whatever the make did, and on a timeout too.
+      - name: Say what the watchdog saw
+        if: always()
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: |
+          tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+          tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
+
+      - name: Keep what the watchdog saw
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-watchdog
+          path: |
+            ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/make-tail.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Keep the failure classes' measurements
         if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
@@ -946,7 +987,8 @@ jobs:
       # CreateArtifact", retried five times past its step's limit), and a run
       # then said nothing of why it failed until it was cancelled.
       - name: Say what the cluster said
-        if: failure()
+        # And when the job's limit ends it: a red that runs long still says why.
+        if: failure() || cancelled()
         working-directory: workspace/meridian-core
         run: |
           for log in .e2e-*.log; do
@@ -1003,7 +1045,9 @@ jobs:
     # could not be read runs it.
     if: ${{ !cancelled() && needs.tier.outputs.full != 'false' }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    # Half again its slowest green run, 20.1 minutes over 19 runs
+    # (2026-11-19), the arm64 images' build included, rounded up to five.
+    timeout-minutes: 35
     permissions:
       contents: read
       packages: write
@@ -1144,6 +1188,14 @@ jobs:
         with:
           version: v3.16.2
 
+      # What the runner had left, every five seconds, to a file outside the
+      # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
+      # runner six minutes into the make below, with no log text at all.
+      - name: Start the watchdog
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: tools/ci-watchdog.sh start "$RUNNER_TEMP/watchdog.log"
+
       # The images built above, here already: nothing is built again. The
       # browser's and the platform's images build on Docker's own builder,
       # as on amd64's runs.
@@ -1152,10 +1204,39 @@ jobs:
         env:
           DOCKER_BUILDKIT: "1"
           BUILDX_BUILDER: default
-        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled
+        # Teed to a file the steps after it keep, its exit status unchanged.
+        run: |
+          set -o pipefail
+          make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled 2>&1 | tee "$RUNNER_TEMP/make.log"
+
+      # The watchdog's last samples in the job's log, and the make's last
+      # lines and FAILED lines in the step summary, each kept in an upload
+      # of its own before any other, so a hang in a later upload cannot lose
+      # them. Whatever the make did, and on a timeout too.
+      - name: Say what the watchdog saw
+        if: always()
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: |
+          tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
+          tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
+
+      - name: Keep what the watchdog saw
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cluster-arm64-watchdog
+          path: |
+            ${{ runner.temp }}/watchdog.log
+            ${{ runner.temp }}/make-tail.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Say what the cluster said
-        if: failure()
+        # And when the job's limit ends it: a red that runs long still says why.
+        if: failure() || cancelled()
         working-directory: workspace/meridian-core
         run: |
           for log in .e2e-*.log; do
