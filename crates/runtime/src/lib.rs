@@ -209,8 +209,9 @@ fn wait_within<T>(
 /// minutes rather than never.
 pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
 
-// A migration applied again waits for its schema lock no longer than this
-// (meridian_changes::take_schema_lock; review c5w3 L-c).
+// A migration waits for its schema lock no longer than this
+// (meridian_changes::take_schema_lock; review c5w3 L-c), and applied again,
+// no longer than what is left of it (migrate_once_connected; review c5s, L3).
 const _: () = assert!(
     MIGRATION_WAITS_AT_MOST.as_secs() == meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST.as_secs()
 );
@@ -230,7 +231,8 @@ const _: () = assert!(
 /// undo that. A migration whose connection its database cut, restarting or
 /// handing its primary on, did not fail: it is waited for and applied again
 /// within the same bound (ruled 2026-11-18; c5w2's ha run, a writer-group
-/// count changed).
+/// count changed). `migrate` is given how long it may wait for its schema
+/// lock: what is left of the bound (review c5s, L3).
 ///
 /// And, on the database the chart brings, the server this release starts:
 /// one allowing the connections the release gives it ([`BROUGHT_DATABASE`]).
@@ -245,7 +247,7 @@ pub fn migrate_once_it_answers<S>(
     what: &str,
     url: &str,
     connect: impl Fn(&str) -> Result<S, String>,
-    migrate: impl FnMut(S) -> Result<(), String>,
+    migrate: impl FnMut(S, Duration) -> Result<(), String>,
 ) -> Result<(), String> {
     let brought = brought_database();
     migrate_once_connected(
@@ -369,13 +371,19 @@ fn migrate_once_connected<S>(
     at_most: Duration,
     every: Duration,
     mut connect: impl FnMut() -> Result<S, Wait>,
-    mut migrate: impl FnMut(S) -> Result<(), String>,
+    mut migrate: impl FnMut(S, Duration) -> Result<(), String>,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
     loop {
         let left = at_most.saturating_sub(started.elapsed());
         let store = wait_within(what, Some(left), every, &mut connect)?;
-        match migrate(store) {
+        // The schema lock waited for within what is left of the bound, so
+        // the two bounds nest (review c5s, L3): a session this migration's
+        // last attempt left holding it is waited for no longer than that.
+        let lock_waits = at_most
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1));
+        match migrate(store, lock_waits) {
             Ok(()) => return Ok(()),
             // Cut off by its database restarting -- an upgrade that changes
             // the database's pod restarts it beside the migration Job (c5w2's
@@ -1964,7 +1972,7 @@ mod tests {
                     Ok("connected")
                 }
             },
-            |store| {
+            |store, _| {
                 assert_eq!(store, "connected");
                 migrated.set(migrated.get() + 1);
                 Ok(())
@@ -1989,7 +1997,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Ok(())
             },
-            |()| {
+            |(), _| {
                 migrated.set(migrated.get() + 1);
                 Err("column \"note\" is of the wrong type".into())
             },
@@ -2021,7 +2029,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Ok(())
             },
-            |()| {
+            |(), _| {
                 migrated.set(migrated.get() + 1);
                 if migrated.get() == 1 {
                     Err("the book is unavailable: connection closed".into())
@@ -2046,7 +2054,7 @@ mod tests {
             Duration::from_millis(30),
             EVERY,
             || Ok(()),
-            |()| {
+            |(), _| {
                 migrated.set(migrated.get() + 1);
                 Err(
                     "the book is unavailable: db error: FATAL: terminating connection due to \
@@ -2063,6 +2071,40 @@ mod tests {
         assert!(migrated.get() > 1, "it gave up without trying again");
     }
 
+    /// Review c5s L3: a migration cut off near the end of its bound, applied
+    /// again, waits for the schema lock its cut-off session still holds only
+    /// for what is left of the bound, so the two bounds nest rather than add.
+    #[test]
+    fn a_migration_applied_again_waits_for_its_lock_within_what_is_left_of_its_bound() {
+        let at_most = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            at_most,
+            EVERY,
+            || Ok(()),
+            |(), lock_waits| {
+                migrated.set(migrated.get() + 1);
+                if migrated.get() == 1 {
+                    std::thread::sleep(at_most - Duration::from_millis(200));
+                    return Err("the book is unavailable: connection closed".into());
+                }
+                // The lock the cut-off session holds, waited for as
+                // take_schema_lock does: refused once its wait is spent.
+                std::thread::sleep(lock_waits);
+                Err("the book is unavailable: canceling statement due to lock timeout".into())
+            },
+        );
+        let waited = started.elapsed();
+        assert!(done.is_err(), "the lock was taken: {done:?}");
+        assert_eq!(migrated.get(), 2, "it was not applied again");
+        assert!(
+            waited <= at_most + Duration::from_millis(500),
+            "it waited {waited:?}, past its bound of {at_most:?}"
+        );
+    }
+
     #[test]
     fn a_database_that_never_answers_is_given_up_on() {
         let tried = Cell::new(0);
@@ -2074,7 +2116,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Err(Wait::NotYet("error connecting to server".into()))
             },
-            |()| panic!("it migrated without a connection"),
+            |(), _| panic!("it migrated without a connection"),
         );
         let said = done.expect_err("it waited for ever");
         assert!(
@@ -2096,7 +2138,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Err(Wait::Refused("the database URL is unreadable".into()))
             },
-            |()| panic!("it migrated without a connection"),
+            |(), _| panic!("it migrated without a connection"),
         );
         assert_eq!(done, Err("the database URL is unreadable".into()));
         assert_eq!(tried.get(), 1);

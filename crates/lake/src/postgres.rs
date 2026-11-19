@@ -403,13 +403,20 @@ impl PostgresStore {
     /// Apply every migration not yet recorded, under a lock. Run once per
     /// release by `meridian-lake migrate`, never by a starting process.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
+        self.migrate_within(clock, meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST)
+    }
+
+    /// [`Self::migrate`], its schema lock waited for at most `lock_waits`:
+    /// what is left of the migration's bound when it is applied again
+    /// (meridian_runtime::migrate_once_it_answers; review c5s L3).
+    pub fn migrate_within(
+        &self,
+        clock: &dyn meridian_clock::Clock,
+        lock_waits: std::time::Duration,
+    ) -> Result<()> {
         let mut conn = self.conn()?;
-        meridian_changes::take_schema_lock(
-            &mut *conn,
-            SCHEMA_LOCK,
-            meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST,
-        )
-        .map_err(unavailable)?;
+        meridian_changes::take_schema_lock(&mut *conn, SCHEMA_LOCK, lock_waits)
+            .map_err(unavailable)?;
         let outcome = apply_migrations(&mut conn, clock);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome

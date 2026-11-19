@@ -86,9 +86,9 @@ fn run() -> Result<(), String> {
                 "the book's database",
                 &url,
                 |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-                |store| {
+                |store, lock_waits| {
                     store
-                        .migrate(&*clock())
+                        .migrate_within(&*clock(), lock_waits)
                         .and_then(|()| store.make_partitions(partitions).map(|_| ()))
                         .map_err(|failed| failed.to_string())
                 },
