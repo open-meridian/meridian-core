@@ -3909,3 +3909,74 @@ async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_dat
         "fenced while serving on, it never refused its topics"
     );
 }
+
+/// A writer fenced before it is told to stop ends at once, though told to
+/// stop while it gives its lease up (review-c5n2 L1): it was not serving
+/// on at its fence, and a writer fenced so ends at once (item 110). Before,
+/// the stop that landed during its let-go began a serve-on, and the fence
+/// waited it out, refusing, up to 20 s.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_before_it_is_told_to_stop_ends_at_once_told_while_it_lets_go() {
+    let api = Unreliable {
+        latency: Duration::from_millis(400),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+    let said = Arc::clone(&stepped);
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        move |_, _| said.lock().unwrap().push(began.elapsed()),
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Fenced, not serving on: its epoch's look at 2 s finds 6, and it gives
+    // its lease up, about 0.8 s.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep_until(began + Duration::from_millis(2_200)).await;
+    // Told to stop meanwhile.
+    let refused = Arc::new(AtomicBool::new(false));
+    let refusing = Arc::clone(&refused);
+    let serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                move || refusing.store(true, Ordering::SeqCst),
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    watching.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(
+        stepped.len(),
+        1,
+        "fenced before it was told to stop, it never ended: {stepped:?}"
+    );
+    assert!(
+        stepped[0] < Duration::from_millis(3_500),
+        "it ended {:?} after it began, fenced at 2 s",
+        stepped[0]
+    );
+    assert!(
+        !refused.load(Ordering::SeqCst),
+        "fenced before it was told to stop, it refused as one serving on"
+    );
+    assert_eq!(
+        serving.await.expect("told to stop"),
+        ServedOn::AtOnce,
+        "fenced before it was told to stop, it served on"
+    );
+}

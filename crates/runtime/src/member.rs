@@ -373,8 +373,20 @@ pub struct ServingOn(Arc<ServingOnSeen>);
 struct ServingOnSeen {
     /// [`NOT_SERVING_ON`], [`SERVING_ON`] or [`SERVED_ON`].
     at: tokio::sync::watch::Sender<u8>,
-    /// What refuses the store's topics from here, run once, at the fence.
-    refuse: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// What its fence found, under one lock with what the serve-on began
+    /// with: a fence and a stop that land together are put in one order
+    /// (review-c5n2 L1).
+    held: std::sync::Mutex<Held>,
+}
+
+#[derive(Default)]
+struct Held {
+    /// What stops the writer and refuses the store's topics from here, run
+    /// once, at the fence.
+    refuse: Option<Box<dyn FnOnce() + Send>>,
+    /// Fenced, and whether it was serving on then: none before its fence.
+    /// A writer fenced before it is told to stop never serves on after.
+    fenced: Option<bool>,
 }
 
 const NOT_SERVING_ON: u8 = 0;
@@ -385,7 +397,7 @@ impl Default for ServingOn {
     fn default() -> Self {
         Self(Arc::new(ServingOnSeen {
             at: tokio::sync::watch::channel(NOT_SERVING_ON).0,
-            refuse: std::sync::Mutex::new(None),
+            held: std::sync::Mutex::new(Held::default()),
         }))
     }
 }
@@ -412,8 +424,21 @@ impl ServingOn {
         if mine == 0 || count < 2 {
             return ServedOn::AtOnce;
         }
-        *self.0.refuse.lock().expect("serving on poisoned") = Some(Box::new(refuse));
-        self.0.at.send_replace(SERVING_ON);
+        {
+            let mut held = self.0.held.lock().expect("serving on poisoned");
+            // Fenced first, not serving on: it ends at once, as a writer
+            // fenced while it is not serving on does (item 110), even told
+            // to stop while it gives its lease up (review-c5n2 L1).
+            if held.fenced.is_some() {
+                tracing::info!(
+                    writer_group = mine,
+                    "told to stop after its fence: not serving on"
+                );
+                return ServedOn::AtOnce;
+            }
+            held.refuse = Some(Box::new(refuse));
+            self.0.at.send_replace(SERVING_ON);
+        }
         let served = serve_on_within(mine, count, true, told_at_ns, look, at_most, every).await;
         self.0.at.send_replace(SERVED_ON);
         served
@@ -424,12 +449,20 @@ impl ServingOn {
     /// fence itself, before its lease is given up, up to
     /// [`STEP_DOWN_RELEASE`] (review-c5n2 M2): its handlers and its
     /// commits through every database, the epoch refusing only those of
-    /// partitions raised, were let run meanwhile. Not serving on, nothing.
+    /// partitions raised, were let run meanwhile. Not serving on, nothing
+    /// but that, said for good: told to stop after, it serves on no more
+    /// (review-c5n2 L1).
     fn fence(&self, component: &str) {
-        if *self.0.at.borrow() != SERVING_ON {
-            return;
-        }
-        let refuse = self.0.refuse.lock().expect("serving on poisoned").take();
+        let refuse = {
+            let mut held = self.0.held.lock().expect("serving on poisoned");
+            let serving = *held
+                .fenced
+                .get_or_insert_with(|| *self.0.at.borrow() == SERVING_ON);
+            if !serving {
+                return;
+            }
+            held.refuse.take()
+        };
         if let Some(refuse) = refuse {
             tracing::warn!(
                 component,
@@ -439,8 +472,8 @@ impl ServingOn {
         }
     }
 
-    /// This writer is fenced, and about to step down. Not serving on:
-    /// nothing, at once. Serving on: its topics are refused from here, and
+    /// This writer is fenced, and about to step down. Not serving on at its
+    /// fence: nothing, at once. Serving on: its topics are refused from here, and
     /// this waits for the serve-on's own end -- or, where it holds a lease,
     /// until the lease names another member: its own writer group's
     /// successor, which serves its topics (the lease is its group's), and
@@ -452,11 +485,12 @@ impl ServingOn {
         component: &str,
         elector: Option<&tokio::sync::Mutex<Elector<L>>>,
     ) {
-        let mut at = self.0.at.subscribe();
-        if *at.borrow_and_update() != SERVING_ON {
+        self.fence(component);
+        let serving = self.0.held.lock().expect("serving on poisoned").fenced == Some(true);
+        if !serving {
             return;
         }
-        self.fence(component);
+        let mut at = self.0.at.subscribe();
         let Some(elector) = elector else {
             let _ = at.wait_for(|at| *at == SERVED_ON).await;
             return;
