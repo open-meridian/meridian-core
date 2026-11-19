@@ -628,3 +628,207 @@ async fn two_shards_share_a_want_s_subjects_and_a_lost_shard_s_are_handed_on_at_
         "the first shard's plugin was handed a want that is not its own"
     );
 }
+
+/// `feed-1`'s bus in memory, the conductor's answer to its configuration
+/// served on it.
+fn feed_bus() -> Arc<Bus> {
+    let bus = Arc::new(Bus::single(
+        "feed-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    bus
+}
+
+/// The lake's standing want `id` of `feed-1`'s prices, naming `names`.
+fn publish_want(bus: &Bus, id: &str, names: &[String]) {
+    use meridian_domain::v1::{ObservationsWantedEvent, SubjectRef};
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        ObservationsWantedEvent {
+            want_id: id.into(),
+            dataset: "feed-1:prices".into(),
+            data_type: "meridian.v1.Price".into(),
+            subjects: names
+                .iter()
+                .map(|entity| SubjectRef {
+                    entity_id: entity.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            standing: true,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+fn publish_withdrawn(bus: &Bus, id: &str) {
+    bus.publish(
+        "platform.lake.event.want-withdrawn",
+        "meridian.v1.WantWithdrawnEvent",
+        meridian_domain::v1::WantWithdrawnEvent {
+            want_id: id.into(),
+            dataset: "feed-1:prices".into(),
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+/// What the stream delivers until it is quiet for `quiet`: each want's ID
+/// and subjects, each withdrawal's ID with none, each loss as "lost".
+async fn drained(
+    stream: &mut super::Deliveries,
+    quiet: std::time::Duration,
+) -> Vec<(String, Vec<String>)> {
+    let mut heard = Vec::new();
+    while let Ok(Some(delivery)) = tokio::time::timeout(quiet, stream.next()).await {
+        match delivery.expect("a delivery").item.expect("an item") {
+            plugin::delivery::Item::ObservationsWanted(want) => heard.push((
+                want.want_id,
+                want.subjects.into_iter().map(|s| s.entity_id).collect(),
+            )),
+            plugin::delivery::Item::WantWithdrawn(gone) => heard.push((gone.want_id, Vec::new())),
+            plugin::delivery::Item::Lost(_) => heard.push(("lost".into(), Vec::new())),
+            _ => {}
+        }
+    }
+    heard
+}
+
+/// Ruling 184 (option B): a taker's hold is handed to its plugin as its
+/// stream opens, through the shard's own path -- its share alone, each want
+/// once though the take's delivery and the sweep's both came, none
+/// withdrawn in the window -- and the stream hears on from where the hold
+/// left off: a withdrawal after it reaches the plugin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_s_hold_is_handed_as_its_stream_opens_each_want_once() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.set_live([1]);
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let mine: Vec<String> = names.iter().filter(|n| shards.keeps(n)).cloned().collect();
+    assert!(!mine.is_empty() && mine.len() < names.len());
+    publish_want(&bus, "want-1", &names);
+    publish_want(&bus, "want-2", &names);
+    // Held, then withdrawn.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    publish_withdrawn(&bus, "want-2");
+    // The sweep's redelivery of want-1 in the same window.
+    publish_want(&bus, "want-1", &names);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        drained(&mut stream, std::time::Duration::from_millis(300)).await,
+        vec![("want-1".to_string(), mine)],
+        "not want-1's share alone, once"
+    );
+    publish_withdrawn(&bus, "want-1");
+    assert_eq!(
+        drained(&mut stream, std::time::Duration::from_millis(300)).await,
+        vec![("want-1".to_string(), Vec::new())],
+        "the withdrawal after the hold did not reach the plugin"
+    );
+}
+
+/// Publishes `n` standing wants of `feed-1`'s naming `subject`,
+/// `want-<from + i>`, a few at a time, so the bus's own queue never drops,
+/// and waits for the sidecar to read them.
+async fn publish_many(bus: &Bus, from: usize, n: usize, subject: &str) {
+    for i in from..from + n {
+        publish_want(bus, &format!("want-{i}"), &[subject.to_string()]);
+        if i % 100 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+/// Review c5u2 N1, a withdrawal: a shard's plugin was handed a want, and its
+/// queue is full when the lake withdraws it. The withdrawal is never
+/// dropped: nothing would tell it again, and the want would be served for
+/// good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_s_withdrawal_of_a_want_handed_is_never_dropped_from_a_full_queue() {
+    let bus = feed_bus();
+    let (sidecar, _shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    publish_want(&bus, "first", &["INS-1".to_string()]);
+    assert_eq!(wanted_subjects(&next(&mut stream).await).0, "first");
+    // The queue filled, and past it.
+    publish_many(&bus, 0, QUEUE + 5, "INS-1").await;
+    publish_withdrawn(&bus, "first");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        heard.contains(&("first".to_string(), Vec::new())),
+        "the withdrawal was dropped: {} delivered, the last {:?}",
+        heard.len(),
+        heard.last()
+    );
+}
+
+/// Review c5u2 N1, a part: a want heard while the queue is full is dropped,
+/// and so is not kept as handed: the next sharing hands it, rather than
+/// skipping it as handed until the lake's next redelivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_s_part_dropped_from_a_full_queue_is_handed_at_the_next_sharing() {
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    // A subject shard 0 keeps whether or not shard 1 lives: its part is the
+    // same either side of the change below.
+    let ours = (0..200)
+        .map(|i| format!("INS-{i:03}"))
+        .find(|name| {
+            crate::shards::keeper(name, &std::collections::BTreeSet::from([0, 1])) == Some(0)
+        })
+        .unwrap();
+    // The queue filled and past it (the stream's own sending holds two
+    // more), every filler's part unchanged by the change below too.
+    publish_many(&bus, 0, QUEUE + 10, &ours).await;
+    publish_want(&bus, "dropped", std::slice::from_ref(&ours));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        !heard.iter().any(|(id, _)| id == "dropped"),
+        "the queue was not full: {} delivered",
+        heard.len()
+    );
+    // Shard 1 comes up: every standing want is shared again.
+    shards.set_live([1]);
+    let again = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        again.contains(&("dropped".to_string(), vec![ours])),
+        "the dropped part was kept as handed: {} delivered, {:?}",
+        again.len(),
+        again.iter().take(3).collect::<Vec<_>>()
+    );
+}

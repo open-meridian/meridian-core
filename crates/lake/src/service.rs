@@ -6043,7 +6043,51 @@ impl Lake {
             previous = took.previous_holder,
             "a shard was taken: its epoch raised in every writer group"
         );
+        self.deliver_standing_again(&took.instance);
         Ok(meridian_domain::v1::TakeShardReply { epoch: took.epoch })
+    }
+
+    /// A shard of `instance` taken (ruling 184, option B; item 33): each of
+    /// the instance's standing wants still asked for delivered again at
+    /// once, as the sweep delivers it again -- the same want under the same
+    /// ID, no change to it and so no record of it -- so the taker hands its
+    /// plugin its share within the lapse, not at the next redelivery. The
+    /// taker's sidecar listens from before it asks to take. The sweep's
+    /// redelivery stays, counted from this one.
+    fn deliver_standing_again(&self, instance: &str) {
+        let now = self.clock.now_ns();
+        let again: Vec<ObservationsWantedEvent> = {
+            let mut wants = self.wants.lock().expect("wants poisoned");
+            wants
+                .open
+                .values_mut()
+                .filter(|open| {
+                    open.event.standing
+                        && now - open.asked_at_ns <= lapses_after(open)
+                        && meridian_domain::lake::instance_of(&open.event.dataset) == Some(instance)
+                })
+                .map(|open| {
+                    open.published_at_ns = now;
+                    open.event.clone()
+                })
+                .collect()
+        };
+        for event in again {
+            tracing::debug!(
+                want_id = event.want_id,
+                dataset = event.dataset,
+                "a standing want delivered again at a take of its instance's shard"
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a standing want was not delivered again at a take");
+            }
+        }
     }
 
     /// Every lake and book writer group asked to raise `took`'s shard to its

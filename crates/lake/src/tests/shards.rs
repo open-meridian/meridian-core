@@ -333,3 +333,118 @@ async fn a_take_sent_past_its_sidecar_s_wait_is_not_numbered_or_recorded() {
         "a take sent past its sidecar's wait was recorded"
     );
 }
+
+/// Ruling 184 (option B; item 33): a take of one of an instance's shards
+/// delivers each of that instance's standing wants still asked for again
+/// at once, as the sweep would -- the same want under the same ID, nothing
+/// recorded -- and nothing else: no other instance's, no one-off want, and
+/// nothing for a take refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_delivers_its_instance_s_standing_wants_again_and_nothing_else() {
+    let h = harness();
+    let dataset = |instance: &str| DatasetRef {
+        dataset: format!("{instance}:daily"),
+        instance: instance.into(),
+        vendor: "Coinbase".into(),
+        declaration: Some(declaration("daily", 60)),
+        ..Default::default()
+    };
+    let entitled = |dataset: &str, reader: &str| DatasetEntitlement {
+        dataset: dataset.into(),
+        instance: reader.into(),
+        allowed: true,
+        ..Default::default()
+    };
+    h.lake.configured(&EntitlementsChangedEvent {
+        datasets: vec![dataset(INSTANCE), dataset("kraken-1")],
+        licences: vec![],
+        entitlements: vec![
+            entitled("lake-1:daily", "reporting-1"),
+            entitled("kraken-1:daily", "reporting-2"),
+        ],
+        changed_at_ns: NOW,
+    });
+    book_group(&h.bus, 0);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let renew = |reader: &str| {
+        h.lake
+            .renew_wants(
+                meridian_domain::v1::RenewWantsRequest {
+                    wants: vec![meridian_domain::v1::RenewedWant {
+                        data_type: "meridian.v1.Price".into(),
+                        subjects: vec![SubjectRef {
+                            entity_id: BTC.into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                },
+                &envelope(reader, true, ""),
+            )
+            .unwrap()
+    };
+    renew("reporting-1");
+    renew("reporting-2");
+    // A one-off want of the instance's: a day's prices it has none of.
+    read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    let mut heard = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(200), wanted.recv()).await
+    {
+        heard.push(ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap());
+    }
+    let standing: Vec<&ObservationsWantedEvent> = heard
+        .iter()
+        .filter(|want| want.standing && want.dataset == "lake-1:daily")
+        .collect();
+    assert_eq!(standing.len(), 1, "{heard:?}");
+    let standing = standing[0].clone();
+    assert!(
+        heard
+            .iter()
+            .any(|want| !want.standing && want.dataset == "lake-1:daily"),
+        "no one-off want of the instance's: {heard:?}"
+    );
+    assert!(heard.iter().any(|want| want.dataset == "kraken-1:daily"));
+    let recorded = h.store.want_changes().unwrap().len();
+
+    take(&h.bus, 1, 0).await.unwrap();
+    let mut again = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(200), wanted.recv()).await
+    {
+        again.push(ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap());
+    }
+    assert_eq!(
+        again,
+        vec![standing.clone()],
+        "the take delivered other than the instance's standing want, as it was"
+    );
+    assert_eq!(
+        h.store.want_changes().unwrap().len(),
+        recorded,
+        "a delivery again was recorded as a change"
+    );
+
+    // A take refused -- its Lease's transitions below one a take was
+    // numbered with -- delivers nothing.
+    take(&h.bus, 1, 7).await.unwrap();
+    while tokio::time::timeout(Duration::from_millis(200), wanted.recv())
+        .await
+        .is_ok_and(|heard| heard.is_some())
+    {}
+    assert!(take(&h.bus, 1, 3).await.is_err(), "a take behind was taken");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), wanted.recv())
+            .await
+            .is_err(),
+        "a refused take delivered a want again"
+    );
+}
