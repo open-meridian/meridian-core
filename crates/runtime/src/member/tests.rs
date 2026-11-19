@@ -4016,3 +4016,54 @@ async fn a_serve_on_dropped_part_way_never_leaves_its_fenced_writer_waiting() {
         .expect("its serve-on dropped, the fenced writer waited on")
         .expect("waited");
 }
+
+/// A task's step-down that is no fence -- no commit refused by a newer
+/// epoch, no fence of this writer seen -- ends at once while it serves on,
+/// refusing nothing: its store's topics, reads included, are not refused
+/// up to 20 s for a failure that took nothing over (review-c5n2 L2). A
+/// fence seen, it waits its serve-on out as any fence does (item 110).
+#[tokio::test(start_paused = true)]
+async fn a_task_stepping_down_with_no_fence_ends_at_once_while_it_serves_on() {
+    let serving_on = ServingOn::default();
+    let refused = Arc::new(AtomicBool::new(false));
+    let (on, refusing) = (serving_on.clone(), Arc::clone(&refused));
+    let _serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            |_, _| Ok(false),
+            move || refusing.store(true, Ordering::SeqCst),
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stepping = SteppingDown {
+        elector: None,
+        component: "lake",
+        serving_on: serving_on.clone(),
+    };
+    tokio::time::timeout(Duration::from_secs(1), stepping.before_stepping_down())
+        .await
+        .expect("no fence, it waited its serve-on out");
+    assert!(
+        !refused.load(Ordering::SeqCst),
+        "no fence, it refused its topics"
+    );
+    // Its fence seen by another of its tasks: a fence's step-down.
+    serving_on.fence("lake");
+    assert!(refused.load(Ordering::SeqCst), "fenced, it never refused");
+    let stepping = SteppingDown {
+        elector: None,
+        component: "lake",
+        serving_on,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), stepping.before_stepping_down())
+            .await
+            .is_err(),
+        "fenced while serving on, it did not wait its serve-on out"
+    );
+}

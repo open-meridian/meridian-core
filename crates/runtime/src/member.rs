@@ -483,6 +483,16 @@ impl ServingOn {
         }
     }
 
+    /// Whether this writer's fence was seen ([`ServingOn::fence`]).
+    fn was_fenced(&self) -> bool {
+        self.0
+            .held
+            .lock()
+            .expect("serving on poisoned")
+            .fenced
+            .is_some()
+    }
+
     /// This writer is fenced, and about to step down. Not serving on at its
     /// fence: nothing, at once. Serving on: its topics are refused from here, and
     /// this waits for the serve-on's own end -- or, where it holds a lease,
@@ -1502,10 +1512,27 @@ pub struct SteppingDown {
 
 impl SteppingDown {
     /// The lease given up where it still names this member (within
-    /// [`STEP_DOWN_RELEASE`]), then [`step_down`].
+    /// [`STEP_DOWN_RELEASE`]), then [`step_down`]; where this is a fence,
+    /// its serve-on waited out first ([`Self::before_stepping_down`]).
     pub async fn now(self, why: &str) -> ! {
-        fenced_stepping_down(&self.serving_on, self.elector.as_deref(), self.component).await;
+        self.before_stepping_down().await;
         step_down(self.component, why)
+    }
+
+    /// What [`Self::now`] does before the process ends. A fence -- a commit
+    /// of this process refused by a newer epoch
+    /// ([`meridian_changes::fenced_seen`]), or this writer's fence seen by
+    /// another of its tasks -- is a fence's step-down, its serve-on waited
+    /// out where it serves on (item 110; [`fenced_stepping_down`]). Any
+    /// other failure is none: its lease given up, it ends at once, as
+    /// before item 110 -- its store's topics never refused for it, reads
+    /// included, up to 20 s (review-c5n2 L2).
+    async fn before_stepping_down(&self) {
+        if meridian_changes::fenced_seen() || self.serving_on.was_fenced() {
+            fenced_stepping_down(&self.serving_on, self.elector.as_deref(), self.component).await;
+        } else if let Some(elector) = &self.elector {
+            let_go_stepping_down(elector, self.component).await;
+        }
     }
 }
 
