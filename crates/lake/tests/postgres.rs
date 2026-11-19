@@ -9051,6 +9051,91 @@ fn places_kept_by_the_streams_name_are_carried_to_its_identity_once() {
 }
 
 /// The review of item 191's finding 2 (`lake_partition.taken_in`, item
+/// 202), at finding 1's carry: where a range's source stood at its last
+/// move, kept before `taken_in` (a bare `taken_from`), is a place in the
+/// stream the position under the name was taken in. The carry into that
+/// stream marks it taken there, so its group leaves uncounted what it left
+/// uncounted before the upgrade. A range that never moved, or whose place
+/// is kept with its stream already, is left as it is; a stream made after
+/// the position was taken marks nothing.
+#[test]
+fn a_place_taken_from_before_taken_in_is_carried_into_the_stream_it_was_taken_in() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::stream_key;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let (url, store) = isolated("taken-in-carried");
+    store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: STREAM.into(),
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 10,
+                    at_ns: 10_000,
+                },
+                ..Default::default()
+            },
+            SystemClock.now_ns(),
+        )
+        .unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO lake_partition (dataset, head, taken_from, taken_in) VALUES
+                ('before-1:daily', 1, 7, NULL),
+                ('never-1:daily', 1, NULL, NULL),
+                ('kept-1:daily', 1, 9, 42)",
+        )
+        .unwrap();
+    let mut taken_in = || -> Vec<(String, Option<i64>)> {
+        client
+            .query(
+                "SELECT dataset, taken_in FROM lake_partition ORDER BY dataset",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    };
+    let before = vec![
+        ("before-1:daily".to_string(), None),
+        ("kept-1:daily".to_string(), Some(42)),
+        ("never-1:daily".to_string(), None),
+    ];
+    // A stream made after the position was taken: nothing marked.
+    assert!(!store
+        .write_ahead_carried(STREAM, &stream_key(STREAM, 20_000), 20_000)
+        .unwrap());
+    assert_eq!(taken_in(), before);
+    // The stream it was taken in: the bare place marked taken there.
+    assert!(store
+        .write_ahead_carried(STREAM, &stream_key(STREAM, 1_000), 1_000)
+        .unwrap());
+    assert_eq!(
+        taken_in(),
+        vec![
+            ("before-1:daily".to_string(), Some(1_000)),
+            ("kept-1:daily".to_string(), Some(42)),
+            ("never-1:daily".to_string(), None),
+        ],
+        "the bare taken_from carried into the stream it was taken in"
+    );
+    // Read as a place in that stream by the writer taking from it.
+    store.in_stream(1_000);
+    assert_eq!(
+        store
+            .taken_from(&[
+                "before-1:daily".to_string(),
+                "never-1:daily".to_string(),
+                "kept-1:daily".to_string(),
+            ])
+            .unwrap(),
+        [("before-1:daily".to_string(), 7)].into_iter().collect()
+    );
+}
+
+/// The review of item 191's finding 2 (`lake_partition.taken_in`, item
 /// 202): where a range's source stood at its last move (`taken_from`) is a
 /// place in the stream the move was made in, and in no other. After `ha`
 /// is left and taken again, the stream made again numbers from its own
@@ -9546,17 +9631,14 @@ async fn a_target_taken_back_from_its_first_write_counts_no_run_before_the_strea
 /// The review of item 191's finding 4: a range's switch between databases
 /// stopped between its two rows keeps, beside the source's pointer, the
 /// place its target takes the range's rows from -- the source's -- under
-/// the target's key. A target group that has never committed is not at
-/// that place: its own position is none, its home's first, never a point
-/// kept beside a pointer, so it skips none of its own ranges' writes.
-#[test]
-fn a_point_kept_beside_a_pointer_is_never_a_fresh_groups_own_position() {
+/// the target's key: group 0's place, with group 1 never committed.
+fn a_switch_stopped_beside_a_pointer(tag: &str) -> Across {
     use meridian_changes::moves::points;
     use meridian_lake::partition_moves::Asked;
     use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
     use meridian_lake::write_ahead::group_key;
     const STREAM: &str = "LAKE_WRITE_AHEAD";
-    let a = across("kept-point", true);
+    let a = across(tag, true);
     let lower = a.lower();
     let mover = a.mover();
     // Group 0, the source, has committed through 5, at home.
@@ -9591,14 +9673,37 @@ fn a_point_kept_beside_a_pointer_is_never_a_fresh_groups_own_position() {
         Some(source),
         "the point kept beside the pointer"
     );
-    // Group 1 has never committed: no position of its own.
+    a
+}
+
+/// Finding 4, the group's own read: a target group that has never
+/// committed is not at the place kept beside a pointer. Its own position is
+/// none -- its home's first, never a point kept beside a pointer -- so it
+/// skips none of its own ranges' writes.
+#[test]
+fn a_point_kept_beside_a_pointer_is_never_a_fresh_groups_own_position() {
+    use meridian_lake::write_ahead::group_key;
+    let a = a_switch_stopped_beside_a_pointer("kept-point");
     assert_eq!(
-        a.one.write_ahead_position(&group_key(STREAM, 1)).unwrap(),
+        a.one
+            .write_ahead_position(&group_key("LAKE_WRITE_AHEAD", 1))
+            .unwrap(),
         None,
         "a fresh group adopted the point kept beside a pointer"
     );
+}
+
+/// Finding 4, another group's read (`group_position`, as a group waiting
+/// for the target reads it): the place kept beside a pointer is not the
+/// fresh target's position either.
+#[test]
+fn a_point_kept_beside_a_pointer_is_never_read_as_a_fresh_groups_position() {
+    use meridian_lake::write_ahead::group_key;
+    let a = a_switch_stopped_beside_a_pointer("kept-point-read");
     assert_eq!(
-        a.zero.group_position(&group_key(STREAM, 1), 1).unwrap(),
+        a.zero
+            .group_position(&group_key("LAKE_WRITE_AHEAD", 1), 1)
+            .unwrap(),
         None,
         "another group read the point kept beside a pointer as group 1's"
     );
