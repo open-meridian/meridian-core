@@ -3804,18 +3804,21 @@ def groups_held():
 
 def groups_lowering_refused(s, what):
     """The writer-group count lowered from two to one in ha, under the
-    driver's load: refused by the chart (PO item 111, option B; item 103's
-    step), saying why, and nothing changes -- no revision, and no store
-    member's pod, epoch, partition's group or place in the write-ahead
-    stream moves, through the upgrade and a while after it."""
+    driver's load, each store's alone: each refused by the chart (PO item
+    111, option B; item 103's step), saying why and naming its own store --
+    Helm stops at the first refusal, so one upgrade lowering both would
+    prove one store's (review c5s, L4) -- and nothing changes: no revision,
+    and no store member's pod, epoch, partition's group or place in the
+    write-ahead stream moves, through the upgrades and a while after."""
     print(f"T: {what}", flush=True)
     before_revision = revision()
     members, rows, partitions = groups_held()
-    upgraded = upgrade("lake.writerGroups=1", "bor.writerGroups=1")
-    said = upgraded.stderr.decode(errors="replace")
-    s.check(upgraded.returncode != 0 and "can't lower them yet" in said,
-            f"{what}: the upgrade refused, saying why"
-            + (" (it applied)" if upgraded.returncode == 0 else f": {said[-400:]}"))
+    for store in ("lake", "bor"):
+        upgraded = upgrade(f"{store}.writerGroups=1")
+        said = upgraded.stderr.decode(errors="replace")
+        s.check(upgraded.returncode != 0 and f"{store}.writerGroups is 1" in said and "can't lower them yet" in said,
+                f"{what}: {store}.writerGroups lowered alone, the upgrade refused, saying why"
+                + (" (it applied)" if upgraded.returncode == 0 else f": {said[-400:]}"))
     time.sleep(30)
     s.check(revision() == before_revision, f"{what}: the release's revision unchanged")
     members_after, rows_after, partitions_after = groups_held()
