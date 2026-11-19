@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use meridian_changes::scratch::Scratch;
+use meridian_changes::scratch::{OffRuntime, Scratch};
 use meridian_clock::{Clock, SystemClock};
 use meridian_domain::date::Date;
 use meridian_domain::v1::{
@@ -7250,9 +7250,11 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
     // as the driver's dataset in CI 43621875619.
     let (url, zero, one, dataset, _lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-ham", 1));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     let lake_of = |store: &Arc<PostgresStore>, instance: &str| ha_lake(store, instance, &dataset);
     let (lake0, lake1) =
         tokio::task::block_in_place(|| (lake_of(&zero, "lake-0"), lake_of(&one, "lake-1")));
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     // The stream: each write a row in each half, each row its own key.
     let stream: Vec<Taken> = (1..=WRITES)
         .map(|n| {
@@ -7291,11 +7293,11 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
             }
         })
         .collect();
-    let mut writers = [
+    let mut writers = OffRuntime::new([
         tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
         tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
-    ];
-    let lakes = [lake0.clone(), lake1.clone()];
+    ]);
+    let lakes = OffRuntime::new([lake0.clone(), lake1.clone()]);
     // Group 0, the target, takes four writes a step; group 1, the source,
     // one: the target is ahead when the range moves.
     let paces = [4usize, 1];
@@ -7451,7 +7453,6 @@ async fn a_range_moved_between_groups_in_ha_under_load_commits_each_row_once_and
             .collect();
         assert!(missed.is_empty(), "missed: {missed:?}");
     });
-    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, zero, one)));
 }
 
 /// A write is answered a success only when its answer accounts for every
@@ -7489,6 +7490,7 @@ async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sen
     // of group 0's; and one served and not kept.
     let (url, zero, one, dataset, _lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-rule", 1));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     let named = |tag: &str, owner: u32| {
         (0..)
             .map(|n| unique(&format!("coinbase-1:{tag}{n}")))
@@ -7502,6 +7504,7 @@ async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sen
             ha_lake(&one, "lake-1", &dataset),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let configured = EntitlementsChangedEvent {
         datasets: [&dataset, &other, &served]
             .iter()
@@ -7544,11 +7547,11 @@ async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sen
         lake0.configured(&configured);
         lake1.configured(&configured);
     });
-    let lakes = [lake0.clone(), lake1.clone()];
-    let mut writers = [
+    let lakes = OffRuntime::new([lake0.clone(), lake1.clone()]);
+    let mut writers = OffRuntime::new([
         tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
         tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
-    ];
+    ]);
     let mut stream: Vec<Taken> = Vec::new();
     let row = |dataset: &str, key: &str, subject: &str, valid: i64| match trade(
         dataset, key, subject, valid,
@@ -7719,7 +7722,6 @@ async fn a_write_is_a_success_only_when_its_answer_accounts_for_every_row_it_sen
         counts(ask!(served, vec![row(&served, "u", &low, 50)])),
         (1, 0, 0)
     );
-    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, zero, one)));
 }
 
 /// A lake range moved to the group that answers its dataset, across
@@ -7747,11 +7749,13 @@ async fn a_range_moved_to_its_datasets_answering_group_behind_the_hot_layer_lose
     const STREAM: &str = "LAKE_WRITE_AHEAD";
     const WRITES: u64 = 120;
     // Group 1's dataset, both halves at its home (database 1).
-    let a = tokio::task::block_in_place(|| across_owned("ham3", true, 1));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| {
+        across_owned("ham3", true, 1)
+    }));
     let dataset = a.dataset.clone();
     let upper = format!("{dataset}/8000-ffff");
     let (_, high) = halves_of("ham3");
-    let mover = Arc::new(a.mover());
+    let mover = OffRuntime::new(Arc::new(a.mover()));
     let asked = || Asked {
         by_hand: true,
         moved_by: "admin-1".into(),
@@ -7780,6 +7784,7 @@ async fn a_range_moved_to_its_datasets_answering_group_behind_the_hot_layer_lose
             behind_hot(&a.one, a.ones[0].groups(), "lake-1"),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let stream: Vec<Taken> = (1..=WRITES)
         .map(|n| {
             let row = match trade(&dataset, &format!("y{n}"), &high, 1_000 + n as i64) {
@@ -7812,11 +7817,11 @@ async fn a_range_moved_to_its_datasets_answering_group_behind_the_hot_layer_lose
             }
         })
         .collect();
-    let mut writers = [
+    let mut writers = OffRuntime::new([
         tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
         tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
-    ];
-    let lakes = [lake0.clone(), lake1.clone()];
+    ]);
+    let lakes = OffRuntime::new([lake0.clone(), lake1.clone()]);
     let mut settling = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     let mut taken_back = 0;
@@ -7974,7 +7979,6 @@ async fn a_range_moved_to_its_datasets_answering_group_behind_the_hot_layer_lose
         &uncounted[..uncounted.len().min(12)]
     );
     assert!(twice.is_empty(), "held twice: {twice:?}");
-    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, mover, a)));
 }
 
 /// A lake range moved between writer groups across databases in ha, under
@@ -7994,7 +7998,7 @@ async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_ev
     use prost::Message;
     const STREAM: &str = "LAKE_WRITE_AHEAD";
     const WRITES: u64 = 360;
-    let a = tokio::task::block_in_place(|| across("ham2", true));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| across("ham2", true)));
     let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
     let (_, high) = halves_of("ham2");
     let (lake0, lake1) = tokio::task::block_in_place(|| {
@@ -8013,6 +8017,7 @@ async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_ev
             ),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let stream: Vec<Taken> = (1..=WRITES)
         .map(|n| {
             let row = |half: &str, subject: &str| match trade(
@@ -8050,12 +8055,12 @@ async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_ev
             }
         })
         .collect();
-    let mut writers = [
+    let mut writers = OffRuntime::new([
         tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
         tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
-    ];
-    let lakes = [lake0.clone(), lake1.clone()];
-    let mover = Arc::new(a.mover());
+    ]);
+    let lakes = OffRuntime::new([lake0.clone(), lake1.clone()]);
+    let mover = OffRuntime::new(Arc::new(a.mover()));
     let mut settling = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     let mut taken_back = 0;
@@ -8205,7 +8210,6 @@ async fn a_range_moved_across_databases_in_ha_under_load_is_answered_counting_ev
             .collect();
         assert!(missed.is_empty(), "missed: {missed:?}");
     });
-    tokio::task::block_in_place(move || drop((writers, lakes, lake0, lake1, mover, a)));
 }
 
 /// A write split across two writer groups, in ha, is answered counting
@@ -8228,6 +8232,7 @@ async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
     // to group 0.
     let (_url, zero, one, dataset, _lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-parts", 1));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     tokio::task::block_in_place(|| {
         let mover = Mover::new(
             vec![one.clone()],
@@ -8246,6 +8251,7 @@ async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
             ha_lake(&one, "lake-1", &dataset),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let write = |n: u64, rows: Vec<(&str, &String)>| Taken {
         sequence: n,
         at_ns: 1_000 + n as i64,
@@ -8283,10 +8289,12 @@ async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
         write(1, vec![("l", &low), ("h", &high)]),
         write(2, vec![("h", &high)]),
     ];
-    let mut writer0 =
-        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer0 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
+    );
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     // Group 1, answering, takes both first; group 0 commits its parts after.
     let answers = tokio::task::block_in_place(|| writer1.take(stream.clone())).unwrap();
     let waits = writer1.take_waits();
@@ -8328,7 +8336,6 @@ async fn a_write_split_across_groups_is_answered_counting_every_groups_part() {
         named.contains(&upper),
         "its range named at its head: {named:?}"
     );
-    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, zero, one)));
 }
 
 /// A row sent again unchanged in a write just after its range's switch is
@@ -8353,12 +8360,14 @@ async fn a_row_sent_again_unchanged_just_after_a_switch_is_answered_unchanged() 
     // The dataset and both its halves group 1's, which answers its writes.
     let (url, zero, one, dataset, _lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split_of("lake-taken", 1));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     let (lake0, lake1) = tokio::task::block_in_place(|| {
         (
             ha_lake(&zero, "lake-0", &dataset),
             ha_lake(&one, "lake-1", &dataset),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let sent_at = SystemClock.now_ns();
     let write = |n: u64, key: &str, subject: &String| Taken {
         sequence: n,
@@ -8393,10 +8402,12 @@ async fn a_row_sent_again_unchanged_just_after_a_switch_is_answered_unchanged() 
         write(2, "again", &high),
         write(3, "other", &low),
     ];
-    let mut writer0 =
-        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer0 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
+    );
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     // Both groups take the first write: group 1 commits and counts its row.
     let first = taken_past_a_switch(&mut writer1, vec![stream[0].clone()])
         .await
@@ -8485,7 +8496,6 @@ async fn a_row_sent_again_unchanged_just_after_a_switch_is_answered_unchanged() 
         kept, 0,
         "group 0 counts nothing of the write its source counted"
     );
-    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, zero, one)));
 }
 
 /// No write is answered while a range of its dataset is between two
@@ -8510,9 +8520,9 @@ async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
     const STREAM: &str = "LAKE_WRITE_AHEAD";
     // The dataset group 0's, which answers its writes, in database 0; its
     // lower half moved to group 1, in database 1.
-    let a = tokio::task::block_in_place(|| across("between", true));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| across("between", true)));
     let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
-    let mover = Arc::new(a.mover());
+    let mover = OffRuntime::new(Arc::new(a.mover()));
     tokio::task::block_in_place(|| {
         assert!(mover.begin(&lower));
         mover.run(&lower, 1, &Asked::default()).unwrap();
@@ -8536,6 +8546,7 @@ async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
             ),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let write = |n: u64| Taken {
         sequence: n,
         at_ns: 1_000 + n as i64,
@@ -8570,10 +8581,12 @@ async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
         let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
         (reply.recorded, reply.restated, reply.unchanged)
     };
-    let mut writer0 =
-        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer0 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
+    );
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     // A first write, its row group 1's: committed there, answered by group 0.
     taken_past_a_switch(&mut writer1, vec![write(1)])
         .await
@@ -8642,7 +8655,6 @@ async fn a_write_is_not_answered_while_its_range_is_between_two_databases() {
         (1, 0, 0),
         "answered once its row was committed, and counted"
     );
-    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
 /// A write the target group passed, its row then another group's, whose
@@ -8674,9 +8686,9 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
     }
     // The dataset group 0's, which answers its writes, split, both halves
     // in database 0; its lower half moves to group 1, in database 1.
-    let a = tokio::task::block_in_place(|| across("passed", true));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| across("passed", true)));
     let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
-    let mover = Arc::new(a.mover());
+    let mover = OffRuntime::new(Arc::new(a.mover()));
     let (lake0, lake1) = tokio::task::block_in_place(|| {
         (
             ha_lake_over(
@@ -8693,6 +8705,7 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
             ),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let write = |n: u64| Taken {
         sequence: n,
         at_ns: 1_000 + n as i64,
@@ -8727,10 +8740,12 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
         let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
         (reply.recorded, reply.restated, reply.unchanged)
     };
-    let mut writer0 =
-        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer0 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
+    );
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     // A first write, its row group 0's: committed there, passed by group 1.
     taken_past_a_switch(&mut writer0, vec![write(1)])
         .await
@@ -8769,8 +8784,11 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
         futures_util::stream::pending::<Result<async_nats::jetstream::Message, String>>();
     let mut stall = Stall::new(meridian_lake::write_ahead::STALL_AFTER);
     let next = writer1.next();
-    let said =
-        tokio::time::timeout(hold, read(&mut quiet, &mut stall, next, &mut Two, &writer1)).await;
+    let said = tokio::time::timeout(
+        hold,
+        read(&mut quiet, &mut stall, next, &mut Two, &*writer1),
+    )
+    .await;
     assert!(
         matches!(said, Ok(Read::TakenBack)),
         "group 1 never found its place taken back within the hold: {said:?}"
@@ -8791,7 +8809,6 @@ async fn a_write_passed_just_before_its_range_switched_is_taken_again_with_no_wr
         (1, 0, 0),
         "answered once group 1 committed its row"
     );
-    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
 /// Item 191 (ruled 2026-11-19): a move's switch takes back the target's
@@ -9743,11 +9760,13 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
     // the upper half moved to group 0 in database 0 first, nothing writing:
     // the shape CI moved it back from. Every member reads it, as its sweep
     // does.
-    let a = tokio::task::block_in_place(|| across_owned("answering", true, 1));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| {
+        across_owned("answering", true, 1)
+    }));
     let dataset = a.dataset.clone();
     let upper = format!("{dataset}/8000-ffff");
     let (_, high) = halves_of("answering");
-    let mover = Arc::new(a.mover());
+    let mover = OffRuntime::new(Arc::new(a.mover()));
     let asked = || Asked {
         by_hand: true,
         moved_by: "admin-1".into(),
@@ -9777,6 +9796,7 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
             ),
         )
     });
+    let (lake0, lake1) = (OffRuntime::new(lake0), OffRuntime::new(lake1));
     let write = |n: u64| Taken {
         sequence: n,
         at_ns: 1_000 + n as i64,
@@ -9811,10 +9831,12 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
         let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
         (reply.recorded, reply.restated, reply.unchanged)
     };
-    let mut writer0 =
-        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer0 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap(),
+    );
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     // A first write, its row group 0's: committed there, taken by group 1
     // with none of its rows.
     taken_past_a_switch(&mut writer0, vec![write(1)])
@@ -9856,8 +9878,11 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
         futures_util::stream::pending::<Result<async_nats::jetstream::Message, String>>();
     let mut stall = Stall::new(meridian_lake::write_ahead::STALL_AFTER);
     let next = writer1.next();
-    let said =
-        tokio::time::timeout(hold, read(&mut quiet, &mut stall, next, &mut Two, &writer1)).await;
+    let said = tokio::time::timeout(
+        hold,
+        read(&mut quiet, &mut stall, next, &mut Two, &*writer1),
+    )
+    .await;
     assert!(
         matches!(said, Ok(Read::TakenBack)),
         "group 1, which answers the dataset, never found its place taken back within the hold: \
@@ -9894,7 +9919,6 @@ async fn a_write_its_answering_group_took_just_before_its_range_switched_to_it_i
         1,
         "the row held once, where its range is now"
     );
-    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
 /// An answer that waits on another group's part is given before its caller
@@ -9918,11 +9942,13 @@ async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_s
     let hold = meridian_changes::moves::hold();
     assert!(std::time::Duration::from_millis(WAIT_MS) < hold);
     // Group 1's dataset, which it answers, its upper half group 0's.
-    let a = tokio::task::block_in_place(|| across_owned("caller", true, 1));
+    let a = OffRuntime::new(tokio::task::block_in_place(|| {
+        across_owned("caller", true, 1)
+    }));
     let dataset = a.dataset.clone();
     let upper = format!("{dataset}/8000-ffff");
     let (_, high) = halves_of("caller");
-    let mover = a.mover();
+    let mover = OffRuntime::new(a.mover());
     tokio::task::block_in_place(|| {
         assert!(mover.begin(&upper));
         let asked = Asked {
@@ -9936,14 +9962,14 @@ async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_s
             store.read_owners().unwrap();
         }
     });
-    let lake1 = tokio::task::block_in_place(|| {
+    let lake1 = OffRuntime::new(tokio::task::block_in_place(|| {
         ha_lake_over(
             a.one.clone() as Arc<dyn Store>,
             a.ones[0].groups(),
             "lake-1",
             &dataset,
         )
-    });
+    }));
     // A write sent now, its row in group 0's half, its caller waiting 2 s.
     // Group 0 never takes it.
     let sent = SystemClock.now_ns();
@@ -9975,8 +10001,9 @@ async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_s
         timeout_ms: Some(WAIT_MS),
     };
     let began = std::time::Instant::now();
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     let answers = taken_past_a_switch(&mut writer1, vec![write])
         .await
         .unwrap();
@@ -10010,7 +10037,6 @@ async fn an_answer_waiting_on_another_groups_part_is_refused_before_its_caller_s
         refused.contains(&overloaded) && meridian_bus::refusal_retry_after(&refused).is_some(),
         "OVERLOADED with a retry-after: {refused}"
     );
-    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
 }
 
 /// A write of `dataset`'s row `key` on `subject`, sent now, its caller
@@ -10086,6 +10112,66 @@ fn answering_with_its_upper_half_out(
     (a, upper, high, mover)
 }
 
+/// An async test that fails drops its databases as it unwinds (merge-queue
+/// run 44594070565): what it holds over its stores is dropped off the
+/// runtime ([`OffRuntime`]), so no sync client closes on the runtime's
+/// thread -- a panic in a destructor, which ended the process with its two
+/// `lake2_*` databases left for `make test-store` to fail on.
+#[test]
+fn what_a_failed_async_test_made_is_dropped_as_it_unwinds() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let there = |names: &[String]| -> i64 {
+        postgres::Client::connect(&test_database(), postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
+                &[&names],
+            )
+            .unwrap()
+            .get(0)
+    };
+    let made = std::sync::Mutex::new(Vec::new());
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let (a, _upper, _high, mover) =
+                tokio::task::block_in_place(|| answering_with_its_upper_half_out("unwound"));
+            let (a, mover) = (OffRuntime::new(a), OffRuntime::new(mover));
+            let lake1 = OffRuntime::new(tokio::task::block_in_place(|| {
+                ha_lake_over(
+                    a.one.clone() as Arc<dyn Store>,
+                    a.ones[0].groups(),
+                    "lake-1",
+                    &a.dataset,
+                )
+            }));
+            let writer1 = OffRuntime::new(
+                tokio::task::block_in_place(|| {
+                    meridian_lake::write_ahead::Writer::start(lake1.clone(), "LAKE_WRITE_AHEAD", 0)
+                })
+                .unwrap(),
+            );
+            let names: Vec<String> = a.urls.iter().map(|url| url.name().to_string()).collect();
+            assert_eq!(tokio::task::block_in_place(|| there(&names)), 2);
+            *made.lock().unwrap() = names;
+            tokio::task::yield_now().await;
+            let _held = (&writer1, &mover);
+            panic!("an async store test that fails");
+        })
+    }));
+    assert!(failed.is_err());
+    let names = made.lock().unwrap().clone();
+    assert_eq!(names.len(), 2, "it failed after making its databases");
+    assert_eq!(
+        there(&names),
+        0,
+        "dropped as the failed test's stack unwound: {names:?}"
+    );
+}
+
 /// Each answer of a batch is sent the moment it is decided, by its own
 /// caller's wait (review c5r M1): one that waits on no other group at once,
 /// and of two waiting on a part group 0 never commits, the one whose caller
@@ -10099,14 +10185,15 @@ async fn each_answer_of_a_batch_is_sent_by_its_own_callers_wait() {
     let (a, _upper, high, mover) =
         tokio::task::block_in_place(|| answering_with_its_upper_half_out("each"));
     let dataset = a.dataset.clone();
-    let lake1 = tokio::task::block_in_place(|| {
+    let (a, _mover) = (OffRuntime::new(a), OffRuntime::new(mover));
+    let lake1 = OffRuntime::new(tokio::task::block_in_place(|| {
         ha_lake_over(
             a.one.clone() as Arc<dyn Store>,
             a.ones[0].groups(),
             "lake-1",
             &dataset,
         )
-    });
+    }));
     // One batch: a 5 s caller's write first, then a 2 s caller's, each a
     // row of group 0's half, which group 0 never takes.
     let began = std::time::Instant::now();
@@ -10114,8 +10201,9 @@ async fn each_answer_of_a_batch_is_sent_by_its_own_callers_wait() {
         a_callers_write(&dataset, "each-5s", &high, 1, 5_000),
         a_callers_write(&dataset, "each-2s", &high, 2, 2_000),
     ];
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     let mut answers = taken_past_a_switch(&mut writer1, writes).await.unwrap();
     let mut waits = writer1.take_waits();
     assert_eq!(
@@ -10179,7 +10267,6 @@ async fn each_answer_of_a_batch_is_sent_by_its_own_callers_wait() {
         five.3
     );
     assert_eq!(settling.load(Ordering::SeqCst), 0, "no answer waits");
-    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
 }
 
 /// A batch held by a move's switch is held no longer than its caller waits
@@ -10198,6 +10285,7 @@ async fn a_batch_held_by_a_switch_is_refused_before_its_caller_stops_waiting() {
     let (a, upper, high, mover) =
         tokio::task::block_in_place(|| answering_with_its_upper_half_out("held"));
     let dataset = a.dataset.clone();
+    let (a, mover) = (OffRuntime::new(a), OffRuntime::new(mover));
     // Back to group 1, stopped between the two databases: the target's row
     // a pointer, so its writes there are held until the sweep opens it.
     tokio::task::block_in_place(|| {
@@ -10219,18 +10307,23 @@ async fn a_batch_held_by_a_switch_is_refused_before_its_caller_stops_waiting() {
             store.read_owners().unwrap();
         }
     });
-    let lake1 = tokio::task::block_in_place(|| {
+    let lake1 = OffRuntime::new(tokio::task::block_in_place(|| {
         ha_lake_over(
             a.one.clone() as Arc<dyn Store>,
             a.ones[0].groups(),
             "lake-1",
             &dataset,
         )
-    });
-    let write = a_callers_write(&dataset, "held-1", &high, 1, WAIT_MS);
-    let mut writer1 =
-        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    }));
+    // Its caller's wait counts from when the write was sent, so the time is
+    // read before the write is stamped. Read after the writer started, it
+    // left out what the start took, and beside other tests' load a refusal
+    // on time read as one come too early.
     let began = std::time::Instant::now();
+    let write = a_callers_write(&dataset, "held-1", &high, 1, WAIT_MS);
+    let mut writer1 = OffRuntime::new(
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap(),
+    );
     let took = taken_past_a_switch(&mut writer1, vec![write.clone()]).await;
     let held = began.elapsed();
     assert!(
@@ -10260,7 +10353,6 @@ async fn a_batch_held_by_a_switch_is_refused_before_its_caller_stops_waiting() {
         refusal.contains(&overloaded) && meridian_bus::refusal_retry_after(&refusal).is_some(),
         "OVERLOADED with a retry-after: {refusal}"
     );
-    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
 }
 
 /// A write split across two writer groups, in ha (step 3d; spec 6.7): the
@@ -10278,6 +10370,7 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
     use prost::Message;
     let (_url, zero, one, dataset, lower, upper, low, high) =
         tokio::task::block_in_place(|| two_groups_and_a_split("lake-wait"));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     tokio::task::block_in_place(|| {
         let mover = Mover::new(
             vec![zero.clone()],
@@ -10294,12 +10387,12 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
         Arc::new(meridian_bus::MemoryBackend::new()),
         Arc::new(SystemClock),
     ));
-    let lake = meridian_lake::service::serve_grouped(
+    let lake = OffRuntime::new(meridian_lake::service::serve_grouped(
         bus,
         zero.clone() as Arc<dyn Store>,
         Arc::new(SystemClock),
         zero.groups(),
-    );
+    ));
     let stream = "lake-test-stream";
     // Group 0's part committed with its position, and its answer made.
     let part = |store: &PostgresStore, key: &str, row: Observation, sequence: u64| {
@@ -10430,7 +10523,6 @@ async fn a_write_split_across_groups_is_answered_once_every_part_has_committed()
     );
     assert!(refused.contains(&overloaded), "{refused}");
     // Their connections closed off the runtime's threads.
-    tokio::task::block_in_place(move || drop((lake, zero, one)));
 }
 
 /// The lake's database count raised under load (step 3d; sections 6.4 and
@@ -11259,6 +11351,7 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
     use prost::Message;
     let (_url, zero, one, dataset, lower, _upper, _low, _high) =
         tokio::task::block_in_place(|| two_groups_and_a_split("lake-c4"));
+    let (zero, one) = (OffRuntime::new(zero), OffRuntime::new(one));
     tokio::task::block_in_place(|| {
         let mover = Mover::new(
             vec![zero.clone()],
@@ -11275,12 +11368,12 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
         Arc::new(meridian_bus::MemoryBackend::new()),
         Arc::new(SystemClock),
     ));
-    let lake = meridian_lake::service::serve_grouped(
+    let lake = OffRuntime::new(meridian_lake::service::serve_grouped(
         bus,
         zero.clone() as Arc<dyn Store>,
         Arc::new(SystemClock),
         zero.groups(),
-    );
+    ));
     let answer = vec![(
         Some("_INBOX.c4".to_string()),
         Ok((
@@ -11316,7 +11409,6 @@ async fn review_c4_an_answer_waits_on_the_ranges_owners_as_they_are_now() {
         "answered before group 1, which owns a range of it now, committed its part"
     );
     // Their connections closed off the runtime's threads.
-    tokio::task::block_in_place(move || drop((lake, zero, one)));
 }
 
 // ---- Part 12 (c30d-m12): the hold of a range's switch between databases --
