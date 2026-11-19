@@ -1363,6 +1363,27 @@ def served_once(s, when, seconds=120):
     return now
 
 
+def served_alone(s, stayed, seconds=90):
+    """The shard that stayed, scaled to one, serves every subject alone
+    (item 33), waited for as it is judged: the only pod with a line in the
+    last SERVING_S is `stayed`, and its set covers every subject. A pod
+    scaled away keeps the lines it was last read with, so the wait waits
+    them out (PR CI 44615932110: a wait on the pods' union passed while the
+    gone pod's lines were still in the window, and the check then failed)."""
+    now = {}
+
+    def alone():
+        served_read()
+        now.clear()
+        now.update(served_between(time.time() - SERVING_S))
+        return list(now) == [stayed] and now[stayed] >= set(SHARD_SUBJECTS)
+    happens(alone, seconds, every=1.0)
+    s.check(list(now) == [stayed] and now[stayed] >= set(SHARD_SUBJECTS),
+            f"served once: the shard that stayed alone serves all {len(SHARD_SUBJECTS)} subjects "
+            f"({ {pod.rsplit('-', 1)[-1]: len(held) for pod, held in now.items()} })")
+    return now
+
+
 def served_taken(s, what, lost_pod, began, taker):
     """After a lapse: the subjects `lost_pod` served in the SERVING_S before
     `began` -- the lost shard's -- each served by `taker` within the
@@ -1948,16 +1969,12 @@ def shards(s):
     kubectl("scale", f"deployment/{name}", "--replicas=1")
     alone = happens(lambda: len(shard_pods()) == 1 and ready(shard_pods()[0]), 120)
     stayed = shard_pods()[0]["metadata"]["name"] if alone else ""
-    first = shard_log(stayed).count(changed) if alone else 0
-    gone = alone and happens(lambda: shard_log(stayed).count(changed) >= first + 1 or first >= 2, 30)
+    # Its neighbour gone: a change said after the scale was asked, by the
+    # cluster's stamp (k3d's pods share the run's clock), not one said
+    # before it, which a count could take for it.
+    gone = alone and happens(lambda: (said_at(stayed, changed) or 0) > scaling, 30)
     if alone:
-        # The one that stayed serves every subject alone (item 33).
-        happens(lambda: served_read() is not None and set().union(
-            *served_between(time.time() - SERVING_S).values() or [set()]) >= set(SHARD_SUBJECTS), 90, every=1.0)
-        alone_serves = served_between(time.time() - SERVING_S)
-        s.check(list(alone_serves) == [stayed] and alone_serves[stayed] >= set(SHARD_SUBJECTS),
-                f"served once: the shard that stayed alone serves all {len(SHARD_SUBJECTS)} subjects "
-                f"({ {pod.rsplit('-', 1)[-1]: len(held) for pod, held in alone_serves.items()} })")
+        served_alone(s, stayed)
     kubectl("scale", f"deployment/{name}", f"--replicas={SHARDS + 1}")
     again = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     lines = shard_log(stayed).count(changed) if alone else 0
