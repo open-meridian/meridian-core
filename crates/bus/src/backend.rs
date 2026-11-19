@@ -447,9 +447,12 @@ pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync
 /// refuses from here ([`crate::Bus::refuse_from_here`]).
 #[derive(Clone)]
 pub struct PreRoute {
-    owner: std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>,
+    owner: OwnerOf,
     refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// A request's owner, decided from it: the internal topic and the group.
+type OwnerOf = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
 
 impl PreRoute {
     /// `owner` decides a request's owner; `refusing` is set once this
