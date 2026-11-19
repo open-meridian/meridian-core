@@ -226,8 +226,7 @@ impl Database {
         // bounds (the resilience spec's section 10a).
         meridian_changes::serving::applied(&mut config);
         let manager = r2d2_postgres::PostgresConnectionManager::new(config, tls);
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
+        let pool = meridian_changes::pool(pool_size)
             .build(manager)
             .map_err(|failed| format!("{failed}"))?;
         Ok(Self { pool })

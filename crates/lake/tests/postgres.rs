@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use meridian_changes::scratch::Scratch;
 use meridian_clock::{Clock, SystemClock};
 use meridian_domain::date::Date;
 use meridian_domain::v1::{
@@ -19,6 +20,16 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 fn unique(tag: &str) -> String {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("{tag}-{}-{seq}", SystemClock.now_ns())
+}
+
+fn test_database() -> String {
+    std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL")
+}
+
+/// Schema `name` made in the test database, and a URL whose search path is
+/// it: dropped with its last clone (PO 65).
+fn own_schema(name: &str) -> Scratch {
+    Scratch::schema(&test_database(), name)
 }
 
 fn store() -> PostgresStore {
@@ -1320,12 +1331,7 @@ fn migrating_counts_the_rows_in_force_the_lake_already_keeps() {
     // corrected rows counts each key at its latest version.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("lake_in_force_{}_{seq}", SystemClock.now_ns());
-    let base = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("the test database");
-    postgres::Client::connect(&base, postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{base}?options=-c%20search_path%3D{name}");
+    let url = own_schema(&name);
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     // The lake as the release before this one left it.
@@ -3719,15 +3725,10 @@ fn a_held_answer_is_counted_at_what_it_holds() {
 
 /// A store over a schema of its own, so a takeover raises no other test's
 /// epoch: the lake's tables made there, as `migrate` makes them anywhere.
-fn isolated(tag: &str) -> (String, PostgresStore) {
-    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+/// The schema is dropped with the last clone of its URL.
+fn isolated(tag: &str) -> (Scratch, PostgresStore) {
     let schema = unique(tag).replace(['-', ':'], "_").to_lowercase();
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("a schema of its own");
-    let joined = if url.contains('?') { "&" } else { "?" };
-    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let url = own_schema(&schema);
     let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&SystemClock)
@@ -5672,12 +5673,7 @@ fn a_restatement_keeps_its_keys_valid_time_and_first_subject() {
 fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("lake_convert_{}_{seq}", SystemClock.now_ns());
-    let base = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("the test database");
-    postgres::Client::connect(&base, postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{base}?options=-c%20search_path%3D{name}");
+    let url = own_schema(&name);
     let migrated = PostgresStore::connect(&url, 4).unwrap();
     migrated.migrate(&SystemClock).unwrap();
     let dataset = unique("coinbase-1:live");
@@ -5849,75 +5845,25 @@ fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
 
 /// Two fresh databases beside the test database, each migrated: a lake of
 /// two writer groups on two databases, alone, so no other test's datasets
-/// are taken over by its groups. Dropped with the value, a failed test's
-/// too (m9: every run left its `lake2_*` databases behind).
-fn two_databases() -> TwoDatabases {
-    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
-    let (server, _) = url
-        .rsplit_once('/')
-        .expect("a database URL names its database");
+/// are taken over by its groups. Each is dropped with its URL's last clone,
+/// a failed test's too, and one made before the other failed (m9 and PO 65:
+/// runs left their `lake2_*` databases behind).
+fn two_databases() -> Vec<Scratch> {
     let tag = unique("lake2").replace([':', '-'], "_");
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
     (0..2)
         .map(|d| {
-            let name = format!("{tag}_{d}");
-            admin
-                .batch_execute(&format!("CREATE DATABASE {name}"))
-                .expect("a database made");
-            let made = format!("{server}/{name}");
+            let made = Scratch::database(&test_database(), &format!("{tag}_{d}"));
             PostgresStore::connect(&made, 2)
                 .unwrap()
                 .migrate(&SystemClock)
                 .unwrap();
             made
         })
-        .collect::<Vec<_>>()
-        .into()
-}
-
-/// [`two_databases`]' URLs, each database dropped with them.
-struct TwoDatabases(Vec<String>);
-
-impl From<Vec<String>> for TwoDatabases {
-    fn from(urls: Vec<String>) -> Self {
-        Self(urls)
-    }
-}
-
-impl std::ops::Deref for TwoDatabases {
-    type Target = Vec<String>;
-    fn deref(&self) -> &Vec<String> {
-        &self.0
-    }
-}
-
-impl Drop for TwoDatabases {
-    fn drop(&mut self) {
-        let Ok(url) = std::env::var("MERIDIAN_TEST_DATABASE_URL") else {
-            return;
-        };
-        let names: Vec<String> = self
-            .0
-            .iter()
-            .filter_map(|made| made.rsplit_once('/'))
-            .map(|(_, name)| name.split('?').next().unwrap_or(name).to_string())
-            .collect();
-        // On a thread of its own, so a sync client is never dropped inside a
-        // runtime; FORCE ends a pool's connections still open.
-        let _ = std::thread::spawn(move || {
-            if let Ok(mut admin) = postgres::Client::connect(&url, postgres::NoTls) {
-                for name in names {
-                    let _ = admin
-                        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
-                }
-            }
-        })
-        .join();
-    }
+        .collect()
 }
 
 /// A member of writer group `group` of two, over both databases.
-fn spread(urls: &[String], group: u32) -> meridian_lake::spread::Spread {
+fn spread(urls: &[Scratch], group: u32) -> meridian_lake::spread::Spread {
     let groups = meridian_changes::groups::Groups::new(group, 2).unwrap();
     let stores = urls
         .iter()
@@ -6195,7 +6141,7 @@ fn a_months_table_is_analysed_once_its_first_batch_commits() {
 fn two_groups_and_a_split(
     tag: &str,
 ) -> (
-    String,
+    Scratch,
     Arc<PostgresStore>,
     Arc<PostgresStore>,
     String,
@@ -6214,7 +6160,7 @@ fn two_groups_and_a_split_of(
     tag: &str,
     owner: u32,
 ) -> (
-    String,
+    Scratch,
     Arc<PostgresStore>,
     Arc<PostgresStore>,
     String,
@@ -9978,7 +9924,7 @@ struct Across {
     dataset: String,
     low: String,
     // Last, so its databases are dropped after the stores over them.
-    urls: TwoDatabases,
+    urls: Vec<Scratch>,
 }
 
 fn across(tag: &str, split: bool) -> Across {
@@ -10600,7 +10546,7 @@ fn m12_a_large_range_switches_between_databases_inside_a_short_hold() {
 #[test]
 fn t_a_writer_told_to_stop_stops_only_for_another_groups_writer_serving_anew() {
     use meridian_changes::members::Watch;
-    let store = isolated("t_member").1;
+    let (_schema, store) = isolated("t_member");
     let revision = meridian_changes::members::revision("0.1.900", 1, 2, None);
     let other = meridian_changes::members::revision("0.1.901", 1, 2, None);
     let hour = 3_600_000_000_000_i64;
@@ -10681,7 +10627,7 @@ fn t_a_writer_told_to_stop_stops_only_for_another_groups_writer_serving_anew() {
 /// start, and a writer told to stop stopped for a member serving nothing.
 #[test]
 fn t_a_member_started_again_says_nothing_of_the_process_before() {
-    let store = isolated("t_member").1;
+    let (_schema, store) = isolated("t_member");
     let revision = meridian_changes::members::revision("0.1.900", 1, 2, None);
     let mode = |member: &str| {
         store
@@ -10880,7 +10826,7 @@ fn a_range_moved_to_a_group_whose_writer_has_not_taken_over_records_nothing_at_a
 fn lake_raised_to_two(
     tag: &str,
 ) -> (
-    String,
+    Scratch,
     String,
     String,
     Arc<PostgresStore>,
@@ -11147,7 +11093,9 @@ fn a_range_move_by_hand_to_a_group_not_ready_waits_then_aborts_for_lag_or_moves_
     // Group 1's writer takes over while the gate waits: moved under its
     // epoch.
     let taking = {
-        let url = url.clone();
+        // Its text: a thread a failed test leaves running never holds the
+        // Scratch past the test (review c5p L2).
+        let url = url.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             PostgresStore::connect(&url, 2)

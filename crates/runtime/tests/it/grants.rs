@@ -7,6 +7,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use meridian_changes::scratch::Scratch;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn base_url() -> String {
@@ -17,8 +19,9 @@ fn base_url() -> String {
 }
 
 /// Two roles and a schema of this test's own, as a wizard would leave them:
-/// one that may create, one that may not.
-fn two_roles(tag: &str) -> (String, String, String) {
+/// one that may create, one that may not. The schema is dropped with the
+/// value answered first (PO 65).
+fn two_roles(tag: &str) -> (Scratch, String, String) {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -28,12 +31,12 @@ fn two_roles(tag: &str) -> (String, String, String) {
     let serving = format!("{schema}_app");
     let migrating = format!("{schema}_migrate");
 
+    let scratch = Scratch::schema(&base_url(), &schema);
     let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls)
         .expect("could not reach the test database");
     admin
         .batch_execute(&format!(
-            "create schema {schema};
-             create role {serving} login password 'serving-test';
+            "create role {serving} login password 'serving-test';
              create role {migrating} login password 'migrating-test';
              grant usage on schema {schema} to {migrating};
              grant create on schema {schema} to {migrating};
@@ -55,7 +58,7 @@ fn two_roles(tag: &str) -> (String, String, String) {
         format!("{scheme}://{role}:{password}@{host}{separator}options=-c%20search_path%3D{schema}")
     };
     (
-        schema,
+        scratch,
         url(&serving, "serving-test"),
         url(&migrating, "migrating-test"),
     )
@@ -65,7 +68,8 @@ fn two_roles(tag: &str) -> (String, String, String) {
 fn the_migrating_role_works_in_the_schema_its_url_names() {
     // The serving role's own `current_schema()` is null until it has usage,
     // which is the very thing this grants: only the migrating role's is asked.
-    let (schema, _serving, migrating) = two_roles("where");
+    let (scratch, _serving, migrating) = two_roles("where");
+    let schema = scratch.name();
     let seen: String = postgres::Client::connect(&migrating, postgres::NoTls)
         .expect("connects")
         .query_one("select current_schema()::text", &[])
@@ -76,7 +80,8 @@ fn the_migrating_role_works_in_the_schema_its_url_names() {
 
 #[test]
 fn the_serving_role_can_read_what_the_migrating_role_made() {
-    let (schema, serving, migrating) = two_roles("read");
+    let (scratch, serving, migrating) = two_roles("read");
+    let schema = scratch.name();
 
     let mut migrator = postgres::Client::connect(&migrating, postgres::NoTls).expect("connects");
     migrator
@@ -115,7 +120,8 @@ fn the_serving_role_can_read_what_the_migrating_role_made() {
 fn a_table_made_after_the_grant_is_readable_too() {
     // Default privileges, so the next release's migration needs no second
     // grant to be readable.
-    let (schema, serving, migrating) = two_roles("later");
+    let (scratch, serving, migrating) = two_roles("later");
+    let schema = scratch.name();
     meridian_runtime::grant_serving(&migrating, &serving).expect("grants");
 
     postgres::Client::connect(&migrating, postgres::NoTls)
@@ -135,7 +141,7 @@ fn a_table_made_after_the_grant_is_readable_too() {
 
 #[test]
 fn one_connection_for_both_is_left_alone() {
-    let (_schema, _serving, migrating) = two_roles("same");
+    let (_scratch, _serving, migrating) = two_roles("same");
 
     // An administrator who supplied a single URL has one role, and there is
     // nothing to grant: the tables are already theirs.
@@ -196,7 +202,8 @@ fn the_lake_serving_role_makes_its_partitions_through_the_owners_functions() {
             ..Default::default()
         }))
     };
-    let (schema, serving, migrating) = two_roles("lake");
+    let (scratch, serving, migrating) = two_roles("lake");
+    let schema = scratch.name();
     let migrator = meridian_lake::PostgresStore::connect(&migrating, 2).expect("connects");
     migrator
         .migrate(&meridian_clock::SystemClock)

@@ -13,7 +13,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
-        build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
+        build test test-store check-store-leftovers check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
 
 help:
@@ -506,25 +506,67 @@ test: tests-image
 # The store's tests need a database. A build stage has none, and a lightweight
 # in-process substitute is exactly what must not exist: a store that behaves
 # differently in development is a store nobody has tested.
+#
+# What the test database held before the run is read first, so a leftover of
+# an earlier run -- one killed, whose drops never ran -- is named as that and
+# never blamed on this one; and a failed run is checked for leftovers too, a
+# failed test's being what PO 65 is about (review c5p M2, L5).
 test-store: network tests-image
+	@$(COMPOSE_TEST) up -d --wait postgres >/dev/null 2>&1 \
+		&& $(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -Atc "$(STORE_LEFTOVERS)" \
+			>.test-store-before \
+		|| { echo "test-store FAILED: the test database could not be read before the run" >&2; exit 1; }
 	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before; exit 1; }
 	@# The lake's speed check's figures, on every run, passing or not.
 	@grep -h 'SPEED lake' .test-store.log || echo "test-store: the lake's speed check said nothing"
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: scratch:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, and the upgrade preflight reads every store as ready and a newer one as blocked"
+		     tail -40 .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before; exit 1; }
+	@$(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, the upgrade preflight reads every store as ready and a newer one as blocked, a failed test's schemas and databases are dropped as it unwinds, and the tests left no schema or database behind"
+
+# PO 65 (2026-11-17): each schema and database a store test makes beside the
+# test database's own is dropped by the test that made it, a failed test's
+# too. What a run left there is listed by name, its run's figures cut off,
+# and fails it: left in a development database that outlives its runs, they
+# filled the VM's memory (`bor_fence_*` schemas and `lake2_*` databases).
+STORE_LEFTOVERS := SELECT 'database ' || datname FROM pg_database \
+	WHERE datname NOT IN ('meridian', 'postgres', 'template0', 'template1') \
+	UNION ALL SELECT 'schema ' || nspname FROM pg_namespace \
+	WHERE nspname NOT IN ('public', 'information_schema') AND nspname !~ '^pg_' ORDER BY 1
+#
+# STORE_BEFORE names a listing read before the run (test-store's): what it
+# holds is named as there before, and only what the run added fails it.
+check-store-leftovers:
+	@left=$$($(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -Atc "$(STORE_LEFTOVERS)") \
+		|| { echo "check-store-leftovers: the test database could not be read" >&2; exit 1; }; \
+	before=$$( [ -z "$(STORE_BEFORE)" ] || cat "$(STORE_BEFORE)"); \
+	listed() { printf '%s\n' "$$1" | sed '/^$$/d' | LC_ALL=C sort -u; }; \
+	named() { printf '%s\n' "$$1" | sed -E 's/[-_][0-9]+([-_][0-9]+)*$$//' | sort | uniq -c >&2; }; \
+	earlier=$$(LC_ALL=C comm -12 <(listed "$$before") <(listed "$$left")); \
+	added=$$(LC_ALL=C comm -13 <(listed "$$before") <(listed "$$left")); \
+	if [ -n "$$earlier" ]; then \
+		echo "check-store-leftovers: $$(printf '%s\n' "$$earlier" | wc -l | tr -d ' ') schemas and databases were there before this run, an earlier run's, not counted; drop them, or take the test database down:" >&2; \
+		named "$$earlier"; \
+	fi; \
+	if [ -n "$$added" ]; then \
+		echo "check-store-leftovers FAILED: the store tests left $$(printf '%s\n' "$$added" | wc -l | tr -d ' ') schemas and databases behind (PO 65), by name:" >&2; \
+		named "$$added"; \
+		exit 1; \
+	fi
 
 # The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
 # record and read rates and its latest read as a dataset grows, the plugin

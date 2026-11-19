@@ -9,6 +9,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use meridian_changes::scratch::Scratch;
+
 use meridian_clock::SystemClock;
 use meridian_runtime::preflight::{overall, run, Inputs, Verdict};
 
@@ -22,21 +24,15 @@ fn base_url() -> String {
 }
 
 /// A schema of this test's own, every store migrated into it, and the URL
-/// that reaches it.
-fn migrated(tag: &str) -> String {
+/// that reaches it: dropped with the URL's last clone (PO 65).
+fn migrated(tag: &str) -> Scratch {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let schema = format!("preflight_{tag}_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("could not create a schema");
-    let base = base_url();
-    let separator = if base.contains('?') { "&" } else { "?" };
-    let url = format!("{base}{separator}options=-c%20search_path%3D{schema}");
+    let url = Scratch::schema(&base_url(), &schema);
     meridian_config::PostgresStore::connect(&url, 1)
         .unwrap()
         .migrate(&SystemClock)
@@ -204,7 +200,8 @@ fn answering_late(url: &str, after: Duration) -> String {
 
 #[test]
 fn a_database_that_answers_after_the_hook_starts_is_waited_for() {
-    let url = answering_late(&migrated("late"), Duration::from_secs(3));
+    let schema = migrated("late");
+    let url = answering_late(&schema, Duration::from_secs(3));
     let findings = run(&inputs(&url));
     for f in &findings {
         eprintln!("{} {} {}", f.verdict.word(), f.check, f.why);

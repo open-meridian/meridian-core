@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use meridian_changes::scratch::Scratch;
 use meridian_street::amounts::{Exact, Money, Quantity};
 use meridian_street::store::{
     Cause, Collateral, Completion, Counts, Direction, Figures, Holding, Identifier, Opened, Read,
@@ -939,10 +940,10 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
     let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
 
     let scratch = format!("rename_{}", unique("t").replace('-', "_"));
+    let scoped = Scratch::schema(&url, &scratch);
     client
         .batch_execute(&format!(
-            "CREATE SCHEMA {scratch};
-             SET search_path TO {scratch};
+            "SET search_path TO {scratch};
              CREATE TABLE position (
                 account_id text NOT NULL,
                 instrument_id text NOT NULL,
@@ -957,7 +958,6 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
         ))
         .unwrap();
 
-    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
     let store = PostgresStore::connect(&scoped, 1).unwrap();
     store
         .migrate(&meridian_clock::SystemClock)
@@ -967,10 +967,6 @@ fn a_database_under_the_old_table_name_is_renamed_rather_than_left_behind() {
     let carried = carried.expect("the row was left behind under the old table name");
     // A bigint at 1e8 carried at the eight places it was stated with.
     assert_eq!(carried.quantity.to_string(), "0.00000001");
-
-    client
-        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
-        .unwrap();
 }
 
 // ── A placeholder replaced (W3.9) ──────────────────────────────────────────
@@ -1138,16 +1134,10 @@ fn base_url() -> String {
     )
 }
 
-/// A schema of this test's own, and a URL whose connections land in it.
-fn own_schema(tag: &str) -> (String, postgres::Client) {
-    let name = unique(tag).replace('-', "_");
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database");
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+/// A schema of this test's own, and a URL whose connections land in it:
+/// dropped with the URL's last clone (PO 65).
+fn own_schema(tag: &str) -> (Scratch, postgres::Client) {
+    let url = Scratch::schema(&base_url(), &unique(tag).replace('-', "_"));
     let client = postgres::Client::connect(&url, postgres::NoTls).expect("could not connect");
     (url, client)
 }
@@ -2317,16 +2307,11 @@ fn a_codes_resolution_is_kept_once_and_the_codes_held_are_read() {
 // ── The change log (step 3a) ──
 
 /// A store over a schema of its own: its log begins with it, and a takeover
-/// raises no other test's epoch.
-fn isolated() -> (String, PostgresStore) {
+/// raises no other test's epoch. The schema is dropped with the URL's last
+/// clone (PO 65).
+fn isolated() -> (Scratch, PostgresStore) {
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
-    let schema = unique("street_log").replace('-', "_").to_lowercase();
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("a schema of its own");
-    let joined = if url.contains('?') { "&" } else { "?" };
-    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let url = Scratch::schema(&url, &unique("street_log").replace('-', "_").to_lowercase());
     let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&meridian_clock::SystemClock)

@@ -373,8 +373,7 @@ impl PostgresStore {
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
         let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
+        let pool = meridian_changes::pool(pool_size)
             .connection_customizer(Box::new(meridian_changes::timeline::Watching(
                 std::sync::Arc::clone(&watch),
             )))
