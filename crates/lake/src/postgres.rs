@@ -3018,6 +3018,53 @@ impl Store for PostgresStore {
             }))
     }
 
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The position under the name locked first, as a batch under it
+        // locks it: a lake before item 191 still writing commits before
+        // this or after it, never in between.
+        let at: Option<i64> = tx
+            .query_opt(
+                "SELECT at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
+                &[&from],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        let kept = tx
+            .query_opt("SELECT 1 FROM lake_write_ahead WHERE stream = $1", &[&to])
+            .map_err(unavailable)?
+            .is_some();
+        if kept || at.is_none_or(|at_ns| at_ns < made_ns) {
+            return Ok(false);
+        }
+        for carry in [
+            "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+             SELECT $2, sequence, at_ns, committed_at_ns FROM lake_write_ahead WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_dropped
+                    (stream, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns,
+                     gap_id)
+             SELECT $2, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns, gap_id
+               FROM lake_write_ahead_dropped WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_dataset (stream, dataset, valid_ns)
+             SELECT $2, dataset, valid_ns FROM lake_write_ahead_dataset WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_part
+                    (stream, sequence, recorded, restated, unchanged, committed_at_ns, refused,
+                     refused_detail)
+             SELECT $2, sequence, recorded, restated, unchanged, committed_at_ns, refused,
+                    refused_detail
+               FROM lake_write_ahead_part WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+        ] {
+            tx.execute(carry, &[&from, &to]).map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
+
     fn write_ahead_part(
         &self,
         key: &str,

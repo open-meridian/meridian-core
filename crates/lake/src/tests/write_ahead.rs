@@ -740,6 +740,119 @@ async fn a_stream_made_again_under_its_name_is_taken_from_its_first_write_with_n
     );
 }
 
+/// The review of item 191's finding 1: a lake upgraded from one that kept
+/// its write-ahead places by the stream's name alone carries them -- the
+/// position, the runs it found dropped and each dataset's latest valid time
+/// -- to the stream's identity at its writer's start, and goes on from its
+/// position. The stream is the one it was: a write it took before is never
+/// taken again, so a row restated by a later write is never restated back
+/// (an older write taken again records a new version of the old value, and
+/// the newer then another).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_from_places_kept_by_the_streams_name_goes_on_from_its_position() {
+    // The stream made before its first write.
+    const IDENTITY: i64 = NOW - 1_000;
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let valid = NOW - 50_000;
+    let write = |n: u64| {
+        let price = match n {
+            3 => close("coinbase-1", "K", BTC, "2026-10-07", "1"),
+            7 => close("coinbase-1", "K", BTC, "2026-10-07", "2"),
+            _ => close("coinbase-1", &format!("other-{n}"), BTC, "2026-10-07", "1"),
+        };
+        written(n, "coinbase-1", vec![at_valid(price, valid)])
+    };
+    let versions_of_k = || {
+        h.store
+            .read_dataset_versions("coinbase-1:daily", DataType::Price)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.meta().row_key == "K")
+            .count()
+    };
+    // The lake before item 191: its places under the stream's name. Write
+    // 3 sets K; write 7 restates it; 5 was dropped before it was taken.
+    let mut before =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
+    tokio::task::block_in_place(|| before.take((1..=4).map(write).collect())).unwrap();
+    tokio::task::block_in_place(|| before.take((6..=10).map(write).collect())).unwrap();
+    assert_eq!(
+        versions_of_k(),
+        2,
+        "K set by write 3 and restated by write 7"
+    );
+    let (dropped, valid_times) = h.store.write_ahead_found(STREAM).unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(5, 5)]
+    );
+    // Upgraded: the writer starts under the stream's identity, and goes on
+    // from its position there.
+    let mut after =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, IDENTITY)).unwrap();
+    assert_eq!(after.next(), 11, "goes on from its position");
+    // The stream sends what the writer asks for, from its next.
+    let rest: Vec<Taken> = (after.next()..=12).map(write).collect();
+    tokio::task::block_in_place(|| after.take(rest)).unwrap();
+    assert_eq!(
+        versions_of_k(),
+        2,
+        "no write taken again: K never restated back"
+    );
+    let key = crate::write_ahead::stream_key(STREAM, IDENTITY);
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key)
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(12)
+    );
+    let (carried, carried_times) = h.store.write_ahead_found(&key).unwrap();
+    assert_eq!(
+        carried
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(5, 5)],
+        "the run found dropped carried with the position"
+    );
+    assert_eq!(
+        carried_times, valid_times,
+        "each dataset's latest valid time carried"
+    );
+}
+
+/// Finding 1's carry, never into a stream made after the places were
+/// taken (item 191): places kept by the stream's name from before `ha` was
+/// left -- a lake that switched before the fix -- belong to a stream older
+/// than the one made again, whose writes are all later than its making.
+/// The writer starts in the new stream with no place, from its first write.
+#[tokio::test(flavor = "multi_thread")]
+async fn places_kept_by_the_streams_name_are_never_carried_into_a_stream_made_after_them() {
+    let h = harness();
+    let mut before =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
+    let price = || close("coinbase-1", "a", BTC, "2026-10-07", "1");
+    tokio::task::block_in_place(|| before.take(vec![written(10, "coinbase-1", vec![price()])]))
+        .unwrap();
+    // Made again after write 10 was taken.
+    let made_again = NOW + 1_000;
+    let after =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, made_again)).unwrap();
+    assert_eq!(after.position(), None, "no place in the stream made again");
+    assert_eq!(after.next(), 1, "taken from its first");
+    assert_eq!(
+        h.store
+            .write_ahead_position(&crate::write_ahead::stream_key(STREAM, made_again))
+            .unwrap(),
+        None
+    );
+}
+
 /// Item 191 against a real JetStream (by hand: a broker with JetStream at
 /// MERIDIAN_TEST_JETSTREAM_URL, which this test empties of the lake's
 /// stream): the lake's writer takes ten writes from the stream, three of

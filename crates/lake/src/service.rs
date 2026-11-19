@@ -2754,6 +2754,19 @@ impl Lake {
         self.store.write_ahead_position(stream)
     }
 
+    /// The places a lake before item 191 kept of its write-ahead stream by
+    /// its name alone, `from`, carried to its key with its identity, `to`,
+    /// where they were taken in this stream ([`Store::write_ahead_carried`];
+    /// the review of item 191's finding 1).
+    pub fn write_ahead_carried(
+        &self,
+        from: &str,
+        to: &str,
+        made_ns: i64,
+    ) -> Result<bool, crate::store::StoreError> {
+        self.store.write_ahead_carried(from, to, made_ns)
+    }
+
     /// The ranges' writer groups read again into this member's view (step
     /// 3d; spec 6.1): a write-ahead writer whose position a move took back.
     pub fn read_owners_again(&self) -> Result<(), crate::store::StoreError> {

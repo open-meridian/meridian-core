@@ -636,6 +636,16 @@ impl Store for Spread {
         }
     }
 
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        // In every database: a group's places kept before the count was
+        // raised are still its own (step 3d), each carried where it is.
+        let mut carried = false;
+        for store in &self.stores {
+            carried |= store.write_ahead_carried(from, to, made_ns)?;
+        }
+        Ok(carried)
+    }
+
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
         if let Some(at) = self.own().write_ahead_position(stream)? {
             return Ok(Some(at));

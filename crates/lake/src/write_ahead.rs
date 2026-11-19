@@ -343,7 +343,26 @@ impl Writer {
     pub fn start(lake: Arc<Lake>, stream: &str, identity: i64) -> Result<Writer, StoreError> {
         // Each writer group's own position (step 3d; section 6.1).
         let base = stream_key(stream, identity);
-        let stream = position_key(&base, lake.groups());
+        let key = position_key(&base, lake.groups());
+        // A lake upgraded from one that kept its places by the stream's
+        // name alone carries them to its identity first (the review of
+        // item 191's finding 1): the stream is the one they were taken in,
+        // and the writer goes on from its position, never taking again a
+        // write it took. Never where they were taken in a stream made
+        // before this one under the same name.
+        if base != stream {
+            let named = position_key(stream, lake.groups());
+            if lake.write_ahead_carried(&named, &key, identity)? {
+                tracing::info!(
+                    identity,
+                    from = named,
+                    to = key,
+                    "the lake's places in its write-ahead stream, kept by its name, carried to \
+                     its identity"
+                );
+            }
+        }
+        let stream = key;
         let position = lake.write_ahead_position(&stream)?;
         let (dropped, valid) = lake.write_ahead_found(&stream)?;
         Ok(Writer {

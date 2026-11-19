@@ -893,6 +893,20 @@ pub trait Store: Send + Sync {
         Err(no_write_ahead())
     }
 
+    /// What a lake before item 191 kept of the write-ahead stream under
+    /// `from`, its name alone -- the position, the runs it found dropped,
+    /// each dataset's latest valid time and its parts of writes -- carried
+    /// to `to`, the stream's key with its identity, in one transaction (the
+    /// review of item 191's finding 1): where nothing is kept under `to` yet,
+    /// and the position under `from` was taken in this stream, at or after
+    /// `made_ns`, its making. A position taken before it was taken in a
+    /// stream made before this one under the same name, and is never
+    /// carried. Whether it carried them; nothing where nothing is kept.
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let _ = (from, to, made_ns);
+        Ok(false)
+    }
+
     /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch
     /// numbered max(the epoch held + 1, the Lease's transitions), at least
     /// 1, kept with the stream's place the control writer found (review

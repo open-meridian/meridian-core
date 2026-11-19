@@ -8961,6 +8961,95 @@ async fn a_switch_takes_back_the_place_kept_by_the_streams_identity_never_an_old
     tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
+/// The review of item 191's finding 1, in Postgres: what a lake before
+/// item 191 kept of its write-ahead stream by its name alone -- the
+/// position, a run it found dropped, a dataset's latest valid time and a
+/// part of a write -- carried to the stream's key with its identity in one
+/// transaction, once: never over what the identity's key holds, and never
+/// into a stream made after the position was taken.
+#[test]
+fn places_kept_by_the_streams_name_are_carried_to_its_identity_once() {
+    use meridian_lake::store::{Counts, Dropped, WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::stream_key;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let (url, store) = isolated("carried");
+    let at = WriteAheadPosition {
+        sequence: 10,
+        at_ns: 10_000,
+    };
+    let run = Dropped {
+        first: 5,
+        last: 5,
+        after_at_ns: 4_000,
+        until_at_ns: 6_000,
+        gap_id: "gap-carried".into(),
+    };
+    store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: STREAM.into(),
+                after: None,
+                through: at,
+                dropped: vec![run.clone()],
+                valid: vec![("coinbase-1:daily".to_string(), 7_000)],
+                ..Default::default()
+            },
+            SystemClock.now_ns(),
+        )
+        .unwrap();
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute(
+            "INSERT INTO lake_write_ahead_part
+                    (stream, sequence, recorded, restated, unchanged, committed_at_ns)
+             VALUES ($1, 9, 1, 0, 0, 1)",
+            &[&STREAM],
+        )
+        .unwrap();
+    // A stream made after the position was taken: nothing carried.
+    let later = stream_key(STREAM, 20_000);
+    assert!(!store.write_ahead_carried(STREAM, &later, 20_000).unwrap());
+    assert_eq!(store.write_ahead_position(&later).unwrap(), None);
+    // The stream it was taken in: everything carried, once.
+    let key = stream_key(STREAM, 1_000);
+    assert!(store.write_ahead_carried(STREAM, &key, 1_000).unwrap());
+    assert_eq!(store.write_ahead_position(&key).unwrap(), Some(at));
+    let (dropped, valid) = store.write_ahead_found(&key).unwrap();
+    assert_eq!(dropped, vec![run]);
+    assert_eq!(valid.get("coinbase-1:daily"), Some(&7_000));
+    assert_eq!(
+        store.write_ahead_part(&key, 0, 9).unwrap(),
+        Some(Counts {
+            recorded: 1,
+            restated: 0,
+            unchanged: 0
+        })
+    );
+    // Once: the identity's key keeps its own from now on.
+    store
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: key.clone(),
+                after: Some(at),
+                through: WriteAheadPosition {
+                    sequence: 11,
+                    at_ns: 11_000,
+                },
+                ..Default::default()
+            },
+            SystemClock.now_ns(),
+        )
+        .unwrap();
+    assert!(!store.write_ahead_carried(STREAM, &key, 1_000).unwrap());
+    assert_eq!(
+        store
+            .write_ahead_position(&key)
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(11)
+    );
+}
+
 /// The same, where the switch's target is the group answering the dataset
 /// (failover-repeat 43993402238, ha run 3: "lake range
 /// drive-data:drive/8000-ffff to group 1, from database 0 to database 1: no
