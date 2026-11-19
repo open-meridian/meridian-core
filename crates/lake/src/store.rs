@@ -852,6 +852,14 @@ pub trait Store: Send + Sync {
         now_ns: i64,
     ) -> Result<Recorded>;
 
+    /// The identity of the write-ahead stream the lake's writer takes from
+    /// (the `ha` profile; item 191): a move's switch reads and takes back
+    /// the places its writer groups keep in that stream, never in one made
+    /// before it under the same name. Nothing in a store that keeps none.
+    fn in_stream(&self, identity: i64) {
+        let _ = identity;
+    }
+
     /// The lake's position in its write-ahead stream `stream`, none before
     /// its first batch from it (the `ha` profile).
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
@@ -883,6 +891,20 @@ pub trait Store: Send + Sync {
     fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
         let _ = stream;
         Err(no_write_ahead())
+    }
+
+    /// What a lake before item 191 kept of the write-ahead stream under
+    /// `from`, its name alone -- the position, the runs it found dropped,
+    /// each dataset's latest valid time and its parts of writes -- carried
+    /// to `to`, the stream's key with its identity, in one transaction (the
+    /// review of item 191's finding 1): where nothing is kept under `to` yet,
+    /// and the position under `from` was taken in this stream, at or after
+    /// `made_ns`, its making. A position taken before it was taken in a
+    /// stream made before this one under the same name, and is never
+    /// carried. Whether it carried them; nothing where nothing is kept.
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let _ = (from, to, made_ns);
+        Ok(false)
     }
 
     /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch

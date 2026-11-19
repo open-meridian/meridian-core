@@ -1639,6 +1639,7 @@ def jetstream_rolled(s):
     leader's restart (review c5a3 I2): the lake's identity of the stream
     never changes with the server that answers."""
     before = write_ahead_made() if PROFILE == "ha" else {}
+    began = time.time()
     kubectl("rollout", "restart", f"statefulset/{broker_set()}")
     rolled = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
                      check=False).returncode == 0
@@ -1653,6 +1654,7 @@ def jetstream_rolled(s):
                 f"broker: the lake's write-ahead stream's created is one on every server, before and after "
                 f"its leader moved ({len(before)} and {len(after)} of {servers} servers; created "
                 f"{sorted(str(m) for m in made)}; leaders {', '.join(leaders)})")
+        made_again_since(s, began, "broker: its servers rolled, the write-ahead stream's leader moved")
     parts = ("analytics-coordinator", "analytics-worker")
     for part in parts:
         kubectl("rollout", "restart", f"deployment/{FULL}-{part}")
@@ -2622,6 +2624,8 @@ def broker_lost(s):
     healed = happens(lambda: len(pods("broker")) == len(servers)
                      and all(ready(p) for p in pods("broker")), 180)
     s.check(healed, "broker: the killed server back")
+    if PROFILE == "ha":
+        made_again_since(s, began, "broker: a server cut off and killed")
 
 
 # ── Storage: bit rot, a torn write, a volume lost (step 3b part 2) ─────────
@@ -3389,6 +3393,77 @@ def cluster_said(when):
     print(f"R: {when}: what the cluster said, kept in {name}", flush=True)
 
 
+def jetstream_claims():
+    """The JetStream broker set's volume claims, by name: its servers'
+    `jetstream-<set>-<n>`, with each one's creation time."""
+    said = json.loads(out("get", "pvc", "-o", "json", check=False) or "{}").get("items", [])
+    prefix = f"jetstream-{FULL}-broker-jetstream-"
+    return {c["metadata"]["name"]: c["metadata"]["creationTimestamp"] for c in said
+            if c["metadata"]["name"].startswith(prefix)}
+
+
+def jetstream_servers():
+    """The JetStream broker set's servers running and not going, by name."""
+    try:
+        return [p["metadata"]["name"] for p in pods("broker")
+                if p["metadata"]["labels"].get("meridian.dev/broker-set") == f"{FULL}-broker-jetstream"]
+    except (ValueError, SystemExit):
+        return []
+
+
+def write_ahead_last():
+    """The furthest the lake's write-ahead stream has reached, as any
+    JetStream server says it (/jsz): 0 where none says. Never raises."""
+    last = 0
+    for server in jetstream_servers():
+        _, said = monitored(server, ("/jsz?accounts=true&streams=true",))["/jsz?accounts=true&streams=true"]
+        try:
+            for account in json.loads(said).get("account_details") or []:
+                for stream in account.get("stream_detail") or []:
+                    if stream.get("name") == WRITE_AHEAD_STREAM:
+                        last = max(last, int((stream.get("state") or {}).get("last_seq") or 0))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return last
+
+
+# What the lake's writer says where the stream's identity changed under it
+# (crates/lake/src/write_ahead.rs, write_forever): the stream deleted and
+# made again under its name. Never on a server lost or a leader moved.
+MADE_AGAIN = "the write-ahead stream was made again under its name"
+
+
+def lake_said_since(began):
+    """Each lake pod's logs since `began` (a time.time()), all containers."""
+    return {p["metadata"]["name"]: kubectl("logs", p["metadata"]["name"], "--all-containers",
+                                           f"--since={int(time.time() - began) + 30}s", check=False,
+                                           quiet=True).stdout.decode(errors="replace")
+            for p in pods("lake")}
+
+
+def made_again_since(s, began, what):
+    """The review of item 191's finding 8: the stream's identity (its
+    `created`) is the same through a broker server lost or its leader
+    moved, so the lake never takes it as a stream made again."""
+    said = sorted(name for name, log in lake_said_since(began).items() if MADE_AGAIN in log)
+    s.check(not said, f"{what}: the lake never took its write-ahead stream as made again "
+            f"({', '.join(said) or 'no lake pod said so'})")
+
+
+def write_ahead_places():
+    """The lake's committed places in its write-ahead streams, by stream
+    identity (item 191: kept under `LAKE_WRITE_AHEAD.<identity>`, and
+    `.group-<g>` past group 0): each identity's slowest group's sequence."""
+    places = {}
+    for line in psql("select stream, sequence from lake_write_ahead "
+                     f"where stream like '{WRITE_AHEAD_STREAM}.%'", quiet=True).splitlines():
+        key, _, sequence = line.partition("|")
+        identity = key.split(".")[1]
+        if identity.isdigit():
+            places[identity] = min(places.get(identity, int(sequence)), int(sequence))
+    return places
+
+
 def reconfigure(s):
     global SHAPE
     failed_before = len(s.failures)
@@ -3397,6 +3472,8 @@ def reconfigure(s):
     if len(s.failures) > failed_before:
         cluster_said("reconfigure's internal TLS and archive")
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
+    identities_before = None
+    left_ha_ns = 0
     for target in RECONFIGURE:
         failed_before = len(s.failures)
         # Ended early -- a wait that stopped the move, or a return after a
@@ -3408,8 +3485,17 @@ def reconfigure(s):
             # (back from ha), one upgrade gives it its standbys.
             alone = not under_patroni()
             print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
+            # Leaving ha (item 191): the furthest the write-ahead stream
+            # reached before its set went, read until its servers are gone.
+            leaving = SHAPE == "ha" and target == "tolerant"
+            reached = [write_ahead_last()] if leaving else []
             began = time.time()
             upgraded = upgrade(f"resilience.profile={target}")
+            if leaving:
+                def gone():
+                    reached.append(write_ahead_last())
+                    return not jetstream_servers()
+                happens(gone, 180, every=2)
             s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
                     + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
             if upgraded.returncode != 0:
@@ -3458,6 +3544,55 @@ def reconfigure(s):
                 return
             connections_held(s, f"reconfigure to {target}")
             extra = {"from": "tolerant" if target == "ha" else "ha"}
+            if leaving:
+                # JetStream's volumes go with its set, and the writes the
+                # stream held past the lake's place are stranded: never
+                # answered, so their plugins ask again (item 191; no drain).
+                deleted = happens(lambda: not jetstream_claims(), 180, every=2)
+                s.check(deleted, "reconfigure to tolerant: JetStream's volumes deleted with its set (item 191)"
+                        + ("" if deleted else f": {sorted(jetstream_claims())} left"))
+                # What the stream held past the lake's slowest writer
+                # group's committed place as its set went: an upper bound on
+                # the writes stranded, never answered. A write past it that
+                # its own range's group committed, or that its plugin's
+                # retry already sent again, is in it too (the review of item
+                # 191's finding 10).
+                places = write_ahead_places()
+                place = places[max(places, key=int)] if places else 0
+                past = max(0, max(reached) - place)
+                figure("reconfigure: writes the write-ahead stream held past the lake's slowest group's "
+                       "place leaving ha (at most this many stranded)",
+                       stranded_at_most=past, reached=max(reached), place=place)
+                extra["stranded_at_most"] = past
+                identities_before = set(places)
+                left_ha_ns = time.time_ns()
+            elif target == "ha" and identities_before is not None:
+                # Back to ha (item 191): the servers on volumes made by this
+                # upgrade, and the lake in the stream made again, its own
+                # place kept under its identity, taken from its first write.
+                since = datetime.datetime.fromtimestamp(began, datetime.timezone.utc)
+                claims = jetstream_claims()
+                fresh = len(claims) == 3 and all(
+                    datetime.datetime.fromisoformat(made.replace("Z", "+00:00")) >= since.replace(microsecond=0)
+                    for made in claims.values())
+                s.check(fresh, f"reconfigure back to ha: the broker's servers on fresh volumes (item 191): {claims}")
+                taken = happens(lambda: set(write_ahead_places()) - identities_before, 180, every=5)
+                s.check(taken, "reconfigure back to ha: the lake keeps its place in the stream made again "
+                        f"under its own identity (before {sorted(identities_before)}, now "
+                        f"{sorted(write_ahead_places())})")
+                # Nothing counted lost (the review of item 191's finding
+                # 10): no run the lake found dropped under the new stream's
+                # identity, and no dataset gap recorded since ha was left.
+                new = sorted(set(write_ahead_places()) - identities_before)
+                runs = psql("select count(*) from lake_write_ahead_dropped where "
+                            + " or ".join(f"stream like '{WRITE_AHEAD_STREAM}.{identity}%'" for identity in new),
+                            quiet=True).strip() if new else "?"
+                gaps = psql(f"select count(*) from lake_dataset_gap where recorded_at_ns >= {left_ha_ns}",
+                            quiet=True).strip()
+                s.check(runs == "0" and gaps == "0",
+                        "reconfigure back to ha: the lake took the stream made again from its first write, "
+                        f"nothing counted lost ({runs} runs found dropped in it, {gaps} dataset gaps since ha "
+                        "was left)")
             if DRIVEN:
                 # RPO through the stores across the move: the database moved
                 # under Patroni and back, every member replaced, and nothing
@@ -6209,7 +6344,8 @@ def writer_groups(s):
     counts = handed_on_counts()
     for topic in WRITES_HANDED_ON:
         if topic == "platform.lake.internal.record" and PROFILE == "ha":
-            taken = psql("select count(*) from lake_write_ahead where stream = 'LAKE_WRITE_AHEAD.group-1' "
+            # Group 1's place, kept under the stream's identity (item 191).
+            taken = psql("select count(*) from lake_write_ahead where stream like 'LAKE_WRITE_AHEAD.%.group-1' "
                          f"and committed_at_ns >= {since_ns}").strip()
             s.check(taken == "1", "writer groups: the lake's group 1 took its writes from the write-ahead stream, "
                     f"its own place in it moved since ({taken or 'none'})")

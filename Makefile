@@ -3306,6 +3306,26 @@ chart-check:
 		echo "$$ha" | grep -q -- "$$held" \
 			|| { echo "chart-check FAILED: the ha profile renders no $$held" >&2; exit 1; }; \
 	done; \
+	jsset="$$(echo "$$ha" | awk '/^---/ { if (doc ~ /kind: StatefulSet/ && doc ~ /\n  name: check-meridian-runtime-broker-jetstream\n/) print doc; doc = ""; next } { doc = doc $$0 "\n" } END { if (doc ~ /kind: StatefulSet/ && doc ~ /\n  name: check-meridian-runtime-broker-jetstream\n/) print doc }')"; \
+	[ -n "$$jsset" ] || { echo "chart-check FAILED: the ha profile renders no JetStream broker set" >&2; exit 1; }; \
+	echo "$$jsset" | grep -A2 "^  persistentVolumeClaimRetentionPolicy:$$" | grep -q "^    whenDeleted: Delete$$" \
+		&& echo "$$jsset" | grep -A2 "^  persistentVolumeClaimRetentionPolicy:$$" | grep -q "^    whenScaled: Retain$$" \
+		|| { echo "chart-check FAILED: the JetStream broker set keeps its volumes when it goes: leaving ha deletes them, so a return starts JetStream afresh (item 191)" >&2; exit 1; }; \
+	[ "$$(echo "$$ha" | grep -c 'persistentVolumeClaimRetentionPolicy:')" = 1 ] \
+		|| { echo "chart-check FAILED: a set besides the JetStream broker set deletes its volumes when it goes (item 191 names that set alone)" >&2; exit 1; }; \
+	tolerant="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the tolerant profile did not render" >&2; exit 1; }; \
+	echo "$$tolerant" | grep -q "^  name: check-meridian-runtime-broker$$" \
+		|| { echo "chart-check FAILED: the tolerant profile renders no broker set" >&2; exit 1; }; \
+	echo "$$tolerant" | grep -q 'persistentVolumeClaimRetentionPolicy:' \
+		&& { echo "chart-check FAILED: the broker set without JetStream renders a volume retention policy" >&2; exit 1; }; \
+	for rendered in "$$ha" "$$tolerant"; do \
+		[ "$$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" = '          image: "nats:2.10.29-alpine"' ] \
+			|| { echo "chart-check FAILED: the broker's image is not pinned exactly to nats:2.10.29-alpine (item 191): $$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" >&2; exit 1; }; \
+	done; \
+	composed="$$(grep -hE '^ +image: "?nats:' docker-compose.yaml deploy/harness/compose.yaml | tr -d ' ' | sort -u)"; \
+	[ "$$composed" = 'image:nats:2.10.29-alpine' ] \
+		|| { echo "chart-check FAILED: the compose files' broker is not pinned exactly to nats:2.10.29-alpine, as the chart's is (item 191's review, finding 9): $$composed" >&2; exit 1; }; \
 	[ "$$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget')" = 11 ] \
 		|| { echo "chart-check FAILED: the ha profile renders $$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget') disruption budgets, not 11 (six stores, the database, the broker, the dashboard, two analytics sets)" >&2; exit 1; }; \
 	echo "$$ha" | grep -q "runAsUser" \

@@ -219,6 +219,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "shard_fence",
         sql: include_str!("../migrations/0031_shard_fence.sql"),
     },
+    // The write-ahead stream a range's `taken_from` was taken in (step 3d;
+    // `taken_in` approved 2026-11-19, item 202): a place in another stream
+    // leaves nothing uncounted.
+    Migration {
+        version: 32,
+        name: "taken_in",
+        sql: include_str!("../migrations/0032_taken_in.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

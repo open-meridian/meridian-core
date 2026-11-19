@@ -1,0 +1,11 @@
+-- The write-ahead stream a range's `taken_from` was taken in (step 3d;
+-- item 191's review, finding 2; `taken_in` approved 2026-11-19, item 202):
+-- the stream's identity, its `created` time, as the lake's writer reads
+-- it. A stream made again under the same name -- JetStream's volumes
+-- deleted on leaving `ha`, and `ha` taken again -- numbers from its own
+-- first, and a place in the stream before it is no place in it: a range
+-- whose `taken_from` was taken in another stream leaves nothing uncounted.
+-- NULL where the range never moved between groups, or moved before this
+-- column (the lake's writer carries those into the stream they were taken
+-- in at its first start in it, where that is the stream it runs in).
+ALTER TABLE lake_partition ADD COLUMN IF NOT EXISTS taken_in bigint;

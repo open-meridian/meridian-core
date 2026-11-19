@@ -176,6 +176,17 @@ fn run() -> Result<(), String> {
     } else {
         every_database.push(Arc::new(connect(0, &url)?));
     }
+    // In `ha`, no range's switch until the writer has read the write-ahead
+    // stream's identity: the groups' places are kept by it (item 191). In
+    // `tolerant`, none: a switch reads and writes no place in a stream
+    // (item 191's review, finding 2).
+    for store in &every_database {
+        if write_ahead_on() {
+            store.stream_not_read();
+        } else {
+            meridian_lake::Store::in_stream(&**store, meridian_lake::postgres::NO_STREAM);
+        }
+    }
     let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
         tracing::info!(
             databases = databases.count(),

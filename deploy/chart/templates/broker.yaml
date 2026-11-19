@@ -42,8 +42,12 @@
   client Service follows the set by its label, and each server is named
   under its own set's members. Deliveries in flight across the change are
   caught up by sequence and requests not answered are asked again, as for
-  a lost server (section 4). A set's volumes are kept when it goes, as a
-  StatefulSet's are, and found again if JetStream comes back.
+  a lost server (section 4). The set without JetStream has no volumes. The
+  JetStream set's volumes go with it (item 191, ruled 2026-11-19): a return
+  to JetStream starts it afresh, its streams made again, and never on the
+  state its servers kept before, which they could not agree on again (CI
+  44556229125). Writes the stream still held at the switch were never
+  answered, and their plugins ask again (section 4).
 */}}
 {{- $set := $name }}
 {{- if gt $jetstream 0 }}{{ $set = printf "%s-jetstream" $name }}{{ end }}
@@ -292,6 +296,14 @@ spec:
   serviceName: {{ $set }}-members
   podManagementPolicy: Parallel
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- if gt $jetstream 0 }}
+  # JetStream's volumes are deleted with the set, and kept while it is
+  # scaled (item 191): `meridian upgrade-deployment` deletes any left by a
+  # set that went before this.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  {{- end }}
   # The set without volumes keeps the selector it was made with (a
   # selector cannot change in place); the set with them is selected by its
   # name as well.
