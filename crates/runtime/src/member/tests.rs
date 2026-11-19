@@ -3935,6 +3935,69 @@ async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_dat
     );
 }
 
+/// A writer with no lease that already hands every write on (the tolerant
+/// default), fenced while it serves on, refuses its topics to be asked
+/// again -- UNAVAILABLE, retry-after 1 -- as any fenced writer does (ruled
+/// 2026-11-18, item 120). Before, it went on handing each write on by the
+/// owners it last read, and a write handed to a group with no members was
+/// refused only at its caller's deadline, with no retry-after
+/// (review-c5n2 L3).
+#[tokio::test(start_paused = true)]
+async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_to_be_asked_again() {
+    let holding = Holding {
+        elector: None,
+        component: "bor",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    holding.keep_or(|| 5, move || Ok(reading.load(Ordering::SeqCst)), |_, _| {});
+    let bus = Arc::new(Bus::single(
+        "member-test-handing",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let write = "platform.book.command.record-order";
+    bus.serve(write, |_| Ok(("R".into(), vec![])));
+    bus.hand_writes_on("platform.book.internal.command", 1, move |topic| {
+        topic == write
+    });
+    // Told to stop with no lease: every write handed on.
+    assert!(bus.stop_writing_here(|_| false));
+    assert!(bus.writes_nothing_here());
+    let refusing = Arc::clone(&bus);
+    let _serving = tokio::spawn(async move {
+        holding
+            .serve_on_until_another_group_serves(1, 2, 42, |_, _| Ok(false), &refusing, || {})
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!bus.refuses_from_here(), "it refused before any fence");
+    // Another group's writer raised the epoch of one of its partitions.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        bus.refuses_from_here(),
+        "fenced while serving on, handing every write on, it never refused its topics"
+    );
+    let detail = match bus.call(write, "Q", vec![], None, None).await {
+        Err(meridian_bus::BusError::HandlerFailed { detail, .. }) => detail,
+        other => panic!("fenced while serving on, it answered {other:?}"),
+    };
+    assert_eq!(
+        meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+        Some(meridian_bus::RefusalStatus::Unavailable),
+        "{detail}"
+    );
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&detail),
+        Some(1),
+        "{detail}"
+    );
+}
+
 /// A writer fenced before it is told to stop ends at once, though told to
 /// stop while it gives its lease up (review-c5n2 L1): it was not serving
 /// on at its fence, and a writer fenced so ends at once (item 110). Before,

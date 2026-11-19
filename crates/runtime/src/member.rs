@@ -1194,8 +1194,9 @@ impl Holding {
     /// database's ([`meridian_changes::Fence::stop`]), as a writer with no
     /// lease told to stop does (review-c5n2 M2) -- and refuses its store's
     /// topics from here, to be asked again ([`Bus::refuse_from_here`]),
-    /// unless it already hands every write on, with no lease; and it ends
-    /// when this does, not at the fence.
+    /// one that already hands every write on, with no lease, too (ruled
+    /// 2026-11-18, item 120: nothing more handed on by the owners it last
+    /// read); and it ends when this does, not at the fence.
     pub async fn serve_on_until_another_group_serves<F, S>(
         &self,
         mine: u32,
@@ -1219,9 +1220,7 @@ impl Holding {
                 move || {
                     crate::mark_ready(false);
                     stop_committing();
-                    if !bus.writes_nothing_here() {
-                        bus.refuse_from_here();
-                    }
+                    bus.refuse_from_here();
                 },
                 SERVES_ON_AT_MOST,
                 SERVES_ON_LOOKS_EVERY,

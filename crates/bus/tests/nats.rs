@@ -1840,3 +1840,73 @@ async fn a_writer_fenced_while_it_serves_on_refuses_every_request_to_be_asked_ag
     assert!(answered > 0, "the writer that serves answered none");
     assert_eq!(ran.load(Ordering::SeqCst), 0, "a handler of it ran");
 }
+
+/// Item 120 (ruled 2026-11-18): a later group's writer with no lease, told
+/// to stop -- every write handed on, the internal topic withdrawn -- and
+/// fenced while it serves on refuses to be asked again, UNAVAILABLE with
+/// retry-after 1, at once, as any fenced writer does. Before, it went on
+/// handing each write on by the owners it last read: one handed to a group
+/// with no members (the count lowered) was refused only at its caller's
+/// deadline, with no retry-after (review-c5n2 L3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_at_once() {
+    let instance = format!("store-{}", mark("handing-fenced"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    // The second group's old writer: the write is the second group's, by
+    // the owners it last read (stale once the count is lowered).
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(|_, _| Some(1));
+    old.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+    });
+    // The one group's writer: offers the internal topic to group 0, and does
+    // not serve the public topic yet.
+    let new = bus(&instance).await;
+    new.hand_writes_on(&internal, 0, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.subscribed().await.expect("subscribed");
+    new.subscribed().await.expect("subscribed");
+    // Told to stop with no lease, then fenced while it serves on.
+    assert!(old.stop_writing_here(|_| false));
+    old.refuse_from_here();
+    settle().await;
+    let asking = bus("asking").await;
+    for _ in 0..5 {
+        let began = std::time::Instant::now();
+        let answered = asking
+            .call(
+                &write,
+                "meridian.test.Question",
+                Vec::new(),
+                None,
+                Some(Duration::from_millis(2_000)),
+            )
+            .await;
+        let took = began.elapsed();
+        let detail = match answered {
+            Err(BusError::HandlerFailed { detail, .. }) => detail,
+            other => panic!("the fenced writer handing on answered {other:?}"),
+        };
+        assert_eq!(
+            meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+            Some(meridian_bus::RefusalStatus::Unavailable),
+            "{detail}"
+        );
+        assert_eq!(
+            meridian_bus::refusal_retry_after(&detail),
+            Some(1),
+            "{detail}"
+        );
+        assert!(
+            took < Duration::from_millis(1_000),
+            "refused after {took:?}, at the caller's deadline: {detail}"
+        );
+    }
+}
