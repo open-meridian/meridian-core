@@ -448,3 +448,153 @@ async fn a_take_delivers_its_instance_s_standing_wants_again_and_nothing_else() 
         "a refused take delivered a want again"
     );
 }
+
+/// `lake-1`'s daily dataset served, entitled to `reporting-1`, and a
+/// standing want of it for each of `subjects`: the wants it delivered,
+/// heard on `wanted`.
+async fn standing_wants(
+    h: &Harness,
+    subjects: &[&str],
+    wanted: &mut meridian_bus::Subscription,
+) -> Vec<ObservationsWantedEvent> {
+    h.lake.configured(&EntitlementsChangedEvent {
+        datasets: vec![DatasetRef {
+            dataset: format!("{INSTANCE}:daily"),
+            instance: INSTANCE.into(),
+            vendor: "Coinbase".into(),
+            declaration: Some(declaration("daily", 60)),
+            ..Default::default()
+        }],
+        licences: vec![],
+        entitlements: vec![DatasetEntitlement {
+            dataset: format!("{INSTANCE}:daily"),
+            instance: "reporting-1".into(),
+            allowed: true,
+            ..Default::default()
+        }],
+        changed_at_ns: NOW,
+    });
+    h.lake
+        .renew_wants(
+            meridian_domain::v1::RenewWantsRequest {
+                wants: subjects
+                    .iter()
+                    .map(|subject| meridian_domain::v1::RenewedWant {
+                        data_type: "meridian.v1.Price".into(),
+                        subjects: vec![SubjectRef {
+                            entity_id: (*subject).into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+            &envelope("reporting-1", true, ""),
+        )
+        .unwrap();
+    let mut heard = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(200), wanted.recv()).await
+    {
+        if let Ok(want) = ObservationsWantedEvent::decode(&delivery.envelope.payload[..]) {
+            if want.standing {
+                heard.push(want);
+            }
+        }
+    }
+    heard
+}
+
+/// Review c5z F2 (a): the sweep withdraws a want between a take's choosing
+/// of the wants it delivers again and their delivery. The want is never
+/// heard again after its withdrawal: the plugin would serve it for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_s_delivery_again_never_follows_its_want_s_withdrawal() {
+    let h = harness();
+    book_group(&h.bus, 0);
+    let mut lake_events = h.bus.subscribe_every("platform.lake.event.*");
+    let standing = standing_wants(&h, &[BTC], &mut lake_events).await;
+    assert_eq!(standing.len(), 1, "{standing:?}");
+    let id = standing[0].want_id.clone();
+    // The sweep, past the want's lapse, as the take delivers it again.
+    let (lake, clock) = (Arc::downgrade(&h.lake), h.clock.clone());
+    let once = std::sync::atomic::AtomicBool::new(false);
+    *h.lake.resending.lock().unwrap() = Some(Box::new(move || {
+        if once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (lake, clock) = (lake.clone(), clock.clone());
+        let (swept, sweeping) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            clock.advance(DAY);
+            if let Some(lake) = lake.upgrade() {
+                lake.sweep_wants();
+            }
+            let _ = swept.send(());
+        });
+        let _ = sweeping.recv_timeout(Duration::from_millis(500));
+    }));
+    take(&h.bus, 1, 0).await.unwrap();
+    let mut order = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(1500), lake_events.recv()).await
+    {
+        let payload = &delivery.envelope.payload[..];
+        match delivery.envelope.payload_type.as_str() {
+            "meridian.v1.ObservationsWantedEvent" => order.push((
+                "wanted",
+                ObservationsWantedEvent::decode(payload).unwrap().want_id,
+            )),
+            "meridian.v1.WantWithdrawnEvent" => order.push((
+                "withdrawn",
+                meridian_domain::v1::WantWithdrawnEvent::decode(payload)
+                    .unwrap()
+                    .want_id,
+            )),
+            _ => {}
+        }
+    }
+    let withdrawn = order
+        .iter()
+        .position(|heard| *heard == ("withdrawn", id.clone()))
+        .unwrap_or_else(|| panic!("the sweep did not withdraw the want: {order:?}"));
+    assert!(
+        !order[withdrawn..].contains(&("wanted", id.clone())),
+        "the take delivered the want again after its withdrawal: {order:?}"
+    );
+}
+
+/// Review c5z F3: a take is answered before its instance's standing wants
+/// are delivered again, so however many there are, and however slowly
+/// they go, they never hold up a take already recorded; and each is still
+/// delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_is_answered_before_its_wants_are_delivered_again() {
+    const EACH: Duration = Duration::from_millis(400);
+    let h = harness();
+    book_group(&h.bus, 0);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let standing = standing_wants(&h, &[BTC, USD, USDC, AAPL], &mut wanted).await;
+    assert!(standing.len() >= 2, "{standing:?}");
+    // Each delivery again slow.
+    *h.lake.resending.lock().unwrap() = Some(Box::new(|| std::thread::sleep(EACH)));
+    let sent = std::time::Instant::now();
+    take(&h.bus, 1, 0).await.unwrap();
+    let answered = sent.elapsed();
+    assert!(
+        answered < EACH,
+        "the take was answered in {answered:?}, behind {} wants delivered again",
+        standing.len()
+    );
+    let mut again = Vec::new();
+    while let Ok(Some(delivery)) = tokio::time::timeout(EACH * 3, wanted.recv()).await {
+        again.push(ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap());
+    }
+    let ids = |wants: &[ObservationsWantedEvent]| {
+        wants
+            .iter()
+            .map(|want| want.want_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(ids(&again), ids(&standing), "not each delivered again");
+}
