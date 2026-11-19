@@ -12207,3 +12207,63 @@ fn a_writer_restarted_after_a_lowering_adopts_its_epoch_past_a_stale_row() {
     );
     assert_eq!(took_over(&mut sql), before, "a takeover was recorded");
 }
+
+/// Review c5s L8: a takeover chosen as a deadlock's victim (SQLSTATE 40P01)
+/// is tried again, not given up on. Group 0's takeover at a count lowered
+/// from three to two holds the control partition and waits for group 2's
+/// row, which a batch of group 2's writer, not stopped yet, holds shared
+/// while it waits for the control partition: Postgres ends the takeover,
+/// the one that waited first.
+#[test]
+fn a_takeover_ended_by_a_deadlock_is_tried_again() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-takeover-deadlock");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    for group in 0..3 {
+        store(group, 3)
+            .take_over(&TookOver::unnamed(LEASE_FREE))
+            .unwrap();
+    }
+    let mut batch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut held = batch.transaction().unwrap();
+    held.query_one(
+        "SELECT epoch FROM lake_writer_group WHERE writer_group = 2 FOR SHARE",
+        &[],
+    )
+    .unwrap();
+    let lowered = store(0, 2);
+    let taking = std::thread::spawn(move || lowered.take_over(&TookOver::unnamed(LEASE_FREE)));
+    // The takeover waits for group 2's row, the control partition held.
+    let waiting = (0..500).any(|_| {
+        let waits: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        waits > 0 || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(waiting, "the takeover never waited for group 2's row");
+    held.query_one(
+        "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
+        &[],
+    )
+    .unwrap();
+    held.commit().unwrap();
+    let took = taking.join().unwrap();
+    assert!(
+        took.is_ok(),
+        "the takeover ended by a deadlock was given up on: {took:?}"
+    );
+}
