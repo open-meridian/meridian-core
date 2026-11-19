@@ -352,15 +352,24 @@ async fn a_gap_whose_want_is_declined_is_unrecovered() {
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     let mut writer =
         tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
-    let mut first = written(
-        2,
+    tokio::task::block_in_place(|| {
+        writer.take(vec![written(
+            1,
+            "kraken-1",
+            vec![close("kraken-1", "k", BTC, "2026-10-07", "1")],
+        )])
+    })
+    .unwrap();
+    let mut next = written(
+        3,
         "coinbase-1",
         vec![close("coinbase-1", "a", BTC, "2026-10-07", "1")],
     );
-    first.after = Some(1);
-    // No position yet and the stream's first is 2: 1 was dropped before any
-    // writer took it.
-    tokio::task::block_in_place(|| writer.take(vec![first])).unwrap();
+    next.after = Some(2);
+    // At 1, and the stream's next is 3: 2 was dropped before the writer
+    // took it. (A writer with no place in the stream takes from its first
+    // and counts nothing before it lost: item 191.)
+    tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
     let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
         .unwrap();
     let mut asked = envelope("coinbase-1", true, "");
