@@ -176,6 +176,13 @@ fn run() -> Result<(), String> {
     } else {
         every_database.push(Arc::new(connect(0, &url)?));
     }
+    // In `ha`, no range's switch until the writer has read the write-ahead
+    // stream's identity: the groups' places are kept by it (item 191).
+    if write_ahead_on() {
+        for store in &every_database {
+            store.stream_not_read();
+        }
+    }
     let spread: Option<Arc<meridian_lake::spread::Spread>> = if databases.several() {
         tracing::info!(
             databases = databases.count(),

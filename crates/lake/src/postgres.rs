@@ -142,6 +142,11 @@ pub struct PostgresStore {
     /// When this store last let go of its group's parts of writes kept
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
+    /// The identity of the write-ahead stream the lake's writer takes from
+    /// (item 191): what a move's switch keys the groups' places by. 0 with
+    /// no stream (`tolerant`); [`STREAM_NOT_READ`] in `ha` until the writer
+    /// reads it.
+    stream: std::sync::atomic::AtomicI64,
     /// The datasets whose open ranges' tables this store has seen made:
     /// their ranges are not read again before a batch, as a split makes its
     /// children's tables itself. Let go likewise.
@@ -395,6 +400,7 @@ impl PostgresStore {
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
+            stream: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             latest_all: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2915,7 +2921,42 @@ impl PostgresStore {
     }
 }
 
+/// A store's write-ahead stream in `ha` before the lake's writer has read
+/// its identity (item 191): a move's switch waits for it.
+pub const STREAM_NOT_READ: i64 = -1;
+
+impl PostgresStore {
+    /// The lake keeps a write-ahead stream (`ha`) whose identity its writer
+    /// has not read yet: a move's switch is refused until it has (item 191).
+    pub fn stream_not_read(&self) {
+        self.stream
+            .store(STREAM_NOT_READ, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The key of the write-ahead stream the lake's writer takes from
+    /// ([`crate::write_ahead::stream_key`]): the name alone with no stream;
+    /// refused while its identity is not read (item 191).
+    pub(crate) fn stream_key(&self) -> Result<String> {
+        match self.stream.load(std::sync::atomic::Ordering::SeqCst) {
+            STREAM_NOT_READ => Err(StoreError::Unavailable(
+                "the lake's write-ahead stream's identity is not read yet: no range's switch \
+                 until it is"
+                    .into(),
+            )),
+            identity => Ok(crate::write_ahead::stream_key(
+                meridian_bus::write_ahead::STREAM,
+                identity,
+            )),
+        }
+    }
+}
+
 impl Store for PostgresStore {
+    fn in_stream(&self, identity: i64) {
+        self.stream
+            .store(identity, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn read_owners_again(&self) -> Result<()> {
         self.read_owners().map(|_| ())
     }

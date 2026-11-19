@@ -374,6 +374,9 @@ impl PostgresStore {
         locked: &mut Option<(std::time::Instant, Option<std::time::Instant>)>,
     ) -> Result<Switched> {
         let began = std::time::Instant::now();
+        // The groups' places in the write-ahead stream the writer takes
+        // from now, never in one made before it under its name (item 191).
+        let stream = self.stream_key()?;
         let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
         let same = std::ptr::eq(self, to);
         let timed_out = |failed: &postgres::Error| {
@@ -439,8 +442,8 @@ impl PostgresStore {
         });
         // The source group's committed place in the write-ahead stream, as
         // its batches -- which take this row -- left it.
-        let theirs_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, from);
-        let ours_key = crate::write_ahead::group_key(meridian_bus::write_ahead::STREAM, target);
+        let theirs_key = crate::write_ahead::group_key(&stream, from);
+        let ours_key = crate::write_ahead::group_key(&stream, target);
         let at = match stream_position(&mut tx, &theirs_key)? {
             Some(at) => Some(at),
             None if !same => stream_position(&mut *to.conn()?, &theirs_key)?,

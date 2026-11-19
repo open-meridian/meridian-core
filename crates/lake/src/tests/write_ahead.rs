@@ -43,7 +43,8 @@ async fn writes_from_the_stream_are_recorded_with_its_position_and_answered_as_t
     let mut heard = h
         .bus
         .subscribe_every("platform.lake.coinbase-1:daily.event.prices-recorded");
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     assert_eq!(writer.position(), None);
     assert_eq!(
         writer.next(),
@@ -108,11 +109,13 @@ async fn writes_from_the_stream_are_recorded_with_its_position_and_answered_as_t
 #[tokio::test(flavor = "multi_thread")]
 async fn a_writer_behind_the_held_position_is_refused_and_a_write_taken_again_is_recorded_once() {
     let h = harness();
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     // A second writer that read the position before the first moved it: as
     // a writer whose last commits a database failover lost believes it is
     // further on than the store, this one believes it is behind.
-    let mut stale = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut stale =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let btc = || close("coinbase-1", "BTC:07", BTC, "2026-10-07", "62000.5");
     tokio::task::block_in_place(|| writer.take(vec![written(1, "coinbase-1", vec![btc()])]))
         .unwrap();
@@ -218,7 +221,8 @@ async fn a_writer_gone_past_the_bound_leaves_a_backfill_gap_asked_again_and_reco
     let h = harness();
     tokio::task::block_in_place(|| gap_configured(&h));
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let price =
         |key: &str, valid: i64| at_valid(close("coinbase-1", key, BTC, "2026-10-07", "1"), valid);
     tokio::task::block_in_place(|| {
@@ -303,7 +307,8 @@ async fn a_gap_in_a_dataset_declaring_none_is_recorded_unrecovered_and_read_neve
     let h = harness();
     tokio::task::block_in_place(|| gap_configured(&h));
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let price =
         |key: &str, valid: i64| at_valid(close("kraken-1", key, BTC, "2026-10-07", "1"), valid);
     tokio::task::block_in_place(|| {
@@ -311,7 +316,8 @@ async fn a_gap_in_a_dataset_declaring_none_is_recorded_unrecovered_and_read_neve
     })
     .unwrap();
     // A writer started again after the gap: what it found is the store's.
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let mut next = written(9, "kraken-1", vec![price("i", NOW - 1_000)]);
     next.after = Some(8);
     tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
@@ -344,7 +350,8 @@ async fn a_gap_whose_want_is_declined_is_unrecovered() {
     let h = harness();
     tokio::task::block_in_place(|| gap_configured(&h));
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let mut first = written(
         2,
         "coinbase-1",
@@ -383,7 +390,8 @@ async fn a_gap_is_recorded_the_moment_the_stream_skips_and_each_dataset_names_it
     let h = harness();
     tokio::task::block_in_place(|| gap_configured(&h));
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let coinbase =
         |key: &str, valid: i64| at_valid(close("coinbase-1", key, BTC, "2026-10-07", "1"), valid);
     let kraken =
@@ -446,7 +454,8 @@ async fn a_gap_is_recorded_the_moment_the_stream_skips_and_each_dataset_names_it
     );
     // A writer started again -- a takeover, a restart -- names it too: the
     // run keeps its gap's ID in the store.
-    let mut writer = tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM)).unwrap();
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
     let mut later = written(9, "kraken-1", vec![kraken("i", NOW - 1_000)]);
     later.after = Some(5);
     tokio::task::block_in_place(|| writer.take(vec![later])).unwrap();
@@ -499,7 +508,7 @@ async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_it
     };
     let batch = vec![write(1), write(2)];
     let other = lake_of(1 - owning);
-    let mut skipping = tokio::task::block_in_place(|| Writer::start(other, STREAM)).unwrap();
+    let mut skipping = tokio::task::block_in_place(|| Writer::start(other, STREAM, 0)).unwrap();
     let skipped = tokio::task::block_in_place(|| skipping.take(batch.clone())).unwrap();
     assert!(
         skipped.is_empty(),
@@ -520,7 +529,7 @@ async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_it
         "nothing of them kept"
     );
     let mut taking =
-        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM, 0)).unwrap();
     let answers = tokio::task::block_in_place(|| taking.take(batch)).unwrap();
     assert_eq!(answers.len(), 2);
     assert_eq!(reply(&answers[1].1).recorded, 1);
@@ -541,8 +550,8 @@ async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_it
 /// and were taken, so the group begins at the first write the stream still
 /// holds and counts none before it dropped: no run, no gap, nothing logged
 /// in the control partition, which group 0 writes. Its own dataset's write
-/// is committed and answered. Group 0 with no position still finds the run
-/// it never took.
+/// is committed and answered. Group 0 with no position takes from the
+/// first write the stream holds too (item 191).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_streams_first_with_no_gap(
 ) {
@@ -577,7 +586,8 @@ async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_stream
     };
     // The stream holds 1,810 on: what came before aged out after group 0
     // took it.
-    let mut fresh = tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    let mut fresh =
+        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM, 0)).unwrap();
     assert_eq!(fresh.position(), None);
     let answers = tokio::task::block_in_place(|| fresh.take(vec![write(1_810)])).unwrap();
     assert_eq!(answers.len(), 1);
@@ -597,7 +607,8 @@ async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_stream
     );
     // Committed since: the stream aging past its position later is a gap
     // it marks, as group 0 would ("lake loss is re-sent, never silent").
-    let mut again = tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM)).unwrap();
+    let mut again =
+        tokio::task::block_in_place(|| Writer::start(lake_of(owning), STREAM, 0)).unwrap();
     tokio::task::block_in_place(|| again.take(vec![write(2_500)])).unwrap();
     let (dropped, _) = h.store.write_ahead_found(&key(owning)).unwrap();
     assert_eq!(
@@ -613,15 +624,258 @@ async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_stream
         1,
         "its gap recorded"
     );
-    // Group 0, with no position, never took 1 to 1,809: those it finds.
-    let mut zero = tokio::task::block_in_place(|| Writer::start(lake_of(0), STREAM)).unwrap();
+    // Group 0 with no position in the stream takes from the first write it
+    // holds too, and counts none before it dropped (item 191, ruled
+    // 2026-11-19): the lake answered none of them.
+    let mut zero = tokio::task::block_in_place(|| Writer::start(lake_of(0), STREAM, 0)).unwrap();
     tokio::task::block_in_place(|| zero.take(vec![write(1_811)])).unwrap();
     let (dropped, _) = h.store.write_ahead_found(&key(0)).unwrap();
+    assert!(dropped.is_empty(), "no run counted dropped: {dropped:?}");
+}
+
+/// Item 191 (ruled 2026-11-19): leaving `ha` deletes JetStream's volumes,
+/// and taking `ha` again makes the stream again under the same name,
+/// numbered from its own first. Everything the lake keeps of a stream is
+/// kept by its identity: in the new one the writer has no position, takes
+/// from its first write and counts nothing before it lost; the old one's
+/// position above the new one's sequences skips none of them, and a run
+/// the old one dropped never marks a write of the new one as following a
+/// gap. The old stream's keeping is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_made_again_under_its_name_is_taken_from_its_first_write_with_nothing_of_the_old()
+{
+    const OLD: i64 = 1_790_000_000_000_000_000;
+    const NEW: i64 = OLD + 600_000_000_000;
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let coinbase =
+        |key: &str, valid: i64| at_valid(close("coinbase-1", key, BTC, "2026-10-07", "1"), valid);
+    let key = |identity: i64| crate::write_ahead::stream_key(STREAM, identity);
+    // The old stream: 1 and 2 taken, 3 to 9 dropped, 10 taken -- a run and
+    // its gap kept, and coinbase-1's latest valid time.
+    let mut old =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, OLD)).unwrap();
+    tokio::task::block_in_place(|| {
+        old.take(vec![
+            written(1, "coinbase-1", vec![coinbase("a", NOW - 50_000)]),
+            written(2, "coinbase-1", vec![coinbase("b", NOW - 40_000)]),
+        ])
+    })
+    .unwrap();
+    tokio::task::block_in_place(|| {
+        old.take(vec![written(
+            10,
+            "coinbase-1",
+            vec![coinbase("c", NOW - 30_000)],
+        )])
+    })
+    .unwrap();
+    let held = h.store.write_ahead_position(&key(OLD)).unwrap();
+    assert_eq!(held.map(|at| at.sequence), Some(10));
+    let (dropped, _) = h.store.write_ahead_found(&key(OLD)).unwrap();
     assert_eq!(
         dropped
             .iter()
             .map(|run| (run.first, run.last))
             .collect::<Vec<_>>(),
-        vec![(1, 1_810)]
+        vec![(3, 9)]
     );
+    let before = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(before.len(), 1, "the old stream's run, its gap: {before:?}");
+    // The stream made again: 1 to 12, write 5 its sidecar's next after 4 --
+    // a sequence in the old stream's dropped run.
+    let mut new =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, NEW)).unwrap();
+    assert_eq!(new.position(), None, "no place in the new stream");
+    assert_eq!(new.next(), 1, "taken from its first");
+    let writes: Vec<Taken> = (1..=12)
+        .map(|n| {
+            let mut write = written(
+                n,
+                "coinbase-1",
+                vec![coinbase(&format!("new-{n}"), NOW - 20_000 + n as i64)],
+            );
+            if n == 5 {
+                write.after = Some(4);
+            }
+            write
+        })
+        .collect();
+    let answers = tokio::task::block_in_place(|| new.take(writes)).unwrap();
+    assert_eq!(answers.len(), 12, "every write of the new stream taken");
+    for answered in &answers {
+        assert_eq!(reply(&answered.1).recorded, 1, "{:?}", answered.0);
+    }
+    assert_eq!(
+        h.store
+            .write_ahead_position(&key(NEW))
+            .unwrap()
+            .map(|at| at.sequence),
+        Some(12)
+    );
+    let (dropped, _) = h.store.write_ahead_found(&key(NEW)).unwrap();
+    assert!(dropped.is_empty(), "nothing counted lost: {dropped:?}");
+    assert_eq!(
+        gaps(&h, "", GapState::Unspecified),
+        before,
+        "no gap of the new stream's, and no write of it after the old one's run"
+    );
+    // The old stream's keeping is as it was.
+    assert_eq!(h.store.write_ahead_position(&key(OLD)).unwrap(), held);
+    let restarted =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, NEW)).unwrap();
+    assert_eq!(
+        restarted.next(),
+        13,
+        "a writer started again goes on in the new stream"
+    );
+}
+
+/// Item 191 against a real JetStream (by hand: a broker with JetStream at
+/// MERIDIAN_TEST_JETSTREAM_URL, which this test empties of the lake's
+/// stream): the lake's writer takes ten writes from the stream, three of
+/// them dropped before it took them; the stream is deleted -- `ha` left --
+/// and made again under its name -- `ha` taken again -- holding twelve
+/// writes, more than the old position, one of them its sidecar's next after
+/// a sequence in the old stream's dropped run. Every write of the new stream
+/// is taken and answered, and none is found to follow a gap.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() {
+    use crate::write_ahead::{stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use futures_util::StreamExt as _;
+    use meridian_bus::write_ahead::{subject, AFTER_HEADER, REPLY_HEADER, STREAM, TOPIC_HEADER};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = async_nats::connect(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let bounds = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 64 << 20,
+        replicas: 1,
+    };
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let tag = std::process::id();
+    let mut answered = client
+        .subscribe(format!("_INBOX.c5o-{tag}.>"))
+        .await
+        .unwrap();
+    let put = |round: &'static str, n: u64, after: Option<u64>| {
+        let context = context.clone();
+        async move {
+            let price = at_valid(
+                close(
+                    "coinbase-1",
+                    &format!("{round}-{n}"),
+                    BTC,
+                    "2026-10-07",
+                    "1",
+                ),
+                NOW - 100_000 + n as i64,
+            );
+            let mut write = written(n, "coinbase-1", vec![price]);
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(TOPIC_HEADER, write.topic.as_str());
+            headers.insert(
+                REPLY_HEADER,
+                format!("_INBOX.c5o-{tag}.{round}.{n}").as_str(),
+            );
+            if let Some(after) = after {
+                headers.insert(AFTER_HEADER, after.to_string().as_str());
+            }
+            write.envelope.meta.as_mut().unwrap().published_at_ns = NOW;
+            context
+                .publish_with_headers(
+                    subject("coinbase-1", "daily"),
+                    headers,
+                    write.envelope.encode_to_vec().into(),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+    };
+    let run = || {
+        let (lake, client) = (h.lake.clone(), client.clone());
+        tokio::spawn(async move { write_forever(lake, client, bounds, |_| {}).await })
+    };
+    // Answers heard on `round`'s inbox within `within`, by write.
+    async fn heard(
+        answered: &mut async_nats::Subscriber,
+        round: &str,
+        want: usize,
+        within: Duration,
+    ) -> std::collections::BTreeSet<u64> {
+        let mut seen = std::collections::BTreeSet::new();
+        let until = tokio::time::Instant::now() + within;
+        while seen.len() < want {
+            match tokio::time::timeout_at(until, answered.next()).await {
+                Ok(Some(message)) => {
+                    let mut words = message.subject.as_str().rsplit('.');
+                    let n: u64 = words.next().unwrap().parse().unwrap();
+                    if words.next() == Some(round) && message.headers.is_none() {
+                        seen.insert(n);
+                    }
+                }
+                _ => break,
+            }
+        }
+        seen
+    }
+    // The old stream: 1 to 5 taken.
+    context.create_stream(stream_config(&bounds)).await.unwrap();
+    let writer = run();
+    for n in 1..=5 {
+        put("old", n, None).await;
+    }
+    let first = heard(&mut answered, "old", 5, Duration::from_secs(30)).await;
+    assert_eq!(first.len(), 5, "the old stream's first five: {first:?}");
+    writer.abort();
+    let _ = writer.await;
+    // 6 to 10 written while no writer runs, 6 to 8 dropped before it starts.
+    for n in 6..=10 {
+        put("old", n, None).await;
+    }
+    context
+        .get_stream(STREAM)
+        .await
+        .unwrap()
+        .purge()
+        .sequence(9)
+        .await
+        .unwrap();
+    let writer = run();
+    let rest = heard(&mut answered, "old", 2, Duration::from_secs(30)).await;
+    assert_eq!(rest, [9, 10].into(), "the old stream's last two");
+    writer.abort();
+    let _ = writer.await;
+    let old_gaps = gaps(&h, "", GapState::Unspecified);
+    assert_eq!(old_gaps.len(), 1, "the old stream's run: {old_gaps:?}");
+    // `ha` left and taken again: the stream deleted, made again, twelve
+    // writes in it before the writer starts; write 11 its sidecar's next
+    // after 7.
+    context.delete_stream(STREAM).await.unwrap();
+    context.create_stream(stream_config(&bounds)).await.unwrap();
+    for n in 1..=12 {
+        put("new", n, (n == 11).then_some(7)).await;
+    }
+    let writer = run();
+    let new = heard(&mut answered, "new", 12, Duration::from_secs(30)).await;
+    writer.abort();
+    let _ = writer.await;
+    assert_eq!(
+        new,
+        (1..=12).collect(),
+        "every write of the stream made again taken and answered"
+    );
+    assert_eq!(
+        gaps(&h, "", GapState::Unspecified),
+        old_gaps,
+        "no write of the new stream found to follow the old one's run"
+    );
+    context.delete_stream(STREAM).await.unwrap();
 }

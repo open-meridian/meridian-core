@@ -1108,6 +1108,8 @@ impl Lake {
     pub fn with_stream(&self, identity: i64) {
         self.stream
             .store(identity, std::sync::atomic::Ordering::SeqCst);
+        // A move's switch keeps its places in this stream (item 191).
+        self.store.in_stream(identity);
     }
 
     fn stream_identity(&self) -> i64 {

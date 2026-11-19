@@ -630,6 +630,12 @@ impl Store for Spread {
         Ok(raised)
     }
 
+    fn in_stream(&self, identity: i64) {
+        for store in &self.stores {
+            store.in_stream(identity);
+        }
+    }
+
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
         if let Some(at) = self.own().write_ahead_position(stream)? {
             return Ok(Some(at));

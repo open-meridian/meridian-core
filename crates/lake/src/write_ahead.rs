@@ -151,11 +151,25 @@ pub fn timeout_of(said: Option<&str>) -> Option<u64> {
 }
 
 /// Where a writer group keeps its position in the stream (step 3d; section
-/// 6.1): group 0 under the stream's own name, as every lake before groups
-/// kept it; each group past the first under `<stream>.group-<g>`, as its
-/// queue group is named.
+/// 6.1): group 0 under the stream's key ([`stream_key`]); each group past
+/// the first under `<key>.group-<g>`, as its queue group is named.
 pub fn position_key(stream: &str, groups: meridian_changes::groups::Groups) -> String {
     group_key(stream, groups.mine())
+}
+
+/// The key everything the lake keeps of one write-ahead stream is kept
+/// under -- each group's position, the runs it dropped, each dataset's
+/// latest valid time and each group's parts of a write -- the stream's
+/// name and its identity, `<stream>.<identity>` (item 191, ruled
+/// 2026-11-19). A stream made again under the same name -- JetStream's
+/// volumes deleted on leaving `ha`, and `ha` taken again -- is another
+/// stream, numbered from its own first, and nothing kept of the one before
+/// applies to it. Identity 0, none read, is the name alone.
+pub fn stream_key(stream: &str, identity: i64) -> String {
+    match identity {
+        0 => stream.to_string(),
+        identity => format!("{stream}.{identity}"),
+    }
 }
 
 /// Writer group `group`'s position's key in `stream`.
@@ -292,15 +306,15 @@ pub struct Recorded {
 /// each batch moves, and what the stream dropped that the lake has found.
 pub struct Writer {
     lake: Arc<Lake>,
-    /// The stream's name, as every group's position is kept by.
+    /// The stream's key ([`stream_key`]), as every group's position is
+    /// kept by.
     base: String,
+    /// The stream's identity, as the writer was started in it.
+    identity: i64,
     /// The waits of the answers of the batch taken last (step 3d).
     waits: Vec<Wait>,
     stream: String,
     position: Option<WriteAheadPosition>,
-    /// The sequence to take from next where it is not the one after the
-    /// position: a stream made again, which numbers from its own first.
-    from: Option<u64>,
     dropped: Vec<Dropped>,
     valid: BTreeMap<String, i64>,
     /// When it last passed a write whose rows were, in whole or in part,
@@ -322,21 +336,23 @@ fn spans(groups: meridian_changes::groups::Groups, dataset: &str) -> bool {
 }
 
 impl Writer {
-    /// The writer of `lake`, at the position its store holds in `stream`,
-    /// with what it found the stream dropped.
-    pub fn start(lake: Arc<Lake>, stream: &str) -> Result<Writer, StoreError> {
+    /// The writer of `lake`, at the position its store holds in the stream
+    /// named `stream` whose identity is `identity`, with what it found that
+    /// stream dropped: no position and nothing found in a stream it has
+    /// never committed from (item 191).
+    pub fn start(lake: Arc<Lake>, stream: &str, identity: i64) -> Result<Writer, StoreError> {
         // Each writer group's own position (step 3d; section 6.1).
-        let base = stream.to_string();
-        let stream = position_key(stream, lake.groups());
+        let base = stream_key(stream, identity);
+        let stream = position_key(&base, lake.groups());
         let position = lake.write_ahead_position(&stream)?;
         let (dropped, valid) = lake.write_ahead_found(&stream)?;
         Ok(Writer {
             lake,
             base,
+            identity,
             waits: Vec::new(),
             stream,
             position,
-            from: None,
             dropped,
             valid,
             passed_at: None,
@@ -417,16 +433,10 @@ impl Writer {
         self.position
     }
 
-    /// The first sequence the writer takes next.
+    /// The first sequence the writer takes next: the stream's first it
+    /// still holds where the writer has no position in it.
     pub fn next(&self) -> u64 {
-        self.from
-            .unwrap_or_else(|| self.position.map_or(1, |at| at.sequence + 1))
-    }
-
-    /// Take from `sequence` next, whatever the position: the stream's own
-    /// first, where the stream is not the one the position was taken in.
-    pub fn begin_at(&mut self, sequence: u64) {
-        self.from = Some(sequence);
+        self.position.map_or(1, |at| at.sequence + 1)
     }
 
     /// The ranges' writer groups read again into the member's view.
@@ -444,7 +454,6 @@ impl Writer {
         let (dropped, valid) = self.lake.write_ahead_found(&self.stream)?;
         self.dropped = dropped;
         self.valid = valid;
-        self.from = None;
         Ok(())
     }
 
@@ -464,17 +473,19 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
-        // A writer group past the first that has never committed -- no
-        // position of its own in any of the lake's databases (a position is
-        // committed with its batch's rows), so its first start after
-        // `writerGroups` was raised (step 3d; section 6.1; CI 43615034712)
-        // -- takes from the first write the stream still holds: the writes
-        // before it were group 0's to take, and were taken, so none is
-        // counted dropped. Its datasets' writes in the stream are taken
-        // again, and each row is recorded once. A group that has committed
-        // goes on from its position, and a run the stream dropped past it
-        // is a gap, as for group 0.
-        let fresh = self.position.is_none() && self.from.is_none() && self.lake.groups().mine() > 0;
+        // A writer group that has never committed in this stream -- no
+        // position of its own under its key in any of the lake's databases
+        // (a position is committed with its batch's rows) -- takes from the
+        // first write the stream still holds, and counts none before it
+        // dropped: a group past the first started after `writerGroups` was
+        // raised, whose earlier writes were group 0's to take, and were
+        // taken (step 3d; section 6.1; CI 43615034712); or any group in a
+        // stream made again under the same name, which numbers from its
+        // own first and holds none of the writes the lake answered (item
+        // 191, ruled 2026-11-19). Writes in the stream are taken again, and
+        // each row is recorded once. A group that has committed goes on
+        // from its position, and a run the stream dropped past it is a gap.
+        let fresh = self.position.is_none();
         let mut expected = if fresh {
             taken[0].sequence
         } else {
@@ -581,7 +592,6 @@ impl Writer {
             wait.sent = recorded.sent.get(wait.at).copied().unwrap_or_default();
         }
         self.position = Some(through);
-        self.from = None;
         if passed {
             self.passed_at = Some(tokio::time::Instant::now());
         }
@@ -652,9 +662,14 @@ impl Writer {
         std::mem::take(&mut self.waits)
     }
 
-    /// The stream's name every group's position is kept by.
+    /// The stream's key every group's position is kept by ([`stream_key`]).
     pub fn stream_name(&self) -> &str {
         &self.base
+    }
+
+    /// The identity of the stream the writer was started in.
+    pub fn identity(&self) -> i64 {
+        self.identity
     }
 }
 
@@ -1110,6 +1125,35 @@ pub async fn taken_past_a_switch(
     }
 }
 
+/// The writer started in the stream whose identity is `identity`, its
+/// place read again until the store answers; said where the lake has none
+/// in it (item 191, ruled 2026-11-19): a stream made again under its name,
+/// or one the lake never took from, is taken from the first write it still
+/// holds, and nothing before that is counted lost -- the lake answered none
+/// of it.
+async fn started(lake: &Arc<Lake>, identity: i64) -> Writer {
+    let writer = loop {
+        let started =
+            tokio::task::block_in_place(|| Writer::start(Arc::clone(lake), STREAM, identity));
+        match started {
+            Ok(writer) => break writer,
+            Err(failed) => {
+                tracing::warn!(%failed, "the write-ahead position could not be read yet");
+                tokio::time::sleep(AGAIN_AFTER).await;
+            }
+        }
+    };
+    lake.with_stream(identity);
+    if writer.position().is_none() {
+        tracing::info!(
+            identity,
+            "the lake has no place in this write-ahead stream: taken from the first write it \
+             holds, none before it counted lost"
+        );
+    }
+    writer
+}
+
 pub async fn write_forever(
     lake: Arc<Lake>,
     client: async_nats::Client,
@@ -1150,16 +1194,18 @@ pub async fn write_forever(
             }
         }
     }
-    let mut writer = loop {
-        let started = tokio::task::block_in_place(|| Writer::start(Arc::clone(&lake), STREAM));
-        match started {
-            Ok(writer) => break writer,
+    // The writer starts in the stream as it is now: its identity keys
+    // every place the lake keeps in it (item 191).
+    let identity = loop {
+        match place(&client).await {
+            Ok(place) => break place.stream,
             Err(failed) => {
-                tracing::warn!(%failed, "the write-ahead position could not be read yet");
+                tracing::warn!(%failed, "the write-ahead stream's identity could not be read yet");
                 tokio::time::sleep(AGAIN_AFTER).await;
             }
         }
     };
+    let mut writer = started(&lake, identity).await;
     // The gaps the last writer was asking for again, asked again by this
     // one (W10.14): their wants were in its memory.
     // Group 0's, which holds the lake's wants (step 3d).
@@ -1188,25 +1234,23 @@ pub async fn write_forever(
                 continue;
             }
         };
-        // A stream made again -- its volume lost, or JetStream off and on
-        // again -- numbers from its own first: the position was taken in
-        // another, and what that one held past it is gone.
-        if let (Ok(info), Some(at)) = (stream.info().await, writer.position()) {
-            let state = &info.state;
-            if at.sequence > state.last_sequence && writer.next() > state.first_sequence {
-                tracing::error!(
-                    position = at.sequence,
-                    last = state.last_sequence,
-                    "the lake's write-ahead stream is not the one its position was taken \
-                     in: going on from its first write; what the stream held past the \
-                     position before it was made again is not recorded"
-                );
-                writer.begin_at(state.first_sequence.max(1));
-            }
-        }
         // Its identity, read with the reader that takes its writes, said to
-        // the lake for each write's stamp (c5a2 N4, c5a3 L2).
+        // the lake for each write's stamp (c5a2 N4, c5a3 L2). A stream made
+        // again under its name while the writer ran -- JetStream's volumes
+        // deleted on leaving `ha`, and `ha` taken again -- is another
+        // stream: the writer starts again in it, from what the lake keeps
+        // under its identity (item 191).
         let mut messages = match follow(&mut stream, writer.next()).await {
+            Ok((_, _, identity)) if identity != writer.identity() => {
+                tracing::info!(
+                    was = writer.identity(),
+                    identity,
+                    "the write-ahead stream was made again under its name: the lake takes it \
+                     as another stream"
+                );
+                writer = started(&lake, identity).await;
+                continue;
+            }
             Ok((messages, _, identity)) => {
                 lake.with_stream(identity);
                 messages

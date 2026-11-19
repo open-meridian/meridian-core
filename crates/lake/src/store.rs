@@ -852,6 +852,14 @@ pub trait Store: Send + Sync {
         now_ns: i64,
     ) -> Result<Recorded>;
 
+    /// The identity of the write-ahead stream the lake's writer takes from
+    /// (the `ha` profile; item 191): a move's switch reads and takes back
+    /// the places its writer groups keep in that stream, never in one made
+    /// before it under the same name. Nothing in a store that keeps none.
+    fn in_stream(&self, identity: i64) {
+        let _ = identity;
+    }
+
     /// The lake's position in its write-ahead stream `stream`, none before
     /// its first batch from it (the `ha` profile).
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
