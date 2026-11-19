@@ -3575,8 +3575,11 @@ async fn a_renewal_refused_by_a_standbys_take_steps_the_writer_down_within_that_
 /// on, told to stop, steps down within that renewal, as one not serving on
 /// does (the test above): the lease is its group's, so that member is its
 /// own writer group's successor, and serves its topics (the coordinator's
-/// ruling of 2026-11-18 on review-c5n2 H1). Before, it refused beside its
-/// successor until another group's writer served or its serve-on's bound.
+/// ruling of 2026-11-18 on review-c5n2 H1). A guard, not a change: before
+/// item 110 it stepped down at once too, so this passes on the base; it
+/// fails where the arm waits the serve-on out, refusing beside its
+/// successor up to 20 s, as an early draft of item 110 did (review-c5n5
+/// F4).
 #[tokio::test(start_paused = true)]
 async fn a_leased_writer_serving_on_whose_lease_its_successor_took_steps_down_at_once() {
     let api = Unreliable {
@@ -3897,9 +3900,12 @@ async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_dat
         fence.adopt(5);
     }
     let (stopping, refusing) = (Arc::clone(&fences), Arc::clone(&bus));
+    // Its readiness its own: the process's is other tests' (review-c5n5 F5).
+    let unready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saying = Arc::clone(&unready);
     let _serving = tokio::spawn(async move {
         holding
-            .serve_on_until_another_group_serves(
+            .serve_on_saying(
                 1,
                 2,
                 42,
@@ -3910,12 +3916,14 @@ async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_dat
                         fence.stop();
                     }
                 },
+                move || saying.store(true, Ordering::SeqCst),
             )
             .await
     });
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!bus.refuses_from_here(), "it refused before any fence");
     assert_eq!(fences[1].admits(5), Ok(()), "it stopped before any fence");
+    assert!(!unready.load(Ordering::SeqCst), "unready before any fence");
     // Another group's writer raised the epoch of one of its partitions.
     head.store(6, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3932,6 +3940,10 @@ async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_dat
     assert!(
         bus.refuses_from_here(),
         "fenced while serving on, it never refused its topics"
+    );
+    assert!(
+        unready.load(Ordering::SeqCst),
+        "fenced while serving on, it still said it was ready"
     );
 }
 
@@ -3970,7 +3982,7 @@ async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_to_be
     let refusing = Arc::clone(&bus);
     let _serving = tokio::spawn(async move {
         holding
-            .serve_on_until_another_group_serves(1, 2, 42, |_, _| Ok(false), &refusing, || {})
+            .serve_on_saying(1, 2, 42, |_, _| Ok(false), &refusing, || {}, || {})
             .await
     });
     tokio::time::sleep(Duration::from_secs(3)).await;

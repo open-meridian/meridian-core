@@ -1210,6 +1210,32 @@ impl Holding {
         F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
         S: FnOnce() + Send + 'static,
     {
+        self.serve_on_saying(mine, count, told_at_ns, look, bus, stop_committing, || {
+            crate::mark_ready(false)
+        })
+        .await
+    }
+
+    /// [`Self::serve_on_until_another_group_serves`], `unready` saying at
+    /// the fence that this member is not ready: the process's readiness
+    /// ([`crate::mark_ready`]), or a test's own, which leaves the process's
+    /// to the tests that read it (review-c5n5 F5).
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_on_saying<F, S, U>(
+        &self,
+        mine: u32,
+        count: u32,
+        told_at_ns: i64,
+        look: F,
+        bus: &Arc<Bus>,
+        stop_committing: S,
+        unready: U,
+    ) -> ServedOn
+    where
+        F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+        S: FnOnce() + Send + 'static,
+        U: FnOnce() + Send + 'static,
+    {
         let bus = Arc::clone(bus);
         self.serving_on
             .within(
@@ -1217,10 +1243,13 @@ impl Holding {
                 count,
                 told_at_ns,
                 look,
+                // Refusing before it stops committing: a request admitted
+                // meanwhile has its commit refused, answered "ask again"
+                // as a refused one is (review-c5n5 F1).
                 move || {
-                    crate::mark_ready(false);
-                    stop_committing();
+                    unready();
                     bus.refuse_from_here();
+                    stop_committing();
                 },
                 SERVES_ON_AT_MOST,
                 SERVES_ON_LOOKS_EVERY,
