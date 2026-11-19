@@ -926,7 +926,7 @@ jobs:
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
           if [ "$MAKE_FAILED" = true ]; then
-            timeout 60 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
+            timeout 90 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
           fi
 
       # One fact a step, after a failed make and before any upload: a step's
@@ -1291,7 +1291,7 @@ jobs:
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
           if [ "$MAKE_FAILED" = true ]; then
-            timeout 60 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
+            timeout 90 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
           fi
 
       - name: Keep what the watchdog saw

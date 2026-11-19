@@ -75,10 +75,12 @@ bounded() {
 }
 
 # The hosts a cluster job needs after its start: the images' registry, the
-# store the job's log and artifacts are uploaded to, and GitHub's API.
+# store the job's log and artifacts are uploaded to, GitHub's API, and the
+# service an upload asks first.
 HUB=https://registry-1.docker.io/v2/
 BLOB=https://productionresultssa0.blob.core.windows.net/
 API=https://api.github.com/zen
+RESULTS=https://results-receiver.actions.githubusercontent.com/
 SUBNET=${E2E_K3D_SUBNET:-172.28.0.0/16}
 
 # One URL: its status (000 when nothing answered), curl's exit, and the
@@ -104,9 +106,10 @@ net_line() {
   answers "$HUB" >"$dir/h" &
   answers "$BLOB" >"$dir/b" &
   answers "$API" >"$dir/a" &
+  answers "$RESULTS" >"$dir/r" &
   wait
   n=$(cat "$dir/n")
-  echo "net: names ${n:-?} hub $(cat "$dir/h") blob $(cat "$dir/b") api $(cat "$dir/a") (status/curl exit/lookup s/connect s)"
+  echo "net: names ${n:-?} hub $(cat "$dir/h") blob $(cat "$dir/b") api $(cat "$dir/a") results $(cat "$dir/r") (status/curl exit/lookup s/connect s)"
   rm -rf "$dir"
 }
 
@@ -161,7 +164,7 @@ sample() {
   echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) load $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?')"
   bounded 3 free -m
   bounded 3 df -h / "$root" | awk '!seen[$0]++'
-  bounded 3 ps -eo pid,rss,pcpu,comm --sort=-rss | head -n 6
+  bounded 3 sh -c 'ps -eo pid,rss,pcpu,comm --sort=-rss | head -n 6'
   bounded 4 docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}'
   net_line
   # Only the OOM-killer's lines not written before, so a kill is written once.
@@ -229,6 +232,16 @@ case $cmd in
     # $file is the make's log, $3 the sampler's file; what is gathered goes
     # beside the sampler's file, where the beacon reads it.
     watch=$3 ev="$3.evidence"
+    : >"$ev"
+    # By the API first, from a beacon that outlives this step and sends what
+    # has been gathered so far each time: whether it goes on saying anything
+    # is evidence too, and a command below that hangs loses nothing.
+    posting=""
+    if [ -n "${GH_TOKEN:-}" ] && [ -n "${CHECK_SHA:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+      self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+      setsid nohup "$self" beacon "$file" "$watch" </dev/null >"$watch.beacon.out" 2>&1 &
+      posting=yes
+    fi
     {
       echo "== $(date -u +%Y-%m-%dT%H:%M:%SZ) ${CHECK_NAME:-a cluster job} on $(hostname), runner ${RUNNER_NAME:-?}"
       echo "== FAILED and gave-up lines: the make's, then the e2e's own logs'"
@@ -242,10 +255,23 @@ case $cmd in
       net_state
       echo "-- containers"; bounded 4 docker ps -a --format '{{.Names}} {{.Status}}'
       echo "-- the kernel's last lines"; { timeout 3 sudo -n dmesg 2>/dev/null || timeout 3 dmesg 2>&1 || true; } | tail -n 25
+      # A cluster the make gave up on is left running: why its pods are not
+      # ready, and what its node can resolve and holds.
+      echo "== the cluster, if it was left"
+      if [ -s .e2e-k3d.kubeconfig ]; then
+        KUBECONFIG=.e2e-k3d.kubeconfig bounded 8 kubectl get pods -A -o wide
+        echo "-- its events"; KUBECONFIG=.e2e-k3d.kubeconfig bounded 8 kubectl get events -A --sort-by=.lastTimestamp | tail -n 40
+      else
+        echo "(no .e2e-k3d.kubeconfig here: the cluster was removed or never made)"
+      fi
+      for node in $(timeout 4 docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^k3d-.*-server-0$'); do
+        echo "-- $node: its resolver, a lookup, its images"
+        bounded 8 docker exec "$node" sh -c 'cat /etc/resolv.conf; nslookup registry-1.docker.io 2>&1 | tail -n 6; crictl images 2>&1 | head -n 20'
+      done
       echo "== the sampler's file: its start, then its last three samples"
       sed -n '1,/^=== 20/p' "$watch" 2>/dev/null | head -n 40
       awk '/^=== /{n++} {l[NR]=$0; s[NR]=n} END{for(i=1;i<=NR;i++) if(s[i]>n-3) print l[i]}' "$watch" 2>/dev/null | tail -n 80
-    } 2>&1 | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' >"$ev"
+    } 2>&1 | sed -u -e 's/\x1b\[[0-9;]*[A-Za-z]//g' >>"$ev"
     # Annotations: at most ten of a level a step, each cut to what one keeps.
     annotate() {
       local level=$1 title=$2 text
@@ -256,17 +282,14 @@ case $cmd in
     section 'FAILED and gave-up' | annotate error "the make's FAILED and gave-up lines"
     section "the make's last 60" | tail -n 25 | annotate error "the make's last lines"
     section 'the network now' | annotate warning "the runner's network after the make"
+    section 'the cluster, if it was left' | annotate warning "the cluster the make left"
     section "the sampler's file" | grep -E '^=== |^net: |^Mem:|^/dev/|[Oo]ut of memory|oom' | tail -n 30 | annotate warning "the watchdog's last samples"
-    # The same and more by the API, kept up to date by a beacon that outlives
-    # this step: whether it goes on saying anything is evidence too.
-    if [ -n "${GH_TOKEN:-}" ] && [ -n "${CHECK_SHA:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-      self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-      setsid nohup "$self" beacon "$file" "$watch" </dev/null >"$watch.beacon.out" 2>&1 &
+    if [ -n "$posting" ]; then
       for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$watch.check" ] && break; sleep 1; done
       if [ -s "$watch.check" ]; then
         echo "ci-watchdog: the evidence is check run $(cat "$watch.check") on $CHECK_SHA, and a beacon adds to it"
       else
-        echo "::warning::ci-watchdog: no check run was made in 10 s; the beacon keeps trying. It said: $(tail -c 300 "$watch.beacon.out" 2>/dev/null | tr '\n' ' ')"
+        echo "::warning::ci-watchdog: no check run was made yet; the beacon keeps trying. It said: $(tail -c 300 "$watch.beacon.out" 2>/dev/null | tr '\n' ' ')"
       fi
     else
       echo "ci-watchdog: no GH_TOKEN, CHECK_SHA or GITHUB_REPOSITORY; annotations only"
@@ -289,6 +312,7 @@ case $cmd in
         -H 'X-GitHub-Api-Version: 2022-11-28' -d "$body"
     }
     : >"$after"
+    sleep "${BEACON_FIRST:-3}"
     while [ -d "$(dirname "$watch")" ] && [ "$SECONDS" -lt "$deadline" ]; do
       {
         echo "--- $(date -u +%H:%M:%SZ) load $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?') $(net_line)"
