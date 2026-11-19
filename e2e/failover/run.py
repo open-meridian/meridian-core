@@ -1307,7 +1307,9 @@ SKEW_S = 1
 
 def served_read():
     """Each shard pod's served lines read and kept, by pod: a list of
-    (shard, subject, second, acknowledged at)."""
+    (shard, subject, second, acknowledged at). A line is the pod's it is
+    read from: the chart gives a plugin's container the instance's name as
+    its hostname, so the pod a driver says is the instance's, not its own."""
     for pod in shard_pods():
         name = pod["metadata"]["name"]
         done = kubectl("exec", name, "-c", "plugin", "--", "cat", "/tmp/served.log", check=False)
@@ -1316,7 +1318,7 @@ def served_read():
         lines = []
         for line in done.stdout.decode(errors="replace").splitlines():
             parts = line.split()
-            if len(parts) == 6 and parts[0] == "SERVED" and parts[1] == name:
+            if len(parts) == 6 and parts[0] == "SERVED":
                 lines.append((parts[2], parts[3], int(parts[4]), int(parts[5]) / 1000))
         if len(lines) >= len(SERVED.get(name, [])):
             SERVED[name] = lines
@@ -1439,17 +1441,114 @@ def overlap_in_lapses(s):
             f"over {lines} served lines, in {within or 'none'}; {len(outside)} outside{': ' + said if said else ''})")
 
 
+def wire_fields(body):
+    """A protobuf message's fields in order: (number, wire type, value), a
+    length-delimited value as its bytes."""
+    fields, at = [], 0
+
+    def varint():
+        nonlocal at
+        value = shift = 0
+        while True:
+            byte = body[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value
+    while at < len(body):
+        key = varint()
+        number, kind = key >> 3, key & 7
+        if kind == 0:
+            value = varint()
+        elif kind == 1:
+            value, at = body[at:at + 8], at + 8
+        elif kind == 2:
+            size = varint()
+            value, at = body[at:at + size], at + size
+        elif kind == 5:
+            value, at = body[at:at + 4], at + 4
+        else:
+            raise ValueError(f"protobuf wire type {kind} at {at}")
+        fields.append((number, kind, value))
+    return fields
+
+
+# What the lake or the sidecar stamps on a row, not what its source said:
+# ObservationMeta's sent and recorded times, version, sequence and previous
+# sequence (8 to 12); and Source's instance and plugin version (1, 2).
+STAMPED_META = {8, 9, 10, 11, 12}
+STAMPED_SOURCE = {1, 2}
+# The prefix the SDK gives a raw reference on a shard (item 30). Ruled (item
+# 172, option A, 2026-11-19): the lake does not count it as a change, so one
+# value recorded by two shards is an idempotent repeat, never a version 2.
+SHARD_RAW = re.compile(rb"shard-\d+/")
+
+
+def row_said(body):
+    """A recorded price (meridian.v1.Price) as the lake's sameness rule reads
+    it: (its values, its raw reference, the raw reference without the shard
+    prefix)."""
+    values, raw = [], b""
+    for number, kind, value in wire_fields(body):
+        if number != 1:
+            values.append((number, kind, value))
+            continue
+        for n, k, v in wire_fields(value):
+            if n == 13:
+                raw = v
+            elif n == 3:
+                values.append(("source", tuple(f for f in wire_fields(v) if f[0] not in STAMPED_SOURCE)))
+            elif n not in STAMPED_META:
+                values.append(("meta", n, k, v))
+    return tuple(values), raw, SHARD_RAW.sub(b"", raw)
+
+
 def row_keys_once(s):
-    """No row key of the shards' dataset recorded twice: each one row in the
-    lake's record, never a second version, of many recorded."""
+    """Each row key of the shards' dataset recorded once, of many recorded,
+    as ruled (item 172, option A): a row key has one version unless its
+    values changed, and the shard prefix of a raw reference is no change.
+    The shard driver's price for a subject and a second is the same in every
+    pod, so here no value changes either: any second version is red, said
+    as one of three kinds, each key's kept in .e2e-shards-versions.log --
+      other values: two writes of one key disagree (the driver's fault, or
+        a restatement);
+      shard prefix only: the same values, the raw references differing in
+        nothing but the shard prefix (the lake before item 172's change);
+      same values otherwise: the same values, the raw references differing
+        otherwise or not at all."""
     rows = psql(f"select count(*) from lake_row where dataset = '{SHARD_DATASET}'", quiet=True)
-    twice = psql(f"select row_key from lake_row where dataset = '{SHARD_DATASET}' "
-                 "group by row_key having count(*) > 1 order by row_key limit 5", quiet=True).split()
-    many = psql(f"select count(*) from (select row_key from lake_row where dataset = '{SHARD_DATASET}' "
-                "group by row_key having count(*) > 1) twice", quiet=True)
-    s.check(int(rows or 0) > 0 and int(many or 0) == 0,
-            f"served once: no row key of {SHARD_DATASET} recorded twice ({rows} rows; {many} key(s) twice"
-            f"{': ' + ', '.join(twice) if twice else ''})")
+    listed = psql(f"select row_key, version, encode(body, 'hex') from lake_row where dataset = '{SHARD_DATASET}' "
+                  f"and row_key in (select row_key from lake_row where dataset = '{SHARD_DATASET}' "
+                  "group by row_key having count(*) > 1) order by row_key, version limit 4000", quiet=True)
+    versions = {}
+    for line in listed.splitlines():
+        key, version, body = line.split("|")
+        versions.setdefault(key, []).append((int(version), row_said(bytes.fromhex(body))))
+    kinds = {"other values": [], "shard prefix only": [], "same values otherwise": []}
+    lines = []
+    for key, held in sorted(versions.items()):
+        values, raw, bare = held[0][1]
+        for version, (later, later_raw, later_bare) in held[1:]:
+            kind = ("other values" if later != values else
+                    "shard prefix only" if later_raw != raw and later_bare == bare else
+                    "same values otherwise")
+            if key not in kinds[kind]:
+                kinds[kind].append(key)
+            lines.append(f"VERSION {key} {version} {kind}\n")
+    with open(".e2e-shards-versions.log", "w", encoding="utf-8") as kept:
+        kept.writelines(lines)
+
+    def said(kind):
+        keys = kinds[kind]
+        return f"{len(keys)} {kind}{': ' + ', '.join(keys[:4]) if keys else ''}"
+    s.check(int(rows or 0) > 0 and not kinds["other values"],
+            f"served once: no row key of {SHARD_DATASET} recorded twice with other values "
+            f"({rows} rows; {said('other values')})")
+    s.check(int(rows or 0) > 0 and not kinds["shard prefix only"] and not kinds["same values otherwise"],
+            f"served once: no row key of {SHARD_DATASET} given a second version of the same values "
+            f"(item 172: the shard prefix is no change; {rows} rows; {said('shard prefix only')}; "
+            f"{said('same values otherwise')}; kept in .e2e-shards-versions.log)")
 
 
 def shards_fenced(s, settled):

@@ -1177,7 +1177,9 @@ async def drive_scale_oms(plugin, gen):
 # (`shard-<subject>-<unix s>`, valid at that second, its price a function of
 # both): two shards serving one subject in one second record the same row.
 # Each subject of a batch the lake acknowledged whole is kept in
-# /tmp/served.log as `SERVED <pod> <shard> <subject> <unix s> <unix ms>`:
+# /tmp/served.log as `SERVED <host> <shard> <subject> <unix s> <unix ms>`
+# (the host the instance's name, as the chart sets it; the run reads each
+# pod's file and names the lines by the pod):
 # the second its row is of, and when it was acknowledged. Each batch
 # refused is kept in /tmp/shard-refused.log as `REFUSED <unix ms> <words>`,
 # and each want heard and withdrawn in /tmp/shard-wants.log.
