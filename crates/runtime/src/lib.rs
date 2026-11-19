@@ -209,6 +209,12 @@ fn wait_within<T>(
 /// minutes rather than never.
 pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
 
+// A migration applied again waits for its schema lock no longer than this
+// (meridian_changes::take_schema_lock; review c5w3 L-c).
+const _: () = assert!(
+    MIGRATION_WAITS_AT_MOST.as_secs() == meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST.as_secs()
+);
+
 /// A store's schema applied: once its database answers, and then once.
 ///
 /// The migration Job starts beside everything else an upgrade changes, and on

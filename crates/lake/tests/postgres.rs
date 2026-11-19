@@ -12120,3 +12120,48 @@ fn a_count_lowered_from_three_to_two_fences_group_twos_own_row() {
     assert!(two.head_epoch().unwrap() > two.epoch());
     drop((zero, one));
 }
+
+/// Review c5w3 L-c: a migration cut off by the network alone leaves its
+/// server session holding the schema lock until its keepalive ends it. The
+/// migration applied again waits for that lock a bounded while, then is
+/// refused, so its wait never runs on past the bound; once the lock is let
+/// go it is taken, and the session's lock_timeout is as it was.
+#[test]
+fn a_schema_lock_a_cut_off_session_holds_is_waited_for_a_bounded_while() {
+    // A key of this test's own: every other test's store() migrates under
+    // the lake's.
+    const KEY: i64 = 0x6c61_6b65_6c6f_636b_u64 as i64;
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut cut_off = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    cut_off
+        .execute("SELECT pg_advisory_lock($1)", &[&KEY])
+        .unwrap();
+    let mut again = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let taken =
+            meridian_changes::take_schema_lock(&mut again, KEY, std::time::Duration::from_secs(1));
+        let _ = said.send(taken.map_err(|failed| failed.code().cloned()));
+        again
+    });
+    let taken = heard
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("it waited on past its bound for a lock a cut-off session holds");
+    let refused = taken.expect_err("it took a lock another session holds");
+    assert_eq!(
+        refused,
+        Some(postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "refused for another reason"
+    );
+    cut_off
+        .execute("SELECT pg_advisory_unlock($1)", &[&KEY])
+        .unwrap();
+    let mut again = waiting.join().unwrap();
+    meridian_changes::take_schema_lock(&mut again, KEY, std::time::Duration::from_secs(1))
+        .expect("not taken once let go");
+    let timeout: String = again.query_one("SHOW lock_timeout", &[]).unwrap().get(0);
+    assert_eq!(timeout, "0", "the session's lock_timeout left changed");
+    again
+        .execute("SELECT pg_advisory_unlock($1)", &[&KEY])
+        .unwrap();
+}

@@ -291,8 +291,12 @@ impl PostgresStore {
     /// release by `meridian-bor migrate`, never by a starting process.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
         let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
-            .map_err(unavailable)?;
+        meridian_changes::take_schema_lock(
+            &mut *conn,
+            SCHEMA_LOCK,
+            meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST,
+        )
+        .map_err(unavailable)?;
         let outcome = apply_migrations(&mut conn, clock).and_then(|()| chain(&mut conn));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome

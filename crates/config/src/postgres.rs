@@ -231,8 +231,12 @@ impl PostgresStore {
     /// Each migration is recorded at the deployment's time, from `clock`.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
         let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
-            .map_err(unavailable)?;
+        meridian_changes::take_schema_lock(
+            &mut *conn,
+            SCHEMA_LOCK,
+            meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST,
+        )
+        .map_err(unavailable)?;
         let outcome = apply_migrations(&mut conn, clock)
             .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
