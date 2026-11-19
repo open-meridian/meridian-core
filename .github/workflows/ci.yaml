@@ -772,6 +772,11 @@ jobs:
     # that could not be read fails it too.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    # checks: what a failed make knew, as a check run of its own
+    # (tools/ci-watchdog.sh evidence), since a hung runner uploads nothing.
+    permissions:
+      contents: read
+      checks: write
     # Each run's limit is the plan's (tools/ci_tier.py CLUSTERS), from its
     # slowest green run; 20 minutes for the base installs.
     timeout-minutes: ${{ matrix.timeout || 20 }}
@@ -878,6 +883,7 @@ jobs:
         run: tools/ci-watchdog.sh start "$RUNNER_TEMP/watchdog.log"
 
       - name: make e2e-cluster-k3d
+        id: make
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
@@ -901,13 +907,65 @@ jobs:
       # lines and FAILED lines in the step summary, each kept in an upload
       # of its own before any other, so a hang in a later upload cannot lose
       # them. Whatever the make did, and on a timeout too.
+      # After a failed make the same leaves by the API as well: PR 125's own
+      # run lost a job's log and every upload, this one's among them, while
+      # its steps' results arrived. So the make's lines, the runner's network
+      # and the sampler's last samples go out as annotations and as a check
+      # run of their own on the commit, which a beacon keeps adding to after
+      # the step (tools/ci-watchdog.sh evidence).
       - name: Say what the watchdog saw
         if: always()
-        timeout-minutes: 1
+        timeout-minutes: 2
         working-directory: workspace/meridian-core
+        env:
+          MAKE_FAILED: ${{ steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled' }}
+          GH_TOKEN: ${{ github.token }}
+          CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECK_${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }}: ${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }}
         run: |
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
+          if [ "$MAKE_FAILED" = true ]; then
+            timeout 60 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
+          fi
+
+      # One fact a step, after a failed make and before any upload: a step's
+      # result arrives when its log does not. A red one says its name does
+      # not hold; none of them changes the job's result.
+      - name: "Probe: the make did not give up on making the cluster"
+        if: failure() && steps.make.outcome == 'failure'
+        timeout-minutes: 1
+        continue-on-error: true
+        working-directory: workspace/meridian-core
+        run: tools/ci-watchdog.sh probe gave-up "$RUNNER_TEMP/make.log"
+
+      - name: "Probe: names resolve"
+        if: failure() && steps.make.outcome == 'failure'
+        timeout-minutes: 1
+        continue-on-error: true
+        working-directory: workspace/meridian-core
+        run: timeout 20 tools/ci-watchdog.sh probe names "$RUNNER_TEMP/make.log"
+
+      - name: "Probe: Docker Hub answers"
+        if: failure() && steps.make.outcome == 'failure'
+        timeout-minutes: 1
+        continue-on-error: true
+        working-directory: workspace/meridian-core
+        run: timeout 20 tools/ci-watchdog.sh probe hub "$RUNNER_TEMP/make.log"
+
+      - name: "Probe: the results' blob store answers"
+        if: failure() && steps.make.outcome == 'failure'
+        timeout-minutes: 1
+        continue-on-error: true
+        working-directory: workspace/meridian-core
+        run: timeout 20 tools/ci-watchdog.sh probe blob "$RUNNER_TEMP/make.log"
+
+      - name: "Probe: the runner's network is clear of the cluster's subnet"
+        if: failure() && steps.make.outcome == 'failure'
+        timeout-minutes: 1
+        continue-on-error: true
+        working-directory: workspace/meridian-core
+        run: timeout 20 tools/ci-watchdog.sh probe subnet "$RUNNER_TEMP/make.log"
 
       - name: Keep what the watchdog saw
         if: always()
@@ -1049,6 +1107,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # What a failed make knew, as a check run of its own (as amd64's runs).
+      checks: write
     outputs:
       version: ${{ steps.release.outputs.version }}
       runtime: ${{ steps.candidate.outputs.runtime }}
@@ -1198,6 +1258,7 @@ jobs:
       # browser's and the platform's images build on Docker's own builder,
       # as on amd64's runs.
       - name: make e2e-cluster-k3d
+        id: make
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
@@ -1211,13 +1272,27 @@ jobs:
       # lines and FAILED lines in the step summary, each kept in an upload
       # of its own before any other, so a hang in a later upload cannot lose
       # them. Whatever the make did, and on a timeout too.
+      # After a failed make the same leaves by the API as well: PR 125's own
+      # run lost a job's log and every upload, this one's among them, while
+      # its steps' results arrived. So the make's lines, the runner's network
+      # and the sampler's last samples go out as annotations and as a check
+      # run of their own on the commit, which a beacon keeps adding to after
+      # the step (tools/ci-watchdog.sh evidence).
       - name: Say what the watchdog saw
         if: always()
-        timeout-minutes: 1
+        timeout-minutes: 2
         working-directory: workspace/meridian-core
+        env:
+          MAKE_FAILED: ${{ steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled' }}
+          GH_TOKEN: ${{ github.token }}
+          CHECK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECK_e2e-cluster, arm64: e2e-cluster, arm64
         run: |
           tools/ci-watchdog.sh tail "$RUNNER_TEMP/watchdog.log"
           tools/ci-watchdog.sh make-tail "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/make-tail.log"
+          if [ "$MAKE_FAILED" = true ]; then
+            timeout 60 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
+          fi
 
       - name: Keep what the watchdog saw
         if: always()
