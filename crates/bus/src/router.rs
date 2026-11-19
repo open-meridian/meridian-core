@@ -280,6 +280,10 @@ pub struct Bus {
     /// ([`Bus::stop_writing_here`]): every write is handed on.
     handing: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Fenced while it served on, told to stop ([`Bus::refuse_from_here`]):
+    /// every topic served here is refused, to be asked again.
+    refusing: Arc<std::sync::atomic::AtomicBool>,
+
     /// A sidecar's plugin shard and its epoch, stamped on every message it
     /// sends once set (step 3d, checkpoint 5, item 32; [`Bus::stamp_shard`]).
     /// Unset, as for every core component and every one-pod instance's
@@ -314,6 +318,11 @@ struct Routing {
 
 /// What a write's owning group is, read from its request (step 3d).
 pub type OwnerOf = Arc<dyn Fn(&str, &Envelope) -> Option<u32> + Send + Sync>;
+
+/// What a writer fenced while it served on says of each topic asked of it
+/// ([`Bus::refuse_from_here`]), after the topic's name.
+const NO_LONGER_WRITES: &str =
+    "was asked of a writer that no longer writes, another taking its place; ask again";
 
 /// What a write handed to its owner leaves of its caller's deadline for its
 /// answer's way back through this member.
@@ -406,6 +415,7 @@ impl Bus {
             serves_only: RwLock::new(None),
             routing: Arc::default(),
             handing: Arc::default(),
+            refusing: Arc::default(),
             shard: Arc::default(),
             gate: Arc::default(),
         }
@@ -588,6 +598,7 @@ impl Bus {
         }
         let handler = self.held_to_read_after(topic, Arc::new(handler));
         let handler = self.routed(topic, handler);
+        let handler = self.refused_once_fenced(topic, handler);
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -601,15 +612,21 @@ impl Bus {
         // its owner before it is admitted here (step 3d): never a slot of
         // this member's held while the owner answers, nor admitted twice.
         let routing = Arc::clone(&self.routing);
+        let refusing = Arc::clone(&self.refusing);
         let asked = topic.to_string();
-        let route: crate::backend::PreRoute = Arc::new(move |envelope: &Envelope| {
-            let route = routing.read().expect("routing poisoned").clone()?;
-            if !(route.writes)(&asked) {
-                return None;
-            }
-            let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
-            (group != route.group).then(|| (route.internal.clone(), group))
-        });
+        // Fenced while it served on: nothing is passed on by what this
+        // member last read of the owners; its handler refuses it.
+        let route = crate::backend::PreRoute::new(
+            move |envelope: &Envelope| {
+                let route = routing.read().expect("routing poisoned").clone()?;
+                if !(route.writes)(&asked) {
+                    return None;
+                }
+                let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
+                (group != route.group).then(|| (route.internal.clone(), group))
+            },
+            refusing,
+        );
         self.backend_for(topic)
             .serve_routed(topic, &self.instance_id, handler, route);
     }
@@ -687,7 +704,7 @@ impl Bus {
     pub fn hand_to_owner(&self, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
         let route = self.routing.read().expect("routing poisoned").clone();
         match route {
-            Some(route) => hand(&route, group, topic, envelope),
+            Some(route) => hand_unless_refusing(&self.refusing, &route, group, topic, envelope),
             None => Err(format!(
                 "{topic} is writer group {group}'s to write, and this member hands nothing on"
             )),
@@ -748,12 +765,49 @@ impl Bus {
         self.handing.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Answer nothing more here (ruled 2026-11-18, item 110): from now on
+    /// every topic this member serves is refused UNAVAILABLE with a
+    /// retry-after, its handler never run and nothing handed on, so its
+    /// caller asks again and is answered by the member that serves by then.
+    ///
+    /// What a store's writer does when it is fenced while it serves on,
+    /// told to stop: its commits are refused by the epoch as ever, and until
+    /// another writer group's writer serves, or its serve-on's bound, the
+    /// store's public topics are still answered -- "ask again" -- where a
+    /// writer that ended at its fence left them served by nobody.
+    pub fn refuse_from_here(&self) {
+        self.refusing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Bus::refuse_from_here`] was called.
+    pub fn refuses_from_here(&self) -> bool {
+        self.refusing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A served topic's handler, refused once this member refuses from here
+    /// ([`Bus::refuse_from_here`]).
+    fn refused_once_fenced(&self, topic: &str, handler: Handler) -> Handler {
+        let refusing = Arc::clone(&self.refusing);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(no_longer_writes(&topic));
+            }
+            handler(envelope)
+        })
+    }
+
     /// A write's handler, handed to its owner where its store says so.
     fn routed(&self, topic: &str, handler: Handler) -> Handler {
         let routing = Arc::clone(&self.routing);
         let handing = Arc::clone(&self.handing);
+        let refusing = Arc::clone(&self.refusing);
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
+            let hand = |route: &Routing, group: u32, topic: &str, envelope: Envelope| {
+                hand_unless_refusing(&refusing, route, group, topic, envelope)
+            };
             let route = routing
                 .read()
                 .expect("routing poisoned")
@@ -1534,6 +1588,117 @@ mod tests {
         assert!(matches!(err, BusError::Timeout { .. }), "got {err:?}");
     }
 
+    /// Item 110 (ruled 2026-11-18): a writer fenced while it served on
+    /// answers every topic it serves "ask again" -- UNAVAILABLE, with a
+    /// retry-after -- and runs no handler.
+    #[tokio::test]
+    async fn a_member_refusing_from_here_answers_ask_again_and_runs_no_handler() {
+        let bus = bus();
+        let ran = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&ran);
+        bus.serve("platform.book.command.record-order", move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(("R".into(), vec![]))
+        });
+        let ask = || {
+            bus.call(
+                "platform.book.command.record-order",
+                "Q",
+                vec![],
+                None,
+                None,
+            )
+        };
+        ask().await.expect("answered while it writes");
+        assert!(!bus.refuses_from_here());
+        bus.refuse_from_here();
+        assert!(bus.refuses_from_here());
+        let detail = match ask().await {
+            Err(BusError::HandlerFailed { detail, .. }) => detail,
+            other => panic!("fenced while serving on, it answered {other:?}"),
+        };
+        assert_eq!(
+            crate::backend::read_refusal_status(&detail).map(|(status, _, _)| status),
+            Some(crate::RefusalStatus::Unavailable),
+            "{detail}"
+        );
+        assert_eq!(crate::backend::refusal_retry_after(&detail), Some(1));
+        assert!(detail.contains("ask again"), "{detail}");
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "its handler ran once it refused from here"
+        );
+    }
+
+    /// A handler already running when its writer is fenced while it serves
+    /// on hands nothing on after (ruled 2026-11-18, item 120; review-c5n5
+    /// F2): a part of a write spanning several groups
+    /// ([`Bus::hand_to_owner`]), or a write its handler found another
+    /// group's ([`crate::owners::hand_to`]), is refused to be asked again --
+    /// UNAVAILABLE, retry-after 1 -- not handed on by the owners it last
+    /// read. Before, each was handed on as if no fence had come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handler_running_at_the_fence_hands_nothing_on_after() {
+        for spanning in [true, false] {
+            let bus = Arc::new(bus());
+            let write = "platform.lake.command.record-prices";
+            bus.hand_writes_on("platform.lake.internal.command", 1, move |topic| {
+                topic == write
+            });
+            let (entered, running) = std::sync::mpsc::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (entered, released) = (
+                std::sync::Mutex::new(entered),
+                std::sync::Mutex::new(released),
+            );
+            let handing = Arc::downgrade(&bus);
+            bus.serve(write, move |envelope| {
+                entered.lock().unwrap().send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                if spanning {
+                    // The other group's part of a write spanning two.
+                    return handing.upgrade().unwrap().hand_to_owner(0, write, envelope);
+                }
+                // Found the other group's as it ran.
+                crate::owners::hand_to(0);
+                Err("another group's".into())
+            });
+            let asking = Arc::clone(&bus);
+            let asked =
+                tokio::spawn(async move { asking.call(write, "Q", vec![], None, None).await });
+            tokio::task::spawn_blocking(move || {
+                running.recv_timeout(Duration::from_secs(10)).unwrap()
+            })
+            .await
+            .unwrap();
+            bus.refuse_from_here();
+            release.send(()).unwrap();
+            let detail = match asked.await.unwrap() {
+                Err(BusError::HandlerFailed { detail, .. }) => detail,
+                other => panic!("fenced while it ran (spanning {spanning}), it answered {other:?}"),
+            };
+            assert_eq!(
+                crate::backend::read_refusal_status(&detail).map(|(status, _, _)| status),
+                Some(crate::RefusalStatus::Unavailable),
+                "spanning {spanning}: {detail}"
+            );
+            assert_eq!(
+                crate::backend::refusal_retry_after(&detail),
+                Some(1),
+                "spanning {spanning}: {detail}"
+            );
+            assert!(
+                detail.contains(NO_LONGER_WRITES),
+                "spanning {spanning}: handed on: {detail}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_failing_handler_reports_why() {
         let bus = bus();
@@ -1662,6 +1827,7 @@ mod tests {
             serves_only: RwLock::new(None),
             routing: Arc::default(),
             handing: Arc::default(),
+            refusing: Arc::default(),
             shard: Arc::default(),
             gate: Arc::default(),
         };
@@ -1813,6 +1979,34 @@ mod acting_for {
         );
         assert_eq!(subject_seen(None).await, "");
     }
+}
+
+/// What a member that refuses from here ([`Bus::refuse_from_here`]) answers
+/// a request on `topic`: UNAVAILABLE, retry-after 1, to be asked again.
+fn no_longer_writes(topic: &str) -> String {
+    crate::refusal_status_retrying(
+        crate::RefusalStatus::Unavailable,
+        1,
+        format!("{topic} {NO_LONGER_WRITES}"),
+    )
+}
+
+/// [`hand`], unless this member refuses from here: a handler already
+/// running at its fence hands nothing on after by the owners it last read
+/// -- a part of a write spanning several groups, or a write it found
+/// another group's -- and its caller is answered "ask again" (ruled
+/// 2026-11-18, item 120; review-c5n5 F2).
+fn hand_unless_refusing(
+    refusing: &std::sync::atomic::AtomicBool,
+    route: &Routing,
+    group: u32,
+    topic: &str,
+    envelope: Envelope,
+) -> HandlerReply {
+    if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(no_longer_writes(topic));
+    }
+    hand(route, group, topic, envelope)
 }
 
 /// `envelope`, a write of `topic`, handed to writer group `group` on its

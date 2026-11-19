@@ -1537,6 +1537,64 @@ async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hol
     assert_eq!(reply.epoch, 2);
 }
 
+/// A command a fenced writer's commit refuses -- its epoch passed by a
+/// takeover, or the writer told to stop (`stop_committing`, a writer fenced
+/// while it serves on) -- is answered UNAVAILABLE with retry-after 1, to be
+/// asked again of the writer that serves by then (ruled 2026-11-18, items
+/// 110 and 120; spec section 5): nothing of it committed. Before, it was
+/// answered in plain words, which the sidecar says as ABORTED, with no
+/// retry-after (review-c5n5 F1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_writers_command_is_refused_unavailable_to_be_asked_again() {
+    let (url, writer) = blocking(isolated);
+    let (bus, writer) = wired_with(writer);
+    assert_eq!(blocking(|| writer.adopt()).unwrap(), 1);
+    open(&bus, &unique("ACC"), &unique("INS")).await;
+    let refused_with = |refused: &str, words: &str| {
+        assert!(refused.contains(words), "{refused}");
+        // The bus's error says the topic first, then the handler's detail.
+        let refused = &refused[refused.find("[refusal-status").unwrap_or(0)..];
+        assert_eq!(
+            meridian_bus::read_refusal_status(refused).map(|(status, _, _)| status),
+            Some(meridian_bus::RefusalStatus::Unavailable),
+            "{refused}"
+        );
+        assert_eq!(
+            meridian_bus::refusal_retry_after(refused),
+            Some(1),
+            "{refused}"
+        );
+    };
+    // Its epoch passed: another writer took its partitions over (its
+    // client made and dropped off the runtime's threads).
+    let took = blocking(|| {
+        PostgresStore::connect(&url, 1)
+            .unwrap()
+            .take_over(&meridian_changes::TookOver::unnamed("a test"))
+    });
+    assert_eq!(took.unwrap(), 2);
+    let refused = send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&unique("ACC"), &unique("INS")),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    refused_with(&refused, meridian_changes::FENCED);
+    // Told to stop: it commits nothing more, whatever the epoch.
+    writer.stop_committing();
+    let refused = send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&unique("ACC"), &unique("INS")),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    refused_with(&refused, meridian_changes::STOPPED);
+}
+
 // ── The hot layer (step 3a) ──
 
 /// Each account's book at its head, held by the writer, is the book the

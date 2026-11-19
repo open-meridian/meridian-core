@@ -714,7 +714,25 @@ impl Fenced {
     /// `mine` where no epoch refused the commit: its writer was told to
     /// stop, and commits nothing more ([`Fence::stop`]).
     pub const STOPPED: u64 = u64::MAX;
+
+    /// As the bus carries it to the caller: UNAVAILABLE with retry-after 1,
+    /// asked again of the writer that serves by then (ruled 2026-11-18,
+    /// items 110 and 120; the resilience spec's section 5). Nothing of the
+    /// commit was made. What every store answers a fenced commit with
+    /// (review-c5n5 F1): in plain words the sidecar said it ABORTED, with
+    /// no retry-after.
+    pub fn on_the_bus(&self) -> String {
+        meridian_bus::refusal_status_retrying(
+            meridian_bus::RefusalStatus::Unavailable,
+            FENCED_RETRY_SECONDS,
+            self,
+        )
+    }
 }
+
+/// How long a caller refused by a fenced writer waits before it asks again
+/// ([`Fenced::on_the_bus`]; ruled 2026-11-18, item 120).
+pub const FENCED_RETRY_SECONDS: u32 = 1;
 
 impl std::fmt::Display for Fenced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

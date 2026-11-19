@@ -1748,3 +1748,244 @@ async fn a_writer_told_to_stop_hands_every_write_on_and_its_handler_never_runs()
     // A member with no hand-off configured has nothing to stop.
     assert!(!asking.stop_writing_here(|_| true));
 }
+
+/// Item 110 (ruled 2026-11-18): a later group's writer fenced while it
+/// serves on, told to stop -- the count lowered to one group, whose writer
+/// took every partition over and does not serve yet -- answers each
+/// request "ask again", UNAVAILABLE with a retry-after: no handler run, and
+/// nothing passed on by the owners it last read, to a group whose members
+/// are gone. Its caller asks again, and once the one group's writer serves
+/// it is answered there. Before, the fenced writer ended at its fence and
+/// nothing served the topic; and a write it passed on was never answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_fenced_while_it_serves_on_refuses_every_request_to_be_asked_again() {
+    let instance = format!("store-{}", mark("fenced"));
+    let write = topic("command.record");
+    let read = topic("query.read");
+    let internal = topic("internal.command");
+    // The second group's old writer: every write is the first group's, by
+    // the owners it last read.
+    let ran = Arc::new(AtomicU64::new(0));
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(|_, _| Some(0));
+    for served in [&write, &read] {
+        let counted = Arc::clone(&ran);
+        old.serve(served, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+        });
+    }
+    old.subscribed().await.expect("subscribed");
+    let asking = bus("asking").await;
+    let ask = |topic: String| {
+        let asking = &asking;
+        async move {
+            asking
+                .call(
+                    &topic,
+                    "meridian.test.Question",
+                    Vec::new(),
+                    None,
+                    Some(Duration::from_millis(500)),
+                )
+                .await
+        }
+    };
+    // Fenced while it serves on: it refuses from here.
+    old.refuse_from_here();
+    for served in [&write, &read] {
+        for _ in 0..10 {
+            let detail = match ask(served.clone()).await {
+                Err(BusError::HandlerFailed { detail, .. }) => detail,
+                other => panic!("the fenced writer serving on, {served} was answered {other:?}"),
+            };
+            assert_eq!(
+                meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+                Some(meridian_bus::RefusalStatus::Unavailable),
+                "{detail}"
+            );
+            assert_eq!(meridian_bus::refusal_retry_after(&detail), Some(1));
+        }
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a handler of it ran");
+    // The one group's writer serves: every request is answered there, or
+    // refused to be asked again by the old one, and never by nobody.
+    let new = bus(&instance).await;
+    new.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"new".to_vec()))
+    });
+    new.subscribed().await.expect("subscribed");
+    settle().await;
+    let mut answered = 0;
+    for _ in 0..40 {
+        match ask(write.clone()).await {
+            Ok((_, payload)) => {
+                assert_eq!(payload, b"new".to_vec());
+                answered += 1;
+            }
+            Err(BusError::HandlerFailed { detail, .. }) => {
+                assert_eq!(
+                    meridian_bus::refusal_retry_after(&detail),
+                    Some(1),
+                    "{detail}"
+                );
+            }
+            Err(other) => panic!("neither answered nor to be asked again: {other:?}"),
+        }
+    }
+    assert!(answered > 0, "the writer that serves answered none");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a handler of it ran");
+}
+
+/// Item 120 (ruled 2026-11-18): a later group's writer with no lease, told
+/// to stop -- every write handed on, the internal topic withdrawn -- and
+/// fenced while it serves on refuses to be asked again, UNAVAILABLE with
+/// retry-after 1, at once, as any fenced writer does. Before, it went on
+/// handing each write on by the owners it last read: one handed to a group
+/// with no members (the count lowered) was refused only at its caller's
+/// deadline, with no retry-after (review-c5n2 L3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_at_once() {
+    let instance = format!("store-{}", mark("handing-fenced"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    // The second group's old writer: the write is the second group's, by
+    // the owners it last read (stale once the count is lowered).
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(|_, _| Some(1));
+    old.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+    });
+    // The one group's writer: offers the internal topic to group 0, and does
+    // not serve the public topic yet.
+    let new = bus(&instance).await;
+    new.hand_writes_on(&internal, 0, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.subscribed().await.expect("subscribed");
+    new.subscribed().await.expect("subscribed");
+    // Told to stop with no lease, then fenced while it serves on.
+    assert!(old.stop_writing_here(|_| false));
+    old.refuse_from_here();
+    settle().await;
+    let asking = bus("asking").await;
+    for _ in 0..5 {
+        let began = std::time::Instant::now();
+        let answered = asking
+            .call(
+                &write,
+                "meridian.test.Question",
+                Vec::new(),
+                None,
+                Some(Duration::from_millis(2_000)),
+            )
+            .await;
+        let took = began.elapsed();
+        let detail = match answered {
+            Err(BusError::HandlerFailed { detail, .. }) => detail,
+            other => panic!("the fenced writer handing on answered {other:?}"),
+        };
+        assert_eq!(
+            meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+            Some(meridian_bus::RefusalStatus::Unavailable),
+            "{detail}"
+        );
+        assert_eq!(
+            meridian_bus::refusal_retry_after(&detail),
+            Some(1),
+            "{detail}"
+        );
+        assert!(
+            took < Duration::from_millis(1_000),
+            "refused after {took:?}, at the caller's deadline: {detail}"
+        );
+    }
+}
+
+/// A write whose owner was being decided when its writer was fenced while
+/// it served on is refused to be asked again -- UNAVAILABLE, retry-after 1
+/// -- and never passed on by the owners it last read (ruled 2026-11-18,
+/// item 120; review-c5n5 F2): the fence lands between the owner's decision
+/// and the publish, which looks again. Before, a decision begun before the
+/// fence was passed on all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_owner_was_being_decided_at_the_fence_is_refused_not_passed_on() {
+    let instance = format!("store-{}", mark("deciding-fenced"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    // The second group's old writer, whose owners say the write is the
+    // first group's: its decision held until the test lets it go.
+    let (entered, mut deciding) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(move |_, _| {
+        let _ = entered.send(());
+        let _ = released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10));
+        Some(0)
+    });
+    old.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+    });
+    // The first group's writer: offers the internal topic to group 0.
+    let new = bus(&instance).await;
+    new.hand_writes_on(&internal, 0, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.subscribed().await.expect("subscribed");
+    new.subscribed().await.expect("subscribed");
+    settle().await;
+    let asking = bus("asking").await;
+    let asked = {
+        let write = write.clone();
+        tokio::spawn(async move {
+            asking
+                .call(
+                    &write,
+                    "meridian.test.Question",
+                    Vec::new(),
+                    None,
+                    Some(Duration::from_millis(3_000)),
+                )
+                .await
+        })
+    };
+    // Its owner being decided, the writer is fenced while it serves on.
+    tokio::time::timeout(Duration::from_secs(5), deciding.recv())
+        .await
+        .expect("the write's owner was never decided")
+        .unwrap();
+    old.refuse_from_here();
+    release.send(()).unwrap();
+    let detail = match asked.await.unwrap() {
+        Err(BusError::HandlerFailed { detail, .. }) => detail,
+        other => panic!("fenced while its owner was decided, the write was answered {other:?}"),
+    };
+    assert_eq!(
+        meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+        Some(meridian_bus::RefusalStatus::Unavailable),
+        "{detail}"
+    );
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&detail),
+        Some(1),
+        "{detail}"
+    );
+}

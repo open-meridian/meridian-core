@@ -252,6 +252,9 @@ impl StoreError {
             StoreError::ShardFenced(fenced) => {
                 meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
             }
+            // Its writer fenced, by a newer epoch or told to stop: asked
+            // again of the writer that serves (items 110 and 120).
+            StoreError::Fenced(fenced) => fenced.on_the_bus(),
             other => other.to_string(),
         }
     }

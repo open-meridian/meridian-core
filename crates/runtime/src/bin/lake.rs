@@ -688,14 +688,28 @@ fn run() -> Result<(), String> {
             );
         }
         // A rollout keeps the store's public topics served (stage T).
-        meridian_runtime::member::serve_on_until_another_group_serves(
-            groups.mine(),
-            groups.count(),
-            true,
-            meridian_runtime::now_ns(),
-            another_serves,
-        )
-        .await;
+        // Fenced meanwhile -- the count lowered, another group's writer
+        // taking its partitions over before it serves -- it commits nothing
+        // more through any database, at the fence, and answers each request
+        // "ask again" until its serve-on ends (ruled 2026-11-18, item 110;
+        // review-c5n2 M2), one that already hands every write on, with no
+        // lease, too (item 120): nothing more handed on by the owners it
+        // last read.
+        let stopping = every_database.clone();
+        holding
+            .serve_on_until_another_group_serves(
+                groups.mine(),
+                groups.count(),
+                meridian_runtime::now_ns(),
+                another_serves,
+                &bus,
+                move || {
+                    for store in &stopping {
+                        store.stop_committing();
+                    }
+                },
+            )
+            .await;
         holding.release().await;
         Ok(())
     })

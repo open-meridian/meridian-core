@@ -2332,6 +2332,31 @@ fn serves_after(
     )
 }
 
+/// [`serve_on_within`] at a writer's own bound and pace, as
+/// [`Holding::serve_on_until_another_group_serves`] serves on: what these
+/// tests look at, with no fence (test-only; review-c5n2's minor finding).
+async fn serve_on_until_another_group_serves<F>(
+    mine: u32,
+    count: u32,
+    writer: bool,
+    told_at_ns: i64,
+    look: F,
+) -> ServedOn
+where
+    F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+{
+    serve_on_within(
+        mine,
+        count,
+        writer,
+        told_at_ns,
+        look,
+        SERVES_ON_AT_MOST,
+        SERVES_ON_LOOKS_EVERY,
+    )
+    .await
+}
+
 /// The first group's writer, a store of one group, and a member that is no
 /// writer wait on nobody: told to stop, each stops at once, the store's
 /// members never read.
@@ -2851,6 +2876,7 @@ async fn a_writer_with_no_lease_steps_down_once_its_epoch_is_passed() {
         component: "lake",
         why: "",
         previous: String::new(),
+        serving_on: ServingOn::default(),
     };
     let head = Arc::new(AtomicU64::new(5));
     let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -2877,6 +2903,129 @@ async fn a_writer_with_no_lease_steps_down_once_its_epoch_is_passed() {
         why.contains("past this writer's 5"),
         "it stepped down saying {why:?}"
     );
+}
+
+/// A writer fenced while it serves on, told to stop, stops writing and
+/// keeps its topics answered with a refusal its callers ask again on, until
+/// another writer group's writer serves; only then does it end (ruled
+/// 2026-11-18, item 110). Before, it ended where it was fenced, and until
+/// the writer that took its partitions served, nothing served the store's
+/// public topics.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_answers_ask_again_until_another_serves() {
+    let holding = Holding {
+        elector: None,
+        component: "bor",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reading = Arc::clone(&head);
+    holding.keep_or(
+        || 5,
+        move || Ok(reading.load(Ordering::SeqCst)),
+        move |_, why| {
+            let _ = said.send(why.to_string());
+        },
+    );
+    // Told to stop: it serves on, no other group's writer serving yet.
+    let another = Arc::new(AtomicBool::new(false));
+    let refusing = Arc::new(AtomicBool::new(false));
+    let (looked, refuses) = (Arc::clone(&another), Arc::clone(&refusing));
+    let on = holding.serving_on.clone();
+    let serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            move |_, _| Ok(looked.load(Ordering::SeqCst)),
+            move || refuses.store(true, Ordering::SeqCst),
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !refusing.load(Ordering::SeqCst),
+        "it refused before any fence"
+    );
+    // The writer taking its partitions over raised its epoch.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        refusing.load(Ordering::SeqCst),
+        "fenced while serving on, it never began answering \"ask again\""
+    );
+    assert!(
+        heard.try_recv().is_err(),
+        "it ended where it was fenced: nothing serves its topics until another writer does"
+    );
+    assert!(!serving.is_finished(), "its serve-on ended at the fence");
+    // Another writer group's writer serves: it ends, as a fenced writer does.
+    another.store(true, Ordering::SeqCst);
+    let why = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+        .await
+        .expect("another writer serving, the fenced writer never ended")
+        .expect("said");
+    assert!(
+        why.contains("past this writer's 5"),
+        "it ended saying {why:?}"
+    );
+    assert_eq!(serving.await.expect("served on"), ServedOn::AnotherServes);
+}
+
+/// Fenced while serving on with no other writer ever seen, it ends at the
+/// serve-on's own bound, counted from when it was told to stop and never
+/// from the fence: no bound is widened (item 110).
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_ends_at_the_serve_ons_own_bound() {
+    let holding = Holding {
+        elector: None,
+        component: "lake",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reading = Arc::clone(&head);
+    holding.keep_or(
+        || 5,
+        move || Ok(reading.load(Ordering::SeqCst)),
+        move |_, why| {
+            let _ = said.send(why.to_string());
+        },
+    );
+    let told = tokio::time::Instant::now();
+    let on = holding.serving_on.clone();
+    let serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            |_, _| Ok(false),
+            || {},
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    // Fenced 15 s after it was told.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    head.store(6, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(30), heard.recv())
+        .await
+        .expect("fenced, and past its serve-on's bound, it never ended")
+        .expect("said");
+    let took = told.elapsed();
+    assert!(
+        took >= Duration::from_secs(19) && took <= Duration::from_secs(21),
+        "it ended {took:?} after it was told, its serve-on's bound 20 s"
+    );
+    assert_eq!(serving.await.expect("served on"), ServedOn::Bound);
 }
 
 /// A writer's periodic looks at its store -- its row among the members and,
@@ -2909,6 +3058,7 @@ async fn a_writers_periodic_looks_are_made_one_at_a_time() {
         component: "lake",
         why: "",
         previous: String::new(),
+        serving_on: ServingOn::default(),
     };
     holding.keep_or(
         || 5,
@@ -3199,6 +3349,7 @@ async fn a_renewal_never_answered_is_followed_at_once_and_the_lease_never_goes_i
     let renewing = tokio::spawn(renew_while_writing(
         Arc::new(tokio::sync::Mutex::new(elector)),
         "bor",
+        ServingOn::default(),
         move |_, why| said.lock().unwrap().push(why.to_string()),
     ));
     tokio::time::sleep(Duration::from_secs(20)).await;
@@ -3311,7 +3462,12 @@ async fn a_planned_stop_behind_a_renewal_in_flight_ends_within_the_lease_from_th
     let api = Unreliable::default();
     let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
     api.writes_unanswered.store(1_000, Ordering::SeqCst);
-    let renewing = tokio::spawn(renew_while_writing(Arc::clone(&elector), "bor", |_, _| {}));
+    let renewing = tokio::spawn(renew_while_writing(
+        Arc::clone(&elector),
+        "bor",
+        ServingOn::default(),
+        |_, _| {},
+    ));
     // The renewal begun at 2 s holds the elector, unanswered, to its bound.
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     let began = tokio::time::Instant::now();
@@ -3361,6 +3517,7 @@ async fn a_renewal_landing_late_is_no_other_holder_and_the_writer_renews_on() {
     let renewing = tokio::spawn(renew_while_writing(
         Arc::new(tokio::sync::Mutex::new(elector)),
         "bor",
+        ServingOn::default(),
         move |_, why| said.lock().unwrap().push(why.to_string()),
     ));
     tokio::time::sleep(Duration::from_secs(20)).await;
@@ -3394,6 +3551,7 @@ async fn a_renewal_refused_by_a_standbys_take_steps_the_writer_down_within_that_
     let renewing = tokio::spawn(renew_while_writing(
         Arc::new(tokio::sync::Mutex::new(elector)),
         "bor",
+        ServingOn::default(),
         move |_, why| {
             said.lock()
                 .unwrap()
@@ -3410,5 +3568,602 @@ async fn a_renewal_refused_by_a_standbys_take_steps_the_writer_down_within_that_
         *at < Duration::from_secs(4),
         "stepped down {at:?} after it began holding, its first renewal begun at 2 s and \
          bounded by 2 s: a renew late, ready meanwhile"
+    );
+}
+
+/// A leased writer that finds another member on its lease while it serves
+/// on, told to stop, steps down within that renewal, as one not serving on
+/// does (the test above): the lease is its group's, so that member is its
+/// own writer group's successor, and serves its topics (the coordinator's
+/// ruling of 2026-11-18 on review-c5n2 H1). A guard, not a change: before
+/// item 110 it stepped down at once too, so this passes on the base; it
+/// fails where the arm waits the serve-on out, refusing beside its
+/// successor up to 20 s, as an early draft of item 110 did (review-c5n5
+/// F4).
+#[tokio::test(start_paused = true)]
+async fn a_leased_writer_serving_on_whose_lease_its_successor_took_steps_down_at_once() {
+    let api = Unreliable {
+        latency: Duration::from_millis(100),
+        ..Unreliable::default()
+    };
+    let elector = holding_on(&api).await;
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<(Duration, String)>::new()));
+    let said = Arc::clone(&stepped);
+    let serving_on = ServingOn::default();
+    let renewing = tokio::spawn(renew_while_writing(
+        Arc::new(tokio::sync::Mutex::new(elector)),
+        "bor",
+        serving_on.clone(),
+        move |_, why| {
+            said.lock()
+                .unwrap()
+                .push((began.elapsed(), why.to_string()))
+        },
+    ));
+    // Told to stop at once: it serves on, no other group's writer serving.
+    let serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                || {},
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Its own group's standby's take lands within its next renewal.
+    api.taken_before_write.store(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    renewing.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(
+        stepped.len(),
+        1,
+        "its own group's successor on its lease, it never ended: {stepped:?}"
+    );
+    let (at, why) = &stepped[0];
+    assert!(why.contains("bor-b_1"), "stepped down saying {why:?}");
+    assert!(
+        *at < Duration::from_secs(4),
+        "stepped down {at:?} after it began, its successor's take landing within the renewal at 2 s"
+    );
+    assert!(
+        !serving.is_finished(),
+        "its serve-on ended: the step-down came of it, not of the lease"
+    );
+}
+
+/// The lease a test's writer holds, taken by its own writer group's
+/// standby: `bor-b_1` named, as a take writes it.
+fn taken_by_its_successor(api: &Unreliable) {
+    let mut held = api.held.lock().unwrap();
+    let current = held.as_mut().unwrap();
+    current.holder = "bor-b_1".into();
+    current.duration_seconds = 6;
+    current.transitions += 1;
+    current.resource_version = (current.resource_version.parse::<u64>().unwrap() + 1).to_string();
+}
+
+/// A leased writer serving on, told to stop, whose epoch its own writer
+/// group's standby raised -- the lease taken as lapsed, and naming that
+/// standby -- steps down at its epoch's next look, not at its serve-on's
+/// end: that member serves its topics (the coordinator's ruling of
+/// 2026-11-18 on review-c5n2 H1).
+#[tokio::test(start_paused = true)]
+async fn a_leased_writer_serving_on_whose_epoch_its_successor_raised_steps_down_at_once() {
+    let api = Unreliable {
+        latency: Duration::from_millis(100),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<(Duration, String)>::new()));
+    let said = Arc::clone(&stepped);
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        move |_, why| {
+            said.lock()
+                .unwrap()
+                .push((began.elapsed(), why.to_string()))
+        },
+    ));
+    let serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                || {},
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Its own group's standby takes the lease as lapsed, and raises the
+    // epoch.
+    taken_by_its_successor(&api);
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    watching.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(
+        stepped.len(),
+        1,
+        "its epoch raised by its own group's successor, it never ended: {stepped:?}"
+    );
+    let (at, why) = &stepped[0];
+    assert!(
+        why.contains("past this writer's 5"),
+        "stepped down saying {why:?}"
+    );
+    assert!(
+        *at < Duration::from_secs(4),
+        "stepped down {at:?} after it began, its epoch's look at 2 s finding 6"
+    );
+    assert!(!serving.is_finished(), "its serve-on ended");
+}
+
+/// A leased writer serving on, fenced by another group's writer -- its
+/// lease still its own, and given up at the fence -- whose own writer
+/// group's standby then takes the lease, ends within a renew of that take:
+/// it no longer refuses beside its own group's successor until another
+/// group's writer serves anew (review-c5n2 M1; the coordinator's ruling of
+/// 2026-11-18). Until that take it serves on, refusing, as item 110 says.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_by_another_group_ends_once_its_own_groups_successor_takes_the_lease() {
+    let api = Unreliable {
+        latency: Duration::from_millis(100),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<(Duration, String)>::new()));
+    let said = Arc::clone(&stepped);
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        move |_, why| {
+            said.lock()
+                .unwrap()
+                .push((began.elapsed(), why.to_string()))
+        },
+    ));
+    let refusing = Arc::new(AtomicBool::new(false));
+    let refuses = Arc::clone(&refusing);
+    let serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                move || refuses.store(true, Ordering::SeqCst),
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Another group's writer takes this group's partitions over: the epoch
+    // raised, the lease still this writer's.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        refusing.load(Ordering::SeqCst),
+        "fenced while serving on, it never refused"
+    );
+    assert_eq!(
+        *stepped.lock().unwrap(),
+        Vec::new(),
+        "fenced by another group, with nobody of its own group on the lease, it ended"
+    );
+    assert_eq!(
+        api.held.lock().unwrap().as_ref().unwrap().holder,
+        "",
+        "the lease was not given up at the fence"
+    );
+    // Its own group's standby takes the lease given up, and serves.
+    taken_by_its_successor(&api);
+    let taken = began.elapsed();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    watching.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(
+        stepped.len(),
+        1,
+        "its own group's successor on the lease, it never ended: {stepped:?}"
+    );
+    let (at, _) = &stepped[0];
+    assert!(
+        *at >= taken && *at < taken + Duration::from_secs(3),
+        "stepped down {at:?} after it began, its successor taking the lease at {taken:?}"
+    );
+    assert!(!serving.is_finished(), "its serve-on ended");
+}
+
+/// A writer fenced while it serves on stops writing at the fence itself,
+/// before its lease is given up -- up to 1 s -- not after it (review-c5n2
+/// M2): meanwhile its handlers ran, and its commits to partitions nobody
+/// raised were admitted.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_stops_before_its_lease_is_given_up() {
+    let api = Unreliable {
+        latency: Duration::from_millis(400),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let landed_before = api.landed.lock().unwrap().len();
+    let began = tokio::time::Instant::now();
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        |_, _| {},
+    ));
+    let refused_at = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
+    let refusing = Arc::clone(&refused_at);
+    let _serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                move || *refusing.lock().unwrap() = Some(tokio::time::Instant::now()),
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    watching.abort();
+    let refused = refused_at
+        .lock()
+        .unwrap()
+        .expect("fenced while serving on, it never stopped");
+    let released = *api
+        .landed
+        .lock()
+        .unwrap()
+        .get(landed_before)
+        .expect("the lease was never given up");
+    assert_eq!(api.holder(), "", "the lease was not given up");
+    assert!(
+        refused < released,
+        "it stopped {:?} after it began, its lease given up {:?} after: it wrote on while it let go",
+        refused - began,
+        released - began
+    );
+    assert!(
+        refused - began < Duration::from_millis(2_100),
+        "it stopped {:?} after it began, its epoch's look finding 6 at 2 s",
+        refused - began
+    );
+}
+
+/// A writer fenced while it serves on commits nothing more through any of
+/// its databases from the fence -- a partition nobody raised included, its
+/// head still at the writer's epoch -- as a writer told to stop with no
+/// lease does, and refuses its topics to be asked again (review-c5n2 M2;
+/// item 110): before, only the commits whose partitions were raised were
+/// refused, and every task of the store went on writing up to 20 s.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_while_it_serves_on_commits_nothing_more_through_any_database() {
+    let holding = Holding {
+        elector: None,
+        component: "bor",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    holding.keep_or(|| 5, move || Ok(reading.load(Ordering::SeqCst)), |_, _| {});
+    let bus = Arc::new(Bus::single(
+        "member-test-fenced",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    // Each database's fence, at the writer's epoch.
+    let fences = Arc::new([
+        meridian_changes::Fence::new(),
+        meridian_changes::Fence::new(),
+    ]);
+    for fence in fences.iter() {
+        fence.adopt(5);
+    }
+    let (stopping, refusing) = (Arc::clone(&fences), Arc::clone(&bus));
+    // Its readiness its own: the process's is other tests' (review-c5n5 F5).
+    let unready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saying = Arc::clone(&unready);
+    let _serving = tokio::spawn(async move {
+        holding
+            .serve_on_saying(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                &refusing,
+                move || {
+                    for fence in stopping.iter() {
+                        fence.stop();
+                    }
+                },
+                move || saying.store(true, Ordering::SeqCst),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!bus.refuses_from_here(), "it refused before any fence");
+    assert_eq!(fences[1].admits(5), Ok(()), "it stopped before any fence");
+    assert!(!unready.load(Ordering::SeqCst), "unready before any fence");
+    // Another group's writer raised the epoch of one of its partitions.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for fence in fences.iter() {
+        assert_eq!(
+            fence.admits(5),
+            Err(meridian_changes::Fenced {
+                mine: meridian_changes::Fenced::STOPPED,
+                head: 5,
+            }),
+            "fenced while serving on, a commit to a partition nobody raised was admitted"
+        );
+    }
+    assert!(
+        bus.refuses_from_here(),
+        "fenced while serving on, it never refused its topics"
+    );
+    assert!(
+        unready.load(Ordering::SeqCst),
+        "fenced while serving on, it still said it was ready"
+    );
+}
+
+/// A writer with no lease that already hands every write on (the tolerant
+/// default), fenced while it serves on, refuses its topics to be asked
+/// again -- UNAVAILABLE, retry-after 1 -- as any fenced writer does (ruled
+/// 2026-11-18, item 120). Before, it went on handing each write on by the
+/// owners it last read, and a write handed to a group with no members was
+/// refused only at its caller's deadline, with no retry-after
+/// (review-c5n2 L3).
+#[tokio::test(start_paused = true)]
+async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_to_be_asked_again() {
+    let holding = Holding {
+        elector: None,
+        component: "bor",
+        why: "",
+        previous: String::new(),
+        serving_on: ServingOn::default(),
+    };
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    holding.keep_or(|| 5, move || Ok(reading.load(Ordering::SeqCst)), |_, _| {});
+    let bus = Arc::new(Bus::single(
+        "member-test-handing",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let write = "platform.book.command.record-order";
+    bus.serve(write, |_| Ok(("R".into(), vec![])));
+    bus.hand_writes_on("platform.book.internal.command", 1, move |topic| {
+        topic == write
+    });
+    // Told to stop with no lease: every write handed on.
+    assert!(bus.stop_writing_here(|_| false));
+    assert!(bus.writes_nothing_here());
+    let refusing = Arc::clone(&bus);
+    let _serving = tokio::spawn(async move {
+        holding
+            .serve_on_saying(1, 2, 42, |_, _| Ok(false), &refusing, || {}, || {})
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!bus.refuses_from_here(), "it refused before any fence");
+    // Another group's writer raised the epoch of one of its partitions.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        bus.refuses_from_here(),
+        "fenced while serving on, handing every write on, it never refused its topics"
+    );
+    let detail = match bus.call(write, "Q", vec![], None, None).await {
+        Err(meridian_bus::BusError::HandlerFailed { detail, .. }) => detail,
+        other => panic!("fenced while serving on, it answered {other:?}"),
+    };
+    assert_eq!(
+        meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+        Some(meridian_bus::RefusalStatus::Unavailable),
+        "{detail}"
+    );
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&detail),
+        Some(1),
+        "{detail}"
+    );
+}
+
+/// A writer fenced before it is told to stop ends at once, though told to
+/// stop while it gives its lease up (review-c5n2 L1): it was not serving
+/// on at its fence, and a writer fenced so ends at once (item 110). Before,
+/// the stop that landed during its let-go began a serve-on, and the fence
+/// waited it out, refusing, up to 20 s.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_before_it_is_told_to_stop_ends_at_once_told_while_it_lets_go() {
+    let api = Unreliable {
+        latency: Duration::from_millis(400),
+        ..Unreliable::default()
+    };
+    let elector = Arc::new(tokio::sync::Mutex::new(holding_on(&api).await));
+    let began = tokio::time::Instant::now();
+    let stepped = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+    let said = Arc::clone(&stepped);
+    let head = Arc::new(AtomicU64::new(5));
+    let reading = Arc::clone(&head);
+    let serving_on = ServingOn::default();
+    let watching = tokio::spawn(watch_the_epoch(
+        elector,
+        "bor",
+        serving_on.clone(),
+        || 5,
+        Arc::new(move || Ok(reading.load(Ordering::SeqCst))),
+        move |_, _| said.lock().unwrap().push(began.elapsed()),
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Fenced, not serving on: its epoch's look at 2 s finds 6, and it gives
+    // its lease up, about 0.8 s.
+    head.store(6, Ordering::SeqCst);
+    tokio::time::sleep_until(began + Duration::from_millis(2_200)).await;
+    // Told to stop meanwhile.
+    let refused = Arc::new(AtomicBool::new(false));
+    let refusing = Arc::clone(&refused);
+    let serving = tokio::spawn(async move {
+        serving_on
+            .within(
+                1,
+                2,
+                42,
+                |_, _| Ok(false),
+                move || refusing.store(true, Ordering::SeqCst),
+                Duration::from_secs(20),
+                Duration::from_millis(500),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    watching.abort();
+    let stepped = stepped.lock().unwrap().clone();
+    assert_eq!(
+        stepped.len(),
+        1,
+        "fenced before it was told to stop, it never ended: {stepped:?}"
+    );
+    assert!(
+        stepped[0] < Duration::from_millis(3_500),
+        "it ended {:?} after it began, fenced at 2 s",
+        stepped[0]
+    );
+    assert!(
+        !refused.load(Ordering::SeqCst),
+        "fenced before it was told to stop, it refused as one serving on"
+    );
+    assert_eq!(
+        serving.await.expect("told to stop"),
+        ServedOn::AtOnce,
+        "fenced before it was told to stop, it served on"
+    );
+}
+
+/// A serve-on whose future is dropped part-way -- its task ended -- never
+/// leaves the fence of its writer waiting for good (review-c5n2 L4): its
+/// end is said as it is dropped, and the writer steps down.
+#[tokio::test(start_paused = true)]
+async fn a_serve_on_dropped_part_way_never_leaves_its_fenced_writer_waiting() {
+    let serving_on = ServingOn::default();
+    let on = serving_on.clone();
+    let serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            |_, _| Ok(false),
+            || {},
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let fenced = serving_on.clone();
+    let waiting =
+        tokio::spawn(async move { fenced_stepping_down::<KubeLeases>(&fenced, None, "bor").await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !waiting.is_finished(),
+        "fenced while serving on, it did not wait its serve-on out"
+    );
+    serving.abort();
+    let _ = serving.await;
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("its serve-on dropped, the fenced writer waited on")
+        .expect("waited");
+}
+
+/// A task's step-down that is no fence -- no commit refused by a newer
+/// epoch, no fence of this writer seen -- ends at once while it serves on,
+/// refusing nothing: its store's topics, reads included, are not refused
+/// up to 20 s for a failure that took nothing over (review-c5n2 L2). A
+/// fence seen, it waits its serve-on out as any fence does (item 110).
+#[tokio::test(start_paused = true)]
+async fn a_task_stepping_down_with_no_fence_ends_at_once_while_it_serves_on() {
+    let serving_on = ServingOn::default();
+    let refused = Arc::new(AtomicBool::new(false));
+    let (on, refusing) = (serving_on.clone(), Arc::clone(&refused));
+    let _serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            |_, _| Ok(false),
+            move || refusing.store(true, Ordering::SeqCst),
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stepping = SteppingDown {
+        elector: None,
+        component: "lake",
+        serving_on: serving_on.clone(),
+    };
+    tokio::time::timeout(Duration::from_secs(1), stepping.before_stepping_down())
+        .await
+        .expect("no fence, it waited its serve-on out");
+    assert!(
+        !refused.load(Ordering::SeqCst),
+        "no fence, it refused its topics"
+    );
+    // Its fence seen by another of its tasks: a fence's step-down.
+    serving_on.fence("lake");
+    assert!(refused.load(Ordering::SeqCst), "fenced, it never refused");
+    let stepping = SteppingDown {
+        elector: None,
+        component: "lake",
+        serving_on,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), stepping.before_stepping_down())
+            .await
+            .is_err(),
+        "fenced while serving on, it did not wait its serve-on out"
     );
 }

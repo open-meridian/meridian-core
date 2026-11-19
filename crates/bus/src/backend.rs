@@ -443,8 +443,48 @@ pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync
 /// Where a request is to be handed before it is admitted here (step 3d;
 /// section 6.7): the internal topic and the writer group that owns the
 /// write, where it is another group's; none where it is this member's to
-/// answer, or the request says nothing of its owner.
-pub type PreRoute = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
+/// answer, or the request says nothing of its owner, or this member
+/// refuses from here ([`crate::Bus::refuse_from_here`]).
+#[derive(Clone)]
+pub struct PreRoute {
+    owner: OwnerOf,
+    refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A request's owner, decided from it: the internal topic and the group.
+type OwnerOf = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
+
+impl PreRoute {
+    /// `owner` decides a request's owner; `refusing` is set once this
+    /// member refuses from here.
+    pub fn new(
+        owner: impl Fn(&Envelope) -> Option<(String, u32)> + Send + Sync + 'static,
+        refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            owner: std::sync::Arc::new(owner),
+            refusing,
+        }
+    }
+
+    /// The internal topic and the owning group, where the request is
+    /// another group's to write and this member still passes writes on.
+    /// It may read the owner's record, and blocks.
+    pub fn owner(&self, envelope: &Envelope) -> Option<(String, u32)> {
+        if self.refuses() {
+            return None;
+        }
+        (self.owner)(envelope)
+    }
+
+    /// Whether this member refuses from here: nothing passed on by the
+    /// owners it last read, looked at again just before the request is
+    /// passed (ruled 2026-11-18, item 120; review-c5n5 F2), a fence that
+    /// landed while its owner was decided included.
+    pub fn refuses(&self) -> bool {
+        self.refusing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 /// A future a backend returns, boxed so the trait stays object-safe.
 ///

@@ -75,6 +75,29 @@ pub enum StoreError {
     ShardFenced(#[from] ShardFenced),
 }
 
+impl StoreError {
+    /// As the bus carries it to the writer's caller: held past the hold,
+    /// OVERLOADED with its retry-after (section 6.8); a plugin shard's
+    /// epoch passed, SHARD_FENCED, and its sidecar exits (step 3d,
+    /// checkpoint 5, item 32); this writer fenced, UNAVAILABLE with
+    /// retry-after 1, to be asked again (items 110 and 120; review-c5n5
+    /// F1); every other failure as the store said it.
+    pub fn on_the_bus(self) -> String {
+        match self {
+            StoreError::Held(words) => meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                meridian_changes::moves::HELD_RETRY_SECONDS,
+                words,
+            ),
+            StoreError::ShardFenced(fenced) => {
+                meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
+            }
+            StoreError::Fenced(fenced) => fenced.on_the_bus(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// The shard stamp of a batch's part at `place`: none where the part was
 /// sent by no shard, or the batch names none ([`WriteAheadBatch::shards`]).
 pub fn shard_at(shards: &[Option<ShardStamp>], place: usize) -> Option<&ShardStamp> {
