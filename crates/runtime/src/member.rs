@@ -349,6 +349,92 @@ where
     }
 }
 
+/// A writer's serve-on, told to stop, as the step-downs of its fence see
+/// it (ruled 2026-11-18, item 110; scoped to a writer that is serving on).
+///
+/// A fenced writer stops writing at once, as ever: the epoch refuses its
+/// every commit. One fenced while it serves on does not end there: until
+/// its serve-on ends as it would have -- another writer group's writer
+/// seen serving, or its own bound, counted from when it was told and never
+/// from the fence -- it keeps its store's topics answered, each refused
+/// UNAVAILABLE to be asked again ([`meridian_bus::Bus::refuse_from_here`]),
+/// where the writer that took its partitions over may not serve yet and a
+/// writer ended at its fence left the topics served by nobody. Then it
+/// steps down as before. A writer fenced while it is not serving on --
+/// never told to stop, the first group's, one group's only -- ends at once,
+/// as before: it has no serve-on, and its pod starts it again.
+#[derive(Clone)]
+pub struct ServingOn(Arc<ServingOnSeen>);
+
+struct ServingOnSeen {
+    /// [`NOT_SERVING_ON`], [`SERVING_ON`] or [`SERVED_ON`].
+    at: tokio::sync::watch::Sender<u8>,
+    /// What refuses the store's topics from here, run once, at the fence.
+    refuse: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+const NOT_SERVING_ON: u8 = 0;
+const SERVING_ON: u8 = 1;
+const SERVED_ON: u8 = 2;
+
+impl Default for ServingOn {
+    fn default() -> Self {
+        Self(Arc::new(ServingOnSeen {
+            at: tokio::sync::watch::channel(NOT_SERVING_ON).0,
+            refuse: std::sync::Mutex::new(None),
+        }))
+    }
+}
+
+impl ServingOn {
+    /// [`serve_on_within`] for a writer, said here from its beginning to
+    /// its end; `refuse` is run once if the writer is fenced meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    async fn within<F, R>(
+        &self,
+        mine: u32,
+        count: u32,
+        told_at_ns: i64,
+        look: F,
+        refuse: R,
+        at_most: Duration,
+        every: Duration,
+    ) -> ServedOn
+    where
+        F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+        R: FnOnce() + Send + 'static,
+    {
+        // It waits on nobody ([`ServedOn::AtOnce`]): never serving on.
+        if mine == 0 || count < 2 {
+            return ServedOn::AtOnce;
+        }
+        *self.0.refuse.lock().expect("serving on poisoned") = Some(Box::new(refuse));
+        self.0.at.send_replace(SERVING_ON);
+        let served = serve_on_within(mine, count, true, told_at_ns, look, at_most, every).await;
+        self.0.at.send_replace(SERVED_ON);
+        served
+    }
+
+    /// This writer is fenced, and about to step down. Not serving on:
+    /// nothing, at once. Serving on: its topics are refused from here, and
+    /// this waits for the serve-on's own end.
+    async fn fenced(&self, component: &str) {
+        let mut at = self.0.at.subscribe();
+        if *at.borrow_and_update() != SERVING_ON {
+            return;
+        }
+        let refuse = self.0.refuse.lock().expect("serving on poisoned").take();
+        if let Some(refuse) = refuse {
+            tracing::warn!(
+                component,
+                "fenced while serving on, told to stop: writing nothing more, and answering \"ask again\" until another writer group's writer serves or the serve-on's bound"
+            );
+            refuse();
+        }
+        let _ = at.wait_for(|at| *at == SERVED_ON).await;
+    }
+}
+
 /// A member's settings, from what the chart sets.
 pub struct Member {
     component: &'static str,
@@ -570,6 +656,7 @@ impl Member {
                 component: self.component,
                 why: "",
                 previous: String::new(),
+                serving_on: ServingOn::default(),
             }));
         };
         said().set_mode(Mode::Standby);
@@ -623,6 +710,7 @@ impl Member {
             } else {
                 holder_member(&from)
             },
+            serving_on: ServingOn::default(),
         }))
     }
 }
@@ -760,6 +848,8 @@ pub struct Holding {
     why: &'static str,
     /// The member that held the lease before, where one did.
     previous: String,
+    /// Its serve-on once it is told to stop, which a fence waits out.
+    serving_on: ServingOn,
 }
 
 /// The member a lease's holder names: its pod's name, before the process's
@@ -826,6 +916,7 @@ impl Holding {
         let bus = Arc::clone(bus);
         let look = Arc::new(look);
         let elector = self.elector.clone();
+        let serving_on = self.serving_on.clone();
         tokio::spawn(async move {
             let mut raised = meridian_changes::timeline::raised();
             let mut said_failing = false;
@@ -836,6 +927,7 @@ impl Holding {
                         if let Some(elector) = &elector {
                             let_go_stepping_down(elector, component).await;
                         }
+                        serving_on.fenced(component).await;
                         step_down(
                             component,
                             &format!("the store's epoch is {epoch}, another writer's"),
@@ -878,7 +970,9 @@ impl Holding {
     /// of its own was fenced. A renewal that fails alone never moves it
     /// (contract v30, stage C: the API server lost). Where no lease is held,
     /// the epoch alone is watched: passed, or a commit fenced, the writer
-    /// steps down.
+    /// steps down. A writer fenced while it serves on, told to stop, steps
+    /// down when its serve-on ends, its topics refused meanwhile, to be
+    /// asked again (ruled 2026-11-18, item 110; [`ServingOn`]).
     ///
     /// The epoch is read on a loop of its own: a read waits on the store's
     /// pool, up to its connection timeout while the database's primary is
@@ -903,6 +997,7 @@ impl Holding {
     {
         let component = self.component;
         let epoch_now = Arc::new(epoch_now);
+        let serving_on = self.serving_on.clone();
         let Some(elector) = self.elector.clone() else {
             // No lease -- tolerant's, one member a group -- and the epoch
             // watched all the same (spec section 3, "a frozen writer"): a
@@ -915,6 +1010,7 @@ impl Holding {
                 loop {
                     tokio::time::sleep(UNLEASED_EPOCH_LOOK_EVERY).await;
                     if meridian_changes::fenced_seen() {
+                        serving_on.fenced(component).await;
                         return down(
                             component,
                             "a commit of this writer was refused by a newer epoch",
@@ -923,6 +1019,7 @@ impl Holding {
                     let reading = Arc::clone(&epoch_now);
                     match one_look_at_a_time(move || reading()).await {
                         Ok(Ok(head)) if head > mine() => {
+                            serving_on.fenced(component).await;
                             return down(
                                 component,
                                 &format!(
@@ -944,6 +1041,7 @@ impl Holding {
         tokio::spawn(async move {
             let renew = elector.lock().await.settings().renew;
             let watching = Arc::clone(&elector);
+            let watched_on = serving_on.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(renew).await;
@@ -951,6 +1049,7 @@ impl Holding {
                     match tokio::task::spawn_blocking(move || reading()).await {
                         Ok(Ok(head)) if head > mine() => {
                             let_go_stepping_down(&watching, component).await;
+                            watched_on.fenced(component).await;
                             step_down(
                                 component,
                                 &format!(
@@ -969,7 +1068,7 @@ impl Holding {
                     }
                 }
             });
-            renew_while_writing(elector, component, |component, why| {
+            renew_while_writing(elector, component, serving_on, |component, why| {
                 step_down(component, why)
             })
             .await;
@@ -986,7 +1085,41 @@ impl Holding {
         SteppingDown {
             elector: self.elector.clone(),
             component: self.component,
+            serving_on: self.serving_on.clone(),
         }
+    }
+
+    /// [`serve_on_until_another_group_serves`] for this writer, told to
+    /// stop at `told_at_ns`, and known to its fence's step-downs (ruled
+    /// 2026-11-18, item 110; [`ServingOn`]): fenced meanwhile, it is not
+    /// ready, `refuse` is run -- its store's topics refused from here, to
+    /// be asked again -- and it ends when this does, not at the fence.
+    pub async fn serve_on_until_another_group_serves<F, R>(
+        &self,
+        mine: u32,
+        count: u32,
+        told_at_ns: i64,
+        look: F,
+        refuse: R,
+    ) -> ServedOn
+    where
+        F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+        R: FnOnce() + Send + 'static,
+    {
+        self.serving_on
+            .within(
+                mine,
+                count,
+                told_at_ns,
+                look,
+                move || {
+                    crate::mark_ready(false);
+                    refuse()
+                },
+                SERVES_ON_AT_MOST,
+                SERVES_ON_LOOKS_EVERY,
+            )
+            .await
     }
 
     /// Give the lease up on a planned stop: the standby takes over at its
@@ -1054,6 +1187,7 @@ pub(crate) async fn release_on_stop<L: Leases>(
 async fn renew_while_writing<L, D>(
     elector: Arc<tokio::sync::Mutex<Elector<L>>>,
     component: &'static str,
+    serving_on: ServingOn,
     down: D,
 ) where
     L: Leases + 'static,
@@ -1078,6 +1212,7 @@ async fn renew_while_writing<L, D>(
         next = tokio::time::Instant::now() + renew;
         if meridian_changes::fenced_seen() {
             let_go_stepping_down(&elector, component).await;
+            serving_on.fenced(component).await;
             return down(
                 component,
                 "a commit of this writer was refused by a newer epoch",
@@ -1110,6 +1245,7 @@ async fn renew_while_writing<L, D>(
                 }
             }
             Ok(Standing::HeldBy(holder)) if holder != me => {
+                serving_on.fenced(component).await;
                 return down(
                     component,
                     &format!("another member ({holder}) holds the lease"),
@@ -1202,6 +1338,7 @@ pub async fn let_go_stepping_down<L: Leases>(
 pub struct SteppingDown {
     elector: Option<Arc<tokio::sync::Mutex<Elector<KubeLeases>>>>,
     component: &'static str,
+    serving_on: ServingOn,
 }
 
 impl SteppingDown {
@@ -1211,6 +1348,7 @@ impl SteppingDown {
         if let Some(elector) = &self.elector {
             let_go_stepping_down(elector, self.component).await;
         }
+        self.serving_on.fenced(self.component).await;
         step_down(self.component, why)
     }
 }

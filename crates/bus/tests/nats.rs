@@ -1748,3 +1748,91 @@ async fn a_writer_told_to_stop_hands_every_write_on_and_its_handler_never_runs()
     // A member with no hand-off configured has nothing to stop.
     assert!(!asking.stop_writing_here(|_| true));
 }
+
+/// Item 110 (ruled 2026-11-18): a later group's writer fenced while it
+/// serves on, told to stop -- the count lowered to one group, whose writer
+/// took every partition over and does not serve yet -- answers each
+/// request "ask again", UNAVAILABLE with a retry-after: no handler run, and
+/// nothing passed on by the owners it last read, to a group whose members
+/// are gone. Its caller asks again, and once the one group's writer serves
+/// it is answered there. Before, the fenced writer ended at its fence and
+/// nothing served the topic; and a write it passed on was never answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_fenced_while_it_serves_on_refuses_every_request_to_be_asked_again() {
+    let instance = format!("store-{}", mark("fenced"));
+    let write = topic("command.record");
+    let read = topic("query.read");
+    let internal = topic("internal.command");
+    // The second group's old writer: every write is the first group's, by
+    // the owners it last read.
+    let ran = Arc::new(AtomicU64::new(0));
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(|_, _| Some(0));
+    for served in [&write, &read] {
+        let counted = Arc::clone(&ran);
+        old.serve(served, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+        });
+    }
+    old.subscribed().await.expect("subscribed");
+    let asking = bus("asking").await;
+    let ask = |topic: String| {
+        let asking = &asking;
+        async move {
+            asking
+                .call(
+                    &topic,
+                    "meridian.test.Question",
+                    Vec::new(),
+                    None,
+                    Some(Duration::from_millis(500)),
+                )
+                .await
+        }
+    };
+    // Fenced while it serves on: it refuses from here.
+    old.refuse_from_here();
+    for served in [&write, &read] {
+        for _ in 0..10 {
+            let detail = match ask(served.clone()).await {
+                Err(BusError::HandlerFailed { detail, .. }) => detail,
+                other => panic!("the fenced writer serving on, {served} was answered {other:?}"),
+            };
+            assert_eq!(
+                meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+                Some(meridian_bus::RefusalStatus::Unavailable),
+                "{detail}"
+            );
+            assert_eq!(meridian_bus::refusal_retry_after(&detail), Some(1));
+        }
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a handler of it ran");
+    // The one group's writer serves: every request is answered there, or
+    // refused to be asked again by the old one, and never by nobody.
+    let new = bus(&instance).await;
+    new.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"new".to_vec()))
+    });
+    new.subscribed().await.expect("subscribed");
+    settle().await;
+    let mut answered = 0;
+    for _ in 0..40 {
+        match ask(write.clone()).await {
+            Ok((_, payload)) => {
+                assert_eq!(payload, b"new".to_vec());
+                answered += 1;
+            }
+            Err(BusError::HandlerFailed { detail, .. }) => {
+                assert_eq!(meridian_bus::refusal_retry_after(&detail), Some(1), "{detail}");
+            }
+            Err(other) => panic!("neither answered nor to be asked again: {other:?}"),
+        }
+    }
+    assert!(answered > 0, "the writer that serves answered none");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a handler of it ran");
+}

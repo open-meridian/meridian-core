@@ -814,14 +814,25 @@ fn run() -> Result<(), String> {
             );
         }
         // A rollout keeps the store's public topics served (stage T).
-        meridian_runtime::member::serve_on_until_another_group_serves(
-            groups.mine(),
-            groups.count(),
-            true,
-            meridian_runtime::now_ns(),
-            another_serves,
-        )
-        .await;
+        // Fenced meanwhile -- the count lowered, another group's writer
+        // taking its partitions over before it serves -- it writes nothing
+        // more and answers each request "ask again" until its serve-on
+        // ends (ruled 2026-11-18, item 110). One that already hands every
+        // write on, with no lease, goes on handing them on.
+        let refusing = bus.clone();
+        holding
+            .serve_on_until_another_group_serves(
+                groups.mine(),
+                groups.count(),
+                meridian_runtime::now_ns(),
+                another_serves,
+                move || {
+                    if !refusing.writes_nothing_here() {
+                        refusing.refuse_from_here();
+                    }
+                },
+            )
+            .await;
         holding.release().await;
         Ok(())
     })
