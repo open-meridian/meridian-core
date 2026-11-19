@@ -358,6 +358,52 @@ A count above it is refused. Takes a dict: top, component, values.
 {{- end -}}
 
 {{/*
+A store's writer groups are raised in ha, not lowered yet (PO items 111,
+option B, and 112, ruled 2026-11-18): an upgrade whose <store>.writerGroups
+is below the count the store's writers run at now is refused before
+anything changes, saying why. The book's, in the ha profile, or where the
+running book is ha: its group-0 writer and its standby take a lease
+(MERIDIAN_LEASE_NAME), so ha moved to tolerant and lowered in one upgrade
+is refused too, as the lake's is by its running stream (review c5s, L5).
+The lake's,
+wherever its write-ahead stream is on before or after the upgrade -- the
+ha profile, JetStream at three in tolerant, or a running writer that reads
+the stream (MERIDIAN_LAKE_WRITE_AHEAD), so ha moved to tolerant and lowered
+in one upgrade is refused too. The count, the stream and the lease are
+read live from the store's group-0 writer Deployment (MERIDIAN_WRITER_GROUPS,
+said only with several groups), so it holds for `meridian upgrade-deployment` and
+`helm upgrade` alike. An install, an unchanged count, a raise and a
+lowering with no stream (tolerant) are never refused, nor where nothing can
+be read (`helm template`, a client dry run). Takes a dict: top, component,
+values.
+*/}}
+{{- define "meridian-runtime.writerGroupsNotLowered" -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- $ha := eq (include "meridian-runtime.profile" .top) "ha" -}}
+{{- $streamed := and (eq .component "lake") (gt (int (include "meridian-runtime.jetstreamReplicas" .top)) 0) -}}
+{{- $live := lookup "apps/v1" "Deployment" .top.Release.Namespace (printf "%s-%s" (include "meridian-runtime.fullname" .top) .component) -}}
+{{- $running := 1 -}}
+{{- $streaming := false -}}
+{{- $leased := false -}}
+{{- range (dig "spec" "template" "spec" "containers" (list) (default (dict) $live)) -}}
+{{- range (.env | default list) -}}
+{{- if eq .name "MERIDIAN_WRITER_GROUPS" -}}{{- $running = int .value -}}{{- end -}}
+{{- if eq .name "MERIDIAN_LAKE_WRITE_AHEAD" -}}{{- $streaming = true -}}{{- end -}}
+{{- if eq .name "MERIDIAN_LEASE_NAME" -}}{{- $leased = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $groups $running -}}
+{{- if eq .component "lake" -}}
+{{- if or $ha $streamed $streaming -}}
+{{- fail (printf "lake.writerGroups is %d, but this deployment's lake runs %d writer groups. In the ha profile, this release can raise the lake's writer groups but can't lower them yet: a group taken away could leave writes it had acknowledged unrecorded. Keep lake.writerGroups at %d or more. Nothing was changed." $groups $running $running) -}}
+{{- end -}}
+{{- else if or $ha $leased -}}
+{{- fail (printf "bor.writerGroups is %d, but this deployment's book runs %d writer groups. In the ha profile, this release can raise the book's writer groups but can't lower them yet. Keep bor.writerGroups at %d or more. Nothing was changed." $groups $running $running) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Each writer group past the first of a store (step 3d): group 0's writer
 Deployment as `rendered`, made again as `<release>-<store>-group-<g>` --
 its name, its component label (so its writer and its standby repel each

@@ -287,7 +287,7 @@ pub struct Reads {
     /// since the member's follower last asked ([`Reads::left_behind`]): the
     /// member's record is behind its primary there, and stays so where the
     /// partition is not written again.
-    left_behind: Mutex<std::collections::HashSet<String>>,
+    left_behind: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for Reads {
@@ -300,7 +300,7 @@ impl Default for Reads {
             bound_ms: AtomicU64::new(BOUND_DEFAULT.as_millis() as u64),
             waiting: AtomicUsize::new(0),
             session: RwLock::new(None),
-            left_behind: Mutex::new(std::collections::HashSet::new()),
+            left_behind: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -366,7 +366,11 @@ impl Reads {
     /// (failover-repeat 43697279874, ha run 2: the book's reader, one
     /// behind on `control` from a writer's hand-over to that partition's
     /// next change, a minute later).
-    pub fn left_behind(&self, domain: &str) -> bool {
+    ///
+    /// Said with when the earliest such read came, its wait before it: the
+    /// member was behind from then, not from when its follower asks
+    /// (review-delta A3).
+    pub fn left_behind(&self, domain: &str) -> Option<Instant> {
         self.left_behind
             .lock()
             .expect("left behind poisoned")
@@ -493,10 +497,15 @@ impl Reads {
                     waited_ms = waited.as_millis() as u64,
                     "a reader behind its read_after past its wait: answered from the primary"
                 );
+                let came = Instant::now()
+                    .checked_sub(waited)
+                    .unwrap_or_else(Instant::now);
                 self.left_behind
                     .lock()
                     .expect("left behind poisoned")
-                    .insert(domain.to_string());
+                    .entry(domain.to_string())
+                    .and_modify(|earliest| *earliest = (*earliest).min(came))
+                    .or_insert(came);
                 return Ok(Held::FromPrimary);
             }
         }
@@ -794,14 +803,28 @@ mod tests {
             reads.hold("platform.book.query.list-orders", &mark("control", 23)),
             Ok(Held::Here)
         );
-        assert!(!reads.left_behind("book"), "its own record answered");
+        assert!(
+            reads.left_behind("book").is_none(),
+            "its own record answered"
+        );
+        let came = Instant::now();
         assert_eq!(
             reads.hold("platform.book.query.list-orders", &mark("control", 24)),
             Ok(Held::FromPrimary)
         );
-        assert!(!reads.left_behind("lake"), "another store's is not said");
-        assert!(reads.left_behind("book"));
-        assert!(!reads.left_behind("book"), "said once");
+        assert!(
+            reads.left_behind("lake").is_none(),
+            "another store's is not said"
+        );
+        // Behind from when the read came, its wait before it (review-delta
+        // A3), never from when its follower asks.
+        let behind = reads.left_behind("book").unwrap();
+        assert!(
+            behind <= came + Duration::from_millis(20),
+            "behind from {} ms after the read came",
+            behind.saturating_duration_since(came).as_millis()
+        );
+        assert!(reads.left_behind("book").is_none(), "said once");
     }
 
     #[test]

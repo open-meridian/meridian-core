@@ -99,9 +99,9 @@ fn run() -> Result<(), String> {
             "the instrument store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| {
+            |store, lock_waits| {
                 store
-                    .migrate(&*clock())
+                    .migrate_within(&*clock(), lock_waits)
                     .map_err(|failed| failed.to_string())
             },
         )

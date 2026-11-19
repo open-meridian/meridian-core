@@ -60,7 +60,7 @@ fn run() -> Result<(), String> {
             "the dashboard's database",
             &url,
             |url| Database::connect(url, 1),
-            |database| database.migrate(&*clock()),
+            |database, lock_waits| database.migrate_within(&*clock(), lock_waits),
         )
         .map_err(|failed| format!("the dashboard's schema could not be applied: {failed}"))?;
         tracing::info!("the dashboard's schema is applied");

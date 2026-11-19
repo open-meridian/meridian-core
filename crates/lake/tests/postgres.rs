@@ -11883,6 +11883,106 @@ fn a_raise_on_a_new_timeline_is_the_writers_epoch_before_its_commit_can_be_read(
         .unwrap();
 }
 
+/// A dataset a group past the first begins while its group's takeover is
+/// raising (review-delta B1): the raise has read the ranges it raises and
+/// waits before it raises the group's own row, and the old writer, its row
+/// not raised yet, begins a dataset under its old epoch and commits. The
+/// takeover raises that dataset too, so the new writer can write it. The
+/// raise is held before its group's row by a statement trigger waiting on
+/// an advisory lock this test holds.
+#[test]
+fn a_dataset_begun_while_a_takeover_raises_is_raised_with_the_rest() {
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-raise-begun");
+    let store = |group: u32| {
+        Arc::new(
+            PostgresStore::connect(&url, 4)
+                .unwrap()
+                .with_groups(Groups::new(group, 2).unwrap()),
+        )
+    };
+    let (zero, old) = (store(0), store(1));
+    zero.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let was = old.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let begun = (0..)
+        .map(|n| unique(&format!("coinbase-1:begun{n}")))
+        .find(|dataset| owner(dataset, 2) == 1)
+        .unwrap();
+    let subject = unique("LCL-BTC");
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hold = 0x6335_7742_i64;
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION held_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               PERFORM pg_advisory_xact_lock({hold});
+               RETURN NULL;
+             END $$;
+             CREATE TRIGGER held_raise BEFORE INSERT OR UPDATE ON lake_writer_group
+               FOR EACH STATEMENT EXECUTE FUNCTION held_raise();"
+        ))
+        .unwrap();
+    admin
+        .execute("SELECT pg_advisory_lock($1)", &[&hold])
+        .unwrap();
+    let new = store(1);
+    let taking = Arc::clone(&new);
+    let takeover = std::thread::spawn(move || taking.take_over(&TookOver::unnamed(LEASE_FREE)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while admin
+        .query_one(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+               AND classid = 0 AND objid = $1::bigint::oid AND objsubid = 1",
+            &[&hold],
+        )
+        .unwrap()
+        .get::<_, i64>(0)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the raise never reached its group's row"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The old writer begins a dataset meanwhile, under its row's epoch,
+    // and commits: nothing the raise holds yet waits it.
+    let beginning = {
+        let (old, begun, subject) = (Arc::clone(&old), begun.clone(), subject.clone());
+        std::thread::spawn(move || {
+            old.record(
+                &begun,
+                vec![close(&begun, "a", &subject, "2026-10-01", 1)],
+                10,
+            )
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !beginning.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let committed_first = beginning.is_finished();
+    admin
+        .execute("SELECT pg_advisory_unlock($1)", &[&hold])
+        .unwrap();
+    assert!(committed_first, "the begin waited on the raise");
+    beginning.join().unwrap().unwrap();
+    let raised = takeover.join().unwrap().unwrap();
+    assert!(raised > was);
+    assert_eq!(
+        new.range_tip(&begun).unwrap().unwrap().epoch,
+        raised,
+        "the dataset begun while the takeover raised is left under the fenced epoch"
+    );
+    new.record(
+        &begun,
+        vec![close(&begun, "b", &subject, "2026-10-02", 2)],
+        20,
+    )
+    .unwrap();
+}
+
 /// A dataset begun while the writer's own raise on a new timeline waits at
 /// its commit, and the raise's commit fails (review c5r3, L2): the dataset
 /// is begun under the epoch the writer kept, never the raise's, so the
@@ -11986,4 +12086,184 @@ fn a_dataset_begun_behind_a_raise_whose_commit_fails_never_steps_the_writer_down
         begin(&writer, &begun, &subject).unwrap();
     }
     assert_eq!(writer.range_tip(&begun).unwrap().unwrap().epoch, 1);
+}
+
+/// Review c5w's residual, 3 -> 2: group 0's takeover at the lowered count
+/// raises group 2's own row too, so group 2's writer, not stopped yet,
+/// begins no dataset under its old epoch that a group left now owns.
+#[test]
+fn a_count_lowered_from_three_to_two_fences_group_twos_own_row() {
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-lowered-row");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    let (zero, one, two) = (store(0, 3), store(1, 3), store(2, 3));
+    for each in [&zero, &one, &two] {
+        each.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    }
+    let subject = unique("LCL-UNREC");
+    let begun = (0..)
+        .map(|n| unique(&format!("coinbase-1:lowrow{n}")))
+        .find(|dataset| owner(dataset, 3) == 2 && owner(dataset, 2) == 0)
+        .unwrap();
+    let lowered = store(0, 2);
+    lowered.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let stale = two.record(&begun, vec![trade(&begun, "stale", &subject, 1)], 1_000);
+    assert!(
+        matches!(stale, Err(meridian_lake::store::StoreError::Fenced(_))),
+        "group 2's writer began a dataset group 0 now owns under its old epoch: {stale:?}"
+    );
+    assert!(two.head_epoch().unwrap() > two.epoch());
+    drop((zero, one));
+}
+
+/// Review c5w3 L-c: a migration cut off by the network alone leaves its
+/// server session holding the schema lock until its keepalive ends it. The
+/// migration applied again waits for that lock a bounded while, then is
+/// refused, so its wait never runs on past the bound; once the lock is let
+/// go it is taken, and the session's lock_timeout is as it was.
+#[test]
+fn a_schema_lock_a_cut_off_session_holds_is_waited_for_a_bounded_while() {
+    // A key of this test's own: every other test's store() migrates under
+    // the lake's.
+    const KEY: i64 = 0x6c61_6b65_6c6f_636b_u64 as i64;
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut cut_off = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    cut_off
+        .execute("SELECT pg_advisory_lock($1)", &[&KEY])
+        .unwrap();
+    let mut again = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let taken =
+            meridian_changes::take_schema_lock(&mut again, KEY, std::time::Duration::from_secs(1));
+        let _ = said.send(taken.map_err(|failed| failed.code().cloned()));
+        again
+    });
+    let taken = heard
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("it waited on past its bound for a lock a cut-off session holds");
+    let refused = taken.expect_err("it took a lock another session holds");
+    assert_eq!(
+        refused,
+        Some(postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "refused for another reason"
+    );
+    cut_off
+        .execute("SELECT pg_advisory_unlock($1)", &[&KEY])
+        .unwrap();
+    let mut again = waiting.join().unwrap();
+    meridian_changes::take_schema_lock(&mut again, KEY, std::time::Duration::from_secs(1))
+        .expect("not taken once let go");
+    let timeout: String = again.query_one("SHOW lock_timeout", &[]).unwrap().get(0);
+    assert_eq!(timeout, "0", "the session's lock_timeout left changed");
+    again
+        .execute("SELECT pg_advisory_unlock($1)", &[&KEY])
+        .unwrap();
+}
+
+/// Review c5s L1, a tolerant lowering 3 -> 2: group 1's takeover raised the
+/// row of group 2, now past the count, to group 1's own epoch. Group 1's
+/// writer restarted at the unchanged count adopts its epoch: a row past the
+/// count is no live group's, so it takes nothing over and records no
+/// "assigned" takeover at every restart.
+#[test]
+fn a_writer_restarted_after_a_lowering_adopts_its_epoch_past_a_stale_row() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-lowered-restart");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    for group in 0..3 {
+        store(group, 3)
+            .take_over(&TookOver::unnamed(LEASE_FREE))
+            .unwrap();
+    }
+    store(0, 2)
+        .take_over(&TookOver::unnamed(LEASE_FREE))
+        .unwrap();
+    let one = store(1, 2);
+    let epoch = one.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let mut sql = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let took_over = |sql: &mut postgres::Client| -> i64 {
+        sql.query_one("SELECT count(*) FROM lake_writer_took_over", &[])
+            .unwrap()
+            .get(0)
+    };
+    let before = took_over(&mut sql);
+    drop(one);
+    let restarted = store(1, 2);
+    assert_eq!(
+        restarted.adopt().unwrap(),
+        epoch,
+        "group 1's writer took over again at an unchanged count"
+    );
+    assert_eq!(took_over(&mut sql), before, "a takeover was recorded");
+}
+
+/// Review c5s L8: a takeover chosen as a deadlock's victim (SQLSTATE 40P01)
+/// is tried again, not given up on. Group 0's takeover at a count lowered
+/// from three to two holds the control partition and waits for group 2's
+/// row, which a batch of group 2's writer, not stopped yet, holds shared
+/// while it waits for the control partition: Postgres ends the takeover,
+/// the one that waited first.
+#[test]
+fn a_takeover_ended_by_a_deadlock_is_tried_again() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-takeover-deadlock");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    for group in 0..3 {
+        store(group, 3)
+            .take_over(&TookOver::unnamed(LEASE_FREE))
+            .unwrap();
+    }
+    let mut batch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut held = batch.transaction().unwrap();
+    held.query_one(
+        "SELECT epoch FROM lake_writer_group WHERE writer_group = 2 FOR SHARE",
+        &[],
+    )
+    .unwrap();
+    let lowered = store(0, 2);
+    let taking = std::thread::spawn(move || lowered.take_over(&TookOver::unnamed(LEASE_FREE)));
+    // The takeover waits for group 2's row, the control partition held.
+    let waiting = (0..500).any(|_| {
+        let waits: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        waits > 0 || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(waiting, "the takeover never waited for group 2's row");
+    held.query_one(
+        "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
+        &[],
+    )
+    .unwrap();
+    held.commit().unwrap();
+    let took = taking.join().unwrap();
+    assert!(
+        took.is_ok(),
+        "the takeover ended by a deadlock was given up on: {took:?}"
+    );
 }

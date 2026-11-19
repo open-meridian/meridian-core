@@ -1759,25 +1759,41 @@ async fn follow(
                             // Held behind on purpose (TEST ONLY): what it
                             // lacks is read once it is let go.
                             let held = held_on_purpose();
-                            let left_behind = !held && bus.reads_after().left_behind(domain);
-                            if again || (!held && read_back) || left_behind {
+                            let left_behind = if held {
+                                None
+                            } else {
+                                bus.reads_after().left_behind(domain)
+                            };
+                            if again || (!held && read_back) || left_behind.is_some() {
                                 // A read left behind proves the reader behind
-                                // now: minded from then, never held ready while
-                                // the reconcile reads (review-c5m2 2).
+                                // from when that read came, which waited its
+                                // bound (review-delta A3): minded from then,
+                                // never held ready while the reconcile reads
+                                // (review-c5m2 2).
                                 let proved = Instant::now();
-                                let since = behind_since(
-                                    &gaps,
-                                    &at,
-                                    [unanswered, unchecked_since, left_behind.then_some(proved)],
-                                );
-                                minding(
-                                    since,
+                                let evidence = [unanswered, unchecked_since, left_behind];
+                                let since = behind_since(&gaps, &at, evidence);
+                                // A gap the reconcile records is behind from
+                                // this evidence alone, never from another
+                                // partition's gap (review-delta A2).
+                                let behind_from = evidence
+                                    .into_iter()
+                                    .flatten()
+                                    .min()
+                                    .unwrap_or(proved);
+                                // Minded from now where nothing says it was
+                                // behind before: every catch-up may wait its
+                                // read's timeout, and the member is never held
+                                // ready past its bound meanwhile (review-delta
+                                // A1).
+                                let reconciled = minding(
+                                    since.or(Some(proved)),
                                     bound,
                                     reconcile(
                                         &bus,
                                         domain,
                                         following,
-                                        since.unwrap_or(proved),
+                                        behind_from,
                                         &mut Behind {
                                             at: &mut at,
                                             applied: &mut applied,
@@ -1789,6 +1805,18 @@ async fn follow(
                                     ),
                                 )
                                 .await;
+                                // The primary's heads unread: the proof of
+                                // being behind carried on, as the writer's
+                                // silence is, so the lag counts it and the
+                                // next tick reconciles again (review c5w
+                                // R1) -- never ready while proven behind.
+                                if !reconciled {
+                                    unanswered_since = Some(
+                                        unanswered_since.map_or(behind_from, |since| {
+                                            since.min(behind_from)
+                                        }),
+                                    );
+                                }
                             }
                         }
                         // A gap still open is read again as the writer
@@ -1861,7 +1889,8 @@ async fn follow(
                 // Held past the next tick by a read: the next a second from
                 // now. Fired at once, it began another read before a page
                 // heard meanwhile was taken from the tail, and held the loop a
-                // tick and two reads (c30d-c5j).
+                // tick and two reads, past review-c5i M2's pass of a second
+                // and one read.
                 if ticked.elapsed() >= ASK_EVERY {
                     ask.reset();
                 }
@@ -2205,6 +2234,9 @@ async fn read_gap(
 /// (review-c5c-ci1 M3: a stale one read back as kept, and the reader held
 /// what the record had lost, ready).
 ///
+/// Says whether it read the primary's heads: where it could not, nothing
+/// was reconciled, and its caller carries `behind_from` on (review c5w R1).
+///
 /// [`Reads::left_behind`]: meridian_bus::read_after::Reads::left_behind
 async fn reconcile(
     bus: &Bus,
@@ -2212,7 +2244,7 @@ async fn reconcile(
     following: &Following,
     behind_from: Instant,
     behind: &mut Behind<'_>,
-) {
+) -> bool {
     let Behind {
         at,
         applied,
@@ -2227,17 +2259,17 @@ async fn reconcile(
     let primary = Arc::clone(&following.primary);
     let heads = match tokio::task::spawn_blocking(move || primary.all_heads()).await {
         Ok(Some(heads)) => heads,
-        Ok(None) => return,
+        Ok(None) => return true,
         Err(failed) => {
             tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
-            return;
+            return false;
         }
     };
     let heads = match heads {
         Ok(heads) => heads,
         Err(failed) => {
             tracing::warn!(domain, %failed, "the primary's heads could not be read to reconcile with");
-            return;
+            return false;
         }
     };
     for (partition, head) in heads {
@@ -2315,6 +2347,7 @@ async fn reconcile(
         following.followed.set(&partition, reached);
     }
     said().set_partitions(at.keys().cloned().collect());
+    true
 }
 
 /// Whether a reader is held behind on purpose: TEST ONLY, by the file
@@ -2633,8 +2666,11 @@ async fn read_to_head(
         let mut next = after;
         for change in &page.changes {
             if change.sequence <= next {
+                // Refused, as a change that does not verify is: said at
+                // error, never at debug behind a timeout warned of before
+                // (review-delta A4).
                 return Err(format!(
-                    "change {} came after {next}: out of order",
+                    "{REFUSED}: change {} came after {next}: out of order",
                     change.sequence
                 ));
             }
