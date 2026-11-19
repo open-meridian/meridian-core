@@ -360,9 +360,13 @@ where
 /// UNAVAILABLE to be asked again ([`meridian_bus::Bus::refuse_from_here`]),
 /// where the writer that took its partitions over may not serve yet and a
 /// writer ended at its fence left the topics served by nobody. Then it
-/// steps down as before. A writer fenced while it is not serving on --
-/// never told to stop, the first group's, one group's only -- ends at once,
-/// as before: it has no serve-on, and its pod starts it again.
+/// steps down as before. Fenced by its own writer group's successor -- its
+/// lease, the group's, naming another member, at the fence or after it --
+/// it ends at once, beside that member (the coordinator's ruling of
+/// 2026-11-18 on review-c5n2 H1 and M1). A writer fenced while it is not
+/// serving on -- never told to stop, the first group's, one group's only --
+/// ends at once, as before: it has no serve-on, and its pod starts it
+/// again.
 #[derive(Clone)]
 pub struct ServingOn(Arc<ServingOnSeen>);
 
@@ -417,8 +421,17 @@ impl ServingOn {
 
     /// This writer is fenced, and about to step down. Not serving on:
     /// nothing, at once. Serving on: its topics are refused from here, and
-    /// this waits for the serve-on's own end.
-    async fn fenced(&self, component: &str) {
+    /// this waits for the serve-on's own end -- or, where it holds a lease,
+    /// until the lease names another member: its own writer group's
+    /// successor, which serves its topics (the lease is its group's), and
+    /// beside which it ends at once (the coordinator's ruling of 2026-11-18
+    /// on review-c5n2 H1 and M1). The lease is read at once and every
+    /// renew after, nothing written.
+    async fn fenced<L: Leases>(
+        &self,
+        component: &str,
+        elector: Option<&tokio::sync::Mutex<Elector<L>>>,
+    ) {
         let mut at = self.0.at.subscribe();
         if *at.borrow_and_update() != SERVING_ON {
             return;
@@ -431,8 +444,67 @@ impl ServingOn {
             );
             refuse();
         }
-        let _ = at.wait_for(|at| *at == SERVED_ON).await;
+        let Some(elector) = elector else {
+            let _ = at.wait_for(|at| *at == SERVED_ON).await;
+            return;
+        };
+        let (me, renew) = {
+            let elector = elector.lock().await;
+            (elector.settings().holder.clone(), elector.settings().renew)
+        };
+        loop {
+            if let Some(successor) = successor(elector, &me, renew).await {
+                tracing::info!(
+                    component,
+                    %successor,
+                    "fenced while serving on: its own writer group's successor holds the lease; stopping at once"
+                );
+                return;
+            }
+            tokio::select! {
+                served = at.wait_for(|at| *at == SERVED_ON) => {
+                    let _ = served;
+                    return;
+                }
+                _ = tokio::time::sleep(renew) => {}
+            }
+        }
     }
+}
+
+/// The member a writer's lease names now, where it is another than `me`:
+/// its own writer group's successor, the lease being its group's. Looked
+/// at alone, nothing written ([`Elector::watch`]), within `within`; none
+/// where the lease names nobody or this member, or could not be read.
+async fn successor<L: Leases>(
+    elector: &tokio::sync::Mutex<Elector<L>>,
+    me: &str,
+    within: Duration,
+) -> Option<String> {
+    let looked = tokio::time::timeout(within, async {
+        elector.lock().await.watch(Instant::now()).await
+    })
+    .await;
+    match looked {
+        Ok(Ok(Some(holder))) if holder != me => Some(holder),
+        _ => None,
+    }
+}
+
+/// A writer fenced, before it steps down: its lease given up where it
+/// still names it (ruled 2026-11-16), then its serve-on waited out where
+/// it serves on, told to stop (ruled 2026-11-18, item 110;
+/// [`ServingOn`]) -- unless its own writer group's successor holds the
+/// lease.
+async fn fenced_stepping_down<L: Leases>(
+    serving_on: &ServingOn,
+    elector: Option<&tokio::sync::Mutex<Elector<L>>>,
+    component: &str,
+) {
+    if let Some(elector) = elector {
+        let_go_stepping_down(elector, component).await;
+    }
+    serving_on.fenced(component, elector).await;
 }
 
 /// A member's settings, from what the chart sets.
@@ -924,10 +996,7 @@ impl Holding {
                 let looking = Arc::clone(&look);
                 match one_look_at_a_time(move || looking()).await {
                     Ok(Ok(Timeline::NotMine(epoch))) => {
-                        if let Some(elector) = &elector {
-                            let_go_stepping_down(elector, component).await;
-                        }
-                        serving_on.fenced(component).await;
+                        fenced_stepping_down(&serving_on, elector.as_deref(), component).await;
                         step_down(
                             component,
                             &format!("the store's epoch is {epoch}, another writer's"),
@@ -1010,7 +1079,7 @@ impl Holding {
                 loop {
                     tokio::time::sleep(UNLEASED_EPOCH_LOOK_EVERY).await;
                     if meridian_changes::fenced_seen() {
-                        serving_on.fenced(component).await;
+                        fenced_stepping_down::<KubeLeases>(&serving_on, None, component).await;
                         return down(
                             component,
                             "a commit of this writer was refused by a newer epoch",
@@ -1019,7 +1088,7 @@ impl Holding {
                     let reading = Arc::clone(&epoch_now);
                     match one_look_at_a_time(move || reading()).await {
                         Ok(Ok(head)) if head > mine() => {
-                            serving_on.fenced(component).await;
+                            fenced_stepping_down::<KubeLeases>(&serving_on, None, component).await;
                             return down(
                                 component,
                                 &format!(
@@ -1038,41 +1107,22 @@ impl Holding {
             });
             return;
         };
-        tokio::spawn(async move {
-            let renew = elector.lock().await.settings().renew;
-            let watching = Arc::clone(&elector);
-            let watched_on = serving_on.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(renew).await;
-                    let reading = Arc::clone(&epoch_now);
-                    match tokio::task::spawn_blocking(move || reading()).await {
-                        Ok(Ok(head)) if head > mine() => {
-                            let_go_stepping_down(&watching, component).await;
-                            watched_on.fenced(component).await;
-                            step_down(
-                                component,
-                                &format!(
-                                    "the store's epoch is {head}, past this writer's {}",
-                                    mine()
-                                ),
-                            )
-                        }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(failed)) => {
-                            tracing::warn!(component, %failed, "the store's epoch could not be read")
-                        }
-                        Err(failed) => {
-                            tracing::warn!(component, %failed, "the epoch check failed")
-                        }
-                    }
-                }
-            });
-            renew_while_writing(elector, component, serving_on, |component, why| {
-                step_down(component, why)
-            })
-            .await;
-        });
+        let down = Arc::new(down);
+        let downing = Arc::clone(&down);
+        tokio::spawn(watch_the_epoch(
+            Arc::clone(&elector),
+            component,
+            serving_on.clone(),
+            mine,
+            epoch_now,
+            move |component, why| downing(component, why),
+        ));
+        tokio::spawn(renew_while_writing(
+            elector,
+            component,
+            serving_on,
+            move |component, why| down(component, why),
+        ));
     }
 
     /// What a task of this writer's own steps down with, giving the lease
@@ -1170,6 +1220,45 @@ pub(crate) async fn release_on_stop<L: Leases>(
     }
 }
 
+/// A leased writer's look at its store's head epoch, every renew, on a
+/// loop of its own ([`Holding::keep`]'s other half): passed, the writer is
+/// fenced, and steps down with `down` ([`fenced_stepping_down`]).
+async fn watch_the_epoch<L, M, E, D>(
+    elector: Arc<tokio::sync::Mutex<Elector<L>>>,
+    component: &'static str,
+    serving_on: ServingOn,
+    mine: M,
+    epoch_now: Arc<E>,
+    down: D,
+) where
+    L: Leases + 'static,
+    M: Fn() -> u64 + Send + Sync + 'static,
+    E: Fn() -> Result<u64, String> + Send + Sync + 'static,
+    D: Fn(&'static str, &str) + Send + Sync + 'static,
+{
+    let renew = elector.lock().await.settings().renew;
+    loop {
+        tokio::time::sleep(renew).await;
+        let reading = Arc::clone(&epoch_now);
+        match tokio::task::spawn_blocking(move || reading()).await {
+            Ok(Ok(head)) if head > mine() => {
+                fenced_stepping_down(&serving_on, Some(&elector), component).await;
+                return down(
+                    component,
+                    &format!("the store's epoch is {head}, past this writer's {}", mine()),
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(failed)) => {
+                tracing::warn!(component, %failed, "the store's epoch could not be read")
+            }
+            Err(failed) => {
+                tracing::warn!(component, %failed, "the epoch check failed")
+            }
+        }
+    }
+}
+
 /// A writer's renewals of the lease it holds, from its take until it steps
 /// down with `down`: [`Holding::keep`]'s half that keeps the lease.
 ///
@@ -1211,8 +1300,7 @@ async fn renew_while_writing<L, D>(
         tokio::time::sleep_until(next).await;
         next = tokio::time::Instant::now() + renew;
         if meridian_changes::fenced_seen() {
-            let_go_stepping_down(&elector, component).await;
-            serving_on.fenced(component).await;
+            fenced_stepping_down(&serving_on, Some(&elector), component).await;
             return down(
                 component,
                 "a commit of this writer was refused by a newer epoch",
@@ -1244,8 +1332,10 @@ async fn renew_while_writing<L, D>(
                     );
                 }
             }
+            // Its own writer group's successor, the lease being its group's:
+            // it ends at once, serving on or not (the coordinator's ruling
+            // of 2026-11-18 on review-c5n2 H1), the successor serving.
             Ok(Standing::HeldBy(holder)) if holder != me => {
-                serving_on.fenced(component).await;
                 return down(
                     component,
                     &format!("another member ({holder}) holds the lease"),
@@ -1345,10 +1435,7 @@ impl SteppingDown {
     /// The lease given up where it still names this member (within
     /// [`STEP_DOWN_RELEASE`]), then [`step_down`].
     pub async fn now(self, why: &str) -> ! {
-        if let Some(elector) = &self.elector {
-            let_go_stepping_down(elector, self.component).await;
-        }
-        self.serving_on.fenced(self.component).await;
+        fenced_stepping_down(&self.serving_on, self.elector.as_deref(), self.component).await;
         step_down(self.component, why)
     }
 }
