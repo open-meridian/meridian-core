@@ -143,9 +143,9 @@ pub struct PostgresStore {
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
     /// The identity of the write-ahead stream the lake's writer takes from
-    /// (item 191): what a move's switch keys the groups' places by. 0 with
-    /// no stream (`tolerant`); [`STREAM_NOT_READ`] in `ha` until the writer
-    /// reads it.
+    /// (item 191): what a move's switch keys the groups' places by.
+    /// [`NO_STREAM`] in `tolerant`; [`STREAM_NOT_READ`] in `ha` until the
+    /// writer reads it; 0, the stream's name alone, where neither is said.
     stream: std::sync::atomic::AtomicI64,
     /// The datasets whose open ranges' tables this store has seen made:
     /// their ranges are not read again before a batch, as a split makes its
@@ -2791,7 +2791,7 @@ impl PostgresStore {
                 .flat_map(|part| part.unchanged_in.iter().map(|(range, _)| range.clone()))
                 .chain(part_datasets.iter().cloned())
                 .collect();
-            moves::taken_from_of(&mut tx, &ranges)?
+            moves::taken_from_of(&mut tx, &ranges, self.stream_identity())?
         };
         for counted in &mut batch.counted {
             let mut did = counted.already;
@@ -2925,6 +2925,10 @@ impl PostgresStore {
 /// its identity (item 191): a move's switch waits for it.
 pub const STREAM_NOT_READ: i64 = -1;
 
+/// A store with no write-ahead stream (`tolerant`; item 191's review,
+/// finding 2): a move's switch reads and writes no place in a stream.
+pub const NO_STREAM: i64 = i64::MIN;
+
 impl PostgresStore {
     /// The lake keeps a write-ahead stream (`ha`) whose identity its writer
     /// has not read yet: a move's switch is refused until it has (item 191).
@@ -2934,19 +2938,30 @@ impl PostgresStore {
     }
 
     /// The key of the write-ahead stream the lake's writer takes from
-    /// ([`crate::write_ahead::stream_key`]): the name alone with no stream;
-    /// refused while its identity is not read (item 191).
-    pub(crate) fn stream_key(&self) -> Result<String> {
+    /// ([`crate::write_ahead::stream_key`]), with its identity: none with
+    /// no stream (`tolerant`, item 191's review, finding 2); refused while
+    /// its identity is not read (item 191).
+    pub(crate) fn stream_key(&self) -> Result<Option<(String, i64)>> {
         match self.stream.load(std::sync::atomic::Ordering::SeqCst) {
             STREAM_NOT_READ => Err(StoreError::Unavailable(
                 "the lake's write-ahead stream's identity is not read yet: no range's switch \
                  until it is"
                     .into(),
             )),
-            identity => Ok(crate::write_ahead::stream_key(
-                meridian_bus::write_ahead::STREAM,
+            NO_STREAM => Ok(None),
+            identity => Ok(Some((
+                crate::write_ahead::stream_key(meridian_bus::write_ahead::STREAM, identity),
                 identity,
-            )),
+            ))),
+        }
+    }
+
+    /// The identity of the write-ahead stream this store's places are in:
+    /// none in `tolerant`, or before the writer has read it.
+    fn stream_identity(&self) -> Option<i64> {
+        match self.stream.load(std::sync::atomic::Ordering::SeqCst) {
+            STREAM_NOT_READ | NO_STREAM => None,
+            identity => Some(identity),
         }
     }
 }
@@ -3061,6 +3076,15 @@ impl Store for PostgresStore {
         ] {
             tx.execute(carry, &[&from, &to]).map_err(unavailable)?;
         }
+        // Where each range's source stood at its last move, kept before
+        // `taken_in`: a place in this stream, the one the position was
+        // taken in (item 202).
+        tx.execute(
+            "UPDATE lake_partition SET taken_in = $1
+              WHERE taken_in IS NULL AND taken_from IS NOT NULL",
+            &[&made_ns],
+        )
+        .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         Ok(true)
     }

@@ -9050,6 +9050,204 @@ fn places_kept_by_the_streams_name_are_carried_to_its_identity_once() {
     );
 }
 
+/// The review of item 191's finding 2 (`lake_partition.taken_in`, item
+/// 202): where a range's source stood at its last move (`taken_from`) is a
+/// place in the stream the move was made in, and in no other. After `ha`
+/// is left and taken again, the stream made again numbers from its own
+/// first: a row its range's group finds unchanged in a write at a sequence
+/// at or below the old `taken_from` was counted by nobody, and is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn where_a_range_was_taken_from_in_an_older_stream_never_leaves_a_row_uncounted() {
+    use meridian_domain::v1::{RecordObservationsReply, RecordTradesRequest};
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_lake::service;
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::{
+        group_key, settled, stream_key, taken_past_a_switch, Taken, Writer,
+    };
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    const OLD: i64 = 1_790_000_000_000_000_000;
+    const NEW: i64 = OLD + 600_000_000_000;
+    // The dataset and both its halves group 1's, which answers its writes.
+    let (url, zero, one, dataset, _lower, upper, low, high) =
+        tokio::task::block_in_place(|| two_groups_and_a_split_of("taken-in", 1));
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake(&zero, "lake-0", &dataset),
+            ha_lake(&one, "lake-1", &dataset),
+        )
+    });
+    // In the old stream: group 1 had committed through 500 when the upper
+    // half moved to group 0.
+    lake0.with_stream(OLD);
+    lake1.with_stream(OLD);
+    tokio::task::block_in_place(|| {
+        one.record_write_ahead(
+            WriteAheadBatch {
+                stream: group_key(&stream_key(STREAM, OLD), 1),
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 500,
+                    at_ns: 500,
+                },
+                ..Default::default()
+            },
+            SystemClock.now_ns(),
+        )
+    })
+    .unwrap();
+    let ended = tokio::task::block_in_place(|| {
+        let mover = Mover::new(
+            vec![zero.clone()],
+            zero.groups(),
+            Settings::default(),
+            Arc::new(SystemClock),
+        );
+        assert!(mover.begin(&upper));
+        mover.run(&upper, 0, &Asked::default()).unwrap()
+    });
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    let taken_from: Option<i64> = tokio::task::block_in_place(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT taken_from FROM lake_partition WHERE dataset = $1",
+                &[&upper],
+            )
+            .unwrap()
+            .get(0)
+    });
+    assert_eq!(
+        taken_from,
+        Some(500),
+        "where its source stood in the old stream"
+    );
+    // `ha` left and taken again: the stream made again, the writers in it.
+    lake0.with_stream(NEW);
+    lake1.with_stream(NEW);
+    let sent_at = SystemClock.now_ns();
+    let write = |n: u64, key: &str, subject: &String| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.taken-in.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: sent_at,
+                message_id: format!("taken-in-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![match trade(&dataset, key, subject, 5_000) {
+                    Observation::Trade(trade) => *trade,
+                    _ => unreachable!(),
+                }],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+        timeout_ms: None,
+    };
+    // A row in the upper half, group 0's now; one in the lower; and at 3
+    // the first sent again, unchanged.
+    let stream = vec![
+        write(1, "again", &high),
+        write(2, "other", &low),
+        write(3, "again", &high),
+    ];
+    let mut writer0 =
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, NEW)).unwrap();
+    let mut writer1 =
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, NEW)).unwrap();
+    let answers = taken_past_a_switch(&mut writer1, stream.clone())
+        .await
+        .unwrap();
+    let waits = writer1.take_waits();
+    taken_past_a_switch(&mut writer0, stream.clone())
+        .await
+        .unwrap();
+    writer0.take_waits();
+    let answered = settled(&lake1, writer1.stream_name(), answers, waits).await;
+    let count = |at: usize| {
+        let (_, payload) = answered[at]
+            .1
+            .clone()
+            .unwrap_or_else(|failed| panic!("write {} refused: {failed:?}", at + 1));
+        let reply = RecordObservationsReply::decode(payload.as_slice()).unwrap();
+        (reply.recorded, reply.restated, reply.unchanged)
+    };
+    assert_eq!(count(0), (1, 0, 0));
+    assert_eq!(count(1), (1, 0, 0));
+    assert_eq!(
+        count(2),
+        (0, 0, 1),
+        "the row sent again at 3, below the old stream's taken_from: counted unchanged"
+    );
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, zero, one)));
+}
+
+/// The review of item 191's finding 2, in `tolerant`: a lake with no
+/// write-ahead stream reads and writes no place in one at a move's switch.
+/// Places a lake kept in `ha` before it left stay as they were, and the
+/// range keeps no `taken_from` from them.
+#[test]
+fn a_switch_in_tolerant_reads_and_writes_no_place_in_a_stream() {
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::group_key;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // The dataset and both its halves group 1's.
+    let (url, zero, one, _dataset, _lower, upper, _low, _high) =
+        two_groups_and_a_split_of("tolerant-places", 1);
+    for store in [&zero, &one] {
+        store.in_stream(meridian_lake::postgres::NO_STREAM);
+    }
+    // A place group 0 kept in `ha`, frozen since.
+    let frozen = WriteAheadPosition {
+        sequence: 7,
+        at_ns: 700,
+    };
+    zero.record_write_ahead(
+        WriteAheadBatch {
+            stream: group_key(STREAM, 0),
+            after: None,
+            through: frozen,
+            ..Default::default()
+        },
+        SystemClock.now_ns(),
+    )
+    .unwrap();
+    let mover = Mover::new(
+        vec![zero.clone()],
+        zero.groups(),
+        Settings::default(),
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(&upper));
+    let ended = mover.run(&upper, 0, &Asked::default()).unwrap();
+    assert!(matches!(ended, Ended::Moved(_)), "{ended:?}");
+    assert_eq!(
+        zero.write_ahead_position(&group_key(STREAM, 0)).unwrap(),
+        Some(frozen),
+        "a place kept in ha taken back by a switch in tolerant"
+    );
+    let taken_from: Option<i64> = postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT taken_from FROM lake_partition WHERE dataset = $1",
+            &[&upper],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(taken_from, None, "a taken_from kept from no stream");
+}
+
 /// The same, where the switch's target is the group answering the dataset
 /// (failover-repeat 43993402238, ha run 3: "lake range
 /// drive-data:drive/8000-ffff to group 1, from database 0 to database 1: no
