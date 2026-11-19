@@ -9248,6 +9248,301 @@ fn a_switch_in_tolerant_reads_and_writes_no_place_in_a_stream() {
     assert_eq!(taken_from, None, "a taken_from kept from no stream");
 }
 
+/// The review of item 191's finding 3(b): a move's switch whose source has
+/// no place in the stream -- it never committed in it -- takes its target
+/// back to before the stream's first write, never one write back: the
+/// range's writes the target passed while the source owned it are all
+/// taken again, the first among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_from_a_source_with_no_place_takes_its_target_back_to_the_streams_first_write() {
+    use meridian_domain::v1::RecordTradesRequest;
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    // The dataset group 0's, split, both halves in database 0; its lower
+    // half moves to group 1, in database 1.
+    let a = tokio::task::block_in_place(|| across("no-source", true));
+    let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
+    let mover = Arc::new(a.mover());
+    let lake1 = tokio::task::block_in_place(|| {
+        ha_lake_over(
+            a.one.clone() as Arc<dyn Store>,
+            a.ones[0].groups(),
+            "lake-1",
+            &dataset,
+        )
+    });
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.no-source.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("no-source-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&dataset, &format!("p{n}"), &low, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+        timeout_ms: None,
+    };
+    let mut writer1 =
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    // Group 1 takes 1 and 2, passing both: the lower half is group 0's,
+    // which has committed nothing in the stream.
+    taken_past_a_switch(&mut writer1, vec![write(1), write(2)])
+        .await
+        .unwrap();
+    assert_eq!(writer1.next(), 3);
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+    });
+    tokio::task::block_in_place(|| writer1.reread()).unwrap();
+    assert_eq!(
+        writer1.next(),
+        1,
+        "taken back to before the stream's first write: write 1's row of the range is group 1's to take"
+    );
+    while writer1.next() <= 2 {
+        let from = writer1.next();
+        taken_past_a_switch(&mut writer1, (from..=2).map(write).collect())
+            .await
+            .unwrap();
+    }
+    let keys: Vec<String> = tokio::task::block_in_place(|| a.rows(1, &lower))
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    assert!(
+        keys.contains(&"p1".to_string()) && keys.contains(&"p2".to_string()),
+        "both writes' rows committed where the range went: {keys:?}"
+    );
+    tokio::task::block_in_place(move || drop((writer1, lake1, mover, a)));
+}
+
+/// The review of item 191's finding 3(a): a move's switch whose target has
+/// no place in the stream writes it one, before the stream's first write,
+/// so a batch the target took on its view from before the switch -- its
+/// `after` none -- is refused, never committed without the range's rows;
+/// and the target, its view read again, takes the range's writes from the
+/// stream's first with no gap counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_to_a_target_with_no_place_refuses_its_batch_taken_on_the_view_before() {
+    use meridian_domain::v1::RecordTradesRequest;
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::service;
+    use meridian_lake::store::StoreError;
+    use meridian_lake::write_ahead::{group_key, taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let a = tokio::task::block_in_place(|| across("no-target", true));
+    let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
+    let mover = Arc::new(a.mover());
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake_over(
+                a.zero.clone() as Arc<dyn Store>,
+                a.zeros[0].groups(),
+                "lake-0",
+                &dataset,
+            ),
+            ha_lake_over(
+                a.one.clone() as Arc<dyn Store>,
+                a.ones[0].groups(),
+                "lake-1",
+                &dataset,
+            ),
+        )
+    });
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.no-target.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("no-target-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&dataset, &format!("p{n}"), &low, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+        timeout_ms: None,
+    };
+    let mut writer0 =
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
+    let mut writer1 =
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    // Group 0, the source, commits write 1's row: its place 1.
+    taken_past_a_switch(&mut writer0, vec![write(1)])
+        .await
+        .unwrap();
+    writer0.take_waits();
+    // The lower half's switch to group 1, which has never committed.
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+    });
+    // Group 1's batch of 1 and 2, taken on its view from before the switch,
+    // which names the range group 0's: none of the range's rows in it.
+    let took = tokio::task::block_in_place(|| writer1.take(vec![write(1), write(2)]));
+    assert!(
+        matches!(took, Err(StoreError::PositionMoved(_))),
+        "a batch taken on the view from before the switch was committed: {:?}",
+        took.map(|answers| answers.len())
+    );
+    tokio::task::block_in_place(|| writer1.reread()).unwrap();
+    assert_eq!(writer1.next(), 1, "taken from the stream's first write");
+    while writer1.next() <= 2 {
+        let from = writer1.next();
+        taken_past_a_switch(&mut writer1, (from..=2).map(write).collect())
+            .await
+            .unwrap();
+    }
+    let keys: Vec<String> = tokio::task::block_in_place(|| a.rows(1, &lower))
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    assert!(
+        keys.contains(&"p2".to_string()),
+        "write 2's row committed where the range went: {keys:?}"
+    );
+    let (dropped, _) =
+        tokio::task::block_in_place(|| a.one.write_ahead_found(&group_key(STREAM, 1))).unwrap();
+    assert!(dropped.is_empty(), "no gap counted: {dropped:?}");
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
+}
+
+/// The review of item 191's finding 11: a move's switch that takes its
+/// target back from 1 to 0 -- the source at the same place -- takes it to
+/// before the stream's first write, a place that counts nothing before the
+/// first write it takes as dropped. Write 1, which the target committed,
+/// aged out of the stream since, is never counted lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_target_taken_back_from_its_first_write_counts_no_run_before_the_streams_first() {
+    use meridian_domain::v1::RecordTradesRequest;
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::service;
+    use meridian_lake::write_ahead::{group_key, taken_past_a_switch, Taken, Writer};
+    use prost::Message;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let a = tokio::task::block_in_place(|| across("back-to-first", true));
+    let (dataset, low, lower) = (a.dataset.clone(), a.low.clone(), a.lower());
+    let mover = Arc::new(a.mover());
+    let (lake0, lake1) = tokio::task::block_in_place(|| {
+        (
+            ha_lake_over(
+                a.zero.clone() as Arc<dyn Store>,
+                a.zeros[0].groups(),
+                "lake-0",
+                &dataset,
+            ),
+            ha_lake_over(
+                a.one.clone() as Arc<dyn Store>,
+                a.ones[0].groups(),
+                "lake-1",
+                &dataset,
+            ),
+        )
+    });
+    let write = |n: u64| Taken {
+        sequence: n,
+        at_ns: 1_000 + n as i64,
+        topic: service::RECORD_TRADES.into(),
+        reply_to: Some(format!("_INBOX.back-to-first.{n}")),
+        after: None,
+        envelope: meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "coinbase-1".into(),
+                account_scope_applies: true,
+                published_at_ns: SystemClock.now_ns(),
+                message_id: format!("back-to-first-{n}"),
+                ..Default::default()
+            }),
+            payload_type: "meridian.v1.RecordTradesRequest".into(),
+            payload: RecordTradesRequest {
+                trades: vec![
+                    match trade(&dataset, &format!("p{n}"), &low, 7_000 + n as i64) {
+                        Observation::Trade(trade) => *trade,
+                        _ => unreachable!(),
+                    },
+                ],
+                want_id: String::new(),
+            }
+            .encode_to_vec(),
+        },
+        dataset: dataset.clone(),
+        timeout_ms: None,
+    };
+    let mut writer0 =
+        tokio::task::block_in_place(|| Writer::start(lake0.clone(), STREAM, 0)).unwrap();
+    let mut writer1 =
+        tokio::task::block_in_place(|| Writer::start(lake1.clone(), STREAM, 0)).unwrap();
+    // Both groups at 1: group 0 committed write 1's row, group 1 passed it.
+    taken_past_a_switch(&mut writer0, vec![write(1)])
+        .await
+        .unwrap();
+    writer0.take_waits();
+    taken_past_a_switch(&mut writer1, vec![write(1)])
+        .await
+        .unwrap();
+    // The switch steps group 1 back from 1, the source's place.
+    tokio::task::block_in_place(|| {
+        assert!(mover.begin(&lower));
+        mover.run(&lower, 1, &Asked::default()).unwrap();
+    });
+    tokio::task::block_in_place(|| writer1.reread()).unwrap();
+    assert_eq!(writer1.next(), 1);
+    // Write 1 aged out of the stream since: its first is 2.
+    taken_past_a_switch(&mut writer1, vec![write(2)])
+        .await
+        .unwrap();
+    let (dropped, _) =
+        tokio::task::block_in_place(|| a.one.write_ahead_found(&group_key(STREAM, 1))).unwrap();
+    assert!(
+        dropped.is_empty(),
+        "write 1, committed, counted lost: {dropped:?}"
+    );
+    let keys: Vec<String> = tokio::task::block_in_place(|| a.rows(1, &lower))
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    assert!(keys.contains(&"p2".to_string()), "{keys:?}");
+    tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
+}
+
 /// The same, where the switch's target is the group answering the dataset
 /// (failover-repeat 43993402238, ha run 3: "lake range
 /// drive-data:drive/8000-ffff to group 1, from database 0 to database 1: no

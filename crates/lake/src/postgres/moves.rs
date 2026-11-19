@@ -752,8 +752,13 @@ fn stream_position(
 
 /// A move's target's place in the write-ahead stream, under `key`, taken
 /// back to the source's `source` where that is earlier, else back by one
-/// write (spec 6.1). Nothing where it holds none: its first start takes from
-/// the stream's first.
+/// write (spec 6.1). Where the source has no place in the stream, to before
+/// the stream's first write (the review of item 191's finding 3): none of
+/// the range's writes in it were committed by the source, and the target
+/// takes them all again. A target with no place is given one there too: it
+/// takes from the stream's first write all the same, with no run counted
+/// before it, and a batch it took on its view from before the switch --
+/// its `after` none -- is refused.
 ///
 /// The step back by one where the two are equal (or the target's is
 /// earlier) is deliberate, not an off-by-one: it is a compare-and-set
@@ -764,31 +769,38 @@ fn stream_position(
 /// place and the ranges' owners again before its next batch and never takes
 /// the range's rows on a view that still names the source. Left equal, a
 /// stale target would go on skipping them. The write it steps back over is
-/// taken again: an idempotent repeat.
+/// taken again: an idempotent repeat. A place before the stream's first
+/// write is sequence 0 at the switch's time, so a target there already is
+/// moved all the same; the writer reads no time from it.
 fn take_back(
     client: &mut impl GenericClient,
     key: &str,
     source: Option<WriteAheadPosition>,
 ) -> Result<()> {
-    let Some(row) = client
+    let held = client
         .query_opt(
             "SELECT sequence, at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
             &[&key],
         )
         .map_err(unavailable)?
-    else {
-        return Ok(());
-    };
-    let (sequence, at_ns): (i64, i64) = (row.get(0), row.get(1));
-    let (back, back_at) = match source {
-        Some(at) if (at.sequence as i64) < sequence => (at.sequence as i64, at.at_ns),
-        _ => ((sequence - 1).max(0), at_ns),
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)));
+    let now = meridian_changes::now_ns();
+    let (back, back_at) = match (held, source) {
+        (Some((sequence, _)), Some(at)) if (at.sequence as i64) < sequence => {
+            (at.sequence as i64, at.at_ns)
+        }
+        (Some((sequence, at_ns)), Some(_)) if sequence > 1 => (sequence - 1, at_ns),
+        // Before the stream's first write: the source has no place in it,
+        // the target none, or one back at the first.
+        _ => (0, now),
     };
     client
         .execute(
-            "UPDATE lake_write_ahead SET sequence = $2, at_ns = $3, committed_at_ns = $4
-              WHERE stream = $1",
-            &[&key, &back, &back_at, &meridian_changes::now_ns()],
+            "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (stream) DO UPDATE SET sequence = EXCLUDED.sequence,
+                at_ns = EXCLUDED.at_ns, committed_at_ns = EXCLUDED.committed_at_ns",
+            &[&key, &back, &back_at, &now],
         )
         .map_err(unavailable)?;
     Ok(())

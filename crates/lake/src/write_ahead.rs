@@ -458,6 +458,13 @@ impl Writer {
         self.position.map_or(1, |at| at.sequence + 1)
     }
 
+    /// Its position where it has a place in the stream: none before its
+    /// first commit in it, or at a place before the stream's first write
+    /// that a move's switch took it back to (sequence 0).
+    pub fn placed(&self) -> Option<WriteAheadPosition> {
+        self.position.filter(|at| at.sequence > 0)
+    }
+
     /// The ranges' writer groups read again into the member's view.
     pub fn read_owners(&self) -> Result<(), StoreError> {
         self.lake.read_owners_again()
@@ -504,13 +511,20 @@ impl Writer {
         // 191, ruled 2026-11-19). Writes in the stream are taken again, and
         // each row is recorded once. A group that has committed goes on
         // from its position, and a run the stream dropped past it is a gap.
-        let fresh = self.position.is_none();
+        //
+        // A place before the stream's first write, where a move's switch
+        // took the group back with no place of the source's to take it to
+        // (sequence 0; the review of item 191's findings 3 and 11), is no
+        // place in the stream: it holds no time, and counts nothing before
+        // the first write as dropped.
+        let placed = self.placed();
+        let fresh = placed.is_none();
         let mut expected = if fresh {
             taken[0].sequence
         } else {
             self.next()
         };
-        let mut before_at = self.position.map_or(0, |at| at.at_ns);
+        let mut before_at = placed.map_or(0, |at| at.at_ns);
         let mut dropped = Vec::new();
         for write in &taken {
             if write.sequence > expected {
@@ -1163,7 +1177,7 @@ async fn started(lake: &Arc<Lake>, identity: i64) -> Writer {
         }
     };
     lake.with_stream(identity);
-    if writer.position().is_none() {
+    if writer.placed().is_none() {
         tracing::info!(
             identity,
             "the lake has no place in this write-ahead stream: taken from the first write it \
