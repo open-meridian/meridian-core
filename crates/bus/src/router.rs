@@ -1600,7 +1600,15 @@ mod tests {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(("R".into(), vec![]))
         });
-        let ask = || bus.call("platform.book.command.record-order", "Q", vec![], None, None);
+        let ask = || {
+            bus.call(
+                "platform.book.command.record-order",
+                "Q",
+                vec![],
+                None,
+                None,
+            )
+        };
         ask().await.expect("answered while it writes");
         assert!(!bus.refuses_from_here());
         bus.refuse_from_here();

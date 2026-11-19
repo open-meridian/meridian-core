@@ -1249,7 +1249,7 @@ async fn renew_while_writing<L, D>(
                 return down(
                     component,
                     &format!("another member ({holder}) holds the lease"),
-                )
+                );
             }
             // A write came between this renewal's read, which named this
             // writer, and its own, and the lease read again within the

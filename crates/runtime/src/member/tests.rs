@@ -2923,7 +2923,10 @@ async fn a_writer_fenced_while_it_serves_on_answers_ask_again_until_another_serv
         .await
     });
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!refusing.load(Ordering::SeqCst), "it refused before any fence");
+    assert!(
+        !refusing.load(Ordering::SeqCst),
+        "it refused before any fence"
+    );
     // The writer taking its partitions over raised its epoch.
     head.store(6, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -2942,7 +2945,10 @@ async fn a_writer_fenced_while_it_serves_on_answers_ask_again_until_another_serv
         .await
         .expect("another writer serving, the fenced writer never ended")
         .expect("said");
-    assert!(why.contains("past this writer's 5"), "it ended saying {why:?}");
+    assert!(
+        why.contains("past this writer's 5"),
+        "it ended saying {why:?}"
+    );
     assert_eq!(serving.await.expect("served on"), ServedOn::AnotherServes);
 }
 

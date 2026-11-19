@@ -1828,7 +1828,11 @@ async fn a_writer_fenced_while_it_serves_on_refuses_every_request_to_be_asked_ag
                 answered += 1;
             }
             Err(BusError::HandlerFailed { detail, .. }) => {
-                assert_eq!(meridian_bus::refusal_retry_after(&detail), Some(1), "{detail}");
+                assert_eq!(
+                    meridian_bus::refusal_retry_after(&detail),
+                    Some(1),
+                    "{detail}"
+                );
             }
             Err(other) => panic!("neither answered nor to be asked again: {other:?}"),
         }
