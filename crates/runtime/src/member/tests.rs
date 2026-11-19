@@ -1481,6 +1481,46 @@ fn a_member_with_no_lease_writes_at_once() {
     assert_eq!(said().mode(), "writer");
 }
 
+/// CI 44556229125: every writer's report said `partitions: []` -- only a
+/// standby's following ever set them -- so `meridian status`, the
+/// Resilience page and the e2e saw no writer's partitions. A writer reports
+/// the partitions it writes, sorted, read at once and again as they change;
+/// a read that fails keeps what was read last.
+#[tokio::test(start_paused = true)]
+async fn a_writers_report_lists_the_partitions_it_writes() {
+    let member = Member::sole("bor");
+    let bus = Arc::new(Bus::single(
+        "member-test-bor-writer",
+        Arc::new(meridian_bus::MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let holding = member.wait_to_write(&bus).await.unwrap();
+    assert_eq!(said().mode(), "writer");
+    let read: Arc<Mutex<Result<Vec<String>, String>>> = Arc::new(Mutex::new(Ok(vec![
+        "P1".to_string(),
+        meridian_changes::CONTROL.to_string(),
+        "P0".to_string(),
+    ])));
+    let reading = Arc::clone(&read);
+    holding.report_partitions(move || reading.lock().unwrap().clone());
+    let reported = || member_report("bor", 0, 0).partitions;
+    until("the writer's partitions reported", || {
+        reported() == ["P0", "P1", "control"]
+    })
+    .await;
+    // Changed: read again within the interval its reports go out at.
+    *read.lock().unwrap() = Ok(vec!["P2".to_string(), "P0".to_string()]);
+    tokio::time::sleep(PARTITIONS_READ_EVERY).await;
+    until("the writer's partitions read again", || {
+        reported() == ["P0", "P2"]
+    })
+    .await;
+    // A read that fails keeps the last.
+    *read.lock().unwrap() = Err("the database did not answer".to_string());
+    tokio::time::sleep(PARTITIONS_READ_EVERY * 2).await;
+    assert_eq!(reported(), ["P0", "P2"]);
+}
+
 #[test]
 fn the_tail_is_one_compressed_page_per_transaction() {
     let bus = Arc::new(Bus::single(

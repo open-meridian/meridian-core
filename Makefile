@@ -2463,12 +2463,28 @@ chart-check:
 	@# is ready, so no server waits on another's readiness to start. With
 	@# JetStream, ready also asks that the server is one of the metadata
 	@# group's peers by its own /raftz, which /healthz does not (CI
-	@# 43539633884, 43955282180); without, there is no group to ask.
+	@# 43539633884, 43955282180); without, there is no group to ask. Its
+	@# liveness probe asks the same, over a long bound (CI 44556229125: a
+	@# server that passed its start once then failed every check for over
+	@# 30 minutes, never restarted, as no probe could restart it): a server
+	@# that stays unhealthy past 300 s is started again, as itself, on its
+	@# own volume.
 	@for profile in tolerant ha; do \
 		said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
 			--set resilience.profile=$$profile --show-only templates/broker.yaml 2>/dev/null)"; \
-		[ "$$(echo "$$said" | grep -c "GET /healthz HTTP/1.0")" -eq 2 ] \
-			|| { echo "chart-check FAILED: the broker's startup and readiness probes are not its full /healthz ($$profile)" >&2; exit 1; }; \
+		live="$$(echo "$$said" | awk '$$0 == "          livenessProbe:" { on = 1; print; next } on && /^          [^ ]/ { on = 0 } on')"; \
+		[ -n "$$live" ] \
+			|| { echo "chart-check FAILED: the broker has no liveness probe, so a server that stays unhealthy is never started again ($$profile; CI 44556229125)" >&2; exit 1; }; \
+		echo "$$live" | grep -q "GET /healthz HTTP/1.0" \
+			|| { echo "chart-check FAILED: the broker's liveness probe is not its full /healthz ($$profile)" >&2; exit 1; }; \
+		period=$$(echo "$$live" | sed -nE 's/^ +periodSeconds: ([0-9]+)$$/\1/p'); \
+		failures=$$(echo "$$live" | sed -nE 's/^ +failureThreshold: ([0-9]+)$$/\1/p'); \
+		[ -n "$$period" ] && [ -n "$$failures" ] && [ $$((period * failures)) -eq 300 ] \
+			|| { echo "chart-check FAILED: the broker's liveness bound is $${period:-?} s x $${failures:-?}, not 300 s ($$profile)" >&2; exit 1; }; \
+		if [ $$profile = ha ]; then echo "$$live" | grep -q 'GET /raftz?group=_meta_ HTTP/1.0.*-eq [$$][(][(]size - 1[)][)]' \
+			|| { echo "chart-check FAILED: the broker's liveness probe does not ask that the server is one of the metadata group's peers (ha)" >&2; exit 1; }; fi; \
+		[ "$$(echo "$$said" | grep -c "GET /healthz HTTP/1.0")" -eq 3 ] \
+			|| { echo "chart-check FAILED: the broker's startup, readiness and liveness probes are not its full /healthz ($$profile)" >&2; exit 1; }; \
 		echo "$$said" | grep -q 'js-enabled-only' \
 			&& { echo "chart-check FAILED: the broker's probe reads only that JetStream is on ($$profile)" >&2; exit 1; }; \
 		echo "$$said" | grep -q '^  publishNotReadyAddresses: true$$' \
@@ -2476,7 +2492,7 @@ chart-check:
 		echo "$$said" | grep -q '^  podManagementPolicy: Parallel$$' \
 			|| { echo "chart-check FAILED: the broker's servers do not start in parallel ($$profile)" >&2; exit 1; }; \
 		members=$$(echo "$$said" | grep -c 'GET /raftz?group=_meta_ HTTP/1.0.*-eq [$$][(][(]size - 1[)][)]'); \
-		want=0; [ $$profile = ha ] && want=2; \
+		want=0; [ $$profile = ha ] && want=3; \
 		[ "$$members" -eq $$want ] \
 			|| { echo "chart-check FAILED: $$members of the broker's probes ask that the server is one of JetStream's metadata group's peers, not $$want ($$profile; CI 43539633884)" >&2; exit 1; }; \
 	done; true

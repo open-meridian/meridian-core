@@ -433,6 +433,20 @@ fn run() -> Result<(), String> {
                     .map_err(|failed| failed.to_string())
             },
         );
+        // Its partitions in its report, as its record lists their heads,
+        // and its control partition: what a standby following it names (CI
+        // 44556229125: a writer named none).
+        let listing = record.clone();
+        holding.report_partitions(move || {
+            meridian_bor::Store::heads(listing.as_ref())
+                .map(|heads| {
+                    heads
+                        .into_keys()
+                        .chain([meridian_changes::CONTROL.to_string()])
+                        .collect()
+                })
+                .map_err(|failed| failed.to_string())
+        });
         // Several writer groups (step 3d; section 6.7): each command whose
         // account another group writes handed to it, unchanged, and the
         // commands handed to this group answered here. Before the book's

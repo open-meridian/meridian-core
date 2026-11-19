@@ -460,11 +460,24 @@ spec:
           # minutes. NATS's /healthz says only that a server is current with
           # its leader, so its place in the group is read from the group as
           # the server holds it (/raftz): in CI 43539633884 all three said
-          # ok with one outside. A server that does not
-          # come right within its start's bound is started again, and joins
-          # afresh. The set starts its
-          # servers in parallel and each name resolves before it is ready,
-          # so no server waits on another's readiness to start.
+          # ok with one outside. A server that does not come right within
+          # its start's bound, 180 s, is started again; so is one that came
+          # right and then stays unhealthy past its liveness bound, 300 s
+          # (CI 44556229125: a server passed its start once, then said a
+          # consumer was "not current: group node unhealthy" at every check
+          # for over 30 minutes, and with no liveness probe nothing
+          # restarted it). Started again, a server keeps its name, so its
+          # Raft peer, and its volume, so the JetStream state it kept: it
+          # rejoins as itself and catches up from the others, and a restart
+          # clears nothing. The bound is above anything a server comes back
+          # from on its own: in CI a whole set moved to ha is ready within
+          # about 75 s of the upgrade, a server killed is back within 180 s,
+          # a roll of all three ends within 300 s and the others stay
+          # healthy through it; and restarted at 300 s and given its 180 s
+          # to start, a server is back inside the 10 minutes `meridian
+          # upgrade-deployment` waits for. The set starts its servers in
+          # parallel and each name resolves before it is ready, so no server
+          # waits on another's readiness to start.
           startupProbe:
             exec:
               command: {{ include "meridian-runtime.brokerHealthz" . }}
@@ -477,6 +490,12 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
