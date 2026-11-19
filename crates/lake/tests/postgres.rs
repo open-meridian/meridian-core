@@ -12165,3 +12165,45 @@ fn a_schema_lock_a_cut_off_session_holds_is_waited_for_a_bounded_while() {
         .execute("SELECT pg_advisory_unlock($1)", &[&KEY])
         .unwrap();
 }
+
+/// Review c5s L1, a tolerant lowering 3 -> 2: group 1's takeover raised the
+/// row of group 2, now past the count, to group 1's own epoch. Group 1's
+/// writer restarted at the unchanged count adopts its epoch: a row past the
+/// count is no live group's, so it takes nothing over and records no
+/// "assigned" takeover at every restart.
+#[test]
+fn a_writer_restarted_after_a_lowering_adopts_its_epoch_past_a_stale_row() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-lowered-restart");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    for group in 0..3 {
+        store(group, 3)
+            .take_over(&TookOver::unnamed(LEASE_FREE))
+            .unwrap();
+    }
+    store(0, 2)
+        .take_over(&TookOver::unnamed(LEASE_FREE))
+        .unwrap();
+    let one = store(1, 2);
+    let epoch = one.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let mut sql = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let took_over = |sql: &mut postgres::Client| -> i64 {
+        sql.query_one("SELECT count(*) FROM lake_writer_took_over", &[])
+            .unwrap()
+            .get(0)
+    };
+    let before = took_over(&mut sql);
+    drop(one);
+    let restarted = store(1, 2);
+    assert_eq!(
+        restarted.adopt().unwrap(),
+        epoch,
+        "group 1's writer took over again at an unchanged count"
+    );
+    assert_eq!(took_over(&mut sql), before, "a takeover was recorded");
+}
