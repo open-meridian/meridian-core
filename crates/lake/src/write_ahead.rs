@@ -499,26 +499,34 @@ impl Writer {
             sequence: last.sequence,
             at_ns: last.at_ns,
         };
-        // A writer group that has never committed in this stream -- no
-        // position of its own under its key in any of the lake's databases
-        // (a position is committed with its batch's rows) -- takes from the
-        // first write the stream still holds, and counts none before it
-        // dropped: a group past the first started after `writerGroups` was
-        // raised, whose earlier writes were group 0's to take, and were
-        // taken (step 3d; section 6.1; CI 43615034712); or any group in a
-        // stream made again under the same name, which numbers from its
-        // own first and holds none of the writes the lake answered (item
-        // 191, ruled 2026-11-19). Writes in the stream are taken again, and
-        // each row is recorded once. A group that has committed goes on
-        // from its position, and a run the stream dropped past it is a gap.
+        // A writer group past the first that has never committed in this
+        // stream -- no position of its own under its key in any of the
+        // lake's databases (a position is committed with its batch's rows)
+        // -- takes from the first write the stream still holds, and counts
+        // none before it dropped: started after `writerGroups` was raised,
+        // its earlier writes were group 0's to take, and were taken (step
+        // 3d; section 6.1; CI 43615034712). Writes in the stream are taken
+        // again, and each row is recorded once. Group 0 with no position in
+        // the stream counts the stream's own sequences from 1 (the review
+        // of item 191's finding 5, the coordinator's reading, item 203): a
+        // run that aged out before its first take -- a writer down longer
+        // than the stream's bound -- is a gap (spec section 4). A stream
+        // made again under the same name numbers from its own first: the
+        // writes of the one before are never in its numbering, and nothing
+        // is counted lost of them (item 191, ruled 2026-11-19). A group that
+        // has committed goes on from its position, and a run the stream
+        // dropped past it is a gap.
         //
         // A place before the stream's first write, where a move's switch
         // took the group back with no place of the source's to take it to
         // (sequence 0; the review of item 191's findings 3 and 11), is no
-        // place in the stream: it holds no time, and counts nothing before
-        // the first write as dropped.
+        // place in the stream for any group: it holds no time, and counts
+        // nothing before the first write as dropped.
         let placed = self.placed();
-        let fresh = placed.is_none();
+        let fresh = match self.position {
+            None => self.lake.groups().mine() > 0,
+            Some(_) => placed.is_none(),
+        };
         let mut expected = if fresh {
             taken[0].sequence
         } else {
@@ -1162,8 +1170,9 @@ pub async fn taken_past_a_switch(
 /// place read again until the store answers; said where the lake has none
 /// in it (item 191, ruled 2026-11-19): a stream made again under its name,
 /// or one the lake never took from, is taken from the first write it still
-/// holds, and nothing before that is counted lost -- the lake answered none
-/// of it.
+/// holds. Nothing of the stream before it is counted lost: its writes are
+/// not in this one's numbering. Group 0 counts this stream's own writes
+/// that aged out before its first take (finding 5, item 203).
 async fn started(lake: &Arc<Lake>, identity: i64) -> Writer {
     let writer = loop {
         let started =
@@ -1181,7 +1190,7 @@ async fn started(lake: &Arc<Lake>, identity: i64) -> Writer {
         tracing::info!(
             identity,
             "the lake has no place in this write-ahead stream: taken from the first write it \
-             holds, none before it counted lost"
+             holds; nothing of a stream before it under its name is counted lost"
         );
     }
     writer

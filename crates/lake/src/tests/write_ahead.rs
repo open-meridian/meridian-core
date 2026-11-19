@@ -352,24 +352,15 @@ async fn a_gap_whose_want_is_declined_is_unrecovered() {
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     let mut writer =
         tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, 0)).unwrap();
-    tokio::task::block_in_place(|| {
-        writer.take(vec![written(
-            1,
-            "kraken-1",
-            vec![close("kraken-1", "k", BTC, "2026-10-07", "1")],
-        )])
-    })
-    .unwrap();
-    let mut next = written(
-        3,
+    let mut first = written(
+        2,
         "coinbase-1",
         vec![close("coinbase-1", "a", BTC, "2026-10-07", "1")],
     );
-    next.after = Some(2);
-    // At 1, and the stream's next is 3: 2 was dropped before the writer
-    // took it. (A writer with no place in the stream takes from its first
-    // and counts nothing before it lost: item 191.)
-    tokio::task::block_in_place(|| writer.take(vec![next])).unwrap();
+    first.after = Some(1);
+    // No position yet and the stream's first is 2: 1 was dropped before any
+    // writer took it.
+    tokio::task::block_in_place(|| writer.take(vec![first])).unwrap();
     let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
         .unwrap();
     let mut asked = envelope("coinbase-1", true, "");
@@ -559,8 +550,8 @@ async fn each_writer_group_takes_its_own_datasets_writes_from_the_stream_with_it
 /// and were taken, so the group begins at the first write the stream still
 /// holds and counts none before it dropped: no run, no gap, nothing logged
 /// in the control partition, which group 0 writes. Its own dataset's write
-/// is committed and answered. Group 0 with no position takes from the
-/// first write the stream holds too (item 191).
+/// is committed and answered. Group 0 with no position still finds the run
+/// it never took.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_streams_first_with_no_gap(
 ) {
@@ -633,13 +624,17 @@ async fn a_writer_group_started_after_the_count_was_raised_takes_from_the_stream
         1,
         "its gap recorded"
     );
-    // Group 0 with no position in the stream takes from the first write it
-    // holds too, and counts none before it dropped (item 191, ruled
-    // 2026-11-19): the lake answered none of them.
+    // Group 0, with no position, never took 1 to 1,809: those it finds.
     let mut zero = tokio::task::block_in_place(|| Writer::start(lake_of(0), STREAM, 0)).unwrap();
     tokio::task::block_in_place(|| zero.take(vec![write(1_811)])).unwrap();
     let (dropped, _) = h.store.write_ahead_found(&key(0)).unwrap();
-    assert!(dropped.is_empty(), "no run counted dropped: {dropped:?}");
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(1, 1_810)]
+    );
 }
 
 /// Item 191 (ruled 2026-11-19): leaving `ha` deletes JetStream's volumes,
@@ -850,6 +845,41 @@ async fn places_kept_by_the_streams_name_are_never_carried_into_a_stream_made_af
             .write_ahead_position(&crate::write_ahead::stream_key(STREAM, made_again))
             .unwrap(),
         None
+    );
+}
+
+/// The review of item 191's finding 5 (the coordinator's reading, item
+/// 203): group 0, in a stream it has no place in, counts the stream's own
+/// sequences from 1. A run that aged out of the stream before its first
+/// take -- a new stream whose writer was down longer than its bound -- is
+/// a gap (spec section 4, GAP_CAUSE_WRITE_AHEAD_BOUND). The old stream's
+/// writes are never in the new one's numbering: nothing is counted lost of
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_zero_with_no_place_in_a_stream_counts_a_run_aged_out_before_its_first_take() {
+    const IDENTITY: i64 = NOW - 1_000;
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut writer =
+        tokio::task::block_in_place(|| Writer::start(h.lake.clone(), STREAM, IDENTITY)).unwrap();
+    assert_eq!(writer.position(), None);
+    let first = written(
+        5,
+        "coinbase-1",
+        vec![close("coinbase-1", "a", BTC, "2026-10-07", "1")],
+    );
+    tokio::task::block_in_place(|| writer.take(vec![first])).unwrap();
+    let (dropped, _) = h
+        .store
+        .write_ahead_found(&crate::write_ahead::stream_key(STREAM, IDENTITY))
+        .unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|run| (run.first, run.last))
+            .collect::<Vec<_>>(),
+        vec![(1, 4)],
+        "1 to 4 aged out before group 0's first take: a gap"
     );
 }
 
