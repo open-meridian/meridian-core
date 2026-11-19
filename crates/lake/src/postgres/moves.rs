@@ -227,6 +227,21 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Whether a range's row here is a move's pointer naming writer group
+    /// `group`: beside it, a switch between databases may keep, under the
+    /// group's key, the place it takes the range's rows from (the review of
+    /// item 191's finding 4).
+    pub fn points_to(&self, group: u32) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM lake_partition WHERE writer_group = $1 AND epoch = $2 LIMIT 1",
+                &[&(group as i32), &meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .is_some())
+    }
+
     /// Every range's row here: its group as named, its head, and whether
     /// it is written (not a move's pointer).
     #[allow(clippy::type_complexity)]

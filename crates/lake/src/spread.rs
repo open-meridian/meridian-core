@@ -147,11 +147,20 @@ impl Spread {
         Ok(away)
     }
 
-    /// The furthest position kept under `key` in any database.
-    fn furthest_position(&self, key: &str) -> Result<Option<WriteAheadPosition>> {
+    /// The furthest position writer group `group` keeps under `key` in any
+    /// database, never one beside a move's pointer naming the group (the
+    /// review of item 191's finding 4): a range's switch between databases
+    /// keeps there, under the target's own key, the place its target takes
+    /// the range's rows from -- the source's, which the target has not
+    /// committed to. Taken for the group's own, a fresh target skipped its
+    /// own ranges' writes up to it with no gap.
+    fn furthest_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
         let mut furthest: Option<WriteAheadPosition> = None;
         for store in &self.stores {
             if let Some(at) = store.write_ahead_position(key)? {
+                if store.points_to(group)? {
+                    continue;
+                }
                 if furthest.is_none_or(|held| at.sequence > held.sequence) {
                     furthest = Some(at);
                 }
@@ -654,8 +663,9 @@ impl Store for Spread {
         // count was raised (step 3d; "lake loss is re-sent, never silent").
         // That position is carried home with nothing else, so the writer
         // goes on from it and a run the stream dropped past it is a gap --
-        // never mistaken for a group's first start.
-        let Some(at) = self.furthest_position(stream)? else {
+        // never mistaken for a group's first start. Never a point a switch
+        // kept beside a pointer, which is the source's (finding 4).
+        let Some(at) = self.furthest_position(stream, self.groups.mine())? else {
             return Ok(None);
         };
         self.own().record_write_ahead(
@@ -706,7 +716,7 @@ impl Store for Spread {
         if let Some(at) = self.database(home).write_ahead_position(key)? {
             return Ok(Some(at));
         }
-        self.furthest_position(key)
+        self.furthest_position(key, group)
     }
 
     fn range_between(&self, dataset: &str) -> Result<bool> {

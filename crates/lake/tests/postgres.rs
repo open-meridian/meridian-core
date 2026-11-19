@@ -9543,6 +9543,67 @@ async fn a_target_taken_back_from_its_first_write_counts_no_run_before_the_strea
     tokio::task::block_in_place(move || drop((writer0, writer1, lake0, lake1, mover, a)));
 }
 
+/// The review of item 191's finding 4: a range's switch between databases
+/// stopped between its two rows keeps, beside the source's pointer, the
+/// place its target takes the range's rows from -- the source's -- under
+/// the target's key. A target group that has never committed is not at
+/// that place: its own position is none, its home's first, never a point
+/// kept beside a pointer, so it skips none of its own ranges' writes.
+#[test]
+fn a_point_kept_beside_a_pointer_is_never_a_fresh_groups_own_position() {
+    use meridian_changes::moves::points;
+    use meridian_lake::partition_moves::Asked;
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    use meridian_lake::write_ahead::group_key;
+    const STREAM: &str = "LAKE_WRITE_AHEAD";
+    let a = across("kept-point", true);
+    let lower = a.lower();
+    let mover = a.mover();
+    // Group 0, the source, has committed through 5, at home.
+    let source = WriteAheadPosition {
+        sequence: 5,
+        at_ns: 500,
+    };
+    a.zero
+        .record_write_ahead(
+            WriteAheadBatch {
+                stream: group_key(STREAM, 0),
+                after: None,
+                through: source,
+                ..Default::default()
+            },
+            SystemClock.now_ns(),
+        )
+        .unwrap();
+    points::arm(
+        "lake.switch.between",
+        &lower,
+        Arc::new(|_| Err("stopped between the two databases".into())),
+    );
+    assert!(mover.begin(&lower));
+    let _ = mover.run(&lower, 1, &Asked::default());
+    points::disarm("lake.switch.between", &lower);
+    // The point kept beside the source's pointer, in database 0.
+    assert_eq!(
+        a.zeros[0]
+            .write_ahead_position(&group_key(STREAM, 1))
+            .unwrap(),
+        Some(source),
+        "the point kept beside the pointer"
+    );
+    // Group 1 has never committed: no position of its own.
+    assert_eq!(
+        a.one.write_ahead_position(&group_key(STREAM, 1)).unwrap(),
+        None,
+        "a fresh group adopted the point kept beside a pointer"
+    );
+    assert_eq!(
+        a.zero.group_position(&group_key(STREAM, 1), 1).unwrap(),
+        None,
+        "another group read the point kept beside a pointer as group 1's"
+    );
+}
+
 /// The same, where the switch's target is the group answering the dataset
 /// (failover-repeat 43993402238, ha run 3: "lake range
 /// drive-data:drive/8000-ffff to group 1, from database 0 to database 1: no
