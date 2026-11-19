@@ -389,6 +389,15 @@ struct Held {
     fenced: Option<bool>,
 }
 
+/// Says [`SERVED_ON`] as it is dropped: a serve-on's end, whatever ends it.
+struct ServedOnAtTheEnd<'a>(&'a ServingOnSeen);
+
+impl Drop for ServedOnAtTheEnd<'_> {
+    fn drop(&mut self) {
+        self.0.at.send_replace(SERVED_ON);
+    }
+}
+
 const NOT_SERVING_ON: u8 = 0;
 const SERVING_ON: u8 = 1;
 const SERVED_ON: u8 = 2;
@@ -439,9 +448,11 @@ impl ServingOn {
             held.refuse = Some(Box::new(refuse));
             self.0.at.send_replace(SERVING_ON);
         }
-        let served = serve_on_within(mine, count, true, told_at_ns, look, at_most, every).await;
-        self.0.at.send_replace(SERVED_ON);
-        served
+        // Its end said however it ends, this future dropped part-way
+        // included: a fence waiting on it never waits for good (review-c5n2
+        // L4).
+        let _ends = ServedOnAtTheEnd(&self.0);
+        serve_on_within(mine, count, true, told_at_ns, look, at_most, every).await
     }
 
     /// This writer is fenced, seen now. Serving on, it writes nothing more

@@ -3980,3 +3980,39 @@ async fn a_writer_fenced_before_it_is_told_to_stop_ends_at_once_told_while_it_le
         "fenced before it was told to stop, it served on"
     );
 }
+
+/// A serve-on whose future is dropped part-way -- its task ended -- never
+/// leaves the fence of its writer waiting for good (review-c5n2 L4): its
+/// end is said as it is dropped, and the writer steps down.
+#[tokio::test(start_paused = true)]
+async fn a_serve_on_dropped_part_way_never_leaves_its_fenced_writer_waiting() {
+    let serving_on = ServingOn::default();
+    let on = serving_on.clone();
+    let serving = tokio::spawn(async move {
+        on.within(
+            1,
+            2,
+            42,
+            |_, _| Ok(false),
+            || {},
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let fenced = serving_on.clone();
+    let waiting =
+        tokio::spawn(async move { fenced_stepping_down::<KubeLeases>(&fenced, None, "bor").await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !waiting.is_finished(),
+        "fenced while serving on, it did not wait its serve-on out"
+    );
+    serving.abort();
+    let _ = serving.await;
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("its serve-on dropped, the fenced writer waited on")
+        .expect("waited");
+}
