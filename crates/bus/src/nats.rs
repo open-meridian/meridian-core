@@ -1067,16 +1067,21 @@ impl NatsBackend {
                     if let Some(route) = route {
                         let started = std::time::Instant::now();
                         let looked = asked.clone();
-                        let owner = tokio::task::spawn_blocking(move || route(&looked))
+                        let deciding = route.clone();
+                        let owner = tokio::task::spawn_blocking(move || deciding.owner(&looked))
                             .await
                             .ok()
                             .flatten();
                         // A wait spent while it was decided: dropped here,
                         // below, as any request whose caller stopped waiting
-                        // -- never passed on to be run late.
+                        // -- never passed on to be run late. A fence that
+                        // landed meanwhile: refused here, below, by its
+                        // handler, never passed on (review-c5n5 F2).
                         let spent = deadline
                             .is_some_and(|deadline| std::time::Instant::now() >= deadline);
-                        if let Some((internal, group)) = owner.filter(|_| !spent) {
+                        if let Some((internal, group)) =
+                            owner.filter(|_| !spent && !route.refuses())
+                        {
                             let mut headers = async_nats::HeaderMap::new();
                             headers.insert(
                                 crate::owners::WRITER_GROUP_HEADER,

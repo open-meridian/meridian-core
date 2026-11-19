@@ -1910,3 +1910,82 @@ async fn a_writer_handing_every_write_on_fenced_while_it_serves_on_refuses_at_on
         );
     }
 }
+
+/// A write whose owner was being decided when its writer was fenced while
+/// it served on is refused to be asked again -- UNAVAILABLE, retry-after 1
+/// -- and never passed on by the owners it last read (ruled 2026-11-18,
+/// item 120; review-c5n5 F2): the fence lands between the owner's decision
+/// and the publish, which looks again. Before, a decision begun before the
+/// fence was passed on all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_owner_was_being_decided_at_the_fence_is_refused_not_passed_on() {
+    let instance = format!("store-{}", mark("deciding-fenced"));
+    let write = topic("command.record");
+    let internal = topic("internal.command");
+    // The second group's old writer, whose owners say the write is the
+    // first group's: its decision held until the test lets it go.
+    let (entered, mut deciding) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let old = bus(&instance).await;
+    old.hand_writes_on(&internal, 1, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.route_writes_by(move |_, _| {
+        let _ = entered.send(());
+        let _ = released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10));
+        Some(0)
+    });
+    old.serve(&write, |_| {
+        Ok(("meridian.test.Answer".to_string(), b"old".to_vec()))
+    });
+    // The first group's writer: offers the internal topic to group 0.
+    let new = bus(&instance).await;
+    new.hand_writes_on(&internal, 0, {
+        let write = write.clone();
+        move |topic| topic == write
+    });
+    old.subscribed().await.expect("subscribed");
+    new.subscribed().await.expect("subscribed");
+    settle().await;
+    let asking = bus("asking").await;
+    let asked = {
+        let write = write.clone();
+        tokio::spawn(async move {
+            asking
+                .call(
+                    &write,
+                    "meridian.test.Question",
+                    Vec::new(),
+                    None,
+                    Some(Duration::from_millis(3_000)),
+                )
+                .await
+        })
+    };
+    // Its owner being decided, the writer is fenced while it serves on.
+    tokio::time::timeout(Duration::from_secs(5), deciding.recv())
+        .await
+        .expect("the write's owner was never decided")
+        .unwrap();
+    old.refuse_from_here();
+    release.send(()).unwrap();
+    let detail = match asked.await.unwrap() {
+        Err(BusError::HandlerFailed { detail, .. }) => detail,
+        other => panic!("fenced while its owner was decided, the write was answered {other:?}"),
+    };
+    assert_eq!(
+        meridian_bus::read_refusal_status(&detail).map(|(status, _, _)| status),
+        Some(meridian_bus::RefusalStatus::Unavailable),
+        "{detail}"
+    );
+    assert_eq!(
+        meridian_bus::refusal_retry_after(&detail),
+        Some(1),
+        "{detail}"
+    );
+}

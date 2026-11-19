@@ -614,19 +614,19 @@ impl Bus {
         let routing = Arc::clone(&self.routing);
         let refusing = Arc::clone(&self.refusing);
         let asked = topic.to_string();
-        let route: crate::backend::PreRoute = Arc::new(move |envelope: &Envelope| {
-            // Fenced while it served on: nothing is passed on by what this
-            // member last read of the owners; its handler refuses it.
-            if refusing.load(std::sync::atomic::Ordering::SeqCst) {
-                return None;
-            }
-            let route = routing.read().expect("routing poisoned").clone()?;
-            if !(route.writes)(&asked) {
-                return None;
-            }
-            let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
-            (group != route.group).then(|| (route.internal.clone(), group))
-        });
+        // Fenced while it served on: nothing is passed on by what this
+        // member last read of the owners; its handler refuses it.
+        let route = crate::backend::PreRoute::new(
+            move |envelope: &Envelope| {
+                let route = routing.read().expect("routing poisoned").clone()?;
+                if !(route.writes)(&asked) {
+                    return None;
+                }
+                let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
+                (group != route.group).then(|| (route.internal.clone(), group))
+            },
+            refusing,
+        );
         self.backend_for(topic)
             .serve_routed(topic, &self.instance_id, handler, route);
     }
@@ -704,7 +704,7 @@ impl Bus {
     pub fn hand_to_owner(&self, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
         let route = self.routing.read().expect("routing poisoned").clone();
         match route {
-            Some(route) => hand(&route, group, topic, envelope),
+            Some(route) => hand_unless_refusing(&self.refusing, &route, group, topic, envelope),
             None => Err(format!(
                 "{topic} is writer group {group}'s to write, and this member hands nothing on"
             )),
@@ -792,11 +792,7 @@ impl Bus {
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
             if refusing.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(crate::refusal_status_retrying(
-                    crate::RefusalStatus::Unavailable,
-                    1,
-                    format!("{topic} {NO_LONGER_WRITES}"),
-                ));
+                return Err(no_longer_writes(&topic));
             }
             handler(envelope)
         })
@@ -806,8 +802,12 @@ impl Bus {
     fn routed(&self, topic: &str, handler: Handler) -> Handler {
         let routing = Arc::clone(&self.routing);
         let handing = Arc::clone(&self.handing);
+        let refusing = Arc::clone(&self.refusing);
         let topic = topic.to_string();
         Arc::new(move |envelope: Envelope| {
+            let hand = |route: &Routing, group: u32, topic: &str, envelope: Envelope| {
+                hand_unless_refusing(&refusing, route, group, topic, envelope)
+            };
             let route = routing
                 .read()
                 .expect("routing poisoned")
@@ -1631,6 +1631,74 @@ mod tests {
         );
     }
 
+    /// A handler already running when its writer is fenced while it serves
+    /// on hands nothing on after (ruled 2026-11-18, item 120; review-c5n5
+    /// F2): a part of a write spanning several groups
+    /// ([`Bus::hand_to_owner`]), or a write its handler found another
+    /// group's ([`crate::owners::hand_to`]), is refused to be asked again --
+    /// UNAVAILABLE, retry-after 1 -- not handed on by the owners it last
+    /// read. Before, each was handed on as if no fence had come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handler_running_at_the_fence_hands_nothing_on_after() {
+        for spanning in [true, false] {
+            let bus = Arc::new(bus());
+            let write = "platform.lake.command.record-prices";
+            bus.hand_writes_on("platform.lake.internal.command", 1, move |topic| {
+                topic == write
+            });
+            let (entered, running) = std::sync::mpsc::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (entered, released) = (
+                std::sync::Mutex::new(entered),
+                std::sync::Mutex::new(released),
+            );
+            let handing = Arc::downgrade(&bus);
+            bus.serve(write, move |envelope| {
+                entered.lock().unwrap().send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                if spanning {
+                    // The other group's part of a write spanning two.
+                    return handing.upgrade().unwrap().hand_to_owner(0, write, envelope);
+                }
+                // Found the other group's as it ran.
+                crate::owners::hand_to(0);
+                Err("another group's".into())
+            });
+            let asking = Arc::clone(&bus);
+            let asked =
+                tokio::spawn(async move { asking.call(write, "Q", vec![], None, None).await });
+            tokio::task::spawn_blocking(move || {
+                running.recv_timeout(Duration::from_secs(10)).unwrap()
+            })
+            .await
+            .unwrap();
+            bus.refuse_from_here();
+            release.send(()).unwrap();
+            let detail = match asked.await.unwrap() {
+                Err(BusError::HandlerFailed { detail, .. }) => detail,
+                other => panic!("fenced while it ran (spanning {spanning}), it answered {other:?}"),
+            };
+            assert_eq!(
+                crate::backend::read_refusal_status(&detail).map(|(status, _, _)| status),
+                Some(crate::RefusalStatus::Unavailable),
+                "spanning {spanning}: {detail}"
+            );
+            assert_eq!(
+                crate::backend::refusal_retry_after(&detail),
+                Some(1),
+                "spanning {spanning}: {detail}"
+            );
+            assert!(
+                detail.contains(NO_LONGER_WRITES),
+                "spanning {spanning}: handed on: {detail}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_failing_handler_reports_why() {
         let bus = bus();
@@ -1911,6 +1979,34 @@ mod acting_for {
         );
         assert_eq!(subject_seen(None).await, "");
     }
+}
+
+/// What a member that refuses from here ([`Bus::refuse_from_here`]) answers
+/// a request on `topic`: UNAVAILABLE, retry-after 1, to be asked again.
+fn no_longer_writes(topic: &str) -> String {
+    crate::refusal_status_retrying(
+        crate::RefusalStatus::Unavailable,
+        1,
+        format!("{topic} {NO_LONGER_WRITES}"),
+    )
+}
+
+/// [`hand`], unless this member refuses from here: a handler already
+/// running at its fence hands nothing on after by the owners it last read
+/// -- a part of a write spanning several groups, or a write it found
+/// another group's -- and its caller is answered "ask again" (ruled
+/// 2026-11-18, item 120; review-c5n5 F2).
+fn hand_unless_refusing(
+    refusing: &std::sync::atomic::AtomicBool,
+    route: &Routing,
+    group: u32,
+    topic: &str,
+    envelope: Envelope,
+) -> HandlerReply {
+    if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(no_longer_writes(topic));
+    }
+    hand(route, group, topic, envelope)
 }
 
 /// `envelope`, a write of `topic`, handed to writer group `group` on its
