@@ -890,7 +890,17 @@ async fn group_zero_with_no_place_in_a_stream_counts_a_run_aged_out_before_its_f
 /// and made again under its name -- `ha` taken again -- holding twelve
 /// writes, more than the old position, one of them its sidecar's next after
 /// a sequence in the old stream's dropped run. Every write of the new stream
-/// is taken and answered, and none is found to follow a gap.
+/// is taken and answered, and none is found to follow a gap. Then the
+/// stream is deleted and made again once more under the writer while it
+/// runs (the review of item 191's finding 10): the running writer finds the
+/// stream's identity another, starts again in it from its first write, and
+/// takes and answers every write of it, none found to follow a gap.
+///
+/// Run by hand, with JetStream on: `docker run --rm -d --name js -p
+/// 4222:4222 nats:2.10.29-alpine -js`, then `MERIDIAN_TEST_JETSTREAM_URL=
+/// nats://localhost:4222 cargo test -p meridian-lake --lib
+/// a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker --
+/// --ignored`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
 async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() {
@@ -1017,8 +1027,6 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
     }
     let writer = run();
     let new = heard(&mut answered, "new", 12, Duration::from_secs(30)).await;
-    writer.abort();
-    let _ = writer.await;
     assert_eq!(
         new,
         (1..=12).collect(),
@@ -1028,6 +1036,27 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
         gaps(&h, "", GapState::Unspecified),
         old_gaps,
         "no write of the new stream found to follow the old one's run"
+    );
+    // `ha` left and taken again under the running writer: the stream
+    // deleted and made again once more, four writes in it; write 3 its
+    // sidecar's next after 7, a sequence in the first stream's dropped run.
+    context.delete_stream(STREAM).await.unwrap();
+    context.create_stream(stream_config(&bounds)).await.unwrap();
+    for n in 1..=4 {
+        put("again", n, (n == 3).then_some(7)).await;
+    }
+    let again = heard(&mut answered, "again", 4, Duration::from_secs(30)).await;
+    writer.abort();
+    let _ = writer.await;
+    assert_eq!(
+        again,
+        (1..=4).collect(),
+        "every write of the stream made again under the running writer taken and answered"
+    );
+    assert_eq!(
+        gaps(&h, "", GapState::Unspecified),
+        old_gaps,
+        "no write of the stream made again under the running writer found to follow a gap"
     );
     context.delete_stream(STREAM).await.unwrap();
 }
