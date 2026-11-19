@@ -832,3 +832,84 @@ async fn a_shard_s_part_dropped_from_a_full_queue_is_handed_at_the_next_sharing(
         again.iter().take(3).collect::<Vec<_>>()
     );
 }
+
+/// Review c5z F1: the live shards change just as a taker's stream is
+/// handed its hold, before the stream would hear their next change. The
+/// change is shared all the same: the want the hold handed is shared again
+/// over the shards now live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_change_at_the_hold_s_hand_over_is_shared_again() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.set_live([1]);
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let mine: Vec<String> = names.iter().filter(|n| shards.keeps(n)).cloned().collect();
+    assert!(!mine.is_empty() && mine.len() < names.len());
+    publish_want(&bus, "want-1", &names);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The other shard is gone at the hand-over.
+    let at = Arc::downgrade(&shards);
+    shards.at_hand_over(move || {
+        if let Some(shards) = at.upgrade() {
+            shards.set_live([]);
+        }
+    });
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        heard.last(),
+        Some(&("want-1".to_string(), names)),
+        "the change at the hand-over was not shared: {} of 40 handed",
+        heard.last().map_or(0, |(_, subjects)| subjects.len())
+    );
+}
+
+/// Review c5z F2 (b): a want and its withdrawal are two topics, read by two
+/// forwarders, so the withdrawal can be heard first. The want heard after
+/// it is never handed: the lake has forgotten it, and nothing would
+/// withdraw it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_want_heard_on_the_stream_after_its_withdrawal_is_never_handed() {
+    let bus = feed_bus();
+    let (sidecar, _shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    publish_withdrawn(&bus, "late");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publish_want(&bus, "late", &["INS-1".to_string()]);
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(heard.is_empty(), "handed after its withdrawal: {heard:?}");
+}
+
+/// Review c5z, a nit: a want the take's hold handed carries the message it
+/// was heard in, as every other delivery does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_want_is_handed_with_the_message_it_was_heard_in() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    publish_want(&bus, "want-1", &["INS-1".to_string()]);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let delivery = next(&mut stream).await;
+    assert_eq!(wanted_subjects(&delivery).0, "want-1");
+    let meta = delivery.meta.expect("its meta");
+    assert!(
+        !meta.message_id.is_empty() && meta.published_at_ns > 0,
+        "handed without its message: {meta:?}"
+    );
+}

@@ -339,9 +339,19 @@ impl Sidecar {
                 Arc::new(move |row: &'static str| waiting.lose(None, Some(row))),
             );
         }
+        // Told of each change of the live shards from before the hold's
+        // hand-over and the first want forwarded (review c5z F1): a change
+        // between them and the sharing's start is shared, not missed until
+        // the next change or the lake's redelivery.
+        let changes = lake
+            .shards
+            .as_ref()
+            .filter(|_| lake.chosen.contains(WANTED))
+            .map(|shards| shards.changes());
         // A taker's hold (ruling 184): what it heard of its instance's wants
         // since before its take, handed first through the shard's own path,
-        // then its two subscriptions forwarded from where the hold left them.
+        // each with the message it came in, then its two subscriptions
+        // forwarded from where the hold left them.
         let mut forwarded: BTreeSet<&'static str> = BTreeSet::new();
         if let (Some(shards), true) = (lake.shards.as_ref(), lake.chosen.contains(WANTED)) {
             if let Some(held) = shards.take_held().await {
@@ -350,12 +360,13 @@ impl Sidecar {
                     wanted,
                     withdrawn,
                     lost,
+                    ..
                 } = held;
                 if lost {
                     waiting.lose(None, Some(WANTED));
                 }
-                for want in wants {
-                    shards.heard_then(want, |handed| hand_on(handed, &lake, &waiting));
+                for (want, meta) in wants {
+                    shards.heard_then(want, |handed| hand_on_as(handed, &lake, &waiting, &meta));
                 }
                 for (row, subscription) in [(lake.wanted, wanted), (lake.withdrawn, withdrawn)] {
                     let Some(row) = row.filter(|row| lake.chosen.contains(row.name)) else {
@@ -380,17 +391,20 @@ impl Sidecar {
                 start(row);
             }
         }
+        #[cfg(test)]
+        if let Some(shards) = &lake.shards {
+            shards.handed_over();
+        }
         // A shard's wants shared again whenever the live shards change
         // (step 3d): a lost shard's subjects handed to its plugin at once.
-        if let Some(shards) = lake.shards.clone() {
-            if lake.chosen.contains(WANTED) {
-                tokio::spawn(share_again(
-                    shards,
-                    lake.clone(),
-                    Arc::clone(&waiting),
-                    closed.clone(),
-                ));
-            }
+        if let (Some(shards), Some(changes)) = (lake.shards.clone(), changes) {
+            tokio::spawn(share_again(
+                shards,
+                changes,
+                lake.clone(),
+                Arc::clone(&waiting),
+                closed.clone(),
+            ));
         }
         let registry = Arc::clone(&self.subscriptions);
 
@@ -484,15 +498,16 @@ fn hand_on_as(
     }
 }
 
-/// Each standing want shared again when the live shards change, until the
+/// Each standing want shared again when the live shards change, as
+/// `changes` tells from when the stream subscribed to them, until the
 /// stream ends.
 async fn share_again(
     shards: Arc<crate::shards::Shards>,
+    mut changes: watch::Receiver<u64>,
     lake: Lake,
     waiting: Arc<Waiting>,
     mut closed: watch::Receiver<()>,
 ) {
-    let mut changes = shards.changes();
     loop {
         tokio::select! {
             changed = changes.changed() => if changed.is_err() { return },

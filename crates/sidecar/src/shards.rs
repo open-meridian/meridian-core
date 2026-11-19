@@ -35,7 +35,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
-use meridian_bus::{Bus, Delivery, Subscription};
+use meridian_bus::{Bus, Delivery, MessageMeta, Subscription};
 use meridian_domain::v1::{ObservationsWantedEvent, WantWithdrawnEvent};
 use prost::Message as _;
 use tokio::sync::{oneshot, watch};
@@ -82,6 +82,13 @@ pub async fn fenced() {
 /// of each was handed on, and never in their place.
 const WANTS_KEPT: usize = 4_096;
 
+/// The most withdrawals a shard remembers (review c5z F2): as many as it
+/// keeps wants of both kinds, the oldest forgotten first. A want's ID is
+/// never the lake's again once withdrawn, and the lake delivers no want
+/// after its withdrawal but in a moment's race, so a want heard after it is
+/// heard while it is remembered.
+const WITHDRAWALS_KEPT: usize = 2 * WANTS_KEPT;
+
 /// The topics of the two rows a data plugin hears its instance's wants by
 /// (W10.7), as the lake publishes them.
 pub(crate) const WANTED_TOPIC: &str = "platform.lake.event.observations-wanted";
@@ -116,9 +123,15 @@ pub struct Shards {
     /// asks for it (ruling 184): asked once, by the stream, with where to
     /// answer.
     hold: Mutex<Option<oneshot::Sender<oneshot::Sender<Held>>>>,
+    /// The take answered: the hold's bound counted from then.
+    hold_from: Mutex<Option<oneshot::Sender<()>>>,
     /// Called once a want's part is worked out and before it is kept.
     #[cfg(test)]
     between: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Called once a stream has been handed the take's hold, and before it
+    /// shares its wants again on the live shards' changes.
+    #[cfg(test)]
+    handed_over: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 #[derive(Default)]
@@ -130,14 +143,36 @@ struct Wants {
     /// standing want out.
     standing: VecDeque<String>,
     once: VecDeque<String>,
+    /// The latest wants withdrawn, and the order they were heard in (review
+    /// c5z F2): a want and its withdrawal are two topics, heard in either
+    /// order, and a want heard after its withdrawal is never kept or
+    /// handed, since nothing would withdraw it again.
+    gone: HashSet<String>,
+    gone_order: VecDeque<String>,
+}
+
+impl Wants {
+    /// `want_id` withdrawn: remembered, the oldest past
+    /// [`WITHDRAWALS_KEPT`] forgotten.
+    fn gone(&mut self, want_id: String) {
+        if self.gone.insert(want_id.clone()) {
+            self.gone_order.push_back(want_id);
+            while self.gone_order.len() > WITHDRAWALS_KEPT {
+                if let Some(oldest) = self.gone_order.pop_front() {
+                    self.gone.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 /// What a taker heard of its instance's wants from before its take until
 /// its plugin's stream opened (ruling 184), handed to that stream.
 pub(crate) struct Held {
     /// The wants, in the order first heard, each the latest heard under its
-    /// ID; none a withdrawal heard in the window named.
-    pub(crate) wants: Vec<ObservationsWantedEvent>,
+    /// ID with the message it came in; none a withdrawal heard in the window
+    /// named.
+    pub(crate) wants: Vec<(ObservationsWantedEvent, MessageMeta)>,
     /// The two subscriptions, open since before the take: the stream
     /// forwards from them, so nothing heard since is missed or heard twice.
     pub(crate) wanted: Subscription,
@@ -145,13 +180,17 @@ pub(crate) struct Held {
     /// Some were left out: the hold was full, one did not read, or the bus
     /// dropped some.
     pub(crate) lost: bool,
+    /// The withdrawals heard in the window: the shard remembers them as it
+    /// hands the hold over (review c5z F2), since their wants may still wait
+    /// in the subscriptions the stream forwards from.
+    gone: HashSet<String>,
 }
 
 /// The hold's wants, by ID, and the withdrawals heard in it.
 #[derive(Default)]
 struct Holding {
     order: Vec<String>,
-    wants: HashMap<String, ObservationsWantedEvent>,
+    wants: HashMap<String, (ObservationsWantedEvent, MessageMeta)>,
     gone: HashSet<String>,
     lost: bool,
 }
@@ -170,11 +209,12 @@ impl Holding {
         {
             return;
         }
+        let meta = heard.envelope.meta.clone().unwrap_or_default();
         if let Some(held) = self.wants.get_mut(&want.want_id) {
-            *held = want;
+            *held = (want, meta);
         } else if self.wants.len() < HOLD_MOST {
             self.order.push(want.want_id.clone());
-            self.wants.insert(want.want_id.clone(), want);
+            self.wants.insert(want.want_id.clone(), (want, meta));
         } else {
             self.lost = true;
         }
@@ -203,24 +243,29 @@ impl Holding {
 }
 
 /// A take's hold, until the stream asks for it, `within` passes, the shard
-/// is fenced, or the bus ends. Asked, it answers what it holds with its two
-/// subscriptions; otherwise it ends, and what it held is forgotten.
+/// is fenced, or the bus ends. `within` counts from the hold's start, and
+/// again from the take's answer when `from_take` tells of it. Asked, it
+/// answers what it holds with its two subscriptions; otherwise it ends, and
+/// what it held is forgotten.
 async fn holding(
     instance: String,
     mut wanted: Subscription,
     mut withdrawn: Subscription,
     mut asked: oneshot::Receiver<oneshot::Sender<Held>>,
+    mut from_take: oneshot::Receiver<()>,
     within: Duration,
 ) {
     enum Woke {
         Asked(oneshot::Sender<Held>),
         Ended,
+        Taken,
         Want(Delivery),
         Withdrawn(Delivery),
     }
     let mut held = Holding::default();
     let until = tokio::time::sleep(within);
     tokio::pin!(until);
+    let mut counted_from_take = false;
     loop {
         let woke = tokio::select! {
             biased;
@@ -230,6 +275,7 @@ async fn holding(
             },
             _ = fenced() => Woke::Ended,
             _ = &mut until => Woke::Ended,
+            _ = &mut from_take, if !counted_from_take => Woke::Taken,
             heard = withdrawn.recv() => heard.map_or(Woke::Ended, Woke::Withdrawn),
             heard = wanted.recv() => heard.map_or(Woke::Ended, Woke::Want),
         };
@@ -246,8 +292,15 @@ async fn holding(
                     wanted,
                     withdrawn,
                     lost,
+                    gone: held.gone,
                 });
                 return;
+            }
+            // The take answered (or will not be): the bound counted from
+            // now, once.
+            Woke::Taken => {
+                counted_from_take = true;
+                until.as_mut().reset(tokio::time::Instant::now() + within);
             }
             Woke::Ended => {
                 tracing::debug!(
@@ -321,8 +374,11 @@ impl Shards {
             changed: watch::channel(0).0,
             wants: Mutex::default(),
             hold: Mutex::default(),
+            hold_from: Mutex::default(),
             #[cfg(test)]
             between: Mutex::default(),
+            #[cfg(test)]
+            handed_over: Mutex::default(),
         }
     }
 
@@ -380,14 +436,39 @@ impl Shards {
         let wanted = bus.subscribe_every(WANTED_TOPIC);
         let withdrawn = bus.subscribe_every(WITHDRAWN_TOPIC);
         let (ask, asked) = oneshot::channel();
+        let (taken, from_take) = oneshot::channel();
         *self.hold.lock().expect("hold poisoned") = Some(ask);
+        *self.hold_from.lock().expect("hold poisoned") = Some(taken);
         tokio::spawn(holding(
             instance.to_string(),
             wanted,
             withdrawn,
             asked,
+            from_take,
             within,
         ));
+    }
+
+    /// The take answered: the hold's bound counted again from now (review
+    /// c5z, a nit), so it covers the lake's redelivery of what the take
+    /// delivered again, which the lake counts from its answer.
+    pub fn hold_from_the_take(&self) {
+        if let Some(taken) = self.hold_from.lock().expect("hold poisoned").take() {
+            let _ = taken.send(());
+        }
+    }
+
+    /// Run at a stream's hand-over, before it shares its wants again.
+    #[cfg(test)]
+    pub(crate) fn at_hand_over(&self, run: impl Fn() + Send + 'static) {
+        *self.handed_over.lock().unwrap() = Some(Box::new(run));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handed_over(&self) {
+        if let Some(run) = self.handed_over.lock().unwrap().as_ref() {
+            run();
+        }
     }
 
     /// What the take held, for the plugin's stream opening now: once, while
@@ -399,7 +480,16 @@ impl Shards {
         }
         let (answer, answered) = oneshot::channel();
         ask.send(answer).ok()?;
-        answered.await.ok()
+        let mut held = answered.await.ok()?;
+        // Remembered before the stream forwards from the hold's
+        // subscriptions, where a want withdrawn in the window may still wait
+        // (review c5z F2).
+        let mut wants = self.wants.lock().expect("wants poisoned");
+        for want_id in held.gone.drain() {
+            wants.gone(want_id);
+        }
+        drop(wants);
+        Some(held)
     }
 
     /// Whether `subject` is this shard's to keep.
@@ -441,8 +531,14 @@ impl Shards {
     /// takes ([`Shards::shared_again_then`]): a change of the live shards
     /// between them would else be shared over every want but this one, kept
     /// after with its part as the shards were.
+    ///
+    /// A want whose withdrawal was heard first is neither kept nor handed
+    /// (review c5z F2).
     pub fn heard_then(&self, want: ObservationsWantedEvent, hand: impl FnOnce(Handed) -> bool) {
         let mut wants = self.wants.lock().expect("wants poisoned");
+        if wants.gone.contains(&want.want_id) {
+            return;
+        }
         let (part, subjects) = self.part(&want);
         #[cfg(test)]
         if let Some(between) = self.between.lock().unwrap().as_ref() {
@@ -485,9 +581,11 @@ impl Shards {
     }
 
     /// A want the lake withdrew: forgotten, and handed on only where some
-    /// of it was this shard's.
+    /// of it was this shard's; remembered as withdrawn, so the want heard
+    /// after it is never kept (review c5z F2).
     pub fn withdrawn(&self, want_id: &str) -> bool {
         let mut wants = self.wants.lock().expect("wants poisoned");
+        wants.gone(want_id.to_string());
         wants.standing.retain(|held| held != want_id);
         wants.once.retain(|held| held != want_id);
         wants
@@ -899,7 +997,7 @@ mod tests {
     fn ids(held: &Held) -> Vec<&str> {
         held.wants
             .iter()
-            .map(|want| want.want_id.as_str())
+            .map(|(want, _)| want.want_id.as_str())
             .collect()
     }
 
@@ -934,7 +1032,7 @@ mod tests {
         settle().await;
         let held = shards.take_held().await.expect("the hold answered");
         assert_eq!(ids(&held), vec!["kept"]);
-        assert_eq!(held.wants[0].subjects.len(), 2, "the latest of the two");
+        assert_eq!(held.wants[0].0.subjects.len(), 2, "the latest of the two");
         assert!(!held.lost);
     }
 
@@ -1036,5 +1134,98 @@ mod tests {
             recording.sent.lock().unwrap()
         );
         assert!(recording.shared.lock().unwrap().is_empty());
+    }
+
+    // ---- Review c5z: F2 and the hold's bound. ----
+
+    /// Review c5z F2 (b): a want heard after its withdrawal -- two topics,
+    /// two forwarders, either order -- is never kept, so never handed, and
+    /// not shared again at a change: the lake has forgotten it, and nothing
+    /// would withdraw it.
+    #[test]
+    fn a_want_heard_after_its_withdrawal_is_never_kept_or_handed() {
+        let shards = Shards::new(0);
+        assert!(!shards.withdrawn("late"), "a want not kept was handed");
+        assert_eq!(
+            shards.heard(want("late", &["INS-1", "INS-2"], true)),
+            Handed::Nothing,
+            "a want heard after its withdrawal was handed"
+        );
+        shards.set_live([1]);
+        assert!(
+            shards.shared_again().is_empty(),
+            "a want heard after its withdrawal was kept"
+        );
+    }
+
+    /// The withdrawals remembered are bounded as the keep is: past
+    /// [`WITHDRAWALS_KEPT`], the oldest is forgotten first.
+    #[test]
+    fn the_withdrawals_remembered_are_bounded_the_oldest_forgotten_first() {
+        let shards = Shards::new(0);
+        for n in 0..=WITHDRAWALS_KEPT {
+            shards.withdrawn(&format!("gone-{n}"));
+        }
+        assert_eq!(shards.wants.lock().unwrap().gone.len(), WITHDRAWALS_KEPT);
+        assert!(matches!(
+            shards.heard(want("gone-0", &["INS-1"], true)),
+            Handed::Part(_)
+        ));
+        assert_eq!(
+            shards.heard(want(&format!("gone-{WITHDRAWALS_KEPT}"), &["INS-1"], true)),
+            Handed::Nothing
+        );
+    }
+
+    /// Review c5z F2 (c): the hold read a want's withdrawal, and the want
+    /// was still in its subscription when the stream asked. The stream
+    /// forwards it from there, and it is never handed.
+    #[tokio::test]
+    async fn a_want_left_in_the_hold_s_subscription_after_its_withdrawal_is_never_handed() {
+        clear_fenced();
+        let (pod, _, lake) = buses();
+        let shards = Shards::new(0);
+        shards.hold_wants(&pod, "feed", LONG);
+        publish_withdrawn(&lake, "w");
+        // The hold reads the withdrawal.
+        settle().await;
+        // The want waits in the hold's subscription: on this one thread the
+        // hold does not run before the stream's ask, which it reads first.
+        publish_want(&lake, &want("w", &["INS-1", "INS-2"], true));
+        let held = shards.take_held().await.expect("the hold answered");
+        assert!(held.wants.is_empty());
+        let mut wanted = held.wanted;
+        let heard = wanted.recv().await.expect("the want, still waiting");
+        let heard = ObservationsWantedEvent::decode(&heard.envelope.payload[..]).unwrap();
+        assert_eq!(heard.want_id, "w");
+        assert_eq!(
+            shards.heard(heard),
+            Handed::Nothing,
+            "a want withdrawn in the hold was handed after it"
+        );
+    }
+
+    /// The hold's bound counts from the take's answer, not from the hold's
+    /// start (review c5z, a nit): the lake's redelivery of what the take
+    /// delivered again falls within it.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_s_bound_counts_from_the_take_s_answer() {
+        clear_fenced();
+        let (pod, _, lake) = buses();
+        let shards = Shards::new(0);
+        let bound = std::time::Duration::from_secs(75);
+        shards.hold_wants(&pod, "feed", bound);
+        // The take answered a while after the hold began.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        shards.hold_from_the_take();
+        // Past the bound from the hold's start, within it from the take's.
+        tokio::time::sleep(bound - std::time::Duration::from_secs(2)).await;
+        publish_want(&lake, &want("w", &["INS-1"], true));
+        settle().await;
+        let held = shards
+            .take_held()
+            .await
+            .expect("the hold ended before its bound from the take");
+        assert_eq!(ids(&held), vec!["w"]);
     }
 }

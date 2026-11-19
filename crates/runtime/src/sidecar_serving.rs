@@ -52,8 +52,9 @@ const SERVING_ENDS_WITHIN: std::time::Duration = std::time::Duration::from_secs(
 
 /// How long a taker holds what it hears of its instance's wants for its
 /// plugin's stream (ruling 184): one full period of the lake's redelivery,
-/// its 60 s and the 15 s between its sweeps, counted from the take's own
-/// delivery. Within it the hold is the only way a want reaches a stream
+/// its 60 s and the 15 s between its sweeps, counted from the take's answer
+/// (review c5z, a nit), as the lake counts its next redelivery from when it
+/// answered. Within it the hold is the only way a want reaches a stream
 /// not yet open; past it the lake has delivered each standing want again,
 /// and a stream opening later is served at the lake's next redelivery, as
 /// before the hold.
@@ -201,7 +202,8 @@ pub async fn serve<L: Leases + 'static>(
     if let Some((set, shards)) = &mut shard {
         // Listening for the instance's wants from before the take (ruling
         // 184, option B; item 33): the lake delivers its standing wants
-        // again as it answers, and the plugin's stream opens only later.
+        // again once it has answered, and the plugin's stream opens only
+        // later.
         // Only where the plugin hears wants.
         if meridian_sidecar::shards::hears_wants(&identity.roles) {
             shards.hold_wants(&bus, &identity.instance_id, HOLD_WANTS_FOR);
@@ -228,6 +230,7 @@ pub async fn serve<L: Leases + 'static>(
                 "the shard's epoch was not raised: {failed}"
             )));
         }
+        shards.hold_from_the_take();
         // Nothing sent once its serving has ended, whatever it still holds
         // until its runtime is shut (review c5a6 L3); and a data shard writes
         // on past its renew deadline with its lake record writes alone,
