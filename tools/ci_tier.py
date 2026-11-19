@@ -64,13 +64,17 @@ CLUSTERS = [
     {"target": "e2e-cluster", "k3s": "v1.34.12-k3s1"},
     {"target": "e2e-cluster", "k3s": "v1.35.9-k3s1"},
     {"target": "e2e-cluster", "k3s": "v1.37.1-k3s1"},
-    # Each longer from stage T: write-scale's three shapes in the scaled run;
-    # the group counts, a database added and the restore across two in
-    # reconfigure.
-    {"target": "e2e-cluster-scaled", "agents": 3, "timeout": 75},
-    {"target": "e2e-cluster-reconfigure", "agents": 3, "timeout": 90},
-    {"target": "e2e-cluster-failover", "profile": "tolerant"},
-    {"target": "e2e-cluster-failover", "profile": "ha", "agents": 3, "timeout": 70},
+    # Each job's limit in minutes (ci.yaml's default, 20, where none is
+    # given): half again its slowest green run over 25 runs on c30d
+    # (2026-11-19), rounded up to five, so a runner that dies frees the queue
+    # soon; a red that runs past it still prints its logs and the watchdog's
+    # as the limit ends it (ci.yaml). Slowest green: the
+    # base installs 12.9 (external), scaled 18.9, reconfigure 21.1, failover
+    # tolerant 16.9, failover ha 31.6.
+    {"target": "e2e-cluster-scaled", "agents": 3, "timeout": 30},
+    {"target": "e2e-cluster-reconfigure", "agents": 3, "timeout": 35},
+    {"target": "e2e-cluster-failover", "profile": "tolerant", "timeout": 30},
+    {"target": "e2e-cluster-failover", "profile": "ha", "agents": 3, "timeout": 50},
 ]
 
 
