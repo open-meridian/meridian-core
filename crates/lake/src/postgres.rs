@@ -5177,14 +5177,24 @@ fn raise(
         Some(groups) if !groups.several() => {
             tx.execute("UPDATE lake_writer_group SET epoch = $1", &[&epoch])?;
         }
-        Some(groups) if !groups.holds_control() => {
+        Some(groups) => {
+            if !groups.holds_control() {
+                tx.execute(
+                    "INSERT INTO lake_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+                     ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
+                    &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+                )?;
+            }
+            // And each group's past the count, as at one group (review c5w's
+            // residual; the several groups' counterpart of review c5r3 M1):
+            // a writer of a group the count was lowered past, not stopped
+            // yet, begins no dataset under its old epoch that a group left
+            // now owns, and its epoch's watch sees the takeover.
             tx.execute(
-                "INSERT INTO lake_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
-                 ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
-                &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+                "UPDATE lake_writer_group SET epoch = $1 WHERE writer_group >= $2",
+                &[&epoch, &(groups.count() as i32)],
             )?;
         }
-        Some(_) => {}
     }
     // A dataset a batch of a group past the first began in the meantime,
     // under its row's old epoch held shared: that batch has committed once

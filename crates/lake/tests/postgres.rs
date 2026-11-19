@@ -12087,3 +12087,36 @@ fn a_dataset_begun_behind_a_raise_whose_commit_fails_never_steps_the_writer_down
     }
     assert_eq!(writer.range_tip(&begun).unwrap().unwrap().epoch, 1);
 }
+
+/// Review c5w's residual, 3 -> 2: group 0's takeover at the lowered count
+/// raises group 2's own row too, so group 2's writer, not stopped yet,
+/// begins no dataset under its old epoch that a group left now owns.
+#[test]
+fn a_count_lowered_from_three_to_two_fences_group_twos_own_row() {
+    use meridian_changes::groups::{owner, Groups};
+    use meridian_changes::{TookOver, LEASE_FREE};
+    let (url, _migrated) = isolated("lake-lowered-row");
+    let store = |group: u32, count: u32| {
+        PostgresStore::connect(&url, 2)
+            .unwrap()
+            .with_groups(Groups::new(group, count).unwrap())
+    };
+    let (zero, one, two) = (store(0, 3), store(1, 3), store(2, 3));
+    for each in [&zero, &one, &two] {
+        each.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    }
+    let subject = unique("LCL-UNREC");
+    let begun = (0..)
+        .map(|n| unique(&format!("coinbase-1:lowrow{n}")))
+        .find(|dataset| owner(dataset, 3) == 2 && owner(dataset, 2) == 0)
+        .unwrap();
+    let lowered = store(0, 2);
+    lowered.take_over(&TookOver::unnamed(LEASE_FREE)).unwrap();
+    let stale = two.record(&begun, vec![trade(&begun, "stale", &subject, 1)], 1_000);
+    assert!(
+        matches!(stale, Err(meridian_lake::store::StoreError::Fenced(_))),
+        "group 2's writer began a dataset group 0 now owns under its old epoch: {stale:?}"
+    );
+    assert!(two.head_epoch().unwrap() > two.epoch());
+    drop((zero, one));
+}
