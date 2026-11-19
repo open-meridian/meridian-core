@@ -3323,6 +3323,9 @@ chart-check:
 		[ "$$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" = '          image: "nats:2.10.29-alpine"' ] \
 			|| { echo "chart-check FAILED: the broker's image is not pinned exactly to nats:2.10.29-alpine (item 191): $$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" >&2; exit 1; }; \
 	done; \
+	composed="$$(grep -hE '^ +image: "?nats:' docker-compose.yaml deploy/harness/compose.yaml | tr -d ' ' | sort -u)"; \
+	[ "$$composed" = 'image:nats:2.10.29-alpine' ] \
+		|| { echo "chart-check FAILED: the compose files' broker is not pinned exactly to nats:2.10.29-alpine, as the chart's is (item 191's review, finding 9): $$composed" >&2; exit 1; }; \
 	[ "$$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget')" = 11 ] \
 		|| { echo "chart-check FAILED: the ha profile renders $$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget') disruption budgets, not 11 (six stores, the database, the broker, the dashboard, two analytics sets)" >&2; exit 1; }; \
 	echo "$$ha" | grep -q "runAsUser" \
