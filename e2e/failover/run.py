@@ -3778,17 +3778,72 @@ def lowered_written(said, into_only=False):
     return into if into_only else into and prices > 0 and entries > 0
 
 
+GROUP_COMPONENTS = ("lake", "bor", "lake-group-1", "bor-group-1")
+
+
+def groups_held():
+    """What a writer-group count's change would move, as it stands: each
+    store member's pod (its name, uid and restarts), each group's epoch,
+    the lake's control epoch, the places kept in the write-ahead stream
+    (their keys alone: their sequences move with the driver's load), and
+    each partition's group and epoch."""
+    members = {p["metadata"]["name"]: (p["metadata"]["uid"], restarts(p["metadata"]["name"]))
+               for component in GROUP_COMPONENTS for p in pods(component)}
+    rows = {
+        "each lake group's epoch": psql("select writer_group, epoch from lake_writer_group order by 1"),
+        "each book group's epoch": psql("select writer_group, epoch from book_writer_group order by 1"),
+        "the lake's control epoch": psql("select epoch from lake_change_head where partition = 'control'"),
+        "the places in the write-ahead stream": psql("select stream from lake_write_ahead order by 1"),
+    }
+    partitions = {
+        "lake": psql("select dataset, writer_group, epoch from lake_partition"),
+        "bor": psql("select partition, writer_group, epoch from book_partition_head where partition <> 'control'"),
+    }
+    return members, rows, {store: set(said.splitlines()) for store, said in partitions.items()}
+
+
+def groups_lowering_refused(s, what):
+    """The writer-group count lowered from two to one in ha, under the
+    driver's load: refused by the chart (PO item 111, option B; item 103's
+    step), saying why, and nothing changes -- no revision, and no store
+    member's pod, epoch, partition's group or place in the write-ahead
+    stream moves, through the upgrade and a while after it."""
+    print(f"T: {what}", flush=True)
+    before_revision = revision()
+    members, rows, partitions = groups_held()
+    upgraded = upgrade("lake.writerGroups=1", "bor.writerGroups=1")
+    said = upgraded.stderr.decode(errors="replace")
+    s.check(upgraded.returncode != 0 and "can't lower them yet" in said,
+            f"{what}: the upgrade refused, saying why"
+            + (" (it applied)" if upgraded.returncode == 0 else f": {said[-400:]}"))
+    time.sleep(30)
+    s.check(revision() == before_revision, f"{what}: the release's revision unchanged")
+    members_after, rows_after, partitions_after = groups_held()
+    s.check(members_after == members, f"{what}: no store member's pod moved or restarted"
+            + ("" if members_after == members else f" (before {sorted(members)}, after {sorted(members_after)})"))
+    for name, said_before in rows.items():
+        s.check(rows_after[name] == said_before, f"{what}: {name} unchanged"
+                + ("" if rows_after[name] == said_before else f" ({said_before!r} -> {rows_after[name]!r})"))
+    for store, before in partitions.items():
+        moved = sorted(before - partitions_after[store])
+        s.check(not moved, f"{what}: no {store} partition's group or epoch moved"
+                + ("" if not moved else f" ({len(moved)}, first {moved[:3]})"))
+
+
 def two_groups_two_databases(s):
-    """In ha, last before the restore: two writer groups, then a database
-    added to each store (section 15, the online conversions), under the
-    driver's load; each rollout measured, and every lease handed over
-    released. The restore to a time is then across each store's two
+    """In ha, last before the restore: two writer groups, a lowering to one
+    refused with nothing changed (PO item 103, as ruled by item 111), then a
+    database added to each store (section 15, the online conversions),
+    under the driver's load; each rollout measured, and every lease handed
+    over released. The restore to a time is then across each store's two
     databases."""
     since_ns = time.time_ns()
     if not groups_upgraded(s, "ha groups raised: two writer groups in ha", 2, False,
                            "lake.writerGroups=2", "bor.writerGroups=2"):
         return
     no_lease_lapsed(s, "ha groups raised", since_ns)
+    # Lowered in ha (PO item 103, as ruled by item 111, option B): refused.
+    groups_lowering_refused(s, "ha groups lowered")
     since_ns = time.time_ns()
     # Where each acknowledged write is before the databases are added, so
     # before any move home: the first database (moved_and_kept, below).
