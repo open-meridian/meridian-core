@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.request
 
+import rollout
+
 # What home's header shows a deployment admin and nobody else: the gear to
 # Settings, named for a screen reader.
 ADMIN_HOME = 'href="/admin" aria-label="Settings"'
@@ -586,6 +588,30 @@ def wait_for(what, ready, seconds=420):
             pass
         time.sleep(1)
     raise SystemExit(f"{what} never happened")
+
+
+def rolled_out(s, what, seconds=600):
+    """After an upgrade, every Deployment and StatefulSet of the release
+    rolled out, as `meridian upgrade-deployment` waits for it before it says
+    the upgrade is done (e2e/cluster/rollout.py), not only Available;
+    checked, and says whether."""
+    def left():
+        items = {kind: json.loads(kubectl("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}",
+                                          "-o", "json"))["items"]
+                 for kind in ("deployments", "statefulsets")}
+        return rollout.unfinished(items["deployments"], items["statefulsets"])
+    said = ["not read"]
+    for _ in range(seconds // 5):
+        try:
+            said = left()
+        except SystemExit as failed:
+            said = [str(failed)[:200]]
+        if not said:
+            break
+        time.sleep(5)
+    s.check(not said, f"{what}: every workload of the release rolled out"
+            + (f"; not: {'; '.join(said[:4])}" if said else ""))
+    return not said
 
 
 def main():
@@ -1258,6 +1284,7 @@ spec:
                 break
             time.sleep(1)
         s.check(gone, "turned off, the live instance is removed by the restarted launcher")
+        rolled_out(s, "turned off")
         template = kubectl("get", "configmap", f"{RELEASE}-meridian-runtime-launcher-template", "-o", "json")
         s.check("plugin-live.json" not in template, "and the launcher holds no live shape to make")
         s.check(
@@ -1446,6 +1473,7 @@ def upgraded(s):
         f"{int(time.time() - started)}s",
     )
     revision = int(json.loads(run(HELM, "status", RELEASE, "--namespace", NAMESPACE, "-o", "json"))["version"])
+    rolled_out(s, "upgraded in place")
 
     def pods():
         return json.loads(kubectl("get", "pods", "-o", "json"))["items"]

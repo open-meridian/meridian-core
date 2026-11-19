@@ -14,7 +14,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-store-leftovers check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger e2e-harness-check
 
 help:
 	@echo "  make pre-push       the fast gate the pre-push hook runs: lint, build, the changed crates' tests, the stages a path selects"
@@ -32,6 +32,7 @@ help:
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
+	@echo "  make e2e-harness-check       the cluster harnesses' own tests, no cluster: rollouts, the dashboard's forward"
 	@echo "  make licence-check-test      the suggestion-licence action decides as it should (no network)"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make e2e-settings-page  a plugin's Settings pages in a real browser: the entry grid, its most, one screen"
@@ -158,7 +159,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check e2e-harness-check
 	@$(GATE) end checks
 # The images at once (the CI images job is the run's critical path; step 3b
 # part 5): the release build beside the SDK's image and the harness's, which
@@ -274,7 +275,7 @@ pre-push-run: GATE_BUDGETS_COLD = $(PRE_PUSH_BUDGETS_COLD)
 pre-push-run: gate-start $(addprefix pre-push-,$(PRE_PUSH_STAGES))
 	@$(GATE) finish
 
-pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check advisories
+pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check e2e-harness-check advisories
 	@$(GATE) end checks
 pre-push-rust:     gate-begin-rust fast-rust
 	@$(GATE) end rust
@@ -1173,6 +1174,16 @@ CLAIMS ?= $(wildcard .e2e-*-claims.jsonl)
 ci-tier-check:
 	@$(PY) tools/ci_tier.py --self-test >/dev/null
 	@$(PY) tools/ci_tier.py check
+
+# The cluster harnesses' own tests, no cluster (PR CI 44604574060): what a
+# finished rollout is (e2e/cluster/rollout.py), and the failover run's waits
+# after an upgrade and its client of the dashboard, whose forward ends with
+# the pod it landed on (e2e/failover/self_test.py).
+e2e-harness-check:
+	@$(PY) e2e/cluster/rollout.py --self-test
+	@said="$$($(PY) e2e/failover/self_test.py 2>&1)" \
+		|| { echo "$$said" >&2; echo "e2e-harness-check FAILED" >&2; exit 1; }
+	@echo "failover harness: self-test OK"
 
 claims-check:
 	@$(PY) tools/claims.py --self-test >/dev/null

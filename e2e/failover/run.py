@@ -125,6 +125,10 @@ FIGURES = os.environ.get("E2E_FAILOVER_FIGURES", ".e2e-failover-figures.jsonl")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 import claims as claims_tool  # noqa: E402
 import shard_accounts  # noqa: E402
+# Whether a release's workloads rolled out, judged as the CLI judges it: the
+# cluster harness's, shared. Appended: e2e/cluster holds a run.py of its own.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cluster"))
+import rollout  # noqa: E402
 CLUSTER = os.environ.get("E2E_K3D_CLUSTER", "meridian-e2e")
 ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
@@ -3066,6 +3070,7 @@ def tls_turned_on(s):
     figure("internal TLS on: every member ready after the upgrade", took_s=round(time.time() - began))
     if not settled:
         raise SystemExit("the deployment did not settle with internal TLS on")
+    upgrade_rolled_out(s, "internal TLS on")
     TLS = True
     internal_tls(s)
     if DRIVEN:
@@ -3093,28 +3098,34 @@ def database_said(s, when):
 def rollout_unfinished():
     """Each Deployment and StatefulSet of the release whose rollout is not
     finished, and why, judged as `meridian upgrade-deployment` judges it
-    before it says an upgrade is done (meridian-cli, upgrade_deployment.rs):
-    its template seen by its controller, every replica on it and ready,
-    and nothing old left -- a StatefulSet's current revision its update's."""
-    left = []
-    for kind in ("deployments", "statefulsets"):
-        items = json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
-        for item in items:
-            name, spec, status = item["metadata"]["name"], item["spec"], item.get("status", {})
-            wanted = spec.get("replicas", 1)
-            if item["metadata"].get("generation", 0) > status.get("observedGeneration", 0):
-                left.append(f"{name}: its new template not yet seen")
-            elif status.get("updatedReplicas", 0) < wanted:
-                left.append(f"{name}: {status.get('updatedReplicas', 0)} of {wanted} on the new template")
-            elif status.get("readyReplicas", 0) < wanted:
-                left.append(f"{name}: {status.get('readyReplicas', 0)} of {wanted} ready")
-            elif kind == "deployments" and (status.get("replicas", 0) > wanted
-                                            or status.get("availableReplicas", 0) < wanted):
-                left.append(f"{name}: old pods still being replaced")
-            elif kind == "statefulsets" and spec.get("updateStrategy", {}).get("type") != "OnDelete" \
-                    and status.get("currentRevision") != status.get("updateRevision"):
-                left.append(f"{name}: its update not finished")
-    return left
+    before it says an upgrade is done (e2e/cluster/rollout.py)."""
+    items = {kind: json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+             for kind in ("deployments", "statefulsets")}
+    return rollout.unfinished(items["deployments"], items["statefulsets"])
+
+
+def rollout_left():
+    """What of the release has not rolled out, but the sharded instance's
+    standby pod, never ready by design (scaled)."""
+    return [left for left in rollout_unfinished() if SHARDED not in left]
+
+
+def rolled_out():
+    """Every workload of the release rolled out (rollout_left). Not
+    `condition=Available` (all_ready): a Deployment that replaces a pod at a
+    time is Available all through its rollout, an old pod still to go (PR
+    CI 44604574060: the dashboard's, two copies, maxSurge 0)."""
+    return not rollout_left()
+
+
+def upgrade_rolled_out(s, what, seconds=600):
+    """After an upgrade, every workload of the release rolled out, as
+    `meridian upgrade-deployment` waits for it before it says the upgrade
+    is done; checked, and says whether."""
+    done = happens(rolled_out, seconds, every=5)
+    s.check(done, f"{what}: every workload of the release rolled out after the upgrade"
+            + ("" if done else f" ({'; '.join(rollout_left()[:4])})"))
+    return done
 
 
 def ready_of(pod):
@@ -3456,6 +3467,7 @@ def reconfigure(s):
                 for component in STORES:
                     explain(s, f"reconfigure to {target}", component)
                 return
+            upgrade_rolled_out(s, f"reconfigure to {target}")
             connections_held(s, f"reconfigure to {target}")
             extra = {"from": "tolerant" if target == "ha" else "ha"}
             if DRIVEN:
@@ -4015,6 +4027,7 @@ def archived_in_tolerant(s):
     figure("restore: every member ready with the archive on", took_s=round(time.time() - began))
     if not settled:
         raise SystemExit("the deployment did not settle with the archive on")
+    upgrade_rolled_out(s, "restore: the archive on")
     s.check(not under_patroni(), "restore: the base backup is taken from the database alone, as tolerant runs it")
 
     def archive_said(words):
@@ -4895,6 +4908,7 @@ def write_ahead_bound(s):
     # failed"); then the lease's holder a pod that runs.
     for rolled in ("lake", "lake-reader"):
         kubectl("rollout", "status", f"deployment/{FULL}-{rolled}", "--timeout=600s", check=False)
+    upgrade_rolled_out(s, "write-ahead-bound: the bound set short")
     wait_for("the lake's writer running", lambda: writer_pod("lake") in
              [p["metadata"]["name"] for p in pods("lake")], seconds=300)
     since = int(time.time() * 1e9)
@@ -4973,6 +4987,7 @@ def write_ahead_bound(s):
     back = upgrade("lake.writeAhead.maxAge=10m")
     s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    upgrade_rolled_out(s, "write-ahead-bound: the bound set back")
     # Every member of the sets this run pinned placed and ready after both
     # upgrades: none left Pending where no node can hold it.
     for name in pinned_sets():
@@ -5212,6 +5227,9 @@ class Dashboard:
 
     HOST = "failover-e2e.localhost"
     CALLBACK = "http://127.0.0.1:53682/callback"
+    # How many times a request whose forward ended is sent again, each on a
+    # forward made anew.
+    RESENDS = 2
 
     def __init__(self):
         import socket
@@ -5239,7 +5257,7 @@ class Dashboard:
                      f"{self.port}:80"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(1)
             try:
-                return self.send("GET", "/sign-in")[0] == 200
+                return self.sent("GET", "/sign-in")[0] == 200
             except (OSError, http.client.HTTPException):
                 return False
         if happens(answers, 120, every=1):
@@ -5253,7 +5271,48 @@ class Dashboard:
             self.forward.wait()
             self.forward = None
 
-    def send(self, method, path, fields=None, body=None, bearer=None):
+    @staticmethod
+    def ended(error):
+        """Whether `error` is the forward ending under a request: the pod it
+        landed on stopped (a rollout's, PR CI 44604574060), the connection
+        closed with no response, reset or refused."""
+        if isinstance(error, urllib.error.HTTPError):
+            return False
+        if isinstance(error, urllib.error.URLError):
+            error = error.reason
+        return isinstance(error, (ConnectionError, http.client.RemoteDisconnected))
+
+    def made_anew(self, method, path, error, attempt):
+        """The forward made anew after it ended under `method path`, said."""
+        print(f"R: the dashboard's forward ended under {method} {path} ({error!r}); made anew "
+              f"({attempt} of {self.RESENDS})", flush=True)
+        if not self.forwarded():
+            raise SystemExit(f"{method} {path}: the dashboard's forward ended under it, and it did not "
+                             f"answer over a forward made anew")
+
+    def send(self, method, path, fields=None, body=None, bearer=None, again=None):
+        """The request sent; its status, body and Location. Where the forward
+        ends under it, the forward is made anew and a GET sent again, up to
+        RESENDS times; any other request only where `again()` says what it
+        would start has not begun, and otherwise it stops here: it may
+        have acted."""
+        for attempt in range(self.RESENDS + 1):
+            try:
+                return self.sent(method, path, fields=fields, body=body, bearer=bearer)
+            except (OSError, http.client.HTTPException) as error:
+                if not self.ended(error):
+                    raise
+                if attempt == self.RESENDS:
+                    raise SystemExit(f"{method} {path}: the dashboard's forward ended under it "
+                                     f"{attempt + 1} times ({error!r})")
+                self.made_anew(method, path, error, attempt + 1)
+                if method != "GET" and not (again and again()):
+                    raise SystemExit(f"{method} {path}: the dashboard's forward ended under it ({error!r}); "
+                                     f"made anew, the request not sent again: it may have acted")
+        raise AssertionError("unreachable")
+
+    def sent(self, method, path, fields=None, body=None, bearer=None):
+        """The request sent once, over the forward as it is."""
         data, kind = None, None
         if body is not None:
             data, kind = json.dumps(body).encode(), "application/json"
@@ -5336,29 +5395,51 @@ class Dashboard:
                 return
         self.connect()
 
-    def call(self, tool, arguments):
-        """A tool called as her client: its structured answer."""
+    def call(self, tool, arguments, again=None):
+        """A tool called as her client: its structured answer. `again`, as
+        `send` takes it: whether the call may be sent again where the
+        forward ended under it."""
         asked = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                  "params": {"name": tool, "arguments": arguments}}
-        status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
+        status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access, again=again)
         if status == 401 and "expired" in said:
             self.refreshed()
-            status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
+            status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access, again=again)
         if status != 200:
             raise SystemExit(f"{tool}: /mcp answered {status}: {said[:400]}")
         return (json.loads(said).get("result") or {}).get("structuredContent") or {}
 
-    def move_dialog(self, partition, group, note):
+    def move_dialog(self, partition, group, note, unbegun):
         """The Resilience page's Move dialog posted, as she posts it signed in:
-        its status and where it sent her."""
-        status, page, _ = self.send("GET", "/admin/resilience")
-        token = re.search(r'action="/admin/resilience/move-partition"><input type="hidden" '
-                          r'name="form_token" value="([^"]+)"', page)
-        if status != 200 or not token:
-            raise SystemExit(f"the Resilience page with its Move dialog was not shown: {status}")
-        status, _, location = self.send("POST", "/admin/resilience/move-partition", fields={
-            "form_token": token.group(1), "partition": partition, "target_group": str(group), "note": note})
-        return status, location or ""
+        its status and where it sent her. Where the forward ends under her
+        post, it is made anew and the dialog posted again from the page and
+        a token shown again, only once `unbegun()` says, from the store, that
+        no move of it began: a post again never starts a second move. Up to
+        RESENDS times, each said."""
+        path = "/admin/resilience/move-partition"
+        for attempt in range(self.RESENDS + 1):
+            status, page, _ = self.send("GET", "/admin/resilience")
+            token = re.search(r'action="/admin/resilience/move-partition"><input type="hidden" '
+                              r'name="form_token" value="([^"]+)"', page)
+            if status != 200 or not token:
+                raise SystemExit(f"the Resilience page with its Move dialog was not shown: {status}")
+            try:
+                status, _, location = self.sent("POST", path, fields={
+                    "form_token": token.group(1), "partition": partition, "target_group": str(group),
+                    "note": note})
+                return status, location or ""
+            except (OSError, http.client.HTTPException) as error:
+                if not self.ended(error):
+                    raise
+                if attempt == self.RESENDS:
+                    raise SystemExit(f"her Move dialog: the dashboard's forward ended under her post "
+                                     f"{attempt + 1} times ({error!r})")
+                self.made_anew("POST", path, error, attempt + 1)
+                if not unbegun():
+                    raise SystemExit(f"her Move dialog: the dashboard's forward ended under her post ({error!r}), "
+                                     f"and the store shows a move of {partition} begun: not posted again")
+                print(f"R: her Move dialog: no move of {partition} begun; posted again", flush=True)
+        raise AssertionError("unreachable")
 
     def sign_in(self):
         status, _, _ = self.send("POST", "/sign-in", fields={
@@ -5568,6 +5649,10 @@ def book_partitions():
     return [f"P{i}" for i in range(BOOK_PARTITIONS)]
 
 
+# How long a move is given to end, moved or aborted, from its request.
+MOVE_ENDS_S = 120
+
+
 def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
     """One move under the driver's load, by her tool (or her Move dialog):
     answered at once, ended moved within switchSeconds, the driver's writes
@@ -5587,17 +5672,24 @@ def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
         ended = "moved" if moved else None
     else:
         note = f"rebalance: {kind} {name} moved under load"
+
+        def unbegun():
+            """No move of it begun by a request whose answer the dashboard's
+            forward lost: none ended, moved or aborted, within the time a
+            move is given to end, and the target not its owner."""
+            owner = lake_owner if store == "lake" else book_owner
+            return partition_moved(store, name, since_ns, MOVE_ENDS_S) is None and owner(name) != target
         if by_dialog:
-            status, location = dash.move_dialog(name, target, note)
+            status, location = dash.move_dialog(name, target, note, unbegun)
             s.check(status == 303 and location.endswith("#partitions"),
                     f"rebalance: {what}: her Move dialog answered by the store, the move begun "
                     f"({status} to {location})")
         else:
             answer = dash.call("dashboard__move_partition",
-                               {"partition": name, "target_group": target, "note": note})
+                               {"partition": name, "target_group": target, "note": note}, again=unbegun)
             s.check(answer.get("outcome") == "made",
                     f"rebalance: {what}: dashboard__move_partition answered, the move begun ({answer})")
-        ended = partition_moved(store, name, since_ns, 120)
+        ended = partition_moved(store, name, since_ns, MOVE_ENDS_S)
         s.check(ended == "moved", f"rebalance: {what}: switched, its digests equal ({ended})")
     ended_ms = int(time.time() * 1000)
     window_held(s, what, began_ms, ended_ms)
@@ -5673,9 +5765,12 @@ def rebalance(s):
     began = time.time()
     upgraded = upgrade(f"bor.partitions={BOOK_PARTITIONS}")
     s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
-    for deployment in (f"{FULL}-bor", f"{FULL}-bor-group-1"):
-        run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
-            "--timeout=420s", check=False)
+    # Every workload rolled out before her forward is made: the dashboard's
+    # among them, handed the chart's values, which replaces its two copies
+    # one at a time and is Available all through (PR CI 44604574060: her
+    # forward landed on the last old pod, which the rollout then ended
+    # under her Move dialog's post).
+    upgrade_rolled_out(s, "rebalance: the book at four partitions")
     wait_for("every component ready", all_ready, seconds=600)
     dash = Dashboard()
     try:
@@ -5752,6 +5847,7 @@ def moves(s, dash):
             "--timeout=420s", check=False)
     ready = happens(all_ready, 600, every=5)
     s.check(ready, "rebalance: every component ready at two databases")
+    upgrade_rolled_out(s, "rebalance: the lake and the book at two databases")
     # The dashboard's pod was replaced too: it is handed the chart's
     # resilience values (item 34), which the databases' count changed, and
     # her port-forward ended with the old pod (PR CI 43783060111: the next
@@ -6018,11 +6114,9 @@ def scale_upgraded(s, what, *sets):
         return False
     migrated(s, f"write-scale: {what}")
     # But the sharded instance's: its standby pod is never ready, by design.
-    def unfinished():
-        return [left for left in rollout_unfinished() if SHARDED not in left]
-    settled = happens(lambda: not unfinished() and all_ready() and group_members_ready(2), 900, every=5)
+    settled = happens(lambda: rolled_out() and all_ready() and group_members_ready(2), 900, every=5)
     s.check(settled, f"write-scale: {what}: every workload rolled out and ready"
-            + ("" if settled else f" ({'; '.join(unfinished()[:4])})"))
+            + ("" if settled else f" ({'; '.join(rollout_left()[:4])})"))
     return settled
 
 
@@ -6135,6 +6229,7 @@ def writer_groups(s):
             rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
                          "--timeout=420s", check=False)
             s.check(rolled.returncode == 0, f"writer groups: {deployment} rolled out and ready")
+    upgrade_rolled_out(s, "writer groups: at two")
     groups_ok = happens(lambda: all(any(ready(p) for p in pods(c)) for c in
                                     ("lake", "lake-group-1", "bor", "bor-group-1")), 300)
     s.check(groups_ok, "writer groups: each store's group 0 and group 1 writer ready")
