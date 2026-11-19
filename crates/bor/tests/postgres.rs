@@ -2166,12 +2166,29 @@ async fn a_record_read_naming_its_watermark_is_never_answered_from_a_replica_beh
 /// batch's commits told in their order; and a batch an unexpected database
 /// error broke is tried again one command at a time, so only the command it
 /// was is refused.
+///
+/// Over a schema of its own: a broken batch's commands commit one
+/// transaction each, and another test's store writing the shared database's
+/// P0 between two of them took a number of the page told (the run of
+/// 2026-11-14, `[126, 128, ...]`). A partition has one writer. And nothing
+/// here is slept for: the first batch is held in its decision until each of
+/// the others waits in the lane, in its order, so which command of the two
+/// took the entry ID first is never the scheduler's to say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alone() {
     use meridian_bor::decide::{set_attribute, Context};
     use meridian_bor::store::{Acted, Decided, StoreError};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
-    let store = blocking(store);
+    /// Waited for, never slept for; its bound only ends a run that failed.
+    fn until(what: &str, met: impl Fn() -> bool) {
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !met() {
+            assert!(std::time::Instant::now() < bound, "never: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let (_schema, store) = blocking(isolated);
     // Each batch's commits as the store tells them: how many, and their
     // sequences, which run on from one to the next.
     let batches: Arc<Mutex<Vec<Vec<u64>>>> = Arc::default();
@@ -2192,8 +2209,12 @@ async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alo
     const REFUSED: usize = 7;
     const BROKEN: usize = 11;
     const SAME_ENTRY_AS: usize = 3;
+    // The first command's transaction: in flight, then let go.
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let let_go = Arc::new(AtomicBool::new(false));
     let act = |n: usize| {
         let store = Arc::clone(&store);
+        let (in_flight, let_go) = (Arc::clone(&in_flight), Arc::clone(&let_go));
         let (account, shared) = (format!("ACC-{run}-{n}"), shared_entry.clone());
         std::thread::spawn(move || {
             let request = SetAccountAttributeRequest {
@@ -2215,9 +2236,12 @@ async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alo
                 &request.encode_to_vec(),
                 &mut |book, head| {
                     if n == 0 {
-                        // The first batch held in flight while the others
-                        // queue behind it.
-                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        // The first batch held in flight until the others
+                        // wait behind it.
+                        in_flight.store(true, Ordering::SeqCst);
+                        until("the first batch is let go", || {
+                            let_go.load(Ordering::SeqCst)
+                        });
                     }
                     if n == REFUSED {
                         return Err(StoreError::Invalid(format!("{n} is refused alone")));
@@ -2239,8 +2263,21 @@ async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alo
         })
     };
     let first = act(0);
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let others: Vec<_> = (1..COMMANDS).map(act).collect();
+    until("the first command's transaction is in flight", || {
+        in_flight.load(Ordering::SeqCst)
+    });
+    // Each of the others waiting in the lane before the next is asked, so
+    // they wait in their order.
+    let others: Vec<_> = (1..COMMANDS)
+        .map(|n| {
+            let other = act(n);
+            until("a command waits behind the first", || {
+                store.waiting("P0") == n
+            });
+            other
+        })
+        .collect();
+    let_go.store(true, Ordering::SeqCst);
     let mut outcomes = vec![first.join().unwrap()];
     outcomes.extend(others.into_iter().map(|other| other.join().unwrap()));
     let mut committed = 0;
@@ -2272,9 +2309,10 @@ async fn group_commit_refuses_each_command_alone_and_a_broken_batch_is_tried_alo
     let batches = batches.lock().unwrap().clone();
     let told: usize = batches.iter().map(Vec::len).sum();
     assert_eq!(told, committed, "every commit told once: {batches:?}");
-    assert!(
-        batches.iter().any(|batch| batch.len() > 1),
-        "the commands queued behind the first committed together: {batches:?}"
+    assert_eq!(
+        batches.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, COMMANDS - 3],
+        "the first alone, then those waiting behind it told together: {batches:?}"
     );
     for batch in &batches {
         assert!(

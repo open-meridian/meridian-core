@@ -1779,6 +1779,13 @@ impl PostgresStore {
         )
     }
 
+    /// How many commands wait in `partition`'s lane for its transaction in
+    /// flight (section 6.5): what a test of group commit waits on, never a
+    /// sleep.
+    pub fn waiting(&self, partition: &str) -> usize {
+        self.lane(partition).waiting()
+    }
+
     /// One batch of `partition`'s commands in one transaction (section 6.5),
     /// each answered its own outcome in order. An unexpected database error
     /// mid-batch tries the batch again one command at a time.
