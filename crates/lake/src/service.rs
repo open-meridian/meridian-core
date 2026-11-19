@@ -561,6 +561,9 @@ pub struct Lake {
     /// Its writer group and the lake's count (step 3d; section 6.1): the
     /// datasets it writes, and those it hands to their owners.
     groups: meridian_changes::groups::Groups,
+    /// Called before each standing want a take delivers again is published.
+    #[cfg(test)]
+    pub(crate) resending: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// A gap asked again of its data plugin (W10.14): recovered once every want
@@ -1080,6 +1083,8 @@ impl Lake {
             write_ahead: std::sync::OnceLock::new(),
             stream: std::sync::atomic::AtomicI64::new(0),
             store,
+            #[cfg(test)]
+            resending: Mutex::default(),
         })
     }
 
@@ -5947,7 +5952,7 @@ impl Lake {
         &self,
         request: meridian_domain::v1::TakeShardRequest,
         envelope: &Envelope,
-    ) -> Result<meridian_domain::v1::TakeShardReply, String> {
+    ) -> Result<meridian_domain::v1::ShardTookOver, String> {
         // Answered inside the sidecar's wait, counted from when it sent the
         // take, the way back allowed for, or not recorded at all (reviews
         // c5a2 L1, c5a3 L1).
@@ -5960,13 +5965,16 @@ impl Lake {
     }
 
     /// [`Lake::take_shard`], recorded only before `until`: a take answered
-    /// after its sidecar gave up records no holder that never served.
+    /// after its sidecar gave up records no holder that never served. The
+    /// take as recorded, which its caller answers with its epoch and then
+    /// delivers the instance's standing wants again
+    /// ([`Lake::deliver_standing_again`]).
     pub(crate) fn take_shard_until(
         &self,
         request: meridian_domain::v1::TakeShardRequest,
         envelope: &Envelope,
         until: std::time::Instant,
-    ) -> Result<meridian_domain::v1::TakeShardReply, String> {
+    ) -> Result<meridian_domain::v1::ShardTookOver, String> {
         let meta = envelope.meta.clone().unwrap_or_default();
         if request.instance.is_empty() || request.instance != meta.publisher_instance_id {
             return Err(refusal_with_status(
@@ -6043,7 +6051,54 @@ impl Lake {
             previous = took.previous_holder,
             "a shard was taken: its epoch raised in every writer group"
         );
-        Ok(meridian_domain::v1::TakeShardReply { epoch: took.epoch })
+        Ok(took)
+    }
+
+    /// A shard of `instance` taken (ruling 184, option B; item 33): each of
+    /// the instance's standing wants still asked for delivered again at
+    /// once, as the sweep delivers it again -- the same want under the same
+    /// ID, no change to it and so no record of it -- so the taker hands its
+    /// plugin its share within the lapse, not at the next redelivery. The
+    /// taker's sidecar listens from before it asks to take.
+    ///
+    /// Run after the take is answered, on its own thread (review c5z F3):
+    /// however many wants there are, the take's answer never waits on them.
+    /// The sweep's redelivery stays, counted from `answered_at_ns`, when the
+    /// take was answered: the taker's hold counts from its answer too.
+    ///
+    /// Each is delivered while the wants are held (review c5z F2): a sweep
+    /// that withdraws one publishes its withdrawal after this delivery, never
+    /// before it; and one the sweep withdrew first is no longer open here.
+    pub(crate) fn deliver_standing_again(&self, instance: &str, answered_at_ns: i64) {
+        let now = self.clock.now_ns();
+        let mut wants = self.wants.lock().expect("wants poisoned");
+        for open in wants.open.values_mut() {
+            if !open.event.standing
+                || now - open.asked_at_ns > lapses_after(open)
+                || meridian_domain::lake::instance_of(&open.event.dataset) != Some(instance)
+            {
+                continue;
+            }
+            open.published_at_ns = open.published_at_ns.max(answered_at_ns);
+            #[cfg(test)]
+            if let Some(resending) = self.resending.lock().unwrap().as_ref() {
+                resending();
+            }
+            tracing::debug!(
+                want_id = open.event.want_id,
+                dataset = open.event.dataset,
+                "a standing want delivered again at a take of its instance's shard"
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                open.event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a standing want was not delivered again at a take");
+            }
+        }
     }
 
     /// Every lake and book writer group asked to raise `took`'s shard to its
@@ -8527,16 +8582,34 @@ pub fn serve_grouped(
         },
     );
     // A sidecar's take of a shard (step 3d, checkpoint 5, item 32): the
-    // control writer's, which raises the shard's epoch in every group.
-    serve_on(
-        &bus,
-        &lake,
-        TAKE_SHARD,
-        ("meridian.v1.TakeShardRequest", "meridian.v1.TakeShardReply"),
-        |lake, request: meridian_domain::v1::TakeShardRequest, envelope| {
-            lake.take_shard(request, envelope)
-        },
-    );
+    // control writer's, which raises the shard's epoch in every group. The
+    // take answered first, and its instance's standing wants delivered
+    // again after, on their own thread (ruling 184; review c5z F3).
+    {
+        let resending = Arc::clone(&lake);
+        serve_on(
+            &bus,
+            &lake,
+            TAKE_SHARD,
+            ("meridian.v1.TakeShardRequest", "meridian.v1.TakeShardReply"),
+            move |lake, request: meridian_domain::v1::TakeShardRequest, envelope| {
+                let took = lake.take_shard(request, envelope)?;
+                let answered_at_ns = lake.clock.now_ns();
+                let resending = Arc::clone(&resending);
+                let instance = took.instance.clone();
+                if let Err(failed) = std::thread::Builder::new()
+                    .name("lake-take-resend".into())
+                    .spawn(move || resending.deliver_standing_again(&instance, answered_at_ns))
+                {
+                    tracing::warn!(
+                        %failed,
+                        "a take's standing wants were not delivered again: the sweep's redelivery serves"
+                    );
+                }
+                Ok(meridian_domain::v1::TakeShardReply { epoch: took.epoch })
+            },
+        );
+    }
     // This writer group's raise of a shard's epoch, which the control
     // writer asks of every group before it answers a take.
     {

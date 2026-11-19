@@ -50,6 +50,23 @@ pub struct Serving {
 /// door, bus and every task they started -- before the pod stands by again.
 const SERVING_ENDS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a taker holds what it hears of its instance's wants for its
+/// plugin's stream (ruling 184): one full period of the lake's redelivery,
+/// its 60 s and the 15 s between its sweeps, counted from the take's answer
+/// (review c5z, a nit), as the lake counts its next redelivery from when it
+/// answered. Within it the hold is the only way a want reaches a stream
+/// not yet open; past it the lake has delivered each standing want again,
+/// and a stream opening later is served at the lake's next redelivery, as
+/// before the hold.
+const HOLD_WANTS_FOR: std::time::Duration =
+    std::time::Duration::from_nanos(meridian_lake::service::REDELIVER_STANDING_NS as u64)
+        .saturating_add(meridian_lake::service::SWEEP_EVERY);
+
+/// How long a take waits for its hold's subscriptions to be at the broker:
+/// a broker answers in milliseconds, and a take is never held up for long
+/// against its Lease.
+const HELD_AT_THE_BROKER_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One pod of several (step 3d; the resilience spec's section 7): nothing
 /// is served -- no plugin surface, no front door, nothing on the bus --
 /// until a shard's Lease is this pod's. A standby waits here, and its
@@ -182,7 +199,28 @@ pub async fn serve<L: Leases + 'static>(
     // Lease up, and the pod stands by again (item 49).
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut holding = None;
-    if let Some((set, _)) = &mut shard {
+    if let Some((set, shards)) = &mut shard {
+        // Listening for the instance's wants from before the take (ruling
+        // 184, option B; item 33): the lake delivers its standing wants
+        // again once it has answered, and the plugin's stream opens only
+        // later.
+        // Only where the plugin hears wants.
+        if meridian_sidecar::shards::hears_wants(&identity.roles) {
+            shards.hold_wants(&bus, &identity.instance_id, HOLD_WANTS_FOR);
+            // Held at the broker before the take is sent, or the take's own
+            // delivery could pass it by. A broker slower than this holds the
+            // take up no longer, and the lake's redelivery serves.
+            match tokio::time::timeout(HELD_AT_THE_BROKER_WITHIN, bus.subscribed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(failed)) => tracing::warn!(
+                    %failed,
+                    "the take's hold of its wants is not known to be at the broker: the take goes on"
+                ),
+                Err(_) => tracing::warn!(
+                    "the take's hold of its wants was not at the broker in time: the take goes on"
+                ),
+            }
+        }
         // Renewed just before the take and just after it (review c5a M2,
         // M3): a take that stalled past its lapse is never sent.
         let raised = crate::shards::take_epoch(&bus, &identity.instance_id, set).await;
@@ -192,6 +230,7 @@ pub async fn serve<L: Leases + 'static>(
                 "the shard's epoch was not raised: {failed}"
             )));
         }
+        shards.hold_from_the_take();
         // Nothing sent once its serving has ended, whatever it still holds
         // until its runtime is shut (review c5a6 L3); and a data shard writes
         // on past its renew deadline with its lake record writes alone,

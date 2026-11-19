@@ -384,3 +384,6 @@ fn a_broker_not_answering_never_ends_the_pod_and_a_bus_set_up_wrongly_does() {
         assert_eq!(pod.store.holder(LEASE), "", "its Lease was left to lapse");
     });
 }
+
+// Ruling 184 (B): a taker serves its share within 10 s, driven whole.
+mod takes;
