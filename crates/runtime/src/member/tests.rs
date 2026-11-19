@@ -2332,6 +2332,31 @@ fn serves_after(
     )
 }
 
+/// [`serve_on_within`] at a writer's own bound and pace, as
+/// [`Holding::serve_on_until_another_group_serves`] serves on: what these
+/// tests look at, with no fence (test-only; review-c5n2's minor finding).
+async fn serve_on_until_another_group_serves<F>(
+    mine: u32,
+    count: u32,
+    writer: bool,
+    told_at_ns: i64,
+    look: F,
+) -> ServedOn
+where
+    F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
+{
+    serve_on_within(
+        mine,
+        count,
+        writer,
+        told_at_ns,
+        look,
+        SERVES_ON_AT_MOST,
+        SERVES_ON_LOOKS_EVERY,
+    )
+    .await
+}
+
 /// The first group's writer, a store of one group, and a member that is no
 /// writer wait on nobody: told to stop, each stops at once, the store's
 /// members never read.

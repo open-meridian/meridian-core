@@ -244,31 +244,9 @@ pub enum ServedOn {
 /// meanwhile. A look that fails is asked again.
 ///
 /// `look(told_at_ns, now_ns)` reads the store's members; it blocks, and is
-/// run off the runtime's own threads.
-pub async fn serve_on_until_another_group_serves<F>(
-    mine: u32,
-    count: u32,
-    writer: bool,
-    told_at_ns: i64,
-    look: F,
-) -> ServedOn
-where
-    F: Fn(i64, i64) -> Result<bool, String> + Send + Sync + 'static,
-{
-    serve_on_within(
-        mine,
-        count,
-        writer,
-        told_at_ns,
-        look,
-        SERVES_ON_AT_MOST,
-        SERVES_ON_LOOKS_EVERY,
-    )
-    .await
-}
-
-/// [`serve_on_until_another_group_serves`], for at most `at_most`, looking
-/// every `every`.
+/// run off the runtime's own threads. A writer serves on through
+/// [`Holding::serve_on_until_another_group_serves`], for at most
+/// `at_most`, looking every `every`.
 ///
 /// A look is given what is left of `at_most` and no longer (stage T's
 /// review, finding 1). It reads the store's database 0 through the store's
@@ -1209,7 +1187,7 @@ impl Holding {
         }
     }
 
-    /// [`serve_on_until_another_group_serves`] for this writer, told to
+    /// [`serve_on_within`] for this writer, told to
     /// stop at `told_at_ns`, and known to its fence's step-downs (ruled
     /// 2026-11-18, item 110; [`ServingOn`]): fenced meanwhile, at the fence
     /// it is not ready, commits nothing more -- `stop_committing`, every
