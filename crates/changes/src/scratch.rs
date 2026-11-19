@@ -102,3 +102,45 @@ impl Drop for Made {
         .join();
     }
 }
+
+/// What an async test holds over a store -- the store, a writer, a lake, a
+/// mover, the databases under them -- dropped off the runtime wherever its
+/// test ends, a failed one's too. A store's pool closes sync clients, and a
+/// sync client closed on a runtime's thread panics: in a test already
+/// unwinding that is a panic in a destructor, which ends the process before
+/// any [`Scratch`] drops what it made (merge-queue run 44594070565: one
+/// failed attempt of a lake test left its two `lake2_*` databases, and the
+/// run failed on them after the test's retry passed). Reads as what it
+/// holds.
+pub struct OffRuntime<T: Send>(Option<T>);
+
+impl<T: Send> OffRuntime<T> {
+    /// `held`, dropped off the runtime when this goes.
+    pub fn new(held: T) -> OffRuntime<T> {
+        OffRuntime(Some(held))
+    }
+}
+
+impl<T: Send> std::ops::Deref for OffRuntime<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("held until dropped")
+    }
+}
+
+impl<T: Send> std::ops::DerefMut for OffRuntime<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("held until dropped")
+    }
+}
+
+impl<T: Send> Drop for OffRuntime<T> {
+    fn drop(&mut self) {
+        let held = self.0.take();
+        // On a thread of its own, as a `Scratch` drops what it made: never
+        // on the runtime's, whatever kind of runtime its test runs on.
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(held));
+        });
+    }
+}
