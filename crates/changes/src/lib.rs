@@ -735,6 +735,33 @@ impl std::fmt::Display for Fenced {
 
 impl std::error::Error for Fenced {}
 
+/// How long a migration waits for its schema's advisory lock: the
+/// runtime's bound on a migration's wait (MIGRATION_WAITS_AT_MOST).
+pub const SCHEMA_LOCK_WAITS_AT_MOST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A migration's schema lock (`pg_advisory_lock(key)`, held by the session
+/// until it lets it go), waited for at most `wait` (review c5w3 L-c). Cut
+/// off by the network alone, a migration's server session lives on holding
+/// the lock until its keepalive ends it; the migration applied again
+/// (meridian_runtime::migrate_once_it_answers) would wait for it past its
+/// bound. Only the lock's wait is bounded: the migration's own statements
+/// wait as they did. Refused past `wait` (SQLSTATE 55P03, lock not
+/// available).
+pub fn take_schema_lock(
+    client: &mut impl postgres::GenericClient,
+    key: i64,
+    wait: std::time::Duration,
+) -> Result<(), postgres::Error> {
+    client.batch_execute(&format!(
+        "SET lock_timeout = '{}ms'",
+        wait.as_millis().max(1)
+    ))?;
+    let taken = client.execute("SELECT pg_advisory_lock($1)", &[&key]);
+    let reset = client.batch_execute("RESET lock_timeout");
+    taken?;
+    reset
+}
+
 #[cfg(test)]
 mod tests;
 

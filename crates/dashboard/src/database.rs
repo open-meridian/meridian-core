@@ -237,8 +237,12 @@ impl Database {
     /// from `clock`.
     pub fn migrate(&self, clock: &dyn crate::Clock) -> Result<(), String> {
         let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
-            .map_err(said)?;
+        meridian_changes::take_schema_lock(
+            &mut *conn,
+            SCHEMA_LOCK,
+            meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST,
+        )
+        .map_err(said)?;
         let outcome = apply(&mut conn, clock);
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome.map_err(|failed| format!("the dashboard's tables could not be made: {failed}"))
