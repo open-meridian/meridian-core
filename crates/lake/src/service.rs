@@ -735,26 +735,14 @@ fn row_keys(rows: &[Observation]) -> Vec<(i16, String)> {
 /// A store's refusal of a write as its plugin hears it: a restatement the
 /// lake's rule 5 refuses is INVALID_ARGUMENT naming the field at the first
 /// row of the write under that key (`series[3].meta.valid_from_ns`); every
-/// other failure as the store said it.
+/// other failure as the bus carries it ([`StoreError::on_the_bus`]).
+///
+/// [`StoreError::on_the_bus`]: crate::store::StoreError::on_the_bus
 fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, String)]) -> String {
     if let Some(refused) = crate::store::key_fixed_refusal(&failed, field, keys) {
         return refused;
     }
-    match failed {
-        // Held past the hold (section 6.8): OVERLOADED, its retry-after.
-        crate::store::StoreError::Held(words) => meridian_bus::refusal_retrying(
-            meridian_pb::v1::RefusalReason::Overloaded as i32,
-            meridian_changes::moves::HELD_RETRY_SECONDS,
-            words,
-        ),
-        // Its plugin shard's epoch is no longer the instance's (step 3d,
-        // checkpoint 5, item 32): FAILED_PRECONDITION, and its sidecar
-        // exits.
-        crate::store::StoreError::ShardFenced(fenced) => {
-            meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
-        }
-        other => other.to_string(),
-    }
+    failed.on_the_bus()
 }
 
 pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
@@ -3493,7 +3481,7 @@ impl Lake {
         let done = self
             .store
             .record(lake::EXECUTION_COST_DATASET, rows, self.clock.now_ns())
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         Ok(RecordObservationsReply {
             recorded: done.recorded,
@@ -6035,7 +6023,7 @@ impl Lake {
         }
         self.store
             .record_shard_take(&took)
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         if std::time::Instant::now() >= until {
             // Its record's commit ran past the sidecar's wait: the sidecar
             // has given up, and is answered nothing it could act on.
@@ -6191,7 +6179,7 @@ impl Lake {
         let epoch = self
             .store
             .raise_shard(&took.instance, took.shard, took.epoch, admit)
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         Ok(meridian_domain::v1::TakeShardReply { epoch })
     }
 
@@ -6233,7 +6221,7 @@ impl Lake {
                 crate::store::StoreError::Invalid { field, words } => {
                     refusal_with_status(RefusalStatus::InvalidArgument, &[field.to_string()], words)
                 }
-                other => other.to_string(),
+                other => other.on_the_bus(),
             })?;
         tracing::info!(
             parent = split.parent,
@@ -6563,7 +6551,7 @@ impl Lake {
         }
         self.store
             .assess(&journal)
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         self.publish_control();
         Ok(RecordQualityAssessmentsReply {
             recorded: request.assessments.len() as u32,
@@ -6653,7 +6641,7 @@ impl Lake {
         match self
             .store
             .set_priority(&priority, request.against_updated_at_ns)
-            .map_err(|failed| failed.to_string())?
+            .map_err(crate::store::StoreError::on_the_bus)?
         {
             Ok(set) => {
                 self.publish_control();

@@ -100,6 +100,14 @@ impl MemoryStore {
         self.fence.adopt(epoch);
     }
 
+    /// Commit nothing more, as a writer told to stop does
+    /// ([`meridian_changes::Fence::stop`]): what a test of a stopped
+    /// writer does.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.fence.stop();
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
