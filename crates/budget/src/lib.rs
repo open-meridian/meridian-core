@@ -129,14 +129,52 @@ pub struct Accounting {
 pub struct Admitted {
     pub turn: Turn,
     pub reservation: Reservation,
+    /// Whose request it is, as its turn was queued.
+    caller: String,
+    /// When its wait ends: [`WAIT`] after it came.
+    waits_until: std::time::Instant,
 }
 
 impl Admitted {
     /// Run `work` with this request's reservation as the thread's own, so
-    /// a store's [`grow`] and [`check`] reach it.
+    /// a store's [`grow`] and [`check`] reach it, and with its caller and
+    /// the end of its wait known to it ([`waiting`]).
     pub fn within<R>(&self, work: impl FnOnce() -> R) -> R {
+        let before = WAITING.with(|held| {
+            held.replace(Some(Waiting {
+                caller: self.caller.clone(),
+                until: self.waits_until,
+            }))
+        });
+        struct Restore(Option<Waiting>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                WAITING.with(|held| *held.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(before);
         within(&self.reservation, work)
     }
+}
+
+/// The request a thread answers, for whatever else it must wait for once
+/// admitted (the lake's place to build a whole answer): whose it is, and
+/// when its wait ends. A request waits [`WAIT`] in all from when it came,
+/// its turn and its room included, never that long again for each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting {
+    pub caller: String,
+    pub until: std::time::Instant,
+}
+
+thread_local! {
+    static WAITING: std::cell::RefCell<Option<Waiting>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The admitted request this thread answers ([`Admitted::within`]); none
+/// where it answers none, as a component's own work and a test's.
+pub fn waiting() -> Option<Waiting> {
+    WAITING.with(|held| held.borrow().clone())
 }
 
 impl Process {
@@ -222,7 +260,12 @@ impl Process {
             .budget
             .reserve_async(FLOOR_BYTES + bytes, what, left)
             .await?;
-        Ok(Admitted { turn, reservation })
+        Ok(Admitted {
+            turn,
+            reservation,
+            caller: caller.to_string(),
+            waits_until: started + WAIT,
+        })
     }
 }
 
@@ -314,6 +357,25 @@ mod tests {
         let before = process().accounting().refused;
         count_refusal();
         assert!(process().accounting().refused > before);
+    }
+
+    /// A request waits [`WAIT`] in all: what it must wait for once admitted
+    /// is told whose it is and when its wait ends, counted from when it
+    /// came, and only while it is answered.
+    #[tokio::test]
+    async fn an_admitted_request_knows_its_caller_and_when_its_wait_ends() {
+        let process = Process::unbounded(1);
+        let came = std::time::Instant::now();
+        let admitted = process
+            .admit(Class::Rest, "drive-flood", 0, "a read")
+            .await
+            .unwrap();
+        assert_eq!(waiting(), None, "none before it is answered");
+        let known = admitted.within(waiting).expect("known while answered");
+        assert_eq!(known.caller, "drive-flood");
+        assert!(known.until >= came + WAIT);
+        assert!(known.until <= std::time::Instant::now() + WAIT);
+        assert_eq!(waiting(), None, "none after");
     }
 
     #[test]

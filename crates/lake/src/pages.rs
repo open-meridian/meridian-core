@@ -24,8 +24,8 @@
 //! past the most waits for one being built to finish; its rows are read
 //! when it starts building, so it answers as of its own cut-off as before.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,22 +155,104 @@ fn heap_per_encoded_byte(row: &Observation) -> usize {
 }
 
 /// Whole answers built at once, at most so many (rulings 957, 958).
+///
+/// A read past the most waits for a place, in its caller's turn among the
+/// callers waiting, as at the component's gate (the resilience spec's
+/// section 10a, fair shares): one caller's reads wait behind each other,
+/// and every other caller's next read is built after at most one of its.
+/// A read answered for an admitted request waits no longer than that
+/// request's own wait ([`Building::enter_by`]): then it is refused for load
+/// with a retry-after, where it waited with no end before.
 pub struct Building {
     most: AtomicUsize,
-    /// Those being built now, and the most there have been at once.
-    now: Mutex<(usize, usize)>,
+    now: Mutex<Line>,
     freed: Condvar,
+    /// How long one took to build, smoothed, in nanoseconds: what a
+    /// retry-after is estimated from.
+    built_ns: AtomicU64,
+}
+
+/// Those being built and those waiting for a place.
+#[derive(Default)]
+struct Line {
+    building: usize,
+    /// The most there have been built at once.
+    peak: usize,
+    /// The next read's number in the line.
+    next: u64,
+    /// Callers with a read waiting, in the order their turn comes.
+    turn: VecDeque<String>,
+    by_caller: HashMap<String, VecDeque<u64>>,
+}
+
+impl Line {
+    fn join(&mut self, caller: &str) -> u64 {
+        let number = self.next;
+        self.next += 1;
+        if !self.by_caller.contains_key(caller) {
+            self.turn.push_back(caller.to_string());
+        }
+        self.by_caller
+            .entry(caller.to_string())
+            .or_default()
+            .push_back(number);
+        number
+    }
+
+    /// Whose turn it is: the first read of the first caller waiting.
+    fn first(&self) -> Option<u64> {
+        let caller = self.turn.front()?;
+        self.by_caller.get(caller)?.front().copied()
+    }
+
+    /// The first takes its place: its caller goes to the back of the turn
+    /// while it has more waiting.
+    fn take_first(&mut self) {
+        let Some(caller) = self.turn.pop_front() else {
+            return;
+        };
+        let more = self.by_caller.get_mut(&caller).is_some_and(|waiting| {
+            waiting.pop_front();
+            !waiting.is_empty()
+        });
+        if more {
+            self.turn.push_back(caller);
+        } else {
+            self.by_caller.remove(&caller);
+        }
+    }
+
+    /// A read that gave up leaves the line, its caller's turn kept for the
+    /// rest of its reads.
+    fn leave(&mut self, caller: &str, number: u64) {
+        let Some(waiting) = self.by_caller.get_mut(caller) else {
+            return;
+        };
+        waiting.retain(|other| *other != number);
+        if waiting.is_empty() {
+            self.by_caller.remove(caller);
+            self.turn.retain(|other| other != caller);
+        }
+    }
+
+    fn waiting(&self) -> usize {
+        self.by_caller.values().map(VecDeque::len).sum()
+    }
 }
 
 /// One whole answer being built; the next waiting may start once it drops.
-pub struct Permit<'a>(&'a Building);
+pub struct Permit<'a> {
+    of: &'a Building,
+    began: Instant,
+}
 
 impl Building {
     pub fn new(most: usize) -> Self {
         Building {
             most: AtomicUsize::new(most.max(1)),
-            now: Mutex::new((0, 0)),
+            now: Mutex::new(Line::default()),
             freed: Condvar::new(),
+            built_ns: AtomicU64::new(50_000_000),
         }
     }
 
@@ -185,29 +267,87 @@ impl Building {
         self.most.load(Ordering::SeqCst)
     }
 
-    /// Wait for a place, then hold it until the permit drops.
+    /// Wait for a place, however long, then hold it until the permit drops:
+    /// the lake's own work, which answers no request.
     pub fn enter(&self) -> Permit<'_> {
-        let mut now = self.now.lock().expect("building poisoned");
-        while now.0 >= self.most() {
-            now = self.freed.wait(now).expect("building poisoned");
+        match self.wait("", None) {
+            Ok(permit) => permit,
+            Err(_) => unreachable!("a wait with no end is never refused"),
         }
-        now.0 += 1;
-        now.1 = now.1.max(now.0);
-        Permit(self)
+    }
+
+    /// `caller`'s place, in its turn among the callers waiting, by `until`
+    /// at the latest, held until the permit drops; refused for load with a
+    /// retry-after where none comes by then, the read leaving the line.
+    pub fn enter_by(
+        &self,
+        caller: &str,
+        until: Instant,
+    ) -> Result<Permit<'_>, meridian_budget::Overloaded> {
+        self.wait(caller, Some(until))
+    }
+
+    fn wait(
+        &self,
+        caller: &str,
+        until: Option<Instant>,
+    ) -> Result<Permit<'_>, meridian_budget::Overloaded> {
+        let mut now = self.now.lock().expect("building poisoned");
+        let number = now.join(caller);
+        loop {
+            if now.building < self.most() && now.first() == Some(number) {
+                now.take_first();
+                now.building += 1;
+                now.peak = now.peak.max(now.building);
+                // Another place may be free, for the next in turn.
+                self.freed.notify_all();
+                return Ok(Permit {
+                    of: self,
+                    began: Instant::now(),
+                });
+            }
+            now = match until {
+                None => self.freed.wait(now).expect("building poisoned"),
+                Some(until) => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        now.leave(caller, number);
+                        let waiting = now.waiting();
+                        let most = self.most();
+                        // Whose turn it is may have changed.
+                        self.freed.notify_all();
+                        let built = self.built_ns.load(Ordering::Relaxed) as f64 / 1e9;
+                        let seconds = ((waiting + 1) as f64 * built / most as f64).ceil() as u32;
+                        return Err(meridian_budget::Overloaded {
+                            retry_after_seconds: seconds
+                                .clamp(1, meridian_budget::MOST_RETRY_AFTER_SECONDS),
+                            words: format!(
+                                "overloaded: {caller} waited its while and no place came to \
+                                 build its answer, {waiting} waiting for the {most} built at once"
+                            ),
+                        });
+                    }
+                    self.freed
+                        .wait_timeout(now, left)
+                        .expect("building poisoned")
+                        .0
+                }
+            };
+        }
     }
 
     /// Run `then` only while nothing is being built, none starting until it
     /// returns; None, without running it, while anything is.
     pub fn when_idle<R>(&self, then: impl FnOnce() -> R) -> Option<R> {
         let now = self.now.lock().expect("building poisoned");
-        let ran = (now.0 == 0).then(then);
+        let ran = (now.building == 0).then(then);
         drop(now);
         ran
     }
 
     /// The most that have been built at once.
     pub fn peak(&self) -> usize {
-        self.now.lock().expect("building poisoned").1
+        self.now.lock().expect("building poisoned").peak
     }
 }
 
@@ -219,10 +359,16 @@ impl Default for Building {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut now = self.0.now.lock().expect("building poisoned");
-        now.0 -= 1;
+        let took = self.began.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let before = self.of.built_ns.load(Ordering::Relaxed);
+        self.of
+            .built_ns
+            .store(before - before / 8 + took / 8, Ordering::Relaxed);
+        let mut now = self.of.now.lock().expect("building poisoned");
+        now.building -= 1;
         drop(now);
-        self.0.freed.notify_one();
+        // Every one waiting looks again: only the first in turn takes it.
+        self.of.freed.notify_all();
     }
 }
 
@@ -488,6 +634,63 @@ mod tests {
             assert!(highest.load(Ordering::SeqCst) <= most, "at most {most}");
             assert!((1..=most).contains(&building.peak()));
         }
+    }
+
+    /// Section 10a, fair shares: a caller's read is built in its turn among
+    /// the callers waiting, so a flood's reads wait behind each other and
+    /// another caller's read behind at most one of them.
+    #[test]
+    fn a_read_is_built_in_its_callers_turn_among_the_callers_waiting() {
+        let building = Arc::new(Building::new(1));
+        let taken = building.enter();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut threads = Vec::new();
+        for (n, caller) in ["flood", "flood", "flood", "flood", "other"]
+            .into_iter()
+            .enumerate()
+        {
+            let (waits, order) = (Arc::clone(&building), Arc::clone(&order));
+            let until = Instant::now() + Duration::from_secs(10);
+            threads.push(std::thread::spawn(move || {
+                let _permit = waits.enter_by(caller, until).expect("its place comes");
+                order.lock().unwrap().push(caller);
+            }));
+            // Each in the line before the next joins it.
+            while building.now.lock().unwrap().waiting() <= n {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        drop(taken);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["flood", "other", "flood", "flood", "flood"]
+        );
+    }
+
+    /// Section 10a, overload answered: a read whose place does not come by
+    /// the end of its wait is refused with a retry-after and leaves the
+    /// line, so the next in turn takes the place when it frees.
+    #[test]
+    fn a_read_whose_place_does_not_come_by_its_waits_end_is_refused_and_leaves_the_line() {
+        let building = Arc::new(Building::new(1));
+        let taken = building.enter();
+        let began = Instant::now();
+        let refused = building
+            .enter_by("flood", began + Duration::from_millis(60))
+            .err()
+            .expect("no place came");
+        assert!(began.elapsed() >= Duration::from_millis(60));
+        assert!(refused.retry_after_seconds >= 1);
+        assert!(refused.words.starts_with("overloaded: flood"), "{refused}");
+        assert_eq!(building.now.lock().unwrap().waiting(), 0, "it left");
+        drop(taken);
+        let _next = building
+            .enter_by("other", Instant::now() + Duration::from_millis(60))
+            .expect("the place is free");
+        assert_eq!(building.peak(), 1);
     }
 
     /// Ruling 957 (b): what runs when idle runs only while nothing is being

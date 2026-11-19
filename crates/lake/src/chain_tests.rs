@@ -1136,33 +1136,35 @@ async fn a_read_in_pages_from_memory_is_not_held() {
 
 /// A chain's quotes read in pages of 100, as of a cut-off (0: now).
 fn quotes_page(h: &Harness, as_of_ns: i64, cursor: &str) -> service::ReadAnswer {
-    h.lake
-        .read(
-            ReadRequest {
-                data_type: DataType::Quote,
-                subjects: subjects(AAPL),
-                kinds: vec![],
-                interval_ns: 0,
-                sources: None,
-                at_ns: 0,
-                business_date: String::new(),
-                valid_from_ns: 0,
-                valid_until_ns: 0,
-                as_of_ns,
-                page_size: 100,
-                cursor: cursor.into(),
-                after: None,
-                tenors: vec![],
-                published_as_of_ns: 0,
-                series_keys: vec![],
-                all_series: true,
-                dates: None,
-                window: Default::default(),
-                fields: Vec::new(),
-            },
-            &envelope("signal-1"),
-        )
-        .unwrap()
+    quotes_asked(h, as_of_ns, cursor).unwrap()
+}
+
+fn quotes_asked(h: &Harness, as_of_ns: i64, cursor: &str) -> Result<service::ReadAnswer, String> {
+    h.lake.read(
+        ReadRequest {
+            data_type: DataType::Quote,
+            subjects: subjects(AAPL),
+            kinds: vec![],
+            interval_ns: 0,
+            sources: None,
+            at_ns: 0,
+            business_date: String::new(),
+            valid_from_ns: 0,
+            valid_until_ns: 0,
+            as_of_ns,
+            page_size: 100,
+            cursor: cursor.into(),
+            after: None,
+            tenors: vec![],
+            published_as_of_ns: 0,
+            series_keys: vec![],
+            all_series: true,
+            dates: None,
+            window: Default::default(),
+            fields: Vec::new(),
+        },
+        &envelope("signal-1"),
+    )
 }
 
 fn a_chain_of(h: &Harness, series: usize) {
@@ -1255,6 +1257,70 @@ async fn no_more_whole_answers_are_built_at_once_than_the_chart_says() {
             h.lake.most_built_at_once()
         );
     }
+}
+
+/// The resilience spec's section 10a, "overload answered" (the product
+/// owner's rule: a refusal with a retry-after, never a timeout): a read
+/// admitted while every place to build a whole answer is taken waits its
+/// while, counted from when it came, then is refused for load with a
+/// retry-after. It waited with no end before, its turn held, however long
+/// the answers ahead of it took: sixteen turns over two places, and its
+/// caller heard nothing until its own deadline (PR CI 44417302659, the
+/// tolerant profile's memory-pressure: 463 reads given up, none refused).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_no_answer_is_built_for_within_its_wait_is_refused_with_a_retry_after() {
+    let h = Arc::new(harness());
+    a_chain_of(&h, 450);
+    h.lake.build_at_most(1);
+    let process = meridian_budget::Process::unbounded(16);
+    // The one place taken, as an answer being built takes it.
+    let taken = h.lake.building().enter();
+    let came = std::time::Instant::now();
+    let admitted = process
+        .admit(meridian_budget::Class::Rest, "signal-1", 0, "a read")
+        .await
+        .unwrap();
+    let (says, said) = std::sync::mpsc::channel();
+    let reading = {
+        let h = Arc::clone(&h);
+        std::thread::spawn(move || {
+            let answered = admitted.within(|| quotes_asked(&h, NOW, ""));
+            let _ = says.send(answered.map(|page| page.rows.len()));
+        })
+    };
+    let heard = said.recv_timeout(meridian_budget::WAIT + std::time::Duration::from_secs(2));
+    let waited = came.elapsed();
+    drop(taken);
+    reading.join().unwrap();
+    let refused = heard
+        .expect("neither answered nor refused: still waiting for a place, past its wait")
+        .expect_err("no place was free: refused, never answered");
+    assert_eq!(
+        meridian_bus::read_refusal(&refused).map(|(reason, _)| reason),
+        Some(meridian_pb::v1::RefusalReason::Overloaded as i32),
+        "{refused}"
+    );
+    assert!(
+        meridian_bus::refusal_retry_after(&refused).is_some_and(|seconds| seconds >= 1),
+        "{refused}"
+    );
+    assert!(
+        waited >= meridian_budget::WAIT - std::time::Duration::from_millis(100),
+        "it waits its while first: {waited:?}"
+    );
+    // The place free again: the same read asked again is answered.
+    let admitted = process
+        .admit(meridian_budget::Class::Rest, "signal-1", 0, "a read")
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted
+            .within(|| quotes_asked(&h, NOW, ""))
+            .unwrap()
+            .rows
+            .len(),
+        100
+    );
 }
 
 /// Ruling 957 (b): the sweep hands freed memory back only while no whole

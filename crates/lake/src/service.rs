@@ -4811,8 +4811,28 @@ impl Lake {
         reader: &Reader,
     ) -> Result<crate::pages::Placed, String> {
         // At most so many built at once (rulings 957, 958); never while
-        // waiting for a source below, which builds nothing.
-        let building = self.building.enter();
+        // waiting for a source below, which builds nothing. A request's
+        // read waits for its place in its caller's turn and no longer than
+        // the request's own wait, then is refused for load with a
+        // retry-after (the resilience spec's section 10a): it holds one of
+        // the member's turns while it waits, and with every turn taken by
+        // reads waiting here a caller heard nothing until its own deadline.
+        let building = match meridian_budget::waiting() {
+            Some(waiting) => self
+                .building
+                .enter_by(&waiting.caller, waiting.until)
+                .map_err(|over| {
+                    tracing::info!(
+                        caller = waiting.caller,
+                        retry_after_seconds = over.retry_after_seconds,
+                        "{}",
+                        over.words
+                    );
+                    meridian_budget::count_refusal();
+                    meridian_bus::overloaded(&over)
+                })?,
+            None => self.building.enter(),
+        };
         self.built
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answered = read::choose(self.store.as_ref(), read, against)?;
