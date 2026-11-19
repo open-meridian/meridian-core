@@ -136,7 +136,10 @@ one others. /healthz alone does not say it: CI 43539633884 had a server
 current with the leader, /healthz 200, that the leader had never added, so
 the group was two and no stream at three could be placed (and, by the same
 signature, CI 43955282180, for fifteen minutes).
-Not ready, its startup probe's bound starts it again, and it joins afresh.
+A server that does not pass it within its startup probe's bound, or that
+fails it past its liveness probe's once started, is started again: the same
+pod name, so the same Raft peer, on the same volume, with the JetStream state
+it kept, catching up from the others. A restart clears no state.
 Takes the chart.
 */}}
 {{- define "meridian-runtime.brokerHealthz" -}}

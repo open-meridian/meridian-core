@@ -2955,17 +2955,77 @@ def record_now():
     return held
 
 
-def settled_everywhere():
+# Why settled_everywhere last said no: the clause it stopped at and what it
+# saw, for the check that waited on it (CI 44556229125 said only that the
+# move to ha never settled, and its dump named the stores' members alone).
+UNSETTLED = {"why": "", "at": 0.0}
+
+
+def names_of(pods_said):
+    return ", ".join(p["metadata"]["name"] for p in pods_said) or "none"
+
+
+def unsettled():
+    """Why the deployment is not settled everywhere: the first clause that
+    does not hold and what it saw, or "" where every one holds."""
     if not all_ready():
-        return False
-    if not all(members_settled(c) for c in STORES):
-        return False
+        return "not every Deployment of the release is Available"
+    for component in STORES:
+        if not members_settled(component):
+            live = pods(component)
+            want = 2 if SHAPE in ("ha", "scaled") else 1
+            return (f"{component}: {sum(ready(p) for p in live)} of {len(live)} running member(s) ready, "
+                    f"{want} wanted (not ready: {names_of(p for p in live if not ready(p))})")
     database = pods("database")
     if len(database) != database_members() or not all(ready(p) for p in database):
-        return False
-    servers = [p for p in pods("broker") if p["metadata"]["labels"].get("meridian.dev/broker-set") == broker_set()]
-    return len(servers) == (3 if SHAPE == "ha" else 1) and all(ready(p) for p in servers) \
-        and len(pods("broker")) == len(servers)
+        return (f"the database: {sum(ready(p) for p in database)} of {len(database)} running member(s) "
+                f"ready, {database_members()} wanted (not ready: {names_of(p for p in database if not ready(p))})")
+    every = pods("broker")
+    servers = [p for p in every if p["metadata"]["labels"].get("meridian.dev/broker-set") == broker_set()]
+    want = 3 if SHAPE == "ha" else 1
+    if len(servers) != want or not all(ready(p) for p in servers):
+        return (f"the broker: {sum(ready(p) for p in servers)} of {len(servers)} running server(s) of "
+                f"{broker_set()} ready, {want} wanted (not ready: {names_of(p for p in servers if not ready(p))})")
+    if len(every) != len(servers):
+        return (f"the broker: server(s) of another set still running beside {broker_set()}: "
+                f"{names_of(p for p in every if p not in servers)}")
+    return ""
+
+
+def settled_everywhere():
+    UNSETTLED["why"], UNSETTLED["at"] = unsettled(), time.time()
+    return not UNSETTLED["why"]
+
+
+def broker_health(s, when):
+    """Each broker server's pod and health, for a check that waited on the
+    deployment settling: its set, readiness and restarts, and its full
+    health check with its details (CI 44556229125: a server 0/1 for over
+    30 minutes, its consumer "not current" at every check, not restarted)."""
+    try:
+        every = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+                               "-o", "json", check=False) or "{}").get("items", [])
+    except ValueError as failed:
+        s.note(f"{when}: the broker's servers could not be listed: {failed}")
+        return
+    if not every:
+        s.note(f"{when}: no broker server is there")
+    for pod in every:
+        name = pod["metadata"]["name"]
+        status, said = monitored(name, ("/healthz?details=true",))["/healthz?details=true"]
+        restarted = sum(c.get("restartCount", 0) for c in pod["status"].get("containerStatuses", []))
+        s.note(f"{when}: {name} (set {pod['metadata'].get('labels', {}).get('meridian.dev/broker-set', '?')}) "
+               f"{pod['status'].get('phase')}, ready {ready(pod)}, restarted {restarted} time(s); "
+               f"/healthz?details=true {status} {' '.join(said.split())[:600]}")
+
+
+def not_settled(s, when):
+    """What a wait for every member found last, where it ended unsettled:
+    the clause that did not hold, and every broker server's health."""
+    ago = round(time.time() - UNSETTLED["at"]) if UNSETTLED["at"] else None
+    s.note(f"{when}: not settled, at the last look ({'never looked' if ago is None else f'{ago} s ago'}): "
+           f"{UNSETTLED['why'] or 'every member, database member and broker server ready'}")
+    broker_health(s, when)
 
 
 def helm_takes_counts():
@@ -3065,6 +3125,7 @@ def tls_turned_on(s):
     s.check(settled, "internal TLS on: every member ready after the upgrade")
     figure("internal TLS on: every member ready after the upgrade", took_s=round(time.time() - began))
     if not settled:
+        not_settled(s, "internal TLS on")
         raise SystemExit("the deployment did not settle with internal TLS on")
     TLS = True
     internal_tls(s)
@@ -3231,8 +3292,15 @@ SAID_KEPT = []
 # loopback alone (`http: 127.0.0.1:8222`, broker_config) and is reached by
 # a port-forward, which lands on the pod's own loopback.
 BROKER_MONITOR_PORT = 8222
-BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=true&config=true",
-               "/raftz?group=_meta_", "/routez", "/varz")
+# Its full health with the details of every check that failed, and every
+# Raft group it holds -- the metadata group, each stream's and each
+# consumer's -- not the metadata group alone (CI 44556229125: a consumer's
+# group "not current" on one server, which neither showed). /raftz names
+# one account's groups, the system account's where none is asked: the
+# metadata group there, the streams' and consumers' in the global account,
+# $G, where the deployment's components keep them.
+BROKER_SAID = ("/healthz?details=true", "/jsz?streams=true&consumers=true&config=true",
+               "/raftz", "/raftz?acc=$G", "/routez", "/varz")
 
 
 def broker_servers():
@@ -3453,6 +3521,7 @@ def reconfigure(s):
             took = time.time() - began
             s.check(settled, f"reconfigure: every member in the {target} shape and ready after the upgrade")
             if not settled:
+                not_settled(s, f"reconfigure to {target}")
                 for component in STORES:
                     explain(s, f"reconfigure to {target}", component)
                 return
@@ -3694,6 +3763,7 @@ def groups_upgraded(s, what, groups, held, *sets):
     s.check(settled, f"{what}: every workload rolled out and ready after the upgrade"
             + ("" if settled else f" ({'; '.join(rollout_unfinished()[:4])})"))
     if not settled:
+        not_settled(s, what)
         return False
     s.check(acks_again(int(time.time() * 1000), seconds=300),
             f"{what}: the write driver acknowledged by the book and the lake again")
@@ -4014,6 +4084,7 @@ def archived_in_tolerant(s):
     s.check(settled, "restore: every member ready with the archive on after the upgrades")
     figure("restore: every member ready with the archive on", took_s=round(time.time() - began))
     if not settled:
+        not_settled(s, "the archive on")
         raise SystemExit("the deployment did not settle with the archive on")
     s.check(not under_patroni(), "restore: the base backup is taken from the database alone, as tolerant runs it")
 
@@ -4127,8 +4198,10 @@ def restored_to_a_time(s):
             seconds=300)
     for name, replicas in running.items():
         kubectl("scale", "deployment", name, f"--replicas={replicas}")
-    s.check(happens(settled_everywhere, 900, every=5),
-            f"restore: every component ready again, and the database's {members} members")
+    settled = happens(settled_everywhere, 900, every=5)
+    s.check(settled, f"restore: every component ready again, and the database's {members} members")
+    if not settled:
+        not_settled(s, "restore")
     rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT)
     s.check(rows == "1:before,2:before,3:before", f"restore: the rows as they stood at the time ({rows})")
     for component, d, name, _ in extras:

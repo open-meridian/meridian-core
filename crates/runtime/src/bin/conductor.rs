@@ -271,6 +271,14 @@ fn run() -> Result<(), String> {
                 move || writing.epoch(),
                 move || watched.head_epoch().map_err(|failed| failed.to_string()),
             );
+            // Its partitions in its report: its log's own and its control
+            // partition (CI 44556229125: a writer named none).
+            holding.report_partitions(|| {
+                Ok(meridian_config::postgres::CHANGES
+                    .partitions()
+                    .map(String::from)
+                    .to_vec())
+            });
             // A new database timeline raises the epoch (contract v30, stage C).
             let following = Arc::clone(postgres);
             holding.follow_timeline(&bus, "config", move || {

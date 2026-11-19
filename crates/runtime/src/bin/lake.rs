@@ -443,6 +443,21 @@ fn run() -> Result<(), String> {
             move || writing.epoch(),
             move || watched.head_epoch().map_err(|failed| failed.to_string()),
         );
+        // Its partitions in its report, as its record lists them, and its
+        // control partition: what a standby following it names (CI
+        // 44556229125: a writer named none).
+        let listing = Arc::clone(&record);
+        holding.report_partitions(move || {
+            listing
+                .heads()
+                .map(|heads| {
+                    heads
+                        .into_keys()
+                        .chain([meridian_changes::CONTROL.to_string()])
+                        .collect()
+                })
+                .map_err(|failed| failed.to_string())
+        });
         // A new database timeline raises the epoch (contract v30, stage C):
         // the hot layer let go of what the record may have lost.
         let following = Arc::clone(&store);

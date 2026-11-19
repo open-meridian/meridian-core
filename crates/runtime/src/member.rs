@@ -981,11 +981,51 @@ pub fn holder_member(holder: &str) -> String {
         .to_string()
 }
 
+/// How often a writer reads its partitions again for its report, the
+/// interval its reports go out at.
+pub const PARTITIONS_READ_EVERY: Duration = Duration::from_secs(10);
+
 impl Holding {
     /// Whether this writer took a lease, and so takes the partitions over
     /// (raising their epoch) rather than adopting the epoch it finds.
     pub fn took_over(&self) -> bool {
         self.elector.is_some()
+    }
+
+    /// The partitions this writer writes, for its report (`partitions`, the
+    /// field a standby fills with what it follows): read by `read` at once
+    /// and every [`PARTITIONS_READ_EVERY`] after, off the runtime's threads,
+    /// while it writes. Reporting only: nothing it writes goes by them. A
+    /// read that fails keeps what was read last. Before CI 44556229125 only
+    /// a standby's following set them, and every writer reported none.
+    pub fn report_partitions<F>(&self, read: F)
+    where
+        F: Fn() -> Result<Vec<String>, String> + Send + Sync + 'static,
+    {
+        let component = self.component;
+        let read = Arc::new(read);
+        tokio::spawn(async move {
+            let mut said_failing = false;
+            while said().mode() == Mode::Writer.as_str() {
+                let reading = Arc::clone(&read);
+                match tokio::task::spawn_blocking(move || reading()).await {
+                    Ok(Ok(partitions)) => {
+                        said().set_partitions(partitions);
+                        said_failing = false;
+                    }
+                    Ok(Err(failed)) if !said_failing => {
+                        tracing::warn!(
+                            component,
+                            %failed,
+                            "this writer's partitions could not be read for its report; keeping the last"
+                        );
+                        said_failing = true;
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(PARTITIONS_READ_EVERY).await;
+            }
+        });
     }
 
     /// The epoch this writer writes under: the one it finds where it is the
