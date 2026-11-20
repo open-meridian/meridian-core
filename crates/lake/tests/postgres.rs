@@ -12719,6 +12719,178 @@ fn group_0_keeps_the_take_s_place_with_its_numbering() {
     );
 }
 
+/// Lead from the layer-A simulation of a timeline change during a take
+/// (draft PR #129, `crates/sim/src/timeline.rs`), shown on the code here:
+/// a later take's place admits a write an earlier take had fenced.
+///
+/// Spec 7.4, "What it guarantees": no write sent after a group's raise
+/// commits is accepted from a stale holder. The holder at epoch 1 is
+/// fenced by the take to 2, numbered with the stream at 105. Its write at
+/// 150 -- sent after that take, and refused while the shard is at 2 -- is
+/// still in the stream, the writer not yet at it (or taking it again after
+/// a database failover lost the position), when the shard is taken again
+/// under the same Lease transitions, a sidecar restarted in its pod, with
+/// the stream at 200. The row keeps one place for every older epoch
+/// (`place_kept`: GREATEST), so the write stamped 1 at 150 is admitted.
+///
+/// The write at 100, which the stream held before the take that fenced
+/// its holder, stays admitted after the second take (its replay is never
+/// refused): what a fix must keep.
+#[test]
+#[ignore = "red on main 8599e1fd: a later take's place admits a write an earlier take fenced (fence-lead; a read-only review precedes the fix)"]
+fn a_write_fenced_by_one_take_is_not_admitted_by_the_place_of_the_next() {
+    use meridian_changes::shard_fence::{Admit, Taking};
+    use meridian_lake::store::{ShardStamp, StoreError};
+    const STREAM: i64 = 1_790_000_000_000_000_000;
+    let store = store();
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let taking = |through| Taking {
+        admit: Some(Admit {
+            through,
+            stream: STREAM,
+        }),
+        ..lease(0)
+    };
+    let old = |sequence| ShardStamp::of(&instance, 1, 1).map(|s| s.in_stream(sequence, STREAM));
+    assert_eq!(
+        store
+            .take_shard(took(&instance, 1), &taking(10))
+            .unwrap()
+            .epoch,
+        1
+    );
+    // The take that fences the holder at 1, the stream at 105.
+    assert_eq!(
+        store
+            .take_shard(took(&instance, 1), &taking(105))
+            .unwrap()
+            .epoch,
+        2
+    );
+    // While the shard is at 2, the old holder's write at 150 is refused:
+    // in a stream position of its own, so the writer below has not taken
+    // it.
+    let seen = unique("STREAM");
+    let done = store
+        .record_write_ahead(
+            fenced_batch(&seen, &dataset, &subject, 150, "seen", old(150)),
+            150,
+        )
+        .unwrap();
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "at epoch 2, a write sent after the take's place was admitted: {:?}",
+        done[0]
+    );
+    // The same pod takes again under the same transitions, the stream at
+    // 200.
+    assert_eq!(
+        store
+            .take_shard(took(&instance, 1), &taking(200))
+            .unwrap()
+            .epoch,
+        3
+    );
+    let stream = unique("STREAM");
+    // What a fix keeps: the write the stream held before the take that
+    // fenced its holder.
+    let done = store
+        .record_write_ahead(
+            fenced_batch(&stream, &dataset, &subject, 100, "before", old(100)),
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        done[0].as_ref().map(|d| d.recorded).ok(),
+        Some(1),
+        "a write the stream held before the take that fenced it was refused: {:?}",
+        done[0]
+    );
+    // The lead: the write at 150, stamped 1, past the place of the take
+    // to 2 and at or below the place of the take to 3.
+    let mut after = fenced_batch(&stream, &dataset, &subject, 150, "after", old(150));
+    after.after = store.write_ahead_position(&stream).unwrap();
+    let done = store.record_write_ahead(after, 150).unwrap();
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "a write stamped 1, sent after the take to 2 (place 105), was admitted by the take to \
+         3's place (200): {:?}",
+        done[0]
+    );
+}
+
+/// The same lead with no take again by the same pod, and in a database the
+/// take's raise reaches (`hold`: GREATEST), not the one its numbering
+/// does: pod B's take fences pod A at 105, pod C's take of the Lease after
+/// it (one more transition) finds the stream at 200, and pod A's write at
+/// 150 is admitted in the second database.
+#[test]
+#[ignore = "red on main 8599e1fd: a later take's place admits a write an earlier take fenced (fence-lead; a read-only review precedes the fix)"]
+fn a_write_fenced_by_one_pod_s_take_is_not_admitted_by_the_place_of_another_s() {
+    use meridian_changes::shard_fence::Admit;
+    use meridian_lake::store::{ShardStamp, StoreError};
+    const STREAM: i64 = 1_790_000_000_000_000_000;
+    let urls = two_databases();
+    let zero = spread(&urls, 0);
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let stream = unique("STREAM");
+    let place = |through| Admit {
+        through,
+        stream: STREAM,
+    };
+    let by = |holder: &str, previous: &str| meridian_domain::v1::ShardTookOver {
+        holder: holder.into(),
+        previous_holder: previous.into(),
+        ..took(&instance, 1)
+    };
+    // Each take numbered with the stream's place, raised in every database
+    // with the place its raise found, and recorded.
+    let take = |took: meridian_domain::v1::ShardTookOver, transitions: u64, through: u64| {
+        let taking = meridian_changes::shard_fence::Taking {
+            admit: Some(place(through)),
+            ..lease(transitions)
+        };
+        let took = zero.take_shard(took, &taking).unwrap();
+        assert_eq!(
+            zero.raise_shard(&took.instance, took.shard, took.epoch, Some(place(through)))
+                .unwrap(),
+            took.epoch
+        );
+        zero.record_shard_take(&took).unwrap();
+        took.epoch
+    };
+    assert_eq!(take(by("feed-pod-a_1", ""), 0, 10), 1);
+    assert_eq!(take(by("feed-pod-b_1", "feed-pod-a_1"), 1, 105), 2);
+    assert_eq!(take(by("feed-pod-c_1", "feed-pod-b_1"), 2, 200), 3);
+    let one = PostgresStore::connect(&urls[1], 2).unwrap();
+    let old = |sequence| ShardStamp::of(&instance, 1, 1).map(|s| s.in_stream(sequence, STREAM));
+    let done = one
+        .record_write_ahead(
+            fenced_batch(&stream, &dataset, &subject, 100, "before", old(100)),
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        done[0].as_ref().map(|d| d.recorded).ok(),
+        Some(1),
+        "a write the stream held before the take that fenced it was refused: {:?}",
+        done[0]
+    );
+    let mut after = fenced_batch(&stream, &dataset, &subject, 150, "after", old(150));
+    after.after = one.write_ahead_position(&stream).unwrap();
+    let done = one.record_write_ahead(after, 150).unwrap();
+    assert!(
+        matches!(done[0], Err(StoreError::ShardFenced(_))),
+        "pod A's write stamped 1, sent after pod B's take (place 105), was admitted by pod \
+         C's take's place (200): {:?}",
+        done[0]
+    );
+}
+
 /// Review c5a2 N5 (approved 2026-11-16): a Lease made again -- another
 /// uid, its transitions from 0 -- is taken, never refused by the floor the
 /// old Lease's takes raised; on it, its own floor holds.
