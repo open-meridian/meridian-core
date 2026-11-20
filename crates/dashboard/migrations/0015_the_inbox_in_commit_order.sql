@@ -28,11 +28,15 @@
 -- While an upgrade rolls, a dashboard of the release before still moves a
 -- reader's place by its notice ID alone, never its number. A trigger on
 -- the places keeps the number with it: where a place's notice ID moves and
--- its number does not, the number is set to the greater of the one it had
--- and the highest number of the person's notices at or before that ID, the
--- same rule the places kept before this migration are set by. So a place
--- the release before moved is read on from by this one, and nothing it
--- read is read again (the review of v31a-core-1, finding 2).
+-- its number does not, the number is moved on only past what the release
+-- before delivered, the notices after the number it had whose IDs lie
+-- between the place's old ID and its new one, and stops before the first
+-- that does not (the review of v31a-core-1, finding 2; the delta review of
+-- 77afd5d0, finding 1). A notice numbered after the place but with an ID
+-- below the place's was never read by the release before, and this one
+-- still reads it: while the upgrade rolls a notice may be read twice, and
+-- none is lost. A new place the release before makes is moved on the same
+-- way, from nothing; a place made with no notice ID is left at 0.
 --
 -- Written to be run again harmlessly, as every migration here is.
 
@@ -91,21 +95,32 @@ CREATE TRIGGER dashboard_notice_takes_its_number
 CREATE OR REPLACE FUNCTION dashboard_inbox_cursor_keeps_its_number() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-    had bigint := 0;
+    had  bigint := 0;
+    was  text := '';
+    upto bigint;
 BEGIN
+    IF coalesce(NEW.notice_id, '') = '' THEN
+        RETURN NEW;
+    END IF;
     IF TG_OP = 'UPDATE' THEN
         IF NEW.notice_id IS NOT DISTINCT FROM OLD.notice_id OR NEW.seq <> OLD.seq THEN
             RETURN NEW;
         END IF;
         had := OLD.seq;
+        was := coalesce(OLD.notice_id, '');
     ELSIF NEW.seq <> 0 THEN
         RETURN NEW;
     END IF;
-    NEW.seq := greatest(had, coalesce((
-        SELECT max(n.inbox_seq) FROM dashboard_notice n
-         WHERE n.subject = NEW.subject AND n.inbox_seq IS NOT NULL
-           AND n.notice_id <= NEW.notice_id
-    ), 0));
+    -- The first notice after the number it had that the release before
+    -- did not deliver: its ID at or below the old one, or past the new.
+    SELECT min(n.inbox_seq) - 1 INTO upto FROM dashboard_notice n
+     WHERE n.subject = NEW.subject AND n.inbox_seq > had
+       AND (n.notice_id <= was OR n.notice_id > NEW.notice_id);
+    IF upto IS NULL THEN
+        SELECT max(n.inbox_seq) INTO upto FROM dashboard_notice n
+         WHERE n.subject = NEW.subject AND n.inbox_seq IS NOT NULL;
+    END IF;
+    NEW.seq := greatest(had, coalesce(upto, 0));
     RETURN NEW;
 END
 $$;

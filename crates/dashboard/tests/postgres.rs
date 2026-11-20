@@ -1239,14 +1239,49 @@ fn a_place_this_release_moved_is_never_read_again_by_the_release_before() {
         read_before(&mut raw, "DLG-1").is_empty(),
         "the release before reads again what this release read"
     );
-    // A move by number to a notice whose ID is lower keeps the higher ID.
-    store
-        .insert(
-            &ticket("TKT-01N5", "01N5", T0 + 5),
-            &[notice("01N5", "local|ada", "TKT-01N5", T0 + 5)],
-        )
-        .unwrap();
-    store.advance("local|ada", "DLG-1", 3, "01N5").unwrap();
-    assert_eq!(store.cursor("local|ada", "DLG-1").unwrap(), 3);
+    let insert = |id: &str, at: i64| {
+        store
+            .insert(
+                &ticket(&format!("TKT-{id}"), id, at),
+                &[notice(id, "local|ada", &format!("TKT-{id}"), at)],
+            )
+            .unwrap();
+    };
+    // A notice numbered after the place, its ID below the place's: the
+    // release before does not read it...
+    insert("01N5", T0 + 5);
     assert!(read_before(&mut raw, "DLG-1").is_empty());
+    // ...and where it moves the place past it, to the next it reads, this
+    // release still reads it: the release before delivered only the IDs
+    // between the place's and the one it moved to (the delta review of
+    // 77afd5d0, finding 1). A repeat while the upgrade rolls, never a loss.
+    insert("01NA", T0 + 10);
+    assert_eq!(read_before(&mut raw, "DLG-1"), ["01NA"]);
+    raw.execute(
+        "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id) VALUES ($1, $2, $3)
+         ON CONFLICT (subject, reader) DO UPDATE SET notice_id = excluded.notice_id
+          WHERE dashboard_inbox_cursor.notice_id < excluded.notice_id",
+        &[&"local|ada", &"DLG-1", &"01NA"],
+    )
+    .unwrap();
+    let read: Vec<String> = tickets::store::read_new(&store, "local|ada", "DLG-1", 50)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.notice_id)
+        .collect();
+    assert!(
+        read.contains(&"01N5".to_string()),
+        "a notice neither release delivered was lost: {read:?}"
+    );
+    // A move by number to a notice whose ID is lower keeps the higher ID.
+    let all: Vec<String> = tickets::store::read_new(&store, "local|ada", "DLG-2", 50)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.notice_id)
+        .collect();
+    assert_eq!(all, ["01N9", "01N1", "01N5", "01NA"]);
+    insert("01N7", T0 + 7);
+    store.advance("local|ada", "DLG-2", 5, "01N7").unwrap();
+    assert_eq!(store.cursor("local|ada", "DLG-2").unwrap(), 5);
+    assert!(read_before(&mut raw, "DLG-2").is_empty());
 }
