@@ -193,9 +193,8 @@ fn election(seed: u64, seconds: u64) -> (Vec<Window>, usize) {
         .tick_duration(Duration::from_millis(10))
         .min_message_latency(Duration::from_millis(1))
         .max_message_latency(Duration::from_millis(40))
-        .build_with_rng(Box::new(
-            <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(seed),
-        ));
+        .rng_seed(seed)
+        .build();
     let lease: Rc<RefCell<Option<Record>>> = Rc::default();
     let kept = Rc::clone(&lease);
     sim.host("api", move || {
