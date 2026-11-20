@@ -84,6 +84,22 @@ pub fn roles_now(roles: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Whether the subject a message is sent for is a service account's (W9.8,
+/// contract v21): its kind stamped `SUBJECT_KIND_SERVICE_ACCOUNT`, or the
+/// subject a service account's `SA-` ID, or an owner sent beside it, which
+/// only a service account has -- whatever its kind says. The one rule, used
+/// by the book, the dashboard and the sidecar alike (the review of
+/// v31a-core-1, finding 5). It is only this: a subject that is none of
+/// these, its kind unset, is not a service account here, as the contract's
+/// `SUBJECT_KIND_UNSPECIFIED` reads; failing closed on the unset kind
+/// waits for a person kind (`SUBJECT_KIND_PERSON`, contract 31).
+pub fn is_service_account(subject: &str, kind: i32, owner_subject: &str) -> bool {
+    !subject.is_empty()
+        && (kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
+            || subject.starts_with("SA-")
+            || !owner_subject.is_empty())
+}
+
 /// A count as a sentence says it, "2,190": a hold's days and a span's
 /// records (contract v16), which the sidecar's refusal, the conductor's and
 /// the dashboard's pages each name, and must name alike.

@@ -96,7 +96,11 @@ pub fn set(app: &App, envelope: &Envelope) -> Result<SetOwnSettingsReply, String
     }
     // A service account administers nothing and has no settings of its own
     // (contract v21): refused, as the sidecar refused it first.
-    if meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
+    if meridian_domain::is_service_account(
+        &meta.acting_for_subject,
+        meta.acting_for_kind,
+        &meta.owner_subject,
+    ) {
         return Err(
             "permission_denied: a service account administers nothing, and keeps no settings of              its own"
                 .into(),

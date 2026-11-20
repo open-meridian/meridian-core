@@ -137,7 +137,7 @@ pub(crate) fn app() -> Arc<App> {
 /// A dashboard whose bus is on as `instance`, keeping `tickets`: what a
 /// sidecar of that instance asking on the bus looks like to the rows, in
 /// one process, where the in-memory bus answers only its own handlers.
-fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
+pub(crate) fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
     let cache = Arc::new(RecordsCache::default());
     cache.store(records(), SystemClock.now_ns());
     let app = Arc::new(App {

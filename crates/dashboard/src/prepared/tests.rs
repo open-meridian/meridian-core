@@ -181,3 +181,39 @@ fn every_prepared_page_and_the_agents_tab_names_its_tool_or_its_exception() {
         );
     }
 }
+
+/// A service account sent with its kind unset (the review of v31a-core-1,
+/// finding 5): named by its `SA-` ID, its owner beside it. Never a person a
+/// plugin acts for, so it reads no prepared change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_account_sent_with_no_kind_reads_no_prepared_change() {
+    use meridian_bus::Stamp;
+    use prost::Message as _;
+    let sidecar =
+        crate::tickets::tests::app_as(crate::tickets::tests::OPS, std::sync::Arc::default());
+    serve(std::sync::Arc::clone(&sidecar));
+    let asked = sidecar
+        .bus
+        .call_stamped(
+            own::PREPARED_CALL,
+            "meridian.v1.ReadPreparedCallRequest",
+            meridian_pb::v1::ReadPreparedCallRequest {
+                prepared_call_id: "PC-01".into(),
+            }
+            .encode_to_vec(),
+            None,
+            None,
+            &Stamp {
+                acting_for_subject: "SA-01JX0000000000000000000000".into(),
+                owner_subject: crate::tickets::tests::ADA.into(),
+                ..Stamp::default()
+            },
+        )
+        .await;
+    match asked {
+        Err(meridian_bus::BusError::HandlerFailed { detail, .. }) => {
+            assert!(detail.starts_with("permission_denied"), "{detail}")
+        }
+        other => panic!("answered: {other:?}"),
+    }
+}

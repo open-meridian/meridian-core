@@ -1593,7 +1593,11 @@ pub fn serve(app: Arc<App>) {
             // read is the deployment's configuration, which it does not reach.
             if !crate::plugins::is_instance(&instance)
                 || meta.acting_for_subject.is_empty()
-                || meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
+                || meridian_domain::is_service_account(
+                    &meta.acting_for_subject,
+                    meta.acting_for_kind,
+                    &meta.owner_subject,
+                )
             {
                 return Err(
                     "permission_denied: a prepared change is read only for a person a plugin acts for"

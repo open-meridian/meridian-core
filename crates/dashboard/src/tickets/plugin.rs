@@ -60,22 +60,24 @@ fn acting(app: &App, envelope: &Envelope) -> Result<(Actor, String), String> {
     // From contract v21 the plugin's role's service account, its owner named
     // beside it (W4.12, the plan's Q13): the ticket's provenance is the
     // instance for that service account.
-    let person = if meta.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
-        let name = app
-            .service_accounts
-            .held(&subject)
-            .map(|account| account.name)
-            .unwrap_or_else(|| subject.clone());
-        crate::service_accounts::admission::preparer_name(
-            &crate::service_accounts::store::ServiceAccount {
-                name,
-                ..Default::default()
-            },
-            &super::display_name(&records, &meta.owner_subject),
-        )
-    } else {
-        super::display_name(&records, &subject)
-    };
+    let person =
+        if meridian_domain::is_service_account(&subject, meta.acting_for_kind, &meta.owner_subject)
+        {
+            let name = app
+                .service_accounts
+                .held(&subject)
+                .map(|account| account.name)
+                .unwrap_or_else(|| subject.clone());
+            crate::service_accounts::admission::preparer_name(
+                &crate::service_accounts::store::ServiceAccount {
+                    name,
+                    ..Default::default()
+                },
+                &super::display_name(&records, &meta.owner_subject),
+            )
+        } else {
+            super::display_name(&records, &subject)
+        };
     let author = Author {
         provenance: Provenance::Plugin,
         person,

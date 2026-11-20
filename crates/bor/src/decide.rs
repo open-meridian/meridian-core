@@ -226,16 +226,17 @@ impl Context {
 
 impl Context {
     /// Whether `acting_for` is a service account (contract v21, W6.32,
-    /// W9.8): stamped so, or named by a service account's `SA-` subject, or
-    /// sent with an owner beside it, which only a service account has. One
-    /// sent with its kind left unset is never taken for a person (v31a.16,
-    /// fail closed): an approval, an override, acknowledging an alert and the
-    /// agents' guard each turn on it.
+    /// W9.8), by the one rule ([`meridian_domain::is_service_account`]):
+    /// stamped so, or named by a service account's `SA-` subject, or sent
+    /// with an owner beside it, whatever its kind says (v31a.16). An
+    /// approval, an override, acknowledging an alert and the agents' guard
+    /// each turn on it.
     pub(crate) fn service_account(&self) -> bool {
-        !self.acting_for.is_empty()
-            && (self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
-                || self.acting_for.starts_with("SA-")
-                || !self.owner_subject.is_empty())
+        meridian_domain::is_service_account(
+            &self.acting_for,
+            self.acting_for_kind,
+            &self.owner_subject,
+        )
     }
 
     /// Whether the act is an agent's (contract v26, W11.8; G1 question 3):
