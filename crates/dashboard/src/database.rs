@@ -11,6 +11,8 @@
 //!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
 //! - tickets, their references and notes, notices and each reader's place
 //!   in a person's inbox ([`crate::tickets`], contract v13);
+//! - the judges' lease and each judge's place ([`crate::judges`]): which
+//!   copy of the dashboard judges latency and health, and where it is;
 //! - prepared changes, the admins' levels and a person's own settings
 //!   ([`crate::prepared`], contract v20);
 //! - service accounts, each role's "runs as" and their records
@@ -144,6 +146,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "the_inbox_in_commit_order",
         sql: include_str!("../migrations/0015_the_inbox_in_commit_order.sql"),
+        then: None,
+    },
+    Migration {
+        version: 16,
+        name: "one_judge_per_deployment",
+        sql: include_str!("../migrations/0016_one_judge_per_deployment.sql"),
         then: None,
     },
 ];

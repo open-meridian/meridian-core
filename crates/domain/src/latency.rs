@@ -136,7 +136,7 @@ impl Histogram {
 }
 
 /// What a series of histograms is about.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Scope {
     /// A plugin's session and its metric (`LatencyMetric`'s name).
     Session { session: String, metric: String },
@@ -145,7 +145,7 @@ pub enum Scope {
 }
 
 /// The key a series is kept under: who measured it, and what.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Key {
     /// The reporting instance, as its sidecar stamped it -- a plugin's own
     /// snapshots and its sidecar's hops alike -- or, for the lake's and the
@@ -236,6 +236,21 @@ pub struct Monitor {
     held: Mutex<BTreeMap<Key, Series>>,
 }
 
+/// Where the judge is in one series: every minute before `judged_to`
+/// judged, the minutes in a row over and clear since the last change, and
+/// the open episodes. What the deployment's one judge keeps with the
+/// notices it files, and what a copy that comes to judge next takes up, so
+/// no minute is judged twice and none is left unjudged (v31a; one judge
+/// per deployment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Place {
+    pub judged_to: i64,
+    pub over: u32,
+    pub clear: u32,
+    pub latency_since: i64,
+    pub backlog_since: i64,
+}
+
 impl Monitor {
     /// A snapshot's histogram merged into its minute, and its minute's hour;
     /// the oldest minute past 7 days and hour past 30 let go.
@@ -291,6 +306,45 @@ impl Monitor {
         }
         forget_the_silent(&mut held, current);
         out
+    }
+
+    /// Where the judge is in each series it holds.
+    pub fn places(&self) -> Vec<(Key, Place)> {
+        let Ok(held) = self.held.lock() else {
+            return Vec::new();
+        };
+        held.iter()
+            .map(|(key, series)| {
+                (
+                    key.clone(),
+                    Place {
+                        judged_to: series.judged_to,
+                        over: series.over,
+                        clear: series.clear,
+                        latency_since: series.latency_since,
+                        backlog_since: series.backlog_since,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The judge's place taken up from `places`: each series held is
+    /// judged next from where `places` says, and one they do not name from
+    /// its first minute. What it held of the minutes themselves is kept.
+    pub fn restore(&self, places: &[(Key, Place)]) {
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        let places: BTreeMap<&Key, &Place> = places.iter().map(|(k, p)| (k, p)).collect();
+        for (key, series) in held.iter_mut() {
+            let place = places.get(key).copied().copied().unwrap_or_default();
+            series.judged_to = place.judged_to;
+            series.over = place.over;
+            series.clear = place.clear;
+            series.latency_since = place.latency_since;
+            series.backlog_since = place.backlog_since;
+        }
     }
 
     /// How many series it holds.

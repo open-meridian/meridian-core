@@ -38,6 +38,7 @@ pub mod first_run;
 pub mod health;
 pub mod html;
 pub mod in_flight;
+pub mod judges;
 pub mod kit;
 pub mod latency;
 pub mod markdown;

@@ -1094,3 +1094,99 @@ fn a_thing_in_flight_put_on_one_copy_is_spent_once_on_another() {
     other.sweep(T0 + 2 * MINUTE_NS).unwrap();
     assert_eq!(count(&url, "dashboard_in_flight"), 0);
 }
+
+/// One judge per deployment (the review of v31a-core-1, findings 1 and 3):
+/// two dashboards on one database, one holding the judges' lease at a time;
+/// the holder files its notices and keeps its place together, and a copy
+/// whose term has passed files nothing.
+#[test]
+fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
+    use meridian_dashboard::judges::{LASTS_NS, LEASE};
+    use meridian_dashboard::latency::notices::{InPostgres, Notice, NoticeStore as _};
+    let (_url, database) = migrated("judges");
+    let (a, b) = (
+        InPostgres::on(database.clone()),
+        InPostgres::on(database.clone()),
+    );
+    let notice = |id: &str, at: i64| Notice {
+        notice_id: id.into(),
+        subject: "local|dee".into(),
+        plugin_instance_id: "lake".into(),
+        kind: "component-shedding".into(),
+        about: "lake shed".into(),
+        changed_ns: at,
+    };
+    assert_eq!(a.lead(LEASE, "a", T0, T0 + LASTS_NS).unwrap(), Some(1));
+    assert_eq!(b.lead(LEASE, "b", T0 + 1, T0 + 1 + LASTS_NS).unwrap(), None);
+    assert!(a
+        .file(
+            LEASE,
+            "a",
+            1,
+            T0 + 2,
+            "component-health",
+            &[notice("01A", T0 + 2)],
+            "{\"a\":1}"
+        )
+        .unwrap());
+    assert_eq!(
+        b.place("component-health").unwrap().as_deref(),
+        Some("{\"a\":1}")
+    );
+    // b files nothing while a holds it.
+    assert!(!b
+        .file(
+            LEASE,
+            "b",
+            1,
+            T0 + 3,
+            "component-health",
+            &[notice("01B", T0 + 3)],
+            "{}"
+        )
+        .unwrap());
+    // a stops renewing; b takes the lease once it lapses, under term 2.
+    let lapsed = T0 + LASTS_NS + 1;
+    assert_eq!(
+        b.lead(LEASE, "b", lapsed, lapsed + LASTS_NS).unwrap(),
+        Some(2)
+    );
+    assert!(!a
+        .file(
+            LEASE,
+            "a",
+            1,
+            lapsed,
+            "component-health",
+            &[notice("01C", lapsed)],
+            "{\"a\":2}"
+        )
+        .unwrap());
+    assert_eq!(
+        b.place("component-health").unwrap().as_deref(),
+        Some("{\"a\":1}"),
+        "a lapsed holder keeps no place"
+    );
+    assert!(b
+        .file(
+            LEASE,
+            "b",
+            2,
+            lapsed + 1,
+            "component-health",
+            &[notice("01D", lapsed + 1)],
+            "{\"b\":1}"
+        )
+        .unwrap());
+    let ids: Vec<String> = a
+        .notices("local|dee", 50)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.notice_id)
+        .collect();
+    assert_eq!(
+        ids,
+        ["01D", "01A"],
+        "newest filed first, the lapsed holder's never"
+    );
+}

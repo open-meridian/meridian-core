@@ -594,6 +594,10 @@ fn run() -> Result<(), String> {
         // Core's latency monitor (contract v28; W4.16): every plugin's
         // ReportLatency, merged for the Age tab and dashboard__read_data_age.
         meridian_dashboard::latency::serve(Arc::clone(&app));
+        // One judge per deployment: the copy holding the judges' lease
+        // files the latency and health judges' notices (the review of
+        // v31a-core-1, findings 1 and 3).
+        meridian_runtime::keep(meridian_dashboard::judges::lead_forever(Arc::clone(&app)));
         // Its judge: each whole minute, each episode opened or closed a
         // notice to the people it concerns (W4.16; ruling 427).
         meridian_runtime::keep(meridian_dashboard::latency::notices::judge_forever(

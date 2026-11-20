@@ -53,9 +53,30 @@ pub struct Sample {
 #[derive(Debug, Default)]
 struct Kept {
     samples: VecDeque<Sample>,
+    /// Its restarts and sheds as last judged: what a rise is judged from.
+    judged: Option<(u32, u64)>,
     over_budget: bool,
     repeatedly: bool,
     climbing: bool,
+}
+
+/// Where the health judge is (one judge per deployment; [`crate::judges`]):
+/// each member's restarts and sheds as last judged and its open conditions.
+/// What its one judge keeps with the notices it files, and what a copy that
+/// comes to judge next takes up.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Place {
+    pub members: BTreeMap<String, MemberPlace>,
+}
+
+/// One member's part of [`Place`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemberPlace {
+    pub restarts: u32,
+    pub sheds: u64,
+    pub over_budget: bool,
+    pub repeatedly: bool,
+    pub climbing: bool,
 }
 
 /// One notice to file: its kind and the dashboard's words for it.
@@ -66,12 +87,11 @@ pub struct Opened {
     pub plugin: bool,
     pub kind: String,
     pub about: String,
-    /// What it is of, its kind and its window (review-F headline 2): every
-    /// copy of the dashboard judging the same reports names the same event,
-    /// so the notices' store keeps it once. A restart's window is the
-    /// cluster's time of it; every other kind's, the hour it opened in, so
-    /// two copies asking seconds apart file one notice, and one condition
-    /// opening again within the hour files none again.
+    /// What it is of, its kind and its window (review-F headline 2), the
+    /// notice's keyed ID: a second guard behind the one judge
+    /// ([`crate::judges`]). A restart's window is the cluster's time of it;
+    /// every other kind's, the hour it opened in, so one condition opening
+    /// again within the hour files none again (decision 40).
     pub event: String,
     pub window_ns: i64,
 }
@@ -117,7 +137,7 @@ impl Judge {
                 restarts: report.restarts,
             };
             let kept = self.members.entry(key.clone()).or_default();
-            let before = kept.samples.back().copied();
+            let before = kept.judged.replace((sample.restarts, sample.sheds));
             kept.samples.push_back(sample);
             while kept
                 .samples
@@ -139,8 +159,8 @@ impl Judge {
                     window_ns,
                 })
             };
-            if let Some(before) = before {
-                if sample.restarts > before.restarts {
+            if let Some((restarts, sheds)) = before {
+                if sample.restarts > restarts {
                     let why = match report.last_restart_reason.as_str() {
                         "OOMKilled" => " after an OOM kill, a defect: lower the bound that held the memory, never raise its limit".to_string(),
                         "" => String::new(),
@@ -163,12 +183,12 @@ impl Judge {
                         Some(window),
                     );
                 }
-                if sample.sheds > before.sheds {
+                if sample.sheds > sheds {
                     open(
                         "shedding",
                         format!(
                             "{key} cancelled {} request(s) above its shed line: its largest in flight, refused for load; lower the bound that holds the memory",
-                            sample.sheds - before.sheds
+                            sample.sheds - sheds
                         ),
                         None,
                     );
@@ -228,6 +248,42 @@ impl Judge {
                 .is_some_and(|last| last.at_ns >= now_ns - KEPT_NS)
         });
         opened
+    }
+
+    /// Where it is, to keep: see [`Place`].
+    pub fn place(&self) -> Place {
+        Place {
+            members: self
+                .members
+                .iter()
+                .filter_map(|(key, kept)| {
+                    let (restarts, sheds) = kept.judged?;
+                    Some((
+                        key.clone(),
+                        MemberPlace {
+                            restarts,
+                            sheds,
+                            over_budget: kept.over_budget,
+                            repeatedly: kept.repeatedly,
+                            climbing: kept.climbing,
+                        },
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// `place` taken up: each member it names judged next from its
+    /// restarts, sheds and open conditions there, keeping the samples this
+    /// copy heard.
+    pub fn restore(&mut self, place: &Place) {
+        for (key, at) in &place.members {
+            let kept = self.members.entry(key.clone()).or_default();
+            kept.judged = Some((at.restarts, at.sheds));
+            kept.over_budget = at.over_budget;
+            kept.repeatedly = at.repeatedly;
+            kept.climbing = at.climbing;
+        }
     }
 
     /// A member's peak and restarts over its kept 24 hours: what `status`
@@ -300,13 +356,71 @@ pub fn notices_of(records: &AccessRecords, opened: &[Opened], now_ns: i64) -> Ve
     notices
 }
 
-/// Ask the conductor every [`ASK_EVERY`], judge, and file what opened on the
-/// latency judge's path. The task is handed back, for the component to end
-/// before its runtime stops.
+/// The health judge's name for its place ([`crate::judges`]).
+pub const JUDGE: &str = "component-health";
+
+/// One judging by this copy, at `now_ns` (one judge per deployment;
+/// [`crate::judges`]): where it has just come to hold the lease under
+/// `term`, `judge`'s place restored from what the last holder kept; the
+/// conductor's answer judged; and where it holds the lease, what opened filed with the place, to the
+/// people `records` tell. Where the records are stale, nothing is filed,
+/// and it is judged again from the place last kept until they are read
+/// again. How many notices were filed.
+#[allow(clippy::too_many_arguments)]
+pub fn judge_once(
+    judge: &mut Judge,
+    judging: &mut crate::judges::Judging,
+    store: &dyn crate::latency::notices::NoticeStore,
+    term: Option<i64>,
+    holder: &str,
+    members: &[ComponentReport],
+    records: Option<&AccessRecords>,
+    now_ns: i64,
+) -> Result<usize, String> {
+    if let Some(place) = judging.take_up(store, term) {
+        match place
+            .as_deref()
+            .map(serde_json::from_str::<Place>)
+            .transpose()
+        {
+            Ok(place) => judge.restore(&place.unwrap_or_default()),
+            Err(failed) => {
+                tracing::warn!(%failed, "the health judge's place did not read; judged from what this copy heard")
+            }
+        }
+    }
+    let opened = judge.judge(members, now_ns);
+    if !judging.files() {
+        return Ok(0);
+    }
+    let notices = match records {
+        Some(records) => notices_of(records, &opened, now_ns),
+        None if opened.is_empty() => Vec::new(),
+        None => {
+            tracing::warn!(notices = opened.len(), "a component's notice opened while the access records were stale; told once they are read, nobody meanwhile rather than the wrong people");
+            judging.again();
+            return Ok(0);
+        }
+    };
+    let place = serde_json::to_string(&judge.place()).map_err(|failed| failed.to_string())?;
+    let filed = notices.len();
+    if !judging.file(store, holder, now_ns, &notices, place)? {
+        return Ok(0);
+    }
+    for one in &opened {
+        tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
+    }
+    Ok(filed)
+}
+
+/// Ask the conductor every [`ASK_EVERY`] and judge its answer, filing what opened on the latency judge's path where this copy
+/// holds the judges' lease ([`judge_once`]). The task is handed back, for
+/// the component to end before its runtime stops.
 pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     let judge = Arc::new(Mutex::new(Judge::default()));
     tokio::spawn(async move {
         let mut every = tokio::time::interval(ASK_EVERY);
+        let mut judging = crate::judges::Judging::new(JUDGE);
         loop {
             every.tick().await;
             let asked = app
@@ -329,29 +443,43 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 tracing::warn!("a ReadComponentHealthReply did not decode");
                 continue;
             };
+            let members = reply.members;
             let now = app.clock.now_ns();
-            let opened = judge
-                .lock()
-                .map(|mut judge| judge.judge(&reply.members, now))
-                .unwrap_or_default();
-            if opened.is_empty() {
-                continue;
-            }
-            let Ok(records) = app.records.current(now) else {
-                tracing::warn!(notices = opened.len(), "a component's notice opened while the access records were stale; told nobody rather than the wrong people");
-                continue;
-            };
-            for one in &opened {
-                tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
-            }
-            let notices = notices_of(&records, &opened, now);
-            if notices.is_empty() {
-                continue;
-            }
-            let kept =
-                tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices)).await;
-            if !matches!(kept, Ok(Ok(()))) {
-                tracing::error!("a component's notices were not kept");
+            let records = app.records.current(now).ok();
+            let judge = Arc::clone(&judge);
+            let judged = tokio::task::spawn_blocking(move || {
+                let mut judge = judge
+                    .lock()
+                    .map_err(|_| "the health judge's lock".to_string());
+                let judged = judge
+                    .as_mut()
+                    .map_err(|failed| failed.clone())
+                    .and_then(|judge| {
+                        judge_once(
+                            judge,
+                            &mut judging,
+                            &*crate::latency::notices::store(),
+                            crate::judges::term(),
+                            crate::judges::holder(),
+                            &members,
+                            records.as_ref(),
+                            now,
+                        )
+                    });
+                (judging, judged)
+            })
+            .await;
+            match judged {
+                Ok((back, judged)) => {
+                    judging = back;
+                    if let Err(failed) = judged {
+                        tracing::error!(%failed, "a component's notices were not kept; judged again from the place last kept");
+                    }
+                }
+                Err(failed) => {
+                    tracing::error!(%failed, "the health judge stopped");
+                    return;
+                }
             }
         }
     })
@@ -503,6 +631,108 @@ mod tests {
         }
         let filed = store.notices("local|dee", 50).unwrap();
         assert_eq!(filed.len(), 3, "{filed:#?}");
+    }
+
+    /// One judge per deployment (the review of v31a-core-1, finding 3):
+    /// ha's two copies each ask the conductor on their own minute, so one
+    /// shed is judged by one 30 seconds before the hour and by the other 10
+    /// seconds after it. Only the copy holding the judges' lease files it:
+    /// one notice.
+    #[test]
+    fn two_judges_over_a_shed_either_side_of_the_hour_file_one_notice() {
+        use crate::judges::{Judging, LASTS_NS, LEASE};
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        const S: i64 = 1_000_000_000;
+        let records = records();
+        let store = InMemory::default();
+        let hour = (T0 / HOUR_NS + 1) * HOUR_NS;
+        let lead = |holder: &str, at: i64| store.lead(LEASE, holder, at, at + LASTS_NS).unwrap();
+        let (mut a, mut b) = (Judge::default(), Judge::default());
+        let (mut ja, mut jb) = (Judging::new(JUDGE), Judging::new(JUDGE));
+        for (report, at_a, at_b) in [
+            (lake(100 * MIB, 0, 0, 0), hour - 90 * S, hour - 50 * S),
+            (lake(100 * MIB, 0, 2, 0), hour - 30 * S, hour + 10 * S),
+        ] {
+            for (judge, judging, holder, at) in
+                [(&mut a, &mut ja, "a", at_a), (&mut b, &mut jb, "b", at_b)]
+            {
+                judge_once(
+                    judge,
+                    judging,
+                    &store,
+                    lead(holder, at),
+                    holder,
+                    &[report.clone()],
+                    Some(&records),
+                    at,
+                )
+                .unwrap();
+            }
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].kind, "component-shedding");
+    }
+
+    /// The lease passing (one judge per deployment): a, holding it, files
+    /// the lake crossing its budget and stops; the lake sheds; b, up only
+    /// since, takes the lease once it lapses, in the next hour. b judges on
+    /// from the place a kept with its last notice: the budget crossed is
+    /// not filed again, and the shed a never heard is filed.
+    #[test]
+    fn the_lease_passing_files_each_condition_once_and_misses_none() {
+        use crate::judges::{Judging, LASTS_NS, LEASE};
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        const S: i64 = 1_000_000_000;
+        let records = records();
+        let store = InMemory::default();
+        let hour = (T0 / HOUR_NS + 1) * HOUR_NS;
+        let lead = |holder: &str, at: i64| store.lead(LEASE, holder, at, at + LASTS_NS).unwrap();
+        let mut a = Judge::default();
+        let mut ja = Judging::new(JUDGE);
+        for (report, at) in [
+            (lake(100 * MIB, 0, 0, 0), hour - 3 * MINUTE),
+            (lake(700 * MIB, 0, 0, 0), hour - 2 * MINUTE),
+        ] {
+            judge_once(
+                &mut a,
+                &mut ja,
+                &store,
+                lead("a", at),
+                "a",
+                &[report],
+                Some(&records),
+                at,
+            )
+            .unwrap();
+        }
+        let mut b = Judge::default();
+        let mut jb = Judging::new(JUDGE);
+        let at = hour + 30 * S;
+        let term = lead("b", at);
+        assert!(term.is_some(), "a's lease lapsed");
+        assert_eq!(
+            judge_once(
+                &mut b,
+                &mut jb,
+                &store,
+                term,
+                "b",
+                &[lake(700 * MIB, 0, 3, 0)],
+                Some(&records),
+                at,
+            )
+            .unwrap(),
+            1
+        );
+        let mut filed: Vec<String> = store
+            .notices("local|dee", 50)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.kind)
+            .collect();
+        filed.sort();
+        assert_eq!(filed, ["component-over-budget", "component-shedding"]);
     }
 
     #[test]
