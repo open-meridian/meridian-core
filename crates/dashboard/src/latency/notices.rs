@@ -395,6 +395,8 @@ pub fn rows(notices: &[Notice]) -> String {
                 kind if kind.ends_with("-shedding") => ("Shedding", " warn"),
                 kind if kind.ends_with("-restarting-repeatedly") => ("Restarting", " warn"),
                 kind if kind.ends_with("-memory-climbing") => ("Climbing", " warn"),
+                // The conductor silent (approved 2026-11-20).
+                kind if kind.ends_with("-unheard") => ("Unheard", " warn"),
                 // A gap in a dataset (W10.14; contract v30, stage D).
                 "gap_found" => ("Gap found", " warn"),
                 _ => ("Recovered", ""),
