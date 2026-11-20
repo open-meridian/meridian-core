@@ -12,7 +12,8 @@
 
 use std::sync::Arc;
 
-use meridian_domain::latency::{self, Histogram, Key, Read, Said, Scope};
+use meridian_bus::{Bus, Envelope, Subscription};
+use meridian_domain::latency::{self, Histogram, Key, Monitor, Read, Said, Scope};
 use meridian_domain::v1::{
     AgeHop, LatencyCeilings, LatencyMetric, ReportLatencyReply, ReportLatencyRequest,
 };
@@ -65,6 +66,10 @@ fn ceiling_of(scope: &Scope, ceilings: Option<&LatencyCeilings>) -> i64 {
     }
 }
 
+/// One snapshot as the monitor keeps it: its series, its time, its
+/// histogram and what it said beside it.
+type Merged = (Key, i64, Histogram, Said);
+
 /// One call's snapshots merged, each under the instance its sidecar
 /// stamped -- the envelope's publisher where a snapshot names none or
 /// another; the component's own name for a core component's hops (606) --
@@ -74,6 +79,30 @@ pub fn receive(
     publisher: &str,
     now_ns: i64,
 ) -> Result<u32, String> {
+    receive_into(latency::monitor(), request, publisher, now_ns)
+}
+
+/// [`receive`], into `monitor`.
+pub fn receive_into(
+    monitor: &Monitor,
+    request: &ReportLatencyRequest,
+    publisher: &str,
+    now_ns: i64,
+) -> Result<u32, String> {
+    let merged = read(request, publisher, now_ns)?;
+    let n = merged.len() as u32;
+    for (key, at, held, said) in merged {
+        monitor.merge(key, at, &held, said);
+    }
+    Ok(n)
+}
+
+/// One call's snapshots read, or refused whole, naming the snapshot.
+fn read(
+    request: &ReportLatencyRequest,
+    publisher: &str,
+    now_ns: i64,
+) -> Result<Vec<Merged>, String> {
     if request.snapshots.is_empty() || request.snapshots.len() > MOST {
         return Err(format!(
             "invalid_argument: snapshots holds {}; a batch is 1 to {MOST}",
@@ -129,25 +158,57 @@ pub fn receive(
             said,
         ));
     }
+    Ok(merged)
+}
+
+/// A report on the monitor's topic read, under the instance the envelope's
+/// publisher names.
+fn of_envelope(envelope: &Envelope, now_ns: i64) -> Result<Vec<Merged>, String> {
+    let publisher = envelope
+        .meta
+        .as_ref()
+        .map(|meta| meta.publisher_instance_id.as_str())
+        .unwrap_or_default();
+    let request = ReportLatencyRequest::decode(&envelope.payload[..])
+        .map_err(|failed| format!("invalid_argument: the report did not read: {failed}"))?;
+    read(&request, publisher, now_ns)
+}
+
+/// How this copy of the dashboard hears the monitor's topic: every report,
+/// whichever copy answers it (v31a.4). ha runs two copies; a report reaches
+/// one of them as a request, so each copy's monitor held about half of
+/// every minute, and the Age tab, `dashboard__read_data_age` and the judge
+/// each said something different on each copy.
+pub fn hearing(bus: &Bus) -> Subscription {
+    bus.subscribe_every(REPORT_LATENCY)
+}
+
+/// One report heard merged into `monitor`. How many snapshots it held.
+pub fn heard(monitor: &Monitor, envelope: &Envelope, now_ns: i64) -> Result<u32, String> {
+    let merged = of_envelope(envelope, now_ns)?;
     let n = merged.len() as u32;
     for (key, at, held, said) in merged {
-        latency::monitor().merge(key, at, &held, said);
+        monitor.merge(key, at, &held, said);
     }
     Ok(n)
 }
 
-/// Answer the monitor's topic on the bus, from now on.
+/// Answer the monitor's topic on the bus, and hear it, from now on: one
+/// copy answers each report, saying what it accepted or refusing it whole,
+/// and every copy merges it into its own monitor ([`hearing`]).
 pub fn serve(app: Arc<App>) {
     let clock = Arc::clone(&app.clock);
+    let mut heard_here = hearing(&app.bus);
+    tokio::spawn(async move {
+        while let Some(delivery) = heard_here.recv().await {
+            // A refused report was refused to its sender by the copy that
+            // answered it; here it is merged by none.
+            let _ = heard(latency::monitor(), &delivery.envelope, clock.now_ns());
+        }
+    });
+    let clock = Arc::clone(&app.clock);
     app.bus.serve(REPORT_LATENCY, move |envelope| {
-        let publisher = envelope
-            .meta
-            .as_ref()
-            .map(|meta| meta.publisher_instance_id.clone())
-            .unwrap_or_default();
-        let request = ReportLatencyRequest::decode(&envelope.payload[..])
-            .map_err(|failed| format!("invalid_argument: the report did not read: {failed}"))?;
-        let accepted = receive(&request, &publisher, clock.now_ns())?;
+        let accepted = of_envelope(&envelope, clock.now_ns())?.len() as u32;
         Ok((
             "meridian.v1.ReportLatencyReply".to_string(),
             ReportLatencyReply { accepted }.encode_to_vec(),

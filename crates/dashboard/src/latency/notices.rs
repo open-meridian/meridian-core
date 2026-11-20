@@ -650,4 +650,95 @@ mod tests {
             assert_eq!(store.notices(person, SHOWN).unwrap().len(), 1, "{person}");
         }
     }
+
+    /// ha's two dashboards on one broker (v31a.4): each report is heard by
+    /// both, so each copy's monitor holds every minute, and the two judges
+    /// name one episode alike: one notice to each person.
+    #[test]
+    fn every_copy_hears_every_report_and_one_episode_is_one_notice() {
+        use meridian_bus::{Backend as _, Bus, Envelope, MemoryBackend, MessageMeta};
+        use meridian_domain::latency::{bucket_of, Monitor};
+        use meridian_domain::v1::{
+            LatencyBucket, LatencyCeilings, LatencyHistogram, LatencyMetric, LatencySnapshot,
+            ReportLatencyRequest,
+        };
+        use prost::Message as _;
+        const MINUTE: i64 = 60_000_000_000;
+        let t0 = (1_792_400_000_000_000_000 / MINUTE) * MINUTE;
+        let backend = Arc::new(MemoryBackend::new());
+        let copy = || {
+            Bus::single(
+                "dashboard-1",
+                Arc::clone(&backend) as Arc<dyn meridian_bus::Backend>,
+                Arc::new(meridian_clock::SystemClock),
+            )
+        };
+        let (bus_a, bus_b) = (copy(), copy());
+        let (mut heard_a, mut heard_b) = (
+            crate::latency::hearing(&bus_a),
+            crate::latency::hearing(&bus_b),
+        );
+        // fix-1's sidecar reports a slow round trip each minute for six.
+        for minute in 0..6 {
+            let at = t0 + minute * MINUTE + 1_000_000_000;
+            let report = ReportLatencyRequest {
+                snapshots: vec![LatencySnapshot {
+                    interval_start_ns: at,
+                    interval_ns: 10_000_000_000,
+                    session: "fix-order".into(),
+                    metric: LatencyMetric::Rtt as i32,
+                    histogram: Some(LatencyHistogram {
+                        lowest_ns: 1_000,
+                        significant_digits: 2,
+                        buckets: vec![LatencyBucket {
+                            bucket: bucket_of(2_000_000_000),
+                            count: 50,
+                        }],
+                        min_ns: 2_000_000_000,
+                        max_ns: 2_000_000_000,
+                        total: 50,
+                    }),
+                    ceilings: Some(LatencyCeilings {
+                        rtt_p99_ns: 250_000_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            };
+            backend
+                .publish(
+                    crate::latency::REPORT_LATENCY,
+                    Envelope {
+                        meta: Some(MessageMeta {
+                            topic: crate::latency::REPORT_LATENCY.into(),
+                            publisher_instance_id: "fix-1".into(),
+                            ..Default::default()
+                        }),
+                        payload_type: "meridian.v1.ReportLatencyRequest".into(),
+                        payload: report.encode_to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        let (a, b) = (Monitor::default(), Monitor::default());
+        for (heard, monitor) in [(&mut heard_a, &a), (&mut heard_b, &b)] {
+            while let Some(delivery) = heard.try_recv() {
+                crate::latency::heard(monitor, &delivery.envelope, t0).unwrap();
+            }
+        }
+        let records = records();
+        let store = InMemory::default();
+        // Each copy judges the same whole minutes, seconds apart.
+        for (judge, at) in [
+            (&a, t0 + 6 * MINUTE + 3_000_000_000),
+            (&b, t0 + 6 * MINUTE + 17_000_000_000),
+        ] {
+            store
+                .notify(&notices_of(&records, &judge.judge(at), at))
+                .unwrap();
+        }
+        for person in ["local|ola", "local|eve"] {
+            assert_eq!(store.notices(person, SHOWN).unwrap().len(), 1, "{person}");
+        }
+    }
 }
