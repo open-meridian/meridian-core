@@ -58,11 +58,11 @@ fn disk_is_judged_by_the_free_space_where_storage_does_not_hold_it_to_its_volume
         "{}",
         ready.why
     );
-    // The same shares, of what it holds and what is free: a migration that
-    // will not fit still blocks.
-    let warned = judge_disk(held, Some(declared), node(6 * GIB));
+    // The same shares, of what it holds and what is free to it: a migration
+    // that will not fit still blocks.
+    let warned = judge_disk(held, Some(declared), node(16 * GIB));
     assert_eq!(warned.verdict, Verdict::Warning, "{}", warned.why);
-    let blocked = judge_disk(held, Some(declared), node(2 * GIB));
+    let blocked = judge_disk(held, Some(declared), node(11 * GIB));
     assert_eq!(blocked.verdict, Verdict::Blocked, "{}", blocked.why);
     assert!(
         blocked.why.contains("free space on that filesystem first"),
@@ -74,26 +74,67 @@ fn disk_is_judged_by_the_free_space_where_storage_does_not_hold_it_to_its_volume
         judge_disk(GIB, Some(declared), node(50 * MIB)).verdict,
         Verdict::Blocked
     );
-
-    // A filesystem that is the volume's own -- its size, or a little under
-    // or over -- holds the database to it: judged as it always was.
-    let own = Some(Filesystem {
-        total: declared - 300 * MIB,
-        free: 600 * MIB,
-    });
-    let enforced = judge_disk(19 * GIB, Some(declared), own);
-    assert_eq!(enforced.verdict, Verdict::Blocked);
-    assert_eq!(
-        enforced.why,
-        judge_disk(19 * GIB, Some(declared), None).why,
-        "today's check, word for word"
-    );
-    assert_eq!(judge_disk(GIB, Some(declared), own).verdict, Verdict::Ready);
     // No volume of the chart's: its operator's to watch, read or not.
     assert_eq!(
         judge_disk(GIB, None, node(GIB)).verdict,
         Verdict::NotChecked
     );
+}
+
+/// Review finding 3: the kubelet evicts pods as a node's filesystem nears a
+/// tenth free, so that tenth is not the database's to grow into. 23 GiB with
+/// 12 GiB free of 100 was called ready at 66%; 2 GiB of it is the database's.
+#[test]
+fn a_tenth_of_a_nodes_filesystem_is_left_to_the_node() {
+    let judged = judge_disk(
+        23 * GIB,
+        Some(20 * GIB),
+        Some(Filesystem {
+            total: 100 * GIB,
+            free: 12 * GIB,
+        }),
+    );
+    assert_eq!(judged.verdict, Verdict::Blocked, "{}", judged.why);
+    assert!(
+        judged.why.contains("2.0 GiB of it past the tenth"),
+        "{}",
+        judged.why
+    );
+}
+
+/// Review finding 4: a volume holds more than the database -- its WAL,
+/// another database -- so one that is the database's own and nearly full
+/// blocks though the database is under half its declared size.
+#[test]
+fn a_volume_of_its_own_is_judged_by_the_stricter_of_its_size_and_its_free_space() {
+    let declared = 20 * GIB;
+    let nearly_full = Some(Filesystem {
+        total: 18 * GIB + 600 * MIB,
+        free: 800 * MIB,
+    });
+    let blocked = judge_disk(9 * GIB, Some(declared), nearly_full);
+    assert_eq!(blocked.verdict, Verdict::Blocked, "{}", blocked.why);
+    assert!(
+        blocked
+            .why
+            .contains("its 20.0 GiB volume has 800.0 MiB free")
+            && blocked.why.contains("grow the volume first"),
+        "{}",
+        blocked.why
+    );
+    // Where the declared size binds -- the database alone on a filesystem a
+    // little over it -- today's check, word for word.
+    for held in [GIB, 16 * GIB, 19 * GIB] {
+        let alone = Some(Filesystem {
+            total: declared + 500 * MIB,
+            free: declared + 500 * MIB - held,
+        });
+        assert_eq!(
+            judge_disk(held, Some(declared), alone),
+            judge_disk(held, Some(declared), None),
+            "today's check, word for word"
+        );
+    }
 }
 
 /// The filesystem is read where a path is mounted, and not where none is.

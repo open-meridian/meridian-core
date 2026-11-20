@@ -209,11 +209,21 @@ impl Filesystem {
     }
 }
 
-/// The database's size against its volume: the volume's declared size where
-/// the storage holds the database to it, or where the filesystem was not
-/// read; and where it does not (item 211), against what the database could
-/// reach on the filesystem it is on -- what it holds and what is free there
-/// -- at the same shares.
+/// The share of a node's filesystem left to the node: the kubelet evicts
+/// pods as its filesystem's free space nears a tenth (`nodefs.available`,
+/// 10% by default), so a database on a node's disk is never promised it.
+const LEFT_TO_THE_NODE: u64 = 10;
+
+/// The database's size against its volume.
+///
+/// Where the filesystem was not read, the volume's declared size. Where it
+/// was and the storage holds the database to its volume, the stricter of
+/// the declared size and what the database could reach on its filesystem --
+/// what it holds and what is free there -- since a volume also holds the
+/// server's WAL and other databases. Where the storage does not hold it to
+/// its volume (item 211), what it could reach on the node's filesystem
+/// alone, less the tenth of that filesystem left to the node. The same
+/// shares throughout.
 pub fn judge_disk(used: u64, volume: Option<u64>, filesystem: Option<Filesystem>) -> Finding {
     let Some(volume) = volume else {
         return finding(
@@ -226,21 +236,35 @@ pub fn judge_disk(used: u64, volume: Option<u64>, filesystem: Option<Filesystem>
         );
     };
     let unheld = filesystem.filter(|filesystem| !filesystem.holds_to(volume));
-    let limit = match unheld {
-        Some(filesystem) => used.saturating_add(filesystem.free),
-        None => volume,
+    // What is free to the database, where the filesystem binds: on a node's
+    // disk, past what is left to the node; on its own volume, all of it,
+    // and only where that is stricter than the declared size.
+    let free = match (unheld, filesystem) {
+        (Some(node), _) => Some(node.free.saturating_sub(node.total / LEFT_TO_THE_NODE)),
+        (None, Some(own)) if used.saturating_add(own.free) < volume => Some(own.free),
+        _ => None,
     };
+    let limit = free.map_or(volume, |free| used.saturating_add(free));
     let s = share(used, limit);
-    let why = match unheld {
-        Some(filesystem) => format!(
-            "the database holds {}, and the filesystem it is on has {} free ({} of the two); \
-             its storage does not hold it to its {} volume",
+    let why = match (unheld, free) {
+        (Some(node), Some(free)) => format!(
+            "the database holds {}, and the filesystem it is on has {} free, {} of it past the \
+             tenth left to its node ({} of what it holds and that); its storage does not hold it \
+             to its {} volume",
             bytes_said(used),
-            bytes_said(filesystem.free),
+            bytes_said(node.free),
+            bytes_said(free),
             percent(used, limit),
             bytes_said(volume)
         ),
-        None => format!(
+        (None, Some(free)) => format!(
+            "the database holds {}, and its {} volume has {} free ({} of the two)",
+            bytes_said(used),
+            bytes_said(volume),
+            bytes_said(free),
+            percent(used, limit)
+        ),
+        _ => format!(
             "the database holds {} of its {} volume ({})",
             bytes_said(used),
             bytes_said(volume),
