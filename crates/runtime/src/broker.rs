@@ -145,7 +145,8 @@ fn component_topics(components: &[&str]) -> Vec<&'static str> {
 ///
 /// From contract v30's stage E, in `ha`, the lake's write-ahead stream
 /// (the resilience spec's section 4), to the lake's credential, so its writer
-/// makes the stream and reads it. A data plugin's credential publishes to the
+/// makes the stream and reads it (`meridian_lake::write_ahead`): never its
+/// deletion or purge, which a lake never asks for. A data plugin's credential publishes to the
 /// stream's subjects of its own instance alone
 /// ([`write_ahead::instance_subjects`]), in [`permissions_entitled`].
 fn jetstream_grants(components: &[&str]) -> Vec<String> {
@@ -156,7 +157,8 @@ fn jetstream_grants(components: &[&str]) -> Vec<String> {
             // `get_or_create_stream` and `get_stream`: asked, made if not there.
             format!("$JS.API.STREAM.INFO.{stream}"),
             format!("$JS.API.STREAM.CREATE.{stream}"),
-            // `get_or_create_consumer`, and asked again on a missed heartbeat.
+            // `get_or_create_consumer`, and asked again by a pull on a
+            // reconnect.
             format!("$JS.API.CONSUMER.INFO.{stream}.{consumer}"),
             format!("$JS.API.CONSUMER.CREATE.{stream}.{consumer}"),
             // A worker's pull.
@@ -168,10 +170,19 @@ fn jetstream_grants(components: &[&str]) -> Vec<String> {
     if components.contains(&"lake") {
         let stream = write_ahead::STREAM;
         granted.extend([
-            format!("$JS.API.STREAM.*.{stream}"),
-            format!("$JS.API.CONSUMER.*.{stream}"),
-            format!("$JS.API.CONSUMER.*.{stream}.>"),
+            // Its place (`place`), and the stream made or brought to this
+            // release's bounds (`get_stream`, then `update_stream` or
+            // `create_stream`).
+            format!("$JS.API.STREAM.INFO.{stream}"),
+            format!("$JS.API.STREAM.CREATE.{stream}"),
+            format!("$JS.API.STREAM.UPDATE.{stream}"),
+            // Its reader: an ephemeral consumer, made unnamed, so the
+            // server names it, and only then asked, pulled from and let go
+            // by that name -- the one `*`, the server's name for it.
+            format!("$JS.API.CONSUMER.CREATE.{stream}"),
+            format!("$JS.API.CONSUMER.INFO.{stream}.*"),
             format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.*"),
+            format!("$JS.API.CONSUMER.DELETE.{stream}.*"),
         ]);
     }
     granted

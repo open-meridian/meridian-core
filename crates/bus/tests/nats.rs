@@ -607,6 +607,14 @@ async fn the_analytics_credential_reaches_its_own_stream_and_not_the_lakes() {
             .unwrap();
         withheld.push(sent);
     }
+    // A second granted call after the refused ones: the connection still
+    // carries what it may, so nothing arriving above is a refusal, not a
+    // connection the broker closed.
+    let granted_after = mark("analytics-own-stream-after");
+    analytics
+        .publish(its_own, granted_after.clone().into())
+        .await
+        .unwrap();
     let asked_by_another = mark("the-lakes-own-call");
     listening
         .publish(
@@ -628,6 +636,10 @@ async fn the_analytics_credential_reaches_its_own_stream_and_not_the_lakes() {
             "the broker carried {subject} from the analytics credential"
         );
     }
+    assert!(
+        heard(&mut allowed, &granted_after).await,
+        "the analytics credential's own stream's info was not carried after the refusals"
+    );
     assert!(
         !heard(&mut overheard, &asked_by_another).await,
         "the analytics credential heard another client's call on the lake's stream"

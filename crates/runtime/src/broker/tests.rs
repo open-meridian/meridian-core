@@ -405,16 +405,38 @@ fn a_data_plugin_writes_ahead_on_its_own_subjects_and_the_lake_reads_the_stream(
         .publish
         .iter()
         .any(|s| s.starts_with("platform.lake.internal.write-ahead")));
+    // The lake's writer: exactly the calls `meridian_lake::write_ahead`
+    // makes (review of #132, item 2), its reader's consumer named by the
+    // server.
     let runtime = user(&users, "runtime");
-    for api in [
-        "$JS.API.STREAM.*.LAKE_WRITE_AHEAD",
-        "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD",
-        "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>",
-        "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*",
+    let jetstream: Vec<&str> = runtime
+        .publish
+        .iter()
+        .map(String::as_str)
+        .filter(|s| s.starts_with("$JS"))
+        .collect();
+    assert_eq!(
+        jetstream,
+        vec![
+            "$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD",
+            "$JS.API.STREAM.CREATE.LAKE_WRITE_AHEAD",
+            "$JS.API.STREAM.UPDATE.LAKE_WRITE_AHEAD",
+            "$JS.API.CONSUMER.CREATE.LAKE_WRITE_AHEAD",
+            "$JS.API.CONSUMER.INFO.LAKE_WRITE_AHEAD.*",
+            "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*",
+            "$JS.API.CONSUMER.DELETE.LAKE_WRITE_AHEAD.*",
+        ]
+    );
+    for never in [
+        "$JS.API.STREAM.DELETE.LAKE_WRITE_AHEAD",
+        "$JS.API.STREAM.PURGE.LAKE_WRITE_AHEAD",
+        "$JS.API.CONSUMER.PAUSE.LAKE_WRITE_AHEAD.x",
     ] {
-        assert!(runtime.publish.contains(&api.to_string()), "{api}");
+        assert!(
+            !runtime.publish.iter().any(|grant| grants(grant, never)),
+            "the runtime may call {never}"
+        );
     }
-    assert!(!runtime.publish.contains(&"$JS.API.>".to_string()));
 }
 
 /// Step 3a: each store's change log is a component topic, held by the
@@ -570,10 +592,10 @@ fn the_grammar_the_jetstream_tests_read_grants_with() {
     assert!(grants("a.b", "a.b") && !grants("a.b", "a.b.c") && !grants("a.b.c", "a.b"));
 }
 
-/// Every JetStream call that reaches `stream`, or the account's streams
-/// whatever their name, short of a data plugin reading back its own writes
-/// (contract v30, stage C): what a credential that is not the stream's owner
-/// must be refused.
+/// Every JetStream call that reaches `stream`, short of a data plugin
+/// reading back its own writes (contract v30, stage C): what every
+/// credential is refused but the stream's owner, which is granted only the
+/// calls it makes ([`owners_calls`]).
 fn every_call_on(stream: &str) -> Vec<String> {
     let mut calls: Vec<String> = [
         "STREAM.CREATE",
@@ -586,6 +608,9 @@ fn every_call_on(stream: &str) -> Vec<String> {
         "STREAM.MSG.GET",
         "STREAM.MSG.DELETE",
         "STREAM.LEADER.STEPDOWN",
+        "STREAM.PEER.REMOVE",
+        "ACCOUNT.STREAM.MOVE",
+        "ACCOUNT.STREAM.CANCEL_MOVE",
         "CONSUMER.CREATE",
         "CONSUMER.NAMES",
         "CONSUMER.LIST",
@@ -600,6 +625,7 @@ fn every_call_on(stream: &str) -> Vec<String> {
         "CONSUMER.INFO",
         "CONSUMER.DELETE",
         "CONSUMER.PAUSE",
+        "CONSUMER.UNPIN",
         "CONSUMER.MSG.NEXT",
         "CONSUMER.LEADER.STEPDOWN",
     ] {
@@ -610,12 +636,35 @@ fn every_call_on(stream: &str) -> Vec<String> {
         write_ahead::subject("someone-else", "key")
     ));
     calls.push(format!("$JS.ACK.{stream}.someone.1.2.3.4.5"));
+    calls.push(format!("$JS.FC.{stream}.someone.1"));
+    calls
+}
+
+/// Of [`every_call_on`] its stream, the calls the stream's owner makes: the
+/// analytics queue asks for and makes its stream (its consumer's calls name
+/// `workers`, which no probe does); the lake's writer asks for, makes and
+/// updates its stream, and makes, asks, pulls from and lets go of its
+/// reader, a consumer the server names.
+fn owners_calls(stream: &str) -> Vec<String> {
+    let mut calls = vec![
+        format!("$JS.API.STREAM.INFO.{stream}"),
+        format!("$JS.API.STREAM.CREATE.{stream}"),
+    ];
+    if stream == write_ahead::STREAM {
+        calls.extend([
+            format!("$JS.API.STREAM.UPDATE.{stream}"),
+            format!("$JS.API.CONSUMER.CREATE.{stream}"),
+            format!("$JS.API.CONSUMER.INFO.{stream}.someone"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.someone"),
+            format!("$JS.API.CONSUMER.DELETE.{stream}.someone"),
+        ]);
+    }
     calls
 }
 
 /// The calls on no one stream: every stream's names, the account's, the
-/// cluster's.
-const ACCOUNT_WIDE: [&str; 7] = [
+/// cluster's, and the key-value and object stores' subjects.
+const ACCOUNT_WIDE: [&str; 10] = [
     "$JS.API.INFO",
     "$JS.API.STREAM.NAMES",
     "$JS.API.STREAM.LIST",
@@ -623,6 +672,9 @@ const ACCOUNT_WIDE: [&str; 7] = [
     "$JS.API.META.LEADER.STEPDOWN",
     "$JS.API.SERVER.REMOVE",
     "$JS.API.STREAM.TEMPLATE.CREATE.any",
+    "$JS.FC.any.any.1",
+    "$KV.bucket.key",
+    "$O.bucket.C.chunk",
 ];
 
 /// Review C (2026-11-20), X1: every credential is in one account, so a grant
@@ -633,23 +685,29 @@ const ACCOUNT_WIDE: [&str; 7] = [
 /// clients' calls and could answer for the server.
 #[test]
 fn no_credential_reaches_jetstream_wholesale_or_another_components_stream() {
-    let users = users(
-        Contract::embedded(),
-        &[
-            Instance::plugin("truefx", &["data"]),
-            Instance::plugin("reporting-1", &["reporting"]),
-            Instance::plugin("signal-1", &["signal"]),
-            Instance::component("dashboard-1", "dashboard"),
-        ],
-    )
-    .expect("generates");
+    // An instance of every role and every component the contract names.
+    let mut instances = Vec::new();
+    for line in include_str!("../../../../deploy/roles.tsv")
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .skip(1)
+    {
+        let (name, kind) = line.split_once('\t').expect("a name and a kind");
+        instances.push(match kind {
+            "role" => Instance::plugin(format!("{name}-1"), &[name])
+                .with_datasets(vec!["dataset-1".to_string()]),
+            _ => Instance::component(format!("{name}-1"), name),
+        });
+    }
+    assert!(instances.len() > 10, "the roles were not read");
+    let users = users(Contract::embedded(), &instances).expect("generates");
     // Each stream, and the one credential that may call on it.
     let owners = [
         (meridian_analytics::queue::STREAM, "analytics"),
         (write_ahead::STREAM, "runtime"),
     ];
     for user in &users {
-        for wholesale in ["$JS.>", "$JS.API.>", "$JS.ACK.>", ">"] {
+        for wholesale in ["$JS.>", "$JS.API.>", "$JS.ACK.>", "$JS.FC.>", "$KV.>", "$O.>", ">"] {
             assert!(
                 !user.publish.iter().any(|s| s == wholesale),
                 "{} publishes {wholesale}",
@@ -670,10 +728,11 @@ fn no_credential_reaches_jetstream_wholesale_or_another_components_stream() {
             );
         }
         for (stream, owner) in owners {
-            if user.user == owner {
-                continue;
-            }
+            let made = owners_calls(stream);
             for call in every_call_on(stream) {
+                if user.user == owner && made.contains(&call) {
+                    continue;
+                }
                 let by: Vec<&String> = user
                     .publish
                     .iter()
@@ -696,7 +755,7 @@ fn no_credential_reaches_jetstream_wholesale_or_another_components_stream() {
 /// info and makes it when not found; `get_stream` asks its info;
 /// `get_or_create_consumer` asks the consumer's info and makes it when not
 /// found, by its durable name and no filter; `messages()` pulls, and asks the
-/// consumer's info again on a missed heartbeat; a unit is acknowledged on the
+/// consumer's info again on a reconnect; a unit is acknowledged on the
 /// subject it was delivered with, `$JS.ACK.<stream>.<consumer>.` and five
 /// counters (the broker's v1 form).
 #[test]
@@ -763,4 +822,23 @@ fn analytics_reaches_its_own_queue_and_nothing_of_the_lakes_stream() {
             "analytics may call {call} on the lake's write-ahead stream"
         );
     }
+}
+
+/// The JetStream grants above are the calls async-nats 0.47 makes, read from
+/// its source (review of #132, item 3): a bump of it must look at them again,
+/// and this says so rather than a broker refusing a renamed call in `ha`.
+#[test]
+fn the_jetstream_grants_were_read_from_async_nats_0_47() {
+    let lock = include_str!("../../../../Cargo.lock");
+    let versions: Vec<&str> = lock
+        .split("[[package]]")
+        .filter(|package| package.contains("\nname = \"async-nats\"\n"))
+        .filter_map(|package| package.lines().find(|l| l.starts_with("version = ")))
+        .collect();
+    assert_eq!(
+        versions,
+        vec!["version = \"0.47.0\""],
+        "async-nats changed: read its JetStream calls again (context.rs, stream.rs, \
+         consumer/pull.rs) against jetstream_grants, then update this"
+    );
 }
