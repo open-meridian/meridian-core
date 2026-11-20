@@ -1190,3 +1190,60 @@ fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
         "newest filed first, the lapsed holder's never"
     );
 }
+
+/// The inbox through a rolling upgrade (the review of v31a-core-1, finding
+/// 2): a dashboard of the release before still moves a reader's place by
+/// its notice ID alone. Migration 15 sets the place's number from the ID it
+/// moved to, so this release reads on from there: nothing is read twice.
+#[test]
+fn a_place_moved_by_the_release_before_reads_on_from_it() {
+    use tickets::TicketStore as _;
+    let (url, database) = migrated("inbox_rolling");
+    let store = tickets::InPostgres::on(database);
+    for i in 1..=5 {
+        store
+            .insert(
+                &ticket(&format!("TKT-0{i}"), &format!("roll-{i}"), T0 + i),
+                &[notice(
+                    &format!("01N{i}"),
+                    "local|ada",
+                    &format!("TKT-0{i}"),
+                    T0 + i,
+                )],
+            )
+            .unwrap();
+    }
+    let read = |reader: &str| -> Vec<String> {
+        tickets::store::read_new(&store, "local|ada", reader, 50)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.notice_id)
+            .collect()
+    };
+    // The release before's advance, as it wrote it.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let advance_before = |raw: &mut postgres::Client, reader: &str, to: &str| {
+        raw.execute(
+            "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id) VALUES ($1, $2, $3)
+             ON CONFLICT (subject, reader) DO UPDATE SET notice_id = excluded.notice_id
+              WHERE dashboard_inbox_cursor.notice_id < excluded.notice_id",
+            &[&"local|ada", &reader, &to],
+        )
+        .unwrap();
+    };
+    // A new reader, its first place moved by the release before.
+    advance_before(&mut raw, "DLG-OLD", "01N3");
+    assert_eq!(read("DLG-OLD"), ["01N4", "01N5"]);
+    // A reader this release moved to the second, then the release before
+    // to the fourth.
+    assert_eq!(read("DLG-NEW").len(), 5);
+    raw.execute(
+        "UPDATE dashboard_inbox_cursor SET seq = 2, notice_id = '01N2'
+          WHERE subject = 'local|ada' AND reader = 'DLG-NEW'",
+        &[],
+    )
+    .unwrap();
+    advance_before(&mut raw, "DLG-NEW", "01N4");
+    assert_eq!(read("DLG-NEW"), ["01N5"]);
+    assert!(read("DLG-NEW").is_empty());
+}
