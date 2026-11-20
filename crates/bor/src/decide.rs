@@ -58,7 +58,9 @@ pub struct Context {
     /// it beside them (W4.9, W6.27, contract v20); empty otherwise.
     pub prepared_call_id: String,
     /// The kind of user `acting_for` names, as the sidecar stamped it (W4.9,
-    /// contract v21): a service account where it says so, else a person.
+    /// contract v21): a service account where it says so, else a person --
+    /// unless the subject or its owner says otherwise
+    /// ([`Context::service_account`]).
     pub acting_for_kind: i32,
     /// A service account's owner when it acted, as the sidecar stamped it
     /// beside it (W4.9, W9.8, contract v21); empty for a person.
@@ -223,14 +225,27 @@ impl Context {
 }
 
 impl Context {
+    /// Whether `acting_for` is a service account (contract v21, W6.32,
+    /// W9.8), by the one rule ([`meridian_domain::is_service_account`]):
+    /// stamped so, or named by a service account's `SA-` subject, or sent
+    /// with an owner beside it, whatever its kind says (v31a.16). An
+    /// approval, an override, acknowledging an alert and the agents' guard
+    /// each turn on it.
+    pub(crate) fn service_account(&self) -> bool {
+        meridian_domain::is_service_account(
+            &self.acting_for,
+            self.acting_for_kind,
+            &self.owner_subject,
+        )
+    }
+
     /// Whether the act is an agent's (contract v26, W11.8; G1 question 3):
     /// made through a delegation, or by a service account. A person's own
     /// act at a page is not, nor one a person makes from an agent's
     /// prepared change: its actor is the person, through no delegation.
     pub(crate) fn agents(&self) -> bool {
         !self.acting_for.is_empty()
-            && (!self.acting_through_delegation.is_empty()
-                || self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32)
+            && (!self.acting_through_delegation.is_empty() || self.service_account())
     }
 
     pub(crate) fn actor(&self) -> Actor {
@@ -239,7 +254,7 @@ impl Context {
                 actor::Kind::System(SystemActor {
                     instance_id: self.instance_id.clone(),
                 })
-            } else if self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32 {
+            } else if self.service_account() {
                 // A service account a plugin's autonomous work acted as
                 // (contract v21, W9.8): never a person, nor the plugin's own
                 // finding.

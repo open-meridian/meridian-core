@@ -972,12 +972,14 @@ jobs:
       # A make that did not succeed may leave its k3d cluster up, and every
       # upload after it then hung until the job's limit (runs 44692159189 and
       # 44740504927; inferred, not verified). Its logs are files already, so
-      # the cluster goes before the first upload.
+      # the cluster goes before the first upload: the job's own, by the name
+      # the make gave it (E2E_K3D_CLUSTER, meridian-e2e unless set), never
+      # every cluster on the runner.
       - name: Remove a cluster the make left
         if: always() && steps.make.outcome != 'success'
         timeout-minutes: 2
         continue-on-error: true
-        run: timeout 90 k3d cluster delete --all || true
+        run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
 
       - name: Keep what the watchdog saw
         if: always()
@@ -1309,12 +1311,14 @@ jobs:
       # A make that did not succeed may leave its k3d cluster up, and every
       # upload after it then hung until the job's limit (runs 44692159189 and
       # 44740504927; inferred, not verified). Its logs are files already, so
-      # the cluster goes before the first upload.
+      # the cluster goes before the first upload: the job's own, by the name
+      # the make gave it (E2E_K3D_CLUSTER, meridian-e2e unless set), never
+      # every cluster on the runner.
       - name: Remove a cluster the make left
         if: always() && steps.make.outcome != 'success'
         timeout-minutes: 2
         continue-on-error: true
-        run: timeout 90 k3d cluster delete --all || true
+        run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
 
       - name: Keep what the watchdog saw
         if: always()

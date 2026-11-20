@@ -137,7 +137,7 @@ pub(crate) fn app() -> Arc<App> {
 /// A dashboard whose bus is on as `instance`, keeping `tickets`: what a
 /// sidecar of that instance asking on the bus looks like to the rows, in
 /// one process, where the in-memory bus answers only its own handlers.
-fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
+pub(crate) fn app_as(instance: &str, tickets: Arc<Tickets>) -> Arc<App> {
     let cache = Arc::new(RecordsCache::default());
     cache.store(records(), SystemClock.now_ns());
     let app = Arc::new(App {
@@ -910,6 +910,53 @@ async fn two_delegations_of_one_person_each_read_a_notice_once_and_marking_read_
     // Ben filed it and is told nothing of his own filing; Cy reaches none.
     assert!(read_inbox(&app, &reader(BEN), "").await.unwrap().is_empty());
     assert!(read_inbox(&app, &reader(CY), "").await.unwrap().is_empty());
+}
+
+/// A notice minted before another but kept after it -- its transaction
+/// slower to commit -- is still read once by each reader (review-E F2;
+/// W6.24 "each client a person connects sees every new notice once").
+#[tokio::test]
+async fn a_notice_kept_after_a_later_minted_one_is_still_read() {
+    let app = app();
+    let id = filed(&app, &at_page(BEN), filing("Slow page", "", OPS)).await;
+    let ada = through(ADA, &covering(OPS, "write", &["AcG-A"]));
+    let place = ada.author.delegation_id.clone();
+    let first = read_inbox(&app, &ada.reader(), &place).await.unwrap();
+    assert_eq!(first.len(), 1);
+    // Minted before the filing's notice, kept only now.
+    let late = Notice {
+        notice_id: "00000000000000000000000000".into(),
+        subject: ADA.into(),
+        ticket_id: id.clone(),
+        kind: "noted".into(),
+        author: Author::rules(),
+        changed_ns: 1,
+        read: false,
+    };
+    let note = Note {
+        kind: TicketNoteKind::Advice as i32,
+        author: Author::rules(),
+        noted_ns: 1,
+        note: "Seen before.".into(),
+        ..Note::default()
+    };
+    let on = id.clone();
+    app.tickets
+        .blocking(move |store| store.add_note(&on, &note, &[late]))
+        .await
+        .unwrap();
+    let then = read_inbox(&app, &ada.reader(), &place).await.unwrap();
+    assert_eq!(
+        then.iter()
+            .map(|(n, _)| n.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["noted"],
+        "the notice kept late is read"
+    );
+    assert!(read_inbox(&app, &ada.reader(), &place)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

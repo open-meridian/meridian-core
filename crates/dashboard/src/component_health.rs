@@ -10,7 +10,10 @@
 //! the last six hours and stands above half its limit. A core component's
 //! notices go to the deployment admins, on the latency judge's path (the
 //! Inbox and `dashboard__read_inbox`); a plugin's, the same five kinds, to
-//! its admins, from its sidecar's report as it carries them.
+//! its admins, from its sidecar's report as it carries them. The conductor
+//! not answering three asks in a row is a notice too, `component-unheard`
+//! about the conductor, to the deployment admins (approved 2026-11-20):
+//! nobody's health is judged while it is silent.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -39,6 +42,10 @@ pub const REPEATEDLY: u32 = 3;
 /// Hours in a row a peak must rise, above half the limit, to be "climbing".
 pub const CLIMBING_HOURS: usize = 6;
 
+/// Asks in a row the conductor leaves unanswered before its silence is a
+/// notice (`component-unheard`, approved 2026-11-20): three minutes.
+pub const UNHEARD_ASKS: u32 = 3;
+
 /// One sample of a member's health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
@@ -58,6 +65,15 @@ struct Kept {
     climbing: bool,
 }
 
+/// The conductor's silence: asks unanswered in a row, the first of them,
+/// and whether its notice has been kept.
+#[derive(Debug, Default)]
+struct Unheard {
+    asks: u32,
+    since_ns: i64,
+    open: bool,
+}
+
 /// One notice to file: its kind and the dashboard's words for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
@@ -66,12 +82,23 @@ pub struct Opened {
     pub plugin: bool,
     pub kind: String,
     pub about: String,
+    /// What it is of, its kind and its window (review-F headline 2): every
+    /// copy of the dashboard judging the same reports names the same event,
+    /// so the notices' store keeps it once. A restart's window is the
+    /// cluster's time of it; every other kind's, the conductor's silence
+    /// among them, the hour it opened in, so two copies asking seconds apart
+    /// file one notice, and one condition opening again within the hour
+    /// files none again (decision 40). Two copies judging
+    /// either side of an hour's boundary still file two, until v32.
+    pub event: String,
+    pub window_ns: i64,
 }
 
 /// The judge's memory of every member, for 24 hours.
 #[derive(Debug, Default)]
 pub struct Judge {
     members: BTreeMap<String, Kept>,
+    unheard: Unheard,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -82,6 +109,7 @@ impl Judge {
     /// Each member's latest report judged against what it said before; the
     /// notices that open. A member not heard for 24 hours is let go.
     pub fn judge(&mut self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+        self.heard();
         let mut opened = Vec::new();
         for report in members {
             let key = if report.member.is_empty() {
@@ -118,12 +146,17 @@ impl Judge {
             {
                 kept.samples.pop_front();
             }
-            let mut open = |name: &str, about: String| {
+            let hour = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+            let mut open = |name: &str, about: String, window: Option<(i64, String)>| {
+                let kind = kind(name);
+                let (window_ns, at) = window.unwrap_or((hour, String::new()));
                 opened.push(Opened {
                     of: of.clone(),
                     plugin,
-                    kind: kind(name),
+                    event: format!("{kind}|{key}|{window_ns}{at}"),
+                    kind,
                     about,
+                    window_ns,
                 })
             };
             if let Some(before) = before {
@@ -133,12 +166,21 @@ impl Judge {
                         "" => String::new(),
                         reason => format!(" ({reason})"),
                     };
+                    // The restart itself, as the cluster times it; where
+                    // the conductor may not read the pod, the restarts
+                    // counted within the hour.
+                    let window = if report.last_restart_at_ns > 0 {
+                        (report.last_restart_at_ns, String::new())
+                    } else {
+                        (hour, format!("|{}", sample.restarts))
+                    };
                     open(
                         "restarted",
                         format!(
                             "{key} restarted{why}; {} restart(s) since its pod started",
                             sample.restarts
                         ),
+                        Some(window),
                     );
                 }
                 if sample.sheds > before.sheds {
@@ -148,6 +190,7 @@ impl Judge {
                             "{key} cancelled {} request(s) above its shed line: its largest in flight, refused for load; lower the bound that holds the memory",
                             sample.sheds - before.sheds
                         ),
+                        None,
                     );
                 }
             }
@@ -164,6 +207,7 @@ impl Judge {
                         mib(budget),
                         mib(report.memory_limit_bytes)
                     ),
+                    None,
                 );
             }
             kept.over_budget = over;
@@ -180,6 +224,7 @@ impl Judge {
                 open(
                     "restarting-repeatedly",
                     format!("{key} restarted {lately} times within the hour"),
+                    None,
                 );
             }
             kept.repeatedly = repeatedly;
@@ -192,6 +237,7 @@ impl Judge {
                         mib(sample.memory_bytes),
                         mib(report.memory_limit_bytes)
                     ),
+                    None,
                 );
             }
             kept.climbing = climbing;
@@ -202,6 +248,55 @@ impl Judge {
                 .is_some_and(|last| last.at_ns >= now_ns - KEPT_NS)
         });
         opened
+    }
+
+    /// The conductor did not answer at `now_ns`: its silence opens a notice
+    /// to the deployment admins at the [`UNHEARD_ASKS`]th ask in a row
+    /// (`component-unheard`, approved 2026-11-20), offered again at each ask
+    /// until [`Judge::kept`] says it was kept, then not until it answers and
+    /// falls silent again: an opening dropped -- the records stale, or the
+    /// keeping failed -- is not lost, and its keyed ID makes a repeat
+    /// harmless.
+    /// Its window is the hour of the ask that opens it, as every other
+    /// kind's is the hour it opened in (decision 40), so every copy names one
+    /// event, and a silence opening again within that hour files none again.
+    pub fn unanswered(&mut self, now_ns: i64) -> Vec<Opened> {
+        let unheard = &mut self.unheard;
+        if unheard.asks == 0 {
+            unheard.since_ns = now_ns;
+        }
+        unheard.asks = unheard.asks.saturating_add(1);
+        if unheard.open || unheard.asks < UNHEARD_ASKS {
+            return Vec::new();
+        }
+        let kind = "component-unheard".to_string();
+        let window_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+        vec![Opened {
+            of: "conductor".into(),
+            plugin: false,
+            event: format!("{kind}|conductor|{window_ns}"),
+            about: format!(
+                "the conductor has not answered for {} asks in a row, since {}: no component's or plugin's health is judged until it does",
+                unheard.asks,
+                crate::custody::utc(unheard.since_ns)
+            ),
+            kind,
+            window_ns,
+        }]
+    }
+
+    /// The conductor answered, whether or not its answer reads: its silence
+    /// over, and a notice again should it fall silent.
+    pub fn heard(&mut self) {
+        self.unheard = Unheard::default();
+    }
+
+    /// What one judging opened is kept, or there was nobody to tell: the
+    /// conductor's silence, among them, is not offered again while it lasts.
+    pub fn kept(&mut self, opened: &[Opened]) {
+        if opened.iter().any(|one| one.kind == "component-unheard") {
+            self.unheard.open = true;
+        }
     }
 
     /// A member's peak and restarts over its kept 24 hours: what `status`
@@ -255,9 +350,28 @@ pub fn told(records: &AccessRecords, opened: &Opened) -> BTreeSet<String> {
         .collect()
 }
 
-/// Ask the conductor every [`ASK_EVERY`], judge, and file what opened on the
-/// latency judge's path. The task is handed back, for the component to end
-/// before its runtime stops.
+/// The notices one judging files: one per opening per person told, each ID
+/// its event's ([`crate::latency::notices::keyed_id`]).
+pub fn notices_of(records: &AccessRecords, opened: &[Opened], now_ns: i64) -> Vec<Notice> {
+    let mut notices = Vec::new();
+    for one in opened {
+        for subject in told(records, one) {
+            notices.push(Notice {
+                notice_id: crate::latency::notices::keyed_id(one.window_ns, &one.event, &subject),
+                subject,
+                plugin_instance_id: one.of.clone(),
+                kind: one.kind.clone(),
+                about: one.about.clone(),
+                changed_ns: now_ns,
+            });
+        }
+    }
+    notices
+}
+
+/// Ask the conductor every [`ASK_EVERY`], judge its answer or its silence,
+/// and file what opened on the latency judge's path. The task is handed
+/// back, for the component to end before its runtime stops.
 pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     let judge = Arc::new(Mutex::new(Judge::default()));
     tokio::spawn(async move {
@@ -274,20 +388,31 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                     None,
                 )
                 .await;
-            let Ok((_, bytes)) = asked else {
-                tracing::debug!(
-                    "the conductor did not answer ReadComponentHealth; asked again in a minute"
-                );
-                continue;
-            };
-            let Ok(reply) = ReadComponentHealthReply::decode(&bytes[..]) else {
-                tracing::warn!("a ReadComponentHealthReply did not decode");
-                continue;
+            let members = match asked {
+                Ok((_, bytes)) => match ReadComponentHealthReply::decode(&bytes[..]) {
+                    Ok(reply) => Some(reply.members),
+                    Err(_) => {
+                        // An answer, if not one that reads: the silence's
+                        // count ends.
+                        tracing::warn!("a ReadComponentHealthReply did not decode");
+                        if let Ok(mut judge) = judge.lock() {
+                            judge.heard();
+                        }
+                        continue;
+                    }
+                },
+                Err(failed) => {
+                    tracing::debug!(%failed, "the conductor did not answer ReadComponentHealth; asked again in a minute");
+                    None
+                }
             };
             let now = app.clock.now_ns();
             let opened = judge
                 .lock()
-                .map(|mut judge| judge.judge(&reply.members, now))
+                .map(|mut judge| match &members {
+                    Some(members) => judge.judge(members, now),
+                    None => judge.unanswered(now),
+                })
                 .unwrap_or_default();
             if opened.is_empty() {
                 continue;
@@ -296,27 +421,21 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 tracing::warn!(notices = opened.len(), "a component's notice opened while the access records were stale; told nobody rather than the wrong people");
                 continue;
             };
-            let mut notices = Vec::new();
             for one in &opened {
                 tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
-                for subject in told(&records, one) {
-                    notices.push(Notice {
-                        notice_id: app.tickets.ulid(now),
-                        subject,
-                        plugin_instance_id: one.of.clone(),
-                        kind: one.kind.clone(),
-                        about: one.about.clone(),
-                        changed_ns: now,
-                    });
+            }
+            let notices = notices_of(&records, &opened, now);
+            if !notices.is_empty() {
+                let kept =
+                    tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices))
+                        .await;
+                if !matches!(kept, Ok(Ok(()))) {
+                    tracing::error!("a component's notices were not kept");
+                    continue;
                 }
             }
-            if notices.is_empty() {
-                continue;
-            }
-            let kept =
-                tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices)).await;
-            if !matches!(kept, Ok(Ok(()))) {
-                tracing::error!("a component's notices were not kept");
+            if let Ok(mut judge) = judge.lock() {
+                judge.kept(&opened);
             }
         }
     })
@@ -412,6 +531,165 @@ mod tests {
                 .map(|d| d.1),
             Some(0)
         );
+    }
+
+    /// The deployment admin, Dee, and nobody else.
+    fn records() -> AccessRecords {
+        use meridian_domain::v1::{Permission, SignInRecord, UserGroup};
+        AccessRecords {
+            user_groups: vec![UserGroup {
+                user_group_id: "UG-DEE".into(),
+                name: "UG-DEE".into(),
+                directory_groups: vec![],
+                logins: vec!["local|dee".into()],
+            }],
+            permissions: vec![Permission {
+                permission_id: "P-DEE".into(),
+                user_group_id: "UG-DEE".into(),
+                account_group_id: String::new(),
+                access_group_id: meridian_access::DEPLOYMENT_ADMIN.into(),
+            }],
+            people: vec![SignInRecord {
+                subject: "local|dee".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// ha runs two dashboards, each asking the conductor on its own minute
+    /// and judging (review-F headline 2): one restart, one shed and one
+    /// crossing of the budget are each one notice in the one store both
+    /// keep their notices in.
+    #[test]
+    fn two_judges_over_one_store_file_one_notice() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let (mut a, mut b) = (Judge::default(), Judge::default());
+        let mut restarted = lake(700 * MIB, 0, 2, 1);
+        restarted.last_restart_reason = "OOMKilled".into();
+        restarted.last_restart_at_ns = T0 + 30_000_000_000;
+        // The same reports, read by each copy 40 seconds apart.
+        for (judge, offset) in [(&mut a, 0), (&mut b, 40_000_000_000)] {
+            judge.judge(&[lake(100 * MIB, 0, 0, 0)], T0 - MINUTE + offset);
+            let at = T0 + MINUTE + offset;
+            let opened = judge.judge(&[restarted.clone()], at);
+            assert_eq!(
+                kinds(&opened),
+                vec![
+                    "component-restarted",
+                    "component-shedding",
+                    "component-over-budget"
+                ]
+            );
+            store.notify(&notices_of(&records, &opened, at)).unwrap();
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 3, "{filed:#?}");
+    }
+
+    /// The conductor silent (`component-unheard`, approved 2026-11-20):
+    /// three asks unanswered in a row are a notice about the conductor to
+    /// the deployment admins, its window the hour of the ask that opens it,
+    /// as the other conditions' is (decision 40). Every copy judges, and
+    /// the keyed ID makes their notices one: within one hour a silence, an
+    /// answer and a silence again are one notice, from either copy.
+    #[test]
+    fn a_silent_conductor_within_one_hour_is_one_notice() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let hour = T0.div_euclid(HOUR_NS) * HOUR_NS;
+        let heard = [lake(MIB, 0, 0, 0)];
+        // Two copies, asking 40 seconds apart.
+        for offset in [0, 40_000_000_000] {
+            let mut judge = Judge::default();
+            let mut ask = |answered: bool, minute: i64| {
+                let at = hour + minute * MINUTE + offset;
+                let opened = if answered {
+                    judge.judge(&heard, at)
+                } else {
+                    judge.unanswered(at)
+                };
+                store.notify(&notices_of(&records, &opened, at)).unwrap();
+            };
+            ask(true, 0);
+            for minute in 1..=3 {
+                ask(false, minute);
+            }
+            ask(true, 6);
+            for minute in 7..=9 {
+                ask(false, minute);
+            }
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].kind, "component-unheard");
+        assert_eq!(filed[0].plugin_instance_id, "conductor");
+        assert!(crate::latency::notices::rows(&filed).contains(">Unheard<"));
+    }
+
+    /// The conductor's silence takes the hour of the ask that opens it as
+    /// its window, as every other kind takes the hour it opened in
+    /// (decision 40; the delta review of 77afd5d0, finding 2): a silence
+    /// begun before the hour and opened in it, an answer, and a silence
+    /// again within that hour are one notice.
+    #[test]
+    fn a_silence_opened_within_one_hour_is_one_notice_whenever_it_began() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let eleven = T0.div_euclid(HOUR_NS) * HOUR_NS + HOUR_NS;
+        let heard = [lake(MIB, 0, 0, 0)];
+        let mut judge = Judge::default();
+        let mut ask = |answered: bool, minute: i64| {
+            let at = eleven + minute * MINUTE;
+            let opened = if answered {
+                judge.judge(&heard, at)
+            } else {
+                judge.unanswered(at)
+            };
+            store.notify(&notices_of(&records, &opened, at)).unwrap();
+        };
+        // Unheard at 10:58, 10:59 and 11:00; answered at 11:01; unheard at
+        // 11:02 to 11:04.
+        for minute in -2..=0 {
+            ask(false, minute);
+        }
+        ask(true, 1);
+        for minute in 2..=4 {
+            ask(false, minute);
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+    }
+
+    /// The silence's opening is offered until it is kept (the delta review
+    /// of 77afd5d0, finding 3): one dropped -- the records stale, or the
+    /// keeping failed -- is offered again at the next ask; its keyed ID
+    /// makes a repeat harmless. Once kept, none again while it is silent.
+    #[test]
+    fn a_silence_whose_notice_was_not_kept_is_offered_again() {
+        let mut judge = Judge::default();
+        for minute in 1..=3 {
+            let _dropped = judge.unanswered(T0 + minute * MINUTE);
+        }
+        let opened = judge.unanswered(T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-unheard"]);
+        judge.kept(&opened);
+        assert!(judge.unanswered(T0 + 5 * MINUTE).is_empty());
+    }
+
+    /// An answer that does not decode is an answer: it ends the silence's
+    /// count (the delta review of 77afd5d0, finding 4).
+    #[test]
+    fn an_answer_that_does_not_read_ends_the_silences_count() {
+        let mut judge = Judge::default();
+        assert!(judge.unanswered(T0 + MINUTE).is_empty());
+        assert!(judge.unanswered(T0 + 2 * MINUTE).is_empty());
+        judge.heard();
+        assert!(judge.unanswered(T0 + 3 * MINUTE).is_empty());
     }
 
     #[test]
