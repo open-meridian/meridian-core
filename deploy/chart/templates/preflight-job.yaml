@@ -56,22 +56,36 @@
        volume and the like is a directory of its node's disk, held to no
        size, so its declared size says nothing about what a migration has
        room for (the dev deployment's database, 23.1 GiB on a 20Gi volume
-       with 30 GiB free, was blocked at 116%). Only where all of this is so,
-       and otherwise the check judges the declared size as it always has:
+       with 30 GiB free, was blocked at 116%). Mounting it holds this pod to
+       the database's node, so only where all of this is so, and otherwise
+       the check judges the declared size as it always has:
        - a cluster answers and the claim is there (as backups, above);
-       - the claim's provisioner makes a node's directory. Such a volume
-         holds whoever mounts it to its node, so this pod is placed beside
-         the database with nothing said here; a volume of any other kind is
-         never mounted, so the hook never waits on one that only one node or
-         one pod may hold, and a provisioner not named is judged as before;
-       - the database is one member, running: under Patroni member 0 may be
-         a standby, and on a node that is down this pod would wait for it;
-       - it is the only database brought: the check has one volume's size
-         and judges every database it reaches by it.
+       - the claim's provisioner makes a node's directory; a volume of any
+         other kind is never mounted, so the hook never waits on one that
+         only one node or one pod may hold, and a provisioner not named is
+         judged as before;
+       - the database is one member, and it is the only database brought:
+         under Patroni member 0 may be a standby, and the check has one
+         volume's size and judges every database it reaches by it;
+       - its pod is running and ready, on a node that is ready and not
+         cordoned: this pod is named to that node, where the volume is, and
+         on a node that takes no pod it would wait until its deadline and
+         fail an upgrade the database itself would have passed;
+       - the volume is bound to that node -- its PersistentVolume names a
+         node (nodeAffinity) or is a `local` one -- so it is the database's
+         directory this pod reads, never an empty one of the same path on
+         another node.
+       The node and the volume are read only once everything before them
+       holds, since they are the cluster's and not the namespace's: whoever
+       upgrades a deployment on node directories must be able to read them.
+       What remains: a node cordoned, lost or filled after this is rendered
+       and before the pod starts fails the hook, and so the upgrade, with
+       nothing changed; upgrading again judges it afresh.
        The check itself tells a filesystem that is the volume's own from a
-       node's disk, by its size; the list only says where mounting is safe. */}}
+       node's disk, by its size; this only says where mounting is safe. */}}
 {{- $nodeDirectories := list "rancher.io/local-path" "docker.io/hostpath" "k8s.io/minikube-hostpath" "microk8s.io/hostpath" "openebs.io/local" }}
 {{- $data := "" }}
+{{- $dataNode := "" }}
 {{- if and .Values.database.brought.enabled (not (include "meridian-runtime.extraDatabases" . | fromJsonArray)) }}
 {{- $database := printf "%s-database" (include "meridian-runtime.fullname" .) }}
 {{- $claim := default (dict) (lookup "v1" "PersistentVolumeClaim" .Release.Namespace (printf "data-%s-0" $database)) }}
@@ -79,7 +93,26 @@
 {{- $provisioner := index $annotations "volume.kubernetes.io/storage-provisioner" | default (index $annotations "volume.beta.kubernetes.io/storage-provisioner") | default "" }}
 {{- $members := dig "spec" "replicas" 0 (default (dict) (lookup "apps/v1" "StatefulSet" .Release.Namespace $database)) | int }}
 {{- if and (has $provisioner $nodeDirectories) (eq $members 1) }}
+{{- $pod := default (dict) (lookup "v1" "Pod" .Release.Namespace (printf "%s-0" $database)) }}
+{{- $podReady := false }}
+{{- range dig "status" "conditions" (list) $pod }}
+{{- if and (eq .type "Ready") (eq .status "True") }}{{ $podReady = true }}{{ end }}
+{{- end }}
+{{- $on := dig "spec" "nodeName" "" $pod }}
+{{- $volume := dig "spec" "volumeName" "" $claim }}
+{{- if and $podReady (eq (dig "status" "phase" "" $pod) "Running") (not (dig "metadata" "deletionTimestamp" "" $pod)) $on $volume }}
+{{- $node := default (dict) (lookup "v1" "Node" "" $on) }}
+{{- $nodeReady := false }}
+{{- range dig "status" "conditions" (list) $node }}
+{{- if and (eq .type "Ready") (eq .status "True") }}{{ $nodeReady = true }}{{ end }}
+{{- end }}
+{{- $held := default (dict) (lookup "v1" "PersistentVolume" "" $volume) }}
+{{- $bound := or (dig "spec" "nodeAffinity" false $held) (dig "spec" "local" false $held) }}
+{{- if and $nodeReady (not (dig "spec" "unschedulable" false $node)) $bound }}
 {{- $data = printf "data-%s-0" $database }}
+{{- $dataNode = $on }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- /* Internal TLS as the database serves it now, not as this upgrade
@@ -111,6 +144,10 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
+      {{- if $dataNode }}
+      # Beside the database, whose volume it reads (see above).
+      nodeName: {{ $dataNode | quote }}
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
