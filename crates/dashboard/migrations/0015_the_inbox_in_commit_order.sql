@@ -25,6 +25,15 @@
 -- column takes the notices' table whole until this commits, so no notice is
 -- inserted while they are numbered.
 --
+-- While an upgrade rolls, a dashboard of the release before still moves a
+-- reader's place by its notice ID alone, never its number. A trigger on
+-- the places keeps the number with it: where a place's notice ID moves and
+-- its number does not, the number is set to the greater of the one it had
+-- and the highest number of the person's notices at or before that ID, the
+-- same rule the places kept before this migration are set by. So a place
+-- the release before moved is read on from by this one, and nothing it
+-- read is read again (the review of v31a-core-1, finding 2).
+--
 -- Written to be run again harmlessly, as every migration here is.
 
 ALTER TABLE dashboard_notice ADD COLUMN IF NOT EXISTS inbox_seq bigint;
@@ -78,3 +87,30 @@ DROP TRIGGER IF EXISTS dashboard_notice_takes_its_number ON dashboard_notice;
 CREATE TRIGGER dashboard_notice_takes_its_number
     BEFORE INSERT ON dashboard_notice
     FOR EACH ROW EXECUTE FUNCTION dashboard_notice_takes_its_number();
+
+CREATE OR REPLACE FUNCTION dashboard_inbox_cursor_keeps_its_number() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    had bigint := 0;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.notice_id IS NOT DISTINCT FROM OLD.notice_id OR NEW.seq <> OLD.seq THEN
+            RETURN NEW;
+        END IF;
+        had := OLD.seq;
+    ELSIF NEW.seq <> 0 THEN
+        RETURN NEW;
+    END IF;
+    NEW.seq := greatest(had, coalesce((
+        SELECT max(n.inbox_seq) FROM dashboard_notice n
+         WHERE n.subject = NEW.subject AND n.inbox_seq IS NOT NULL
+           AND n.notice_id <= NEW.notice_id
+    ), 0));
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS dashboard_inbox_cursor_keeps_its_number ON dashboard_inbox_cursor;
+CREATE TRIGGER dashboard_inbox_cursor_keeps_its_number
+    BEFORE INSERT OR UPDATE ON dashboard_inbox_cursor
+    FOR EACH ROW EXECUTE FUNCTION dashboard_inbox_cursor_keeps_its_number();
