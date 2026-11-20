@@ -2016,14 +2016,7 @@ pub async fn read_inbox(
     let (subject, place_of) = (reader.subject.clone(), place.to_string());
     let notices = app
         .tickets
-        .blocking(move |store| {
-            let after = store.cursor(&subject, &place_of)?;
-            let notices = store.notices(&subject, &after, INBOX_PAGE)?;
-            if let Some(last) = notices.last() {
-                store.advance(&subject, &place_of, &last.notice_id)?;
-            }
-            Ok(notices)
-        })
+        .blocking(move |store| store::read_new(store, &subject, &place_of, INBOX_PAGE))
         .await?;
     let visible = app.tickets.visible_by_id(reader).await?;
     Ok(notices

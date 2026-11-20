@@ -66,6 +66,14 @@ pub struct Opened {
     pub plugin: bool,
     pub kind: String,
     pub about: String,
+    /// What it is of, its kind and its window (review-F headline 2): every
+    /// copy of the dashboard judging the same reports names the same event,
+    /// so the notices' store keeps it once. A restart's window is the
+    /// cluster's time of it; every other kind's, the hour it opened in, so
+    /// two copies asking seconds apart file one notice, and one condition
+    /// opening again within the hour files none again.
+    pub event: String,
+    pub window_ns: i64,
 }
 
 /// The judge's memory of every member, for 24 hours.
@@ -118,12 +126,17 @@ impl Judge {
             {
                 kept.samples.pop_front();
             }
-            let mut open = |name: &str, about: String| {
+            let hour = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
+            let mut open = |name: &str, about: String, window: Option<(i64, String)>| {
+                let kind = kind(name);
+                let (window_ns, at) = window.unwrap_or((hour, String::new()));
                 opened.push(Opened {
                     of: of.clone(),
                     plugin,
-                    kind: kind(name),
+                    event: format!("{kind}|{key}|{window_ns}{at}"),
+                    kind,
                     about,
+                    window_ns,
                 })
             };
             if let Some(before) = before {
@@ -133,12 +146,21 @@ impl Judge {
                         "" => String::new(),
                         reason => format!(" ({reason})"),
                     };
+                    // The restart itself, as the cluster times it; where
+                    // the conductor may not read the pod, the restarts
+                    // counted within the hour.
+                    let window = if report.last_restart_at_ns > 0 {
+                        (report.last_restart_at_ns, String::new())
+                    } else {
+                        (hour, format!("|{}", sample.restarts))
+                    };
                     open(
                         "restarted",
                         format!(
                             "{key} restarted{why}; {} restart(s) since its pod started",
                             sample.restarts
                         ),
+                        Some(window),
                     );
                 }
                 if sample.sheds > before.sheds {
@@ -148,6 +170,7 @@ impl Judge {
                             "{key} cancelled {} request(s) above its shed line: its largest in flight, refused for load; lower the bound that holds the memory",
                             sample.sheds - before.sheds
                         ),
+                        None,
                     );
                 }
             }
@@ -164,6 +187,7 @@ impl Judge {
                         mib(budget),
                         mib(report.memory_limit_bytes)
                     ),
+                    None,
                 );
             }
             kept.over_budget = over;
@@ -180,6 +204,7 @@ impl Judge {
                 open(
                     "restarting-repeatedly",
                     format!("{key} restarted {lately} times within the hour"),
+                    None,
                 );
             }
             kept.repeatedly = repeatedly;
@@ -192,6 +217,7 @@ impl Judge {
                         mib(sample.memory_bytes),
                         mib(report.memory_limit_bytes)
                     ),
+                    None,
                 );
             }
             kept.climbing = climbing;
@@ -255,6 +281,25 @@ pub fn told(records: &AccessRecords, opened: &Opened) -> BTreeSet<String> {
         .collect()
 }
 
+/// The notices one judging files: one per opening per person told, each ID
+/// its event's ([`crate::latency::notices::keyed_id`]).
+pub fn notices_of(records: &AccessRecords, opened: &[Opened], now_ns: i64) -> Vec<Notice> {
+    let mut notices = Vec::new();
+    for one in opened {
+        for subject in told(records, one) {
+            notices.push(Notice {
+                notice_id: crate::latency::notices::keyed_id(one.window_ns, &one.event, &subject),
+                subject,
+                plugin_instance_id: one.of.clone(),
+                kind: one.kind.clone(),
+                about: one.about.clone(),
+                changed_ns: now_ns,
+            });
+        }
+    }
+    notices
+}
+
 /// Ask the conductor every [`ASK_EVERY`], judge, and file what opened on the
 /// latency judge's path. The task is handed back, for the component to end
 /// before its runtime stops.
@@ -296,20 +341,10 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 tracing::warn!(notices = opened.len(), "a component's notice opened while the access records were stale; told nobody rather than the wrong people");
                 continue;
             };
-            let mut notices = Vec::new();
             for one in &opened {
                 tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
-                for subject in told(&records, one) {
-                    notices.push(Notice {
-                        notice_id: app.tickets.ulid(now),
-                        subject,
-                        plugin_instance_id: one.of.clone(),
-                        kind: one.kind.clone(),
-                        about: one.about.clone(),
-                        changed_ns: now,
-                    });
-                }
             }
+            let notices = notices_of(&records, &opened, now);
             if notices.is_empty() {
                 continue;
             }
@@ -412,6 +447,62 @@ mod tests {
                 .map(|d| d.1),
             Some(0)
         );
+    }
+
+    /// The deployment admin, Dee, and nobody else.
+    fn records() -> AccessRecords {
+        use meridian_domain::v1::{Permission, SignInRecord, UserGroup};
+        AccessRecords {
+            user_groups: vec![UserGroup {
+                user_group_id: "UG-DEE".into(),
+                name: "UG-DEE".into(),
+                directory_groups: vec![],
+                logins: vec!["local|dee".into()],
+            }],
+            permissions: vec![Permission {
+                permission_id: "P-DEE".into(),
+                user_group_id: "UG-DEE".into(),
+                account_group_id: String::new(),
+                access_group_id: meridian_access::DEPLOYMENT_ADMIN.into(),
+            }],
+            people: vec![SignInRecord {
+                subject: "local|dee".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// ha runs two dashboards, each asking the conductor on its own minute
+    /// and judging (review-F headline 2): one restart, one shed and one
+    /// crossing of the budget are each one notice in the one store both
+    /// keep their notices in.
+    #[test]
+    fn two_judges_over_one_store_file_one_notice() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let (mut a, mut b) = (Judge::default(), Judge::default());
+        let mut restarted = lake(700 * MIB, 0, 2, 1);
+        restarted.last_restart_reason = "OOMKilled".into();
+        restarted.last_restart_at_ns = T0 + 30_000_000_000;
+        // The same reports, read by each copy 40 seconds apart.
+        for (judge, offset) in [(&mut a, 0), (&mut b, 40_000_000_000)] {
+            judge.judge(&[lake(100 * MIB, 0, 0, 0)], T0 - MINUTE + offset);
+            let at = T0 + MINUTE + offset;
+            let opened = judge.judge(&[restarted.clone()], at);
+            assert_eq!(
+                kinds(&opened),
+                vec![
+                    "component-restarted",
+                    "component-shedding",
+                    "component-over-budget"
+                ]
+            );
+            store.notify(&notices_of(&records, &opened, at)).unwrap();
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 3, "{filed:#?}");
     }
 
     #[test]

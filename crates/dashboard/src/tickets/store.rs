@@ -81,18 +81,28 @@ pub trait TicketStore: Send + Sync {
         notices: &[Notice],
     ) -> Result<bool, String>;
 
-    /// A person's notices after `after` (a notice id; empty for all),
-    /// oldest first, at most `limit`.
-    fn notices(&self, subject: &str, after: &str, limit: usize) -> Result<Vec<Notice>, String>;
+    /// A person's notices after `after` -- a number of the person's inbox,
+    /// 0 for all -- in the order they were kept, at most `limit`, each with
+    /// its number. A person's notices are numbered as they are kept, inside
+    /// the keeping transaction, so a number is never kept after a higher one
+    /// (W6.24; review-E F2): never by their IDs, which are minted earlier.
+    fn notices(
+        &self,
+        subject: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Notice)>, String>;
 
     /// A person's latest notices, newest first, at most `limit`.
     fn latest_notices(&self, subject: &str, limit: usize) -> Result<Vec<Notice>, String>;
 
     /// Where a reader -- a delegation, or empty for the person's pages -- has
-    /// read a person's inbox to; empty before its first read.
-    fn cursor(&self, subject: &str, reader: &str) -> Result<String, String>;
+    /// read a person's inbox to: the last number it read, 0 before its first.
+    fn cursor(&self, subject: &str, reader: &str) -> Result<i64, String>;
 
-    fn advance(&self, subject: &str, reader: &str, to: &str) -> Result<(), String>;
+    /// The reader's place moved on to `to`, the number of `notice_id`;
+    /// never back.
+    fn advance(&self, subject: &str, reader: &str, to: i64, notice_id: &str) -> Result<(), String>;
 
     /// Mark a person's notices of these tickets read. How many were unread.
     fn mark_read(&self, subject: &str, ticket_ids: &[String]) -> Result<usize, String>;
@@ -106,13 +116,44 @@ pub trait TicketStore: Send + Sync {
     fn sweep(&self, before_ns: i64) -> Result<usize, String>;
 }
 
+/// What is new in `subject`'s inbox for one reader -- a delegation, or
+/// empty for the person's pages -- at most `limit`, oldest first, and the
+/// reader's place advanced past it (W6.24).
+pub fn read_new(
+    store: &dyn TicketStore,
+    subject: &str,
+    reader: &str,
+    limit: usize,
+) -> Result<Vec<Notice>, String> {
+    let after = store.cursor(subject, reader)?;
+    let notices = store.notices(subject, after, limit)?;
+    if let Some((to, last)) = notices.last() {
+        store.advance(subject, reader, *to, &last.notice_id)?;
+    }
+    Ok(notices.into_iter().map(|(_, notice)| notice).collect())
+}
+
 // ── In memory ────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Kept {
     tickets: BTreeMap<String, Ticket>,
-    notices: Vec<Notice>,
-    cursors: HashMap<(String, String), String>,
+    /// Each with its number in its person's inbox, in the order kept.
+    notices: Vec<(i64, Notice)>,
+    /// Each person's last number taken.
+    heads: HashMap<String, i64>,
+    cursors: HashMap<(String, String), i64>,
+}
+
+impl Kept {
+    /// Notices kept, each taking its person's next number.
+    fn keep(&mut self, notices: &[Notice]) {
+        for notice in notices {
+            let head = self.heads.entry(notice.subject.clone()).or_default();
+            *head += 1;
+            self.notices.push((*head, notice.clone()));
+        }
+    }
 }
 
 /// For tests, and for a dashboard given no database, where a restart
@@ -150,7 +191,7 @@ impl TicketStore for InMemory {
         let mut kept_ticket = ticket.clone();
         kept_ticket.note_count = ticket.notes.len() as i32;
         kept.tickets.insert(ticket.ticket_id.clone(), kept_ticket);
-        kept.notices.extend(notices.iter().cloned());
+        kept.keep(notices);
         Ok(Inserted::Made)
     }
 
@@ -247,7 +288,7 @@ impl TicketStore for InMemory {
             ..note.clone()
         });
         ticket.note_count = number;
-        kept.notices.extend(notices.iter().cloned());
+        kept.keep(notices);
         Ok(number)
     }
 
@@ -290,19 +331,24 @@ impl TicketStore for InMemory {
             ..note.clone()
         });
         ticket.note_count = number;
-        kept.notices.extend(notices.iter().cloned());
+        kept.keep(notices);
         Ok(true)
     }
 
-    fn notices(&self, subject: &str, after: &str, limit: usize) -> Result<Vec<Notice>, String> {
+    fn notices(
+        &self,
+        subject: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Notice)>, String> {
         let kept = self.lock();
-        let mut found: Vec<Notice> = kept
+        let mut found: Vec<(i64, Notice)> = kept
             .notices
             .iter()
-            .filter(|n| n.subject == subject && n.notice_id.as_str() > after)
+            .filter(|(number, n)| n.subject == subject && *number > after)
             .cloned()
             .collect();
-        found.sort_by(|a, b| a.notice_id.cmp(&b.notice_id));
+        found.sort_by_key(|(number, _)| *number);
         found.truncate(limit);
         Ok(found)
     }
@@ -312,6 +358,7 @@ impl TicketStore for InMemory {
         let mut found: Vec<Notice> = kept
             .notices
             .iter()
+            .map(|(_, n)| n)
             .filter(|n| n.subject == subject)
             .cloned()
             .collect();
@@ -320,34 +367,32 @@ impl TicketStore for InMemory {
         Ok(found)
     }
 
-    fn cursor(&self, subject: &str, reader: &str) -> Result<String, String> {
+    fn cursor(&self, subject: &str, reader: &str) -> Result<i64, String> {
         Ok(self
             .lock()
             .cursors
             .get(&(subject.to_string(), reader.to_string()))
-            .cloned()
+            .copied()
             .unwrap_or_default())
     }
 
-    fn advance(&self, subject: &str, reader: &str, to: &str) -> Result<(), String> {
+    fn advance(&self, subject: &str, reader: &str, to: i64, _: &str) -> Result<(), String> {
         let mut kept = self.lock();
         let at = kept
             .cursors
             .entry((subject.to_string(), reader.to_string()))
             .or_default();
-        if to > at.as_str() {
-            *at = to.to_string();
-        }
+        *at = (*at).max(to);
         Ok(())
     }
 
     fn mark_read(&self, subject: &str, ticket_ids: &[String]) -> Result<usize, String> {
         let mut kept = self.lock();
         let mut marked = 0;
-        for notice in kept
+        for (_, notice) in kept
             .notices
             .iter_mut()
-            .filter(|n| n.subject == subject && !n.read && ticket_ids.contains(&n.ticket_id))
+            .filter(|(_, n)| n.subject == subject && !n.read && ticket_ids.contains(&n.ticket_id))
         {
             notice.read = true;
             marked += 1;
@@ -360,6 +405,7 @@ impl TicketStore for InMemory {
             .lock()
             .notices
             .iter()
+            .map(|(_, n)| n)
             .filter(|n| n.subject == subject && !n.read)
             .cloned()
             .collect())
@@ -383,7 +429,7 @@ impl TicketStore for InMemory {
     fn sweep(&self, before_ns: i64) -> Result<usize, String> {
         let mut kept = self.lock();
         let before = kept.notices.len();
-        kept.notices.retain(|n| n.changed_ns >= before_ns);
+        kept.notices.retain(|(_, n)| n.changed_ns >= before_ns);
         Ok(before - kept.notices.len())
     }
 }
@@ -563,8 +609,14 @@ fn insert_note(
     Ok(())
 }
 
+/// Each takes its person's next number as it is inserted (migration 15's
+/// trigger), holding that person's head row until the transaction ends: in
+/// the people's order, so two transactions telling the same people take
+/// their heads in one order and never deadlock on them: the second waits.
 fn insert_notices(tx: &mut postgres::Transaction<'_>, notices: &[Notice]) -> Result<(), String> {
-    for notice in notices {
+    let mut in_order: Vec<&Notice> = notices.iter().collect();
+    in_order.sort_by(|a, b| a.subject.cmp(&b.subject));
+    for notice in in_order {
         let a = &notice.author;
         tx.execute(
             "INSERT INTO dashboard_notice (notice_id, subject, ticket_id, kind,
@@ -903,18 +955,27 @@ impl TicketStore for InPostgres {
         Ok(true)
     }
 
-    fn notices(&self, subject: &str, after: &str, limit: usize) -> Result<Vec<Notice>, String> {
+    fn notices(
+        &self,
+        subject: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Notice)>, String> {
         let mut conn = self.database.conn()?;
         let rows = conn
             .query(
                 &format!(
-                    "SELECT {NOTICE_COLUMNS} FROM dashboard_notice
-                      WHERE subject = $1 AND ticket_id IS NOT NULL AND notice_id > $2 ORDER BY notice_id LIMIT $3"
+                    "SELECT {NOTICE_COLUMNS}, inbox_seq FROM dashboard_notice
+                      WHERE subject = $1 AND ticket_id IS NOT NULL AND inbox_seq > $2
+                      ORDER BY inbox_seq LIMIT $3"
                 ),
                 &[&subject, &after, &(limit as i64)],
             )
             .map_err(said)?;
-        Ok(rows.iter().map(notice_of).collect())
+        Ok(rows
+            .iter()
+            .map(|row| (row.get(12), notice_of(row)))
+            .collect())
     }
 
     fn latest_notices(&self, subject: &str, limit: usize) -> Result<Vec<Notice>, String> {
@@ -931,11 +992,11 @@ impl TicketStore for InPostgres {
         Ok(rows.iter().map(notice_of).collect())
     }
 
-    fn cursor(&self, subject: &str, reader: &str) -> Result<String, String> {
+    fn cursor(&self, subject: &str, reader: &str) -> Result<i64, String> {
         let mut conn = self.database.conn()?;
         Ok(conn
             .query_opt(
-                "SELECT notice_id FROM dashboard_inbox_cursor WHERE subject = $1 AND reader = $2",
+                "SELECT seq FROM dashboard_inbox_cursor WHERE subject = $1 AND reader = $2",
                 &[&subject, &reader],
             )
             .map_err(said)?
@@ -943,13 +1004,17 @@ impl TicketStore for InPostgres {
             .unwrap_or_default())
     }
 
-    fn advance(&self, subject: &str, reader: &str, to: &str) -> Result<(), String> {
+    fn advance(&self, subject: &str, reader: &str, to: i64, notice_id: &str) -> Result<(), String> {
         let mut conn = self.database.conn()?;
+        // The notice's ID kept beside its number, as the release before
+        // this one reads a place.
         conn.execute(
-            "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id) VALUES ($1, $2, $3)
-             ON CONFLICT (subject, reader) DO UPDATE SET notice_id = excluded.notice_id
-              WHERE dashboard_inbox_cursor.notice_id < excluded.notice_id",
-            &[&subject, &reader, &to],
+            "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id, seq)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (subject, reader) DO UPDATE
+                SET seq = excluded.seq, notice_id = excluded.notice_id
+              WHERE dashboard_inbox_cursor.seq < excluded.seq",
+            &[&subject, &reader, &notice_id, &to],
         )
         .map_err(said)?;
         Ok(())

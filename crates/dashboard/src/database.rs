@@ -140,6 +140,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0014_in_flight.sql"),
         then: None,
     },
+    Migration {
+        version: 15,
+        name: "the_inbox_in_commit_order",
+        sql: include_str!("../migrations/0015_the_inbox_in_commit_order.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and

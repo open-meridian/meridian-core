@@ -725,17 +725,183 @@ fn tickets_are_kept_folded_by_key_noted_and_changed_as_the_memory_store_does_it(
     assert!(store.change("TKT-01", 3, &reopen, &recorded, &[]).is_err());
 
     // The inbox: a place per reader, marking read, the sweep.
-    assert_eq!(store.notices("local|ada", "", 10).unwrap().len(), 1);
-    store.advance("local|ada", "DLG-1", "N-01").unwrap();
-    assert_eq!(store.cursor("local|ada", "DLG-1").unwrap(), "N-01");
-    assert!(store.notices("local|ada", "N-01", 10).unwrap().is_empty());
-    assert_eq!(store.cursor("local|ada", "").unwrap(), "");
+    let numbered = store.notices("local|ada", 0, 10).unwrap();
+    assert_eq!(numbered.len(), 1);
+    assert_eq!(
+        (numbered[0].0, numbered[0].1.notice_id.as_str()),
+        (1, "N-01")
+    );
+    store.advance("local|ada", "DLG-1", 1, "N-01").unwrap();
+    assert_eq!(store.cursor("local|ada", "DLG-1").unwrap(), 1);
+    assert!(store.notices("local|ada", 1, 10).unwrap().is_empty());
+    assert_eq!(store.cursor("local|ada", "").unwrap(), 0);
     assert_eq!(store.mark_read("local|ada", &["TKT-01".into()]).unwrap(), 1);
     assert!(store.unread("local|ada").unwrap().is_empty());
     assert_eq!(store.filed_by("ops-1", "", 10).unwrap().len(), 2);
     assert_eq!(store.sweep(T0 + 1).unwrap(), 1);
     assert_eq!(count(&url, "dashboard_notice"), 0);
     assert_eq!(count(&url, "dashboard_ticket"), 2);
+}
+
+/// A notice minted before another but committed after it is still read,
+/// once, by a reader that read between the two commits (review-E F2; W6.24
+/// "each client a person connects sees every new notice once"): the inbox
+/// is read in the order its notices were committed, never by their IDs.
+#[test]
+fn a_notice_committed_after_a_later_minted_one_is_still_read() {
+    use std::time::{Duration, Instant};
+    use tickets::TicketStore as _;
+    let (url, database) = migrated("inbox_order");
+    let store = std::sync::Arc::new(tickets::InPostgres::on(database));
+    store.insert(&ticket("TKT-01", "late-1", T0), &[]).unwrap();
+    store.insert(&ticket("TKT-02", "late-2", T0), &[]).unwrap();
+    // N1, minted first, on one ticket, its transaction held open.
+    let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut slow = held.transaction().unwrap();
+    slow.execute(
+        "INSERT INTO dashboard_notice (notice_id, subject, ticket_id, kind,
+             author_provenance, changed_ns, read)
+         VALUES ('01N1', 'local|ada', 'TKT-01', 'noted', 'rules', $1, false)",
+        &[&T0],
+    )
+    .unwrap();
+    // N2, minted after it, on another ticket, kept by another copy: at
+    // once, or as soon as N1's transaction lets it.
+    let writer = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || {
+            let note = tickets::Note {
+                kind: 2,
+                author: tickets::Author::rules(),
+                noted_ns: T0 + 1,
+                note: "Seen again.".into(),
+                ..Default::default()
+            };
+            store.add_note(
+                "TKT-02",
+                &note,
+                &[notice("01N2", "local|ada", "TKT-02", T0 + 1)],
+            )
+        })
+    };
+    let waited = Instant::now() + Duration::from_secs(2);
+    while !writer.is_finished() && Instant::now() < waited {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let read = |into: &mut Vec<String>| {
+        into.extend(
+            tickets::store::read_new(&*store, "local|ada", "DLG-1", 50)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.notice_id),
+        )
+    };
+    let mut seen = Vec::new();
+    read(&mut seen);
+    slow.commit().unwrap();
+    writer.join().unwrap().unwrap();
+    read(&mut seen);
+    read(&mut seen);
+    seen.sort();
+    assert_eq!(seen, ["01N1", "01N2"], "each notice read once");
+}
+
+/// Migration 15 over notices and places kept before it: each person's
+/// ticket notices numbered in their IDs' order, the order they were read
+/// in, and each place set at the number of the last notice at or before
+/// the ID it held, so nothing unread is skipped and nothing read is read
+/// again; a notice kept after it takes the next number.
+#[test]
+fn the_inbox_numbered_by_the_upgrade_reads_on_from_each_place() {
+    use tickets::TicketStore as _;
+    let url = scratch("inbox_upgrade");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.batch_execute(
+        "CREATE TABLE dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations() {
+        if version > 14 {
+            continue;
+        }
+        raw.batch_execute(sql).unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_schema_migration VALUES ($1, $2, 0)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    let database = Database::connect(&url, 2).expect("connects");
+    let store = tickets::InPostgres::on(database.clone());
+    store.insert(&ticket("TKT-01", "up-1", T0), &[]).unwrap();
+    for (id, subject) in [
+        ("01C", "local|ada"),
+        ("01A", "local|ada"),
+        ("01B", "local|ada"),
+        ("01A", "local|ben"),
+    ] {
+        raw.execute(
+            "INSERT INTO dashboard_notice (notice_id, subject, ticket_id, kind,
+                 author_provenance, changed_ns, read)
+             VALUES ($1 || $2, $2, 'TKT-01', 'noted', 'rules', $3, false)",
+            &[&id, &subject, &T0],
+        )
+        .unwrap();
+    }
+    raw.execute(
+        "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id)
+         VALUES ('local|ada', 'DLG-1', '01Blocal|ada')",
+        &[],
+    )
+    .unwrap();
+    database.migrate(&meridian_clock::SystemClock).unwrap();
+    database.migrate(&meridian_clock::SystemClock).unwrap();
+    database.verify().unwrap();
+    let numbers: Vec<(String, i64)> = raw
+        .query(
+            "SELECT notice_id, inbox_seq FROM dashboard_notice ORDER BY subject, inbox_seq",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        numbers,
+        [
+            ("01Alocal|ada".to_string(), 1),
+            ("01Blocal|ada".to_string(), 2),
+            ("01Clocal|ada".to_string(), 3),
+            ("01Alocal|ben".to_string(), 1),
+        ]
+    );
+    assert_eq!(store.cursor("local|ada", "DLG-1").unwrap(), 2);
+    let read = |reader: &str| -> Vec<String> {
+        tickets::store::read_new(&store, "local|ada", reader, 50)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.notice_id)
+            .collect()
+    };
+    assert_eq!(read("DLG-1"), ["01Clocal|ada"]);
+    assert_eq!(read(""), ["01Alocal|ada", "01Blocal|ada", "01Clocal|ada"]);
+    let note = tickets::Note {
+        kind: 2,
+        author: tickets::Author::rules(),
+        noted_ns: T0 + 1,
+        note: "Seen again.".into(),
+        ..Default::default()
+    };
+    store
+        .add_note(
+            "TKT-01",
+            &note,
+            &[notice("00Z", "local|ada", "TKT-01", T0 + 1)],
+        )
+        .unwrap();
+    assert_eq!(read("DLG-1"), ["00Z"], "a lower ID kept later is read");
+    assert!(read("DLG-1").is_empty());
 }
 
 #[test]
