@@ -559,7 +559,10 @@ fn grants(pattern: &str, subject: &str) -> bool {
 
 #[test]
 fn the_grammar_the_jetstream_tests_read_grants_with() {
-    assert!(grants("$JS.API.>", "$JS.API.STREAM.DELETE.LAKE_WRITE_AHEAD"));
+    assert!(grants(
+        "$JS.API.>",
+        "$JS.API.STREAM.DELETE.LAKE_WRITE_AHEAD"
+    ));
     assert!(grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.PURGE.S"));
     assert!(!grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.MSG.DELETE.S"));
     assert!(!grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.INFO.T"));

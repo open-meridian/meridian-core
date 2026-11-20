@@ -601,12 +601,18 @@ async fn the_analytics_credential_reaches_its_own_stream_and_not_the_lakes() {
     let mut withheld = Vec::new();
     for subject in the_lakes {
         let sent = mark("analytics-the-lakes-stream");
-        analytics.publish(subject, sent.clone().into()).await.unwrap();
+        analytics
+            .publish(subject, sent.clone().into())
+            .await
+            .unwrap();
         withheld.push(sent);
     }
     let asked_by_another = mark("the-lakes-own-call");
     listening
-        .publish("$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD", asked_by_another.clone().into())
+        .publish(
+            "$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD",
+            asked_by_another.clone().into(),
+        )
         .await
         .unwrap();
     analytics.flush().await.unwrap();
