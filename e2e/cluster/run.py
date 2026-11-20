@@ -188,7 +188,7 @@ def free_registry_port():
         ["kubectl", "get", "pods", "--all-namespaces", "-o",
          "jsonpath={.items[*].spec.containers[*].ports[*].hostPort}"],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     if held.returncode != 0:
         raise SystemExit(f"the cluster's host ports could not be read\n{held.stderr}")
     taken = {int(port) for port in held.stdout.split()}
@@ -279,7 +279,7 @@ class Scorecard:
 
 def run(*command, **kwargs):
     """A command that must work, with its output returned."""
-    done = subprocess.run(command, capture_output=True, text=True, **kwargs)
+    done = subprocess.run(command, capture_output=True, text=True, errors="replace", **kwargs)
     if done.returncode != 0:
         raise SystemExit(
             f"{' '.join(command)} failed ({done.returncode})\n{done.stdout}\n{done.stderr}"
@@ -308,7 +308,7 @@ def psql(sql, database="meridian"):
         [*where, "psql", "-U", "postgres", "-d", database, "-Atc", sql],
         capture_output=True,
         text=True,
-    )
+    errors="replace", )
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
@@ -548,7 +548,7 @@ def by_cli(s, deployment_id, enrolment_code):
         "--plain-http",
     ]
     done = subprocess.run(
-        command, capture_output=True, text=True, env={**os.environ, **environment}
+        command, capture_output=True, text=True, errors="replace", env={**os.environ, **environment}
     )
     os.unlink(params.name)
     os.unlink(registry.name)
@@ -570,7 +570,7 @@ def apply(manifest):
     done = subprocess.run(
         ["kubectl", "--namespace", NAMESPACE, "apply", "-f", "-"],
         input=manifest, capture_output=True, text=True,
-    )
+    errors="replace", )
     if done.returncode != 0:
         raise SystemExit(f"kubectl apply failed\n{done.stdout}\n{done.stderr}")
 
@@ -1349,7 +1349,7 @@ def edge_storage(s):
         done = subprocess.run(
             ["kubectl", "--namespace", NAMESPACE, "create", "--dry-run=server", "-f", "-"],
             input=manifest, capture_output=True, text=True,
-        )
+        errors="replace", )
         return done.returncode == 0, (done.stdout + done.stderr).strip()
 
     claim = lambda name: {"persistentVolumeClaim": {"claimName": name}}
@@ -1425,7 +1425,7 @@ def footprint(s):
                     "--peak-to", os.environ.get("E2E_FOOTPRINT_PEAK", ".e2e-footprint-peak.txt")]
     if disk is not None:
         command += ["--disk-mib", f"{disk:.1f}"]
-    done = subprocess.run(command, capture_output=True, text=True)
+    done = subprocess.run(command, capture_output=True, text=True, errors="replace")
     s.note((done.stdout + done.stderr).strip())
     s.check(done.returncode == 0, "the default profile's footprint is within v29's baseline (ruling 1058)")
 
@@ -1464,7 +1464,7 @@ def upgraded(s):
          "--reset-then-reuse-values", "--wait", "--timeout", "10m", *conflicts,
          "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     for line in (done.stdout + done.stderr).splitlines():
         print(f"    | {line}", flush=True)
     s.check(

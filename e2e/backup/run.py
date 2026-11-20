@@ -151,7 +151,7 @@ def cli(workdir, *args):
          "-v", f"{CHART}:/chart:ro",
          CLI_IMAGE, *args],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     for line in (done.stdout + done.stderr).splitlines():
         print(f"    | {line}", flush=True)
     return done

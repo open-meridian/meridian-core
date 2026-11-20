@@ -87,7 +87,7 @@ def log(text):
 
 def compose(*args, check=True, env=None):
     done = subprocess.run(COMPOSE + list(args), env=env or ENV, capture_output=True, text=True,
-                          timeout=900)
+                          errors="replace", timeout=900)
     log(f"$ compose {' '.join(args)[:300]}\n{done.stdout}{done.stderr}")
     if check and done.returncode != 0:
         raise Failed(f"compose {' '.join(args)[:200]}: {(done.stdout + done.stderr).strip()[-600:]}")
@@ -139,7 +139,7 @@ def platform(path, body=None):
               + ";print(urllib.request.urlopen(r).read().decode())")
     done = subprocess.run(COMPOSE + ["exec", "-T", "platform", "python", "-c", script], env=ENV,
                           input=json.dumps(body) if body is not None else None,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, errors="replace", timeout=60)
     log(f"$ platform {path}\n{done.stdout}{done.stderr}")
     if done.returncode != 0:
         raise Failed(f"the platform stand-in {path}: {done.stderr[-400:]}")
