@@ -313,6 +313,71 @@ fn the_runtime_answers_on_the_inboxes_of_the_data_plugins_alone() {
         .any(|g| g.as_str() == "_INBOX.truefx.>"));
 }
 
+/// The conductor's access changes (decision 47; the access audit's
+/// mismatch 7): user groups, account groups, access groups, permissions,
+/// and which connectivity plugins reach an `ems` and its accounts.
+const ACCESS_CHANGES: [&str; 7] = [
+    "platform.config.command.define-user-group",
+    "platform.config.command.define-account-group",
+    "platform.config.command.define-access-group",
+    "platform.config.command.grant-permission",
+    "platform.config.command.withdraw-permission",
+    "platform.config.command.link-connectivity",
+    "platform.config.command.set-linkable-accounts",
+];
+
+/// v31a, item 14 (decision 47), the triage: the conductor checks an access
+/// change's shape, not its actor's admin right, so the question is whether
+/// any credential but the dashboard's may publish one. None may: not a
+/// plugin of any role, nor one holding every role, nor a component.
+#[test]
+fn only_the_dashboards_credential_may_publish_an_access_change() {
+    let roles: Vec<&str> = include_str!("../../../../deploy/roles.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            (fields.next() == Some("role")).then_some(name)
+        })
+        .collect();
+    assert!(roles.len() > 10, "{roles:?}");
+    let mut instances: Vec<Instance> = roles
+        .iter()
+        .map(|role| Instance::plugin(format!("{role}-1"), &[role]))
+        .collect();
+    instances.push(Instance::plugin("every-role-1", &roles));
+    instances.push(Instance::component("dashboard-1", "dashboard"));
+    instances.push(Instance::component("launcher-1", "launcher"));
+    let users = users(Contract::embedded(), &instances).expect("generates");
+    let mut credentials: Vec<String> = users.iter().map(|user| user.user.clone()).collect();
+    credentials.sort_unstable();
+    let mut every: Vec<String> = roles.iter().map(|role| format!("{role}-1")).collect();
+    every.extend(
+        [
+            "first-run",
+            "instrument",
+            "analytics",
+            "runtime",
+            "every-role-1",
+            "dashboard-1",
+            "launcher-1",
+        ]
+        .map(String::from),
+    );
+    every.sort_unstable();
+    assert_eq!(credentials, every, "every credential is here");
+    for topic in ACCESS_CHANGES {
+        let may: Vec<&str> = users
+            .iter()
+            .filter(|user| user.publish.iter().any(|grant| grants(grant, topic)))
+            .map(|user| user.user.as_str())
+            .collect();
+        assert_eq!(may, vec!["dashboard-1"], "who may publish {topic}");
+    }
+}
+
 #[test]
 fn a_password_is_named_and_never_written() {
     let rendered = rendered(

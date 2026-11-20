@@ -911,6 +911,57 @@ async fn a_handler_knows_the_credential_that_asked_by_its_inbox() {
     assert_eq!(String::from_utf8_lossy(&payload), "custody-test-1");
 }
 
+/// v31a, item 14 (decision 47), the triage on a real broker: an access
+/// change sent by every credential this broker admits but the dashboard's is
+/// refused; the dashboard's is carried.
+#[tokio::test]
+async fn only_the_dashboard_may_publish_an_access_change() {
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let topic = "platform.config.command.define-user-group";
+    let mut heard_on = listening.subscribe(topic).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+
+    let mut withheld = Vec::new();
+    for credential in [
+        "MERIDIAN_TEST_BROKER_URL_CUSTODY",
+        "MERIDIAN_TEST_BROKER_URL_REFERENCE",
+        "MERIDIAN_TEST_BROKER_URL_RUNTIME",
+        "MERIDIAN_TEST_BROKER_URL_INSTRUMENT",
+        "MERIDIAN_TEST_BROKER_URL_ANALYTICS",
+    ] {
+        let client = raw(credential).await;
+        let sent = mark(&format!("access-change-by-{credential}"));
+        client.publish(topic, sent.clone().into()).await.unwrap();
+        client.flush().await.unwrap();
+        withheld.push((credential, sent));
+    }
+    let dashboard = raw("MERIDIAN_TEST_BROKER_URL_DASHBOARD").await;
+    let carried = mark("access-change-by-the-dashboard");
+    dashboard
+        .publish(topic, carried.clone().into())
+        .await
+        .unwrap();
+    dashboard.flush().await.unwrap();
+
+    use futures_util::StreamExt;
+    let mut heard = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, heard_on.next()).await {
+        heard.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    assert!(
+        heard.contains(&carried),
+        "the dashboard's access change was not carried"
+    );
+    for (credential, sent) in withheld {
+        assert!(
+            !heard.contains(&sent),
+            "{credential} published an access change"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_instrument_store_asks_for_the_plugin_catalogue_with_its_own_credential() {
     // Contract v20 (the product owner, 2026-10-11): the instrument store reads

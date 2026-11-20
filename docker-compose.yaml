@@ -607,6 +607,9 @@ services:
       # The reference plugin's, holding no role: its sidecar's own traffic
       # and nothing else.
       MERIDIAN_TEST_BROKER_URL_REFERENCE: nats://reference-1:reference-1-dev-only@nats:4222
+      # The dashboard's own, the one credential that may publish an access
+      # change (v31a, item 14).
+      MERIDIAN_TEST_BROKER_URL_DASHBOARD: nats://dashboard-1:dashboard-1-dev-only@nats:4222
       MERIDIAN_TEST_PLATFORM_ADDRESS: ${MERIDIAN_PLATFORM_ADDRESS:-http://site:8000}
       MERIDIAN_TEST_DEPLOYMENT_ID: ${MERIDIAN_DEPLOYMENT_ID:-}
       # Read-only, and the same key the runtime generated. The end-to-end test
