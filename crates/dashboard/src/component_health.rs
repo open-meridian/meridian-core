@@ -66,7 +66,7 @@ struct Kept {
 }
 
 /// The conductor's silence: asks unanswered in a row, the first of them,
-/// and whether its notice has opened.
+/// and whether its notice has been kept.
 #[derive(Debug, Default)]
 struct Unheard {
     asks: u32,
@@ -252,8 +252,12 @@ impl Judge {
     }
 
     /// The conductor did not answer at `now_ns`: its silence opens a notice
-    /// to the deployment admins at the [`UNHEARD_ASKS`]th ask in a row, once
-    /// until it answers again (`component-unheard`, approved 2026-11-20).
+    /// to the deployment admins at the [`UNHEARD_ASKS`]th ask in a row
+    /// (`component-unheard`, approved 2026-11-20), offered again at each ask
+    /// until [`Judge::kept`] says it was kept, then not until it answers and
+    /// falls silent again: an opening dropped -- the records stale, or the
+    /// keeping failed -- is not lost, and its keyed ID makes a repeat
+    /// harmless.
     /// Its window is the hour of the ask that opens it, as every other
     /// kind's is the hour it opened in (decision 40), so every copy names one
     /// event, and a silence opening again within that hour files none again.
@@ -266,7 +270,6 @@ impl Judge {
         if unheard.open || unheard.asks < UNHEARD_ASKS {
             return Vec::new();
         }
-        unheard.open = true;
         let kind = "component-unheard".to_string();
         let window_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
         vec![Opened {
@@ -281,6 +284,14 @@ impl Judge {
             kind,
             window_ns,
         }]
+    }
+
+    /// What one judging opened is kept, or there was nobody to tell: the
+    /// conductor's silence, among them, is not offered again while it lasts.
+    pub fn kept(&mut self, opened: &[Opened]) {
+        if opened.iter().any(|one| one.kind == "component-unheard") {
+            self.unheard.open = true;
+        }
     }
 
     /// A member's peak and restarts over its kept 24 hours: what `status`
@@ -405,13 +416,17 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 tracing::warn!(of = one.of, kind = one.kind, "{}", one.about);
             }
             let notices = notices_of(&records, &opened, now);
-            if notices.is_empty() {
-                continue;
+            if !notices.is_empty() {
+                let kept =
+                    tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices))
+                        .await;
+                if !matches!(kept, Ok(Ok(()))) {
+                    tracing::error!("a component's notices were not kept");
+                    continue;
+                }
             }
-            let kept =
-                tokio::task::spawn_blocking(move || crate::latency::notices::keep(&notices)).await;
-            if !matches!(kept, Ok(Ok(()))) {
-                tracing::error!("a component's notices were not kept");
+            if let Ok(mut judge) = judge.lock() {
+                judge.kept(&opened);
             }
         }
     })
@@ -639,6 +654,22 @@ mod tests {
         }
         let filed = store.notices("local|dee", 50).unwrap();
         assert_eq!(filed.len(), 1, "{filed:#?}");
+    }
+
+    /// The silence's opening is offered until it is kept (the delta review
+    /// of 77afd5d0, finding 3): one dropped -- the records stale, or the
+    /// keeping failed -- is offered again at the next ask; its keyed ID
+    /// makes a repeat harmless. Once kept, none again while it is silent.
+    #[test]
+    fn a_silence_whose_notice_was_not_kept_is_offered_again() {
+        let mut judge = Judge::default();
+        for minute in 1..=3 {
+            let _dropped = judge.unanswered(T0 + minute * MINUTE);
+        }
+        let opened = judge.unanswered(T0 + 4 * MINUTE);
+        assert_eq!(kinds(&opened), vec!["component-unheard"]);
+        judge.kept(&opened);
+        assert!(judge.unanswered(T0 + 5 * MINUTE).is_empty());
     }
 
     #[test]
