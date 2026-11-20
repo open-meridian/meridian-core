@@ -7,14 +7,18 @@
 //!
 //! **It changes nothing.** Every database session it opens is read-only
 //! (`default_transaction_read_only`), it holds no Kubernetes right, it calls
-//! nothing on the bus, and what it reads of backups is a directory listing.
+//! nothing on the bus, what it reads of backups is a directory listing, and
+//! of the database's volume, where the chart mounts it, the size and free
+//! space of its filesystem.
 //! Its report holds no deployment data: counts, sizes, versions and the
 //! names of stores and templates, never an account or a person.
 //!
 //! Each check answers **ready**, **warning** or **blocked**, with its reason,
 //! or **not checked** with why; the whole answers the worst of them.
 //!
-//! - **Headroom:** the database's size against its volume, its memory as
+//! - **Headroom:** the database's size against its volume (or, where its
+//!   storage does not hold it to that size, against the free space of the
+//!   filesystem it is on), its memory as
 //!   configured against the container's limit, its connections in use
 //!   against `max_connections`; the largest bus answer core builds from
 //!   stored records -- the dashboard's AccessRecords -- against the broker's
@@ -159,8 +163,58 @@ pub fn quantity(said: &str) -> Option<u64> {
     Some((number * factor) as u64)
 }
 
-/// The database's size against its volume.
-pub fn judge_disk(used: u64, volume: Option<u64>) -> Finding {
+/// The filesystem the database's volume is on, as the check's own pod reads
+/// it where the chart mounts that volume for it: its size, and what of it is
+/// free to the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Filesystem {
+    pub total: u64,
+    pub free: u64,
+}
+
+/// How far past its volume's declared size a filesystem may be and still be
+/// the volume's own: a filesystem made for a volume is its size or a little
+/// under, never well over.
+const OWN_FILESYSTEM_AT_MOST: f64 = 1.05;
+
+impl Filesystem {
+    /// Read where `path` is mounted; none where it cannot be read.
+    pub fn at(path: &str) -> Option<Filesystem> {
+        let path = std::ffi::CString::new(path).ok()?;
+        let mut read = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is a NUL-terminated string that outlives the call,
+        // and statvfs writes one whole `statvfs` where it answers 0, which
+        // is the only case it is read in.
+        let read = unsafe {
+            if libc::statvfs(path.as_ptr(), read.as_mut_ptr()) != 0 {
+                return None;
+            }
+            read.assume_init()
+        };
+        let block = read.f_frsize as u64;
+        Some(Filesystem {
+            total: (read.f_blocks as u64).saturating_mul(block),
+            // What one who is not root may still write, as Postgres is not.
+            free: (read.f_bavail as u64).saturating_mul(block),
+        })
+    }
+
+    /// Whether the storage holds the database to its volume's declared
+    /// size: the filesystem is the volume's own. A node's directory (a
+    /// `local-path` volume and the like) is on the node's disk, larger than
+    /// the volume and shared, and nothing stops the database growing past
+    /// what was declared.
+    fn holds_to(&self, volume: u64) -> bool {
+        self.total as f64 <= volume as f64 * OWN_FILESYSTEM_AT_MOST
+    }
+}
+
+/// The database's size against its volume: the volume's declared size where
+/// the storage holds the database to it, or where the filesystem was not
+/// read; and where it does not (item 211), against what the database could
+/// reach on the filesystem it is on -- what it holds and what is free there
+/// -- at the same shares.
+pub fn judge_disk(used: u64, volume: Option<u64>, filesystem: Option<Filesystem>) -> Finding {
     let Some(volume) = volume else {
         return finding(
             "database_disk",
@@ -171,13 +225,28 @@ pub fn judge_disk(used: u64, volume: Option<u64>) -> Finding {
             ),
         );
     };
-    let s = share(used, volume);
-    let why = format!(
-        "the database holds {} of its {} volume ({})",
-        bytes_said(used),
-        bytes_said(volume),
-        percent(used, volume)
-    );
+    let unheld = filesystem.filter(|filesystem| !filesystem.holds_to(volume));
+    let limit = match unheld {
+        Some(filesystem) => used.saturating_add(filesystem.free),
+        None => volume,
+    };
+    let s = share(used, limit);
+    let why = match unheld {
+        Some(filesystem) => format!(
+            "the database holds {}, and the filesystem it is on has {} free ({} of the two); \
+             its storage does not hold it to its {} volume",
+            bytes_said(used),
+            bytes_said(filesystem.free),
+            percent(used, limit),
+            bytes_said(volume)
+        ),
+        None => format!(
+            "the database holds {} of its {} volume ({})",
+            bytes_said(used),
+            bytes_said(volume),
+            percent(used, volume)
+        ),
+    };
     let verdict = if s >= BLOCK_AT {
         Verdict::Blocked
     } else if s >= WARN_AT {
@@ -185,9 +254,14 @@ pub fn judge_disk(used: u64, volume: Option<u64>) -> Finding {
     } else {
         Verdict::Ready
     };
+    let grow = if unheld.is_some() {
+        "free space on that filesystem"
+    } else {
+        "grow the volume"
+    };
     let why = match verdict {
-        Verdict::Blocked => format!("{why}: a migration may not fit; grow the volume first"),
-        Verdict::Warning => format!("{why}: grow the volume soon"),
+        Verdict::Blocked => format!("{why}: a migration may not fit; {grow} first"),
+        Verdict::Warning => format!("{why}: {grow} soon"),
         _ => why,
     };
     finding("database_disk", verdict, why)
@@ -536,6 +610,9 @@ pub struct Inputs {
     /// Each store and its database URL; a store with none is skipped.
     pub stores: Vec<(&'static str, String)>,
     pub volume: Option<u64>,
+    /// The filesystem the database's volume is on, where the chart mounted
+    /// that volume for the check (item 211).
+    pub filesystem: Option<Filesystem>,
     pub memory_limit: Option<u64>,
     /// The brought database's max_connections once the upgrade is applied,
     /// counted by the chart from what it deploys: the memory is judged by
@@ -570,6 +647,8 @@ impl Inputs {
         Inputs {
             stores,
             volume: var("MERIDIAN_PREFLIGHT_DATABASE_VOLUME").and_then(|q| quantity(&q)),
+            filesystem: var("MERIDIAN_PREFLIGHT_DATABASE_FILESYSTEM")
+                .and_then(|path| Filesystem::at(&path)),
             memory_limit: var("MERIDIAN_PREFLIGHT_DATABASE_MEMORY").and_then(|q| quantity(&q)),
             max_connections: var("MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS")
                 .and_then(|n| n.parse().ok()),
@@ -816,6 +895,7 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
                 Ok(row) => findings.push(judge_disk(
                     row.get::<_, i64>(0).max(0) as u64,
                     inputs.volume,
+                    inputs.filesystem,
                 )),
                 Err(failed) => findings.push(finding(
                     "database_disk",

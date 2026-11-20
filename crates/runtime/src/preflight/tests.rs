@@ -18,12 +18,12 @@ fn quantities_read_as_the_chart_and_the_broker_write_them() {
 
 #[test]
 fn disk_warns_at_three_quarters_and_blocks_at_nine_tenths() {
-    assert_eq!(judge_disk(GIB, Some(8 * GIB)).verdict, Verdict::Ready);
+    assert_eq!(judge_disk(GIB, Some(8 * GIB), None).verdict, Verdict::Ready);
     assert_eq!(
-        judge_disk(6 * GIB + MIB, Some(8 * GIB)).verdict,
+        judge_disk(6 * GIB + MIB, Some(8 * GIB), None).verdict,
         Verdict::Warning
     );
-    let blocked = judge_disk(7 * GIB + 600 * MIB, Some(8 * GIB));
+    let blocked = judge_disk(7 * GIB + 600 * MIB, Some(8 * GIB), None);
     assert_eq!(blocked.verdict, Verdict::Blocked);
     assert!(
         blocked.why.contains("grow the volume first"),
@@ -31,7 +31,77 @@ fn disk_warns_at_three_quarters_and_blocks_at_nine_tenths() {
         blocked.why
     );
     // A database the chart does not bring: its operator's to watch.
-    assert_eq!(judge_disk(GIB, None).verdict, Verdict::NotChecked);
+    assert_eq!(judge_disk(GIB, None, None).verdict, Verdict::NotChecked);
+}
+
+/// Item 211: the dev deployment's database held 23.1 GiB on a `local-path`
+/// volume declared 20 GiB, with 30 GiB free on the node's disk it is a
+/// directory of, and its upgrade was blocked at 116% of a size nothing
+/// enforces.
+#[test]
+fn disk_is_judged_by_the_free_space_where_storage_does_not_hold_it_to_its_volume() {
+    let declared = 20 * GIB;
+    let node = |free: u64| {
+        Some(Filesystem {
+            total: 100 * GIB,
+            free,
+        })
+    };
+    let held = 23 * GIB + 100 * MIB;
+    let ready = judge_disk(held, Some(declared), node(30 * GIB));
+    assert_eq!(ready.verdict, Verdict::Ready, "{}", ready.why);
+    assert!(
+        ready.why.contains("30.0 GiB free")
+            && ready
+                .why
+                .contains("does not hold it to its 20.0 GiB volume"),
+        "{}",
+        ready.why
+    );
+    // The same shares, of what it holds and what is free: a migration that
+    // will not fit still blocks.
+    let warned = judge_disk(held, Some(declared), node(6 * GIB));
+    assert_eq!(warned.verdict, Verdict::Warning, "{}", warned.why);
+    let blocked = judge_disk(held, Some(declared), node(2 * GIB));
+    assert_eq!(blocked.verdict, Verdict::Blocked, "{}", blocked.why);
+    assert!(
+        blocked.why.contains("free space on that filesystem first"),
+        "{}",
+        blocked.why
+    );
+    // And a small database on a full node is blocked, whatever was declared.
+    assert_eq!(
+        judge_disk(GIB, Some(declared), node(50 * MIB)).verdict,
+        Verdict::Blocked
+    );
+
+    // A filesystem that is the volume's own -- its size, or a little under
+    // or over -- holds the database to it: judged as it always was.
+    let own = Some(Filesystem {
+        total: declared - 300 * MIB,
+        free: 600 * MIB,
+    });
+    let enforced = judge_disk(19 * GIB, Some(declared), own);
+    assert_eq!(enforced.verdict, Verdict::Blocked);
+    assert_eq!(
+        enforced.why,
+        judge_disk(19 * GIB, Some(declared), None).why,
+        "today's check, word for word"
+    );
+    assert_eq!(judge_disk(GIB, Some(declared), own).verdict, Verdict::Ready);
+    // No volume of the chart's: its operator's to watch, read or not.
+    assert_eq!(
+        judge_disk(GIB, None, node(GIB)).verdict,
+        Verdict::NotChecked
+    );
+}
+
+/// The filesystem is read where a path is mounted, and not where none is.
+#[test]
+fn a_filesystem_is_read_where_it_is_mounted() {
+    let here = Filesystem::at("/").expect("the root filesystem reads");
+    assert!(here.total > 0 && here.free <= here.total);
+    assert_eq!(Filesystem::at("/no/such/mount"), None);
 }
 
 #[test]

@@ -34,8 +34,10 @@
   (`default_transaction_read_only`), on the serving credential, never the
   migrating one; what it reads of backups is a directory listing of the
   chart's own backup volume, mounted read-only, where the chart brings that
-  volume. Its report names stores, sizes and counts, never an account or a
-  person.
+  volume; and of the database's own volume, where that is a node's
+  directory, only the size and free space of the filesystem it is on, the
+  volume mounted read-only and no file of it opened. Its report names
+  stores, sizes and counts, never an account or a person.
 */}}
 {{- $b := .Values.backup | default dict }}
 {{- /* Backups as they are now, as internal TLS below: where a cluster
@@ -49,6 +51,37 @@
 {{- $claimNow = lookup "v1" "PersistentVolumeClaim" .Release.Namespace ($b.existingClaim | default (printf "%s-backup" (include "meridian-runtime.fullname" .))) }}
 {{- end }}
 {{- $backups := and $b.recipient (or $b.path $b.existingClaim) $claimNow }}
+{{- /* The database's own volume, mounted read-only so the check reads the
+       free space of the filesystem it is on (item 211): a `local-path`
+       volume and the like is a directory of its node's disk, held to no
+       size, so its declared size says nothing about what a migration has
+       room for (the dev deployment's database, 23.1 GiB on a 20Gi volume
+       with 30 GiB free, was blocked at 116%). Only where all of this is so,
+       and otherwise the check judges the declared size as it always has:
+       - a cluster answers and the claim is there (as backups, above);
+       - the claim's provisioner makes a node's directory. Such a volume
+         holds whoever mounts it to its node, so this pod is placed beside
+         the database with nothing said here; a volume of any other kind is
+         never mounted, so the hook never waits on one that only one node or
+         one pod may hold, and a provisioner not named is judged as before;
+       - the database is one member, running: under Patroni member 0 may be
+         a standby, and on a node that is down this pod would wait for it;
+       - it is the only database brought: the check has one volume's size
+         and judges every database it reaches by it.
+       The check itself tells a filesystem that is the volume's own from a
+       node's disk, by its size; the list only says where mounting is safe. */}}
+{{- $nodeDirectories := list "rancher.io/local-path" "docker.io/hostpath" "k8s.io/minikube-hostpath" "microk8s.io/hostpath" "openebs.io/local" }}
+{{- $data := "" }}
+{{- if and .Values.database.brought.enabled (not (include "meridian-runtime.extraDatabases" . | fromJsonArray)) }}
+{{- $database := printf "%s-database" (include "meridian-runtime.fullname" .) }}
+{{- $claim := default (dict) (lookup "v1" "PersistentVolumeClaim" .Release.Namespace (printf "data-%s-0" $database)) }}
+{{- $annotations := dig "metadata" "annotations" (dict) $claim }}
+{{- $provisioner := index $annotations "volume.kubernetes.io/storage-provisioner" | default (index $annotations "volume.beta.kubernetes.io/storage-provisioner") | default "" }}
+{{- $members := dig "spec" "replicas" 0 (default (dict) (lookup "apps/v1" "StatefulSet" .Release.Namespace $database)) | int }}
+{{- if and (has $provisioner $nodeDirectories) (eq $members 1) }}
+{{- $data = printf "data-%s-0" $database }}
+{{- end }}
+{{- end }}
 {{- /* Internal TLS as the database serves it now, not as this upgrade
        will make it (see above). */}}
 {{- $tls := dict "top" . "on" (include "meridian-runtime.databaseServesTls" . | eq "true") }}
@@ -139,6 +172,11 @@ spec:
             # limit, which the check measures it against.
             - name: MERIDIAN_PREFLIGHT_DATABASE_VOLUME
               value: {{ .Values.database.brought.size | quote }}
+            {{- if $data }}
+            # Where its volume is mounted, to read the filesystem it is on.
+            - name: MERIDIAN_PREFLIGHT_DATABASE_FILESYSTEM
+              value: /database-volume
+            {{- end }}
             # And the connections it will allow once this upgrade is
             # applied, which the memory is judged by.
             - name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS
@@ -160,8 +198,13 @@ spec:
               value: {{ .Values.logLevel | quote }}
             {{- with (include "meridian-runtime.internalTlsClientEnv" $tls) }}{{ . | nindent 12 }}{{- end }}
             {{- with (include "meridian-runtime.databaseCaEnv" $) }}{{ . | nindent 12 }}{{- end }}
-          {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret }}
+          {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret $data }}
           volumeMounts:
+            {{- if $data }}
+            - name: database-volume
+              mountPath: /database-volume
+              readOnly: true
+            {{- end }}
             {{- if and $backups $b.path }}
             - name: backups
               mountPath: /backups
@@ -172,8 +215,14 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret }}
+      {{- if or (and $backups $b.path) $tls.on .Values.database.caSecret $data }}
       volumes:
+        {{- if $data }}
+        - name: database-volume
+          persistentVolumeClaim:
+            claimName: {{ $data }}
+            readOnly: true
+        {{- end }}
         {{- if and $backups $b.path }}
         {{/* Only the chart's own backup volume, a node directory every pod
              may share; a claim of the administrator's own may be one that
