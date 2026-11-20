@@ -146,8 +146,8 @@ fn component_topics(components: &[&str]) -> Vec<&'static str> {
 /// From contract v30's stage E, in `ha`, the lake's write-ahead stream
 /// (the resilience spec's section 4), to the lake's credential, so its writer
 /// makes the stream and reads it (`meridian_lake::write_ahead`): never its
-/// deletion or purge, which a lake never asks for. A data plugin's credential publishes to the
-/// stream's subjects of its own instance alone
+/// deletion or purge, which a lake never asks for. A data plugin's
+/// credential publishes to the stream's subjects of its own instance alone
 /// ([`write_ahead::instance_subjects`]), in [`permissions_entitled`].
 fn jetstream_grants(components: &[&str]) -> Vec<String> {
     let mut granted = Vec::new();
