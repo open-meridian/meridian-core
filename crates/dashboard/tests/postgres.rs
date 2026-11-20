@@ -1192,3 +1192,61 @@ fn one_readers_reads_at_once_return_each_notice_once() {
         assert_eq!(read, [id], "round {round}");
     }
 }
+
+/// The inbox through a rolling upgrade, the other way (the review of
+/// v31a-core-1, review 2, finding 3): this release reads by number, the
+/// release before by notice ID. Where the numbers' order and the IDs' order
+/// differ, the ID this release keeps beside a place is the highest it read,
+/// never the last by number, so the release before reads nothing again.
+#[test]
+fn a_place_this_release_moved_is_never_read_again_by_the_release_before() {
+    use tickets::TicketStore as _;
+    let (url, database) = migrated("inbox_rolling_back");
+    let store = tickets::InPostgres::on(database);
+    // Minted in one order, committed in the other: 01N9 takes number 1.
+    for (id, at) in [("01N9", T0 + 9), ("01N1", T0 + 1)] {
+        store
+            .insert(
+                &ticket(&format!("TKT-{id}"), id, at),
+                &[notice(id, "local|ada", &format!("TKT-{id}"), at)],
+            )
+            .unwrap();
+    }
+    let read: Vec<String> = tickets::store::read_new(&store, "local|ada", "DLG-1", 50)
+        .unwrap()
+        .into_iter()
+        .map(|n| n.notice_id)
+        .collect();
+    assert_eq!(read, ["01N9", "01N1"]);
+    // The release before's read, as it wrote it: the notices after the
+    // place's notice ID.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let read_before = |raw: &mut postgres::Client, reader: &str| -> Vec<String> {
+        raw.query(
+            "SELECT notice_id FROM dashboard_notice
+              WHERE subject = $1 AND ticket_id IS NOT NULL
+                AND notice_id > (SELECT notice_id FROM dashboard_inbox_cursor
+                                  WHERE subject = $1 AND reader = $2)
+              ORDER BY notice_id",
+            &[&"local|ada", &reader],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+    };
+    assert!(
+        read_before(&mut raw, "DLG-1").is_empty(),
+        "the release before reads again what this release read"
+    );
+    // A move by number to a notice whose ID is lower keeps the higher ID.
+    store
+        .insert(
+            &ticket("TKT-01N5", "01N5", T0 + 5),
+            &[notice("01N5", "local|ada", "TKT-01N5", T0 + 5)],
+        )
+        .unwrap();
+    store.advance("local|ada", "DLG-1", 3, "01N5").unwrap();
+    assert_eq!(store.cursor("local|ada", "DLG-1").unwrap(), 3);
+    assert!(read_before(&mut raw, "DLG-1").is_empty());
+}

@@ -101,7 +101,7 @@ pub trait TicketStore: Send + Sync {
     fn cursor(&self, subject: &str, reader: &str) -> Result<i64, String>;
 
     /// The reader's place moved on to `to`, the number of `notice_id`;
-    /// never back.
+    /// never back, and the notice ID kept beside it never a lower one.
     fn advance(&self, subject: &str, reader: &str, to: i64, notice_id: &str) -> Result<(), String>;
 
     /// What is new for one reader, at most `limit`, oldest first, and its
@@ -1029,12 +1029,15 @@ impl TicketStore for InPostgres {
     fn advance(&self, subject: &str, reader: &str, to: i64, notice_id: &str) -> Result<(), String> {
         let mut conn = self.database.conn()?;
         // The notice's ID kept beside its number, as the release before
-        // this one reads a place.
+        // this one reads a place: never a lower one than it holds, since
+        // the numbers' order is not the IDs' (review 2 of v31a-core-1,
+        // finding 3).
         conn.execute(
             "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id, seq)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (subject, reader) DO UPDATE
-                SET seq = excluded.seq, notice_id = excluded.notice_id
+                SET seq = excluded.seq,
+                    notice_id = greatest(dashboard_inbox_cursor.notice_id, excluded.notice_id)
               WHERE dashboard_inbox_cursor.seq < excluded.seq",
             &[&subject, &reader, &notice_id, &to],
         )
@@ -1073,14 +1076,23 @@ impl TicketStore for InPostgres {
             )
             .map_err(said)?;
         if let Some(last) = rows.last() {
-            // The notice's ID kept beside its number, as the release before
-            // this one reads a place.
+            // The highest notice ID read kept beside the number, as the
+            // release before this one reads a place by ID alone: the last
+            // by number may have a lower ID than one read before it, and
+            // the place's ID never moves back, so the release before reads
+            // nothing this one read again (review 2 of v31a-core-1, finding
+            // 3).
             let to: i64 = last.get(12);
-            let notice_id: String = last.get(0);
+            let highest: String = rows
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .max()
+                .unwrap_or_default();
             tx.execute(
-                "UPDATE dashboard_inbox_cursor SET seq = $3, notice_id = $4
+                "UPDATE dashboard_inbox_cursor
+                    SET seq = $3, notice_id = greatest(notice_id, $4)
                   WHERE subject = $1 AND reader = $2",
-                &[&subject, &reader, &to, &notice_id],
+                &[&subject, &reader, &to, &highest],
             )
             .map_err(said)?;
         }
