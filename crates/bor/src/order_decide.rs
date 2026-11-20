@@ -142,11 +142,11 @@ pub(crate) fn user_required(ctx: &Context, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// An approval or an override is a person's (W11.5).
+/// An approval or an override is a person's (W11.5), and so is
+/// acknowledging an alert (W11.34): never a service account's, its kind
+/// stamped or left unset ([`Context::service_account`]; v31a.16).
 pub(crate) fn person_required(ctx: &Context, what: &str) -> Result<()> {
-    if ctx.acting_for.is_empty()
-        || ctx.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
-    {
+    if ctx.acting_for.is_empty() || ctx.service_account() {
         return Err(StoreError::refused(
             RefusalReason::ActorRequired,
             format!("{what} is a person's act, and no person stands behind this"),

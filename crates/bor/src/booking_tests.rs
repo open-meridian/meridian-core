@@ -2045,3 +2045,96 @@ async fn an_account_moves_by_continuation_and_replays_the_same() {
         .iter()
         .any(|entry| entry.idempotency_key == crate::moves::control_key(&moved)));
 }
+
+/// An approval, an override and acknowledging an alert are a person's
+/// (W11.5, W11.34), and the agents' guard is never an agent's to set
+/// (W11.38). A service account's subject sent with its kind left unset is
+/// no person, and no person's own act, as one sent with its kind is not
+/// (v31a.16: the unset kind fails closed): each refused, nothing recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_account_sent_with_no_kind_is_no_person() {
+    use crate::booking_service::SET_AGENT_ORDERS_DEMO_ONLY;
+    const SA: &str = "SA-01JAD000000000000000000001";
+    let w = wired();
+    waits(&w, ACC, false).await;
+    let order = propose(&w, &buy("10")).await.unwrap();
+    send_from(
+        &w.bus,
+        RAISE_ALERT,
+        "meridian.v1.RaiseAlertRequest",
+        &RaiseAlertRequest {
+            account_id: ACC.into(),
+            kind: AlertKind::Compliance as i32,
+            reason: "a name on the restricted list".into(),
+            subject: None,
+        },
+        &anywhere(PM),
+    )
+    .await
+    .unwrap();
+    let alert = alerts_in(&w, ACC)[0].alert_id.clone();
+    let before = w.store.journal(ACC).unwrap().len();
+    for decision in [ApprovalDecision::Approve, ApprovalDecision::Override] {
+        let refused = order_command(
+            &w,
+            DECIDE_APPROVAL,
+            "meridian.v1.DecideApprovalRequest",
+            &DecideApprovalRequest {
+                order_id: order.order_id.clone(),
+                decision: decision as i32,
+                reason: "within the desk's limit".into(),
+                ..Default::default()
+            },
+            &person(SA),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            Some(RefusalReason::ActorRequired),
+            "{decision:?}: {refused}"
+        );
+    }
+    let refused = send_from(
+        &w.bus,
+        ACKNOWLEDGE_ALERT,
+        "meridian.v1.AcknowledgeAlertRequest",
+        &AcknowledgeAlertRequest {
+            alert_id: alert,
+            reason: "reviewed".into(),
+        },
+        &anywhere(SA),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        code(&refused),
+        Some(RefusalReason::ActorRequired),
+        "{refused}"
+    );
+    assert_eq!(
+        w.store.journal(ACC).unwrap().len(),
+        before,
+        "nothing recorded"
+    );
+    let guard = send_from(
+        &w.bus,
+        SET_AGENT_ORDERS_DEMO_ONLY,
+        "meridian.v1.SetAgentOrdersDemoOnlyRequest",
+        &SetAgentOrdersDemoOnlyRequest {
+            agent_orders_demo_only: true,
+            reason: "an agent's".into(),
+        },
+        &As {
+            person: Some(SA),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&guard).map(|(status, _)| status),
+        Some(meridian_bus::RefusalStatus::PermissionDenied),
+        "{guard}"
+    );
+}
