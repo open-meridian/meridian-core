@@ -48,17 +48,7 @@ fn gap_id_of(about: &str) -> Option<&str> {
 /// so every dashboard copy and every restart files the same notice, which
 /// the store keeps once (ha runs two copies, each its own judge).
 pub fn notice_id(gap: &DatasetGap, subject: &str) -> String {
-    use sha2::Digest;
-    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let digest = sha2::Sha256::digest(format!("{}\0{subject}", gap.gap_id).as_bytes());
-    let mut rest = [0u8; 16];
-    rest.copy_from_slice(&digest[..16]);
-    let ms = (gap.recorded_at_ns.max(0) / 1_000_000) as u128;
-    let value: u128 = (ms << 80) | (u128::from_be_bytes(rest) & ((1u128 << 80) - 1));
-    (0..26)
-        .rev()
-        .map(|i| CROCKFORD[((value >> (i * 5)) & 31) as usize] as char)
-        .collect()
+    crate::latency::notices::keyed_id(gap.recorded_at_ns, &gap.gap_id, subject)
 }
 
 /// A time as a person reads it, to the second, in UTC.

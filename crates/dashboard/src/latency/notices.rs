@@ -277,19 +277,49 @@ pub fn told(records: &AccessRecords, instance: &str, scope: &Scope) -> BTreeSet<
         .collect()
 }
 
-/// The notices one judging makes: one per transition per person told.
-pub fn notices_of(
-    records: &AccessRecords,
-    transitions: &[Transition],
-    mut id: impl FnMut() -> String,
-    now_ns: i64,
-) -> Vec<Notice> {
+/// A notice's ID that names its event and the person told, so every
+/// dashboard copy (ha runs two, each its own judge) and every restart files
+/// the same notice, which the store keeps once (review-F headline 2): a
+/// ULID whose time is the event's window and whose rest is the digest of
+/// the event's key and the person. The gap judge's first
+/// ([`crate::dataset_gaps::notice_id`], its key the gap's ID).
+pub fn keyed_id(window_ns: i64, key: &str, subject: &str) -> String {
+    use sha2::Digest;
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let digest = sha2::Sha256::digest(format!("{key}\0{subject}").as_bytes());
+    let mut rest = [0u8; 16];
+    rest.copy_from_slice(&digest[..16]);
+    let ms = (window_ns.max(0) / 1_000_000) as u128;
+    let value: u128 = (ms << 80) | (u128::from_be_bytes(rest) & ((1u128 << 80) - 1));
+    (0..26)
+        .rev()
+        .map(|i| CROCKFORD[((value >> (i * 5)) & 31) as usize] as char)
+        .collect()
+}
+
+/// A transition's event: its kind, its series and the minute judged, which
+/// every judge of the same series names alike.
+fn event_of(transition: &Transition) -> String {
+    let series = match &transition.key.scope {
+        Scope::Session { session, metric } => format!("session|{session}|{metric}"),
+        Scope::Dataset { dataset, hop } => format!("dataset|{dataset}|{hop}"),
+    };
+    format!(
+        "{}|{}|{series}|{}",
+        transition.kind, transition.key.instance, transition.at_ns
+    )
+}
+
+/// The notices one judging makes: one per transition per person told,
+/// each ID its event's ([`keyed_id`]).
+pub fn notices_of(records: &AccessRecords, transitions: &[Transition], now_ns: i64) -> Vec<Notice> {
     let mut out = Vec::new();
     for transition in transitions {
         let instance = &transition.key.instance;
+        let event = event_of(transition);
         for subject in told(records, instance, &transition.key.scope) {
             out.push(Notice {
-                notice_id: id(),
+                notice_id: keyed_id(transition.at_ns, &event, &subject),
                 subject,
                 plugin_instance_id: instance.clone(),
                 kind: transition.kind.to_string(),
@@ -323,8 +353,7 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 );
                 continue;
             };
-            let tickets = Arc::clone(&app.tickets);
-            let notices = notices_of(&records, &transitions, || tickets.ulid(now), now);
+            let notices = notices_of(&records, &transitions, now);
             if notices.is_empty() {
                 continue;
             }
@@ -521,7 +550,6 @@ mod tests {
     #[test]
     fn each_transition_is_one_notice_per_person_in_the_dashboards_words() {
         let records = records();
-        let mut n = 0;
         let notices = notices_of(
             &records,
             &[
@@ -544,10 +572,6 @@ mod tests {
                     0,
                 ),
             ],
-            || {
-                n += 1;
-                format!("N{n:02}")
-            },
             7,
         );
         assert_eq!(notices.len(), 3);
@@ -566,10 +590,64 @@ mod tests {
         store.notify(&notices).unwrap();
         let ola = store.notices("local|ola", SHOWN).unwrap();
         assert_eq!(ola.len(), 2);
-        assert_eq!(ola[0].notice_id, "N03", "newest first");
+        // Each ID its event's and the person's: filed again, kept once.
+        store.notify(&notices).unwrap();
+        assert_eq!(store.notices("local|ola", SHOWN).unwrap(), ola);
+        assert_eq!(
+            &ola[0].notice_id[..10],
+            &keyed_id(1_792_400_040_000_000_000, "", "")[..10]
+        );
+        assert_ne!(ola[0].notice_id, ola[1].notice_id);
         let drawn = rows(&ola);
         assert!(drawn.contains(">Breached<"), "{drawn}");
         assert!(drawn.contains("<strong>fix-1</strong>"), "{drawn}");
         assert_eq!(json(&ola[0])["kind"], "latency_breached");
+    }
+
+    /// ha runs two dashboards, each its own judge over the same series
+    /// (review-F headline 2): one episode, one notice to each person, in
+    /// the one store both keep their notices in.
+    #[test]
+    fn two_judges_over_one_store_file_one_notice() {
+        use meridian_domain::latency::{Histogram, Monitor, Said};
+        const MINUTE: i64 = 60_000_000_000;
+        let t0 = (1_792_400_000_000_000_000 / MINUTE) * MINUTE;
+        let key = Key {
+            instance: "fix-1".into(),
+            scope: Scope::Session {
+                session: "fix-order".into(),
+                metric: "LATENCY_METRIC_RTT".into(),
+            },
+        };
+        let mut slow = Histogram::default();
+        for _ in 0..50 {
+            slow.record(2_000_000_000);
+        }
+        let said = Said {
+            ceiling_ns: 250_000_000,
+            ..Default::default()
+        };
+        let (a, b) = (Monitor::default(), Monitor::default());
+        for minute in 0..4 {
+            for judge in [&a, &b] {
+                judge.merge(key.clone(), t0 + minute * MINUTE + 1, &slow, said);
+            }
+        }
+        let records = records();
+        let store = InMemory::default();
+        // Each copy judges the same whole minutes, seconds apart.
+        for (judge, at) in [
+            (&a, t0 + 4 * MINUTE + 3_000_000_000),
+            (&b, t0 + 4 * MINUTE + 17_000_000_000),
+        ] {
+            let transitions = judge.judge(at);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            store
+                .notify(&notices_of(&records, &transitions, at))
+                .unwrap();
+        }
+        for person in ["local|ola", "local|eve"] {
+            assert_eq!(store.notices(person, SHOWN).unwrap().len(), 1, "{person}");
+        }
     }
 }
