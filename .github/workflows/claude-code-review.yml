@@ -21,6 +21,13 @@ on:
 
 jobs:
   claude-review:
+    # Skipped, not failed, when the merge queue's bot is the run's actor: a
+    # merge into a stage branch (c30d) moves the head of that branch's open
+    # pull request, the action refuses to run for a bot, and the gate below
+    # then failed a review that was never asked for (run 44556229125's actor
+    # and triggering actor: github-merge-queue[bot]). That pull request's one
+    # review runs when a person marks it ready.
+    if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read

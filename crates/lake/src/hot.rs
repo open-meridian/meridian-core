@@ -794,6 +794,14 @@ impl Store for HotStore {
         done
     }
 
+    fn in_stream(&self, identity: i64) {
+        self.inner.in_stream(identity)
+    }
+
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        self.inner.write_ahead_carried(from, to, made_ns)
+    }
+
     fn write_ahead_position(
         &self,
         stream: &str,

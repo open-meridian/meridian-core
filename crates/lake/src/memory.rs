@@ -458,6 +458,33 @@ impl Store for MemoryStore {
         Ok(self.lock().write_ahead.get(stream).copied())
     }
 
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let mut held = self.lock();
+        if held.write_ahead.contains_key(to) {
+            return Ok(false);
+        }
+        let Some(at) = held.write_ahead.get(from).copied() else {
+            return Ok(false);
+        };
+        if at.at_ns < made_ns {
+            return Ok(false);
+        }
+        held.write_ahead.insert(to.to_string(), at);
+        if let Some(runs) = held.dropped.get(from).cloned() {
+            held.dropped.insert(to.to_string(), runs);
+        }
+        let times: Vec<(String, i64)> = held
+            .valid
+            .iter()
+            .filter(|((stream, _), _)| stream == from)
+            .map(|((_, dataset), valid)| (dataset.clone(), *valid))
+            .collect();
+        for (dataset, valid) in times {
+            held.valid.insert((to.to_string(), dataset), valid);
+        }
+        Ok(true)
+    }
+
     fn take_shard(
         &self,
         mut took: meridian_domain::v1::ShardTookOver,

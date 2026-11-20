@@ -142,6 +142,11 @@ pub struct PostgresStore {
     /// When this store last let go of its group's parts of writes kept
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
+    /// The identity of the write-ahead stream the lake's writer takes from
+    /// (item 191): what a move's switch keys the groups' places by.
+    /// [`NO_STREAM`] in `tolerant`; [`STREAM_NOT_READ`] in `ha` until the
+    /// writer reads it; 0, the stream's name alone, where neither is said.
+    stream: std::sync::atomic::AtomicI64,
     /// The datasets whose open ranges' tables this store has seen made:
     /// their ranges are not read again before a batch, as a split makes its
     /// children's tables itself. Let go likewise.
@@ -395,6 +400,7 @@ impl PostgresStore {
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
+            stream: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             latest_all: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2785,7 +2791,7 @@ impl PostgresStore {
                 .flat_map(|part| part.unchanged_in.iter().map(|(range, _)| range.clone()))
                 .chain(part_datasets.iter().cloned())
                 .collect();
-            moves::taken_from_of(&mut tx, &ranges)?
+            moves::taken_from_of(&mut tx, &ranges, self.stream_identity())?
         };
         for counted in &mut batch.counted {
             let mut did = counted.already;
@@ -2915,7 +2921,57 @@ impl PostgresStore {
     }
 }
 
+/// A store's write-ahead stream in `ha` before the lake's writer has read
+/// its identity (item 191): a move's switch waits for it.
+pub const STREAM_NOT_READ: i64 = -1;
+
+/// A store with no write-ahead stream (`tolerant`; item 191's review,
+/// finding 2): a move's switch reads and writes no place in a stream.
+pub const NO_STREAM: i64 = i64::MIN;
+
+impl PostgresStore {
+    /// The lake keeps a write-ahead stream (`ha`) whose identity its writer
+    /// has not read yet: a move's switch is refused until it has (item 191).
+    pub fn stream_not_read(&self) {
+        self.stream
+            .store(STREAM_NOT_READ, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The key of the write-ahead stream the lake's writer takes from
+    /// ([`crate::write_ahead::stream_key`]), with its identity: none with
+    /// no stream (`tolerant`, item 191's review, finding 2); refused while
+    /// its identity is not read (item 191).
+    pub(crate) fn stream_key(&self) -> Result<Option<(String, i64)>> {
+        match self.stream.load(std::sync::atomic::Ordering::SeqCst) {
+            STREAM_NOT_READ => Err(StoreError::Unavailable(
+                "the lake's write-ahead stream's identity is not read yet: no range's switch \
+                 until it is"
+                    .into(),
+            )),
+            NO_STREAM => Ok(None),
+            identity => Ok(Some((
+                crate::write_ahead::stream_key(meridian_bus::write_ahead::STREAM, identity),
+                identity,
+            ))),
+        }
+    }
+
+    /// The identity of the write-ahead stream this store's places are in:
+    /// none in `tolerant`, or before the writer has read it.
+    fn stream_identity(&self) -> Option<i64> {
+        match self.stream.load(std::sync::atomic::Ordering::SeqCst) {
+            STREAM_NOT_READ | NO_STREAM => None,
+            identity => Some(identity),
+        }
+    }
+}
+
 impl Store for PostgresStore {
+    fn in_stream(&self, identity: i64) {
+        self.stream
+            .store(identity, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn read_owners_again(&self) -> Result<()> {
         self.read_owners().map(|_| ())
     }
@@ -2975,6 +3031,62 @@ impl Store for PostgresStore {
                 sequence: row.get::<_, i64>(0) as u64,
                 at_ns: row.get(1),
             }))
+    }
+
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The position under the name locked first, as a batch under it
+        // locks it: a lake before item 191 still writing commits before
+        // this or after it, never in between.
+        let at: Option<i64> = tx
+            .query_opt(
+                "SELECT at_ns FROM lake_write_ahead WHERE stream = $1 FOR UPDATE",
+                &[&from],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        let kept = tx
+            .query_opt("SELECT 1 FROM lake_write_ahead WHERE stream = $1", &[&to])
+            .map_err(unavailable)?
+            .is_some();
+        if kept || at.is_none_or(|at_ns| at_ns < made_ns) {
+            return Ok(false);
+        }
+        for carry in [
+            "INSERT INTO lake_write_ahead (stream, sequence, at_ns, committed_at_ns)
+             SELECT $2, sequence, at_ns, committed_at_ns FROM lake_write_ahead WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_dropped
+                    (stream, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns,
+                     gap_id)
+             SELECT $2, first_sequence, last_sequence, after_at_ns, until_at_ns, noted_at_ns, gap_id
+               FROM lake_write_ahead_dropped WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_dataset (stream, dataset, valid_ns)
+             SELECT $2, dataset, valid_ns FROM lake_write_ahead_dataset WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+            "INSERT INTO lake_write_ahead_part
+                    (stream, sequence, recorded, restated, unchanged, committed_at_ns, refused,
+                     refused_detail)
+             SELECT $2, sequence, recorded, restated, unchanged, committed_at_ns, refused,
+                    refused_detail
+               FROM lake_write_ahead_part WHERE stream = $1
+             ON CONFLICT DO NOTHING",
+        ] {
+            tx.execute(carry, &[&from, &to]).map_err(unavailable)?;
+        }
+        // Where each range's source stood at its last move, kept before
+        // `taken_in`: a place in this stream, the one the position was
+        // taken in (item 202).
+        tx.execute(
+            "UPDATE lake_partition SET taken_in = $1
+              WHERE taken_in IS NULL AND taken_from IS NOT NULL",
+            &[&made_ns],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
     }
 
     fn write_ahead_part(

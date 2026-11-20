@@ -15,7 +15,9 @@ component took to answer again and holding it to its bound:
   recorded (`WriterTookOver`), the old writer back as the standby.
 - `PROFILE=scaled`, the HA install held to its shape (e2e-cluster-scaled):
   every member set spread over nodes and zones, each lease held, a budget
-  per set, every stateless pod tolerating a lost node for 30 s.
+  per set, every stateless pod tolerating a lost node for 30 s; and a
+  plugin instance at two shards with a standby pod serving a reader's
+  standing want, each subject served once (step 3d, checkpoint 5, item 33).
 
 A component "answers" when its change log answers on the bus from inside
 one of its pods (`meridian-<component> probe`), asked every half second: so
@@ -125,6 +127,10 @@ FIGURES = os.environ.get("E2E_FAILOVER_FIGURES", ".e2e-failover-figures.jsonl")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 import claims as claims_tool  # noqa: E402
 import shard_accounts  # noqa: E402
+# Whether a release's workloads rolled out, judged as the CLI judges it: the
+# cluster harness's, shared. Appended: e2e/cluster holds a run.py of its own.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cluster"))
+import rollout  # noqa: E402
 CLUSTER = os.environ.get("E2E_K3D_CLUSTER", "meridian-e2e")
 ADMIN = "local|alice"
 ZONES = ["zone-a", "zone-b", "zone-c"]
@@ -196,6 +202,8 @@ DRIVER_ROLES = {"data": ["data", "reporting"], "oms": ["oms"], "desk": ["oms", "
 FLOOD_IN_FLIGHT = 32
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
+# The subjects a sharded instance shares, in the scaled run (item 33).
+SHARD_FIXTURES = ["e2e/failover/shards.sql"]
 # Enough keys that the oms instance appends to the run's end (driver.py: a
 # key takes PER_KEY appends, 400): at its 5 appends a second, 36 last 48
 # minutes. Twelve lasted 17 (CI 43656183991, ha: full at 1,047 s, before
@@ -213,41 +221,41 @@ DRIVER_SIGNER_KEY_ID = "e2e-drive"
 INTEROP_IMAGE = os.environ.get("E2E_INTEROP_IMAGE", "meridian-python-interop")
 # A plugin instance run as two shards with a standby pod (step 3d; the
 # resilience spec's sections 7 and 15), in the scaled shape: a sidecars[]
-# entry with a stand-in for its plugin beside it, so what is held is the
-# pods, their Leases, the standby's takeover and what a plugin's container
-# is given and reaches. Its subjects' sharing is the sidecar crate's own
-# tests' (receive::tests, shards::tests).
+# entry whose plugin is the shard driver (driver.py, DRIVER_ROLE=shard; step
+# 3d, checkpoint 5, item 33), a data plugin on the SDK's meridian.run, so
+# what is held is the pods, their Leases, the standby's takeover, what a
+# plugin's container is given and reaches, and what each pod serves of the
+# reader's want (served_once, below).
 SHARDED = "shard-proof"
 SHARDS = 2
-# The stand-in: the runtime's image, saying whether the members' token is
-# in its container and when its sidecar first answers on loopback -- where
-# a plugin's Register is answered, and so when its run() may start.
-# (No apostrophe in either: each is echoed inside single quotes. The first
-# run's said "the plugin's container", and bash read the script as unended:
-# PR CI 43740296065.)
-SHARD_STUB_NO_TOKEN = "stub: no lease token in the plugin container"
-SHARD_STUB_ANSWERED = "stub: the sidecar answers"
-# Said each time the sidecar stops answering: a shard lost ends its
-# sidecar, which comes back in its pod as the standby, while the plugin's
-# container -- and its log -- runs on (PR CI 43854641653: a standby's
-# plugin log held the answer of a shard its pod had held before). So the
-# stub says each change, and a check reads its last word.
-SHARD_STUB_GONE = "stub: the sidecar no longer answers"
-SHARD_STUB = (
-    "test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && echo '" + SHARD_STUB_NO_TOKEN + "'; "
-    "was=; while true; do "
-    "if (exec 3<>/dev/tcp/127.0.0.1/9191) 2>/dev/null; then now=yes; else now=; fi; "
-    "if [ \"$now\" != \"$was\" ]; then "
-    "if [ -n \"$now\" ]; then echo '" + SHARD_STUB_ANSWERED + "'; else echo '" + SHARD_STUB_GONE + "'; fi; "
-    "was=$now; fi; sleep 0.5; done"
-)
+# What the shard driver says, as the stand-in before it did: whether the
+# members' token is in its container, and each time it changes, whether its
+# sidecar answers on loopback -- where a plugin's Register is answered, and
+# so whether its run() may start. A shard lost stands its sidecar by again
+# while the plugin's container -- and its log -- runs on (PR CI
+# 43854641653: a standby's plugin log held the answer of a shard its pod had
+# held before). So it says each change, and a check reads its last word.
+# The same words as driver.py's.
+SHARD_NO_TOKEN = "shard: no lease token in the plugin container"
+SHARD_ANSWERED = "shard: the sidecar answers"
+SHARD_GONE = "shard: the sidecar no longer answers"
 
 
-def stub_answered(said):
-    """Whether the shard stub's log `said` ends answered: its last word of
+def plugin_answered(said):
+    """Whether the shard driver's log `said` ends answered: its last word of
     the sidecar is that it answers, not that it no longer does."""
-    words = [line for line in said.splitlines() if SHARD_STUB_ANSWERED in line or SHARD_STUB_GONE in line]
-    return bool(words) and SHARD_STUB_ANSWERED in words[-1]
+    words = [line for line in said.splitlines() if SHARD_ANSWERED in line or SHARD_GONE in line]
+    return bool(words) and SHARD_ANSWERED in words[-1]
+
+
+# The reader whose standing want the shards share (driver.py,
+# DRIVER_ROLE=shard-reader): a view of the subjects' prices, which its
+# sidecar renews at the lake as a standing want of the dataset it is
+# entitled to, the shard instance's.
+SHARD_READER = "shard-reader"
+SHARD_DATASET = f"{SHARDED}:served"
+# The subjects shared (e2e/failover/shards.sql).
+SHARD_SUBJECTS = [f"LCL-01J8XQ4M7K00000000E2ESH{n:02d}" for n in range(32)]
 # A standby holds a lapsed shard within this (ruling 1056, question 12).
 SHARD_TAKEOVER = 10
 # The write-scale step's load (step 3d, stage T; section 15), in the scaled
@@ -607,27 +615,33 @@ def install(s):
         values += driver_values()
     if PROFILE == "scaled":
         # One list: a values file's sidecars[] replaces another's whole.
-        sidecars = [{
-            "instanceId": SHARDED, "roles": ["data"], "shards": SHARDS, "standby": True,
-            "plugin": {"image": IMAGE, "pullPolicy": "IfNotPresent", "args": ["bash", "-c", SHARD_STUB]},
-        }]
+        # Each runs driver.py in the SDK's interop image.
+        def driven(role, env):
+            return {"image": INTEROP_IMAGE, "pullPolicy": "IfNotPresent",
+                    "args": ["python", "-c",
+                             "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
+                    "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
+                            **env}}
+        # The sharded instance and the reader whose want it shares (item 33).
+        sidecars = [
+            {"instanceId": SHARDED, "roles": ["data"], "shards": SHARDS, "standby": True,
+             "plugin": driven("shard", {})},
+            {"instanceId": SHARD_READER, "roles": ["reporting"],
+             "plugin": driven("shard-reader", {"DRIVER_SUBJECTS": ",".join(SHARD_SUBJECTS)})},
+        ]
         # The write-scale step's load (stage T), idle until it is told.
         public = driver_signer()
         for instance, role in SCALE_DRIVERS.items():
-            sidecars.append({"instanceId": instance, "roles": SCALE_ROLES[role], "limits": SCALE_LIMITS, "plugin": {
-                "image": INTEROP_IMAGE, "pullPolicy": "IfNotPresent",
-                "args": ["python", "-c",
-                         "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
-                "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
-                        "DRIVER_ACCOUNTS": ",".join(DRIVER_ACCOUNTS), "DRIVER_SCALE_KEYS": ",".join(scale_keys())},
-            }})
+            sidecars.append({"instanceId": instance, "roles": SCALE_ROLES[role], "limits": SCALE_LIMITS,
+                             "plugin": driven(role, {"DRIVER_ACCOUNTS": ",".join(DRIVER_ACCOUNTS),
+                                                     "DRIVER_SCALE_KEYS": ",".join(scale_keys())})})
             if role == "scale-oms":
                 sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
         sharded = os.path.join(tempfile.mkdtemp(prefix="failover-shards-"), "shards.json")
         with open(sharded, "w", encoding="utf-8") as kept:
             json.dump({"sidecars": sidecars}, kept)
         values += ["-f", sharded, "--set", f"bor.partitions={SCALE_PARTITIONS}"]
-        for at in range(1, len(sidecars)):
+        for at in range(len(sidecars)):
             values += ["--set-file", f"sidecars[{at}].plugin.env.MERIDIAN_DRIVER={DRIVER_SCRIPT}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
@@ -1250,25 +1264,344 @@ LOST = "the shard's lease is lost"
 STANDING_AGAIN = "; standing by again"
 # What it says once it stands by, every shard's Lease another's.
 STOOD_BY = "standing by, serving nothing"
+# What it says as a store refuses a write of its as fenced (item 32).
+FENCED = "a store refused a write as fenced"
+
+
+def line_at(line):
+    """A stamped log line's time, in seconds since the epoch; 0 where it
+    has none."""
+    whole, _, rest = line.split(" ", 1)[0].rstrip("Z").partition(".")
+    try:
+        at = datetime.datetime.strptime(whole, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return 0
+    return at.timestamp() + float("0." + (rest or "0"))
+
+
+def shard_lines(pod_name, path):
+    """A file the shard driver keeps in its pod's scratch, by line."""
+    done = kubectl("exec", pod_name, "-c", "plugin", "--", "cat", path, check=False)
+    return done.stdout.decode(errors="replace").splitlines() if done.returncode == 0 else []
+
+
+# ── Each subject served once (step 3d, checkpoint 5, item 33) ──────────────
+#
+# What each shard pod served, by the shard driver's own record of what the
+# lake acknowledged (driver.py: /tmp/served.log, `SERVED <pod> <shard>
+# <subject> <unix s> <unix ms>`, a line per subject a second): read from
+# each pod while it is there and kept here, since a pod deleted takes its
+# file with it. A pod's lines after its last read -- one rolled or scaled
+# away -- are not judged.
+SERVED = {}
+# What one pod serves now: the subjects it recorded within this many
+# seconds. It records each once a second.
+SERVING_S = 4
+# Two seconds a pod recorded one subject in, this far apart or less, are one
+# stretch of its serving it.
+STRETCH_GAP_S = 3
+# Each window in which the live shards changed, (what, from, until) in
+# seconds since the epoch: the shards settling, each lapse and take, the
+# roll and the scaling -- the only time two pods may serve one subject.
+LAPSES = []
+# The cluster's clock and the run's: a stamp of either may be this far off
+# the other's (said_at's lines are judged so too).
+SKEW_S = 1
+
+
+def served_read():
+    """Each shard pod's served lines read and kept, by pod: a list of
+    (shard, subject, second, acknowledged at). A line is the pod's it is
+    read from: the chart gives a plugin's container the instance's name as
+    its hostname, so the pod a driver says is the instance's, not its own."""
+    for pod in shard_pods():
+        name = pod["metadata"]["name"]
+        done = kubectl("exec", name, "-c", "plugin", "--", "cat", "/tmp/served.log", check=False)
+        if done.returncode != 0:
+            continue
+        lines = []
+        for line in done.stdout.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) == 6 and parts[0] == "SERVED":
+                lines.append((parts[2], parts[3], int(parts[4]), int(parts[5]) / 1000))
+        if len(lines) >= len(SERVED.get(name, [])):
+            SERVED[name] = lines
+    return SERVED
+
+
+def served_between(since, until=None):
+    """Each pod's subjects it served between two times (by acknowledgement),
+    from what was last read; a pod that served none is left out."""
+    held = {}
+    for pod, lines in SERVED.items():
+        subjects = {subject for _, subject, _, at in lines if at >= since and (until is None or at < until)}
+        if subjects:
+            held[pod] = subjects
+    return held
+
+
+def served_once(s, when, seconds=120):
+    """Each subject served by one shard alone: within `seconds`, a moment
+    at which the pods' served sets of the last SERVING_S cover all of the
+    subjects, and none of them twice; then each held."""
+    now = {}
+
+    def once():
+        served_read()
+        now.clear()
+        now.update(served_between(time.time() - SERVING_S))
+        sets = list(now.values())
+        return (set().union(*sets) >= set(SHARD_SUBJECTS)
+                and all(sum(subject in held for held in sets) == 1 for subject in SHARD_SUBJECTS))
+    happens(once, seconds, every=1.0)
+    sets = list(now.values())
+    covered = set().union(*sets) if sets else set()
+    twice = sorted(subject for subject in SHARD_SUBJECTS if sum(subject in held for held in sets) > 1)
+    counts = {pod.rsplit("-", 1)[-1]: len(held) for pod, held in sorted(now.items())}
+    s.check(covered >= set(SHARD_SUBJECTS),
+            f"served once, {when}: the shards' served sets cover all {len(SHARD_SUBJECTS)} subjects "
+            f"({len(covered & set(SHARD_SUBJECTS))} served; by pod {counts})")
+    s.check(len(now) == SHARDS and not twice,
+            f"served once, {when}: the {SHARDS} shards' served sets are disjoint, the standby's empty "
+            f"({len(now)} pods serving; {len(twice)} subject(s) served by two{': ' + ', '.join(twice[:4]) if twice else ''})")
+    return now
+
+
+def served_alone(s, stayed, seconds=90):
+    """The shard that stayed, scaled to one, serves every subject alone
+    (item 33), waited for as it is judged: the only pod with a line in the
+    last SERVING_S is `stayed`, and its set covers every subject. A pod
+    scaled away keeps the lines it was last read with, so the wait waits
+    them out (PR CI 44615932110: a wait on the pods' union passed while the
+    gone pod's lines were still in the window, and the check then failed)."""
+    now = {}
+
+    def alone():
+        served_read()
+        now.clear()
+        now.update(served_between(time.time() - SERVING_S))
+        return list(now) == [stayed] and now[stayed] >= set(SHARD_SUBJECTS)
+    happens(alone, seconds, every=1.0)
+    s.check(list(now) == [stayed] and now[stayed] >= set(SHARD_SUBJECTS),
+            f"served once: the shard that stayed alone serves all {len(SHARD_SUBJECTS)} subjects "
+            f"({ {pod.rsplit('-', 1)[-1]: len(held) for pod, held in now.items()} })")
+    return now
+
+
+def served_taken(s, what, lost_pod, began, taker):
+    """After a lapse: the subjects `lost_pod` served in the SERVING_S before
+    `began` -- the lost shard's -- each served by `taker` within the
+    takeover's bound of `began`."""
+    served_read()
+    lost = served_between(began - SERVING_S - SKEW_S, began).get(lost_pod, set())
+
+    def first_served():
+        firsts = {}
+        for _, subject, _, at in SERVED.get(taker, []):
+            if subject in lost and at >= began - SKEW_S:
+                firsts[subject] = min(firsts.get(subject, at), at)
+        return firsts
+    happens(lambda: served_read() is not None and set(first_served()) >= lost, SHARD_TAKEOVER + 20, every=1.0)
+    firsts = first_served()
+    late = max((at - began for at in firsts.values()), default=None)
+    unserved = sorted(lost - set(firsts))
+    held = bool(lost) and not unserved and late <= SHARD_TAKEOVER
+    # The time measured is said only where the bound was not held.
+    s.check(held, f"served once, {what}: the taker serves each of the lost shard's {len(lost)} subjects within "
+                  f"{SHARD_TAKEOVER} s" + ("" if held else
+                  f" ({'never' if late is None else round(late, 2)} s for the last; {len(unserved)} not served"
+                  f"{': ' + ', '.join(unserved[:4]) if unserved else ''}; {lost_pod} served {len(lost)} in the "
+                  f"{SERVING_S} s before, {taker} took)"))
+    figure(f"served once: {what}, the lost shard's subjects served again", serving_s=late,
+           subjects=len(lost), unserved=len(unserved))
+
+
+# Each take of shard 1 not yet judged: (what, the pod that lost it, when,
+# the pod that took it), its subjects judged after the second kill
+# (served_taken), or at the step's end where it ended before.
+TAKES = []
+
+
+def lapse(what, began):
+    """A window in which the live shards changed, from `began` to now."""
+    LAPSES.append((what, began, time.time()))
+
+
+def overlap_in_lapses(s):
+    """Two pods served one subject only inside a lapse's window: each pod's
+    stretches of serving each subject (its seconds recorded, STRETCH_GAP_S
+    apart at most), and every stretch of two pods' that overlaps by a second
+    or more lies within a window LAPSES holds, give or take the clocks'."""
+    served_read()
+    stretches = {}
+    for pod, lines in SERVED.items():
+        seconds = {}
+        for _, subject, second, _ in lines:
+            seconds.setdefault(subject, set()).add(second)
+        for subject, held in seconds.items():
+            ordered = sorted(held)
+            start = last = ordered[0]
+            for second in ordered[1:]:
+                if second - last > STRETCH_GAP_S:
+                    stretches.setdefault(subject, []).append((pod, start, last + 1))
+                    start = second
+                last = second
+            stretches.setdefault(subject, []).append((pod, start, last + 1))
+    overlaps = []
+    for subject, held in stretches.items():
+        for i, (pod_a, from_a, to_a) in enumerate(held):
+            for pod_b, from_b, to_b in held[i + 1:]:
+                lo, hi = max(from_a, from_b), min(to_a, to_b)
+                if pod_a != pod_b and hi - lo >= 1:
+                    overlaps.append((subject, lo, hi))
+    outside = [(subject, lo, hi) for subject, lo, hi in overlaps
+               if not any(began - SKEW_S <= lo and hi <= until + SKEW_S + 1 for _, began, until in LAPSES)]
+    within = sorted({what for _, lo, hi in overlaps for what, began, until in LAPSES
+                     if began - SKEW_S <= lo and hi <= until + SKEW_S + 1})
+    said = ", ".join(f"{subject[-4:]} {time.strftime('%H:%M:%S', time.gmtime(lo))}+{hi - lo}s"
+                     for subject, lo, hi in outside[:4])
+    lines = sum(len(each) for each in SERVED.values())
+    s.check(lines > 0 and not outside,
+            f"served once: two pods served one subject only inside a lapse's window ({len(overlaps)} overlap(s) "
+            f"over {lines} served lines, in {within or 'none'}; {len(outside)} outside{': ' + said if said else ''})")
+
+
+def wire_fields(body):
+    """A protobuf message's fields in order: (number, wire type, value), a
+    length-delimited value as its bytes."""
+    fields, at = [], 0
+
+    def varint():
+        nonlocal at
+        value = shift = 0
+        while True:
+            byte = body[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value
+    while at < len(body):
+        key = varint()
+        number, kind = key >> 3, key & 7
+        if kind == 0:
+            value = varint()
+        elif kind == 1:
+            value, at = body[at:at + 8], at + 8
+        elif kind == 2:
+            size = varint()
+            value, at = body[at:at + size], at + size
+        elif kind == 5:
+            value, at = body[at:at + 4], at + 4
+        else:
+            raise ValueError(f"protobuf wire type {kind} at {at}")
+        fields.append((number, kind, value))
+    return fields
+
+
+# What the lake or the sidecar stamps on a row, not what its source said:
+# ObservationMeta's sent and recorded times, version, sequence and previous
+# sequence (8 to 12); and Source's instance and plugin version (1, 2).
+STAMPED_META = {8, 9, 10, 11, 12}
+STAMPED_SOURCE = {1, 2}
+# The prefix the SDK gives a raw reference on a shard (item 30). The lake
+# counts a raw reference in its sameness rule, so one value recorded by two
+# shards, their references differing, is kept as a second version (item
+# 180, 2026-11-19: so ruled for v30; item 172's prefix rule is withdrawn).
+SHARD_RAW = re.compile(rb"shard-\d+/")
+# Each row key with more than one version, judged by its bodies: at most
+# this many rows read. More is said, and fails the strict check, rather than
+# passing it unread.
+VERSIONS_READ = 20000
+
+
+def row_said(body):
+    """A recorded price (meridian.v1.Price) as the lake's sameness rule reads
+    it: (its values, its raw reference, the raw reference without the shard
+    prefix)."""
+    values, raw = [], b""
+    for number, kind, value in wire_fields(body):
+        if number != 1:
+            values.append((number, kind, value))
+            continue
+        for n, k, v in wire_fields(value):
+            if n == 13:
+                raw = v
+            elif n == 3:
+                values.append(("source", tuple(f for f in wire_fields(v) if f[0] not in STAMPED_SOURCE)))
+            elif n not in STAMPED_META:
+                values.append(("meta", n, k, v))
+    return tuple(values), raw, SHARD_RAW.sub(b"", raw)
+
+
+def row_keys_once(s):
+    """Each row key of the shards' dataset recorded once, as ruled (item
+    180, 2026-11-19): no row key has a second version with other values;
+    a second version of the same values is listed, not failed. The shard
+    driver's price for a subject and a second is the same in every pod, so a
+    second version with other values is two writes of one key disagreeing
+    (the driver's fault, or a restatement). Each second version is said as
+    one of three kinds, each key's kept in .e2e-shards-versions.log --
+      other values: red;
+      shard prefix only: the same values, the raw references differing in
+        nothing but the shard prefix;
+      same values otherwise: the same values, the raw references differing
+        otherwise or not at all."""
+    rows = psql(f"select count(*) from lake_row where dataset = '{SHARD_DATASET}'", quiet=True)
+    # One statement, so the rows read and their count are one snapshot: the
+    # count is taken over every versioned row before the limit cuts.
+    listed = psql(f"select row_key, version, encode(body, 'hex'), count(*) over () from lake_row "
+                  f"where dataset = '{SHARD_DATASET}' and row_key in (select row_key from lake_row "
+                  f"where dataset = '{SHARD_DATASET}' group by row_key having count(*) > 1) "
+                  f"order by row_key, version limit {VERSIONS_READ}", quiet=True)
+    versions, many = {}, 0
+    for line in listed.splitlines():
+        key, version, body, many = line.split("|")
+        versions.setdefault(key, []).append((int(version), row_said(bytes.fromhex(body))))
+    kinds = {"other values": [], "shard prefix only": [], "same values otherwise": []}
+    lines = []
+    for key, held in sorted(versions.items()):
+        values, raw, bare = held[0][1]
+        for version, (later, later_raw, later_bare) in held[1:]:
+            kind = ("other values" if later != values else
+                    "shard prefix only" if later_raw != raw and later_bare == bare else
+                    "same values otherwise")
+            if key not in kinds[kind]:
+                kinds[kind].append(key)
+            lines.append(f"VERSION {key} {version} {kind}\n")
+    with open(".e2e-shards-versions.log", "w", encoding="utf-8") as kept:
+        kept.writelines(lines)
+
+    def said(kind):
+        keys = kinds[kind]
+        return f"{len(keys)} {kind}{': ' + ', '.join(keys[:4]) if keys else ''}"
+    unread = int(many) - sum(len(held) for held in versions.values())
+    s.check(int(rows or 0) > 0 and not kinds["other values"] and unread == 0,
+            f"served once: no row key of {SHARD_DATASET} recorded twice with other values "
+            f"({rows} rows; {said('other values')}"
+            f"{f'; {unread} versioned row(s) past the {VERSIONS_READ} read, not judged' if unread else ''})")
+    s.note(f"served once: second versions of the same values, listed, not failed (item 180): "
+           f"{said('shard prefix only')}; {said('same values otherwise')}; kept in .e2e-shards-versions.log")
 
 
 def shards_fenced(s, settled):
     """Step 3d, checkpoint 5, item 32: the epoch fence for plugin writes, as
-    the shards' sidecars meet it with the stub plugin, which writes nothing
-    (its writes' checks are item 33's, with the shard driver).
+    the shards' sidecars meet it with the shard driver writing (item 33).
 
     (a) Every pod of the instance cut from the API server, both ways, past
     a Lease's lapse: a data shard writes on through it, fenced by its epoch,
     and is never stopped by the clock -- no sidecar restarts, each Lease's
-    holder and each shard's epoch as they were, no take recorded.
+    holder and each shard's epoch as they were, no take recorded, and every
+    subject's rows landing through it.
 
     (b) The holder of shard 1 alone cut from it: the standby takes the
-    Lease once it lapses, within the takeover's bound; the lake records one
-    take and raises the shard's epoch by one; the cut holder serves on
-    until it hears the API server again and finds another holder, then stands
-    by again in its process, its container never restarted (item 49, ruled
-    2026-11-16), within a lapse and the takeover's bound of hearing the API
-    server again.
+    Lease once it lapses, within the takeover's bound, and serves the lost
+    shard's subjects within it; the lake records one take and raises the
+    shard's epoch by one; the cut holder writes on until a write of its is
+    refused as fenced, or it hears the API server again and finds another
+    holder, then stands by again in its process, its container never
+    restarted (item 49, ruled 2026-11-16), within a lapse and the takeover's
+    bound of hearing the API server again.
 
     Answers the cut holder, its sidecar container's status before the cut,
     and when its Lease was taken; none where the shards did not settle
@@ -1309,6 +1642,15 @@ def shards_fenced(s, settled):
     after = [shard_epochs(n) for n in range(SHARDS)]
     s.check(after == epochs and shard_takes() == takes,
             f"shards: no take, each shard's epoch as it was ({epochs} -> {after})")
+    # Its rows landing through the outage (item 32's e2e; item 33): each
+    # holder recorded its subjects, all of them between the two, in the
+    # outage's last seconds -- past a Lease's lapse.
+    served_read()
+    late = served_between(began + SHARD_LAPSE_S + SKEW_S, began + SHARD_CUT_S - SKEW_S)
+    landed = set().union(*late.values()) if late else set()
+    s.check(set(late) == set(holder_pods) and landed >= set(SHARD_SUBJECTS),
+            f"shards: through the API server's outage, past a lapse, each shard's rows kept landing "
+            f"({len(landed & set(SHARD_SUBJECTS))} of {len(SHARD_SUBJECTS)} subjects, by {len(late)} pod(s))")
 
     # (b) The holder of shard 1 alone cut.
     if not a_standby_stands_by(s, "the holder alone is cut"):
@@ -1318,6 +1660,7 @@ def shards_fenced(s, settled):
     epoch, takes = shard_epoch(1), shard_takes()
     before = restarts(lost)
     sidecar_before = sidecar_status(json.loads(out("get", "pod", lost, "-o", "json")))
+    refused_before = shard_lines(lost, "/tmp/shard-refused.log")
     began = time.time()
     cut_api("-I", only={lost})
     try:
@@ -1342,11 +1685,20 @@ def shards_fenced(s, settled):
         on_time = taken and took <= SHARD_TAKEOVER and serving and served <= SHARD_TAKEOVER
         s.check(restarts(lost) == before and (said_at(lost, LOST) or 0) < began,
                 "shards: the cut holder serves on while it cannot hear the API server")
+        TAKES.append(("the holder alone cut", lost, began, now_pod))
         figure("shards: the holder alone cut, its lease taken", lease_s=round(took, 2),
                serving_s=round(served, 2))
     finally:
         cut_api("-D", only={lost})
     lifted, lost_at = time.time(), began + took
+    # Its writes after the take refused (item 32's e2e): fenced, a write of
+    # its own the first after the take, while it could not hear the API
+    # server.
+    fenced = happens(lambda: any("fenced" in line for line in
+                                 shard_lines(lost, "/tmp/shard-refused.log")[len(refused_before):]),
+                     5, every=0.5)
+    s.check(fenced, "shards: the cut holder's write after the take refused as fenced, its plugin told "
+                    f"({(shard_lines(lost, '/tmp/shard-refused.log')[len(refused_before):] or ['none'])[0][:200]})")
     # The standby's own words through the cut, kept whatever the result,
     # once the cut is lifted: its pod is killed next, and its log went with
     # it once (CI 43973174092, PO item 54). The standby last, so the tail CI
@@ -1357,20 +1709,23 @@ def shards_fenced(s, settled):
     # standing by -- and its plugin no longer answered. Judged by its log
     # and its container's last end, never by restartCount, which the
     # kubelet raises only once a back-off has passed (review c5a5 F1).
+    # Its serving ended by a write refused as fenced (item 32), or by the
+    # Lease read again, whichever came first.
     def stood_by_again():
-        said = shard_log(lost).splitlines()
+        said = shard_log(lost, stamped=True).splitlines()
         at = next((n for n, line in enumerate(said)
-                   if LOST in line and f"held by {now_pod}" in line and STANDING_AGAIN in line), None)
+                   if STANDING_AGAIN in line and (FENCED in line or (LOST in line and f"held by {now_pod}" in line))
+                   and line_at(line) >= began - SKEW_S), None)
         return (at is not None and any("standing by" in line and STANDING_AGAIN not in line for line in said[at + 1:])
-                and not stub_answered(shard_log(lost, container="plugin")))
+                and not plugin_answered(shard_log(lost, container="plugin")))
     again = happens(stood_by_again, 30, every=0.5)
     sidecar_after = sidecar_status(json.loads(out("get", "pod", lost, "-o", "json")))
     kept_on = (sidecar_after.get("restartCount") == sidecar_before.get("restartCount")
                and sidecar_after.get("lastState") == sidecar_before.get("lastState")
                and "running" in sidecar_after.get("state", {}))
-    words = [line for line in shard_log(lost).splitlines() if LOST in line]
+    words = [line for line in shard_log(lost).splitlines() if LOST in line or FENCED in line]
     s.check(again and kept_on,
-            f"shards: the cut holder, hearing the API server again, found another holder and stood by again in its "
+            f"shards: the cut holder, fenced or hearing the API server again, stood by again in its "
             f"process, its plugin no longer answered ({'stood by again' if again else 'did not stand by again'}; "
             f"{'its container ran on' if kept_on else 'its container ended: ' + json.dumps(sidecar_after.get('lastState'))}"
             f"; {words[-1:] or 'it said nothing of it'})")
@@ -1384,6 +1739,7 @@ def shards_fenced(s, settled):
             f"server again ({stood_in} s)")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
+    lapse("the holder alone cut", began)
     return (lost, sidecar_before, lost_at) if back else None
 
 
@@ -1398,7 +1754,15 @@ def shards(s):
     pod that lost that shard in the fence's step (b), standing by in its
     process since (item 49). Its taker killed in turn within 60 s, the
     second taker serves within the bound too. Its pods then roll a shard at a time, and a shard
-    gone and back is read by the one that stayed."""
+    gone and back is read by the one that stayed.
+
+    Each subject served once (step 3d, checkpoint 5, item 33): the shard
+    driver in each pod serves its share of the reader's standing want of
+    the 32 subjects. Settled, the shards' served sets are disjoint and
+    cover all 32, the standby's empty; after each lapse the taker serves
+    the lost shard's subjects within the takeover's bound; two pods serve
+    one subject only inside a lapse's window; and no row key is recorded
+    twice."""
     print("S: a plugin instance at two shards with a standby pod", flush=True)
 
     def settled():
@@ -1434,20 +1798,25 @@ def shards(s):
             and mounted == ["sidecar"],
             f"shards: the lease right's token is mounted in the sidecar's container alone, a plugin's beside it "
             f"(containers {containers}; mounted in {mounted})")
-    stubs = {n: shard_log(n, container="plugin") for n in names}
-    s.check(all(SHARD_STUB_NO_TOKEN in said for said in stubs.values()),
-            "shards: no pod's plugin container holds the token")
-    answered = happens(lambda: all(stub_answered(shard_log(h, container="plugin")) for h in holders), 30)
+    # Said by the shard driver itself, a real plugin's container (item 31).
+    plugins = {n: shard_log(n, container="plugin") for n in names}
+    s.check(all(SHARD_NO_TOKEN in said for said in plugins.values()),
+            "shards: no pod's plugin container holds the token, as the shard driver finds it")
+    answered = happens(lambda: all(plugin_answered(shard_log(h, container="plugin")) for h in holders), 30)
     # The standby's as it stands now: a pod whose shard was lost before
     # (its sidecar ended and came back standing by) said both, in turn.
-    waits = happens(lambda: not stub_answered(shard_log(standby, container="plugin")), 10)
-    if SHARD_STUB_ANSWERED in shard_log(standby, container="plugin"):
+    waits = happens(lambda: not plugin_answered(shard_log(standby, container="plugin")), 10)
+    if SHARD_ANSWERED in shard_log(standby, container="plugin"):
         restarts = out("get", "pod", standby, "-o", "jsonpath={.status.containerStatuses[?(@.name=='sidecar')]"
                        ".restartCount}")
         s.note(f"shards: the standby {standby} held a shard before (its sidecar restarted {restarts} time(s)); "
                f"its plugin: {shard_log(standby, container='plugin').strip()[-400:]}")
     s.check(answered and waits,
             "shards: each shard's plugin is answered by its sidecar; the standby's is not, so its run() waits")
+    # The reader's want shared (item 33): until the shards first serve it
+    # whole, they are settling.
+    served_once(s, "as the shards settled", seconds=240)
+    lapse("the shards settling", 0)
     deployment = json.loads(out("get", "deployment", "-l", f"meridian.dev/instance={SHARDED}", "-o", "json"))["items"][0]
     shard_admission(s, deployment)
     # Its own account (item 31): its pods run under it, its Role names its
@@ -1502,6 +1871,7 @@ def shards(s):
         s.check(served and serving <= SHARD_TAKEOVER,
                 f"shards: its taker serves within {SHARD_TAKEOVER}s of the kill"
                 + ("" if served else " (never)"))
+        TAKES.append(("the first kill", lost, began, now_pod))
     finally:
         cut_api("-D", only={lost})
     after = sidecar_status(json.loads(out("get", "pod", cut_holder, "-o", "json")))
@@ -1515,7 +1885,7 @@ def shards(s):
     figure("shards: the lease changed hands, and its taker served, after the kill",
            lease_s=round(took, 2), serving_s=None if serving is None else round(serving, 2))
     s.check(shard_holder(0)[1] == other_held, "shards: the live shard's lease never changed hands")
-    plugged = happens(lambda: stub_answered(shard_log(now_pod, container="plugin")), 30)
+    plugged = happens(lambda: plugin_answered(shard_log(now_pod, container="plugin")), 30)
     s.check(plugged, "shards: the taker's plugin is answered by its sidecar")
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
@@ -1535,6 +1905,8 @@ def shards(s):
     if not stood:
         return
     began = time.time()
+    # The first kill's window ends as the second's begins.
+    lapse("the first kill", first_kill)
     crash(lost, "sidecar")
     taken = happens(lambda: shard_holder(1)[1] not in ("", was), SHARD_TAKEOVER + 20, every=0.25)
     now_pod, now = shard_holder(1)
@@ -1545,8 +1917,15 @@ def shards(s):
             f"within {SHARD_TAKEOVER} s ({'never' if serving is None else round(serving, 2)}; {now}, was {was})")
     figure("shards: the second kill within 60 s, its taker served",
            apart_s=round(began - first_kill, 1), serving_s=None if serving is None else round(serving, 2))
+    TAKES.append(("the second kill", lost, began, now_pod))
     back = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     s.check(back, f"shards: two shards and a standby again ({len(shard_pods())} pods)")
+    # Each take's subjects, judged once the second kill is over: the 60 s
+    # between the two kills (item 49) waits for nothing of them.
+    while TAKES:
+        served_taken(s, *TAKES.pop(0))
+    served_once(s, "after the second kill")
+    lapse("the second kill", began)
 
     # The instance's pods rolled: a shard at a time, a new pod standing by
     # and taking the Lease an old one gives up as it stops. Never fewer
@@ -1554,15 +1933,21 @@ def shards(s):
     shard_restarts_said(s, "before its pods roll")
     name = deployment["metadata"]["name"]
     before = {p["metadata"]["name"] for p in shard_pods()}
+    served_read()
+    rolling = time.time()
     kubectl("rollout", "restart", f"deployment/{name}")
     # Judged by its pods, not by `kubectl rollout status`: that waits for
     # every replica available, and the standby pod is never ready, by
     # design, so it never ends for this Deployment (PR CI 43783060111: it
     # ran to its 300 s with the three new pods there, two ready and the
     # third standing by, which is the rollout done).
-    least, rolled, until = SHARDS, False, time.time() + 300
+    least, rolled, until, read_at = SHARDS, False, time.time() + 300, 0
     while time.time() < until and not rolled:
         try:
+            # What the pods going served, read while they are there.
+            if time.time() - read_at >= 3:
+                served_read()
+                read_at = time.time()
             live = shard_pods()
             least = min(least, len([p for p in live if ready(p)]))
             rolled = (not ({p["metadata"]["name"] for p in live} & before) and settled()
@@ -1575,17 +1960,25 @@ def shards(s):
     s.check(rolled and least >= 1, f"shards: a shard at a time: never fewer than one ready (least {least})")
     if not rolled:
         return
+    served_once(s, "after the roll")
+    lapse("the roll", rolling)
 
     # A shard gone and back, read by the one that stayed: down to one pod
     # (the standby goes first, being not ready, then a shard, which gives
     # its Lease up), then back to three.
     changed = "the instance's live shards changed"
     shard_restarts_said(s, "before they are scaled down")
+    served_read()
+    scaling = time.time()
     kubectl("scale", f"deployment/{name}", "--replicas=1")
     alone = happens(lambda: len(shard_pods()) == 1 and ready(shard_pods()[0]), 120)
     stayed = shard_pods()[0]["metadata"]["name"] if alone else ""
-    first = shard_log(stayed).count(changed) if alone else 0
-    gone = alone and happens(lambda: shard_log(stayed).count(changed) >= first + 1 or first >= 2, 30)
+    # Its neighbour gone: a change said after the scale was asked, by the
+    # cluster's stamp (k3d's pods share the run's clock), not one said
+    # before it, which a count could take for it.
+    gone = alone and happens(lambda: (said_at(stayed, changed) or 0) > scaling, 30)
+    if alone:
+        served_alone(s, stayed)
     kubectl("scale", f"deployment/{name}", f"--replicas={SHARDS + 1}")
     again = happens(lambda: settled() and len([p for p in shard_pods() if ready(p)]) == SHARDS, 180)
     lines = shard_log(stayed).count(changed) if alone else 0
@@ -1594,6 +1987,32 @@ def shards(s):
     s.check(bool(gone) and again and bool(told),
             f"shards: the shard that stayed read its neighbour live, gone and back, and shared its subjects again "
             f"each time ({lines} changes said, at least 3)")
+    served_once(s, "after the scale back")
+    lapse("scaled to one and back", scaling)
+
+
+def served_whole(s):
+    """The shards step's whole record (item 33), however far it got: two
+    pods served one subject only inside a lapse's window, and no row key
+    was recorded twice. The shard drivers and the reader stopped after, so
+    nothing they write reaches the steps after."""
+    # A take the step did not get to judge (it ended early).
+    while TAKES:
+        served_taken(s, *TAKES.pop(0))
+    overlap_in_lapses(s)
+    row_keys_once(s)
+    # What every pod served, and the windows, kept beside the run (CI keeps
+    # .e2e-*.log when a run fails, and prints each one's tail: the windows).
+    with open(".e2e-shards-served.log", "w", encoding="utf-8") as kept:
+        for pod, lines in sorted(SERVED.items()):
+            kept.writelines(f"SERVED {pod} {shard} {subject} {second} {int(at * 1000)}\n"
+                            for shard, subject, second, at in lines)
+        kept.writelines(f"LAPSE {what} {began:.1f} {until:.1f}\n" for what, began, until in LAPSES)
+    print("    - served once: what each shard pod served, and each lapse's window, kept in .e2e-shards-served.log",
+          flush=True)
+    for pod in [p["metadata"]["name"] for p in shard_pods()] + [driver_pod(SHARD_READER)]:
+        if pod:
+            kubectl("exec", pod, "-c", "plugin", "--", "touch", "/tmp/stop", check=False)
 
 
 # What analytics says once it has its stream, and where it could not make one.
@@ -1639,6 +2058,7 @@ def jetstream_rolled(s):
     leader's restart (review c5a3 I2): the lake's identity of the stream
     never changes with the server that answers."""
     before = write_ahead_made() if PROFILE == "ha" else {}
+    began = time.time()
     kubectl("rollout", "restart", f"statefulset/{broker_set()}")
     rolled = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
                      check=False).returncode == 0
@@ -1653,6 +2073,7 @@ def jetstream_rolled(s):
                 f"broker: the lake's write-ahead stream's created is one on every server, before and after "
                 f"its leader moved ({len(before)} and {len(after)} of {servers} servers; created "
                 f"{sorted(str(m) for m in made)}; leaders {', '.join(leaders)})")
+        made_again_since(s, began, "broker: its servers rolled, the write-ahead stream's leader moved")
     parts = ("analytics-coordinator", "analytics-worker")
     for part in parts:
         kubectl("rollout", "restart", f"deployment/{FULL}-{part}")
@@ -1742,8 +2163,9 @@ def driver_trusted(public):
 def driver_fixtures(s):
     """What an admin would have done before the driver can write: its
     accounts and their grant, and the instrument its rows name (as e2e-book's
-    are written), then the driver writing both kinds."""
-    for path in DRIVER_FIXTURES:
+    are written), then the driver writing both kinds. In the scaled run, the
+    subjects the sharded instance shares too (item 33)."""
+    for path in DRIVER_FIXTURES + (SHARD_FIXTURES if PROFILE == "scaled" else []):
         with open(path, encoding="utf-8") as held:
             psql(held.read())
     s.check(True, "the driver's accounts, grant and instrument written")
@@ -2622,6 +3044,8 @@ def broker_lost(s):
     healed = happens(lambda: len(pods("broker")) == len(servers)
                      and all(ready(p) for p in pods("broker")), 180)
     s.check(healed, "broker: the killed server back")
+    if PROFILE == "ha":
+        made_again_since(s, began, "broker: a server cut off and killed")
 
 
 # ── Storage: bit rot, a torn write, a volume lost (step 3b part 2) ─────────
@@ -2955,17 +3379,77 @@ def record_now():
     return held
 
 
-def settled_everywhere():
+# Why settled_everywhere last said no: the clause it stopped at and what it
+# saw, for the check that waited on it (CI 44556229125 said only that the
+# move to ha never settled, and its dump named the stores' members alone).
+UNSETTLED = {"why": "", "at": 0.0}
+
+
+def names_of(pods_said):
+    return ", ".join(p["metadata"]["name"] for p in pods_said) or "none"
+
+
+def unsettled():
+    """Why the deployment is not settled everywhere: the first clause that
+    does not hold and what it saw, or "" where every one holds."""
     if not all_ready():
-        return False
-    if not all(members_settled(c) for c in STORES):
-        return False
+        return "not every Deployment of the release is Available"
+    for component in STORES:
+        if not members_settled(component):
+            live = pods(component)
+            want = 2 if SHAPE in ("ha", "scaled") else 1
+            return (f"{component}: {sum(ready(p) for p in live)} of {len(live)} running member(s) ready, "
+                    f"{want} wanted (not ready: {names_of(p for p in live if not ready(p))})")
     database = pods("database")
     if len(database) != database_members() or not all(ready(p) for p in database):
-        return False
-    servers = [p for p in pods("broker") if p["metadata"]["labels"].get("meridian.dev/broker-set") == broker_set()]
-    return len(servers) == (3 if SHAPE == "ha" else 1) and all(ready(p) for p in servers) \
-        and len(pods("broker")) == len(servers)
+        return (f"the database: {sum(ready(p) for p in database)} of {len(database)} running member(s) "
+                f"ready, {database_members()} wanted (not ready: {names_of(p for p in database if not ready(p))})")
+    every = pods("broker")
+    servers = [p for p in every if p["metadata"]["labels"].get("meridian.dev/broker-set") == broker_set()]
+    want = 3 if SHAPE == "ha" else 1
+    if len(servers) != want or not all(ready(p) for p in servers):
+        return (f"the broker: {sum(ready(p) for p in servers)} of {len(servers)} running server(s) of "
+                f"{broker_set()} ready, {want} wanted (not ready: {names_of(p for p in servers if not ready(p))})")
+    if len(every) != len(servers):
+        return (f"the broker: server(s) of another set still running beside {broker_set()}: "
+                f"{names_of(p for p in every if p not in servers)}")
+    return ""
+
+
+def settled_everywhere():
+    UNSETTLED["why"], UNSETTLED["at"] = unsettled(), time.time()
+    return not UNSETTLED["why"]
+
+
+def broker_health(s, when):
+    """Each broker server's pod and health, for a check that waited on the
+    deployment settling: its set, readiness and restarts, and its full
+    health check with its details (CI 44556229125: a server 0/1 for over
+    30 minutes, its consumer "not current" at every check, not restarted)."""
+    try:
+        every = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+                               "-o", "json", check=False) or "{}").get("items", [])
+    except ValueError as failed:
+        s.note(f"{when}: the broker's servers could not be listed: {failed}")
+        return
+    if not every:
+        s.note(f"{when}: no broker server is there")
+    for pod in every:
+        name = pod["metadata"]["name"]
+        status, said = monitored(name, ("/healthz?details=true",))["/healthz?details=true"]
+        restarted = sum(c.get("restartCount", 0) for c in pod["status"].get("containerStatuses", []))
+        s.note(f"{when}: {name} (set {pod['metadata'].get('labels', {}).get('meridian.dev/broker-set', '?')}) "
+               f"{pod['status'].get('phase')}, ready {ready(pod)}, restarted {restarted} time(s); "
+               f"/healthz?details=true {status} {' '.join(said.split())[:600]}")
+
+
+def not_settled(s, when):
+    """What a wait for every member found last, where it ended unsettled:
+    the clause that did not hold, and every broker server's health."""
+    ago = round(time.time() - UNSETTLED["at"]) if UNSETTLED["at"] else None
+    s.note(f"{when}: not settled, at the last look ({'never looked' if ago is None else f'{ago} s ago'}): "
+           f"{UNSETTLED['why'] or 'every member, database member and broker server ready'}")
+    broker_health(s, when)
 
 
 def helm_takes_counts():
@@ -3065,7 +3549,9 @@ def tls_turned_on(s):
     s.check(settled, "internal TLS on: every member ready after the upgrade")
     figure("internal TLS on: every member ready after the upgrade", took_s=round(time.time() - began))
     if not settled:
+        not_settled(s, "internal TLS on")
         raise SystemExit("the deployment did not settle with internal TLS on")
+    upgrade_rolled_out(s, "internal TLS on")
     TLS = True
     internal_tls(s)
     if DRIVEN:
@@ -3093,28 +3579,34 @@ def database_said(s, when):
 def rollout_unfinished():
     """Each Deployment and StatefulSet of the release whose rollout is not
     finished, and why, judged as `meridian upgrade-deployment` judges it
-    before it says an upgrade is done (meridian-cli, upgrade_deployment.rs):
-    its template seen by its controller, every replica on it and ready,
-    and nothing old left -- a StatefulSet's current revision its update's."""
-    left = []
-    for kind in ("deployments", "statefulsets"):
-        items = json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
-        for item in items:
-            name, spec, status = item["metadata"]["name"], item["spec"], item.get("status", {})
-            wanted = spec.get("replicas", 1)
-            if item["metadata"].get("generation", 0) > status.get("observedGeneration", 0):
-                left.append(f"{name}: its new template not yet seen")
-            elif status.get("updatedReplicas", 0) < wanted:
-                left.append(f"{name}: {status.get('updatedReplicas', 0)} of {wanted} on the new template")
-            elif status.get("readyReplicas", 0) < wanted:
-                left.append(f"{name}: {status.get('readyReplicas', 0)} of {wanted} ready")
-            elif kind == "deployments" and (status.get("replicas", 0) > wanted
-                                            or status.get("availableReplicas", 0) < wanted):
-                left.append(f"{name}: old pods still being replaced")
-            elif kind == "statefulsets" and spec.get("updateStrategy", {}).get("type") != "OnDelete" \
-                    and status.get("currentRevision") != status.get("updateRevision"):
-                left.append(f"{name}: its update not finished")
-    return left
+    before it says an upgrade is done (e2e/cluster/rollout.py)."""
+    items = {kind: json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+             for kind in ("deployments", "statefulsets")}
+    return rollout.unfinished(items["deployments"], items["statefulsets"])
+
+
+def rollout_left():
+    """What of the release has not rolled out, but the sharded instance's
+    standby pod, never ready by design (scaled)."""
+    return [left for left in rollout_unfinished() if SHARDED not in left]
+
+
+def rolled_out():
+    """Every workload of the release rolled out (rollout_left). Not
+    `condition=Available` (all_ready): a Deployment that replaces a pod at a
+    time is Available all through its rollout, an old pod still to go (PR
+    CI 44604574060: the dashboard's, two copies, maxSurge 0)."""
+    return not rollout_left()
+
+
+def upgrade_rolled_out(s, what, seconds=600):
+    """After an upgrade, every workload of the release rolled out, as
+    `meridian upgrade-deployment` waits for it before it says the upgrade
+    is done; checked, and says whether."""
+    done = happens(rolled_out, seconds, every=5)
+    s.check(done, f"{what}: every workload of the release rolled out after the upgrade"
+            + ("" if done else f" ({'; '.join(rollout_left()[:4])})"))
+    return done
 
 
 def ready_of(pod):
@@ -3231,8 +3723,15 @@ SAID_KEPT = []
 # loopback alone (`http: 127.0.0.1:8222`, broker_config) and is reached by
 # a port-forward, which lands on the pod's own loopback.
 BROKER_MONITOR_PORT = 8222
-BROKER_SAID = ("/healthz?js-enabled-only=true", "/jsz?streams=true&consumers=true&config=true",
-               "/raftz?group=_meta_", "/routez", "/varz")
+# Its full health with the details of every check that failed, and every
+# Raft group it holds -- the metadata group, each stream's and each
+# consumer's -- not the metadata group alone (CI 44556229125: a consumer's
+# group "not current" on one server, which neither showed). /raftz names
+# one account's groups, the system account's where none is asked: the
+# metadata group there, the streams' and consumers' in the global account,
+# $G, where the deployment's components keep them.
+BROKER_SAID = ("/healthz?details=true", "/jsz?streams=true&consumers=true&config=true",
+               "/raftz", "/raftz?acc=$G", "/routez", "/varz")
 
 
 def broker_servers():
@@ -3389,6 +3888,77 @@ def cluster_said(when):
     print(f"R: {when}: what the cluster said, kept in {name}", flush=True)
 
 
+def jetstream_claims():
+    """The JetStream broker set's volume claims, by name: its servers'
+    `jetstream-<set>-<n>`, with each one's creation time."""
+    said = json.loads(out("get", "pvc", "-o", "json", check=False) or "{}").get("items", [])
+    prefix = f"jetstream-{FULL}-broker-jetstream-"
+    return {c["metadata"]["name"]: c["metadata"]["creationTimestamp"] for c in said
+            if c["metadata"]["name"].startswith(prefix)}
+
+
+def jetstream_servers():
+    """The JetStream broker set's servers running and not going, by name."""
+    try:
+        return [p["metadata"]["name"] for p in pods("broker")
+                if p["metadata"]["labels"].get("meridian.dev/broker-set") == f"{FULL}-broker-jetstream"]
+    except (ValueError, SystemExit):
+        return []
+
+
+def write_ahead_last():
+    """The furthest the lake's write-ahead stream has reached, as any
+    JetStream server says it (/jsz): 0 where none says. Never raises."""
+    last = 0
+    for server in jetstream_servers():
+        _, said = monitored(server, ("/jsz?accounts=true&streams=true",))["/jsz?accounts=true&streams=true"]
+        try:
+            for account in json.loads(said).get("account_details") or []:
+                for stream in account.get("stream_detail") or []:
+                    if stream.get("name") == WRITE_AHEAD_STREAM:
+                        last = max(last, int((stream.get("state") or {}).get("last_seq") or 0))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return last
+
+
+# What the lake's writer says where the stream's identity changed under it
+# (crates/lake/src/write_ahead.rs, write_forever): the stream deleted and
+# made again under its name. Never on a server lost or a leader moved.
+MADE_AGAIN = "the write-ahead stream was made again under its name"
+
+
+def lake_said_since(began):
+    """Each lake pod's logs since `began` (a time.time()), all containers."""
+    return {p["metadata"]["name"]: kubectl("logs", p["metadata"]["name"], "--all-containers",
+                                           f"--since={int(time.time() - began) + 30}s", check=False,
+                                           quiet=True).stdout.decode(errors="replace")
+            for p in pods("lake")}
+
+
+def made_again_since(s, began, what):
+    """The review of item 191's finding 8: the stream's identity (its
+    `created`) is the same through a broker server lost or its leader
+    moved, so the lake never takes it as a stream made again."""
+    said = sorted(name for name, log in lake_said_since(began).items() if MADE_AGAIN in log)
+    s.check(not said, f"{what}: the lake never took its write-ahead stream as made again "
+            f"({', '.join(said) or 'no lake pod said so'})")
+
+
+def write_ahead_places():
+    """The lake's committed places in its write-ahead streams, by stream
+    identity (item 191: kept under `LAKE_WRITE_AHEAD.<identity>`, and
+    `.group-<g>` past group 0): each identity's slowest group's sequence."""
+    places = {}
+    for line in psql("select stream, sequence from lake_write_ahead "
+                     f"where stream like '{WRITE_AHEAD_STREAM}.%'", quiet=True).splitlines():
+        key, _, sequence = line.partition("|")
+        identity = key.split(".")[1]
+        if identity.isdigit():
+            places[identity] = min(places.get(identity, int(sequence)), int(sequence))
+    return places
+
+
 def reconfigure(s):
     global SHAPE
     failed_before = len(s.failures)
@@ -3397,6 +3967,8 @@ def reconfigure(s):
     if len(s.failures) > failed_before:
         cluster_said("reconfigure's internal TLS and archive")
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
+    identities_before = None
+    left_ha_ns = 0
     for target in RECONFIGURE:
         failed_before = len(s.failures)
         # Ended early -- a wait that stopped the move, or a return after a
@@ -3408,8 +3980,17 @@ def reconfigure(s):
             # (back from ha), one upgrade gives it its standbys.
             alone = not under_patroni()
             print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
+            # Leaving ha (item 191): the furthest the write-ahead stream
+            # reached before its set went, read until its servers are gone.
+            leaving = SHAPE == "ha" and target == "tolerant"
+            reached = [write_ahead_last()] if leaving else []
             began = time.time()
             upgraded = upgrade(f"resilience.profile={target}")
+            if leaving:
+                def gone():
+                    reached.append(write_ahead_last())
+                    return not jetstream_servers()
+                happens(gone, 180, every=2)
             s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
                     + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
             if upgraded.returncode != 0:
@@ -3453,11 +4034,62 @@ def reconfigure(s):
             took = time.time() - began
             s.check(settled, f"reconfigure: every member in the {target} shape and ready after the upgrade")
             if not settled:
+                not_settled(s, f"reconfigure to {target}")
                 for component in STORES:
                     explain(s, f"reconfigure to {target}", component)
                 return
+            upgrade_rolled_out(s, f"reconfigure to {target}")
             connections_held(s, f"reconfigure to {target}")
             extra = {"from": "tolerant" if target == "ha" else "ha"}
+            if leaving:
+                # JetStream's volumes go with its set, and the writes the
+                # stream held past the lake's place are stranded: never
+                # answered, so their plugins ask again (item 191; no drain).
+                deleted = happens(lambda: not jetstream_claims(), 180, every=2)
+                s.check(deleted, "reconfigure to tolerant: JetStream's volumes deleted with its set (item 191)"
+                        + ("" if deleted else f": {sorted(jetstream_claims())} left"))
+                # What the stream held past the lake's slowest writer
+                # group's committed place as its set went: an upper bound on
+                # the writes stranded, never answered. A write past it that
+                # its own range's group committed, or that its plugin's
+                # retry already sent again, is in it too (the review of item
+                # 191's finding 10).
+                places = write_ahead_places()
+                place = places[max(places, key=int)] if places else 0
+                past = max(0, max(reached) - place)
+                figure("reconfigure: writes the write-ahead stream held past the lake's slowest group's "
+                       "place leaving ha (at most this many stranded)",
+                       stranded_at_most=past, reached=max(reached), place=place)
+                extra["stranded_at_most"] = past
+                identities_before = set(places)
+                left_ha_ns = time.time_ns()
+            elif target == "ha" and identities_before is not None:
+                # Back to ha (item 191): the servers on volumes made by this
+                # upgrade, and the lake in the stream made again, its own
+                # place kept under its identity, taken from its first write.
+                since = datetime.datetime.fromtimestamp(began, datetime.timezone.utc)
+                claims = jetstream_claims()
+                fresh = len(claims) == 3 and all(
+                    datetime.datetime.fromisoformat(made.replace("Z", "+00:00")) >= since.replace(microsecond=0)
+                    for made in claims.values())
+                s.check(fresh, f"reconfigure back to ha: the broker's servers on fresh volumes (item 191): {claims}")
+                taken = happens(lambda: set(write_ahead_places()) - identities_before, 180, every=5)
+                s.check(taken, "reconfigure back to ha: the lake keeps its place in the stream made again "
+                        f"under its own identity (before {sorted(identities_before)}, now "
+                        f"{sorted(write_ahead_places())})")
+                # Nothing counted lost (the review of item 191's finding
+                # 10): no run the lake found dropped under the new stream's
+                # identity, and no dataset gap recorded since ha was left.
+                new = sorted(set(write_ahead_places()) - identities_before)
+                runs = psql("select count(*) from lake_write_ahead_dropped where "
+                            + " or ".join(f"stream like '{WRITE_AHEAD_STREAM}.{identity}%'" for identity in new),
+                            quiet=True).strip() if new else "?"
+                gaps = psql(f"select count(*) from lake_dataset_gap where recorded_at_ns >= {left_ha_ns}",
+                            quiet=True).strip()
+                s.check(runs == "0" and gaps == "0",
+                        "reconfigure back to ha: the lake took the stream made again from its first write, "
+                        f"nothing counted lost ({runs} runs found dropped in it, {gaps} dataset gaps since ha "
+                        "was left)")
             if DRIVEN:
                 # RPO through the stores across the move: the database moved
                 # under Patroni and back, every member replaced, and nothing
@@ -3694,6 +4326,7 @@ def groups_upgraded(s, what, groups, held, *sets):
     s.check(settled, f"{what}: every workload rolled out and ready after the upgrade"
             + ("" if settled else f" ({'; '.join(rollout_unfinished()[:4])})"))
     if not settled:
+        not_settled(s, what)
         return False
     s.check(acks_again(int(time.time() * 1000), seconds=300),
             f"{what}: the write driver acknowledged by the book and the lake again")
@@ -4014,7 +4647,9 @@ def archived_in_tolerant(s):
     s.check(settled, "restore: every member ready with the archive on after the upgrades")
     figure("restore: every member ready with the archive on", took_s=round(time.time() - began))
     if not settled:
+        not_settled(s, "the archive on")
         raise SystemExit("the deployment did not settle with the archive on")
+    upgrade_rolled_out(s, "restore: the archive on")
     s.check(not under_patroni(), "restore: the base backup is taken from the database alone, as tolerant runs it")
 
     def archive_said(words):
@@ -4127,8 +4762,10 @@ def restored_to_a_time(s):
             seconds=300)
     for name, replicas in running.items():
         kubectl("scale", "deployment", name, f"--replicas={replicas}")
-    s.check(happens(settled_everywhere, 900, every=5),
-            f"restore: every component ready again, and the database's {members} members")
+    settled = happens(settled_everywhere, 900, every=5)
+    s.check(settled, f"restore: every component ready again, and the database's {members} members")
+    if not settled:
+        not_settled(s, "restore")
     rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT)
     s.check(rows == "1:before,2:before,3:before", f"restore: the rows as they stood at the time ({rows})")
     for component, d, name, _ in extras:
@@ -4895,6 +5532,7 @@ def write_ahead_bound(s):
     # failed"); then the lease's holder a pod that runs.
     for rolled in ("lake", "lake-reader"):
         kubectl("rollout", "status", f"deployment/{FULL}-{rolled}", "--timeout=600s", check=False)
+    upgrade_rolled_out(s, "write-ahead-bound: the bound set short")
     wait_for("the lake's writer running", lambda: writer_pod("lake") in
              [p["metadata"]["name"] for p in pods("lake")], seconds=300)
     since = int(time.time() * 1e9)
@@ -4973,6 +5611,7 @@ def write_ahead_bound(s):
     back = upgrade("lake.writeAhead.maxAge=10m")
     s.check(back.returncode == 0, "write-ahead-bound: the stream's bound set back")
     wait_for("lake settled", lambda: members_settled("lake"), seconds=600)
+    upgrade_rolled_out(s, "write-ahead-bound: the bound set back")
     # Every member of the sets this run pinned placed and ready after both
     # upgrades: none left Pending where no node can hold it.
     for name in pinned_sets():
@@ -5148,17 +5787,22 @@ def rows_read_are_kept(s, failure, began_ms):
             f"{len(missing)} not held{': ' + ', '.join(missing[:5]) if missing else ''})")
 
 
-def page_entitled(s):
-    """The data driver entitled to read its own dataset back, as a deployment
-    admin entitles a reader (W10.1): its DatasetEntitlement recorded where
-    the conductor keeps it, published whole within a minute. Once a run."""
+def entitled(dataset, instance, why):
+    """An instance entitled to read a dataset, as a deployment admin
+    entitles a reader (W10.1): its DatasetEntitlement recorded where the
+    conductor keeps it, which the conductor publishes whole within a
+    minute."""
     now = time.time_ns()
-    dataset, instance = "drive-data:drive", "drive-data"
-    why = "the buy-side trust targets: the page reads the driver's price back"
     entitlement = (text_field(1, dataset) + text_field(2, instance) + varint(3 << 3) + varint(1)
                    + text_field(5, ADMIN) + varint(6 << 3) + varint(now) + text_field(9, why))
     psql("INSERT INTO config_dataset_entitlement_change (dataset, instance, entitlement, changed_at_ns) "
          f"VALUES ('{dataset}', '{instance}', decode('{entitlement.hex()}', 'hex'), {now})")
+
+
+def page_entitled(s):
+    """The data driver entitled to read its own dataset back (entitled),
+    and reading it. Once a run."""
+    entitled("drive-data:drive", "drive-data", "the buy-side trust targets: the page reads the driver's price back")
     reading = happens(lambda: any(r[1] == "ok" for r in page_reads(0)), 240, every=5)
     s.check(reading, "the page reads the driver's price back")
 
@@ -5212,6 +5856,9 @@ class Dashboard:
 
     HOST = "failover-e2e.localhost"
     CALLBACK = "http://127.0.0.1:53682/callback"
+    # How many times a request whose forward ended is sent again, each on a
+    # forward made anew.
+    RESENDS = 2
 
     def __init__(self):
         import socket
@@ -5239,7 +5886,7 @@ class Dashboard:
                      f"{self.port}:80"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(1)
             try:
-                return self.send("GET", "/sign-in")[0] == 200
+                return self.sent("GET", "/sign-in")[0] == 200
             except (OSError, http.client.HTTPException):
                 return False
         if happens(answers, 120, every=1):
@@ -5253,7 +5900,48 @@ class Dashboard:
             self.forward.wait()
             self.forward = None
 
-    def send(self, method, path, fields=None, body=None, bearer=None):
+    @staticmethod
+    def ended(error):
+        """Whether `error` is the forward ending under a request: the pod it
+        landed on stopped (a rollout's, PR CI 44604574060), the connection
+        closed with no response, reset or refused."""
+        if isinstance(error, urllib.error.HTTPError):
+            return False
+        if isinstance(error, urllib.error.URLError):
+            error = error.reason
+        return isinstance(error, (ConnectionError, http.client.RemoteDisconnected))
+
+    def made_anew(self, method, path, error, attempt):
+        """The forward made anew after it ended under `method path`, said."""
+        print(f"R: the dashboard's forward ended under {method} {path} ({error!r}); made anew "
+              f"({attempt} of {self.RESENDS})", flush=True)
+        if not self.forwarded():
+            raise SystemExit(f"{method} {path}: the dashboard's forward ended under it, and it did not "
+                             f"answer over a forward made anew")
+
+    def send(self, method, path, fields=None, body=None, bearer=None, again=None):
+        """The request sent; its status, body and Location. Where the forward
+        ends under it, the forward is made anew and a GET sent again, up to
+        RESENDS times; any other request only where `again()` says what it
+        would start has not begun, and otherwise it stops here: it may
+        have acted."""
+        for attempt in range(self.RESENDS + 1):
+            try:
+                return self.sent(method, path, fields=fields, body=body, bearer=bearer)
+            except (OSError, http.client.HTTPException) as error:
+                if not self.ended(error):
+                    raise
+                if attempt == self.RESENDS:
+                    raise SystemExit(f"{method} {path}: the dashboard's forward ended under it "
+                                     f"{attempt + 1} times ({error!r})")
+                self.made_anew(method, path, error, attempt + 1)
+                if method != "GET" and not (again and again()):
+                    raise SystemExit(f"{method} {path}: the dashboard's forward ended under it ({error!r}); "
+                                     f"made anew, the request not sent again: it may have acted")
+        raise AssertionError("unreachable")
+
+    def sent(self, method, path, fields=None, body=None, bearer=None):
+        """The request sent once, over the forward as it is."""
         data, kind = None, None
         if body is not None:
             data, kind = json.dumps(body).encode(), "application/json"
@@ -5336,29 +6024,51 @@ class Dashboard:
                 return
         self.connect()
 
-    def call(self, tool, arguments):
-        """A tool called as her client: its structured answer."""
+    def call(self, tool, arguments, again=None):
+        """A tool called as her client: its structured answer. `again`, as
+        `send` takes it: whether the call may be sent again where the
+        forward ended under it."""
         asked = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                  "params": {"name": tool, "arguments": arguments}}
-        status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
+        status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access, again=again)
         if status == 401 and "expired" in said:
             self.refreshed()
-            status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access)
+            status, said, _ = self.send("POST", "/mcp", body=asked, bearer=self.access, again=again)
         if status != 200:
             raise SystemExit(f"{tool}: /mcp answered {status}: {said[:400]}")
         return (json.loads(said).get("result") or {}).get("structuredContent") or {}
 
-    def move_dialog(self, partition, group, note):
+    def move_dialog(self, partition, group, note, unbegun):
         """The Resilience page's Move dialog posted, as she posts it signed in:
-        its status and where it sent her."""
-        status, page, _ = self.send("GET", "/admin/resilience")
-        token = re.search(r'action="/admin/resilience/move-partition"><input type="hidden" '
-                          r'name="form_token" value="([^"]+)"', page)
-        if status != 200 or not token:
-            raise SystemExit(f"the Resilience page with its Move dialog was not shown: {status}")
-        status, _, location = self.send("POST", "/admin/resilience/move-partition", fields={
-            "form_token": token.group(1), "partition": partition, "target_group": str(group), "note": note})
-        return status, location or ""
+        its status and where it sent her. Where the forward ends under her
+        post, it is made anew and the dialog posted again from the page and
+        a token shown again, only once `unbegun()` says, from the store, that
+        no move of it began: a post again never starts a second move. Up to
+        RESENDS times, each said."""
+        path = "/admin/resilience/move-partition"
+        for attempt in range(self.RESENDS + 1):
+            status, page, _ = self.send("GET", "/admin/resilience")
+            token = re.search(r'action="/admin/resilience/move-partition"><input type="hidden" '
+                              r'name="form_token" value="([^"]+)"', page)
+            if status != 200 or not token:
+                raise SystemExit(f"the Resilience page with its Move dialog was not shown: {status}")
+            try:
+                status, _, location = self.sent("POST", path, fields={
+                    "form_token": token.group(1), "partition": partition, "target_group": str(group),
+                    "note": note})
+                return status, location or ""
+            except (OSError, http.client.HTTPException) as error:
+                if not self.ended(error):
+                    raise
+                if attempt == self.RESENDS:
+                    raise SystemExit(f"her Move dialog: the dashboard's forward ended under her post "
+                                     f"{attempt + 1} times ({error!r})")
+                self.made_anew("POST", path, error, attempt + 1)
+                if not unbegun():
+                    raise SystemExit(f"her Move dialog: the dashboard's forward ended under her post ({error!r}), "
+                                     f"and the store shows a move of {partition} begun: not posted again")
+                print(f"R: her Move dialog: no move of {partition} begun; posted again", flush=True)
+        raise AssertionError("unreachable")
 
     def sign_in(self):
         status, _, _ = self.send("POST", "/sign-in", fields={
@@ -5568,6 +6278,10 @@ def book_partitions():
     return [f"P{i}" for i in range(BOOK_PARTITIONS)]
 
 
+# How long a move is given to end, moved or aborted, from its request.
+MOVE_ENDS_S = 120
+
+
 def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
     """One move under the driver's load, by her tool (or her Move dialog):
     answered at once, ended moved within switchSeconds, the driver's writes
@@ -5587,17 +6301,24 @@ def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
         ended = "moved" if moved else None
     else:
         note = f"rebalance: {kind} {name} moved under load"
+
+        def unbegun():
+            """No move of it begun by a request whose answer the dashboard's
+            forward lost: none ended, moved or aborted, within the time a
+            move is given to end, and the target not its owner."""
+            owner = lake_owner if store == "lake" else book_owner
+            return partition_moved(store, name, since_ns, MOVE_ENDS_S) is None and owner(name) != target
         if by_dialog:
-            status, location = dash.move_dialog(name, target, note)
+            status, location = dash.move_dialog(name, target, note, unbegun)
             s.check(status == 303 and location.endswith("#partitions"),
                     f"rebalance: {what}: her Move dialog answered by the store, the move begun "
                     f"({status} to {location})")
         else:
             answer = dash.call("dashboard__move_partition",
-                               {"partition": name, "target_group": target, "note": note})
+                               {"partition": name, "target_group": target, "note": note}, again=unbegun)
             s.check(answer.get("outcome") == "made",
                     f"rebalance: {what}: dashboard__move_partition answered, the move begun ({answer})")
-        ended = partition_moved(store, name, since_ns, 120)
+        ended = partition_moved(store, name, since_ns, MOVE_ENDS_S)
         s.check(ended == "moved", f"rebalance: {what}: switched, its digests equal ({ended})")
     ended_ms = int(time.time() * 1000)
     window_held(s, what, began_ms, ended_ms)
@@ -5673,9 +6394,12 @@ def rebalance(s):
     began = time.time()
     upgraded = upgrade(f"bor.partitions={BOOK_PARTITIONS}")
     s.check(upgraded.returncode == 0, "rebalance: the book at four partitions")
-    for deployment in (f"{FULL}-bor", f"{FULL}-bor-group-1"):
-        run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
-            "--timeout=420s", check=False)
+    # Every workload rolled out before her forward is made: the dashboard's
+    # among them, handed the chart's values, which replaces its two copies
+    # one at a time and is Available all through (PR CI 44604574060: her
+    # forward landed on the last old pod, which the rollout then ended
+    # under her Move dialog's post).
+    upgrade_rolled_out(s, "rebalance: the book at four partitions")
     wait_for("every component ready", all_ready, seconds=600)
     dash = Dashboard()
     try:
@@ -5752,6 +6476,7 @@ def moves(s, dash):
             "--timeout=420s", check=False)
     ready = happens(all_ready, 600, every=5)
     s.check(ready, "rebalance: every component ready at two databases")
+    upgrade_rolled_out(s, "rebalance: the lake and the book at two databases")
     # The dashboard's pod was replaced too: it is handed the chart's
     # resilience values (item 34), which the databases' count changed, and
     # her port-forward ended with the old pod (PR CI 43783060111: the next
@@ -6018,11 +6743,9 @@ def scale_upgraded(s, what, *sets):
         return False
     migrated(s, f"write-scale: {what}")
     # But the sharded instance's: its standby pod is never ready, by design.
-    def unfinished():
-        return [left for left in rollout_unfinished() if SHARDED not in left]
-    settled = happens(lambda: not unfinished() and all_ready() and group_members_ready(2), 900, every=5)
+    settled = happens(lambda: rolled_out() and all_ready() and group_members_ready(2), 900, every=5)
     s.check(settled, f"write-scale: {what}: every workload rolled out and ready"
-            + ("" if settled else f" ({'; '.join(unfinished()[:4])})"))
+            + ("" if settled else f" ({'; '.join(rollout_left()[:4])})"))
     return settled
 
 
@@ -6135,6 +6858,7 @@ def writer_groups(s):
             rolled = run("kubectl", "--namespace", NAMESPACE, "rollout", "status", f"deployment/{deployment}",
                          "--timeout=420s", check=False)
             s.check(rolled.returncode == 0, f"writer groups: {deployment} rolled out and ready")
+    upgrade_rolled_out(s, "writer groups: at two")
     groups_ok = happens(lambda: all(any(ready(p) for p in pods(c)) for c in
                                     ("lake", "lake-group-1", "bor", "bor-group-1")), 300)
     s.check(groups_ok, "writer groups: each store's group 0 and group 1 writer ready")
@@ -6209,7 +6933,8 @@ def writer_groups(s):
     counts = handed_on_counts()
     for topic in WRITES_HANDED_ON:
         if topic == "platform.lake.internal.record" and PROFILE == "ha":
-            taken = psql("select count(*) from lake_write_ahead where stream = 'LAKE_WRITE_AHEAD.group-1' "
+            # Group 1's place, kept under the stream's identity (item 191).
+            taken = psql("select count(*) from lake_write_ahead where stream like 'LAKE_WRITE_AHEAD.%.group-1' "
                          f"and committed_at_ns >= {since_ns}").strip()
             s.check(taken == "1", "writer groups: the lake's group 1 took its writes from the write-ahead stream, "
                     f"its own place in it moved since ({taken or 'none'})")
@@ -6247,6 +6972,16 @@ def main():
             page_entitled(s)
         except SystemExit as stopped:
             s.check(False, f"the page's entitlement: {stopped}")
+    if PROFILE == "scaled":
+        # The instruments every driver names, and the shards' subjects, and
+        # the shard reader entitled to the shards' dataset: written before
+        # the shape is read, so the reader's standing want is the lake's
+        # by the time the shards are (item 33).
+        try:
+            driver_fixtures(s)
+            entitled(SHARD_DATASET, SHARD_READER, "each subject served once: the reader's want shared by the shards")
+        except SystemExit as stopped:
+            s.check(False, f"the drivers' fixtures: {stopped}")
     if TLS:
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
@@ -6256,12 +6991,15 @@ def main():
             shards(s)
         except SystemExit as stopped:
             s.check(False, f"shards: {stopped}")
+        try:
+            served_whole(s)
+        except SystemExit as stopped:
+            s.check(False, f"served once: the record could not be read: {stopped}")
     properties(s, "the install")
     if PROFILE == "scaled":
         # Last: it changes the install's shape (two writer groups, then two
         # databases), which every reading above holds as installed.
         try:
-            driver_fixtures(s)
             write_scale(s)
         except SystemExit as stopped:
             s.check(False, f"write-scale: {stopped}")

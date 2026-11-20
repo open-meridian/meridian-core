@@ -7,10 +7,12 @@ for main.
 This file holds what ci.yaml's tiered jobs run, as data -- the stage legs, the
 harness groups, the cluster runs -- and decides, for a run, which of them run:
 
-  ci_tier.py plan --event E [--base B --head H]
+  ci_tier.py plan --event E [--base B --head H] [--base-ref R]
       key=value lines for $GITHUB_OUTPUT: each job's matrix, as JSON, and
       what the pull request leaves to the queue. Any event but pull_request,
-      and a pull request whose changes cannot be read, runs everything.
+      a pull request into a branch other than main (R, the branch it merges
+      into: a stage branch has no merge queue, ruling 205 of 2026-11-19), and
+      a pull request whose changes cannot be read, run everything.
   ci_tier.py table
       every job, today / pull request (fast tier) / merge queue, as Markdown.
   ci_tier.py suites
@@ -161,11 +163,16 @@ def select(paths: list[str] | None) -> dict:
     return {"full": False, "why": why, **{k: sorted(v) for k, v in chosen.items()}}
 
 
-def plan(event: str, paths: list[str] | None) -> dict[str, str]:
+def plan(event: str, paths: list[str] | None, base_ref: str = "") -> dict[str, str]:
     """The outputs a run's tier job writes: each tiered job's matrix and
-    what is left to the queue, as JSON."""
-    full = event != "pull_request"
-    chosen = {"full": True, "why": [f"{event}: everything runs"]} if full else select(paths)
+    what is left to the queue, as JSON. A pull request into a branch other
+    than main runs everything: no merge queue runs after it (ruling 205)."""
+    if event != "pull_request":
+        chosen = {"full": True, "why": [f"{event}: everything runs"]}
+    elif base_ref and base_ref != "main":
+        chosen = {"full": True, "why": [f"a pull request into {base_ref}, which has no merge queue: everything runs"]}
+    else:
+        chosen = select(paths)
     every = chosen["full"]
     stages = [leg for leg in STAGE_LEGS if every or leg["stage"] in chosen["stages"]]
     harness = [g for g in HARNESS_GROUPS if every or g["group"] in chosen["harness"]]
@@ -194,7 +201,8 @@ JOBS_UNTIERED = ["ci-local (checks)", "ci-local (lint)", "ci-local (images)", "c
 
 
 def table() -> str:
-    rows = ["| job | today | pull request (fast tier) | merge queue |", "|---|---|---|---|"]
+    rows = ["| job | today | pull request into main (fast tier) | merge queue, and a pull request into a stage branch |",
+            "|---|---|---|---|"]
     for name in JOBS_UNTIERED:
         rows.append(f"| {name} | runs | runs | runs |")
     for leg in STAGE_LEGS:
@@ -243,6 +251,7 @@ def check(workflow: pathlib.Path, makefile: pathlib.Path) -> list[str]:
         ("matrix: ${{ fromJSON(needs.tier.outputs.harness) }}", "the harness groups' matrix from the plan"),
         ("matrix: ${{ fromJSON(needs.tier.outputs.clusters) }}", "the cluster runs' matrix from the plan"),
         ("tools/ci_tier.py plan", "the tier job running the plan"),
+        ('--base-ref "$BASE_REF"', "the plan told the branch a pull request merges into"),
         ("needs.tier.outputs.harness_any != 'false'", "the harness job run unless the plan says none"),
         ("needs.tier.outputs.full != 'false'", "the arm64 run run unless the plan says the pull request's tier"),
         ("every job of the merge queue's run succeeded", "ci-local failing a queue run where a job did not succeed"),
@@ -270,6 +279,10 @@ def self_test() -> int:
     assert plan("pull_request", [".github/workflows/ci.yaml"])["full"] == "true"
     assert plan("pull_request", None)["full"] == "true"
     assert plan("workflow_dispatch", ["INSTALL.md"])["full"] == "true"
+    # A pull request into a stage branch runs everything, whatever it touches
+    # (ruling 205: the stage branch has no merge queue); one into main, its tier.
+    assert plan("pull_request", ["INSTALL.md"], base_ref="c30d")["full"] == "true"
+    assert plan("pull_request", ["INSTALL.md"], base_ref="main")["full"] == "false"
     # Every cluster name a rule names is a cluster run.
     for _, adds in RULES:
         for name in adds.get("clusters", []):
@@ -288,6 +301,7 @@ def main() -> int:
     p.add_argument("--event", required=True)
     p.add_argument("--base", default="")
     p.add_argument("--head", default="HEAD")
+    p.add_argument("--base-ref", default="", help="the branch a pull request merges into")
     sub.add_parser("table")
     sub.add_parser("suites")
     c = sub.add_parser("check")
@@ -298,7 +312,7 @@ def main() -> int:
         return self_test()
     if asked.command == "plan":
         paths = changed_files(asked.base, asked.head) if asked.event == "pull_request" and asked.base else None
-        for key, value in plan(asked.event, paths).items():
+        for key, value in plan(asked.event, paths, asked.base_ref).items():
             print(f"{key}={value}")
         return 0
     if asked.command == "suites":
