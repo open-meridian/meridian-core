@@ -1151,3 +1151,44 @@ fn a_place_moved_by_the_release_before_reads_on_from_it() {
     assert_eq!(read("DLG-NEW"), ["01N5"]);
     assert!(read("DLG-NEW").is_empty());
 }
+
+/// One reader reading twice at once (the review of v31a-core-1, finding 4):
+/// an agent's two calls through one delegation, each on its own copy of the
+/// dashboard. Each new notice is returned to one of them, never both.
+#[test]
+fn one_readers_reads_at_once_return_each_notice_once() {
+    use std::sync::{Arc, Barrier};
+    use tickets::TicketStore as _;
+    let (_url, database) = migrated("inbox_at_once");
+    let store = Arc::new(tickets::InPostgres::on(database));
+    for round in 0..20_i64 {
+        let id = format!("01R{round:02}");
+        store
+            .insert(
+                &ticket(&format!("TKT-R{round:02}"), &id, T0 + round),
+                &[notice(
+                    &id,
+                    "local|ada",
+                    &format!("TKT-R{round:02}"),
+                    T0 + round,
+                )],
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (store, barrier) = (Arc::clone(&store), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    tickets::store::read_new(&*store, "local|ada", "DLG-1", 50).unwrap()
+                })
+            })
+            .collect();
+        let read: Vec<String> = readers
+            .into_iter()
+            .flat_map(|reader| reader.join().unwrap())
+            .map(|n| n.notice_id)
+            .collect();
+        assert_eq!(read, [id], "round {round}");
+    }
+}
