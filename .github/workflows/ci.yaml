@@ -935,39 +935,49 @@ jobs:
       # result arrives when its log does not. A red one says its name does
       # not hold; none of them changes the job's result.
       - name: "Probe: the make did not give up on making the cluster"
-        if: failure() && steps.make.outcome == 'failure'
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         continue-on-error: true
         working-directory: workspace/meridian-core
         run: tools/ci-watchdog.sh probe gave-up "$RUNNER_TEMP/make.log"
 
       - name: "Probe: names resolve"
-        if: failure() && steps.make.outcome == 'failure'
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe names "$RUNNER_TEMP/make.log"
 
       - name: "Probe: Docker Hub answers"
-        if: failure() && steps.make.outcome == 'failure'
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe hub "$RUNNER_TEMP/make.log"
 
       - name: "Probe: the results' blob store answers"
-        if: failure() && steps.make.outcome == 'failure'
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe blob "$RUNNER_TEMP/make.log"
 
       - name: "Probe: the runner's network is clear of the cluster's subnet"
-        if: failure() && steps.make.outcome == 'failure'
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe subnet "$RUNNER_TEMP/make.log"
+
+      # A make that did not succeed may leave its k3d cluster up, and every
+      # upload after it then hung until the job's limit (runs 44692159189 and
+      # 44740504927; inferred, not verified). Its logs are files already, so
+      # the cluster goes before the first upload.
+      - name: Remove a cluster the make left
+        if: always() && steps.make.outcome != 'success'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: timeout 90 k3d cluster delete --all || true
 
       - name: Keep what the watchdog saw
         if: always()
@@ -1295,6 +1305,16 @@ jobs:
           if [ "$MAKE_FAILED" = true ]; then
             timeout 90 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
           fi
+
+      # A make that did not succeed may leave its k3d cluster up, and every
+      # upload after it then hung until the job's limit (runs 44692159189 and
+      # 44740504927; inferred, not verified). Its logs are files already, so
+      # the cluster goes before the first upload.
+      - name: Remove a cluster the make left
+        if: always() && steps.make.outcome != 'success'
+        timeout-minutes: 2
+        continue-on-error: true
+        run: timeout 90 k3d cluster delete --all || true
 
       - name: Keep what the watchdog saw
         if: always()
