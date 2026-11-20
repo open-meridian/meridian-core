@@ -707,7 +707,15 @@ fn no_credential_reaches_jetstream_wholesale_or_another_components_stream() {
         (write_ahead::STREAM, "runtime"),
     ];
     for user in &users {
-        for wholesale in ["$JS.>", "$JS.API.>", "$JS.ACK.>", "$JS.FC.>", "$KV.>", "$O.>", ">"] {
+        for wholesale in [
+            "$JS.>",
+            "$JS.API.>",
+            "$JS.ACK.>",
+            "$JS.FC.>",
+            "$KV.>",
+            "$O.>",
+            ">",
+        ] {
             assert!(
                 !user.publish.iter().any(|s| s == wholesale),
                 "{} publishes {wholesale}",

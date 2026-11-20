@@ -205,12 +205,19 @@ mod tests {
         for n in 0..ASKED {
             // Not a unit a worker can answer: taken, refused, acknowledged.
             let asked = units
-                .ask(format!("{{\"not-a-unit\":{n}}}").into_bytes(), Duration::from_secs(2))
+                .ask(
+                    format!("{{\"not-a-unit\":{n}}}").into_bytes(),
+                    Duration::from_secs(2),
+                )
                 .await;
             assert!(asked.is_err(), "a part came back for no unit");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(!worker.is_finished(), "the worker stopped: {:?}", worker.await);
+        assert!(
+            !worker.is_finished(),
+            "the worker stopped: {:?}",
+            worker.await
+        );
 
         let mut stream = units.context.get_stream(STREAM).await.unwrap();
         let mut taking = stream
@@ -224,7 +231,11 @@ mod tests {
             (0, 0, 0),
             "every unit delivered once and acknowledged"
         );
-        assert_eq!(stream.info().await.unwrap().state.messages, 0, "units left in the queue");
+        assert_eq!(
+            stream.info().await.unwrap().state.messages,
+            0,
+            "units left in the queue"
+        );
 
         // The lake's write-ahead stream: refused, so never answered, where a
         // credential granted it would hear at least "stream not found".
