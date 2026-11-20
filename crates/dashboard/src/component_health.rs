@@ -109,8 +109,7 @@ impl Judge {
     /// Each member's latest report judged against what it said before; the
     /// notices that open. A member not heard for 24 hours is let go.
     pub fn judge(&mut self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
-        // Heard: its silence over, and a notice again should it fall silent.
-        self.unheard = Unheard::default();
+        self.heard();
         let mut opened = Vec::new();
         for report in members {
             let key = if report.member.is_empty() {
@@ -286,6 +285,12 @@ impl Judge {
         }]
     }
 
+    /// The conductor answered, whether or not its answer reads: its silence
+    /// over, and a notice again should it fall silent.
+    pub fn heard(&mut self) {
+        self.unheard = Unheard::default();
+    }
+
     /// What one judging opened is kept, or there was nobody to tell: the
     /// conductor's silence, among them, is not offered again while it lasts.
     pub fn kept(&mut self, opened: &[Opened]) {
@@ -387,8 +392,12 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 Ok((_, bytes)) => match ReadComponentHealthReply::decode(&bytes[..]) {
                     Ok(reply) => Some(reply.members),
                     Err(_) => {
-                        // An answer, if not one that reads: not silence.
+                        // An answer, if not one that reads: the silence's
+                        // count ends.
                         tracing::warn!("a ReadComponentHealthReply did not decode");
+                        if let Ok(mut judge) = judge.lock() {
+                            judge.heard();
+                        }
                         continue;
                     }
                 },
@@ -670,6 +679,17 @@ mod tests {
         assert_eq!(kinds(&opened), vec!["component-unheard"]);
         judge.kept(&opened);
         assert!(judge.unanswered(T0 + 5 * MINUTE).is_empty());
+    }
+
+    /// An answer that does not decode is an answer: it ends the silence's
+    /// count (the delta review of 77afd5d0, finding 4).
+    #[test]
+    fn an_answer_that_does_not_read_ends_the_silences_count() {
+        let mut judge = Judge::default();
+        assert!(judge.unanswered(T0 + MINUTE).is_empty());
+        assert!(judge.unanswered(T0 + 2 * MINUTE).is_empty());
+        judge.heard();
+        assert!(judge.unanswered(T0 + 3 * MINUTE).is_empty());
     }
 
     #[test]
