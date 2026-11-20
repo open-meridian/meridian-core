@@ -85,10 +85,10 @@ pub struct Opened {
     /// What it is of, its kind and its window (review-F headline 2): every
     /// copy of the dashboard judging the same reports names the same event,
     /// so the notices' store keeps it once. A restart's window is the
-    /// cluster's time of it; the conductor's silence, the hour of its first
-    /// unheard ask; every other kind's, the hour it opened in, so two copies
-    /// asking seconds apart file one notice, and one condition opening again
-    /// within the hour files none again (decision 40). Two copies judging
+    /// cluster's time of it; every other kind's, the conductor's silence
+    /// among them, the hour it opened in, so two copies asking seconds apart
+    /// file one notice, and one condition opening again within the hour
+    /// files none again (decision 40). Two copies judging
     /// either side of an hour's boundary still file two, until v32.
     pub event: String,
     pub window_ns: i64,
@@ -254,8 +254,9 @@ impl Judge {
     /// The conductor did not answer at `now_ns`: its silence opens a notice
     /// to the deployment admins at the [`UNHEARD_ASKS`]th ask in a row, once
     /// until it answers again (`component-unheard`, approved 2026-11-20).
-    /// Its window is the hour of the first unheard ask, so every copy names
-    /// one event, and a silence again within that hour files none again.
+    /// Its window is the hour of the ask that opens it, as every other
+    /// kind's is the hour it opened in (decision 40), so every copy names one
+    /// event, and a silence opening again within that hour files none again.
     pub fn unanswered(&mut self, now_ns: i64) -> Vec<Opened> {
         let unheard = &mut self.unheard;
         if unheard.asks == 0 {
@@ -267,7 +268,7 @@ impl Judge {
         }
         unheard.open = true;
         let kind = "component-unheard".to_string();
-        let window_ns = unheard.since_ns.div_euclid(HOUR_NS) * HOUR_NS;
+        let window_ns = now_ns.div_euclid(HOUR_NS) * HOUR_NS;
         vec![Opened {
             of: "conductor".into(),
             plugin: false,
@@ -566,7 +567,7 @@ mod tests {
 
     /// The conductor silent (`component-unheard`, approved 2026-11-20):
     /// three asks unanswered in a row are a notice about the conductor to
-    /// the deployment admins, its window the hour of the first unheard ask,
+    /// the deployment admins, its window the hour of the ask that opens it,
     /// as the other conditions' is (decision 40). Every copy judges, and
     /// the keyed ID makes their notices one: within one hour a silence, an
     /// answer and a silence again are one notice, from either copy.
@@ -603,6 +604,41 @@ mod tests {
         assert_eq!(filed[0].kind, "component-unheard");
         assert_eq!(filed[0].plugin_instance_id, "conductor");
         assert!(crate::latency::notices::rows(&filed).contains(">Unheard<"));
+    }
+
+    /// The conductor's silence takes the hour of the ask that opens it as
+    /// its window, as every other kind takes the hour it opened in
+    /// (decision 40; the delta review of 77afd5d0, finding 2): a silence
+    /// begun before the hour and opened in it, an answer, and a silence
+    /// again within that hour are one notice.
+    #[test]
+    fn a_silence_opened_within_one_hour_is_one_notice_whenever_it_began() {
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let eleven = T0.div_euclid(HOUR_NS) * HOUR_NS + HOUR_NS;
+        let heard = [lake(MIB, 0, 0, 0)];
+        let mut judge = Judge::default();
+        let mut ask = |answered: bool, minute: i64| {
+            let at = eleven + minute * MINUTE;
+            let opened = if answered {
+                judge.judge(&heard, at)
+            } else {
+                judge.unanswered(at)
+            };
+            store.notify(&notices_of(&records, &opened, at)).unwrap();
+        };
+        // Unheard at 10:58, 10:59 and 11:00; answered at 11:01; unheard at
+        // 11:02 to 11:04.
+        for minute in -2..=0 {
+            ask(false, minute);
+        }
+        ask(true, 1);
+        for minute in 2..=4 {
+            ask(false, minute);
+        }
+        let filed = store.notices("local|dee", 50).unwrap();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
     }
 
     #[test]
