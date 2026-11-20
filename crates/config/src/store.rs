@@ -48,6 +48,11 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct KnownPlugin {
     pub plugin_instance_id: String,
     pub roles: Vec<String>,
+    /// When the report that was last kept was made. In Postgres that is its
+    /// first, or the one that changed its roles: a report saying what is
+    /// kept already writes nothing (item 210), so this is not its latest
+    /// report's time, which the dashboard's health holds. The memory store,
+    /// which keeps no change log, keeps every report's.
     pub last_reported_at_ns: i64,
 }
 
@@ -848,11 +853,14 @@ pub trait Store: Send + Sync {
     /// The latest sign-in stands; groups are never merged across sign-ins.
     fn record_sign_in(&self, record: &SignInRecord) -> Result<()>;
 
+    /// Keep a plugin heard reporting. In Postgres, written when it is first
+    /// heard and when its roles change, and not otherwise (item 210).
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()>;
 
     /// Replace what a plugin declared it needs. Written only from the report
     /// of a registered plugin, so one that is between registrations keeps
-    /// what it last declared.
+    /// what it last declared; and only where it differs from what is kept,
+    /// so a report declaring the same again writes nothing (item 210).
     ///
     /// In the same step, a value held for a setting [`redeclared`] is
     /// cleared, the clear its own change record naming the re-declaration,
