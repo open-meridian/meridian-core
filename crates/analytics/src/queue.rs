@@ -15,7 +15,9 @@
 //!
 //! The part goes back by core NATS to the inbox the unit names in its
 //! `Meridian-Part-To` header. The stream's subject is the component's own
-//! topic, granted to its credential alone, beside JetStream's API.
+//! topic, granted to its credential alone, beside JetStream's API for this
+//! stream and its one consumer alone: the calls made here, and no other
+//! stream's (the runtime's broker permissions; review C, X1).
 
 use std::sync::Arc;
 use std::time::Duration;

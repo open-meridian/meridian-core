@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 
+use meridian_analytics::queue as units;
 use meridian_bus::write_ahead;
 use meridian_sidecar::Contract;
 
@@ -66,25 +67,12 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// gap. Published and subscribed alike: a member asks and answers, tells
 /// and hears.
 ///
-/// From step 3b, with JetStream at three for the analytics units' work queue
-/// (spec/a-deployment-scales-out-and-fails-over-by-configuration section 4):
-/// JetStream's API and its acknowledgements, to the analytics component's
-/// credential alone, so its coordinators make and fill the queue and its
-/// workers take and acknowledge from it. No other credential holds either.
-///
 /// From contract v30 (W12.4; the step 3 plan's question 13), the analytics
 /// coordinators' own: each says it is live on `members` and hears the
 /// others there, and is handed a standing job's question by another on
 /// `standing.{member}`, its pod's name (approved 2026-11-10); and the lake's
 /// `read-from-writer`, on which a lake reader hands its writer a read that
 /// depends on the writer's own acts (stage B, approved 2026-11-10).
-///
-/// From contract v30's stage E, in `ha`, the lake's write-ahead stream
-/// (the resilience spec's section 4): JetStream's API for that stream alone,
-/// to the lake's credential, so its writer makes the stream and reads it.
-/// No other stream is reached by it, and the analytics component's stays
-/// its own. A data plugin's credential publishes to the stream's subjects of
-/// its own instance alone ([`write_ahead::instance_subjects`]).
 ///
 /// From step 3d (the resilience spec's section 6.7), a write handed to the
 /// writer group owning its partition: the lake's `internal.record` and the
@@ -94,21 +82,15 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// each writer group: `raise-shard.{group}`, the lake's and the book's,
 /// asked by the lake's control writer of every group before it answers a
 /// take.
-const COMPONENT_TOPICS: [(&str, &str); 24] = [
+const COMPONENT_TOPICS: [(&str, &str); 18] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
     ("analytics", "platform.analytics.internal.members"),
     ("analytics", "platform.analytics.internal.standing.*"),
-    ("analytics", "$JS.API.>"),
-    ("analytics", "$JS.ACK.>"),
     ("lake", "platform.lake.internal.read-changes"),
     ("lake", "platform.lake.internal.changes.*"),
     ("lake", "platform.lake.internal.read-from-writer"),
     ("lake", "platform.lake.internal.record"),
     ("lake", "platform.lake.internal.raise-shard.*"),
-    ("lake", "$JS.API.STREAM.*.LAKE_WRITE_AHEAD"),
-    ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD"),
-    ("lake", "$JS.API.CONSUMER.*.LAKE_WRITE_AHEAD.>"),
-    ("lake", "$JS.API.CONSUMER.MSG.NEXT.LAKE_WRITE_AHEAD.*"),
     ("bor", "platform.book.internal.read-changes"),
     ("bor", "platform.book.internal.changes.*"),
     ("bor", "platform.book.internal.command"),
@@ -140,6 +122,59 @@ fn component_topics(components: &[&str]) -> Vec<&'static str> {
         .filter(|(owner, _)| components.contains(owner))
         .map(|(_, topic)| *topic)
         .collect()
+}
+
+/// JetStream's API and acknowledgements a credential holding `components`
+/// is granted: each component's own stream's, and only the calls it makes.
+/// Published alone, never subscribed: the server answers each call on the
+/// caller's inbox and delivers a consumer's messages there, so no client
+/// hears these subjects, and one that could would hear other clients' calls
+/// and could answer for the server.
+///
+/// Every credential is in one account, so a grant over JetStream's whole API
+/// is a grant over every stream in the deployment: the analytics component
+/// holding `$JS.API.>` could delete or purge the lake's write-ahead stream
+/// (review C, 2026-11-20, X1). So each grant names its stream.
+///
+/// From step 3b, with JetStream at three for the analytics units' work queue
+/// (spec/a-deployment-scales-out-and-fails-over-by-configuration section 4),
+/// to the analytics component's credential: its coordinators find or make
+/// the units' stream and put units on it (its subject is the component's
+/// own topic, above), and its workers find or make their one consumer, take
+/// from it and acknowledge each unit taken (`meridian_analytics::queue`).
+///
+/// From contract v30's stage E, in `ha`, the lake's write-ahead stream
+/// (the resilience spec's section 4), to the lake's credential, so its writer
+/// makes the stream and reads it. A data plugin's credential publishes to the
+/// stream's subjects of its own instance alone
+/// ([`write_ahead::instance_subjects`]), in [`permissions_entitled`].
+fn jetstream_grants(components: &[&str]) -> Vec<String> {
+    let mut granted = Vec::new();
+    if components.contains(&"analytics") {
+        let (stream, consumer) = (units::STREAM, units::CONSUMER);
+        granted.extend([
+            // `get_or_create_stream` and `get_stream`: asked, made if not there.
+            format!("$JS.API.STREAM.INFO.{stream}"),
+            format!("$JS.API.STREAM.CREATE.{stream}"),
+            // `get_or_create_consumer`, and asked again on a missed heartbeat.
+            format!("$JS.API.CONSUMER.INFO.{stream}.{consumer}"),
+            format!("$JS.API.CONSUMER.CREATE.{stream}.{consumer}"),
+            // A worker's pull.
+            format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.{consumer}"),
+            // A unit's acknowledgement, on the subject it was delivered with.
+            format!("$JS.ACK.{stream}.{consumer}.>"),
+        ]);
+    }
+    if components.contains(&"lake") {
+        let stream = write_ahead::STREAM;
+        granted.extend([
+            format!("$JS.API.STREAM.*.{stream}"),
+            format!("$JS.API.CONSUMER.*.{stream}"),
+            format!("$JS.API.CONSUMER.*.{stream}.>"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.*"),
+        ]);
+    }
+    granted
 }
 
 /// Why a component holds a credential of its own, as its user's note says.
@@ -374,6 +409,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             publish.push(topic.to_string());
             subscribe.push(topic.to_string());
         }
+        publish.extend(jetstream_grants(&[component]));
         publish.push(INBOX.to_string());
         subscribe.push(INBOX.to_string());
         users.push(User {
@@ -390,6 +426,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         publish.push(topic.to_string());
         subscribe.push(topic.to_string());
     }
+    publish.extend(jetstream_grants(&RUNTIME_COMPONENTS));
     publish.push(INBOX.to_string());
     subscribe.push(INBOX.to_string());
     users.push(User {

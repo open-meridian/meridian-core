@@ -343,11 +343,12 @@ fn the_analytics_component_holds_its_own_credential_and_its_own_topic() {
         analytics.password,
         Password::Env("MERIDIAN_NATS_ANALYTICS".into())
     );
-    // JetStream's API and acknowledgements, for the units' work queue (step
-    // 3b), to the analytics component alone.
-    let api = "$JS.API.>".to_string();
-    let ack = "$JS.ACK.>".to_string();
-    assert!(analytics.publish.contains(&api) && analytics.publish.contains(&ack));
+    // JetStream's API and acknowledgements for the units' work queue (step
+    // 3b), to the analytics component alone: its own stream's, below.
+    assert!(analytics
+        .publish
+        .iter()
+        .any(|s| s.starts_with("$JS.API.") && s.contains(".ANALYTICS_UNITS")));
     for other in users.iter().filter(|u| u.user != "analytics") {
         assert!(
             !other.publish.contains(&unit) && !other.subscribe.contains(&unit),
@@ -537,5 +538,226 @@ fn only_the_stores_own_members_may_hand_a_write_on() {
                 user.user
             );
         }
+    }
+}
+
+/// Whether a subject the broker is asked to carry falls under a grant, in the
+/// broker's grammar: `*` one token, `>` a tail of one or more.
+fn grants(pattern: &str, subject: &str) -> bool {
+    let mut asked = subject.split('.');
+    for token in pattern.split('.') {
+        match (token, asked.next()) {
+            (">", Some(_)) => return true,
+            (_, None) => return false,
+            ("*", Some(_)) => {}
+            (literal, Some(said)) if literal == said => {}
+            _ => return false,
+        }
+    }
+    asked.next().is_none()
+}
+
+#[test]
+fn the_grammar_the_jetstream_tests_read_grants_with() {
+    assert!(grants("$JS.API.>", "$JS.API.STREAM.DELETE.LAKE_WRITE_AHEAD"));
+    assert!(grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.PURGE.S"));
+    assert!(!grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.MSG.DELETE.S"));
+    assert!(!grants("$JS.API.STREAM.*.S", "$JS.API.STREAM.INFO.T"));
+    assert!(!grants("$JS.ACK.S.>", "$JS.ACK.S"));
+    assert!(grants("a.b", "a.b") && !grants("a.b", "a.b.c") && !grants("a.b.c", "a.b"));
+}
+
+/// Every JetStream call that reaches `stream`, or the account's streams
+/// whatever their name, short of a data plugin reading back its own writes
+/// (contract v30, stage C): what a credential that is not the stream's owner
+/// must be refused.
+fn every_call_on(stream: &str) -> Vec<String> {
+    let mut calls: Vec<String> = [
+        "STREAM.CREATE",
+        "STREAM.UPDATE",
+        "STREAM.INFO",
+        "STREAM.DELETE",
+        "STREAM.PURGE",
+        "STREAM.SNAPSHOT",
+        "STREAM.RESTORE",
+        "STREAM.MSG.GET",
+        "STREAM.MSG.DELETE",
+        "STREAM.LEADER.STEPDOWN",
+        "CONSUMER.CREATE",
+        "CONSUMER.NAMES",
+        "CONSUMER.LIST",
+        "DIRECT.GET",
+    ]
+    .iter()
+    .map(|call| format!("$JS.API.{call}.{stream}"))
+    .collect();
+    for call in [
+        "CONSUMER.CREATE",
+        "CONSUMER.DURABLE.CREATE",
+        "CONSUMER.INFO",
+        "CONSUMER.DELETE",
+        "CONSUMER.PAUSE",
+        "CONSUMER.MSG.NEXT",
+        "CONSUMER.LEADER.STEPDOWN",
+    ] {
+        calls.push(format!("$JS.API.{call}.{stream}.someone"));
+    }
+    calls.push(format!(
+        "$JS.API.DIRECT.GET.{stream}.{}",
+        write_ahead::subject("someone-else", "key")
+    ));
+    calls.push(format!("$JS.ACK.{stream}.someone.1.2.3.4.5"));
+    calls
+}
+
+/// The calls on no one stream: every stream's names, the account's, the
+/// cluster's.
+const ACCOUNT_WIDE: [&str; 7] = [
+    "$JS.API.INFO",
+    "$JS.API.STREAM.NAMES",
+    "$JS.API.STREAM.LIST",
+    "$JS.API.ACCOUNT.PURGE.$G",
+    "$JS.API.META.LEADER.STEPDOWN",
+    "$JS.API.SERVER.REMOVE",
+    "$JS.API.STREAM.TEMPLATE.CREATE.any",
+];
+
+/// Review C (2026-11-20), X1: every credential is in one account, so a grant
+/// over JetStream's whole API reaches every stream in the deployment. No
+/// credential holds JetStream's API or acknowledgements wholesale, nor any
+/// call on another component's stream or on the account's; and none
+/// subscribes to a JetStream subject at all, where it would hear other
+/// clients' calls and could answer for the server.
+#[test]
+fn no_credential_reaches_jetstream_wholesale_or_another_components_stream() {
+    let users = users(
+        Contract::embedded(),
+        &[
+            Instance::plugin("truefx", &["data"]),
+            Instance::plugin("reporting-1", &["reporting"]),
+            Instance::plugin("signal-1", &["signal"]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
+    )
+    .expect("generates");
+    // Each stream, and the one credential that may call on it.
+    let owners = [
+        (meridian_analytics::queue::STREAM, "analytics"),
+        (write_ahead::STREAM, "runtime"),
+    ];
+    for user in &users {
+        for wholesale in ["$JS.>", "$JS.API.>", "$JS.ACK.>", ">"] {
+            assert!(
+                !user.publish.iter().any(|s| s == wholesale),
+                "{} publishes {wholesale}",
+                user.user
+            );
+        }
+        let heard: Vec<&String> = user
+            .subscribe
+            .iter()
+            .filter(|s| s.starts_with("$JS") || s.as_str() == ">")
+            .collect();
+        assert!(heard.is_empty(), "{} subscribes to {heard:?}", user.user);
+        for call in ACCOUNT_WIDE {
+            assert!(
+                !user.publish.iter().any(|grant| grants(grant, call)),
+                "{} may call {call}",
+                user.user
+            );
+        }
+        for (stream, owner) in owners {
+            if user.user == owner {
+                continue;
+            }
+            for call in every_call_on(stream) {
+                let by: Vec<&String> = user
+                    .publish
+                    .iter()
+                    .filter(|grant| grants(grant, &call))
+                    .collect();
+                assert!(
+                    by.is_empty(),
+                    "{} may call {call} on {owner}'s stream, by {by:?}",
+                    user.user
+                );
+            }
+        }
+    }
+}
+
+/// Review C (2026-11-20), X1: the analytics component's credential reaches
+/// its units' stream (`meridian_analytics::queue`) by the calls it makes and
+/// no others, and nothing of the lake's write-ahead stream. The calls, as
+/// async-nats 0.47 spells them: `get_or_create_stream` asks the stream's
+/// info and makes it when not found; `get_stream` asks its info;
+/// `get_or_create_consumer` asks the consumer's info and makes it when not
+/// found, by its durable name and no filter; `messages()` pulls, and asks the
+/// consumer's info again on a missed heartbeat; a unit is acknowledged on the
+/// subject it was delivered with, `$JS.ACK.<stream>.<consumer>.` and five
+/// counters (the broker's v1 form).
+#[test]
+fn analytics_reaches_its_own_queue_and_nothing_of_the_lakes_stream() {
+    use meridian_analytics::queue::{CONSUMER, STREAM};
+    assert_eq!((STREAM, CONSUMER), ("ANALYTICS_UNITS", "workers"));
+    let users = users(Contract::embedded(), &[]).expect("generates");
+    let analytics = user(&users, "analytics");
+    let jetstream: Vec<&str> = analytics
+        .publish
+        .iter()
+        .map(String::as_str)
+        .filter(|s| s.starts_with("$JS"))
+        .collect();
+    assert_eq!(
+        jetstream,
+        vec![
+            "$JS.API.STREAM.INFO.ANALYTICS_UNITS",
+            "$JS.API.STREAM.CREATE.ANALYTICS_UNITS",
+            "$JS.API.CONSUMER.INFO.ANALYTICS_UNITS.workers",
+            "$JS.API.CONSUMER.CREATE.ANALYTICS_UNITS.workers",
+            "$JS.API.CONSUMER.MSG.NEXT.ANALYTICS_UNITS.workers",
+            "$JS.ACK.ANALYTICS_UNITS.workers.>",
+        ]
+    );
+    for call in [
+        "$JS.API.STREAM.INFO.ANALYTICS_UNITS",
+        "$JS.API.STREAM.CREATE.ANALYTICS_UNITS",
+        "$JS.API.CONSUMER.INFO.ANALYTICS_UNITS.workers",
+        "$JS.API.CONSUMER.CREATE.ANALYTICS_UNITS.workers",
+        "$JS.API.CONSUMER.MSG.NEXT.ANALYTICS_UNITS.workers",
+        "$JS.ACK.ANALYTICS_UNITS.workers.1.17.17.1763600000000000000.0",
+        // A unit put on the queue: the stream's subject, the component's own
+        // topic.
+        "platform.analytics.internal.compute-unit",
+    ] {
+        assert!(
+            analytics.publish.iter().any(|grant| grants(grant, call)),
+            "analytics is refused {call}, which its queue makes"
+        );
+    }
+    for call in [
+        "$JS.API.STREAM.DELETE.ANALYTICS_UNITS",
+        "$JS.API.STREAM.PURGE.ANALYTICS_UNITS",
+        "$JS.API.STREAM.UPDATE.ANALYTICS_UNITS",
+        "$JS.API.CONSUMER.DELETE.ANALYTICS_UNITS.workers",
+        "$JS.API.CONSUMER.CREATE.ANALYTICS_UNITS.another",
+    ] {
+        assert!(
+            !analytics.publish.iter().any(|grant| grants(grant, call)),
+            "analytics may call {call}, which its queue never makes"
+        );
+    }
+    for call in every_call_on(write_ahead::STREAM)
+        .into_iter()
+        .chain([format!(
+            "$JS.API.DIRECT.GET.{}.{}",
+            write_ahead::STREAM,
+            write_ahead::subject("truefx", "key")
+        )])
+    {
+        assert!(
+            !analytics.publish.iter().any(|grant| grants(grant, &call)),
+            "analytics may call {call} on the lake's write-ahead stream"
+        );
     }
 }

@@ -535,6 +535,99 @@ async fn a_caller_with_no_credential_is_refused_the_broker_entirely() {
     );
 }
 
+/// A raw client, past the backend, with the credential a test URL carries.
+async fn raw(variable: &str) -> async_nats::Client {
+    let url = std::env::var(variable)
+        .unwrap_or_else(|_| panic!("{variable} is not set; run `make test-broker`."));
+    let (scheme, rest) = url.split_once("://").unwrap();
+    let (credential, host) = rest.rsplit_once('@').unwrap();
+    let (user, password) = credential.split_once(':').unwrap();
+    async_nats::ConnectOptions::with_user_and_password(user.into(), password.into())
+        .connect(format!("{scheme}://{host}"))
+        .await
+        .unwrap_or_else(|failed| panic!("could not reach the test broker as {user}: {failed}"))
+}
+
+/// Did this exact payload arrive on a raw subscription, within a window?
+async fn heard(subscription: &mut async_nats::Subscriber, wanted: &str) -> bool {
+    use futures_util::StreamExt;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, subscription.next()).await {
+        if message.payload.as_ref() == wanted.as_bytes() {
+            return true;
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn the_analytics_credential_reaches_its_own_stream_and_not_the_lakes() {
+    // Review C (2026-11-20), X1: every credential is in one account, so a
+    // grant over JetStream's whole API reached the lake's write-ahead stream
+    // from the analytics component. Its credential, under the generated
+    // permissions, may call on its units' stream and is refused the lake's:
+    // what the broker carries for it, not what the list says. This broker
+    // runs no JetStream, so nothing answers; what proves the refusal is that
+    // nothing arrives.
+    let analytics = raw("MERIDIAN_TEST_BROKER_URL_ANALYTICS").await;
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+
+    let its_own = "$JS.API.STREAM.INFO.ANALYTICS_UNITS";
+    let the_lakes = [
+        "$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD",
+        "$JS.API.STREAM.DELETE.LAKE_WRITE_AHEAD",
+        "$JS.API.STREAM.PURGE.LAKE_WRITE_AHEAD",
+    ];
+    let mut allowed = listening.subscribe(its_own).await.unwrap();
+    let mut refused = Vec::new();
+    for subject in the_lakes {
+        refused.push(listening.subscribe(subject).await.unwrap());
+    }
+    // And it hears no other client's JetStream call: a credential that could
+    // would hear the lake's, and could answer for the server.
+    let mut overheard = analytics
+        .subscribe("$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD")
+        .await
+        .unwrap();
+    listening.flush().await.unwrap();
+    analytics.flush().await.unwrap();
+    settle().await;
+
+    let granted = mark("analytics-own-stream");
+    analytics
+        .publish(its_own, granted.clone().into())
+        .await
+        .unwrap();
+    let mut withheld = Vec::new();
+    for subject in the_lakes {
+        let sent = mark("analytics-the-lakes-stream");
+        analytics.publish(subject, sent.clone().into()).await.unwrap();
+        withheld.push(sent);
+    }
+    let asked_by_another = mark("the-lakes-own-call");
+    listening
+        .publish("$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD", asked_by_another.clone().into())
+        .await
+        .unwrap();
+    analytics.flush().await.unwrap();
+    listening.flush().await.unwrap();
+
+    assert!(
+        heard(&mut allowed, &granted).await,
+        "the analytics credential was refused its own stream's info"
+    );
+    for ((subject, subscription), sent) in the_lakes.iter().zip(&mut refused).zip(&withheld) {
+        assert!(
+            !heard(subscription, sent).await,
+            "the broker carried {subject} from the analytics credential"
+        );
+    }
+    assert!(
+        !heard(&mut overheard, &asked_by_another).await,
+        "the analytics credential heard another client's call on the lake's stream"
+    );
+}
+
 // ── One credential per instance ─────────────────────────────────────────────
 //
 // A role-wide credential carries the right to speak as every instance of that
