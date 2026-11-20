@@ -180,7 +180,26 @@ data:
 # reads its connection string from (spec/the-local-plugin-registry, decision
 # 3). Made here, empty, so a Role can name it: RBAC cannot narrow `create` to
 # a name. Kept with what it holds, as the credentials above are.
+#
+# Its keys are the broker's, never the release's. Where Helm applies
+# server-side (Helm 4), the chart states no key: Helm then owns none, an
+# upgrade leaves every key as the broker wrote it, and no revision's manifest
+# carries a credential. Rendered from what the Secret held, as this was, a
+# revision kept each plugin's credential as it was that day, and a rollback
+# to it was refused once one had been made again: `helm rollback` applies
+# the stored manifest, and the broker owns the field with another value (the
+# dev deployment's revision 69, 2026-11-20).
+#
+# Where Helm merges client-side instead (Helm 3, and Helm 4 on a release
+# Helm 3 installed), a manifest that stops stating the keys would delete
+# them, so there they are still rendered as held, unchanged. Which it is, is
+# read from the Secret: server-side apply leaves an `Apply` entry in its
+# managed fields, and a client-side merge never does.
 {{- $launched := lookup "v1" "Secret" .Release.Namespace (printf "%s-launched" $name) }}
+{{- $applied := false }}
+{{- range (dig "metadata" "managedFields" list ($launched | default dict)) }}
+{{- if eq (.operation | default "") "Apply" }}{{ $applied = true }}{{ end }}
+{{- end }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -190,7 +209,7 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
 type: Opaque
-{{- if and $launched $launched.data }}
+{{- if and $launched $launched.data (not $applied) }}
 data:
   {{- toYaml $launched.data | nindent 2 }}
 {{- end }}

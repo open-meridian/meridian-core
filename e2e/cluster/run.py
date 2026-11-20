@@ -1462,7 +1462,9 @@ def stand_in(present):
     apply(json.dumps({
         "apiVersion": "apps/v1", "kind": "Deployment",
         "metadata": {"name": name, "labels": labels},
-        "spec": {"replicas": 0, "selector": {"matchLabels": labels},
+        # Three old ReplicaSets kept, as every Deployment of the namespace
+        # is held to after an upgrade.
+        "spec": {"replicas": 0, "revisionHistoryLimit": 3, "selector": {"matchLabels": labels},
                  "template": {"metadata": {"labels": labels},
                               "spec": {"containers": [{"name": "plugin", "image": "rancher/mirrored-pause:3.6"}]}}},
     }))
