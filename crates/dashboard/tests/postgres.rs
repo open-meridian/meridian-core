@@ -1098,7 +1098,7 @@ fn a_thing_in_flight_put_on_one_copy_is_spent_once_on_another() {
 /// One judge per deployment (the review of v31a-core-1, findings 1 and 3):
 /// two dashboards on one database, one holding the judges' lease at a time;
 /// the holder files its notices and keeps its place together, and a copy
-/// whose term has passed files nothing.
+/// whose term has passed, or lapsed by the database's clock, files nothing.
 #[test]
 fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
     use meridian_dashboard::judges::{LASTS_NS, LEASE};
@@ -1116,8 +1116,8 @@ fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
         about: "lake shed".into(),
         changed_ns: at,
     };
-    assert_eq!(a.lead(LEASE, "a", T0, T0 + LASTS_NS).unwrap(), Some(1));
-    assert_eq!(b.lead(LEASE, "b", T0 + 1, T0 + 1 + LASTS_NS).unwrap(), None);
+    assert_eq!(a.lead(LEASE, "a", LASTS_NS).unwrap(), Some(1));
+    assert_eq!(b.lead(LEASE, "b", LASTS_NS).unwrap(), None);
     assert!(a
         .file(
             LEASE,
@@ -1145,12 +1145,24 @@ fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
             "{}"
         )
         .unwrap());
-    // a stops renewing; b takes the lease once it lapses, under term 2.
+    // a's last renewal lasts 50 ms and it renews no more: once the
+    // database's clock has passed it, a files nothing even before another
+    // takes the lease, and b takes it under term 2.
+    assert_eq!(a.lead(LEASE, "a", 50_000_000).unwrap(), Some(1));
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let lapsed = T0 + LASTS_NS + 1;
-    assert_eq!(
-        b.lead(LEASE, "b", lapsed, lapsed + LASTS_NS).unwrap(),
-        Some(2)
-    );
+    assert!(!a
+        .file(
+            LEASE,
+            "a",
+            1,
+            lapsed,
+            "component-health",
+            &[notice("01L", lapsed)],
+            "{\"a\":2}"
+        )
+        .unwrap());
+    assert_eq!(b.lead(LEASE, "b", LASTS_NS).unwrap(), Some(2));
     assert!(!a
         .file(
             LEASE,
@@ -1189,6 +1201,64 @@ fn the_judges_lease_is_held_by_one_copy_and_a_lapsed_holder_files_nothing() {
         ["01D", "01A"],
         "newest filed first, the lapsed holder's never"
     );
+}
+
+/// The judges' lease on one clock (the fault pass: a copy's clock stepped
+/// by 40 s). Two dashboards renew every 15 s by their own clocks, b's a
+/// minute ahead of a's, more than the lease lasts. The lease's expiry is
+/// the database's to decide, so b never finds a's lease lapsed while a
+/// renews it: in one minute only a files.
+#[test]
+fn two_copies_whose_clocks_disagree_by_more_than_the_lease_do_not_both_file() {
+    use meridian_dashboard::judges::{LASTS_NS, LEASE};
+    use meridian_dashboard::latency::notices::{InPostgres, Notice, NoticeStore as _};
+    let (_url, database) = migrated("judges_clock");
+    let (a, b) = (
+        InPostgres::on(database.clone()),
+        InPostgres::on(database.clone()),
+    );
+    // Each copy asks at its own time, and the database's clock decides:
+    // `now_ns` is kept beside the place it files, and nothing more.
+    let ask = |store: &InPostgres, holder: &str, _now_ns: i64| {
+        store.lead(LEASE, holder, LASTS_NS).unwrap()
+    };
+    const SECOND_NS: i64 = 1_000_000_000;
+    let ahead = 60 * SECOND_NS;
+    assert!(ahead > LASTS_NS);
+    let mut filers = Vec::new();
+    for round in 0..4 {
+        let a_now = T0 + round * 15 * SECOND_NS;
+        for (store, holder, now) in [(&a, "a", a_now), (&b, "b", a_now + ahead)] {
+            let Some(term) = ask(store, holder, now) else {
+                continue;
+            };
+            let notice = Notice {
+                notice_id: format!("01{holder}{round}"),
+                subject: "local|dee".into(),
+                plugin_instance_id: "lake".into(),
+                kind: "component-shedding".into(),
+                about: format!("{holder} {round}"),
+                changed_ns: now,
+            };
+            let place = format!("{{\"{holder}\":{round}}}");
+            if store
+                .file(
+                    LEASE,
+                    holder,
+                    term,
+                    now,
+                    "component-health",
+                    &[notice],
+                    &place,
+                )
+                .unwrap()
+            {
+                filers.push(holder);
+            }
+        }
+    }
+    filers.dedup();
+    assert_eq!(filers, ["a"], "one copy files in the minute");
 }
 
 /// The inbox through a rolling upgrade (the review of v31a-core-1, finding

@@ -709,7 +709,10 @@ mod tests {
         let records = records();
         let store = InMemory::default();
         let hour = (T0 / HOUR_NS + 1) * HOUR_NS;
-        let lead = |holder: &str, at: i64| store.lead(LEASE, holder, at, at + LASTS_NS).unwrap();
+        let lead = |holder: &str, at: i64| {
+            store.at(at);
+            store.lead(LEASE, holder, LASTS_NS).unwrap()
+        };
         let (mut a, mut b) = (Judge::default(), Judge::default());
         let (mut ja, mut jb) = (Judging::new(JUDGE), Judging::new(JUDGE));
         for (report, at_a, at_b) in [
@@ -750,7 +753,10 @@ mod tests {
         let records = records();
         let store = InMemory::default();
         let hour = (T0 / HOUR_NS + 1) * HOUR_NS;
-        let lead = |holder: &str, at: i64| store.lead(LEASE, holder, at, at + LASTS_NS).unwrap();
+        let lead = |holder: &str, at: i64| {
+            store.at(at);
+            store.lead(LEASE, holder, LASTS_NS).unwrap()
+        };
         let mut a = Judge::default();
         let mut ja = Judging::new(JUDGE);
         for (report, at) in [
@@ -815,7 +821,8 @@ mod tests {
         let mut ask = |asked: Option<&[ComponentReport]>, at: i64| {
             // A minute apart, so each ask takes the lease up again under a
             // new term, from the place kept.
-            let term = store.lead(LEASE, "a", at, at + LASTS_NS).unwrap();
+            store.at(at);
+            let term = store.lead(LEASE, "a", LASTS_NS).unwrap();
             judge_once(
                 &mut judge,
                 &mut judging,

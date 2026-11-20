@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS dashboard_judge_lease (
     -- time it passes to another copy, or is taken again after it lapsed.
     holder         text   NOT NULL,
     term           bigint NOT NULL,
+    -- By the database's own clock (clock_timestamp()), which alone says
+    -- whether the lease has lapsed: never a copy's, so two copies whose
+    -- clocks disagree by more than the lease lasts do not both hold it.
     expires_at_ns  bigint NOT NULL
 );
 

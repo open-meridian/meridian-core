@@ -52,30 +52,28 @@ pub trait NoticeStore: Send + Sync {
     /// at its start so a notice filed once is never filed again after a
     /// restart (`gap_found`, once per gap; contract v30, stage D).
     fn abouts(&self, kind: &str) -> Result<Vec<String>, String>;
-    /// Take or renew `lease` for `holder` until `until_ns` (one judge per
+    /// Take or renew `lease` for `holder`, to last `lasts_ns` (one judge per
     /// deployment; [`crate::judges`]): the term it holds it under, or none
-    /// where another holds it and it has not lapsed at `now_ns`. A lease
-    /// passing to another holder, or taken again once lapsed, is under the
-    /// next term.
-    fn lead(
-        &self,
-        lease: &str,
-        holder: &str,
-        now_ns: i64,
-        until_ns: i64,
-    ) -> Result<Option<i64>, String>;
+    /// where another holds it and it has not lapsed. A lease passing to
+    /// another holder, or taken again once lapsed, is under the next term.
+    ///
+    /// When it lapses, and whether it has, is the store's own clock's to say
+    /// (the database's), never a copy's: two copies whose clocks disagree by
+    /// more than the lease lasts would each find it lapsed under the other.
+    fn lead(&self, lease: &str, holder: &str, lasts_ns: i64) -> Result<Option<i64>, String>;
     /// Where `judge` is, as the lease's holder last kept it.
     fn place(&self, judge: &str) -> Result<Option<String>, String>;
     /// `notices` filed and `judge`'s `place` kept, together, only while
-    /// `holder` holds `lease` under `term` at `now_ns`: false, with nothing
-    /// filed or kept, where it does not.
+    /// `holder` holds `lease` under `term`, by the store's own clock: false,
+    /// with nothing filed or kept, where it does not. `filed_at_ns` is the
+    /// copy's own time, kept beside the place; it decides nothing.
     #[allow(clippy::too_many_arguments)]
     fn file(
         &self,
         lease: &str,
         holder: &str,
         term: i64,
-        now_ns: i64,
+        filed_at_ns: i64,
         judge: &str,
         notices: &[Notice],
         place: &str,
@@ -95,6 +93,22 @@ pub struct InMemory {
     held: Mutex<Vec<Notice>>,
     leases: Mutex<std::collections::BTreeMap<String, Held>>,
     places: Mutex<std::collections::BTreeMap<String, String>>,
+    /// The store's own clock, which alone says when a lease lapses: what
+    /// the database's is in Postgres. A deployment with no database has one
+    /// copy, which never loses the lease; a test sets it ([`InMemory::at`]).
+    now_ns: std::sync::atomic::AtomicI64,
+}
+
+impl InMemory {
+    /// The store's clock set to `now_ns`, as a test moves it.
+    pub fn at(&self, now_ns: i64) {
+        self.now_ns
+            .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn now_ns(&self) -> i64 {
+        self.now_ns.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl NoticeStore for InMemory {
@@ -140,13 +154,9 @@ impl NoticeStore for InMemory {
             .collect())
     }
 
-    fn lead(
-        &self,
-        lease: &str,
-        holder: &str,
-        now_ns: i64,
-        until_ns: i64,
-    ) -> Result<Option<i64>, String> {
+    fn lead(&self, lease: &str, holder: &str, lasts_ns: i64) -> Result<Option<i64>, String> {
+        let now_ns = self.now_ns();
+        let until_ns = now_ns + lasts_ns;
         let mut leases = self
             .leases
             .lock()
@@ -188,11 +198,12 @@ impl NoticeStore for InMemory {
         lease: &str,
         holder: &str,
         term: i64,
-        now_ns: i64,
+        _filed_at_ns: i64,
         judge: &str,
         notices: &[Notice],
         place: &str,
     ) -> Result<bool, String> {
+        let now_ns = self.now_ns();
         let leases = self
             .leases
             .lock()
@@ -215,6 +226,11 @@ impl NoticeStore for InMemory {
 pub struct InPostgres {
     database: Database,
 }
+
+/// The database's own clock, in nanoseconds since the epoch: what alone
+/// says when the judges' lease lapses. `clock_timestamp()`, not `now()`,
+/// which is the transaction's start and stands still through a wait.
+const DATABASE_NOW_NS: &str = "(extract(epoch FROM clock_timestamp()) * 1000000000)::bigint";
 
 impl InPostgres {
     pub fn on(database: Database) -> Self {
@@ -267,31 +283,34 @@ impl NoticeStore for InPostgres {
             .collect())
     }
 
-    fn lead(
-        &self,
-        lease: &str,
-        holder: &str,
-        now_ns: i64,
-        until_ns: i64,
-    ) -> Result<Option<i64>, String> {
+    fn lead(&self, lease: &str, holder: &str, lasts_ns: i64) -> Result<Option<i64>, String> {
         let mut conn = self.database.conn()?;
         // Taken where it is free, renewed where it is this holder's and
         // has not lapsed; under the next term where it changes hands or
         // was let lapse. Waits for a filing that holds the row, so a
         // lease is never taken from under a holder's last filing.
+        //
+        // Lapsed, and lasting, by the database's clock alone, read once
+        // as the row is offered: `excluded.expires_at_ns - $3` is that
+        // time. Read before any wait for the row, it can only be early,
+        // so a lease that lapsed during the wait is taken next time
+        // rather than this.
         let row = conn
             .query_opt(
-                "INSERT INTO dashboard_judge_lease AS held (lease, holder, term, expires_at_ns)
-                 VALUES ($1, $2, 1, $4)
-                 ON CONFLICT (lease) DO UPDATE
-                    SET holder = excluded.holder,
-                        term = CASE WHEN held.holder = excluded.holder
-                                         AND held.expires_at_ns >= $3
-                                    THEN held.term ELSE held.term + 1 END,
-                        expires_at_ns = excluded.expires_at_ns
-                  WHERE held.holder = excluded.holder OR held.expires_at_ns < $3
-                 RETURNING term",
-                &[&lease, &holder, &now_ns, &until_ns],
+                &format!(
+                    "INSERT INTO dashboard_judge_lease AS held (lease, holder, term, expires_at_ns)
+                     VALUES ($1, $2, 1, {DATABASE_NOW_NS} + $3::bigint)
+                     ON CONFLICT (lease) DO UPDATE
+                        SET holder = excluded.holder,
+                            term = CASE WHEN held.holder = excluded.holder
+                                             AND held.expires_at_ns >= excluded.expires_at_ns - $3
+                                        THEN held.term ELSE held.term + 1 END,
+                            expires_at_ns = excluded.expires_at_ns
+                      WHERE held.holder = excluded.holder
+                         OR held.expires_at_ns < excluded.expires_at_ns - $3
+                     RETURNING term"
+                ),
+                &[&lease, &holder, &lasts_ns],
             )
             .map_err(said)?;
         Ok(row.map(|row| row.get(0)))
@@ -313,7 +332,7 @@ impl NoticeStore for InPostgres {
         lease: &str,
         holder: &str,
         term: i64,
-        now_ns: i64,
+        filed_at_ns: i64,
         judge: &str,
         notices: &[Notice],
         place: &str,
@@ -321,16 +340,28 @@ impl NoticeStore for InPostgres {
         let mut conn = self.database.conn()?;
         let mut tx = conn.transaction().map_err(said)?;
         // The lease's row held to the end: no other copy takes the lease
-        // while this files, and none files once it has.
-        let holds = tx
+        // while this files, and none files once it has. Whether it has
+        // lapsed is asked of the database's clock once the row is held,
+        // so a wait for it is counted.
+        let expires_at_ns: Option<i64> = tx
             .query_opt(
-                "SELECT 1 FROM dashboard_judge_lease
-                  WHERE lease = $1 AND holder = $2 AND term = $3 AND expires_at_ns >= $4
+                "SELECT expires_at_ns FROM dashboard_judge_lease
+                  WHERE lease = $1 AND holder = $2 AND term = $3
                     FOR UPDATE",
-                &[&lease, &holder, &term, &now_ns],
+                &[&lease, &holder, &term],
             )
             .map_err(said)?
-            .is_some();
+            .map(|row| row.get(0));
+        let Some(expires_at_ns) = expires_at_ns else {
+            return Ok(false);
+        };
+        let holds: bool = tx
+            .query_one(
+                &format!("SELECT $1::bigint >= {DATABASE_NOW_NS}"),
+                &[&expires_at_ns],
+            )
+            .map_err(said)?
+            .get(0);
         if !holds {
             return Ok(false);
         }
@@ -341,7 +372,7 @@ impl NoticeStore for InPostgres {
              ON CONFLICT (judge) DO UPDATE
                 SET place = excluded.place, term = excluded.term,
                     filed_at_ns = excluded.filed_at_ns",
-            &[&judge, &place, &term, &now_ns],
+            &[&judge, &place, &term, &filed_at_ns],
         )
         .map_err(said)?;
         tx.commit().map_err(said)?;
@@ -965,7 +996,10 @@ mod tests {
         }
         let records = records();
         let store = InMemory::default();
-        let lead = |holder: &str, at: i64| store.lead(LEASE, holder, at, at + LASTS_NS).unwrap();
+        let lead = |holder: &str, at: i64| {
+            store.at(at);
+            store.lead(LEASE, holder, LASTS_NS).unwrap()
+        };
         let (mut ja, mut jb) = (Judging::new(JUDGE), Judging::new(JUDGE));
         let at = t0 + 4 * MINUTE + 3 * S;
         assert_eq!(

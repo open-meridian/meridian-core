@@ -11,6 +11,11 @@
 //! copy takes it only once it has gone [`LASTS_NS`] unrenewed, under the
 //! next term.
 //!
+//! The lease is on one clock: the database's. A copy's own clock says when
+//! it next asks, never whether the lease has lapsed, so two copies whose
+//! clocks disagree by more than the lease lasts (a fault pass stepped one
+//! by 40 s) still find one holder between them.
+//!
 //! The holder keeps each judge's place beside the notices it files, in one
 //! transaction that first finds its term still holding the lease
 //! ([`NoticeStore::file`]). A copy that takes the lease up restores each
@@ -21,11 +26,10 @@
 //! notices' keyed IDs stay a second guard.
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::latency::notices::{Notice, NoticeStore};
-use crate::web::App;
 
 /// The judges' one lease: the latency judge's and the health judge's.
 pub const LEASE: &str = "judges";
@@ -61,14 +65,13 @@ pub fn term() -> Option<i64> {
 
 /// Ask for the lease, or renew it, every [`RENEW_EVERY`] from now on. The
 /// task is handed back, for the component to end before its runtime stops.
-pub fn lead_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
+pub fn lead_forever() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(RENEW_EVERY);
         loop {
             every.tick().await;
-            let now = app.clock.now_ns();
             let asked = tokio::task::spawn_blocking(move || {
-                crate::latency::notices::store().lead(LEASE, holder(), now, now + LASTS_NS)
+                crate::latency::notices::store().lead(LEASE, holder(), LASTS_NS)
             })
             .await
             .map_err(|failed| failed.to_string())
@@ -196,23 +199,21 @@ mod tests {
     #[test]
     fn a_lease_is_held_by_one_copy_until_it_lapses_then_taken_under_the_next_term() {
         let store = InMemory::default();
-        assert_eq!(store.lead(LEASE, "a", 0, LASTS_NS).unwrap(), Some(1));
-        assert_eq!(store.lead(LEASE, "b", 10, 10 + LASTS_NS).unwrap(), None);
-        assert_eq!(store.lead(LEASE, "a", 20, 20 + LASTS_NS).unwrap(), Some(1));
+        let lead = |holder: &str, at: i64| {
+            store.at(at);
+            store.lead(LEASE, holder, LASTS_NS).unwrap()
+        };
+        assert_eq!(lead("a", 0), Some(1));
+        assert_eq!(lead("b", 10), None);
+        assert_eq!(lead("a", 20), Some(1));
         // a stops renewing; b takes it once it has lapsed.
         let lapsed = 20 + LASTS_NS + 1;
-        assert_eq!(
-            store.lead(LEASE, "b", lapsed, lapsed + LASTS_NS).unwrap(),
-            Some(2)
-        );
+        assert_eq!(lead("b", lapsed), Some(2));
         // a, back, files nothing under its old term.
         let mut a = Judging::new("latency");
         a.taken = Some(1);
         assert!(!a.file(&store, "a", lapsed, &[], "{}".into()).unwrap());
         assert!(!a.files());
-        assert_eq!(
-            store.lead(LEASE, "a", lapsed, lapsed + LASTS_NS).unwrap(),
-            None
-        );
+        assert_eq!(lead("a", lapsed), None);
     }
 }

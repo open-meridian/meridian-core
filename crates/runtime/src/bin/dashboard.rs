@@ -597,7 +597,7 @@ fn run() -> Result<(), String> {
         // One judge per deployment: the copy holding the judges' lease
         // files the latency and health judges' notices (the review of
         // v31a-core-1, findings 1 and 3).
-        meridian_runtime::keep(meridian_dashboard::judges::lead_forever(Arc::clone(&app)));
+        meridian_runtime::keep(meridian_dashboard::judges::lead_forever());
         // Its judge: each whole minute, each episode opened or closed a
         // notice to the people it concerns (W4.16; ruling 427).
         meridian_runtime::keep(meridian_dashboard::latency::notices::judge_forever(
