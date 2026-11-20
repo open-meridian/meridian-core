@@ -1245,19 +1245,55 @@ impl Store for PostgresStore {
         // declared every 30 s, and replacing the rows whole each time left a
         // delete and an insert in the change log for every setting of every
         // report, nothing having changed. A row that stands is not touched,
-        // so it leaves no record; one that changed, came or went leaves its
-        // own (decisions/031).
-        for (position, declaration) in declared.iter().enumerate() {
-            let now = KeptDeclaration {
-                position: position as i32,
-                name: declaration.name.clone(),
-                r#type: declaration.r#type as i16,
-                required: declaration.required,
-                secret: declaration.secret,
-                description: declaration.description.clone(),
-                declared: Some(declaration.encode_to_vec()),
-            };
-            let statement = match kept.iter().find(|row| row.position == now.position) {
+        // so it leaves no record; and each record names the setting it is
+        // about (decisions/031): a row is one setting's for as long as it is
+        // kept, updated in place only under the same name, so a setting no
+        // longer declared leaves a delete naming it and one newly declared
+        // an insert naming it. Positions order the rows and need not be
+        // consecutive: a setting keeps its position while the order allows,
+        // and one that must move is deleted there and inserted where it goes.
+        let mut placed: Vec<(i32, KeptDeclaration, Option<&KeptDeclaration>)> = Vec::new();
+        let mut next = 0i32;
+        for declaration in declared {
+            let stays = kept
+                .iter()
+                .find(|row| row.position >= next && row.name == declaration.name);
+            let position = stays.map_or(next, |row| row.position);
+            next = position + 1;
+            placed.push((
+                position,
+                KeptDeclaration {
+                    position,
+                    name: declaration.name.clone(),
+                    r#type: declaration.r#type as i16,
+                    required: declaration.required,
+                    secret: declaration.secret,
+                    description: declaration.description.clone(),
+                    declared: Some(declaration.encode_to_vec()),
+                },
+                stays,
+            ));
+        }
+        // First every row that does not stay, so no position is taken twice.
+        let gone: Vec<i32> = kept
+            .iter()
+            .filter(|row| {
+                !placed
+                    .iter()
+                    .any(|(position, _, stays)| stays.is_some() && *position == row.position)
+            })
+            .map(|row| row.position)
+            .collect();
+        if !gone.is_empty() {
+            tx.execute(
+                "DELETE FROM config_plugin_setting_declaration
+                  WHERE plugin_instance_id = $1 AND position = ANY($2)",
+                &[&plugin_instance_id, &gone],
+            )
+            .map_err(unavailable)?;
+        }
+        for (_, now, stays) in &placed {
+            let statement = match stays {
                 Some(row) if *row == now => continue,
                 Some(_) => {
                     "UPDATE config_plugin_setting_declaration
@@ -1284,14 +1320,6 @@ impl Store for PostgresStore {
                     &now.description,
                     &now.declared,
                 ],
-            )
-            .map_err(unavailable)?;
-        }
-        if kept.iter().any(|row| row.position >= declared.len() as i32) {
-            tx.execute(
-                "DELETE FROM config_plugin_setting_declaration
-                  WHERE plugin_instance_id = $1 AND position >= $2",
-                &[&plugin_instance_id, &(declared.len() as i32)],
             )
             .map_err(unavailable)?;
         }

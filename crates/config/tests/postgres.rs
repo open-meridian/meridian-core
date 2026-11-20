@@ -1006,27 +1006,88 @@ fn a_plugin_declaring_the_same_settings_again_leaves_no_change_record() {
         store.snapshot().unwrap().declared_settings["snaptrade-1"],
         declared
     );
-    // The first no longer declared: each row after it takes the next one's
-    // place, and the last goes.
+    // The first no longer declared: one delete, naming it. The settings
+    // after it stand where they are, and no record names them (review
+    // finding 1: matched by position, the delete named the last setting and
+    // nothing named the one that went).
     declared.remove(0);
     store
         .record_declared_settings("snaptrade-1", &declared, 23)
         .unwrap();
-    assert_eq!(records(&mut log), (4, 4, 1));
+    assert_eq!(records(&mut log), (4, 1, 1));
+    assert_eq!(
+        named(&mut log, "config_plugin_setting_declaration.delete"),
+        ["key_type"]
+    );
     assert_eq!(
         store.snapshot().unwrap().declared_settings["snaptrade-1"],
         declared
     );
-    // None declared: every row goes.
+    // One declared between two: an insert naming it; the first, which
+    // stands, is named by no record, and each setting that makes room is
+    // deleted where it was and inserted where it goes, under its own name.
+    declared.insert(1, declaration("account", SettingType::String, false));
     store
-        .record_declared_settings("snaptrade-1", &[], 24)
+        .record_declared_settings("snaptrade-1", &declared, 24)
         .unwrap();
-    assert_eq!(records(&mut log), (4, 4, 4));
+    let inserted = named(&mut log, "config_plugin_setting_declaration.insert");
+    assert_eq!(inserted.iter().filter(|name| *name == "account").count(), 1);
+    assert_eq!(
+        inserted.iter().filter(|name| *name == "api_key").count(),
+        1,
+        "api_key stands: its first insert is its only record"
+    );
+    let deleted = named(&mut log, "config_plugin_setting_declaration.delete");
+    assert!(!deleted
+        .iter()
+        .any(|name| name == "api_key" || name == "account"));
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared
+    );
+    // Every record of the table names the setting its row holds: an update
+    // never turns one setting's row into another's.
+    let renamed: i64 = log
+        .query_one(
+            "SELECT count(*) FROM config_change u
+              WHERE u.kind = 'config_plugin_setting_declaration.update'
+                AND NOT EXISTS (
+                    SELECT 1 FROM config_change i
+                     WHERE i.kind = 'config_plugin_setting_declaration.insert'
+                       AND i.body->>'position' = u.body->>'position'
+                       AND i.body->>'name' = u.body->>'name'
+                       AND i.sequence < u.sequence)",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(renamed, 0);
+    // None declared: every row goes, each delete naming its own.
+    let kept_before = declared.len() as i64;
+    let (_, _, deletes_before) = records(&mut log);
+    store
+        .record_declared_settings("snaptrade-1", &[], 25)
+        .unwrap();
+    assert_eq!(records(&mut log).2, deletes_before + kept_before);
     assert!(!store
         .snapshot()
         .unwrap()
         .declared_settings
         .contains_key("snaptrade-1"));
+}
+
+/// The setting each change record of one kind names, in the order recorded.
+fn named(client: &mut postgres::Client, kind: &str) -> Vec<String> {
+    client
+        .query(
+            "SELECT body->>'name' FROM config_change WHERE kind = $1
+              ORDER BY sequence, ordinal",
+            &[&kind],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
 }
 
 #[test]
