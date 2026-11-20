@@ -6137,22 +6137,47 @@ def window_held(s, what, began_ms, ended_ms):
               {"move_s": round((ended_ms - began_ms) / 1000, 2), "writes": len(took)})
 
 
-def committed_before(store, d, kind, name, before_ns):
-    """What was committed before `before_ns` of a moved thing, in database
-    `d`: how many, and a digest of them, each by its key and place."""
+def committed_cut(store, d, kind, name):
+    """Where a thing about to move stands in database `d`, as a condition on
+    its rows: a range's rows to its last sequence, a partition's entries
+    (or an account's, in each partition it has been in) to its last. Each
+    is written by one writer in turn under its head's lock, so every row to
+    there is committed and none is added to them later.
+
+    Never a time: `committed_at_ns` and `recorded_at_ns` are stamped as a
+    write is received, before it waits its turn, and merge-queue run
+    44726786526 (ha) had an order received 0.2 s before a move's check
+    began and committed 4.3 s later, after the check's first read -- "7869
+    and 7870", nothing changed."""
+    if kind == "range":
+        said = psql(f"select coalesce(max(sequence), 0) from lake_row where dataset = '{name.split('/')[0]}' "
+                    f"and coalesce(partition, dataset) = '{name}'", pod=database_pod(store, d))
+        return f"sequence <= {int(said)}"
+    whose = f"partition = '{name}'" if kind == "partition" else f"account_id = '{name}'"
+    said = psql(f"select partition, max(last_sequence) from book_entry where {whose} "
+                f"group by partition order by partition", pod=database_pod(store, d))
+    stood = [line.rsplit("|", 1) for line in said.splitlines()]
+    return "(" + " or ".join(f"(partition = '{partition}' and first_sequence <= {int(last)})"
+                             for partition, last in stood) + ")" if stood else "false"
+
+
+def committed_before(store, d, kind, name, cut):
+    """What was committed of a moved thing to `cut` (committed_cut, read
+    before its move), in database `d`: how many, and a digest of them, each
+    by its key and place."""
     if kind == "range":
         dataset = name.split("/")[0]
         sql = (f"select count(*), coalesce(md5(string_agg(row_key || ':' || sequence || ':' || version, ',' "
                f"order by sequence, row_key)), '') from lake_row where dataset = '{dataset}' "
-               f"and coalesce(partition, dataset) = '{name}' and recorded_at_ns < {before_ns}")
+               f"and coalesce(partition, dataset) = '{name}' and {cut}")
     elif kind == "partition":
         sql = (f"select count(*), coalesce(md5(string_agg(entry_id || ':' || encode(digest, 'hex'), ',' "
                f"order by first_sequence)), '') from book_entry where partition = '{name}' "
-               f"and committed_at_ns < {before_ns}")
+               f"and {cut}")
     else:
         sql = (f"select count(*), coalesce(md5(string_agg(entry_id || ':' || encode(digest, 'hex'), ',' "
                f"order by partition, first_sequence)), '') from book_entry where account_id = '{name}' "
-               f"and committed_at_ns < {before_ns}")
+               f"and {cut}")
     return psql(sql, pod=database_pod(store, d))
 
 
@@ -6291,7 +6316,8 @@ def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
     what = f"{store} {kind} {name} to {'group ' + str(target) if kind != 'account' else target}, {where_said(where)}"
     since_ns = time.time_ns()
     time.sleep(1)
-    before = committed_before(store, where[0], kind, name, since_ns)
+    cut = committed_cut(store, where[0], kind, name)
+    before = committed_before(store, where[0], kind, name, cut)
     began_ms = int(time.time() * 1000)
     if kind == "account":
         answer = dash.call("dashboard__move_account", {
@@ -6322,7 +6348,7 @@ def a_move(s, dash, store, kind, name, target, where, by_dialog=False):
         s.check(ended == "moved", f"rebalance: {what}: switched, its digests equal ({ended})")
     ended_ms = int(time.time() * 1000)
     window_held(s, what, began_ms, ended_ms)
-    after = committed_before(store, where[1], kind, name, since_ns)
+    after = committed_before(store, where[1], kind, name, cut)
     s.check(before == after and not before.startswith("0|"),
             f"rebalance: {what}: what was committed before it reads the same after it ({before} and {after})")
     if kind != "account":

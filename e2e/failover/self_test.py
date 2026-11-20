@@ -12,13 +12,27 @@ post ("Remote end closed connection without response").
 - The admin's client (`Dashboard`) makes its forward anew when it ends
   under a request: a GET is sent again; the Move dialog's post only once
   the store shows no move begun, from a page and token asked again.
+
+What merge-queue run 44726786526 (failover, ha) met: a book entry is stamped
+`committed_at_ns` as its command is received, and an order received 0.2 s
+before a move's check began was committed 4.3 s later, after the check's
+first read -- 7869 entries before the move and 7870 after it, none changed.
+
+- What was committed before a move is cut by where its log stood
+  (`committed_cut`), never by a time: a write received before the move and
+  committed after the first read is not of it, and an entry changed or lost
+  under the move still is.
 """
 
+import hashlib
 import os
 import socket
+import sqlite3
 import sys
 import threading
+import time
 import unittest
+from unittest import mock
 
 os.environ.setdefault("E2E_IMAGE", "self-test")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -231,6 +245,134 @@ class ForwardEnds(unittest.TestCase):
             self.assertEqual(posts, 1 + run.Dashboard.RESENDS)
         finally:
             server.close()
+
+
+class Store:
+    """The book's entries and the lake's rows as the rebalance check reads
+    them, in SQLite in memory: `psql` answers a statement as `psql -At`
+    does, a row a line and its columns by `|`."""
+
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.create_function(
+            "md5", 1, lambda text: None if text is None else hashlib.md5(text.encode()).hexdigest())
+        self.db.create_function("encode", 2, lambda held, _: bytes(held).hex())
+        self.db.executescript(
+            "create table book_entry (entry_id text, account_id text, partition text, first_sequence integer,"
+            " last_sequence integer, digest blob, committed_at_ns integer);"
+            "create table lake_row (dataset text, partition text, row_key text, sequence integer,"
+            " version integer, recorded_at_ns integer);")
+        # Committed a minute ago: ten entries of P0, five of them the
+        # account's, and ten rows of the range.
+        self.then_ns = time.time_ns() - 60 * 10**9
+        for n in range(1, 11):
+            self.entry(n, "ACC-1" if n % 2 else "ACC-2", self.then_ns + n)
+            self.row(n, self.then_ns + n)
+
+    def entry(self, sequence, account, at_ns):
+        self.db.execute("insert into book_entry values (?, ?, 'P0', ?, ?, ?, ?)",
+                        (f"ENT-{sequence}", account, sequence, sequence, bytes([sequence]), at_ns))
+
+    def row(self, sequence, at_ns):
+        self.db.execute("insert into lake_row values ('drive', 'drive/8000-ffff', ?, ?, 1, ?)",
+                        (f"key-{sequence}", sequence, at_ns))
+
+    def psql(self, sql, database="meridian", quiet=False, pod=None):
+        return "\n".join("|".join("" if value is None else str(value) for value in row)
+                         for row in self.db.execute(sql).fetchall())
+
+
+class Checks:
+    """The run's summary, as a move's checks are said to it."""
+
+    def __init__(self):
+        self.said = []
+
+    def check(self, ok, what):
+        self.said.append((bool(ok), what))
+        return ok
+
+    def the_same(self):
+        """Whether the move's "reads the same after it" held, and its words."""
+        return next((ok, what) for ok, what in self.said if "reads the same after it" in what)
+
+
+class Admin:
+    """The admin's client: a move asked for is answered made, and `under`
+    happens in the store while it runs."""
+
+    def __init__(self, under):
+        self.under = under
+
+    def call(self, tool, arguments, again=None):
+        self.under()
+        return {"outcome": "made"}
+
+
+MOVES = (("book", "partition", "P0", 1), ("book", "account", "ACC-1", "P1"),
+         ("lake", "range", "drive/8000-ffff", 1))
+
+
+def a_move(store, moved, under):
+    """One of `MOVES` by the run's own `a_move`, the cluster stood in for:
+    the store answers its reads, the move ends moved, and the driver's
+    window and every wait are passed over. Says its checks."""
+    said = Checks()
+    with mock.patch.object(run, "psql", store.psql), \
+            mock.patch.object(run, "database_pod", lambda *_: None), \
+            mock.patch.object(run, "window_held", lambda *_: None), \
+            mock.patch.object(run, "partition_moved", lambda *_: "moved"), \
+            mock.patch.object(run.time, "sleep", lambda _: None):
+        kind_store, kind, name, target = moved
+        run.a_move(said, Admin(under), kind_store, kind, name, target, (0, 0))
+    return said
+
+
+class CommittedBefore(unittest.TestCase):
+    def test_a_write_received_before_the_move_and_committed_after_its_first_read_is_not_of_it(self):
+        # CI 44726786526: stamped as it was received, before the move's
+        # check began, and committed under the move, after the first read.
+        for moved in MOVES:
+            with self.subTest(moved=moved):
+                store = Store()
+
+                def late():
+                    received_ns = time.time_ns() - 5 * 10**9
+                    store.entry(11, "ACC-1", received_ns)
+                    store.row(11, received_ns)
+                ok, what = a_move(store, moved, late).the_same()
+                self.assertTrue(ok, what)
+
+    def test_an_entry_changed_under_the_move_is_found(self):
+        for moved in MOVES:
+            with self.subTest(moved=moved):
+                store = Store()
+
+                def changed():
+                    store.db.execute("update book_entry set digest = x'ff' where first_sequence = 3")
+                    store.db.execute("update lake_row set version = 2 where sequence = 3")
+                ok, what = a_move(store, moved, changed).the_same()
+                self.assertFalse(ok, what)
+
+    def test_an_entry_lost_under_the_move_is_found(self):
+        for moved in MOVES:
+            with self.subTest(moved=moved):
+                store = Store()
+
+                def lost():
+                    store.db.execute("delete from book_entry where first_sequence = 3")
+                    store.db.execute("delete from lake_row where sequence = 3")
+                ok, what = a_move(store, moved, lost).the_same()
+                self.assertFalse(ok, what)
+
+    def test_a_move_of_nothing_committed_before_it_is_found(self):
+        for moved in MOVES:
+            with self.subTest(moved=moved):
+                store = Store()
+                store.db.execute("delete from book_entry")
+                store.db.execute("delete from lake_row")
+                ok, what = a_move(store, moved, lambda: None).the_same()
+                self.assertFalse(ok, what)
 
 
 if __name__ == "__main__":
