@@ -104,6 +104,14 @@ pub trait TicketStore: Send + Sync {
     /// never back.
     fn advance(&self, subject: &str, reader: &str, to: i64, notice_id: &str) -> Result<(), String>;
 
+    /// What is new for one reader, at most `limit`, oldest first, and its
+    /// place moved past it, as one step: the reader's place held from its
+    /// read to its move, so one reader's reads at once -- an agent's two
+    /// calls through one delegation, on two copies of the dashboard --
+    /// return each notice to one of them (the review of v31a-core-1,
+    /// finding 4).
+    fn read_new(&self, subject: &str, reader: &str, limit: usize) -> Result<Vec<Notice>, String>;
+
     /// Mark a person's notices of these tickets read. How many were unread.
     fn mark_read(&self, subject: &str, ticket_ids: &[String]) -> Result<usize, String>;
 
@@ -125,12 +133,7 @@ pub fn read_new(
     reader: &str,
     limit: usize,
 ) -> Result<Vec<Notice>, String> {
-    let after = store.cursor(subject, reader)?;
-    let notices = store.notices(subject, after, limit)?;
-    if let Some((to, last)) = notices.last() {
-        store.advance(subject, reader, *to, &last.notice_id)?;
-    }
-    Ok(notices.into_iter().map(|(_, notice)| notice).collect())
+    store.read_new(subject, reader, limit)
 }
 
 // ── In memory ────────────────────────────────────────────────────────────────
@@ -384,6 +387,25 @@ impl TicketStore for InMemory {
             .or_default();
         *at = (*at).max(to);
         Ok(())
+    }
+
+    fn read_new(&self, subject: &str, reader: &str, limit: usize) -> Result<Vec<Notice>, String> {
+        // One lock from the read to the move.
+        let mut kept = self.lock();
+        let place = (subject.to_string(), reader.to_string());
+        let after = kept.cursors.get(&place).copied().unwrap_or_default();
+        let mut found: Vec<(i64, Notice)> = kept
+            .notices
+            .iter()
+            .filter(|(number, n)| n.subject == subject && *number > after)
+            .cloned()
+            .collect();
+        found.sort_by_key(|(number, _)| *number);
+        found.truncate(limit);
+        if let Some((to, _)) = found.last() {
+            kept.cursors.insert(place, *to);
+        }
+        Ok(found.into_iter().map(|(_, notice)| notice).collect())
     }
 
     fn mark_read(&self, subject: &str, ticket_ids: &[String]) -> Result<usize, String> {
@@ -1018,6 +1040,52 @@ impl TicketStore for InPostgres {
         )
         .map_err(said)?;
         Ok(())
+    }
+
+    fn read_new(&self, subject: &str, reader: &str, limit: usize) -> Result<Vec<Notice>, String> {
+        let mut conn = self.database.conn()?;
+        let mut tx = conn.transaction().map_err(said)?;
+        // The place made where it is the reader's first, then held to the
+        // end: another read by the same reader waits, and reads on from
+        // where this one moved it.
+        tx.execute(
+            "INSERT INTO dashboard_inbox_cursor (subject, reader, notice_id, seq)
+             VALUES ($1, $2, '', 0) ON CONFLICT (subject, reader) DO NOTHING",
+            &[&subject, &reader],
+        )
+        .map_err(said)?;
+        let after: i64 = tx
+            .query_one(
+                "SELECT seq FROM dashboard_inbox_cursor
+                  WHERE subject = $1 AND reader = $2 FOR UPDATE",
+                &[&subject, &reader],
+            )
+            .map_err(said)?
+            .get(0);
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT {NOTICE_COLUMNS}, inbox_seq FROM dashboard_notice
+                      WHERE subject = $1 AND ticket_id IS NOT NULL AND inbox_seq > $2
+                      ORDER BY inbox_seq LIMIT $3"
+                ),
+                &[&subject, &after, &(limit as i64)],
+            )
+            .map_err(said)?;
+        if let Some(last) = rows.last() {
+            // The notice's ID kept beside its number, as the release before
+            // this one reads a place.
+            let to: i64 = last.get(12);
+            let notice_id: String = last.get(0);
+            tx.execute(
+                "UPDATE dashboard_inbox_cursor SET seq = $3, notice_id = $4
+                  WHERE subject = $1 AND reader = $2",
+                &[&subject, &reader, &to, &notice_id],
+            )
+            .map_err(said)?;
+        }
+        tx.commit().map_err(said)?;
+        Ok(rows.iter().map(notice_of).collect())
     }
 
     fn mark_read(&self, subject: &str, ticket_ids: &[String]) -> Result<usize, String> {
