@@ -15,7 +15,9 @@
 //!
 //! The part goes back by core NATS to the inbox the unit names in its
 //! `Meridian-Part-To` header. The stream's subject is the component's own
-//! topic, granted to its credential alone, beside JetStream's API.
+//! topic, granted to its credential alone, beside JetStream's API for this
+//! stream and its one consumer alone: the calls made here, and no other
+//! stream's (the runtime's broker permissions; review C, X1).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,5 +170,85 @@ impl Units {
             }
         }
         Err("the units' queue ended".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue end to end under the analytics component's own credential
+    /// and the broker permissions the runtime generates (review C, X1; the
+    /// review of #132, item 3). By hand: a three-server JetStream cluster
+    /// started with `-js` on the generated dev.conf, and
+    /// MERIDIAN_TEST_JETSTREAM_CLUSTER_URL_ANALYTICS its address with the
+    /// analytics credential. Its stream and consumer are made, every unit
+    /// is delivered and acknowledged, and the lake's write-ahead stream is
+    /// not answered to it at all.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a JetStream cluster on the generated permissions: MERIDIAN_TEST_JETSTREAM_CLUSTER_URL_ANALYTICS"]
+    async fn the_queue_runs_end_to_end_under_the_analytics_credential() {
+        let url = std::env::var("MERIDIAN_TEST_JETSTREAM_CLUSTER_URL_ANALYTICS").unwrap();
+        let mut units = Err(String::new());
+        // The cluster's servers forming their group, as on a roll.
+        for _ in 0..30 {
+            units = Units::connect(&url).await;
+            if units.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let units = units.expect("the units' stream was made under the analytics credential");
+        let working = Arc::clone(&units);
+        let worker = tokio::spawn(working.work(Arc::new(Cache::new(16))));
+        const ASKED: u64 = 3;
+        for n in 0..ASKED {
+            // Not a unit a worker can answer: taken, refused, acknowledged.
+            let asked = units
+                .ask(
+                    format!("{{\"not-a-unit\":{n}}}").into_bytes(),
+                    Duration::from_secs(2),
+                )
+                .await;
+            assert!(asked.is_err(), "a part came back for no unit");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !worker.is_finished(),
+            "the worker stopped: {:?}",
+            worker.await
+        );
+
+        let mut stream = units.context.get_stream(STREAM).await.unwrap();
+        let mut taking = stream
+            .get_consumer::<consumer::pull::Config>(CONSUMER)
+            .await
+            .unwrap();
+        let took = taking.info().await.unwrap().clone();
+        assert!(took.delivered.stream_sequence >= ASKED, "{took:?}");
+        assert_eq!(
+            (took.num_ack_pending, took.num_pending, took.num_redelivered),
+            (0, 0, 0),
+            "every unit delivered once and acknowledged"
+        );
+        assert_eq!(
+            stream.info().await.unwrap().state.messages,
+            0,
+            "units left in the queue"
+        );
+
+        // The lake's write-ahead stream: refused, so never answered, where a
+        // credential granted it would hear at least "stream not found".
+        let refused = tokio::time::timeout(
+            Duration::from_secs(3),
+            units
+                .client
+                .request("$JS.API.STREAM.INFO.LAKE_WRITE_AHEAD", "".into()),
+        )
+        .await;
+        assert!(
+            !matches!(refused, Ok(Ok(_))),
+            "the analytics credential was answered about the lake's stream: {refused:?}"
+        );
     }
 }

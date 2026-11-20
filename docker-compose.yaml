@@ -557,6 +557,9 @@ services:
       MERIDIAN_TEST_BROKER_URL_RUNTIME: nats://runtime:runtime-dev-only@nats:4222
       # The instrument store's own (contract v20).
       MERIDIAN_TEST_BROKER_URL_INSTRUMENT: nats://instrument:instrument-dev-only@nats:4222
+      # The analytics component's own (contract v26): its own JetStream
+      # stream's calls, and none on the lake's (review C, X1).
+      MERIDIAN_TEST_BROKER_URL_ANALYTICS: nats://analytics:analytics-dev-only@nats:4222
       # A plugin's sidecar, with only what the custody role may do. The tests
       # that matter most use this one and expect to be refused.
       MERIDIAN_TEST_BROKER_URL_CUSTODY: nats://custody-test-1:custody-test-1-dev-only@nats:4222
