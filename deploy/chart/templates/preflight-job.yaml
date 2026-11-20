@@ -67,19 +67,18 @@
        - the database is one member, and it is the only database brought:
          under Patroni member 0 may be a standby, and the check has one
          volume's size and judges every database it reaches by it;
-       - its pod is running and ready, on a node that is ready and not
-         cordoned: this pod is named to that node, where the volume is, and
-         on a node that takes no pod it would wait until its deadline and
-         fail an upgrade the database itself would have passed;
-       - the volume is bound to that node -- its PersistentVolume names a
-         node (nodeAffinity) or is a `local` one -- so it is the database's
-         directory this pod reads, never an empty one of the same path on
-         another node.
-       The node and the volume are read only once everything before them
-       holds, since they are the cluster's and not the namespace's: whoever
-       upgrades a deployment on node directories must be able to read them.
-       What remains: a node cordoned, lost or filled after this is rendered
-       and before the pod starts fails the hook, and so the upgrade, with
+       - its pod is running and ready and not being deleted: this pod is
+         named to that pod's node (nodeName), where the volume is, so it
+         reads the database's own directory whether or not the volume
+         names its node, never an empty one of the same path elsewhere;
+         a pod so named starts on a cordoned node, and a node that is not
+         ready has no ready pod.
+       Nothing of the cluster's is read, only the namespace's: the node and
+       the PersistentVolume would say more, but a lookup that is forbidden
+       fails the whole render, and whoever upgrades a deployment may hold
+       rights in its namespace alone.
+       What remains: a node lost or filled after this is rendered and
+       before the pod starts fails the hook, and so the upgrade, with
        nothing changed; upgrading again judges it afresh.
        The check itself tells a filesystem that is the volume's own from a
        node's disk, by its size; this only says where mounting is safe. */}}
@@ -99,19 +98,9 @@
 {{- if and (eq .type "Ready") (eq .status "True") }}{{ $podReady = true }}{{ end }}
 {{- end }}
 {{- $on := dig "spec" "nodeName" "" $pod }}
-{{- $volume := dig "spec" "volumeName" "" $claim }}
-{{- if and $podReady (eq (dig "status" "phase" "" $pod) "Running") (not (dig "metadata" "deletionTimestamp" "" $pod)) $on $volume }}
-{{- $node := default (dict) (lookup "v1" "Node" "" $on) }}
-{{- $nodeReady := false }}
-{{- range dig "status" "conditions" (list) $node }}
-{{- if and (eq .type "Ready") (eq .status "True") }}{{ $nodeReady = true }}{{ end }}
-{{- end }}
-{{- $held := default (dict) (lookup "v1" "PersistentVolume" "" $volume) }}
-{{- $bound := or (dig "spec" "nodeAffinity" false $held) (dig "spec" "local" false $held) }}
-{{- if and $nodeReady (not (dig "spec" "unschedulable" false $node)) $bound }}
+{{- if and $podReady (eq (dig "status" "phase" "" $pod) "Running") (not (dig "metadata" "deletionTimestamp" "" $pod)) $on }}
 {{- $data = printf "data-%s-0" $database }}
 {{- $dataNode = $on }}
-{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
