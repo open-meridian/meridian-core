@@ -120,7 +120,7 @@ def log(text):
 
 def compose(*args, check=True):
     done = subprocess.run(COMPOSE + list(args), env=ENV, capture_output=True, text=True,
-                          timeout=900)
+                          errors="replace", timeout=900)
     log(f"$ compose {' '.join(args)[:300]}\n{done.stdout}{done.stderr}")
     if check and done.returncode != 0:
         raise Failed(f"compose {' '.join(args)[:200]}: {(done.stdout + done.stderr).strip()[-600:]}")
