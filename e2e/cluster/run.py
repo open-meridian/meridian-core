@@ -893,6 +893,9 @@ def main():
         )
 
     if UPGRADE_FROM:
+        # A plugin as the launcher leaves one, made before the upgrade so the
+        # upgrade's revision is rendered while the broker holds its credential.
+        launched_stand_in(s)
         upgraded(s)
         # The lake's rows partitioned by the upgrade's own migration (step
         # 3d, stage T; the resilience spec's section 15, the online
@@ -912,6 +915,7 @@ def main():
             status == 303 and ADMIN_HOME in get("/", session),
             f"after the upgrade {who} signs in, and is still a deployment admin: {status}",
         )
+        rolled_back(s)
         return verdict(s)
 
     if WAY_IN["by"] == "password":
@@ -1439,6 +1443,136 @@ def verdict(s):
         return 1
     print("e2e-cluster OK", flush=True)
     return 0
+
+
+# A launched plugin's stand-in: the Deployment the launcher makes for an
+# instance, by its labels, which is all the broker reads to keep the
+# instance's credential in its Secret (spec/the-local-plugin-registry,
+# decision 3). No pod: the credential is the broker's to make either way.
+STAND_IN = "e2e-rollback"
+LAUNCHED_SECRET = f"{RELEASE}-meridian-runtime-broker-launched"
+
+
+def stand_in(present):
+    name = f"{RELEASE}-meridian-runtime-plugin-{STAND_IN}"
+    if not present:
+        kubectl("delete", "deployment", name, "--ignore-not-found", "--wait")
+        return
+    labels = {"meridian.dev/launched": "true", "meridian.dev/instance": STAND_IN}
+    apply(json.dumps({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": name, "labels": labels},
+        "spec": {"replicas": 0, "selector": {"matchLabels": labels},
+                 "template": {"metadata": {"labels": labels},
+                              "spec": {"containers": [{"name": "plugin", "image": "rancher/mirrored-pause:3.6"}]}}},
+    }))
+
+
+def credential():
+    """The stand-in's credential in the broker's Secret, as a digest: what it
+    is, is never printed. Empty where the Secret holds none for it."""
+    import hashlib
+
+    data = json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "-o", "json")).get("data") or {}
+    held = [data.get(f"{STAND_IN}.{key}", "") for key in ("password", "url")]
+    return hashlib.sha256("\n".join(held).encode()).hexdigest() if all(held) else ""
+
+
+def launched_stand_in(s):
+    print("U: a plugin launched before the upgrade, its credential the broker's", flush=True)
+    stand_in(True)
+    s.check(bool(wait_for("the broker's credential for the launched plugin", credential, seconds=120)),
+            f"the broker wrote {STAND_IN}'s credential to {LAUNCHED_SECRET}")
+
+
+def rolled_back(s):
+    """An upgrade stopped at its preflight, rolled back, and made again, over
+    a launched plugin whose credential was made again since the revision the
+    rollback returns to.
+
+    The dev deployment's failure of 2026-11-20: `meridian rollback-deployment`
+    runs `helm rollback`, which applies the stored manifest, and that
+    manifest carried each launched plugin's credential as it was when the
+    revision was rendered. One made again since is the broker's field with
+    another value, so Helm 4's server-side apply refused the Secret, the
+    rollback's revision was failed too, and `meridian upgrade-deployment`
+    refuses a release at a failed revision. Here: the plugin stopped and
+    launched again, so its credential is new; an upgrade whose preflight
+    cannot run; `helm rollback` as the CLI runs it, which must succeed and
+    leave the credential alone; and the upgrade again, the same.
+    """
+    print("U: a preflight stops an upgrade; rolled back and upgraded again, launched credentials kept",
+          flush=True)
+
+    def release():
+        return json.loads(run(HELM, "history", RELEASE, "--namespace", NAMESPACE, "--max", "4", "-o", "json"))[-1]
+
+    def images():
+        return kubectl("get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o",
+                       "jsonpath={range .items[*]}{.metadata.name}={.spec.template.spec.containers[*].image} {end}")
+
+    deployed = release()
+    s.check(deployed["status"] == "deployed", f"the upgrade left revision {deployed['revision']} deployed")
+    # Stopped and launched again: the broker takes the credential out, then
+    # makes another.
+    before = credential()
+    stand_in(False)
+    wait_for("the stopped plugin's credential taken out", lambda: not credential(), seconds=120)
+    stand_in(True)
+    now = wait_for("a credential for the plugin launched again", credential, seconds=120)
+    s.check(bool(before) and now != before, "stopped and launched again, the plugin's credential was made again")
+
+    # The preflight is the first thing an upgrade runs, from the new image:
+    # one that is nowhere cannot run, and the hook fails with nothing changed.
+    repository, _, tag = IMAGE.rpartition(":")
+    conflicts = ["--force-conflicts"] if run(HELM, "version", "--short").startswith("v4") else []
+    running = images()
+    stopped = subprocess.run(
+        [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+         "--timeout", "45s", *conflicts, "--set", "image.tag=e2e-no-such-image"],
+        capture_output=True, text=True, errors="replace",
+    )
+    failed = release()
+    s.check(
+        stopped.returncode != 0 and "pre-upgrade" in stopped.stderr and failed["status"] == "failed"
+        and failed["revision"] == deployed["revision"] + 1,
+        f"an upgrade whose preflight cannot run is stopped at it, revision {failed['revision']} "
+        f"{failed['status']}: {stopped.stderr.strip()[-200:]}",
+    )
+    s.check(images() == running and credential() == now, "and it changed nothing: every image and the credential as they were")
+
+    # As `meridian rollback-deployment` runs it (meridian-cli, rollback.rs):
+    # to the last revision deployed, no flag that lets Helm take a field.
+    back = subprocess.run(
+        [HELM, "rollback", RELEASE, str(deployed["revision"]), "--namespace", NAMESPACE, "--timeout", "10m"],
+        capture_output=True, text=True, errors="replace",
+    )
+    for line in (back.stdout + back.stderr).splitlines():
+        # Field names, as Helm says a conflict; never a value.
+        print(f"    | {line[:300]}", flush=True)
+    after = release()
+    s.check(
+        back.returncode == 0 and after["status"] == "deployed" and after["revision"] == failed["revision"] + 1,
+        f"helm rollback to revision {deployed['revision']} succeeded: exit {back.returncode}, "
+        f"revision {after['revision']} {after['status']}",
+    )
+    s.check(credential() == now, "and the launched plugin's credential is the one the broker made, not the revision's")
+
+    again = subprocess.run(
+        [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+         "--timeout", "10m", *conflicts, "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
+        capture_output=True, text=True, errors="replace",
+    )
+    for line in (again.stdout + again.stderr).splitlines():
+        print(f"    | {line[:300]}", flush=True)
+    last = release()
+    s.check(
+        again.returncode == 0 and last["status"] == "deployed",
+        f"and the upgrade made again succeeded: exit {again.returncode}, revision {last['revision']} {last['status']}",
+    )
+    rolled_out(s, "upgraded again")
+    s.check(credential() == now, "the credential still the broker's own")
+    stand_in(False)
 
 
 def upgraded(s):
