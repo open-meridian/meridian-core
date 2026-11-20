@@ -20,13 +20,46 @@
 use std::collections::BTreeSet;
 
 use meridian_analytics::queue as units;
-use meridian_bus::write_ahead;
+use meridian_bus::{inbox, write_ahead};
 use meridian_sidecar::Contract;
 
-/// Where a reply lands. A caller has to hear its own answer, and a responder
-/// has to be able to reply to whoever asked; the broker scopes the second to
-/// inboxes it actually received, which is tighter than any list.
-const INBOX: &str = "_INBOX.>";
+/// Where a reply lands: each user's own inboxes, `_INBOX.<user>.`, which its
+/// client makes its inboxes under (v31a, item 2; [`inbox`]). A caller hears
+/// its own answers and no other's. A responder replies to whoever asked by
+/// the broker's `allow_responses`: one answer on the reply subject of each
+/// request it was delivered, whatever its grants say -- the one way into
+/// another credential's inbox, short of the lake's below.
+fn own_inbox(user: &str) -> String {
+    inbox::grant(user)
+}
+
+/// Whether an instance writes to the lake's write-ahead stream: a data
+/// plugin whose name stands in a subject ([`permissions_entitled`]).
+fn writes_ahead(instance: &Instance) -> bool {
+    matches!(
+        instance,
+        Instance::Plugin { instance_id, roles, .. }
+            if roles.iter().any(|role| role == "data") && dataset_reads(instance_id)
+    )
+}
+
+/// The runtime's credential answers each data plugin that writes ahead on
+/// that plugin's inboxes: the lake's writer answers a write it took from the
+/// stream on the inbox the write named (W10.4), which no request carried to
+/// it, so the broker's answer-once rule does not cover it. By name, those
+/// plugins' alone; the lake answers only an inbox of the instance whose
+/// subject the write came on (`meridian_lake::write_ahead`).
+pub fn answer_writes_ahead(users: &mut [User], instance: &Instance) {
+    if !writes_ahead(instance) {
+        return;
+    }
+    if let Some(runtime) = users.iter_mut().find(|user| user.user == "runtime") {
+        let theirs = own_inbox(instance.id());
+        if !runtime.publish.contains(&theirs) {
+            runtime.publish.push(theirs);
+        }
+    }
+}
 
 /// The components this deployment's runtime hosts, sharing one credential.
 const RUNTIME_COMPONENTS: [&str; 4] = ["street", "bor", "lake", "conductor"];
@@ -421,8 +454,8 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             subscribe.push(topic.to_string());
         }
         publish.extend(jetstream_grants(&[component]));
-        publish.push(INBOX.to_string());
-        subscribe.push(INBOX.to_string());
+        publish.push(own_inbox(component));
+        subscribe.push(own_inbox(component));
         users.push(User {
             user: component.to_string(),
             password: Password::Env(variable(component)),
@@ -438,8 +471,8 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         subscribe.push(topic.to_string());
     }
     publish.extend(jetstream_grants(&RUNTIME_COMPONENTS));
-    publish.push(INBOX.to_string());
-    subscribe.push(INBOX.to_string());
+    publish.push(own_inbox("runtime"));
+    subscribe.push(own_inbox("runtime"));
     users.push(User {
         user: "runtime".to_string(),
         password: Password::Env(variable("runtime")),
@@ -454,6 +487,7 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             instance,
             Password::Env(variable(instance.id())),
         )?);
+        answer_writes_ahead(&mut users, instance);
     }
 
     Ok(users)
@@ -502,8 +536,8 @@ pub fn instance_user(
             )
         }
     };
-    publish.push(INBOX.to_string());
-    subscribe.push(INBOX.to_string());
+    publish.push(own_inbox(instance.id()));
+    subscribe.push(own_inbox(instance.id()));
     Ok(User {
         user: instance.id().to_string(),
         password,

@@ -99,7 +99,7 @@ fn every_plugin_credential_carries_its_sidecars_own_traffic() {
         reference.publish,
         vec![
             "platform.config.query.plugin-configuration".to_string(),
-            INBOX.to_string()
+            "_INBOX.reference-1.>".to_string()
         ]
     );
 }
@@ -230,18 +230,87 @@ fn the_runtime_takes_the_contracts_own_columns() {
         .contains(&"platform.street.command.record-holding".to_string()));
 }
 
+/// v31a, item 2 (the access audit's S1): each credential hears and answers
+/// on its own inboxes, `_INBOX.<user>.`, and on no other's. With `_INBOX.>`
+/// on every credential, any one of them heard every answer in the deployment
+/// -- every account's data, every plugin's secret settings -- and could
+/// answer in another's place.
 #[test]
-fn every_user_carries_its_inbox() {
+fn each_credential_holds_its_own_inboxes_and_no_one_holds_every_inbox() {
     let users = users(
-        &contract(),
-        &[Instance::plugin("custody-test-1", &["custody"])],
+        Contract::embedded(),
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("truefx", &["data"]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
     )
     .expect("generates");
-
-    for user in &users {
-        assert!(user.publish.contains(&INBOX.to_string()), "{}", user.user);
-        assert!(user.subscribe.contains(&INBOX.to_string()), "{}", user.user);
+    let named: Vec<&str> = users.iter().map(|u| u.user.as_str()).collect();
+    for name in [
+        "custody-test-1",
+        "truefx",
+        "dashboard-1",
+        "runtime",
+        "first-run",
+        "instrument",
+        "analytics",
+    ] {
+        assert!(named.contains(&name), "{name} is admitted");
     }
+    for user in &users {
+        let own = format!("_INBOX.{}.>", user.user);
+        for (granted, side) in [(&user.publish, "publish"), (&user.subscribe, "subscribe")] {
+            assert!(
+                granted.contains(&own),
+                "{} {side}s on its own inboxes",
+                user.user
+            );
+            assert!(
+                !granted.iter().any(|g| grants(g, "_INBOX.anybody.x")
+                    || grants(g, "_INBOX.x")
+                    || g == "_INBOX.>"),
+                "{} may {side} on inboxes not its own: {granted:?}",
+                user.user
+            );
+        }
+        // Subscribed to its own alone: no credential hears another's answers.
+        let inboxes: Vec<&String> = user
+            .subscribe
+            .iter()
+            .filter(|g| g.starts_with("_INBOX"))
+            .collect();
+        assert_eq!(inboxes, vec![&own], "{}", user.user);
+    }
+}
+
+/// The lake answers a write it took from its write-ahead stream on the inbox
+/// the write named (W10.4): no request carried it there, so the broker's
+/// answer-once rule does not let it through. Its credential, the runtime's,
+/// is granted the inboxes of the data plugins that write ahead, by name, and
+/// no other plugin's.
+#[test]
+fn the_runtime_answers_on_the_inboxes_of_the_data_plugins_alone() {
+    let users = users(
+        Contract::embedded(),
+        &[
+            Instance::plugin("truefx", &["data"]),
+            Instance::plugin("custody-test-1", &["custody"]),
+        ],
+    )
+    .expect("generates");
+    let runtime = user(&users, "runtime");
+    let inboxes: Vec<&str> = runtime
+        .publish
+        .iter()
+        .map(String::as_str)
+        .filter(|g| g.starts_with("_INBOX"))
+        .collect();
+    assert_eq!(inboxes, vec!["_INBOX.runtime.>", "_INBOX.truefx.>"]);
+    assert!(!runtime
+        .subscribe
+        .iter()
+        .any(|g| g.as_str() == "_INBOX.truefx.>"));
 }
 
 #[test]

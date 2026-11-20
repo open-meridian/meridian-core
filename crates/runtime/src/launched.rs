@@ -169,7 +169,7 @@ pub fn configuration(
     launched: &[Launched],
     hashes: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<String>), String> {
-    use crate::broker::{instance_user, rendered, users, Password};
+    use crate::broker::{answer_writes_ahead, instance_user, rendered, users, Password};
     let mut admitted = users(contract, chart)?;
     let mut left_out = Vec::new();
     for plugin in launched {
@@ -183,7 +183,10 @@ pub fn configuration(
             continue;
         };
         match instance_user(contract, &plugin.instance(), Password::Bcrypt(hash.clone())) {
-            Ok(user) => admitted.push(user),
+            Ok(user) => {
+                admitted.push(user);
+                answer_writes_ahead(&mut admitted, &plugin.instance());
+            }
             Err(refusal) => left_out.push(refusal),
         }
     }

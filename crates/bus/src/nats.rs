@@ -67,7 +67,7 @@ pub(crate) const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
 /// every message the client sends, so a client that publishes often never
 /// pings at all. Meanwhile its subscriptions, a writer's change log among
 /// them, are served by nobody. The round trip is on an inbox of its own,
-/// which every credential holds (`_INBOX.>`).
+/// under its credential's prefix ([`crate::inbox`]).
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const UNANSWERED: Duration = Duration::from_secs(2);
 
@@ -412,6 +412,9 @@ pub const INTERNAL_TLS_CA: &str = "MERIDIAN_INTERNAL_TLS_CA";
 /// A cluster of servers (step 3b, `broker.replicas: 3`) is every server, by
 /// its name, after the one credential: `nats://user:password@a:4222,b:4222`,
 /// each tried in turn and reconnected to when one is lost.
+///
+/// Its inboxes are made under its user's prefix, the only inboxes the broker
+/// grants that user (v31a, item 2; [`crate::inbox`]).
 fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("nats", url));
 
@@ -423,7 +426,8 @@ fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
                 async_nats::ConnectOptions::with_user_and_password(
                     user.to_string(),
                     password.to_string(),
-                ),
+                )
+                .custom_inbox_prefix(crate::inbox::prefix(user)),
                 hosts,
             )
         }

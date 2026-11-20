@@ -37,6 +37,48 @@ fn reply(answer: &meridian_bus::HandlerReply) -> RecordObservationsReply {
     RecordObservationsReply::decode(&bytes[..]).unwrap()
 }
 
+/// v31a, item 2 (the access audit's S1, point 10): a write's subject names
+/// the instance whose credential alone may publish it, and the lake answers
+/// it on that credential's own inboxes alone. A reply-to outside them --
+/// another plugin's inbox, a component's, or a client's default -- is
+/// refused: the write is recorded and answered to nobody, so a plugin cannot
+/// have the lake publish into another's inbox as the runtime.
+#[test]
+fn a_reply_to_outside_its_senders_inboxes_is_refused() {
+    use crate::write_ahead::answered_to;
+    use meridian_bus::write_ahead::subject;
+    let truefx = subject("truefx", "eurusd");
+    assert_eq!(
+        answered_to(&truefx, Some("_INBOX.truefx.Ab12.7".into())).as_deref(),
+        Some("_INBOX.truefx.Ab12.7")
+    );
+    for elsewhere in [
+        "_INBOX.kraken-1.Ab12.7",
+        "_INBOX.runtime.Ab12",
+        "_INBOX.dashboard-1.x",
+        "_INBOX.Ab12",
+        "_INBOX.truefx",
+        "platform.config.query.plugin-configuration",
+        "_INBOX.truefxx.Ab12",
+    ] {
+        assert_eq!(
+            answered_to(&truefx, Some(elsewhere.into())),
+            None,
+            "{elsewhere} answered for truefx"
+        );
+    }
+    assert_eq!(answered_to(&truefx, Some(String::new())), None);
+    assert_eq!(answered_to(&truefx, None), None);
+    // A subject of no dataset's names no sender: nobody is answered.
+    assert_eq!(
+        answered_to(
+            "platform.lake.internal.write-ahead",
+            Some("_INBOX.truefx.1".into())
+        ),
+        None
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_from_the_stream_are_recorded_with_its_position_and_answered_as_the_lake_answers() {
     let h = harness();
@@ -922,7 +964,7 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
     tokio::task::block_in_place(|| gap_configured(&h));
     let tag = std::process::id();
     let mut answered = client
-        .subscribe(format!("_INBOX.c5o-{tag}.>"))
+        .subscribe(format!("_INBOX.coinbase-1.c5o-{tag}.>"))
         .await
         .unwrap();
     let put = |round: &'static str, n: u64, after: Option<u64>| {
@@ -943,7 +985,7 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
             headers.insert(TOPIC_HEADER, write.topic.as_str());
             headers.insert(
                 REPLY_HEADER,
-                format!("_INBOX.c5o-{tag}.{round}.{n}").as_str(),
+                format!("_INBOX.coinbase-1.c5o-{tag}.{round}.{n}").as_str(),
             );
             if let Some(after) = after {
                 headers.insert(AFTER_HEADER, after.to_string().as_str());

@@ -751,6 +751,124 @@ async fn the_runtimes_components_may_only_touch_their_own_topics() {
     );
 }
 
+// ── Each credential's own inboxes ───────────────────────────────────────────
+//
+// v31a, item 2 (the access audit's S1): with `_INBOX.>` on every credential,
+// any one of them heard every answer in the deployment and could answer in
+// another's place. Each now holds `_INBOX.<user>.` alone, and its client
+// makes its inboxes there.
+
+#[tokio::test]
+async fn a_credential_cannot_hear_another_credentials_inbox() {
+    let one = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let two = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO").await;
+    let sending = raw("MERIDIAN_TEST_BROKER_URL").await;
+
+    let theirs = "_INBOX.custody-test-2.probe";
+    let mut overheard = one.subscribe(theirs).await.unwrap();
+    let mut own = two.subscribe(theirs).await.unwrap();
+    one.flush().await.unwrap();
+    two.flush().await.unwrap();
+    settle().await;
+
+    let answer = mark("an-answer-for-custody-test-2");
+    sending
+        .publish(theirs, answer.clone().into())
+        .await
+        .unwrap();
+    sending.flush().await.unwrap();
+
+    assert!(
+        heard(&mut own, &answer).await,
+        "a credential did not hear its own inbox"
+    );
+    assert!(
+        !heard(&mut overheard, &answer).await,
+        "custody-test-1 heard custody-test-2's inbox"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_cannot_publish_into_another_credentials_inbox() {
+    let one = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let two = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO").await;
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+
+    let theirs = "_INBOX.custody-test-2.forged";
+    let mut inbox = listening.subscribe(theirs).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+
+    let forged = mark("custody-test-1-answers-for-another");
+    one.publish(theirs, forged.clone().into()).await.unwrap();
+    one.flush().await.unwrap();
+    let own = mark("custody-test-2-on-its-own-inbox");
+    two.publish(theirs, own.clone().into()).await.unwrap();
+    two.flush().await.unwrap();
+
+    // One window for both: whatever arrives is read once.
+    use futures_util::StreamExt;
+    let mut arrived = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
+        arrived.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    assert!(
+        !arrived.contains(&forged),
+        "custody-test-1 published into custody-test-2's inbox"
+    );
+    assert!(
+        arrived.contains(&own),
+        "custody-test-2 was refused its own inbox"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
+    // Asked as custody-test-1 on what every sidecar asks, answered by the
+    // runtime's credential, which holds no inbox of custody-test-1's: the
+    // caller's client makes its inbox under its own prefix, and the broker
+    // lets the one asked answer once on it.
+    let asking = Bus::single(
+        "custody-test-1",
+        Arc::new(as_custody().await),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "conductor",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let topic = "platform.config.query.plugin-configuration";
+    let tag = mark("inbox-answer");
+    let expected = tag.clone();
+    answering.serve(topic, move |envelope| {
+        Ok((
+            "meridian.test.Answer".to_string(),
+            [expected.as_bytes(), b":", &envelope.payload].concat(),
+        ))
+    });
+    settle().await;
+
+    let (_, payload) = asking
+        .call(
+            topic,
+            "meridian.test.Question",
+            b"mine".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("the call was answered on the caller's own inbox");
+    assert_eq!(payload, format!("{tag}:mine").into_bytes());
+}
+
 #[tokio::test]
 async fn the_instrument_store_asks_for_the_plugin_catalogue_with_its_own_credential() {
     // Contract v20 (the product owner, 2026-10-11): the instrument store reads

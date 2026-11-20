@@ -187,6 +187,43 @@ fn a_launched_plugin_is_admitted_by_a_hash_and_its_roles_topics() {
     );
 }
 
+/// A data plugin launched after install writes ahead too (v31a, item 2):
+/// the lake's credential is granted its inboxes, as a chart's data plugin's,
+/// so its writes are answered; a launched plugin of another role's are not.
+#[test]
+fn the_runtime_answers_a_launched_data_plugin_on_its_inboxes_alone() {
+    let contract = meridian_sidecar::Contract::embedded();
+    let launched = [
+        Launched {
+            instance_id: "kraken-2".into(),
+            roles: vec!["data".into()],
+            datasets: vec![],
+        },
+        Launched {
+            instance_id: "snaptrade-2".into(),
+            roles: vec!["custody".into()],
+            datasets: vec![],
+        },
+    ];
+    let hashes = BTreeMap::from([
+        ("kraken-2".to_string(), "$2b$12$abc".to_string()),
+        ("snaptrade-2".to_string(), "$2b$12$def".to_string()),
+    ]);
+    let (written, _) = configuration("", contract, &[], &launched, &hashes).unwrap();
+    let runtime = written
+        .lines()
+        .find(|line| line.contains("user: runtime,"))
+        .expect("admitted");
+    let publish = runtime
+        .split("publish: { allow: ")
+        .nth(1)
+        .and_then(|rest| rest.split(" }").next())
+        .expect("a publish list");
+    assert!(publish.contains("\"_INBOX.kraken-2.>\""), "{publish}");
+    assert!(!publish.contains("_INBOX.snaptrade-2"), "{publish}");
+    assert!(!written.contains("\"_INBOX.>\""), "{written}");
+}
+
 #[test]
 fn a_launched_plugins_entitled_datasets_are_read_from_its_annotation() {
     let mut entitled = deployment(Some("reporting-1"), Some("reporting"));
