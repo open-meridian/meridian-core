@@ -17,7 +17,7 @@ use r2d2_postgres::PostgresConnectionManager;
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginMetadata,
-    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
+    PluginStorageCopied, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, StoredSpan};
@@ -89,6 +89,7 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
         "config_plugin_setting",
         "config_plugin_setting_change",
         "config_plugin_setting_declaration",
+        "config_plugin_storage_copied",
         "config_plugin_usage_report",
         "config_plugin_version",
         "config_record_move",
@@ -124,8 +125,7 @@ impl PostgresStore {
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
         let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
+        let pool = meridian_changes::pool(pool_size)
             .connection_customizer(Box::new(meridian_changes::timeline::Watching(
                 std::sync::Arc::clone(&watch),
             )))
@@ -178,10 +178,9 @@ impl PostgresStore {
             return Ok(Timeline::Same);
         }
         let (found, identity) = CHANGES
-            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .follow_timeline(&mut **conn, &self.fence, meridian_changes::member())
             .map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
-            self.fence.adopt(epoch);
             tracing::warn!(
                 epoch,
                 identity,
@@ -231,8 +230,19 @@ impl PostgresStore {
     ///
     /// Each migration is recorded at the deployment's time, from `clock`.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
+        self.migrate_within(clock, meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST)
+    }
+
+    /// [`Self::migrate`], its schema lock waited for at most `lock_waits`:
+    /// what is left of the migration's bound when it is applied again
+    /// (meridian_runtime::migrate_once_it_answers; review c5s L3).
+    pub fn migrate_within(
+        &self,
+        clock: &dyn meridian_clock::Clock,
+        lock_waits: std::time::Duration,
+    ) -> Result<()> {
         let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+        meridian_changes::take_schema_lock(&mut *conn, SCHEMA_LOCK, lock_waits)
             .map_err(unavailable)?;
         let outcome = apply_migrations(&mut conn, clock)
             .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable));
@@ -1550,6 +1560,88 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         Ok(written == 1)
+    }
+
+    fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE config_plugin_launch
+                    SET storage_copied_from = $2, storage_copied_after_ns = $3
+                  WHERE instance_id = $1 AND state = 1",
+                &[&instance_id, &from_claim, &after_ns],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE config_plugin_launch SET ran_shared = true
+                  WHERE instance_id = $1 AND state = 1",
+                &[&instance_id],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn record_storage_copied(
+        &self,
+        instance_id: &str,
+        reported_at_ns: i64,
+        at_ns: i64,
+    ) -> Result<Option<PluginStorageCopied>> {
+        // The instance's latest launch that copied, where its copy is not
+        // recorded and a pod was heard after the launcher answered: one
+        // query while none is pending (review c5c L9). Its launch may have
+        // stopped before a pod of it was heard, the next finding it copied
+        // (L6) -- a launch on the shared storage; never one since that ran
+        // on its own claim with no marker written (item 89, review c5c86
+        // L3), nor failed (PO item 91, review c5c89 M4).
+        let mut conn = self.conn()?;
+        let Some(pending) = conn
+            .query_opt(
+                "SELECT l.launched_at_ns, l.storage_copied_from FROM config_plugin_launch l
+                  WHERE l.instance_id = $1 AND l.storage_copied_from <> ''
+                    AND l.storage_copied_after_ns < $2
+                    AND l.launched_at_ns = (SELECT max(launched_at_ns) FROM config_plugin_launch
+                                             WHERE instance_id = $1 AND storage_copied_from <> '')
+                    AND NOT EXISTS (SELECT 1 FROM config_plugin_storage_copied c
+                                     WHERE c.instance_id = $1
+                                       AND c.launched_at_ns = l.launched_at_ns)
+                    AND NOT EXISTS (SELECT 1 FROM config_plugin_launch later
+                                     WHERE later.instance_id = $1
+                                       AND later.launched_at_ns > l.launched_at_ns
+                                       AND later.shards <= 1 AND NOT later.standby
+                                       AND NOT later.ran_shared AND later.state <> 3)",
+                &[&instance_id, &reported_at_ns],
+            )
+            .map_err(unavailable)?
+        else {
+            return Ok(None);
+        };
+        let (launched_at_ns, from_claim): (i64, String) = (pending.get(0), pending.get(1));
+        let to_claim = crate::store::shared_claim_of(&from_claim, instance_id);
+        // Once, across conductors: the launch's own key.
+        let row = conn
+            .query_opt(
+                "INSERT INTO config_plugin_storage_copied
+                        (instance_id, launched_at_ns, from_claim, to_claim, at_ns, launched_by)
+                 SELECT instance_id, launched_at_ns, storage_copied_from, $3, $4, launched_by
+                   FROM config_plugin_launch
+                  WHERE instance_id = $1 AND launched_at_ns = $2
+                 ON CONFLICT (instance_id, launched_at_ns) DO NOTHING
+                 RETURNING launched_by",
+                &[&instance_id, &launched_at_ns, &to_claim, &at_ns],
+            )
+            .map_err(unavailable)?;
+        Ok(row.map(|row| PluginStorageCopied {
+            instance_id: instance_id.to_string(),
+            from_claim,
+            to_claim,
+            at_ns,
+            launched_by: row.get(0),
+        }))
     }
 
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {
@@ -3005,7 +3097,11 @@ const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
      stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id, \
-     pull_acknowledgement, sidecar_limits, shards, standby";
+     pull_acknowledgement, sidecar_limits, shards, standby, \
+     (SELECT array[from_claim, to_claim, launched_by, at_ns::text] \
+        FROM config_plugin_storage_copied c \
+       WHERE c.instance_id = config_plugin_launch.instance_id \
+         AND c.launched_at_ns = config_plugin_launch.launched_at_ns)";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
@@ -3087,6 +3183,18 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         limits: row.get::<_, Option<Vec<u8>>>(21).and_then(|bytes| {
             <meridian_domain::v1::SidecarLimits as prost::Message>::decode(&bytes[..]).ok()
         }),
+        // Its own storage copied into its shared storage, where recorded
+        // (item 30).
+        storage_copied: row
+            .get::<_, Option<Vec<String>>>(24)
+            .filter(|copied| copied.len() == 4)
+            .map(|copied| PluginStorageCopied {
+                instance_id: row.get(0),
+                from_claim: copied[0].clone(),
+                to_claim: copied[1].clone(),
+                launched_by: copied[2].clone(),
+                at_ns: copied[3].parse().unwrap_or_default(),
+            }),
     }
 }
 

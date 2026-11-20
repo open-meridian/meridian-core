@@ -60,6 +60,68 @@
   when the conductor's CreatePlugin carries one allowed.
 */}}
 {{- $archive := include "meridian-runtime.archiveShape" . }}
+{{/*
+  The shape of an instance launched with shards or a standby pod (step 3d;
+  the resilience spec's section 7): the same definition as several pods,
+  each sidecar given the shard count and run under its instance's own
+  account, `<fullname>-shards-<instance>`, which the launcher makes with a
+  Role naming that instance's shards' Leases alone, and the Leases (item
+  31). Rendered for one shard; the launcher sets the pods and the count the
+  launch asked. Only where a store runs a standby: shards and standby pods
+  are configuration, as every standby is (ruling 1052). Elsewhere the
+  launcher has no shape for them, and refuses such a launch saying so.
+*/}}
+{{- $leased := false -}}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
+{{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) -}}
+{{- $leased = true -}}
+{{- end -}}
+{{- end -}}
+{{- $shards := "" -}}
+{{- if $leased -}}
+{{- $shards = include "meridian-runtime.plugin" (dict
+      "top" .
+      "name" (printf "%s-plugin-__INSTANCE__" $full)
+      "instance" "__INSTANCE__"
+      "roles" "__ROLES__"
+      "brokerSecret" (printf "%s-launched" $broker)
+      "brokerKey" "__INSTANCE__.url"
+      "plugin" (dict "image" "__IMAGE__")
+      "imageTag" ""
+      "launched" true
+      "shards" 1
+      "standby" true) -}}
+{{- end }}
+{{/*
+  And where edge plugins keep storage, the same shape mounting the
+  instance's shared storage, a folder per shard; the claim it mounts,
+  `shared-claim.json`; and the pod that copies an instance's own claim
+  into its `shard-0/` once, before its first launch as several pods (step
+  3d, checkpoint 5, item 30).
+*/}}
+{{- $shardsStorage := "" -}}
+{{- $sharedClaim := "" -}}
+{{- $storageCopy := "" -}}
+{{- if and $shards .Values.pluginStorage.enabled -}}
+{{- $shardsStorage = include "meridian-runtime.plugin" (dict
+      "top" .
+      "name" (printf "%s-plugin-__INSTANCE__" $full)
+      "instance" "__INSTANCE__"
+      "roles" "__ROLES__"
+      "brokerSecret" (printf "%s-launched" $broker)
+      "brokerKey" "__INSTANCE__.url"
+      "plugin" (dict "image" "__IMAGE__")
+      "imageTag" ""
+      "launched" true
+      "shards" 1
+      "standby" true
+      "storage" true) -}}
+{{- $sharedClaim = include "meridian-runtime.sharedStorage" (dict
+      "top" .
+      "instance" "__INSTANCE__"
+      "plugin" "__PLUGIN__") -}}
+{{- $storageCopy = include "meridian-runtime.storageCopy" . -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -68,12 +130,20 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 data:
   plugin.json: {{ $shape | fromYaml | toJson | quote }}
+  {{- if $shards }}
+  plugin-shards.json: {{ $shards | fromYaml | toJson | quote }}
+  {{- end }}
   {{- if .Values.pluginStorage.enabled }}
   plugin-storage.json: {{ $storage | fromYaml | toJson | quote }}
   claim.json: {{ $claim | fromYaml | toJson | quote }}
   {{- end }}
   {{- if $archive }}
   archive.json: {{ $archive | fromYaml | toJson | quote }}
+  {{- end }}
+  {{- if $shardsStorage }}
+  plugin-shards-storage.json: {{ $shardsStorage | fromYaml | toJson | quote }}
+  shared-claim.json: {{ $sharedClaim | fromYaml | toJson | quote }}
+  storage-copy.json: {{ $storageCopy | fromYaml | toJson | quote }}
   {{- end }}
   {{- if .Values.development }}
   {{- /*
@@ -119,10 +189,14 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 ---
 # Deployments in this namespace, and an edge plugin's storage claim, made and
-# read but never deleted (decisions/028), and nothing else: no Secret, no
-# Service, no NetworkPolicy, no Role. RBAC cannot narrow `create` to a name,
-# so the launcher narrows itself -- it creates only from the templates above
-# and deletes only what carries its label -- and where the cluster has
+# read but never deleted (decisions/028); and where the launcher has a shape
+# for shards and standby pods, an instance's own account, Role and binding
+# and its shards' Leases (item 31) -- the Leases made, never deleted -- and
+# nothing else: no Secret, no Service, no NetworkPolicy. It holds no
+# `escalate` and no `bind`: a Role it makes grants only what it holds itself,
+# its Lease right. RBAC cannot narrow `create` to a name, so the launcher
+# narrows itself -- it creates only from the templates above and deletes only
+# what carries its label -- and where the cluster has
 # ValidatingAdmissionPolicy, the cluster holds it to that too (below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -137,12 +211,36 @@ rules:
     # the broker reads (contract v18, W10.1).
     verbs: ["create", "get", "list", "delete", "patch"]
   {{- if .Values.pluginStorage.enabled }}
+  # update: an instance's shared claim marked as holding its copy (item 89),
+  # which its admission policy holds it to; never delete (decisions/028).
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get", "update"]
   {{- end }}
-  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher) }}
+  {{- if $shards }}
+  # An instance of several pods' own account, its Role naming its shards'
+  # Leases alone, and their binding (item 31).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "get", "update", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "update", "delete"]
+  # Read alone: a stopped instance's pods, ended before their account is
+  # removed, so each sidecar releases its shard's Lease with a live token
+  # (review c5b L5, c5b2 H1).
+  # And where edge plugins keep storage, the one pod it makes, which copies
+  # an instance's own storage claim into its shared storage once (item 30):
+  # made, read and removed, held by its policy below to exactly the chart's
+  # shape.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: {{ if $shardsStorage }}["list", "create", "get", "delete"]{{ else }}["list"]{{ end }}
+  {{- end }}
+  {{- if or $shards (include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher)) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
+  # And an instance of several pods' Leases, made before its pods and never
+  # deleted (item 31); held, so the Role it makes grants nothing it lacks.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
@@ -188,7 +286,7 @@ spec:
         meridian.dev/component: launcher
       annotations:
         # A new template is a new launcher, so it never fills in an old one.
-        checksum/template: {{ printf "%s%s%s%s" $shape $storage $claim $archive | sha256sum }}
+        checksum/template: {{ printf "%s%s%s%s%s%s%s%s" $shape $storage $claim $archive $shards $shardsStorage $sharedClaim $storageCopy | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "launcher" "values" $.Values.launcher "account" true) | nindent 6 }}
@@ -212,6 +310,22 @@ spec:
             {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "launcher" "values" $.Values.launcher "account" true) | nindent 12 }}
             - name: MERIDIAN_LAUNCHER_TEMPLATE
               value: /etc/meridian/launcher/plugin.json
+            {{- if $shards }}
+            # An instance launched with shards or a standby pod (step 3d),
+            # where the deployment runs standbys.
+            - name: MERIDIAN_LAUNCHER_SHARDS_TEMPLATE
+              value: /etc/meridian/launcher/plugin-shards.json
+            {{- end }}
+            {{- if $shardsStorage }}
+            # Its shape keeping storage, the shared claim it mounts and the
+            # pod that copies an instance's own claim into it (item 30).
+            - name: MERIDIAN_LAUNCHER_SHARDS_STORAGE_TEMPLATE
+              value: /etc/meridian/launcher/plugin-shards-storage.json
+            - name: MERIDIAN_LAUNCHER_SHARED_CLAIM_TEMPLATE
+              value: /etc/meridian/launcher/shared-claim.json
+            - name: MERIDIAN_LAUNCHER_STORAGE_COPY_TEMPLATE
+              value: /etc/meridian/launcher/storage-copy.json
+            {{- end }}
             {{- if .Values.development }}
             # A development deployment: the launcher makes the live shape
             # when asked, and refuses it anywhere else
@@ -272,10 +386,19 @@ spec:
           configMap:
             name: {{ $name }}-template
 {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+{{- $own := printf "%s-shards-" $full }}
+{{- $pluginImages := printf "localhost:%v/plugins/" .Values.registry.hostPort }}
+{{- $copyFsGroup := (.Values.podSecurityContext | default dict).fsGroup | default .Values.pluginStorage.fsGroup }}
+{{- $accounts := list (quote "") (quote "default") }}
+{{- with .Values.pluginArchive.serviceAccount }}
+{{- $accounts = append $accounts (quote .) }}
+{{- end }}
 ---
 # Where the cluster can say so itself (Kubernetes 1.30 and later): whatever
-# the launcher's account does to a Deployment, or a claim it makes, it is one
-# the launcher made.
+# the launcher's account does to a Deployment, a claim, or an instance's own
+# account, Role or binding (item 31), it is one the launcher made, and of
+# exactly the shape it makes. Its shards' Leases are held by a policy of
+# their own (shard-leases.yaml).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -293,20 +416,300 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["persistentvolumeclaims"]
+        resources: ["persistentvolumeclaims", "serviceaccounts"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["roles", "rolebindings"]
+      # The pod that copies an instance's own storage into its shared
+      # storage (item 30), the one pod it makes.
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["pods"]
   matchConditions:
     - name: the-launcher
       expression: >-
         request.userInfo.username ==
         "system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}"
+  variables:
+    # The instance an object is made for, by its label -- an instance's name
+    # alone, a host label, else none (review c5b L3: it is read into a
+    # pattern) -- and that instance's own account (item 31):
+    # `<fullname>-shards-<instance>`.
+    - name: labelled
+      expression: >-
+        request.operation == "DELETE" || !has(object.metadata.labels)
+        ? "" : object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: instance
+      expression: >-
+        variables.labelled.matches("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
+        ? variables.labelled : ""
+    - name: own
+      expression: >-
+        {{ $own | quote }} + variables.instance
   validations:
+    # Made by the launcher, as it was before a write and is after it: an
+    # update never makes another's its own (review c5b L1).
     - expression: >-
-        request.operation == "DELETE"
-        ? has(oldObject.metadata.labels) &&
-          oldObject.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
-        : has(object.metadata.labels) &&
-          object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"
+        (
+          (request.operation == "CREATE" ||
+           (has(oldObject.metadata.labels) &&
+            oldObject.metadata.labels[?"meridian.dev/launched"].orValue("") == "true")) &&
+          (request.operation == "DELETE" ||
+           (has(object.metadata.labels) &&
+            object.metadata.labels[?"meridian.dev/launched"].orValue("") == "true"))
+        )
       message: the launcher touches only the Deployments it launched and the storage it made
+    # Which account a launched plugin's pods run as (step 3d; review of
+    # 95d68904, S2): Kubernetes asks nobody whether a pod may use an
+    # account, so the launcher's Deployments are held to the ones the chart
+    # gives it -- none (the namespace's default, which holds no right), its
+    # instance's own account for an instance of several pods (item 31: the
+    # members' is the stores' alone), and the archive's where one is set.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "deployments" ||
+        !has(object.spec.template.spec.serviceAccountName) ||
+        object.spec.template.spec.serviceAccountName in
+        [{{ $accounts | join ", " }}] ||
+        (variables.instance != "" &&
+         object.spec.template.spec.serviceAccountName == variables.own)
+      message: a launched plugin runs under no account, its instance's shards account or the archive's
+    # Under its instance's own account the lease right is the sidecar's
+    # alone, never the plugin's: nothing mounts the token by default, and no
+    # container but the sidecar mounts a volume that carries one.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "deployments" ||
+        !has(object.spec.template.spec.serviceAccountName) ||
+        !object.spec.template.spec.serviceAccountName.startsWith({{ $own | quote }}) ||
+        (
+          has(object.spec.template.spec.automountServiceAccountToken) &&
+          object.spec.template.spec.automountServiceAccountToken == false &&
+          (!has(object.spec.template.spec.initContainers) ||
+           object.spec.template.spec.initContainers.all(c, !has(c.volumeMounts) ||
+             c.volumeMounts.all(m,
+               !has(object.spec.template.spec.volumes) ||
+               !object.spec.template.spec.volumes.exists(v,
+                 v.name == m.name && has(v.projected) && has(v.projected.sources) &&
+                 v.projected.sources.exists(s, has(s.serviceAccountToken)))))) &&
+          !has(object.spec.template.spec.ephemeralContainers) &&
+          object.spec.template.spec.containers.all(c,
+            c.name == "sidecar" || !has(c.volumeMounts) ||
+            c.volumeMounts.all(m,
+              !has(object.spec.template.spec.volumes) ||
+              !object.spec.template.spec.volumes.exists(v,
+                v.name == m.name && has(v.projected) && has(v.projected.sources) &&
+                v.projected.sources.exists(s, has(s.serviceAccountToken)))))
+        )
+      message: under its instance's shards account the token is mounted in the sidecar's container alone
+    # The one pod the launcher makes (item 30): its instance's copy of its
+    # own storage claim, read only, into its shared storage, exactly as the
+    # chart's storage-copy shape -- a plugin image from the deployment's own
+    # registry by digest, as the launcher launches, running the SDK's
+    # `meridian-storage copy` alone (PO items 86 and 88), no account's
+    # token, no secret, no host's namespace, and those two claims of the
+    # instance its label names; run once, its user the plugin's own or the
+    # cluster's (no uid pinned), nothing added to its container and nothing
+    # run beside its command (review c5c M1, L1). The one pod it deletes
+    # is a copy pod, to make one again (review c5c L2). What the cluster's
+    # own admission adds to every pod before this policy reads it is let be
+    # (review c5c2fold H1): DefaultTolerationSeconds' not-ready and
+    # unreachable tolerations alone, and a globalDefault PriorityClass's
+    # name, never a system- one; and what OpenShift's restricted-v2 SCC adds
+    # (review c5c86 H1): an SELinux level alone at the pod, and, where the
+    # chart leaves the group to the cluster, its fsGroup. The not-ready and
+    # unreachable tolerations carry their seconds, so a copy pod on a lost
+    # node is evicted (c5c86 L1). Its confinement is the chart's and no
+    # other (review c5c2fold L1, c5c86 M1): RuntimeDefault seccomp at the
+    # pod, nothing of the container's own, no extra groups, sysctls, claims,
+    # affinity or ports (c5c86 L3); never root -- runAsNonRoot, and no uid
+    # or gid 0 named (c5c89 L2) -- and every capability dropped; its two
+    # mounts whole, each at its own path, so the command never runs from
+    # the shared claim.
+    - expression: >-
+        request.resource.resource != "pods" ||
+        (
+          request.operation == "DELETE" &&
+          has(oldObject.metadata.labels) &&
+          oldObject.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy" &&
+          oldObject.metadata.name.startsWith({{ printf "%s-storage-copy-" $full | quote }})
+        ) ||
+        (
+          request.operation == "CREATE" &&
+          variables.instance != "" &&
+          object.metadata.name == {{ printf "%s-storage-copy-" $full | quote }} + variables.instance &&
+          object.metadata.labels[?"meridian.dev/component"].orValue("") == "storage-copy" &&
+          object.spec.restartPolicy == "Never" &&
+          has(object.spec.securityContext) &&
+          (!has(object.spec.securityContext.seLinuxOptions) ||
+           (!has(object.spec.securityContext.seLinuxOptions.user) &&
+            !has(object.spec.securityContext.seLinuxOptions.role) &&
+            !has(object.spec.securityContext.seLinuxOptions.type))) &&
+          !has(object.spec.securityContext.appArmorProfile) &&
+          has(object.spec.securityContext.seccompProfile) &&
+          object.spec.securityContext.seccompProfile.type == "RuntimeDefault" &&
+          !has(object.spec.securityContext.supplementalGroups) &&
+          !has(object.spec.securityContext.sysctls) &&
+          {{- if $copyFsGroup }}
+          (!has(object.spec.securityContext.fsGroup) ||
+           object.spec.securityContext.fsGroup == {{ $copyFsGroup | int64 }}) &&
+          {{- else }}
+          (!has(object.spec.securityContext.fsGroup) || object.spec.securityContext.fsGroup > 0) &&
+          {{- end }}
+          !has(object.spec.nodeName) && !has(object.spec.affinity) && !has(object.spec.resourceClaims) &&
+          (!has(object.spec.tolerations) || object.spec.tolerations.all(t,
+            has(t.key) && t.key in ["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"] &&
+            has(t.operator) && t.operator == "Exists" && has(t.effect) && t.effect == "NoExecute" &&
+            !has(t.value) && has(t.tolerationSeconds))) &&
+          (!has(object.spec.priorityClassName) || !object.spec.priorityClassName.startsWith("system-")) &&
+          !has(object.spec.runtimeClassName) &&
+          !has(object.spec.hostUsers) &&
+          !has(object.spec.containers[0].lifecycle) &&
+          !has(object.spec.containers[0].livenessProbe) && !has(object.spec.containers[0].readinessProbe) &&
+          !has(object.spec.containers[0].startupProbe) && !has(object.spec.containers[0].workingDir) &&
+          !has(object.spec.containers[0].ports) &&
+          has(object.spec.automountServiceAccountToken) &&
+          object.spec.automountServiceAccountToken == false &&
+          (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == "default") &&
+          !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
+          (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
+          (!has(object.spec.hostPID) || !object.spec.hostPID) &&
+          (!has(object.spec.hostIPC) || !object.spec.hostIPC) &&
+          size(object.spec.containers) == 1 &&
+          object.spec.containers[0].image.matches({{ printf "^%s[a-z]([-a-z0-9]{0,61}[a-z0-9])?@sha256:[0-9a-f]{64}$" $pluginImages | quote }}) &&
+          !has(object.spec.containers[0].args) &&
+          object.spec.containers[0].command == ["meridian-storage", "copy",
+            {{ printf "%s-storage-" $full | quote }} + variables.instance] &&
+          !has(object.spec.containers[0].env) && !has(object.spec.containers[0].envFrom) &&
+          has(object.spec.containers[0].securityContext) &&
+          has(object.spec.containers[0].securityContext.allowPrivilegeEscalation) &&
+          object.spec.containers[0].securityContext.allowPrivilegeEscalation == false &&
+          (!has(object.spec.containers[0].securityContext.privileged) ||
+           !object.spec.containers[0].securityContext.privileged) &&
+          has(object.spec.containers[0].securityContext.runAsNonRoot) &&
+          object.spec.containers[0].securityContext.runAsNonRoot == true &&
+          (!has(object.spec.containers[0].securityContext.runAsUser) ||
+           object.spec.containers[0].securityContext.runAsUser > 0) &&
+          (!has(object.spec.containers[0].securityContext.runAsGroup) ||
+           object.spec.containers[0].securityContext.runAsGroup > 0) &&
+          (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser > 0) &&
+          (!has(object.spec.securityContext.runAsGroup) || object.spec.securityContext.runAsGroup > 0) &&
+          has(object.spec.containers[0].securityContext.capabilities) &&
+          has(object.spec.containers[0].securityContext.capabilities.drop) &&
+          "ALL" in object.spec.containers[0].securityContext.capabilities.drop &&
+          !has(object.spec.containers[0].securityContext.capabilities.add) &&
+          !has(object.spec.containers[0].securityContext.seccompProfile) &&
+          !has(object.spec.containers[0].securityContext.seLinuxOptions) &&
+          !has(object.spec.containers[0].securityContext.appArmorProfile) &&
+          (!has(object.spec.containers[0].securityContext.procMount) ||
+           object.spec.containers[0].securityContext.procMount == "Default") &&
+          has(object.spec.containers[0].securityContext.readOnlyRootFilesystem) &&
+          object.spec.containers[0].securityContext.readOnlyRootFilesystem == true &&
+          has(object.spec.volumes) && size(object.spec.volumes) == 2 &&
+          object.spec.volumes.exists(v, v.name == "from" && has(v.persistentVolumeClaim) &&
+            v.persistentVolumeClaim.claimName == {{ printf "%s-storage-" $full | quote }} + variables.instance &&
+            has(v.persistentVolumeClaim.readOnly) && v.persistentVolumeClaim.readOnly == true) &&
+          object.spec.volumes.exists(v, v.name == "to" && has(v.persistentVolumeClaim) &&
+            v.persistentVolumeClaim.claimName == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance) &&
+          has(object.spec.containers[0].volumeMounts) &&
+          object.spec.containers[0].volumeMounts.all(m,
+            !has(m.subPath) && !has(m.subPathExpr) && !has(m.mountPropagation) &&
+            ((m.name == "from" && m.mountPath == "/var/lib/meridian/copy/from" &&
+              has(m.readOnly) && m.readOnly == true) ||
+             (m.name == "to" && m.mountPath == "/var/lib/meridian/copy/to")))
+        )
+      message: the launcher's one pod copies its instance's own storage into its shared storage, as the chart's shape
+    # The one change it makes to a claim (item 89): its instance's shared
+    # claim marked as holding the copy of its own claim, once a copy pod
+    # said so -- that annotation alone added, nothing else of the claim
+    # changed: no owner given it and no finalizer changed, so it is never
+    # deleted by another's hand (review c5c89 M1; decisions/028).
+    - expression: >-
+        request.resource.resource != "persistentvolumeclaims" ||
+        request.operation != "UPDATE" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == {{ printf "%s-shared-storage-" $full | quote }} + variables.instance &&
+          object.spec == oldObject.spec &&
+          object.metadata.labels == oldObject.metadata.labels &&
+          object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+          object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+          has(object.metadata.annotations) &&
+          object.metadata.annotations[?"meridian.dev/storage-copied"].orValue("") ==
+            {{ printf "%s-storage-" $full | quote }} + variables.instance &&
+          object.metadata.annotations.all(k, k == "meridian.dev/storage-copied" ||
+            (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations &&
+             oldObject.metadata.annotations[k] == object.metadata.annotations[k])) &&
+          (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k,
+            k in object.metadata.annotations))
+        )
+      message: the launcher changes a claim it made only to mark its instance's shared claim as holding its copy
+    # An instance's own account (item 31), of exactly the shape the launcher
+    # makes: the Role's one rule, `get` and `update` on Leases named
+    # `<instance>-shard-<n>` alone, the instance read from its label; the
+    # binding of that Role to the account of the same name alone; and the
+    # account carrying no secret. Each named `<fullname>-shards-<instance>`.
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "roles" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          has(object.rules) && size(object.rules) == 1 &&
+          object.rules[0].apiGroups == ["coordination.k8s.io"] &&
+          object.rules[0].resources == ["leases"] &&
+          size(object.rules[0].verbs) == 2 &&
+          "get" in object.rules[0].verbs && "update" in object.rules[0].verbs &&
+          !has(object.rules[0].nonResourceURLs) &&
+          has(object.rules[0].resourceNames) && size(object.rules[0].resourceNames) > 0 &&
+          object.rules[0].resourceNames.all(lease,
+            lease.matches("^" + variables.instance + "-shard-[0-9]+$"))
+        )
+      message: the launcher's Role grants get and update on its instance's shard Leases alone
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "rolebindings" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          object.roleRef.apiGroup == "rbac.authorization.k8s.io" &&
+          object.roleRef.kind == "Role" &&
+          object.roleRef.name == variables.own &&
+          has(object.subjects) && size(object.subjects) == 1 &&
+          object.subjects[0].kind == "ServiceAccount" &&
+          object.subjects[0].name == variables.own &&
+          has(object.subjects[0].namespace) &&
+          object.subjects[0].namespace == {{ .Release.Namespace | quote }}
+        )
+      message: the launcher's RoleBinding binds its instance's shards Role to the same-named account alone
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "serviceaccounts" ||
+        (
+          variables.instance != "" &&
+          object.metadata.name == variables.own &&
+          (!has(object.secrets) || size(object.secrets) == 0) &&
+          (!has(object.imagePullSecrets) || size(object.imagePullSecrets) == 0)
+        )
+      message: the launcher's ServiceAccount carries no secrets
+    # Its annotations, an archive's workload identity alone (review c5b L2;
+    # the launcher's IDENTITY_ANNOTATIONS).
+    - expression: >-
+        request.operation == "DELETE" ||
+        request.resource.resource != "serviceaccounts" ||
+        !has(object.metadata.annotations) ||
+        object.metadata.annotations.all(key, key in [
+          "iam.gke.io/gcp-service-account",
+          "eks.amazonaws.com/role-arn",
+          "eks.amazonaws.com/audience",
+          "eks.amazonaws.com/sts-regional-endpoints",
+          "eks.amazonaws.com/token-expiration",
+          "azure.workload.identity/client-id",
+          "azure.workload.identity/tenant-id",
+          "azure.workload.identity/service-account-token-expiration"])
+      message: the launcher's ServiceAccount carries workload-identity annotations alone
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

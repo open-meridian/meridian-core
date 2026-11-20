@@ -42,8 +42,12 @@
   client Service follows the set by its label, and each server is named
   under its own set's members. Deliveries in flight across the change are
   caught up by sequence and requests not answered are asked again, as for
-  a lost server (section 4). A set's volumes are kept when it goes, as a
-  StatefulSet's are, and found again if JetStream comes back.
+  a lost server (section 4). The set without JetStream has no volumes. The
+  JetStream set's volumes go with it (item 191, ruled 2026-11-19): a return
+  to JetStream starts it afresh, its streams made again, and never on the
+  state its servers kept before, which they could not agree on again (CI
+  44556229125). Writes the stream still held at the switch were never
+  answered, and their plugins ask again (section 4).
 */}}
 {{- $set := $name }}
 {{- if gt $jetstream 0 }}{{ $set = printf "%s-jetstream" $name }}{{ end }}
@@ -259,6 +263,11 @@ metadata:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   clusterIP: None
+  # Each server's name resolves before it is ready (step 3d): a server is
+  # ready only once its routes and JetStream's metadata group hold, which
+  # needs the other servers' names first. Clients reconnect past one not
+  # ready, as past one lost.
+  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -287,6 +296,14 @@ spec:
   serviceName: {{ $set }}-members
   podManagementPolicy: Parallel
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- if gt $jetstream 0 }}
+  # JetStream's volumes are deleted with the set, and kept while it is
+  # scaled (item 191): `meridian upgrade-deployment` deletes any left by a
+  # set that went before this.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+  {{- end }}
   # The set without volumes keeps the selector it was made with (a
   # selector cannot change in place); the set with them is selected by its
   # name as well.
@@ -433,6 +450,52 @@ spec:
               mountPath: /etc/meridian-internal-tls-server
               readOnly: true
             {{- end }}
+          # Ready means ready (step 3d, decided 2026-11-14): the server's own
+          # full health check -- its routes, and with JetStream its place in
+          # the metadata group, current with its leader -- read on the pod's
+          # own loopback, where its monitoring alone listens. Found in the
+          # reconfigure run: a third server outside the metadata group while
+          # the switch to ha said every member ready, and the lake's
+          # write-ahead stream, kept on three, could not be placed for six
+          # minutes. NATS's /healthz says only that a server is current with
+          # its leader, so its place in the group is read from the group as
+          # the server holds it (/raftz): in CI 43539633884 all three said
+          # ok with one outside. A server that does not come right within
+          # its start's bound, 180 s, is started again; so is one that came
+          # right and then stays unhealthy past its liveness bound, 300 s
+          # (CI 44556229125: a server passed its start once, then said a
+          # consumer was "not current: group node unhealthy" at every check
+          # for over 30 minutes, and with no liveness probe nothing
+          # restarted it). Started again, a server keeps its name, so its
+          # Raft peer, and its volume, so the JetStream state it kept: it
+          # rejoins as itself and catches up from the others, and a restart
+          # clears nothing. The bound is above anything a server comes back
+          # from on its own: in CI a whole set moved to ha is ready within
+          # about 75 s of the upgrade, a server killed is back within 180 s,
+          # a roll of all three ends within 300 s and the others stay
+          # healthy through it; and restarted at 300 s and given its 180 s
+          # to start, a server is back inside the 10 minutes `meridian
+          # upgrade-deployment` waits for. The set starts its servers in
+          # parallel and each name resolves before it is ready, so no server
+          # waits on another's readiness to start.
+          startupProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: {{ include "meridian-runtime.brokerHealthz" . }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:

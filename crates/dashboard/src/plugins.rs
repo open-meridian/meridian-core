@@ -1132,6 +1132,13 @@ pub(crate) async fn frame(
                 },
                 stopped: launch.filter(|_| !running),
                 pulled: pulled_of(&app, &session.subject, launch, &catalogue).await,
+                // Its own storage's copy, from whichever launch made it.
+                copied: catalogue
+                    .launches
+                    .iter()
+                    .rev()
+                    .filter(|held| held.instance_id == instance)
+                    .find_map(|held| held.storage_copied.as_ref()),
                 version: launch.map(|launch| launch.version.as_str()),
                 session: &session,
                 notice,

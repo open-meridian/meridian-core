@@ -173,7 +173,7 @@ fn run() -> Result<(), String> {
             version = VERSION,
             "the analytics component is serving"
         );
-        ready.serving();
+        ready.serving_on(&bus).await;
         shutdown().await;
         tracing::info!("stopping");
         Ok(())

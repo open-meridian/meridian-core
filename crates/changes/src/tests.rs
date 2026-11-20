@@ -129,6 +129,26 @@ fn a_fence_admits_its_own_epoch_alone() {
     assert!(fence.admits(4).is_ok());
 }
 
+/// PR CI 44283011761: a writer's own raise is its epoch while the raise
+/// commits; a commit that fails leaves the epoch it had, and never undoes
+/// an epoch adopted since.
+#[test]
+fn a_fence_holds_its_own_raise_while_it_commits_and_keeps_its_epoch_where_it_fails() {
+    let fence = Fence::new();
+    fence.adopt(3);
+    let held = fence.adopt_committing(4, || Ok::<u64, ()>(fence.epoch()));
+    assert_eq!(held, Ok(4), "the raise is the epoch while it commits");
+    assert_eq!(fence.epoch(), 4);
+    assert!(fence.admits(4).is_ok());
+    assert_eq!(fence.adopt_committing(5, || Err::<(), ()>(())), Err(()));
+    assert_eq!(fence.epoch(), 4, "a raise not committed is not the epoch");
+    let _ = fence.adopt_committing(6, || {
+        fence.adopt(7);
+        Err::<(), ()>(())
+    });
+    assert_eq!(fence.epoch(), 7, "an epoch adopted since is kept");
+}
+
 #[test]
 fn topics_are_the_component_topics_approved() {
     assert_eq!(
@@ -310,4 +330,88 @@ async fn a_stores_reads_are_held_to_read_after_by_its_change_logs_heads() {
         6,
         "answered by its own commit"
     );
+}
+
+/// Stage T's review, finding 3: a writer told to stop where no lease fences
+/// its group commits nothing more -- at its own epoch, which its
+/// replacement shares -- and is not told it was deposed, so it serves on.
+#[test]
+fn a_fence_stopped_admits_nothing_and_is_no_deposition() {
+    let fence = Fence::new();
+    fence.adopt(3);
+    assert!(fence.admits(3).is_ok());
+    fence.stop();
+    let refused = fence.admits(3).expect_err("stopped: nothing commits");
+    assert_eq!(refused.mine, Fenced::STOPPED);
+    assert!(refused.to_string().contains(STOPPED), "{refused}");
+    assert_eq!(fence.epoch(), 3, "its epoch as it was: nothing raised");
+}
+
+/// A pool's connections, counted: what [`pool`] is held to without a
+/// database.
+#[derive(Default)]
+struct Counted(std::sync::atomic::AtomicU32);
+
+impl r2d2::ManageConnection for Counted {
+    type Connection = ();
+    type Error = std::io::Error;
+    fn connect(&self) -> Result<(), std::io::Error> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn is_valid(&self, _: &mut ()) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+    fn has_broken(&self, _: &mut ()) -> bool {
+        false
+    }
+}
+
+/// The pool holds `connections`, within ten seconds.
+fn settles(pool: &r2d2::Pool<Counted>, connections: u32) -> bool {
+    for _ in 0..1_000 {
+        if pool.state().connections == connections {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// PO 67 (2026-11-17): a store's pool of eight keeps two connections open
+/// while idle, not eight; under load it still opens its whole size, every
+/// one held at once; and once they are given back it keeps them until they
+/// have idled out, never more than its size.
+#[test]
+fn a_pool_keeps_two_connections_idle_and_still_opens_its_size_under_load() {
+    let eight = pool::<Counted>(8).build(Counted::default()).unwrap();
+    assert!(settles(&eight, IDLE_CONNECTIONS));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(eight.state().connections, 2, "two open while idle");
+    assert_eq!(eight.state().idle_connections, 2);
+
+    // Eight wanted at once: eight held at once, none refused.
+    let held: Vec<_> = (0..8)
+        .map(|_| {
+            eight
+                .get_timeout(std::time::Duration::from_secs(10))
+                .expect("a connection under load")
+        })
+        .collect();
+    assert_eq!(eight.state().connections, 8, "the pool grows to its size");
+    assert!(
+        eight
+            .get_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "and no further"
+    );
+    drop(held);
+    assert_eq!(eight.state().connections, 8);
+    assert_eq!(eight.state().idle_connections, 8);
+
+    // Smaller pools keep what they are: one of one, and an empty size is one.
+    let one = pool::<Counted>(1).build(Counted::default()).unwrap();
+    assert!(settles(&one, 1));
+    let none = pool::<Counted>(0).build(Counted::default()).unwrap();
+    assert_eq!(none.max_size(), 1);
 }

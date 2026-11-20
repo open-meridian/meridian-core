@@ -5,7 +5,12 @@
   to say which of them writes, under this account. Its one right is its
   Leases: read, make and renew them, in this namespace only, never a
   cluster-wide one. The launcher holds the same right under its own account.
-  With no standby anywhere, as by default, none of this renders.
+  It is the stores' alone (step 3d, checkpoint 5, item 31): a plugin
+  instance run as several pods -- shards, or a standby pod -- takes its
+  shards' Leases under an account of its own, whose Role names those
+  Leases alone (meridian-runtime.shardsAccount; the launcher's for a
+  launched one). With no standby anywhere, as by default, none of this
+  renders.
 */}}
 {{- $leased := false -}}
 {{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}

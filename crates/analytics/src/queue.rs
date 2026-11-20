@@ -91,7 +91,7 @@ impl Units {
             .await
             .map_err(|failed| failed.to_string())?;
         let mut headers = async_nats::HeaderMap::new();
-        headers.insert(PART_TO, inbox.as_str());
+        headers.insert(PART_TO, meridian_bus::header_words(&inbox).as_str());
         let queued = self
             .context
             .publish_with_headers(topics::COMPUTE_UNIT, headers, payload.into())

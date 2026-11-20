@@ -9,7 +9,8 @@
 //!
 //! - `wiring`, which stands up its own world in-process: Dockerfile.rust's
 //!   `test` stage, `run-tests -p meridian-runtime --test it -- wiring::`;
-//! - `grants`, `waiting`, `preflight` and `serving`, against Postgres: `make test-store`;
+//! - `grants`, `waiting`, `preflight`, `probe`, `serving` and `scratch`, against Postgres:
+//!   `make test-store`;
 //! - `end_to_end` and `outage`, against a running platform: `make demo`.
 //!
 //! A filter names the module with its `::`, so it matches only that module's
@@ -20,6 +21,8 @@ mod end_to_end;
 mod grants;
 mod outage;
 mod preflight;
+mod probe;
+mod scratch;
 mod serving;
 mod waiting;
 mod wiring;

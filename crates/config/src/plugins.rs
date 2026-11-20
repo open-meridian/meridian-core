@@ -103,6 +103,36 @@ struct Plugins {
     registries: Option<Arc<crate::registries::Hold>>,
     /// The starter packs whose install is under way (W8.18, v28).
     packs: packs::Jobs,
+    /// What the deployment says an instance of several pods may run under
+    /// (step 3d; the resilience spec's section 7; checkpoint 5, item 30).
+    several: Several,
+}
+
+/// What the deployment says an instance of several pods -- shards, or a
+/// standby pod -- may run under (step 3d): each none where it does not say,
+/// and the launcher's own refusal stands.
+#[derive(Clone, Default)]
+pub struct Several {
+    /// Whether it renders the lease right such an instance runs under:
+    /// where a store runs a standby.
+    pub lease_right: Option<bool>,
+    /// Whether edge plugins keep storage (`pluginStorage.enabled`), and the
+    /// ReadWriteMany class an instance of several pods shares it on
+    /// (`pluginStorage.shared.storageClassName`; item 30), empty for none.
+    pub storage: Option<(bool, String)>,
+    /// The nodes the deployment's pods run on, read at the launch that
+    /// needs it: on one, a ReadWriteOnce claim reaches every pod (item 30).
+    pub nodes: Option<Arc<dyn Fn() -> Result<usize, String> + Send + Sync>>,
+}
+
+impl Several {
+    /// A deployment that says its lease right alone.
+    pub fn leased(lease_right: Option<bool>) -> Self {
+        Self {
+            lease_right,
+            ..Self::default()
+        }
+    }
 }
 
 mod catalogue;
@@ -497,12 +527,24 @@ fn listed(items: &BTreeSet<&str>) -> String {
 
 /// Whether an instance name is one of core's own (contract v18; v17's
 /// security review, Nit 3): a component's name (`dashboard`, `lake`), a
-/// component's instance (`dashboard-1`), or the runtime's broker user. A
-/// plugin launched as one would list its tools in core's `dashboard__`
-/// namespace or speak as a component on the broker.
-pub fn is_reserved(contract: &Contract, instance_id: &str) -> bool {
+/// component's instance (`dashboard-1`), the runtime's broker user, or --
+/// step 3d -- a component's instance as this deployment's chart names it,
+/// `<release>-<component>` (`meridian-runtime-bor`), exactly. A plugin
+/// launched as one would list its tools in core's `dashboard__` namespace or
+/// speak as a component on the bus: its sidecar stamps the plugin's instance
+/// as the publisher, which the conductor's and the lake's checks of the book
+/// and the analytics component trust. Never `*-<component>`: a plugin may
+/// be `sample-analytics`.
+pub fn is_reserved(contract: &Contract, release: Option<&str>, instance_id: &str) -> bool {
     let component = |name: &str| contract.is_component(name);
     if instance_id == "runtime" || component(instance_id) {
+        return true;
+    }
+    if release
+        .and_then(|release| instance_id.strip_prefix(release))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(component)
+    {
         return true;
     }
     instance_id.rsplit_once('-').is_some_and(|(head, tail)| {
@@ -510,10 +552,21 @@ pub fn is_reserved(contract: &Contract, instance_id: &str) -> bool {
     })
 }
 
+/// The release a conductor's instance names (step 3d): the chart names each
+/// core component `<release>-<component>`, so `<release>-conductor`'s
+/// release is `<release>`; none for a name the chart did not give it, as
+/// the development default `conductor-1`.
+pub fn release_of(conductor: &str) -> Option<&str> {
+    conductor
+        .strip_suffix("-conductor")
+        .filter(|release| !release.is_empty())
+}
+
 /// The version a launch runs, if it is recorded and the approval is exactly
 /// what it declares (W8.3).
 pub fn launch<'a>(
     snapshot: &'a Snapshot,
+    release: Option<&str>,
     request: &LaunchPluginRequest,
 ) -> Result<&'a PluginVersion, String> {
     if !is_name(&request.instance_id) {
@@ -523,10 +576,14 @@ pub fn launch<'a>(
             request.instance_id
         ));
     }
-    if is_reserved(Contract::embedded(), &request.instance_id) {
-        return Err(format!(
-            "`{}` is one of core's own names, which no plugin instance takes",
-            request.instance_id
+    if is_reserved(Contract::embedded(), release, &request.instance_id) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["instance_id".to_string()],
+            format!(
+                "`{}` is one of core's own names, which no plugin instance takes",
+                request.instance_id
+            ),
         ));
     }
     // An instance's ID names one plugin for good (contract v18; v17's
@@ -597,7 +654,252 @@ pub fn launch<'a>(
             ),
         ));
     }
+    // Shards split a role's work by subject, and only a data plugin's is
+    // (the resilience spec's section 7: the lake's wants, shared by
+    // rendezvous hashing; ruled 2026-11-15). Each shard of any other role
+    // would hear every row of its instance and act on it.
+    if request.shards > 1 && declared != set(&["data".to_string()]) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["shards".to_string()],
+            format!(
+                "shards is {}, and {} {} declares roles {}: shards split a data plugin's                  subjects among its pods, and nothing splits another role's work; such a                  plugin takes a standby pod (standby), not shards",
+                request.shards,
+                request.name,
+                request.version,
+                listed(&declared)
+            ),
+        ));
+    }
+    // Each shard holds at least one of each limit (a shard's part is the
+    // limit divided by the count, rounded down, and never nothing), so
+    // shards above the in-flight or answer limit the launch names would
+    // together hold more than the instance's share (review finding 11;
+    // accepted 2026-11-15). The deployment's own limits are the
+    // launcher's to hold a launch to.
+    if let Some(limits) = request.limits.as_ref().filter(|_| request.shards > 1) {
+        for (field, limit) in [
+            ("limits.in_flight", limits.in_flight),
+            ("limits.answer_mib", limits.answer_mib),
+        ] {
+            if limit > 0 && request.shards > limit {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["shards".to_string()],
+                    format!(
+                        "shards is {}, and {field} is {limit}: each shard holds at least one,                          so its shards together would hold more than the instance's share; at                          most {limit} shards, or a higher limit",
+                        request.shards
+                    ),
+                ));
+            }
+        }
+    }
     Ok(version)
+}
+
+/// A launch asking several pods of its instance -- shards above 1, or a
+/// standby pod -- refused where the deployment renders no lease right for
+/// them (step 3d; ruled 2026-11-15): before anything is recorded, naming
+/// the field asked.
+fn several_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    lease_right: Option<bool>,
+) -> Option<String> {
+    if lease_right != Some(false) {
+        return None;
+    }
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else {
+        return None;
+    };
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        format!(
+            "{field} was asked for {}, and this deployment runs no store standby: an instance              of several pods takes its shards' Leases under an account the launcher makes for              the instance, which the chart lets it make where a store runs a standby (lake.standby, bor.standby,              instrument.standby, street.standby or conductor.standby at 1; the ha profile              sets each)",
+            instance
+        ),
+    ))
+}
+
+/// Whether a plugin of `roles` declaring `declaration` keeps storage of its
+/// own, as the launcher gives it: one asking for it, or uploaded with no
+/// declaration, before v11 (W8.3, contract v11), that holds an edge role
+/// (decisions/028).
+fn keeps_storage(roles: &[String], declaration: Option<&PluginDeclaration>) -> bool {
+    let asks = declaration.is_none_or(|declaration| declaration.storage.is_some());
+    asks && meridian_domain::roles_now(roles)
+        .iter()
+        .any(|role| meridian_domain::EDGE_ROLES.contains(&role.as_str()))
+}
+
+/// The refusal wording of [`storage_refused`], approved by the product
+/// owner as item 69's first (2026-11-17); "several" for nodes not counted,
+/// item 78.
+fn storage_refusal_said(field: &str, instance: &str, nodes: &str) -> String {
+    format!(
+        "{field} was asked for {instance}, and its plugin keeps storage: its pods share it on \
+         several nodes only through a ReadWriteMany storage class, and this deployment runs on \
+         {nodes} and names none in pluginStorage.shared.storageClassName"
+    )
+}
+
+/// A launch asking several pods of an instance whose plugin keeps storage,
+/// refused where the deployment offers no ReadWriteMany class for them to
+/// share it on and runs on several nodes (step 3d, checkpoint 5, item 30;
+/// approved 2026-11-15): before anything is recorded, naming the field
+/// asked and `pluginStorage.shared.storageClassName`. On one node a
+/// ReadWriteOnce claim reaches every pod, so none is needed; nodes that
+/// could not be counted count as several.
+fn storage_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    keeps: bool,
+    several: &Several,
+) -> Option<String> {
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else {
+        return None;
+    };
+    let Some((enabled, class)) = &several.storage else {
+        return None;
+    };
+    if !keeps || !enabled || !class.is_empty() {
+        return None;
+    }
+    let nodes = match several.nodes.as_ref().map(|nodes| nodes()) {
+        Some(Ok(nodes)) if nodes <= 1 => return None,
+        Some(Ok(nodes)) => format!("{nodes} nodes"),
+        // Nodes not counted are said as several (PO item 78); why, logged.
+        Some(Err(failed)) => {
+            tracing::warn!(instance, %failed, "the deployment's nodes could not be counted; said as several");
+            "several nodes".to_string()
+        }
+        None => "several nodes".to_string(),
+    };
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        storage_refusal_said(field, instance, &nodes),
+    ))
+}
+
+/// The first SDK whose plugins keep storage per shard (step 3d, item 30;
+/// PO item 77).
+const SHARD_STORAGE_SDK: (u64, u64, u64) = (0, 37, 0);
+
+/// Whether an SDK version, as the CLI read it from the built image, is
+/// [`SHARD_STORAGE_SDK`] or later: `major.minor.patch`, as PEP 440 and
+/// semver write it (review c5c2fold L5) -- a leading `v` and build metadata
+/// (`+...`) read past, a post-release (`.post1`, `-post1`) as its release;
+/// a pre-release of a later one counts, of 0.37.0 itself not, and one not
+/// read as a version never does.
+fn keeps_storage_per_shard(sdk_version: &str) -> bool {
+    let version = sdk_version.strip_prefix(['v', 'V']).unwrap_or(sdk_version);
+    let version = version.split('+').next().unwrap_or_default();
+    let (numbers, rest) = match version.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        Some(at) => version.split_at(at),
+        None => (version, ""),
+    };
+    // PEP 440's separator before a suffix (`0.37.0.post1`) is the suffix's.
+    let (numbers, rest) = match numbers.strip_suffix('.') {
+        Some(numbers) => (numbers, &version[numbers.len()..]),
+        None => (numbers, rest),
+    };
+    let parts: Vec<Option<u64>> = numbers.split('.').map(|part| part.parse().ok()).collect();
+    let [Some(major), Some(minor), Some(patch)] = parts[..] else {
+        return false;
+    };
+    let released = rest.is_empty()
+        || rest
+            .trim_start_matches(['.', '-', '_'])
+            .strip_prefix("post")
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+    let base = (major, minor, patch);
+    base > SHARD_STORAGE_SDK || (base == SHARD_STORAGE_SDK && released)
+}
+
+/// The refusal of a version keeping storage built before plugins kept it
+/// per shard (PO item 77, 2026-11-17), before anything is recorded: asked
+/// shards, a standby pod, or one pod of an instance whose storage is shared
+/// since it ran as several, naming the version. `sdk_version` is what the
+/// CLI reported at upload, not proved by the image. `shared` is asked only
+/// for one pod of such a version (a read of every launch).
+fn sdk_refused(
+    instance: &str,
+    (shards, standby): (u32, bool),
+    shared: impl FnOnce() -> Result<bool, String>,
+    version: &PluginVersion,
+) -> Option<String> {
+    let metadata = version.metadata.clone().unwrap_or_default();
+    if !keeps_storage(&metadata.roles, metadata.declaration.as_ref())
+        || keeps_storage_per_shard(&metadata.sdk_version)
+    {
+        return None;
+    }
+    let field = if shards > 1 {
+        "shards"
+    } else if standby {
+        "standby"
+    } else {
+        match shared() {
+            Ok(true) => "version",
+            Ok(false) => return None,
+            Err(failed) => return Some(failed),
+        }
+    };
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        &[field.to_string()],
+        format!(
+            "{instance} was asked shards or a standby pod, and its plugin keeps storage: its \
+             version {} was built before plugins kept storage per shard; publish a version on \
+             SDK 0.37 or later",
+            metadata.version
+        ),
+    ))
+}
+
+/// Whether the instance ran as several pods at any launch ever made, so its
+/// storage is shared since (item 30): read from every launch, live or
+/// ended, never the snapshot's latest alone, which a later launch of one
+/// pod hides (review c5c2fold M3).
+fn ran_as_several(store: &dyn Store, instance: &str) -> Result<bool, String> {
+    Ok(store
+        .launches()
+        .map_err(|failed| failed.to_string())?
+        .iter()
+        .any(|held| held.instance_id == instance && (held.shards > 1 || held.standby)))
+}
+
+/// The refusals of an instance of several pods, or of one on shared
+/// storage, before anything is recorded: no lease right, then no storage
+/// to share, then a version from before storage per shard.
+fn several_or_storage_refused(
+    instance: &str,
+    pods: (u32, bool),
+    shared: impl FnOnce() -> Result<bool, String>,
+    version: &PluginVersion,
+    several: &Several,
+) -> Option<String> {
+    several_refused(instance, pods, several.lease_right)
+        .or_else(|| {
+            let metadata = version.metadata.clone().unwrap_or_default();
+            storage_refused(
+                instance,
+                pods,
+                keeps_storage(&metadata.roles, metadata.declaration.as_ref()),
+                several,
+            )
+        })
+        .or_else(|| sdk_refused(instance, pods, shared, version))
 }
 
 // ── Serving them ────────────────────────────────────────────────────────────
@@ -691,8 +993,17 @@ impl Plugins {
         envelope: &Envelope,
     ) -> Result<PluginLaunch, String> {
         let snapshot = self.snapshot()?;
-        let version = launch(&snapshot, &request)?;
+        let version = launch(&snapshot, release_of(self.bus.instance_id()), &request)?;
         if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
+        }
+        if let Some(refusal) = several_or_storage_refused(
+            &request.instance_id,
+            (request.shards, request.standby),
+            || ran_as_several(self.store.as_ref(), &request.instance_id),
+            version,
+            &self.several,
+        ) {
             return Err(refusal);
         }
         // A registry version is verified again at launch (W8.3; the spec's
@@ -735,7 +1046,7 @@ impl Plugins {
             // Its own share at its sidecar (contract v30; ruled 2026-11-11).
             limits: request.limits,
             // Its shards and standby pod as asked (contract v30; W8.3),
-            // kept on its record; the launcher still runs one pod (3d).
+            // kept on its record; the launcher makes the pods (step 3d).
             shards: request.shards,
             standby: request.standby,
             ..Default::default()
@@ -758,6 +1069,7 @@ impl Plugins {
             request.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
             request.limits,
+            (request.shards, request.standby),
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
@@ -765,6 +1077,10 @@ impl Plugins {
             create,
         ) {
             Ok(made) => {
+                // Its own storage being copied into its shared storage
+                // (item 30): recorded once a pod of it is heard registered
+                // after now, when the copy is whole.
+                self.pend_copy(&request.instance_id, &made)?;
                 tracing::info!(
                     instance = launched.instance_id,
                     plugin = launched.name,
@@ -791,6 +1107,25 @@ impl Plugins {
         }
     }
 
+    /// The claim the launcher said it copies into the instance's shared
+    /// storage (item 30), kept on its live launch: `PluginStorageCopied` is
+    /// recorded once a pod of it is heard registered after now, when the
+    /// copy is whole.
+    fn pend_copy(&self, instance: &str, made: &CreatePluginReply) -> Result<(), String> {
+        // Run on its shared storage, kept on the launch (PO item 91).
+        if made.ran_shared {
+            self.store
+                .keep_ran_shared(instance)
+                .map_err(|f| f.to_string())?;
+        }
+        if made.storage_copied_from.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .pend_storage_copy(instance, &made.storage_copied_from, self.clock.now_ns())
+            .map_err(|f| f.to_string())
+    }
+
     /// What the launcher is asked to make for an instance of a recorded
     /// version.
     fn create_request(
@@ -800,6 +1135,7 @@ impl Plugins {
         live: bool,
         archive: Option<PluginArchive>,
         limits: Option<SidecarLimits>,
+        (shards, standby): (u32, bool),
     ) -> CreatePluginRequest {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
@@ -826,6 +1162,11 @@ impl Plugins {
             // Its own share at its sidecar, as its launch asked (contract
             // v30; ruled 2026-11-11); the chart's otherwise.
             limits,
+            // Its shards and standby pod, as its launch asked (contract
+            // v30, built with 3d; approved 2026-11-15): the launcher makes
+            // a pod per shard and one more for a standby.
+            shards,
+            standby,
         }
     }
 
@@ -993,6 +1334,18 @@ impl Plugins {
                     launch.name, launch.version
                 )
             })?;
+        // Several pods it could not be made as again, on a deployment that
+        // has since left its lease right: refused before its running
+        // workload is removed, so it is not stopped to no end.
+        if let Some(refusal) = several_or_storage_refused(
+            instance,
+            (launch.shards, launch.standby),
+            || ran_as_several(self.store.as_ref(), instance),
+            version,
+            &self.several,
+        ) {
+            return Err(refusal);
+        }
         let _: RemovePluginReply = self
             .ask_launcher(
                 REMOVE_PLUGIN,
@@ -1004,13 +1357,21 @@ impl Plugins {
             .map_err(|failed| {
                 format!("recorded; the launcher did not stop {instance} to restart it: {failed}")
             })?;
-        let create = self.create_request(instance, version, launch.live, archive, launch.limits);
+        let create = self.create_request(
+            instance,
+            version,
+            launch.live,
+            archive,
+            launch.limits,
+            (launch.shards, launch.standby),
+        );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",
             create,
         ) {
             Ok(made) => {
+                self.pend_copy(instance, &made)?;
                 tracing::info!(
                     instance,
                     workload = made.workload,
@@ -1284,6 +1645,31 @@ pub fn serve_plugins_and_registries(
     local: Option<Arc<dyn LocalRegistry>>,
     registries: Option<Arc<crate::registries::Hold>>,
 ) {
+    serve_plugins_on(
+        bus,
+        store,
+        clock,
+        registry,
+        archive,
+        local,
+        registries,
+        Several::default(),
+    )
+}
+
+/// [`serve_plugins_and_registries`], on a deployment that says what an
+/// instance of several pods may run under (step 3d): [`Several`].
+#[allow(clippy::too_many_arguments)]
+pub fn serve_plugins_on(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+    local: Option<Arc<dyn LocalRegistry>>,
+    registries: Option<Arc<crate::registries::Hold>>,
+    several: Several,
+) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
         store,
@@ -1293,6 +1679,7 @@ pub fn serve_plugins_and_registries(
         local,
         registries,
         packs: packs::Jobs::default(),
+        several,
     });
     // A pack install a restart interrupted, carried on (616).
     plugins.resume_pack_jobs();

@@ -243,6 +243,7 @@ async fn the_control_partition_carries_assessments_amendments_priorities_and_ali
         .amend_closed_day(&[crate::store::ClosedDayAmendment {
             dataset: "coinbase-1:live".into(),
             sequence: 1,
+            row_key: String::new(),
             closed_day: None,
             why: "calendar 2 applied".into(),
             at_ns: NOW + 2,
@@ -288,4 +289,45 @@ async fn the_control_partition_carries_assessments_amendments_priorities_and_ali
     // This store now acts as the deposed writer, at the epoch it had.
     h.store.fence_for_test(1);
     assert!(store.keep_alias("INS-A", "INS-B", NOW + 6).is_err());
+}
+
+/// A write a fenced writer's commit refuses -- its epoch passed by a
+/// takeover, or the writer told to stop (a writer fenced while it serves
+/// on) -- is answered UNAVAILABLE with retry-after 1, to be asked again of
+/// the writer that serves by then (ruled 2026-11-18, items 110 and 120;
+/// spec section 5): nothing of it recorded. Before, it was answered in
+/// plain words, which the sidecar says as ABORTED, with no retry-after
+/// (review-c5n5 F1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_writers_write_is_refused_unavailable_to_be_asked_again() {
+    let refused_with = |refused: &str, words: &str| {
+        assert!(refused.contains(words), "{refused}");
+        assert_eq!(
+            meridian_bus::read_refusal_status(refused).map(|(status, _, _)| status),
+            Some(meridian_bus::RefusalStatus::Unavailable),
+            "{refused}"
+        );
+        assert_eq!(
+            meridian_bus::refusal_retry_after(refused),
+            Some(1),
+            "{refused}"
+        );
+    };
+    let price = |key: &str| vec![close("coinbase-1", key, BTC, "2026-10-07", "1")];
+    // Its epoch passed: another writer took the lake over.
+    let h = harness();
+    record(&h, "coinbase-1", price("a"), "").unwrap();
+    let store: &dyn Store = h.store.as_ref();
+    store
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    h.store.fence_for_test(1);
+    let refused = record(&h, "coinbase-1", price("b"), "").unwrap_err();
+    refused_with(&refused, meridian_changes::FENCED);
+    // Told to stop: it commits nothing more, whatever the epoch.
+    let h = harness();
+    record(&h, "coinbase-1", price("a"), "").unwrap();
+    h.store.stop_for_test();
+    let refused = record(&h, "coinbase-1", price("b"), "").unwrap_err();
+    refused_with(&refused, meridian_changes::STOPPED);
 }

@@ -58,7 +58,7 @@ const DAY_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Core's acts that can be prepared (the plan's Q13; from contract v22 the
 /// order path's two, Q44), by their names on the surface.
-pub const CORE_PREPARABLE: [&str; 35] = [
+pub const CORE_PREPARABLE: [&str; 38] = [
     "dashboard__set_plugin_settings",
     "dashboard__allow_archive",
     "dashboard__withdraw_archive",
@@ -105,6 +105,11 @@ pub const CORE_PREPARABLE: [&str; 35] = [
     "dashboard__install_pack",
     "dashboard__update_pack",
     "dashboard__remove_pack",
+    // Contract v30 (W6.39; step 3d): the Resilience page's acts, each
+    // preparable.
+    "dashboard__split_partition",
+    "dashboard__move_partition",
+    "dashboard__move_account",
 ];
 
 /// v20's own tools, never prepared and never levelled but for the three on

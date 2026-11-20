@@ -35,6 +35,18 @@ DRIVER_ROLE says which of its instances it is:
   served, and in the `unkept` mode read, so a lake reader that takes the read
   hands it to the writer (contract v30, stage B).
 
+- `scale-data` and `scale-oms`: the write-scale step's load (step 3d,
+  stage T, below), in the scaled run alone: nothing until /tmp/scale is
+  there, then prices recorded into the datasets of DRIVER_SCALE_KEYS, or
+  orders into DRIVER_ACCOUNTS, by DRIVER_SCALE_WORKERS workers at once, as
+  fast as each is answered.
+
+- `shard` and `shard-reader`: the cluster proof that each subject is served
+  once (step 3d, checkpoint 5, item 33, below), in the scaled run alone:
+  `shard` a data plugin on `meridian.run`, each pod of an instance at two
+  shards with a standby, serving its share of the reader's want, and
+  `shard-reader` the reader whose view of DRIVER_SUBJECTS raises it.
+
 Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
 <id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
 /tmp/history.edn (invoke, ok, fail, info), each order a list-append
@@ -81,8 +93,11 @@ DATASET_KEY = "drive"
 UNKEPT_KEY = "unkept"
 # Every call bounded: a stop is heard within this, whatever the stores do.
 CALL_SECONDS = 10
-# A key takes this many appends at most, so a read of it is one page.
-PER_KEY = 400
+# A key takes this many appends at most, so a read of it is one page: 400,
+# or what DRIVER_PER_KEY says (the reconfigure run's, longer from stage T,
+# takes twice as many a key, so its orders are appended to its end; a
+# key's read is then two pages, which the read follows).
+PER_KEY = int(os.environ.get("DRIVER_PER_KEY", "400"))
 # Appends to a key before the next key is taken.
 RUN_OF = 40
 WORKERS = 2
@@ -123,6 +138,36 @@ def acked(kind, ident):
     line = f"ACKED {kind} {ident} {int(time.time() * 1000)}"
     say(line)
     kept("/tmp/acked", line)
+
+
+def took(kind, began):
+    """A write's own time, from its call to its answer, kept in /tmp/took as
+    `TOOK <kind> <unix ms answered> <ms taken>`: what the rebalance class
+    reads a move's write pause from (step 3d; the resilience spec's section
+    15)."""
+    now = time.time()
+    kept("/tmp/took", f"TOOK {kind} {int(now * 1000)} {int((now - began) * 1000)}")
+
+
+def refused(kind, ident, failed):
+    """A write refused, or answered by nothing, kept in /tmp/refused as
+    `REFUSED <kind> <id> <unix ms> <its words>`: what the rebalance class
+    holds to none inside a move's hold."""
+    kept("/tmp/refused", f"REFUSED {kind} {ident} {int(time.time() * 1000)} {refusal_words(failed)}")
+
+
+def refusal_words(failed):
+    """A refusal's whole words on one line, for the run's log and artifact
+    (CI 43626539705: five refused prices whose cause no log named): its
+    status, its detail in full, and each trailing metadata entry the
+    sidecar sent with it (the refusal's reason among them)."""
+    if not isinstance(failed, grpc.aio.AioRpcError):
+        return f"{type(failed).__name__}: {failed}".replace("\n", " ")
+    said = [f"status={failed.code().name}", f"detail={failed.details()}"]
+    for key, value in failed.trailing_metadata() or ():
+        if not key.endswith("-bin"):
+            said.append(f"{key}={value}")
+    return " ".join(said).replace("\r", " ").replace("\n", " ")
 
 
 def decimal(text):
@@ -317,10 +362,15 @@ async def serve_want(plugin, heard):
 async def drive_data(plugin, gen):
     stub = plugin._operations()
     dataset = f"{plugin.identity.instance_id}:{DATASET_KEY}"
+    # A row key fixes its valid time (the lake's rule 5, enforced from step
+    # 3d): a pod rescheduled starts its generations again from 1 with an
+    # empty /tmp, so each start's keys carry when it started, never another
+    # start's key at a later time.
+    started = time.time_ns() // 1_000_000
     n = 0
     while not stopped():
         n += 1
-        key = f"drive-{gen}-{n}"
+        key = f"drive-{gen}-{started}-{n}"
         now = time.time_ns()
         price = ops.Price(
             meta=ops.ObservationMeta(
@@ -336,12 +386,28 @@ async def drive_data(plugin, gen):
             price=ops.Money(amount=decimal(f"{100 + n % 50}.25"), instrument_id=USD),
             basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT,
         )
+        began = time.time()
         try:
             done = await bounded(stub.RecordPrices(ops.RecordPricesParams(prices=[price])))
+            took("price", began)
             if done.recorded + done.restated + done.unchanged == 1:
                 acked("price", key)
+            else:
+                # Answered, and its one row not counted (CI 43656183991, ha:
+                # every price after its range moved to another writer group
+                # was answered 0, 0, 0): never acknowledged, and kept as a
+                # refusal is, so a move's window holds it to none.
+                # Its own name: `words` is the module's function, which the
+                # except below calls (CI 43804841979: a local of that name
+                # made every refused price an UnboundLocalError, which ended
+                # the driver's loop and hid what the lake said).
+                uncounted = (f"UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
+                             f"unchanged {done.unchanged} for one row")
+                say(f"REFUSED price {key}: {uncounted}")
+                kept("/tmp/refused", f"REFUSED price {key} {int(time.time() * 1000)} {uncounted}")
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
             say(f"REFUSED price {key}: {words(failed)}")
+            refused("price", key, failed)
             await asyncio.sleep(0.5)
         await asyncio.sleep(0.5)
 
@@ -418,6 +484,7 @@ class Book:
         self.history = history
         self.counts = {a: 0 for a in ACCOUNTS}
         self.next = 0
+        self.full = False
         self.lock = asyncio.Lock()
 
     def key_now(self):
@@ -434,6 +501,13 @@ class Book:
         async with self.lock:
             account = self.key_now()
             if account is None:
+                # Said once and kept: the run holds that it never happens
+                # (e2e/failover/run.py, driver_history), since from here no
+                # order is appended and nothing after is under its load.
+                if not self.full:
+                    self.full = True
+                    say(f"FULL: every key holds {PER_KEY} appends; no order is appended from here")
+                    kept("/tmp/full", f"FULL {int(time.time() * 1000)} after {self.next} appends")
                 return "full"
             self.next += 1
             self.counts[account] += 1
@@ -441,6 +515,7 @@ class Book:
         key = f"book/{account}"
         value = append_edn(key, number)
         self.history.write("invoke", process, value)
+        began = time.time()
         try:
             done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
                 account_id=account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
@@ -454,6 +529,7 @@ class Book:
                 venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
                 idempotency_key=f"drive-{number}", acting_for=self.person.assertion())))
         except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            refused("order", number, failed)
             if definitely_not(failed):
                 self.history.write("fail", process, value)
                 say(f"REFUSED order {number}: {words(failed)}")
@@ -461,6 +537,7 @@ class Book:
             self.history.write("info", process, value)
             say(f"UNKNOWN order {number}: {words(failed)}")
             return "info"
+        took("order", began)
         self.history.write("ok", process, value)
         acked("order", done.order.order_id)
         return "ok"
@@ -477,7 +554,9 @@ class Book:
                     account_id=account, page_size=500, cursor=cursor)))
                 for order in listed.orders:
                     if order.venue_order_id.isdigit() and order.origin == ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED:
-                        numbered.append((order.last_change.sequence, int(order.venue_order_id)))
+                        at = order.last_change
+                        numbered.append((at.partition, at.sequence, at.previous_sequence,
+                                         int(order.venue_order_id)))
                 cursor = listed.next_cursor
                 if not cursor:
                     break
@@ -486,9 +565,47 @@ class Book:
             self.history.write("fail", process, read_edn(key, None))
             say(f"UNREAD {key}: {words(failed)}")
             return "fail"
-        numbered.sort()
-        self.history.write("ok", process, read_edn(key, [n for _, n in numbered]))
+        self.history.write("ok", process, read_edn(key, as_recorded(numbered)))
         return "ok"
+
+
+def as_recorded(numbered):
+    """An account's orders in the order the book recorded them, across the
+    account's moves: `numbered` holds each order's last change -- its
+    partition, its sequence there, the sequence of the account's order
+    change before it -- and its number.
+
+    A partition numbers its own sequences, so after a move an order may
+    carry a lower one than an order recorded before it: sorted by sequence
+    alone, a read after ACC-DRIVE-00's move to P1 put its new orders first,
+    and Elle read eight incompatible orders (PR CI 43662032539, ha). The
+    book says the order itself: within a partition its sequence does, and
+    each change names the one before it, in whichever partition that was
+    (crates/bor/tests/postgres.rs,
+    m11_an_accounts_orders_chain_in_order_across_its_move). So each stay in
+    a partition is in sequence order, and a stay follows the one whose last
+    order its first names. These orders change once, when recorded, so the
+    chain is theirs alone."""
+    stays = {}
+    for partition, sequence, previous, number in sorted(numbered):
+        stays.setdefault(partition, []).append((sequence, previous, number))
+    # Each stay by the order its first names, where that is in another
+    # partition; the first stay of all names none (0), or one not listed.
+    last = {rows[-1][0]: partition for partition, rows in stays.items()}
+    follows = {}
+    first = []
+    for partition, rows in stays.items():
+        before = last.get(rows[0][1])
+        if before is None or before == partition or before in follows:
+            first.append(partition)
+        else:
+            follows[before] = partition
+    ordered = []
+    for partition in sorted(first):
+        while partition is not None and stays.get(partition) is not None:
+            ordered.extend(number for _, _, number in stays.pop(partition))
+            partition = follows.get(partition)
+    return ordered
 
 
 async def worker(book, slot, gen):
@@ -685,7 +802,9 @@ async def flood_seed(plugin, dataset):
     if os.path.exists("/tmp/seeded"):
         return
     stub = plugin._operations()
-    began = time.time_ns() - FLOOD_ROWS * 1_000_000
+    # Each row's valid time a constant of its key (the lake's rule 5): a pod
+    # rescheduled seeds again, its /tmp gone, and restates nothing.
+    began = 1_793_491_200_000_000_000  # 2026-11-01T00:00:00Z
     for batch in range(FLOOD_ROWS // 500):
         prices = []
         for n in range(500):
@@ -707,6 +826,9 @@ async def flood_seed(plugin, dataset):
                 break
             except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
                 say(f"driver: flood: seeding batch {batch} again ({words(failed)})")
+                # Told to stop: stops, seeded or not.
+                if stopped():
+                    return
                 await asyncio.sleep(1.0)
     kept("/tmp/seeded", "SEEDED")
     say(f"driver: flood: {FLOOD_ROWS} rows recorded in {dataset}")
@@ -921,7 +1043,293 @@ async def drive_standing(role):
 # ── Start ───────────────────────────────────────────────────────────────────
 
 
+# ── The write-scale step's load (step 3d, stage T; section 15) ─────────────
+#
+# DRIVER_ROLE=scale-data and scale-oms, in e2e-cluster-scaled alone: each
+# store's writes at saturation, so the run can read what one writer group
+# on one database commits a second against two groups on two. Nothing is
+# written until the run makes /tmp/scale, and nothing once it removes it.
+# While it is there SCALE_WORKERS workers each write as fast as they are
+# answered: scale-data a batch of SCALE_BATCH prices into one of the
+# datasets of DRIVER_SCALE_KEYS, taken in turn (several, so they fall to
+# both writer groups); scale-oms a telephoned order into one of
+# DRIVER_ACCOUNTS, taken in turn -- or of those /tmp/scale names, by commas,
+# where it names any (the run names as many of each writer group's). What
+# was committed is read by the run in
+# the stores' own rows, never here; this keeps a count a second in
+# /tmp/scale.log (`SCALE <unix ms> <answered> <refused>`) and the last
+# refusal's words in /tmp/scale-refused, for reading a run that wrote
+# nothing. No figure is printed.
+
+SCALE = "/tmp/scale"
+SCALE_KEYS = [k for k in os.environ.get("DRIVER_SCALE_KEYS", "").split(",") if k]
+SCALE_WORKERS = int(os.environ.get("DRIVER_SCALE_WORKERS", "48"))
+SCALE_BATCH = 20
+
+
+class Scale:
+    def __init__(self):
+        self.answered = 0
+        self.refused = 0
+        self.turn = 0
+        self.named = []
+        self.read_at = None
+
+    def told(self):
+        """Whether to write now, and what /tmp/scale names, read again
+        when the file changes."""
+        try:
+            at = os.stat(SCALE).st_mtime_ns
+        except OSError:
+            self.read_at = None
+            return False
+        if at != self.read_at:
+            with open(SCALE, encoding="utf-8") as held:
+                self.named = [a for a in held.read().strip().split(",") if a]
+            self.read_at = at
+        return True
+
+    def next(self, among):
+        self.turn += 1
+        return among[self.turn % len(among)]
+
+    async def count_forever(self):
+        while not stopped():
+            await asyncio.sleep(1)
+            if self.answered or self.refused:
+                kept("/tmp/scale.log", f"SCALE {int(time.time() * 1000)} {self.answered} {self.refused}")
+                self.answered = self.refused = 0
+
+    async def work(self, write):
+        while not stopped():
+            if not self.told():
+                await asyncio.sleep(0.2)
+                continue
+            try:
+                await bounded(write())
+                self.answered += 1
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                self.refused += 1
+                with open("/tmp/scale-refused", "w", encoding="utf-8") as held:
+                    held.write(f"{int(time.time() * 1000)} {refusal_words(failed)}\n")
+                await asyncio.sleep(0.05)
+
+
+async def drive_scale_data(plugin, gen):
+    stub = plugin._operations()
+    scale = Scale()
+    started = time.time_ns() // 1_000_000
+    numbers = iter(range(1, 1 << 62))
+
+    def write():
+        dataset = f"{plugin.identity.instance_id}:{scale.next(SCALE_KEYS)}"
+        now = time.time_ns()
+        prices = []
+        for at in range(SCALE_BATCH):
+            # A row key of its own, with one valid time (the lake's rule 5).
+            key = f"scale-{gen}-{started}-{next(numbers)}"
+            prices.append(ops.Price(
+                meta=ops.ObservationMeta(
+                    row_key=key, subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+                    source=ops.Source(dataset=dataset), valid_from_ns=now + at,
+                    source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                                 at_ns=now + at)],
+                    raw=plugin.raw_record(f"scale/{key}")),
+                kind=ops.PriceKind.PRICE_KIND_LAST,
+                price=ops.Money(amount=decimal("101.25"), instrument_id=USD),
+                basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT))
+        return stub.RecordPrices(ops.RecordPricesParams(prices=prices))
+
+    await asyncio.gather(scale.count_forever(), *(scale.work(write) for _ in range(SCALE_WORKERS)))
+
+
+async def drive_scale_oms(plugin, gen):
+    stub = plugin._operations()
+    scale = Scale()
+    person = Person(plugin.identity.instance_id)
+    started = time.time_ns() // 1_000_000
+    numbers = iter(range(1, 1 << 62))
+
+    def write():
+        number = next(numbers)
+        return stub.RecordOrder(ops.RecordOrderParams(
+            account_id=scale.next(scale.named or ACCOUNTS), instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
+            quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
+            time_in_force=ops.TimeInForce.TIME_IN_FORCE_GOOD_TILL_CANCELLED,
+            venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
+            idempotency_key=f"scale-{gen}-{started}-{number}", acting_for=person.assertion()))
+
+    await asyncio.gather(scale.count_forever(), *(scale.work(write) for _ in range(SCALE_WORKERS)))
+
+
+# DRIVER_ROLE=shard and shard-reader, in e2e-cluster-scaled alone (step 3d,
+# checkpoint 5, item 33; the resilience spec's section 7): the cluster proof
+# that each subject is served once.
+#
+# `shard` runs in each pod of a plugin instance launched at two shards with
+# a standby pod (run.py's SHARDED), as a data plugin runs: on meridian.run,
+# nothing of it started until its sidecar admits it, its classes stopped
+# when its sidecar is lost, and started again as its pod takes a shard. It
+# declares one streamed dataset (`<instance>:served`) and serves its share
+# of each want of it: the subjects its sidecar hands it, by rendezvous
+# hashing over the live shards. Once a second it records a price of each
+# subject it serves, under a row key fixed by the subject and the second
+# (`shard-<subject>-<unix s>`, valid at that second, its price a function of
+# both): two shards serving one subject in one second record the same row.
+# Each subject of a batch the lake acknowledged whole is kept in
+# /tmp/served.log as `SERVED <host> <shard> <subject> <unix s> <unix ms>`
+# (the host the instance's name, as the chart sets it; the run reads each
+# pod's file and names the lines by the pod):
+# the second its row is of, and when it was acknowledged. Each batch
+# refused is kept in /tmp/shard-refused.log as `REFUSED <unix ms> <words>`,
+# and each want heard and withdrawn in /tmp/shard-wants.log.
+#
+# Beside it, as the stand-in it replaces did, it says whether the members'
+# token is in its container (SHARD_NO_TOKEN; item 31) and, each time it
+# changes, whether its sidecar answers on loopback (SHARD_ANSWERED,
+# SHARD_GONE): where a plugin's Register is answered, so whether its run()
+# may start. run.py reads the same words.
+#
+# `shard-reader` holds reporting: one view (`plugin.subscribe`) of the
+# prices of DRIVER_SUBJECTS, open for the run, which its sidecar keeps as a
+# standing want at the lake (W10.7; contract v28, amended 2026-10-30) of the
+# dataset the lake chooses for it: the shard instance's, the one it is
+# entitled to. Every ten seconds it says how many rows its view holds, in
+# /tmp/reader.log as `READ <unix ms> <rows>`.
+
+SHARD_KEY = "served"
+SUBJECTS = [s for s in os.environ.get("DRIVER_SUBJECTS", "").split(",") if s]
+TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+SHARD_NO_TOKEN = "shard: no lease token in the plugin container"
+SHARD_ANSWERED = "shard: the sidecar answers"
+SHARD_GONE = "shard: the sidecar no longer answers"
+# Where a plugin's Register is answered: its sidecar, on loopback.
+SIDECAR_PORT = 9191
+
+
+def shard_number():
+    """The shard this pod serves, as its sidecar's Register answered it
+    (item 30); `?` before it has."""
+    from meridian import edge
+
+    serving = getattr(edge, "_serving", None)
+    return str(serving[0]) if serving else "?"
+
+
+def shard_price(subject, second):
+    """A subject's price at a second: the same in every pod."""
+    cents = int.from_bytes(hashlib.sha256(f"{subject}/{second}".encode()).digest()[:4], "big") % 10000
+    return f"{100 + cents // 100}.{cents % 100:02d}"
+
+
+async def sidecar_answers():
+    """Said each time it changes: whether the sidecar answers on loopback."""
+    was = False
+    while True:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", SIDECAR_PORT), 1)
+            writer.close()
+            now = True
+        except (OSError, asyncio.TimeoutError):
+            now = False
+        if now != was:
+            say(SHARD_ANSWERED if now else SHARD_GONE)
+            was = now
+        await asyncio.sleep(0.5)
+
+
+class Sharding(data.Role):
+    seed = False
+
+    async def on_start(self):
+        # Afresh for each serving: what an earlier one held is not this one's.
+        self.serving = {}
+        say(f"driver: shard: serving as shard {shard_number()}")
+
+    async def on_observations_wanted(self, heard):
+        want = heard.message
+        if want.dataset != f"{self.plugin.identity.instance_id}:{SHARD_KEY}":
+            return
+        subjects = sorted({subject.entity_id for subject in want.subjects})
+        self.serving[want.want_id] = subjects
+        kept("/tmp/shard-wants.log", f"WANT {int(time.time() * 1000)} {want.want_id} "
+                                     f"standing={want.standing} {','.join(subjects)}")
+
+    async def on_want_withdrawn(self, heard):
+        self.serving.pop(heard.message.want_id, None)
+        kept("/tmp/shard-wants.log", f"WITHDRAWN {int(time.time() * 1000)} {heard.message.want_id}")
+
+    async def run(self):
+        stub = self.plugin._operations()
+        dataset = f"{self.plugin.identity.instance_id}:{SHARD_KEY}"
+        pod = os.environ.get("HOSTNAME", "?")
+        while not stopped():
+            # Just past the next second, so each batch names the second it
+            # is recorded in.
+            await asyncio.sleep(1.05 - time.time() % 1)
+            subjects = sorted(set().union(*self.serving.values())) if self.serving else []
+            if not subjects:
+                continue
+            second = int(time.time())
+            prices = [ops.Price(
+                meta=ops.ObservationMeta(
+                    row_key=f"shard-{subject}-{second}",
+                    subjects=[ops.SubjectRef(entity_id=subject)],
+                    source=ops.Source(dataset=dataset), valid_from_ns=second * 1_000_000_000,
+                    source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                                 at_ns=second * 1_000_000_000)],
+                    raw=self.plugin.raw_record(f"served/{subject}/{second}")),
+                kind=ops.PriceKind.PRICE_KIND_LAST,
+                price=ops.Money(amount=decimal(shard_price(subject, second)), instrument_id=USD),
+                basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT) for subject in subjects]
+            try:
+                done = await bounded(stub.RecordPrices(ops.RecordPricesParams(prices=prices)))
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                kept("/tmp/shard-refused.log", f"REFUSED {int(time.time() * 1000)} {refusal_words(failed)}")
+                say(f"driver: shard: a batch of {len(prices)} refused ({refusal_words(failed)[:300]})")
+                continue
+            at = int(time.time() * 1000)
+            if done.recorded + done.restated + done.unchanged != len(prices):
+                kept("/tmp/shard-refused.log",
+                     f"REFUSED {at} UNCOUNTED: answered recorded {done.recorded}, restated {done.restated}, "
+                     f"unchanged {done.unchanged} for {len(prices)} rows")
+                continue
+            shard = shard_number()
+            with open("/tmp/served.log", "a", encoding="utf-8") as held:
+                held.write("".join(f"SERVED {pod} {shard} {subject} {second} {at}\n" for subject in subjects))
+
+
+async def drive_shard():
+    if not os.path.exists(TOKEN):
+        say(SHARD_NO_TOKEN)
+    answers = asyncio.create_task(sidecar_answers())
+    from meridian import run_async
+
+    try:
+        await run_async(declaration(), [Sharding()])
+    finally:
+        answers.cancel()
+
+
+async def drive_shard_reader(plugin):
+    view = await plugin.subscribe("PricesRecorded", subjects=SUBJECTS)
+    say(f"driver: shard-reader: a view of {len(SUBJECTS)} subjects' prices open")
+    while not stopped():
+        await asyncio.sleep(10)
+        kept("/tmp/reader.log", f"READ {int(time.time() * 1000)} {len(view.rows())}")
+
+
 def declaration():
+    if ROLE == "shard":
+        return Declaration(catalogue=[DatasetDeclaration(
+            key=SHARD_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"], modes=["stream"],
+            terms_and_pricing="A test-only driver's prices, served to the reader that wants them and kept.",
+            day_time_zone="Etc/UTC")])
+    if ROLE == "scale-data":
+        return Declaration(catalogue=[DatasetDeclaration(
+            key=key, vendor="e2e failover driver", data_types=["meridian.v1.Price"], modes=["push"],
+            terms_and_pricing="A test-only driver's own prices, written for the run and kept by it.",
+            day_time_zone="Etc/UTC") for key in SCALE_KEYS])
     if ROLE in ("data", "flood"):
         catalogue = [DatasetDeclaration(
             key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
@@ -941,14 +1349,24 @@ def declaration():
 
 
 async def main():
-    if ROLE not in ("data", "oms", "desk", "flood", "standing") or not INSTRUMENT or (
-            ROLE in ("oms", "desk") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
+    if ROLE not in ("data", "oms", "desk", "flood", "standing", "scale-data", "scale-oms", "shard",
+                    "shard-reader") or not INSTRUMENT or (
+            ROLE in ("oms", "desk", "scale-oms") and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)) or (
+            ROLE == "scale-data" and not SCALE_KEYS) or (ROLE == "shard" and not USD) or (
+            ROLE == "shard-reader" and not SUBJECTS):
         raise SystemExit("driver: DRIVER_ROLE is data, oms or desk, with DRIVER_INSTRUMENT (and, for oms and "
                          "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
+    if ROLE == "shard":
+        # Its process's life on meridian.run, as a data plugin's: it waits
+        # for its sidecar without limit, and leaves only when stopped.
+        await drive_shard()
+        while True:
+            await asyncio.sleep(3600)
     roles = {"data": [Recording(), Reporting()], "oms": [Managing()], "desk": [Desking(), Managing()],
-             "flood": [Recording(), Reporting()], "standing": [Reporting()]}[ROLE]
+             "flood": [Recording(), Reporting()], "standing": [Reporting()],
+             "scale-data": [Recording()], "scale-oms": [Managing()], "shard-reader": [Reporting()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
     while not stopped():
@@ -959,7 +1377,10 @@ async def main():
                 await {"data": lambda: asyncio.gather(drive_data(plugin, gen), drive_page(plugin)),
                        "oms": lambda: drive_oms(plugin, gen),
                        "desk": lambda: drive_desk(plugin), "flood": lambda: drive_flood(plugin),
-                       "standing": lambda: drive_standing(roles[0])}[ROLE]()
+                       "standing": lambda: drive_standing(roles[0]),
+                       "scale-data": lambda: drive_scale_data(plugin, gen),
+                       "scale-oms": lambda: drive_scale_oms(plugin, gen),
+                       "shard-reader": lambda: drive_shard_reader(plugin)}[ROLE]()
             break
         except Exception as failed:  # noqa: BLE001 - every start failure is waited out
             say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")

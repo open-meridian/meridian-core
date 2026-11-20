@@ -123,9 +123,9 @@ fn run() -> Result<(), String> {
             "the configuration store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| {
+            |store, lock_waits| {
                 store
-                    .migrate(&*clock())
+                    .migrate_within(&*clock(), lock_waits)
                     .map_err(|failed| failed.to_string())
             },
         )
@@ -236,6 +236,11 @@ fn run() -> Result<(), String> {
         meridian_runtime::member::Member::from_env("conductor", logged.as_ref().map(|_| "config"))?;
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
+    // The book beside it, whose read of the accounts as itself is answered
+    // in full, to place a new account (ReadAccountsForPlacement, step 3d).
+    if let Some(book) = meridian_config::service::book_beside(&instance_id) {
+        meridian_config::service::reads_for_book(&book);
+    }
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
     let platform = platform_from_env(key)?;
 
@@ -266,6 +271,14 @@ fn run() -> Result<(), String> {
                 move || writing.epoch(),
                 move || watched.head_epoch().map_err(|failed| failed.to_string()),
             );
+            // Its partitions in its report: its log's own and its control
+            // partition (CI 44556229125: a writer named none).
+            holding.report_partitions(|| {
+                Ok(meridian_config::postgres::CHANGES
+                    .partitions()
+                    .map(String::from)
+                    .to_vec())
+            });
             // A new database timeline raises the epoch (contract v30, stage C).
             let following = Arc::clone(postgres);
             holding.follow_timeline(&bus, "config", move || {
@@ -391,7 +404,7 @@ fn run() -> Result<(), String> {
                 .start(Arc::clone(&bus)),
             );
         }
-        meridian_config::serve_plugins_and_registries(
+        meridian_config::serve_plugins_on(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
@@ -399,6 +412,7 @@ fn run() -> Result<(), String> {
             archive,
             local_registry,
             registries,
+            several_pods(),
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing
@@ -503,7 +517,7 @@ fn run() -> Result<(), String> {
             started_at_ns = now_ns(),
             "the conductor is connected"
         );
-        ready.serving();
+        ready.serving_on(&bus).await;
 
         shutdown().await;
         tracing::info!("stopping");
@@ -832,5 +846,35 @@ fn grant_if_serving(migrating_url: &str) -> Result<(), String> {
             meridian_runtime::component_logins_on_brought(&serving)
         }
         None => Ok(()),
+    }
+}
+
+/// What an instance of several pods may run under (step 3d), as the
+/// chart's values state it -- unsaid where the chart handed none: a lease
+/// right to run under, and for a plugin keeping storage, a ReadWriteMany
+/// class to share it on, or one node (checkpoint 5, item 30), counted at
+/// the launch from the nodes the release's pods run on, as the resilience
+/// profile counts them.
+fn several_pods() -> meridian_config::Several {
+    let Some(values) = meridian_runtime::resilience::values_from_env().filter(|v| v.stated) else {
+        return meridian_config::Several::default();
+    };
+    let nodes: Arc<dyn Fn() -> Result<usize, String> + Send + Sync> = Arc::new(|| {
+        let api = meridian_first_run::cluster::ApiServer::in_cluster(clock())
+            .map_err(|failed| failed.0)?;
+        let list = tokio::runtime::Handle::current()
+            .block_on(api.pods())
+            .map_err(|failed| failed.0)?;
+        Ok(meridian_runtime::resilience::pods_of(&list)
+            .into_iter()
+            .filter(|pod| !pod.node.is_empty())
+            .map(|pod| pod.node)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len())
+    });
+    meridian_config::Several {
+        lease_right: Some(values.lease_right()),
+        storage: Some((values.plugin_storage, values.shared_storage_class.clone())),
+        nodes: Some(nodes),
     }
 }

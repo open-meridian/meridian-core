@@ -29,14 +29,16 @@ pub enum Class {
 
 impl Class {
     /// The class a request on `topic` is in: the book's commands are the
-    /// order path's and the venue's facts (decisions/024).
+    /// order path's and the venue's facts (decisions/024), those one writer
+    /// group hands to another (`platform.book.internal.command`) too; the
+    /// book's other internal topics are the rest.
     pub fn of_topic(topic: &str) -> Self {
         let mut parts = topic.split('.');
-        let (domain, kind) = (parts.nth(1), parts.next());
-        if domain == Some("book") && kind == Some("command") {
-            Class::First
-        } else {
-            Class::Rest
+        let (domain, kind, name) = (parts.nth(1), parts.next(), parts.next());
+        match (domain, kind, name) {
+            (Some("book"), Some("command"), _) => Class::First,
+            (Some("book"), Some("internal"), Some("command")) => Class::First,
+            _ => Class::Rest,
         }
     }
 
@@ -301,6 +303,28 @@ mod tests {
         );
         assert_eq!(
             Class::of_topic("platform.lake.query.list-statistics"),
+            Class::Rest
+        );
+    }
+
+    /// A book command one group hands to the group that owns its partition
+    /// is the order path's as when it came direct (the book bench at two
+    /// groups: handed commands waited 524-703 ms in Rest against 29-54 ms
+    /// direct, and every refusal was on that topic); the book's internal
+    /// change reads stay Rest, as do the lake's handed writes, whose
+    /// commands are Rest too.
+    #[test]
+    fn a_handed_book_command_is_the_first_class_and_internal_reads_the_rest() {
+        assert_eq!(
+            Class::of_topic("platform.book.internal.command"),
+            Class::First
+        );
+        assert_eq!(
+            Class::of_topic("platform.book.internal.read-changes"),
+            Class::Rest
+        );
+        assert_eq!(
+            Class::of_topic("platform.lake.internal.record"),
             Class::Rest
         );
     }

@@ -61,10 +61,15 @@ struct Wired {
 }
 
 fn wired() -> Wired {
+    wired_with(MemoryStore::new())
+}
+
+/// [`wired`] over a store of the test's own: one of several partitions.
+fn wired_with(store: MemoryStore) -> Wired {
     let backend = Arc::new(MemoryBackend::new());
     let clock = Arc::new(meridian_clock::ManualClock::at(NOW));
     let bus = Arc::new(Bus::single(ME, backend, clock.clone()));
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(store);
     serve(bus.clone(), store.clone(), bus.clock());
     bus.serve(RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
@@ -2809,6 +2814,7 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
                 instance_id: ME.into(),
                 key: "transactions/6311:trades/6290".into(),
             }),
+            idempotency_key: String::new(),
         },
         &venue(),
     )
@@ -2829,6 +2835,135 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
         pending,
         vec![("2026-10-14".to_string(), "-2275.82".to_string())]
     );
+}
+
+// ── Step 3d (PO item 74): a charge retried after a lost reply ──────────────
+
+fn charge_on(placement_id: &str, amount: &str, key: &str) -> ReportChargeRequest {
+    ReportChargeRequest {
+        placement_id: placement_id.into(),
+        fee: Some(Fee {
+            kind: FeeKind::Financing as i32,
+            amount: usd(amount),
+            ..Default::default()
+        }),
+        trade_date: "2026-10-14".into(),
+        settlement_date: "2026-10-14".into(),
+        raw_record: Some(meridian_pb::v1::RawRecordRef {
+            instance_id: ME.into(),
+            key: "transactions/6311:trades/6290".into(),
+        }),
+        idempotency_key: key.into(),
+    }
+}
+
+async fn report_charge(w: &Wired, request: &ReportChargeRequest) -> Result<FactReply, String> {
+    send_from(
+        &w.bus,
+        REPORT_CHARGE,
+        "meridian.v1.ReportChargeRequest",
+        request,
+        &venue(),
+    )
+    .await
+    .map(|reply| FactReply::decode(&reply[..]).unwrap())
+}
+
+fn charge_id_of(reply: &FactReply) -> String {
+    reply.charge.as_ref().unwrap().charge_id.clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_reported_again_under_its_key_is_recorded_once() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let placement = place(&w, &order.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let on = placement.placement_id.as_str();
+    let key = format!("charge:6311|{on}");
+    let before = w.store.journal(ACC).unwrap().len();
+    let first = report_charge(&w, &charge_on(on, "1.37", &key))
+        .await
+        .unwrap();
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 1);
+
+    // The same key again, after a lost reply: answered as already recorded,
+    // the first's answer, and no second charge minted.
+    let again = report_charge(&w, &charge_on(on, "1.37", &key))
+        .await
+        .unwrap();
+    assert_eq!(again, first);
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 1);
+
+    // The same key with other content is refused, nothing applied.
+    let refused = report_charge(&w, &charge_on(on, "2.00", &key))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(&refused),
+        Some(RefusalReason::IdempotencyConflict),
+        "{refused}"
+    );
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 1);
+
+    // A different key: a second charge.
+    let second = report_charge(&w, &charge_on(on, "1.37", &format!("charge:6312|{on}")))
+        .await
+        .unwrap();
+    assert_ne!(charge_id_of(&second), charge_id_of(&first));
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 2);
+
+    // No key: as before, each report its own charge.
+    let unkeyed = [
+        report_charge(&w, &charge_on(on, "1.37", "")).await.unwrap(),
+        report_charge(&w, &charge_on(on, "1.37", "")).await.unwrap(),
+    ];
+    assert_ne!(charge_id_of(&unkeyed[0]), charge_id_of(&unkeyed[1]));
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 4);
+}
+
+/// Review c5k, L3: a charge sent under a recorded key by an instance whose
+/// scope does not hold the placement's account is kept unplaced, naming no
+/// account, as it is without a key; it is neither answered with the
+/// account's charge nor refused naming the account.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charge_outside_its_senders_scope_is_kept_unplaced_whatever_its_key() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let placement = place(&w, &order.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let on = placement.placement_id.as_str();
+    let key = format!("charge:6311|{on}");
+    report_charge(&w, &charge_on(on, "1.37", &key))
+        .await
+        .unwrap();
+    let before = w.store.journal(ACC).unwrap().len();
+    let elsewhere = As {
+        scope: Some(vec![OTHER]),
+        ..venue()
+    };
+    for amount in ["1.37", "2.00"] {
+        let reply = send_from(
+            &w.bus,
+            REPORT_CHARGE,
+            "meridian.v1.ReportChargeRequest",
+            &charge_on(on, amount, &key),
+            &elsewhere,
+        )
+        .await
+        .map(|reply| FactReply::decode(&reply[..]).unwrap())
+        .unwrap_or_else(|refused| panic!("{amount}: {refused}"));
+        assert!(reply.charge.is_none(), "{amount}: answered with the charge");
+        let kept = reply.unplaced.expect("kept unplaced");
+        assert!(kept.account_id.is_empty(), "{amount}: {}", kept.account_id);
+    }
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before);
 }
 
 // ── Contract v23: an FX order's quote currency (W11.1) ──────────────────────

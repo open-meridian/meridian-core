@@ -123,6 +123,33 @@ HA standbys serve no reads. Takes the chart.
 {{- $n -}}
 {{- end -}}
 
+{{/*
+The broker's own full health check, as its probes run it (step 3d): NATS's
+/healthz on the pod's loopback, where its monitoring alone listens, which
+answers 200 only once the server is current with its metadata leader. Bash's
+own TCP, as the image carries no HTTP client.
+
+With JetStream, also that the server is one of its metadata group's peers,
+by the group as the server itself holds it (/raftz): the leader's peer set,
+which never lists the server's own peer, so a member knows the size less
+one others. /healthz alone does not say it: CI 43539633884 had a server
+current with the leader, /healthz 200, that the leader had never added, so
+the group was two and no stream at three could be placed (and, by the same
+signature, CI 43955282180, for fifteen minutes).
+A server that does not pass it within its startup probe's bound, or that
+fails it past its liveness probe's once started, is started again: the same
+pod name, so the same Raft peer, on the same volume, with the JetStream state
+it kept, catching up from the others. A restart clears no state.
+Takes the chart.
+*/}}
+{{- define "meridian-runtime.brokerHealthz" -}}
+["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8222 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '
+{{- if gt (int (include "meridian-runtime.jetstreamReplicas" .)) 0 -}}
+{{- " " -}} && exec 4<>/dev/tcp/127.0.0.1/8222 && printf 'GET /raftz?group=_meta_ HTTP/1.0\\r\\n\\r\\n' >&4 && group=$(cat <&4) && size=$(sed -nE 's/^ *.size.: *([0-9]+).*/\\1/p' <<<\"$group\" | head -1) && [ -n \"$size\" ] && [ $(grep -cE 'known.: *true' <<<\"$group\") -eq $((size - 1)) ]
+{{- end -}}
+"]
+{{- end -}}
+
 {{- define "meridian-runtime.jetstreamReplicas" -}}
 {{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" (index (.Values.broker.jetstream | default dict) "replicas") "tolerant" 0 "ha" 3) -}}
 {{- if not (has (toString $n) (list "0" "3")) -}}
@@ -243,6 +270,170 @@ when it lapses. More are refused: a count CI does not test is not offered
 {{- end -}}
 
 {{/*
+A store's writer groups (step 3d; the resilience spec's sections 6.1, 6.3
+and 6.7; `lake.writerGroups`, `bor.writerGroups`, approved by 1057): 1, the
+default, one writer over every partition, as ever. Above it each group owns
+a share of the store's partitions by rendezvous hashing -- the lake's
+datasets, the book's partitions, `control` always group 0's -- and every
+group past the first is a writer Deployment of its own,
+`<release>-<store>-group-<g>` (approved 2026-11-12), with its own Lease and
+standby (`<store>.standby` counts per group); every member serves the
+store's public writes and hands each to the group owning it. With the
+lake's write-ahead stream on (ha), each group's writer reads the stream
+with its own position and commits its own datasets' writes (stage H). Zero
+is refused, and more than 64. Takes a dict: top, component, values.
+*/}}
+{{/*
+The book's partitions (step 3d; the resilience spec's section 6.3;
+`bor.partitions`, MERIDIAN_BOR_PARTITIONS ruled 2026-11-13): 1, the default,
+P0 alone; 1 to 64.
+*/}}
+{{- /* A move's bounds (step 3d; section 6.8; MERIDIAN_MOVES_HOLD_SECONDS and
+MERIDIAN_MOVES_SWITCH_SECONDS approved 2026-11-14): the lake's and the
+book's members each told both. A switch shorter than its hold could never
+drain the writes it held, so it is refused. */ -}}
+{{- define "meridian-runtime.movesEnv" -}}
+{{- $hold := .Values.moves.holdSeconds -}}
+{{- $switch := .Values.moves.switchSeconds -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $hold)) -}}
+{{- fail (printf "moves.holdSeconds is %v; a whole number of seconds from 1 (5, the default)" $hold) -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $switch)) -}}
+{{- fail (printf "moves.switchSeconds is %v; a whole number of seconds from 1 (30, the default)" $switch) -}}
+{{- end -}}
+{{- if lt (int $switch) (int $hold) -}}
+{{- fail (printf "moves.switchSeconds is %v and moves.holdSeconds %v; a switch is at least as long as its hold" $switch $hold) -}}
+{{- end }}
+- name: MERIDIAN_MOVES_HOLD_SECONDS
+  value: {{ int $hold | quote }}
+- name: MERIDIAN_MOVES_SWITCH_SECONDS
+  value: {{ int $switch | quote }}
+{{- end -}}
+
+{{- define "meridian-runtime.borPartitions" -}}
+{{- $partitions := .Values.bor.partitions -}}
+{{- if kindIs "invalid" $partitions -}}
+{{- $partitions = 1 -}}
+{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $partitions)) -}}
+{{- fail (printf "bor.partitions is %v; a whole number of partitions from 1 (P0 alone, the default)" $partitions) -}}
+{{- end -}}
+{{- if gt (int $partitions) 64 -}}
+{{- fail (printf "bor.partitions is %v; at most 64" $partitions) -}}
+{{- end -}}
+{{- int $partitions -}}
+{{- end -}}
+
+{{- define "meridian-runtime.writerGroups" -}}
+{{- $groups := 1 -}}
+{{- if hasKey .values "writerGroups" -}}{{- $groups = index .values "writerGroups" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $groups)) -}}
+{{- fail (printf "%s.writerGroups is %v; a whole number of writer groups from 1, each owning a share of the %s's partitions (1, the default, for one writer over all)" .component $groups .component) -}}
+{{- end -}}
+{{- if gt (int $groups) 64 -}}
+{{- fail (printf "%s.writerGroups is %v; at most 64" .component $groups) -}}
+{{- end -}}
+{{- $most := int (include "meridian-runtime.maxWriterGroups" .) -}}
+{{- if gt (int $groups) $most -}}
+{{- fail (printf "%s.writerGroups is %v and %s.maxWriterGroups %d; at most %d. Raise %s.maxWriterGroups to %v first: the database's connections are counted at it, so raising it restarts the database once, and a count within it never does." .component $groups .component $most $most .component $groups) -}}
+{{- end -}}
+{{- int $groups -}}
+{{- end -}}
+
+{{/*
+The most writer groups a store allows (PO items 104 and 106, 2026-11-18;
+`lake.maxWriterGroups`, `bor.maxWriterGroups`): 2 by default, 1 to 64. The
+database's connections are counted at it (databaseConnections), so
+`<store>.writerGroups` changed within it never changes max_connections nor
+the database's pods and never restarts the database; raising it does, once.
+A count above it is refused. Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.maxWriterGroups" -}}
+{{- $most := 2 -}}
+{{- if hasKey .values "maxWriterGroups" -}}{{- $most = index .values "maxWriterGroups" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $most)) -}}
+{{- fail (printf "%s.maxWriterGroups is %v; a whole number of writer groups from 1, the most %s.writerGroups may be (2, the default), its database's connections counted at it" .component $most .component) -}}
+{{- end -}}
+{{- if gt (int $most) 64 -}}
+{{- fail (printf "%s.maxWriterGroups is %v; at most 64" .component $most) -}}
+{{- end -}}
+{{- int $most -}}
+{{- end -}}
+
+{{/*
+A store's writer groups are raised in ha, not lowered yet (PO items 111,
+option B, and 112, ruled 2026-11-18): an upgrade whose <store>.writerGroups
+is below the count the store's writers run at now is refused before
+anything changes, saying why. The book's, in the ha profile, or where the
+running book is ha: its group-0 writer and its standby take a lease
+(MERIDIAN_LEASE_NAME), so ha moved to tolerant and lowered in one upgrade
+is refused too, as the lake's is by its running stream (review c5s, L5).
+The lake's,
+wherever its write-ahead stream is on before or after the upgrade -- the
+ha profile, JetStream at three in tolerant, or a running writer that reads
+the stream (MERIDIAN_LAKE_WRITE_AHEAD), so ha moved to tolerant and lowered
+in one upgrade is refused too. The count, the stream and the lease are
+read live from the store's group-0 writer Deployment (MERIDIAN_WRITER_GROUPS,
+said only with several groups), so it holds for `meridian upgrade-deployment` and
+`helm upgrade` alike. An install, an unchanged count, a raise and a
+lowering with no stream (tolerant) are never refused, nor where nothing can
+be read (`helm template`, a client dry run). Takes a dict: top, component,
+values.
+*/}}
+{{- define "meridian-runtime.writerGroupsNotLowered" -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- $ha := eq (include "meridian-runtime.profile" .top) "ha" -}}
+{{- $streamed := and (eq .component "lake") (gt (int (include "meridian-runtime.jetstreamReplicas" .top)) 0) -}}
+{{- $live := lookup "apps/v1" "Deployment" .top.Release.Namespace (printf "%s-%s" (include "meridian-runtime.fullname" .top) .component) -}}
+{{- $running := 1 -}}
+{{- $streaming := false -}}
+{{- $leased := false -}}
+{{- range (dig "spec" "template" "spec" "containers" (list) (default (dict) $live)) -}}
+{{- range (.env | default list) -}}
+{{- if eq .name "MERIDIAN_WRITER_GROUPS" -}}{{- $running = int .value -}}{{- end -}}
+{{- if eq .name "MERIDIAN_LAKE_WRITE_AHEAD" -}}{{- $streaming = true -}}{{- end -}}
+{{- if eq .name "MERIDIAN_LEASE_NAME" -}}{{- $leased = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $groups $running -}}
+{{- if eq .component "lake" -}}
+{{- if or $ha $streamed $streaming -}}
+{{- fail (printf "lake.writerGroups is %d, but this deployment's lake runs %d writer groups. In the ha profile, this release can raise the lake's writer groups but can't lower them yet: a group taken away could leave writes it had acknowledged unrecorded. Keep lake.writerGroups at %d or more. Nothing was changed." $groups $running $running) -}}
+{{- end -}}
+{{- else if or $ha $leased -}}
+{{- fail (printf "bor.writerGroups is %d, but this deployment's book runs %d writer groups. In the ha profile, this release can raise the book's writer groups but can't lower them yet. Keep bor.writerGroups at %d or more. Nothing was changed." $groups $running $running) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Each writer group past the first of a store (step 3d): group 0's writer
+Deployment as `rendered`, made again as `<release>-<store>-group-<g>` --
+its name, its component label (so its writer and its standby repel each
+other alone), its group in MERIDIAN_WRITER_GROUP and its own Lease -- and
+its PodDisruptionBudget. Nothing with one group. Takes a dict: top,
+component, values, rendered.
+*/}}
+{{- define "meridian-runtime.writerGroupDeployments" -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
+{{- if and (gt $groups 1) (gt (int $count) 0) }}
+{{- range $group := untilStep 1 $groups 1 }}
+{{- $component := printf "%s-group-%d" $.component $group -}}
+{{- $out := $.rendered -}}
+{{- $out = regexReplaceAll "(?m)^  name: (\\S+)$" $out (printf "  name: ${1}-group-%d" $group) -}}
+{{- $out = regexReplaceAll (printf "(?m)^(\\s+)meridian.dev/component: %s$" $.component) $out (printf "${1}meridian.dev/component: %s" $component) -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+- name: MERIDIAN_WRITER_GROUP\\n\\s+value: )\"0\"$" $out (printf "${1}\"%d\"" $group) -}}
+{{- $out = regexReplaceAll "(?m)^(\\s+- name: MERIDIAN_LEASE_NAME\\n\\s+value: )\"(\\S+)\"$" $out (printf "${1}\"${2}-group-%d\"" $group) }}
+---
+{{ $out }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $.top "component" $component "values" $.values) }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 "true" when a component runs a standby, so its members take a lease
 (coordination.k8s.io/v1, in the release's namespace) to say which writes.
 Takes a dict: component, values.
@@ -319,6 +510,28 @@ under (`<component>.readyLagMs`). Takes a dict: top, component, values.
        never. */}}
 - name: MERIDIAN_SCRUB_INTERVAL_DAYS
   value: {{ dig "scrub" "intervalDays" 7 .values | toString | quote }}
+{{- /* Its writer group and the store's count (step 3d; approved
+       2026-11-12): said only with several groups, group 0's here, each
+       other's where writerGroupDeployments makes it. */}}
+{{- if has .component (list "lake" "bor") }}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) }}
+{{- if gt $groups 1 }}
+- name: MERIDIAN_WRITER_GROUP
+  value: "0"
+- name: MERIDIAN_WRITER_GROUPS
+  value: {{ $groups | quote }}
+{{- end }}
+{{- end }}
+{{- /* The book's count of writer groups, to the lake (step 3d, checkpoint 5,
+       item 32): its control writer asks each to raise a plugin shard's epoch
+       before it answers a take. Said only with several. */}}
+{{- if eq .component "lake" }}
+{{- $bookGroups := int (include "meridian-runtime.writerGroups" (dict "top" .top "component" "bor" "values" .top.Values.bor)) }}
+{{- if gt $bookGroups 1 }}
+- name: MERIDIAN_BOR_WRITER_GROUPS
+  value: {{ $bookGroups | quote }}
+{{- end }}
+{{- end }}
 {{- if include "meridian-runtime.leased" . }}
 - name: MERIDIAN_LEASE_NAME
   value: {{ printf "%s-%s" (include "meridian-runtime.fullname" .top) .component | quote }}
@@ -392,6 +605,7 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- if .top.Values.zones }}
   - maxSkew: 1
     topologyKey: topology.kubernetes.io/zone
@@ -400,8 +614,28 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- end }}
 {{- end }}
+{{- end -}}
+
+{{/*
+A required spread counts its own revision's pods alone (found by CI run
+44343480916, where the book's writer and standby ran on one node and one
+zone). A spread is judged only as a pod is scheduled, over every pod its
+selector matches, the revision being rolled away included. A rollout's
+last new pod, scheduled while the old pod it replaces still counted, found
+one pod on every node -- the old revision's two and the new revision's
+first -- so any node passed, the new first's own among them; the old pods
+then stopped and left the set's two members together. Kubernetes' answer is
+`matchLabelKeys` on the Deployment's `pod-template-hash`: the spread then
+holds among the pods of one revision, which are the pods left when its
+rollout ends. A StatefulSet's pods carry no such label and the key is
+ignored for them; they are replaced in place, never beside the old.
+*/}}
+{{- define "meridian-runtime.spreadPerRevision" -}}
+matchLabelKeys:
+  - pod-template-hash
 {{- end -}}
 
 {{/*
@@ -500,6 +734,7 @@ topologySpreadConstraints:
       matchLabels:
         app.kubernetes.io/instance: {{ .top.Release.Name }}
         meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.spreadPerRevision" . | nindent 4 }}
   {{- end }}
 {{- end -}}
 
@@ -762,6 +997,120 @@ spec:
 {{- end -}}
 
 {{/*
+  The storage an instance of several pods shares (step 3d, checkpoint 5,
+  item 30): `<fullname>-shared-storage-<instance>`, a folder per shard,
+  mounted by every pod of the instance. ReadWriteMany in
+  pluginStorage.shared.storageClassName where one is named; with none, the
+  conductor admits such an instance on one node alone, where a
+  ReadWriteOnce claim in pluginStorage.storageClassName reaches every pod.
+  Takes a dict: top, instance, plugin (the launcher's placeholders).
+*/}}
+{{- define "meridian-runtime.sharedStorage" -}}
+{{- $top := .top -}}
+{{- $shared := $top.Values.pluginStorage.shared | default dict -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "meridian-runtime.fullname" $top }}-shared-storage-{{ .instance }}
+  labels:
+    meridian.dev/component: plugin-storage
+    meridian.dev/instance: {{ .instance | quote }}
+    meridian.dev/launched: "true"
+    meridian.dev/plugin: {{ .plugin | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+spec:
+  {{- with $shared.storageClassName }}
+  accessModes: [ReadWriteMany]
+  storageClassName: {{ . | quote }}
+  {{- else }}
+  accessModes: [ReadWriteOnce]
+  {{- with $top.Values.pluginStorage.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $shared.size | default "10Gi" | quote }}
+{{- end -}}
+
+{{/*
+  The pod the launcher copies an instance's own storage claim into its
+  shared storage's `shard-0/` with, once, before its first launch as
+  several pods (step 3d, checkpoint 5, item 30): the instance's own plugin
+  image, which the launcher fills in, running the SDK's `meridian-storage
+  copy` as the plugin's own user (PO items 86 and 88), the instance's own
+  claim read only and its shared claim, and nothing else -- no account's
+  token, no secret. It
+  writes a marker once the copy is whole, which the instance's pods wait
+  for before their plugin starts. The launcher's admission policy holds
+  what it makes to exactly this shape. Takes the chart.
+*/}}
+{{- define "meridian-runtime.storageCopy" -}}
+{{- $full := include "meridian-runtime.fullname" . -}}
+{{- /* As the plugin's own user (item 86): its image's, or the one the
+       cluster assigns, as for its pods -- no uid pinned, which OpenShift
+       refuses -- so the copy reads the SDK's 0600 files as their owner and
+       what it writes stays theirs to write on. */ -}}
+{{- $podSecurity := merge (deepCopy (.Values.podSecurityContext | default dict)) (dict "seccompProfile" (dict "type" "RuntimeDefault")) -}}
+{{- if .Values.pluginStorage.fsGroup -}}
+{{- $podSecurity = merge (deepCopy $podSecurity) (dict "fsGroup" .Values.pluginStorage.fsGroup "fsGroupChangePolicy" "OnRootMismatch") -}}
+{{- end -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $full }}-storage-copy-__INSTANCE__
+  labels:
+    meridian.dev/component: storage-copy
+    meridian.dev/instance: "__INSTANCE__"
+    meridian.dev/launched: "true"
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  {{- /* A copy that fails ends Failed, which the launcher makes again at
+         the instance's next launch (review c5c M1); restarted in place it
+         would stay Running, failing, for ever. */}}
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with $podSecurity }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: copy
+      image: "__IMAGE__"
+      imagePullPolicy: IfNotPresent
+      command: ["meridian-storage", "copy", "{{ $full }}-storage-__INSTANCE__"]
+      {{- /* Never root (review c5c86 M1, L2): the plugin image's own
+             numeric user, or the cluster's, and no uid named, so restricted
+             Pod Security and OpenShift's restricted-v2 both admit it. */}}
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: from
+          mountPath: /var/lib/meridian/copy/from
+          readOnly: true
+        - name: to
+          mountPath: /var/lib/meridian/copy/to
+      resources:
+        {{- toYaml .Values.resources | nindent 8 }}
+  volumes:
+    - name: from
+      persistentVolumeClaim:
+        claimName: {{ $full }}-storage-__INSTANCE__
+        readOnly: true
+    - name: to
+      persistentVolumeClaim:
+        claimName: {{ $full }}-shared-storage-__INSTANCE__
+{{- end -}}
+
+{{/*
   Whether a backup dumps the database (backup.database; task
   kernel/a-deployment-is-backed-up-and-restored, approved 2026-10-11): `auto`
   when empty, which the backup's script reads as the database this chart
@@ -780,7 +1129,9 @@ The connections the deployment's own pods and jobs hold on the brought
 database at most, counted from what this chart deploys (ruled 2026-11-08):
 each store member -- the instrument store, the conductor's configuration
 store, the street store, the book and the lake, writer and standby, and
-during a rollout the one more a standby's surge starts -- holds its pool of
+during a rollout the one more a standby's surge starts, the lake's and the
+book's for each of the most writer groups the store allows
+(<store>.maxWriterGroups, not <store>.writerGroups) -- holds its pool of
 8 and 2 beside it (its change log's tail, a scrub or a probe); each
 dashboard copy its pool of 4 and 1 beside it; and the jobs that may run at
 once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
@@ -799,6 +1150,12 @@ stage E; ruled 2026-11-08). Kept in step with the pools the binaries open
 {{- $members := int (include "meridian-runtime.memberCount" (dict "top" $ "component" $component "values" $values)) -}}
 {{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
 {{- $members = add1 $members -}}
+{{- end -}}
+{{- /* Each writer group's members (step 3d), counted at the most groups
+       the store allows (PO items 104 and 106), so a count changed within
+       it never changes max_connections and never restarts the database. */ -}}
+{{- if has $component (list "lake" "bor") -}}
+{{- $members = mul $members (int (include "meridian-runtime.maxWriterGroups" (dict "top" $ "component" $component "values" $values))) -}}
 {{- end -}}
 {{- $each := 10 -}}
 {{- if and $writeAhead (eq $component "lake") }}{{ $each = 12 }}{{ end -}}
@@ -1048,7 +1405,12 @@ tls-server-address=0.0.0.0
 tls-server-ca-file=/run/archive/tls/ca.crt
 tls-server-cert-file=/run/archive/tls/tls.crt
 tls-server-key-file=/run/archive/tls/tls.key
-tls-server-auth=meridian-backup=meridian
+{{- /* Each database past the first a store's writer groups write to has a
+       stanza of its own, by its name (step 3d; section 6.4). */}}
+{{- $extras := include "meridian-runtime.extraDatabases" $top | fromJsonArray }}
+{{- $stanzas := list "meridian" }}
+{{- range $extras }}{{ $stanzas = append $stanzas (printf "%s-database-%d" .component (int .d)) }}{{ end }}
+tls-server-auth=meridian-backup={{ join "," $stanzas }}
 {{- end }}
 
 [meridian]
@@ -1060,6 +1422,20 @@ pg1-host-type=tls
 pg1-host-ca-file=/run/archive/tls/ca.crt
 pg1-host-cert-file=/run/archive/tls/client.crt
 pg1-host-key-file=/run/archive/tls/client.key
+{{- end }}
+{{- range $extra := include "meridian-runtime.extraDatabases" $top | fromJsonArray }}
+{{- $stanza := printf "%s-database-%d" $extra.component (int $extra.d) }}
+
+[{{ $stanza }}]
+pg1-path=/var/lib/postgresql/data/pgdata
+pg1-socket-path=/var/run/postgresql
+{{- if eq $.role "backup" }}
+pg1-host={{ $extra.name }}
+pg1-host-type=tls
+pg1-host-ca-file=/run/archive/tls-{{ $stanza }}/ca.crt
+pg1-host-cert-file=/run/archive/tls-{{ $stanza }}/client.crt
+pg1-host-key-file=/run/archive/tls-{{ $stanza }}/client.key
+{{- end }}
 {{- end }}
 {{- end -}}
 
@@ -1369,7 +1745,7 @@ A plugin's share at its sidecar (stage M; section 10a): the chart's
 {{- define "meridian-runtime.sidecarLimitsEnv" -}}
 {{- $chart := .top.Values.sidecar.limits | default dict -}}
 {{- $own := .limits | default dict -}}
-{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" }}
+{{- range $name, $env := dict "inFlight" "MERIDIAN_SIDECAR_IN_FLIGHT" "requestsPerSecond" "MERIDIAN_SIDECAR_REQUESTS_PER_SECOND" "answerMiB" "MERIDIAN_SIDECAR_ANSWER_MIB" "writeMiBPerSecond" "MERIDIAN_SIDECAR_WRITE_MIB_PER_SECOND" }}
 {{- range $said := list (dict "where" "sidecar.limits" "from" $chart) (dict "where" "a plugin's limits" "from" $own) }}
 {{- if hasKey $said.from $name }}
 {{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $said.from $name))) }}
@@ -1454,15 +1830,131 @@ Takes the chart.
 {{- if ne $component "launcher" -}}
 {{- $_ := set $one "scrub" (dict "intervalDays" (float64 (dig "scrub" "intervalDays" 7 $values))) -}}
 {{- end -}}
+{{- if has $component (list "lake" "bor") -}}
+{{- $_ := set $one "writerGroups" (int (include "meridian-runtime.writerGroups" (dict "top" $ "component" $component "values" $values))) -}}
+{{- $_ := set $one "databases" (int (include "meridian-runtime.storeDatabases" (dict "top" $ "component" $component "values" $values))) -}}
+{{- end -}}
+{{- if eq $component "bor" -}}
+{{- $_ := set $one "partitions" (int (include "meridian-runtime.borPartitions" $)) -}}
+{{- end -}}
 {{- $_ := set $said $component $one -}}
 {{- end -}}
 {{- $brought := .Values.database.brought.enabled | default false -}}
 {{- $_ := set $said "database" (dict "brought" (dict "enabled" $brought "standbys" (int (include "meridian-runtime.databaseStandbys" .)) "readReplicas" (int (include "meridian-runtime.databaseReadReplicas" .)))) -}}
 {{- $_ := set $said "broker" (dict "replicas" (int (include "meridian-runtime.brokerReplicas" .)) "jetstream" (dict "replicas" (int (include "meridian-runtime.jetstreamReplicas" .)))) -}}
 {{- $_ := set $said "zones" (.Values.zones | default list) -}}
+{{- /* Whether edge plugins keep storage, and the ReadWriteMany class an
+       instance of several pods shares it on (step 3d, checkpoint 5, item
+       30): the conductor refuses such a launch on several nodes where none
+       is named, before the record. A class's name, never an address. */ -}}
+{{- $ps := .Values.pluginStorage | default dict -}}
+{{- $_ := set $said "pluginStorage" (dict "enabled" ($ps.enabled | default false) "shared" (dict "storageClassName" (dig "shared" "storageClassName" "" $ps))) -}}
 {{- $b := .Values.backup | default dict -}}
 {{- $_ := set $said "backup" (dict "schedule" ($b.schedule | default "") "walArchive" (dict "enabled" (dig "walArchive" "enabled" false $b))) -}}
 {{- $_ := set $said "analytics" (dict "coordinator" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "coordinator" "replicaCount" nil .Values.analytics) "what" "analytics.coordinator.replicaCount")))) "worker" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" (dig "worker" "replicaCount" nil .Values.analytics) "what" "analytics.worker.replicaCount"))))) -}}
 {{- $_ := set $said "dashboard" (dict "replicaCount" (int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount")))) -}}
 {{- $said | toJson -}}
+{{- end -}}
+
+{{/*
+A store's databases (step 3d; the resilience spec's section 6.4;
+`lake.databases`, `bor.databases`, approved 2026-11-12): 1, the default, to
+its writer groups' count -- writer group g writes to database g mod the
+count, so one past the groups would hold nothing. With the database this
+chart brings, the chart brings each past the first; with one somebody else
+runs, `<store>.database.groupSecrets` names one Secret for each. Takes a
+dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.storeDatabases" -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "databases" -}}{{- $count = index .values "databases" -}}{{- end -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString $count)) -}}
+{{- fail (printf "%s.databases is %v; a whole number of databases from 1, writer group g writing to database g mod the count (1, the default, for one database)" .component $count) -}}
+{{- end -}}
+{{- $groups := int (include "meridian-runtime.writerGroups" .) -}}
+{{- if gt (int $count) $groups -}}
+{{- fail (printf "%s.databases is %v and %s.writerGroups %d; at most one database for each writer group" .component $count .component $groups) -}}
+{{- end -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $own := dig "database" "existingSecret" "" .values -}}
+{{- if and (gt (int $count) 1) (or (not .top.Values.database.brought.enabled) $own) (ne (len $secrets) (sub (int $count) 1)) -}}
+{{- fail (printf "%s.databases is %v on a database somebody else runs; %s.database.groupSecrets names one Secret for each database past the first, %d, and names %d" .component $count .component (sub (int $count) 1) (len $secrets)) -}}
+{{- end -}}
+{{- if and .top.Values.database.brought.enabled (not $own) (gt (len $secrets) 0) (ne (len $secrets) (sub (int $count) 1)) -}}
+{{- fail (printf "%s.database.groupSecrets names %d Secrets for %v databases; one for each past the first, or none for the databases this chart brings" .component (len $secrets) $count) -}}
+{{- end -}}
+{{- int $count -}}
+{{- end -}}
+
+{{/*
+Whether a store's databases past the first are the ones this chart brings
+(step 3d): the database is brought, and the store names no database of its
+own nor any group Secrets.
+*/}}
+{{- define "meridian-runtime.storeBringsDatabases" -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $own := dig "database" "existingSecret" "" .values -}}
+{{- if and .top.Values.database.brought.enabled (not $own) (eq (len $secrets) 0) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Each database past the first the chart brings, every store's (step 3d;
+section 6.4): a JSON list of {component, d, name}, the name
+`<release>-<store>-database-<d>` (approved 2026-11-12).
+*/}}
+{{- define "meridian-runtime.extraDatabases" -}}
+{{- $out := list -}}
+{{- $full := include "meridian-runtime.fullname" . -}}
+{{- range $component := list "lake" "bor" -}}
+{{- $values := index $.Values $component -}}
+{{- $context := dict "top" $ "component" $component "values" $values -}}
+{{- $count := int (include "meridian-runtime.storeDatabases" $context) -}}
+{{- if and (gt $count 1) (include "meridian-runtime.storeBringsDatabases" $context) -}}
+{{- range $d := untilStep 1 $count 1 -}}
+{{- $out = append $out (dict "component" $component "d" $d "name" (printf "%s-%s-database-%d" $full $component $d)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/*
+A store member's databases past the first (step 3d; section 6.4; the
+variables approved 2026-11-14): MERIDIAN_<STORE>_DATABASES, and each
+database d's URL as MERIDIAN_<STORE>_DATABASE_URL_<d> -- from the Secret
+the chart brings with it, or the group Secret named -- and, where the chart
+brings it read replicas, its replica's as MERIDIAN_<STORE>_READ_DATABASE_URL_<d>.
+Nothing with one database. Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.databasesEnv" -}}
+{{- $count := int (include "meridian-runtime.storeDatabases" .) -}}
+{{- if gt $count 1 -}}
+{{- $full := include "meridian-runtime.fullname" .top -}}
+{{- $store := upper .component -}}
+{{- $brings := include "meridian-runtime.storeBringsDatabases" . -}}
+{{- $secrets := dig "database" "groupSecrets" (list) .values -}}
+{{- $key := dig "database" "key" "" .values | default .top.Values.database.key -}}
+{{- $replicas := int (include "meridian-runtime.databaseReadReplicas" .top) }}
+- name: MERIDIAN_{{ $store }}_DATABASES
+  value: {{ $count | quote }}
+{{- range $d := untilStep 1 $count 1 }}
+- name: MERIDIAN_{{ $store }}_DATABASE_URL_{{ $d }}
+  valueFrom:
+    secretKeyRef:
+      {{- if $brings }}
+      name: {{ printf "%s-%s-database-%d" $full $.component $d }}
+      key: url
+      {{- else }}
+      name: {{ index $secrets (sub $d 1) | quote }}
+      key: {{ $key | quote }}
+      {{- end }}
+{{- if and $brings (gt $replicas 0) }}
+- name: MERIDIAN_{{ $store }}_READ_DATABASE_URL_{{ $d }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ printf "%s-%s-database-%d" $full $.component $d }}
+      key: read-url
+{{- end }}
+{{- end }}
+{{- end -}}
 {{- end -}}

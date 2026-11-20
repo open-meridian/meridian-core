@@ -35,6 +35,7 @@ pub mod report;
 pub mod roles;
 mod service;
 mod service_account;
+pub mod shards;
 pub mod share;
 mod streams;
 mod subscriptions;

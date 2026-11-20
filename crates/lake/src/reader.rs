@@ -193,11 +193,38 @@ fn written() -> StoreError {
 }
 
 impl Store for ReaderStore {
+    /// A reader takes no write, and keeps no part of one.
+    fn write_ahead_refused(&self, _: &str, _: u32, _: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// A reader takes no write, so it holds no view of who writes a range.
+    fn read_owners_again(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn record(&self, _: &str, _: Vec<Observation>, _: i64) -> Result<Recorded> {
         Err(written())
     }
 
-    fn serve_unkept(&self, _: &str, _: Vec<Observation>, _: &[String], _: i64) -> Result<Recorded> {
+    fn record_parts(
+        &self,
+        _: &str,
+        parts: Vec<Vec<Observation>>,
+        _: &[Option<crate::store::ShardStamp>],
+        _: i64,
+    ) -> Vec<Result<Recorded>> {
+        parts.iter().map(|_| Err(written())).collect()
+    }
+
+    fn serve_unkept(
+        &self,
+        _: &str,
+        _: Vec<Observation>,
+        _: &[String],
+        _: Option<&crate::store::ShardStamp>,
+        _: i64,
+    ) -> Result<Recorded> {
         Err(written())
     }
 
@@ -224,7 +251,7 @@ impl Store for ReaderStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         if latest_cut(as_of_ns) {

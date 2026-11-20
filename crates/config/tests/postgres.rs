@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use meridian_changes::scratch::Scratch;
 use meridian_config::store::{
     ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
 };
@@ -39,25 +40,18 @@ fn base_url() -> String {
     )
 }
 
-/// A migrated store in a schema of this test's own.
-fn store(tag: &str) -> PostgresStore {
-    store_at(tag).0
-}
-
-/// The same, and the URL that reaches its schema, to read its tables as a
-/// database dump would.
-fn store_at(tag: &str) -> (PostgresStore, String) {
+/// The URL that reaches a schema of this test's own, to read its tables as a
+/// database dump would, and a migrated store in it. The schema is dropped
+/// with the URL's last clone (PO 65), and answered first so a test's binding
+/// drops it after the store (review c5p L3).
+fn store_at(tag: &str) -> (Scratch, PostgresStore) {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let name = format!("config_{tag}_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let store = PostgresStore::connect(&url, 4).expect("connects");
     assert!(
         store.verify().is_err(),
@@ -70,7 +64,7 @@ fn store_at(tag: &str) -> (PostgresStore, String) {
         .migrate(&meridian_clock::SystemClock)
         .expect("migrating twice is a no-op");
     store.verify().expect("recognised after migrating");
-    (store, url)
+    (url, store)
 }
 
 fn user_group(id: &str, login: &str) -> UserGroup {
@@ -93,7 +87,7 @@ fn admin_permission(id: &str, group: &str) -> Permission {
 
 #[test]
 fn a_fresh_store_has_deployment_admin_and_nobody_holding_it() {
-    let store = store("fresh");
+    let (_schema, store) = store_at("fresh");
     let snapshot = store.snapshot().unwrap();
     let built_in = |id: &str| {
         snapshot
@@ -120,7 +114,7 @@ fn a_fresh_store_has_deployment_admin_and_nobody_holding_it() {
 
 #[test]
 fn what_is_written_is_what_a_snapshot_reads_back() {
-    let store = store("roundtrip");
+    let (_schema, store) = store_at("roundtrip");
     let account = AccountRecord {
         account_id: "ACC-1".into(),
         name: "Growth".into(),
@@ -222,7 +216,7 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
 #[test]
 fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
     // W6.4: a link naming a new account creates it and links it in one step.
-    let store = store("account_and_link");
+    let (_schema, store) = store_at("account_and_link");
     let account = AccountRecord {
         account_id: "ACC-NEW".into(),
         name: "Fidelity Brokerage".into(),
@@ -256,7 +250,7 @@ fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
 
 #[test]
 fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
-    let store = store("shape");
+    let (_schema, store) = store_at("shape");
     store.put_user_group(&user_group("UG-1", "ada")).unwrap();
     store
         .put_account_group(&AccountGroup {
@@ -280,7 +274,7 @@ fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
 
 #[test]
 fn the_latest_sign_in_stands_even_if_an_older_one_arrives_later() {
-    let store = store("signin");
+    let (_schema, store) = store_at("signin");
     let at = |when: i64, group: &str| SignInRecord {
         subject: "ada".into(),
         display_name: "Ada".into(),
@@ -297,7 +291,7 @@ fn the_latest_sign_in_stands_even_if_an_older_one_arrives_later() {
 #[test]
 fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
     // design/a-misspelt-administrators-group (ruled 2026-10-10; H1, 586).
-    let store = store("misspelt");
+    let (_schema, store) = store_at("misspelt");
     let mut wizard = user_group("UG-wizard", "");
     wizard.logins.clear();
     wizard.directory_groups = vec!["meridain-admins".into()];
@@ -333,7 +327,7 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
         "a named login holds it now"
     );
 
-    let fresh = store_at("presented").0;
+    let (_fresh_schema, fresh) = store_at("presented");
     assert!(fresh
         .install_first_admin(
             &wizard,
@@ -365,7 +359,8 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
 
 #[test]
 fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
-    let store = Arc::new(store("race"));
+    let (_schema, store) = store_at("race");
+    let store = Arc::new(store);
     let threads: Vec<_> = (0..2)
         .map(|n| {
             let store = Arc::clone(&store);
@@ -393,7 +388,8 @@ fn only_one_of_two_concurrent_redemptions_installs_an_admin() {
 
 #[test]
 fn two_concurrent_withdrawals_cannot_leave_no_admin() {
-    let store = Arc::new(store("lastadmin"));
+    let (_schema, store) = store_at("lastadmin");
+    let store = Arc::new(store);
     for n in 0..2 {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
         store.put_user_group(&group).unwrap();
@@ -478,7 +474,7 @@ fn launch(instance: &str) -> PluginLaunch {
 
 #[test]
 fn a_version_is_recorded_once_and_read_back_whole() {
-    let store = store("versions");
+    let (_schema, store) = store_at("versions");
     assert!(store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap());
@@ -496,7 +492,7 @@ fn a_version_is_recorded_once_and_read_back_whole() {
 fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
     // Contract v25 (W8.1): the texts in the same transaction as the version.
     use meridian_domain::v1::DocumentationText;
-    let store = store("documentation");
+    let (_schema, store) = store_at("documentation");
     let text = |section: &str, markdown: &str| DocumentationText {
         section: section.into(),
         markdown: markdown.into(),
@@ -541,7 +537,7 @@ fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
 #[test]
 fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
     // Contract v25 (W8.15): the retirement written once beside the version.
-    let store = store("retire");
+    let (_schema, store) = store_at("retire");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -591,7 +587,7 @@ fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
 #[test]
 fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
     // Contract v25 (W3.28).
-    let store = store("licensed");
+    let (_schema, store) = store_at("licensed");
     assert!(store.licensed_schemes().unwrap().is_empty());
     let author = meridian_config::Author {
         by: "local|ada".into(),
@@ -610,7 +606,7 @@ fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
 #[test]
 fn each_routing_change_is_its_own_row_read_back_in_order() {
     // Contract v26 (W12.6, migration 0023).
-    let store = store("routing");
+    let (_schema, store) = store_at("routing");
     assert!(store.model_routing_changes().unwrap().is_empty());
     let author = meridian_config::Author {
         by: "local|ada".into(),
@@ -633,7 +629,7 @@ fn each_routing_change_is_its_own_row_read_back_in_order() {
 
 #[test]
 fn one_live_launch_per_instance_and_it_ends_once() {
-    let store = store("launches");
+    let (_schema, store) = store_at("launches");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -712,7 +708,7 @@ fn one_live_launch_per_instance_and_it_ends_once() {
 /// never an invented delegation.
 #[test]
 fn a_launch_keeps_its_stamp_and_note_and_those_before_v17_a_gap_record() {
-    let (store, url) = store_at("launch_gaps");
+    let (url, store) = store_at("launch_gaps");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -786,7 +782,8 @@ fn a_launch_keeps_its_stamp_and_note_and_those_before_v17_a_gap_record() {
 
 #[test]
 fn two_launches_of_one_instance_at_once_admit_one() {
-    let store = Arc::new(store("race"));
+    let (_schema, store) = store_at("race");
+    let store = Arc::new(store);
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -806,7 +803,7 @@ fn two_launches_of_one_instance_at_once_admit_one() {
 
 #[test]
 fn a_live_launch_is_read_back_as_live() {
-    let store = store("live");
+    let (_schema, store) = store_at("live");
     assert!(store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap());
@@ -844,7 +841,7 @@ fn declaration(name: &str, kind: SettingType, secret: bool) -> SettingDeclaratio
 
 #[test]
 fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
-    let store = store("declared");
+    let (_schema, store) = store_at("declared");
     store
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "snaptrade-1".into(),
@@ -906,7 +903,7 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
 
 #[test]
 fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_value() {
-    let (store, url) = store_at("settings");
+    let (url, store) = store_at("settings");
     let key = SettingsKey::holding(&[7u8; 32]);
     let sealed = key.seal("snaptrade-1", "api_key", SECRET).unwrap();
     store
@@ -1099,7 +1096,7 @@ fn a_database_behind_this_binary_is_waited_for_and_one_ahead_is_refused() {
     // reached, and refuses one a newer release migrated: waiting never fixes
     // that, and this binary's queries may already be wrong against it. The
     // two have to be told apart by what the store returns, not by its words.
-    let (store, url) = store_at("ahead");
+    let (url, store) = store_at("ahead");
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     client
@@ -1147,11 +1144,7 @@ fn access_entries_naming_tags_become_one_per_plugin_at_the_highest_level() {
         .unwrap()
         .as_nanos();
     let name = format!("config_tagged_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     // The store as the release before this one left it: every migration up
@@ -1247,7 +1240,7 @@ fn an_accounts_custodian_type_owner_and_note_are_written_edited_and_cleared() {
     // W6.3: free text, optional, and set whole by each edit, so an empty one
     // clears it; an empty one is held as NULL, as every account's was before
     // the four existed.
-    let (store, url) = store_at("attributes");
+    let (url, store) = store_at("attributes");
     let described = AccountRecord {
         account_id: "ACC-1".into(),
         name: "Growth".into(),
@@ -1317,11 +1310,7 @@ fn an_account_from_before_its_attributes_reads_back_with_none() {
         .unwrap()
         .as_nanos();
     let name = format!("config_before_attributes_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .expect("could not create a schema");
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
 
     let before: Vec<_> = meridian_config::migrations::MIGRATIONS
@@ -1380,11 +1369,7 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
         .unwrap()
         .as_nanos();
     let name = format!("config_upgrade_{nanos}_{seq}");
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
 
     // The release before: migrations 1 to 8, and a deployment admin.
     let mut before = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -1486,11 +1471,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
     // two changes to poll_minutes and a secret set, recorded without values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_backfill_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -1622,7 +1603,7 @@ fn changes_from_before_each_was_its_own_record_are_backfilled_where_known_and_a_
 
 #[test]
 fn a_redeclared_settings_value_is_cleared_and_a_secrets_earlier_values_redacted() {
-    let (store, url) = store_at("redeclared");
+    let (url, store) = store_at("redeclared");
     store
         .record_plugin(&KnownPlugin {
             plugin_instance_id: "snaptrade-1".into(),
@@ -1785,11 +1766,7 @@ fn migration_12_redacts_what_a_secret_settings_records_hold() {
     // was ruled: its records, a backfilled one among them, hold its values.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_redact_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -1880,11 +1857,7 @@ fn upgrading_to_v15_rewrites_each_entry_to_name_its_plugins_one_role_and_records
     // sidecar has reported but a launch names.
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!("config_per_role_{seq}_{}", unique());
-    let mut admin = postgres::Client::connect(&base_url(), postgres::NoTls).unwrap();
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {name}"))
-        .unwrap();
-    let url = format!("{}?options=-c%20search_path%3D{name}", base_url());
+    let url = Scratch::schema(&base_url(), &name);
     let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     db.batch_execute(meridian_config::migrations::HISTORY)
         .unwrap();
@@ -2045,7 +2018,7 @@ fn holds_archives_and_moves_are_each_their_own_record_and_read_back() {
     use meridian_domain::v1::{Hold, MoveRecord, PluginArchive};
     use meridian_pb::v1::{MoveOutcome, RecordMoveRequest};
 
-    let (store, url) = store_at("archive");
+    let (url, store) = store_at("archive");
     let hold = |role: &str, days: u32, at: i64| Hold {
         prepared_call_id: Default::default(),
         role: role.into(),
@@ -2217,7 +2190,7 @@ fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
     use meridian_domain::v1::DatasetEntitlement;
     use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence};
 
-    let store = store("data");
+    let (_schema, store) = store_at("data");
     let catalogue = Catalogue {
         datasets: vec![DatasetDeclaration {
             key: "daily".into(),
@@ -2269,7 +2242,7 @@ fn a_catalogue_licences_and_entitlements_are_kept_each_change_its_own_record() {
 fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
     // Contract v22 (W11.20 to W11.22): the conductor's records.
     use meridian_pb::v1::{ConnectivityLink, VenueAccountMapping};
-    let store = store("connectivity");
+    let (_schema, store) = store_at("connectivity");
     store
         .put_account(&AccountRecord {
             account_id: "ACC-1".into(),
@@ -2355,7 +2328,7 @@ fn the_registries_state_is_kept_whole() {
     use meridian_domain::v1::{
         PluginListing, PluginPull, PluginUsageReport, PullAcknowledgement, SentPluginUsageReport,
     };
-    let store = store("registries");
+    let (_schema, store) = store_at("registries");
     assert_eq!(store.registry_catalogue().unwrap(), None);
     let held = HeldCatalogue {
         listings: vec![PluginListing {
@@ -2530,7 +2503,7 @@ fn the_registries_state_is_kept_whole() {
 /// read of the catalogue starts from -- takes.
 fn catalogue_in_the_store(tag: &str) -> (f64, f64, std::time::Duration) {
     use meridian_domain::v1::{PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion};
-    let store = store(tag);
+    let (_schema, store) = store_at(tag);
     let started = std::time::Instant::now();
     for n in 0..100 {
         for v in 0..20 {
@@ -2614,7 +2587,7 @@ fn capacity_store_at_two_thousand_versions() {
 
 #[test]
 fn a_follower_that_reloaded_and_is_given_the_log_in_any_page_split_builds_the_stores_tables() {
-    let (store, url) = store_at("log");
+    let (url, store) = store_at("log");
     let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let reloaded = meridian_config::postgres::CHANGES
         .snapshot(&mut client)
@@ -2656,7 +2629,7 @@ fn a_follower_that_reloaded_and_is_given_the_log_in_any_page_split_builds_the_st
 
 #[test]
 fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence() {
-    let (writer, url) = store_at("fence");
+    let (url, writer) = store_at("fence");
     assert_eq!(writer.adopt().unwrap(), 1);
     let account = |id: &str| AccountRecord {
         account_id: id.into(),
@@ -2708,32 +2681,42 @@ fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence
 
 #[test]
 fn an_administrative_acts_record_is_kept_as_written() {
-    // Audit logging (ruling 1084; step 3b part 4): every change table, and
-    // the moves, refuses a change or a removal of a row, whoever asks; the
-    // store only ever adds to them.
-    let (_store, url) = store_at("append_only");
+    // Audit logging (ruling 1084; step 3b part 4): every change table, the
+    // moves, and the storage copies (item 30, migration 33) refuse a change
+    // or a removal of a row, whoever asks; the store only ever adds to them.
+    let (url, _store) = store_at("append_only");
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
-    let guarded: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-              WHERE t.tgname = 'config_append_only'
-                AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    let tables: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_tables WHERE schemaname = current_schema()
-                AND (tablename LIKE 'config\\_%\\_change' OR tablename = 'config_record_move')",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert!(tables >= 15, "the change tables are there: {tables}");
+    // The tables kept as written, and the tables guarded, are the same
+    // tables: none listed is unguarded, and none guarded is unlisted
+    // (review-c5c-ci1 L3: two counts matched where one table of each would
+    // have).
+    let mut tables = |sql: &str| -> Vec<String> {
+        client
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    let kept_as_written = tables(
+        "SELECT tablename::text FROM pg_tables WHERE schemaname = current_schema()
+            AND (tablename LIKE 'config\\_%\\_change'
+                 OR tablename IN ('config_record_move', 'config_plugin_storage_copied'))
+          ORDER BY 1",
+    );
+    let guarded = tables(
+        "SELECT c.relname::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+          WHERE t.tgname = 'config_append_only'
+            AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+          ORDER BY 1",
+    );
+    assert!(
+        kept_as_written.len() >= 15,
+        "the change tables are there: {kept_as_written:?}"
+    );
     assert_eq!(
-        guarded, tables,
-        "every change table and the moves are append-only"
+        guarded, kept_as_written,
+        "every change table, the moves and the storage copies are append-only"
     );
 
     client
@@ -2743,9 +2726,19 @@ fn an_administrative_acts_record_is_kept_as_written() {
             &[],
         )
         .expect("a record is added");
+    client
+        .execute(
+            "INSERT INTO config_plugin_storage_copied
+                    (instance_id, launched_at_ns, from_claim, to_claim, at_ns, launched_by)
+             VALUES ('PLG-1', 1, 'claim-a', 'claim-b', 2, 'local|alice')",
+            &[],
+        )
+        .expect("a storage copy is recorded");
     for refused in [
         "UPDATE config_hold_change SET days = 1",
         "DELETE FROM config_hold_change",
+        "UPDATE config_plugin_storage_copied SET to_claim = 'claim-c'",
+        "DELETE FROM config_plugin_storage_copied",
     ] {
         let failed = client.execute(refused, &[]).expect_err(refused);
         assert_eq!(
@@ -2767,7 +2760,7 @@ fn an_administrative_acts_record_is_kept_as_written() {
 /// 300 times: one launch in the snapshot, all 300 in its history.
 #[test]
 fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_own() {
-    let store = store("latest_launch");
+    let (_schema, store) = store_at("latest_launch");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -2806,7 +2799,7 @@ fn a_snapshot_holds_each_instances_latest_launch_and_the_history_is_read_on_its_
 /// that asked none reads none.
 #[test]
 fn a_launchs_own_limits_are_kept_on_its_record() {
-    let store = store("launch_limits");
+    let (_schema, store) = store_at("launch_limits");
     store
         .record_plugin_version(&version("snaptrade", "0.1.0"))
         .unwrap();
@@ -2844,4 +2837,264 @@ fn a_launchs_own_limits_are_kept_on_its_record() {
     };
     assert_eq!(pods("snaptrade-1"), (2, true));
     assert_eq!(pods("snaptrade-2"), (0, false));
+}
+
+/// Item 30 (approved 2026-11-17, item 68): the launcher's copy of an
+/// instance's own claim into its shared storage is recorded once a pod of
+/// it is heard registered after the launcher answered -- its pods start
+/// only once the copy is whole -- as `PluginStorageCopied`, on the launch
+/// that copied, once per launch that copied: an earlier pod's report
+/// records nothing, a later report nothing again, nor a later launch the
+/// launcher said copied none, having found it copied. A second copy, into a
+/// shared claim made again, is recorded on its own launch; and a copy whose
+/// launch stopped before a pod was heard is recorded on that launch, by
+/// its launcher, once a later launch's pod is heard (review c5c L6).
+fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+    store: &dyn Store,
+) {
+    use meridian_domain::v1::PluginStorageCopied;
+    let mut launch = launch("feed-1");
+    launch.launched_by = "local|ada".into();
+    launch.launched_at_ns = 10;
+    assert!(store.begin_launch(&launch, "").unwrap());
+    assert_eq!(
+        store.record_storage_copied("feed-1", 100, 100).unwrap(),
+        None
+    );
+    store
+        .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 50)
+        .unwrap();
+    assert_eq!(
+        store.record_storage_copied("feed-1", 50, 60).unwrap(),
+        None,
+        "a report from before the launcher answered is an earlier pod's"
+    );
+    let copied = PluginStorageCopied {
+        instance_id: "feed-1".into(),
+        from_claim: "check-meridian-runtime-storage-feed-1".into(),
+        to_claim: "check-meridian-runtime-shared-storage-feed-1".into(),
+        at_ns: 70,
+        launched_by: "local|ada".into(),
+    };
+    assert_eq!(
+        store.record_storage_copied("feed-1", 51, 70).unwrap(),
+        Some(copied.clone())
+    );
+    assert_eq!(
+        store.record_storage_copied("feed-1", 80, 90).unwrap(),
+        None,
+        "once"
+    );
+    let on = |store: &dyn Store, at: i64| {
+        store
+            .launches()
+            .unwrap()
+            .into_iter()
+            .find(|held| held.instance_id == "feed-1" && held.launched_at_ns == at)
+            .unwrap()
+            .storage_copied
+    };
+    assert_eq!(on(store, 10), Some(copied.clone()));
+    // Stopped and launched again, the copy pod found done: the launcher
+    // says none, and nothing more is recorded.
+    let stop = Ending {
+        prepared_call_id: Default::default(),
+        state: PluginLaunchState::Stopped,
+        by: "local|ada".into(),
+        delegation: String::new(),
+        client: String::new(),
+        note: String::new(),
+        at_ns: 150,
+        failure: String::new(),
+    };
+    store.end_launch("feed-1", &stop).unwrap().unwrap();
+    launch.launched_at_ns = 200;
+    assert!(store.begin_launch(&launch, "").unwrap());
+    assert_eq!(
+        store.record_storage_copied("feed-1", 220, 230).unwrap(),
+        None
+    );
+    assert_eq!(on(store, 200), None);
+    assert_eq!(on(store, 10), Some(copied.clone()));
+    // Its shared claim made again, the copy made again: recorded on its
+    // own launch.
+    let stopped_at = |at_ns: i64| Ending {
+        at_ns,
+        ..stop.clone()
+    };
+    store
+        .end_launch("feed-1", &stopped_at(250))
+        .unwrap()
+        .unwrap();
+    launch.launched_at_ns = 300;
+    launch.launched_by = "local|bo".into();
+    assert!(store.begin_launch(&launch, "").unwrap());
+    store
+        .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 310)
+        .unwrap();
+    let again = PluginStorageCopied {
+        at_ns: 330,
+        launched_by: "local|bo".into(),
+        ..copied.clone()
+    };
+    assert_eq!(
+        store.record_storage_copied("feed-1", 320, 330).unwrap(),
+        Some(again.clone())
+    );
+    assert_eq!(on(store, 300), Some(again));
+    assert_eq!(on(store, 10), Some(copied));
+    // A launch that copied, stopped before a pod of it was heard; the next
+    // finds it copied: recorded on the launch that copied, by its launcher,
+    // once the next one's pod is heard.
+    launch.instance_id = "feed-2".into();
+    launch.launched_at_ns = 10;
+    launch.launched_by = "local|ada".into();
+    assert!(store.begin_launch(&launch, "").unwrap());
+    store
+        .pend_storage_copy("feed-2", "check-meridian-runtime-storage-feed-2", 50)
+        .unwrap();
+    store
+        .end_launch("feed-2", &stopped_at(60))
+        .unwrap()
+        .unwrap();
+    launch.launched_at_ns = 100;
+    launch.launched_by = "local|bo".into();
+    // As several pods: on the shared storage, so its pod is heard only once
+    // the marker is there.
+    launch.shards = 2;
+    assert!(store.begin_launch(&launch, "").unwrap());
+    let theirs = store.record_storage_copied("feed-2", 120, 130).unwrap();
+    assert_eq!(
+        theirs.as_ref().map(|c| (c.launched_by.as_str(), c.at_ns)),
+        Some(("local|ada", 130))
+    );
+    let on_2 = |at: i64| {
+        store
+            .launches()
+            .unwrap()
+            .into_iter()
+            .find(|held| held.instance_id == "feed-2" && held.launched_at_ns == at)
+            .unwrap()
+            .storage_copied
+    };
+    assert_eq!(on_2(10), theirs);
+    assert_eq!(on_2(100), None);
+    // A launch that copied, whose copy never wrote the marker, stopped; the
+    // next as one pod, on its own claim: its pod heard says nothing of the
+    // copy, so none is recorded (item 89, review c5c86 L3).
+    launch.instance_id = "feed-3".into();
+    launch.launched_at_ns = 10;
+    assert!(store.begin_launch(&launch, "").unwrap());
+    store
+        .pend_storage_copy("feed-3", "check-meridian-runtime-storage-feed-3", 50)
+        .unwrap();
+    store
+        .end_launch("feed-3", &stopped_at(60))
+        .unwrap()
+        .unwrap();
+    launch.launched_at_ns = 100;
+    launch.shards = 0;
+    assert!(store.begin_launch(&launch, "").unwrap());
+    assert_eq!(
+        store.record_storage_copied("feed-3", 120, 130).unwrap(),
+        None,
+        "a later launch of one pod"
+    );
+}
+
+/// Review c5c89 M4 and PO item 91 (2026-11-17): only a later launch that
+/// ran on the instance's own claim keeps an earlier launch's copy
+/// unrecorded. One that failed ran nothing, and one that ran as one shard on
+/// the shared storage (`ran_shared`) waited for the copy: the copy is
+/// recorded once a pod is heard, and once only.
+fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(store: &dyn Store) {
+    let ended = |at_ns: i64, state: PluginLaunchState| Ending {
+        prepared_call_id: Default::default(),
+        state,
+        by: "local|ada".into(),
+        delegation: String::new(),
+        client: String::new(),
+        note: String::new(),
+        at_ns,
+        failure: if state == PluginLaunchState::Failed {
+            "refused".into()
+        } else {
+            String::new()
+        },
+    };
+    let copied_by = |instance: &str, later: &dyn Fn(&dyn Store)| {
+        let mut first = launch(instance);
+        first.launched_by = "local|ada".into();
+        first.launched_at_ns = 10;
+        first.shards = 2;
+        assert!(store.begin_launch(&first, "").unwrap());
+        store
+            .pend_storage_copy(
+                instance,
+                &format!("check-meridian-runtime-storage-{instance}"),
+                50,
+            )
+            .unwrap();
+        store
+            .end_launch(instance, &ended(60, PluginLaunchState::Stopped))
+            .unwrap()
+            .unwrap();
+        let mut next = launch(instance);
+        next.launched_by = "local|bo".into();
+        next.launched_at_ns = 100;
+        next.shards = 0;
+        assert!(store.begin_launch(&next, "").unwrap());
+        later(store);
+        store
+            .record_storage_copied(instance, 120, 130)
+            .unwrap()
+            .map(|copied| (copied.launched_by, copied.at_ns))
+    };
+    // A later launch of one pod that failed.
+    assert_eq!(
+        copied_by("feed-4", &|store| {
+            store
+                .end_launch("feed-4", &ended(110, PluginLaunchState::Failed))
+                .unwrap()
+                .unwrap();
+        }),
+        Some(("local|ada".to_string(), 130)),
+        "a failed later launch ran nothing"
+    );
+    // A later launch of one pod, run as one shard on the shared storage.
+    assert_eq!(
+        copied_by("feed-5", &|store| store.keep_ran_shared("feed-5").unwrap()),
+        Some(("local|ada".to_string(), 130)),
+        "a later launch on the shared storage"
+    );
+    assert_eq!(
+        store.record_storage_copied("feed-5", 140, 150).unwrap(),
+        None,
+        "once"
+    );
+    // A later launch of one pod on its own claim: nothing.
+    assert_eq!(copied_by("feed-6", &|_| {}), None, "on its own claim");
+}
+
+/// A store whose launches' version is there: Postgres holds every launch to
+/// a version recorded first. Its schema answered first, dropped after the
+/// store (PO 65).
+fn store_with_version(tag: &str) -> (Scratch, PostgresStore) {
+    let (schema, store) = store_at(tag);
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    (schema, store)
+}
+
+#[test]
+fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
+    let (_schema, store) = store_with_version("storage_copied_91");
+    only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&store);
+}
+
+#[test]
+fn the_storage_copy_is_recorded_once_in_postgres() {
+    let (_schema, store) = store_with_version("storage_copied");
+    a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store);
 }

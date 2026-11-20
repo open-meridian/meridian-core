@@ -97,6 +97,26 @@ pub struct Body {
     /// Contract v28 (W9.16 to W9.18): each lifecycle event as it stands
     /// after the entry, whole.
     pub lifecycle_events: Vec<meridian_domain::v1::LifecycleEvent>,
+    /// A `~control` entry's record (step 3d; section 6.3, option (c)): its
+    /// kind -- `meridian.v1.WriterTookOver`, `meridian.v1.IntegrityFinding`,
+    /// `meridian.v1.PartitionOwner` -- and its protobuf, in the shape the
+    /// book's `AccountMoved` is kept in. None on every other entry.
+    pub record: Option<(String, Vec<u8>)>,
+    /// The lines the entry's partition's own clearing account,
+    /// `~clearing/<partition>`, takes against this entry's (step 3d; section
+    /// 6.3, ruled 2026-11-13): with more than one partition, a booking's leg
+    /// moving value to or from another account balances in its own entry, so
+    /// every partition balances at every sequence. Signed as the account's
+    /// lines are, no lot named. Empty with one partition, and on every entry
+    /// not a booking's leg.
+    pub clearing: Vec<MovementLine>,
+    /// A booking's pending marker (step 3d; section 6.3): on its
+    /// `booking-booked` (or a replace's) entry, each child it awaits in
+    /// another account -- the account, the allocation and the partition the
+    /// account was in when booked, empty where it was not placed yet. The
+    /// booking posts (`booking-posted`) once each is journalled. Empty with
+    /// one partition.
+    pub pending: Vec<(String, String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -139,6 +159,15 @@ struct Kept {
     states_waits: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lifecycle_events: Vec<String>,
+    /// A `~control` entry's record, its kind and its protobuf (step 3d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record: Option<(String, String)>,
+    /// A booking leg's clearing lines and a booking's pending children
+    /// (step 3d).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clearing: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<(String, String, String)>,
 }
 
 fn encoded<M: Message>(message: &M) -> String {
@@ -189,6 +218,12 @@ impl Body {
             trade: self.trade,
             states_waits: self.states_waits,
             lifecycle_events: self.lifecycle_events.iter().map(encoded).collect(),
+            record: self
+                .record
+                .as_ref()
+                .map(|(kind, body)| (kind.clone(), STANDARD.encode(body))),
+            clearing: self.clearing.iter().map(encoded).collect(),
+            pending: self.pending.clone(),
         };
         serde_json::to_vec(&kept).expect("an entry's body is plain data")
     }
@@ -221,6 +256,19 @@ impl Body {
             trade: kept.trade,
             states_waits: kept.states_waits,
             lifecycle_events: all(&kept.lifecycle_events)?,
+            record: kept
+                .record
+                .map(|(kind, body)| {
+                    STANDARD
+                        .decode(body)
+                        .map(|bytes| (kind, bytes))
+                        .map_err(|failed| {
+                            StoreError::Unavailable(format!("an entry did not read: {failed}"))
+                        })
+                })
+                .transpose()?,
+            clearing: all(&kept.clearing)?,
+            pending: kept.pending,
         })
     }
 
@@ -391,4 +439,83 @@ impl Entry {
             digest: change.digest.clone(),
         })
     }
+}
+
+/// An account's move's entries' kind (step 3d; the resilience spec's
+/// section 6.8; W9.8, "An account moves between partitions by
+/// continuation"): the close in its old partition and the open in its new,
+/// each carrying the move's `AccountMoved` as a `~control` entry carries its
+/// record.
+pub const ACCOUNT_MOVED: &str = "meridian.v1.AccountMoved";
+
+/// An entry's `AccountMoved`, where it is a move's close or open.
+pub fn moved_of(entry: &Entry) -> Option<meridian_domain::v1::AccountMoved> {
+    if entry.meta.kind != ACCOUNT_MOVED {
+        return None;
+    }
+    let (_, body) = entry.body.record.as_ref()?;
+    meridian_domain::v1::AccountMoved::decode(body.as_slice()).ok()
+}
+
+/// Whether `entry` closes its account's chain in its partition, naming the
+/// partition it continues in.
+pub fn closes(entry: &Entry) -> Option<String> {
+    moved_of(entry)
+        .filter(|moved| moved.from_partition == entry.partition)
+        .map(|moved| moved.to_partition)
+}
+
+/// Whether `entry` opens its account's chain in its partition after a move.
+pub fn opens(entry: &Entry) -> bool {
+    moved_of(entry).is_some_and(|moved| moved.to_partition == entry.partition)
+}
+
+/// An account's journal in the order it was written (step 3d; W9.8): within
+/// a partition by sequence, and across a move from the close in the old
+/// partition to the open in the new, which numbers from its own head. An
+/// account that never moved is in one partition, in sequence order.
+pub fn in_order(mut entries: Vec<Entry>) -> Vec<Entry> {
+    // An account moved between databases is read from each, its entries
+    // before the move from both: each once (step 3d; section 6.4).
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| seen.insert(entry.entry_id.clone()));
+    if !entries.iter().any(|entry| entry.meta.kind == ACCOUNT_MOVED) {
+        entries.sort_by_key(|entry| entry.first_sequence);
+        return entries;
+    }
+    let mut by: std::collections::BTreeMap<String, std::collections::VecDeque<Entry>> =
+        std::collections::BTreeMap::new();
+    entries.sort_by(|a, b| {
+        (a.partition.as_str(), a.first_sequence).cmp(&(b.partition.as_str(), b.first_sequence))
+    });
+    for entry in entries {
+        by.entry(entry.partition.clone())
+            .or_default()
+            .push_back(entry);
+    }
+    // The chain starts in the partition whose first entry opens nothing.
+    let mut at = by
+        .iter()
+        .find(|(_, held)| held.front().is_some_and(|first| !opens(first)))
+        .map(|(partition, _)| partition.clone())
+        .or_else(|| by.keys().next().cloned());
+    let mut out = Vec::new();
+    while let Some(partition) = at.take() {
+        let Some(held) = by.get_mut(&partition) else {
+            break;
+        };
+        while let Some(entry) = held.pop_front() {
+            let next = closes(&entry);
+            out.push(entry);
+            if let Some(next) = next {
+                at = Some(next);
+                break;
+            }
+        }
+    }
+    // What no move links, after the chain, in its own order: never lost.
+    for (_, held) in by {
+        out.extend(held);
+    }
+    out
 }

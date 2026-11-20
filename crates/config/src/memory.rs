@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use meridian_domain::v1::{
     AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
     LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState,
-    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
+    PluginStorageCopied, PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_domain::v1::VenueCatalogue;
@@ -49,6 +49,12 @@ pub struct MemoryStore {
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
     launch_notes: Mutex<Vec<LaunchNote>>,
+    /// The claim each launch copies into its instance's shared storage, by
+    /// instance and launch, and from when its pods' reports count (item 30).
+    storage_copies: Mutex<std::collections::BTreeMap<(String, i64), (String, i64)>>,
+    /// The launches the launcher ran on their instance's shared storage
+    /// (PO item 91), by instance and when launched.
+    ran_shared: Mutex<std::collections::BTreeSet<(String, i64)>>,
     /// Each move of raw records (W4.13), numbered from 1 in order.
     moves: Mutex<Vec<RecordedMove>>,
     /// Each licence and entitlement change, in order (contract v18).
@@ -147,6 +153,8 @@ impl MemoryStore {
             plugin_usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
+            storage_copies: Mutex::default(),
+            ran_shared: Mutex::default(),
             moves: Mutex::new(Vec::new()),
             licences: Mutex::new(Vec::new()),
             entitlements: Mutex::new(Vec::new()),
@@ -755,6 +763,98 @@ impl Store for MemoryStore {
                 at_ns: launch.launched_at_ns,
             });
         Ok(true)
+    }
+
+    fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()> {
+        let state = self.state.lock().expect("store lock poisoned");
+        let Some(launch) = state.catalogue.launches.iter().find(|held| {
+            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+        }) else {
+            return Ok(());
+        };
+        self.storage_copies
+            .lock()
+            .expect("store lock poisoned")
+            .insert(
+                (instance_id.to_string(), launch.launched_at_ns),
+                (from_claim.to_string(), after_ns),
+            );
+        Ok(())
+    }
+
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()> {
+        let state = self.state.lock().expect("store lock poisoned");
+        if let Some(launch) = state.catalogue.launches.iter().find(|held| {
+            held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+        }) {
+            self.ran_shared
+                .lock()
+                .expect("store lock poisoned")
+                .insert((instance_id.to_string(), launch.launched_at_ns));
+        }
+        Ok(())
+    }
+
+    fn record_storage_copied(
+        &self,
+        instance_id: &str,
+        reported_at_ns: i64,
+        at_ns: i64,
+    ) -> Result<Option<PluginStorageCopied>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        // The instance's latest launch that copied, ended or not (review c5c
+        // L6), where a pod was heard after the launcher answered.
+        let pending = self
+            .storage_copies
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|((instance, _), _)| instance == instance_id)
+            .max_by_key(|((_, launched_at_ns), _)| *launched_at_ns)
+            .map(|((_, launched_at_ns), (from_claim, after))| {
+                (*launched_at_ns, from_claim.clone(), *after)
+            });
+        let Some((launched_at_ns, from_claim, _)) =
+            pending.filter(|(_, _, after)| reported_at_ns > *after)
+        else {
+            return Ok(None);
+        };
+        // A later launch that ran on its own claim, its pods heard with no
+        // marker written, says nothing of the copy (item 89, review c5c86
+        // L3); one that failed ran nothing, and one that ran on the shared
+        // claim waited for the copy (PO item 91, review c5c89 M4).
+        let shared = self.ran_shared.lock().expect("store lock poisoned");
+        if state.catalogue.launches.iter().any(|held| {
+            held.instance_id == instance_id
+                && held.launched_at_ns > launched_at_ns
+                && held.shards <= 1
+                && !held.standby
+                && held.state != PluginLaunchState::Failed as i32
+                && !shared.contains(&(instance_id.to_string(), held.launched_at_ns))
+        }) {
+            return Ok(None);
+        }
+        drop(shared);
+        let Some(launch) =
+            state.catalogue.launches.iter_mut().find(|held| {
+                held.instance_id == instance_id && held.launched_at_ns == launched_at_ns
+            })
+        else {
+            return Ok(None);
+        };
+        // Once per launch that copied.
+        if launch.storage_copied.is_some() {
+            return Ok(None);
+        }
+        let copied = PluginStorageCopied {
+            instance_id: instance_id.to_string(),
+            to_claim: crate::store::shared_claim_of(&from_claim, instance_id),
+            from_claim,
+            at_ns,
+            launched_by: launch.launched_by.clone(),
+        };
+        launch.storage_copied = Some(copied.clone());
+        Ok(Some(copied))
     }
 
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {

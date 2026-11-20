@@ -85,6 +85,11 @@ pub struct BroughtServer {
     pub superuser_password: String,
     pub serving_password: String,
     pub migrating_password: String,
+    /// Each database past the first the chart brings for a store's writer
+    /// groups (step 3d; the resilience spec's section 6.4): started with
+    /// the first, to the same members. The migrate Job makes each one's
+    /// database and roles.
+    pub also: Vec<String>,
 }
 
 pub struct FirstRun {
@@ -490,6 +495,12 @@ impl FirstRun {
             )
             .await
             .map_err(|failed| format!("the database could not be started: {failed}"))?;
+        for also in &server.also {
+            self.cluster
+                .scale(Workload::StatefulSet, also, server.members.max(1))
+                .await
+                .map_err(|failed| format!("database {also} could not be started: {failed}"))?;
+        }
 
         let privileged = DatabaseLogin {
             host: server.host.clone(),

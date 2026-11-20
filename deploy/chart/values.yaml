@@ -109,14 +109,17 @@ database:
     # readReplicas: 0
     # Its max_connections, counted from what this chart deploys (ruled
     # 2026-11-08): each store member's pool of 8 and 2 beside it, writer,
-    # standby and a rollout's surge, and in ha 2 more for each lake member's
-    # write-ahead writer (stage E); each dashboard copy's 4 and 1; 6 for
-    # jobs; 4 kept for the superuser and Patroni; a quarter over that. 82
-    # tolerant, 220 ha. Set it to override; below what the pods hold is
+    # standby and a rollout's surge, the lake's and the book's for each of
+    # the most writer groups they allow (lake.maxWriterGroups,
+    # bor.maxWriterGroups: PO items 104 and 106, so a writerGroups change
+    # within it never restarts the database), and in ha 2 more for each lake
+    # member's write-ahead writer (stage E); each dashboard copy's 4 and 1;
+    # 6 for jobs; 4 kept for the superuser and Patroni; a quarter over that.
+    # 107 tolerant, 303 ha. Set it to override; below what the pods hold is
     # refused. Each connection may take work_mem (4 MiB) under load, which
     # the preflight counts against the memory limit above. With standbys
     # the limit is the preflight's own count -- shared buffers and work_mem
-    # for every connection allowed -- with a quarter's room, 1280Mi at 220,
+    # for every connection allowed -- with a quarter's room, 1728Mi at 303,
     # or the limit above where that is more.
     # maxConnections:
     # The image the members run under Patroni: postgres:16-alpine's server
@@ -350,8 +353,43 @@ street:
 # so an upgrade never runs two writers. Its tables are prefixed book_, so it
 # may share a schema with the others; its own database is supported and
 # kept apart from the street's by the credential.
+
+# Moves (step 3d; the resilience spec's section 6.8): a partition's or an
+# account's move holds new writes to it for at most holdSeconds, never past
+# the caller's deadline, then answers OVERLOADED with a retry-after; a move
+# whose target has not caught up within switchSeconds, or whose switch has
+# not finished in that time, aborts and the source keeps owning.
+moves:
+  holdSeconds: 5
+  switchSeconds: 30
+
 bor:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its partitions: `control` group 0's, each account partition by rendezvous hashing; each group past
+  # the first is a writer Deployment of its own, <release>-bor-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
+  # The most writer groups the book allows (PO items 104 and 106): 2, as by
+  # default, 1 to 64; a writerGroups above it is refused. The database's
+  # connections are counted at it, so writerGroups changed within it never
+  # changes the database's max_connections and never restarts it; raising
+  # it restarts the database once. Each group it allows counts 10
+  # connections for each of its members (12 for the lake's in ha): writer,
+  # standby and a rollout's surge.
+  maxWriterGroups: 2
+  # A database per writer group (step 3d; the resilience spec's section
+  # 6.4): 1, as by default, every group on the one database. Above it,
+  # writer group g writes to database g mod the count, at most one per
+  # group; database 0 keeps the store's control partition and its
+  # assignments, and reads across databases fan out and merge. With the
+  # database this chart brings, it brings one more for each past the first,
+  # <release>-bor-database-<d>, each with the brought database's
+  # standbys, read replicas and WAL archive; with one somebody else runs,
+  # bor.database.groupSecrets names each past the first.
+  databases: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.
@@ -371,6 +409,10 @@ bor:
   database:
     existingSecret: ""
     key: ""
+    # A database somebody else runs, past the first (step 3d; section
+    # 6.4): one Secret name for each, in order, each read with this store's
+    # key, else database.key. Empty with the database this chart brings.
+    groupSecrets: []
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's
@@ -398,6 +440,12 @@ bor:
   # book's start for every account past it with none current. The default is
   # from core's replay benchmark; 10 to 100000.
   snapshotInterval: 1000
+  # The book's partitions (step 3d; the resilience spec's section 6.3): P0
+  # to P<n-1>, 1 to 64. A new account is placed by rendezvous hashing of its
+  # owner label, else its ID, at its creation and for good; raising the
+  # count places new accounts only. The upgrade preflight refuses lowering
+  # it while a partition past the new count holds accounts.
+  partitions: 1
   # The hot layer (step 3a): each account's book at its head, answered from
   # the book's memory, bounded in MiB, the least recently read evicted
   # first, within its 512 MiB.
@@ -411,6 +459,31 @@ bor:
 # credential.
 lake:
   replicaCount: 1
+  # Writer groups (step 3d; the resilience spec's sections 6.1, 6.3, 6.7):
+  # 1, as by default, one writer over every partition. Above it each group
+  # owns a share of its datasets by rendezvous hashing, `control` group 0's; each group past
+  # the first is a writer Deployment of its own, <release>-lake-group-<g>,
+  # with its own Lease and standby (standby counts per group). Every member
+  # serves the public writes and hands each to the group owning it.
+  writerGroups: 1
+  # The most writer groups the lake allows (PO items 104 and 106): 2, as by
+  # default, 1 to 64; a writerGroups above it is refused. The database's
+  # connections are counted at it, so writerGroups changed within it never
+  # changes the database's max_connections and never restarts it; raising
+  # it restarts the database once. Each group it allows counts 10
+  # connections for each of its members (12 for the lake's in ha): writer,
+  # standby and a rollout's surge.
+  maxWriterGroups: 2
+  # A database per writer group (step 3d; the resilience spec's section
+  # 6.4): 1, as by default, every group on the one database. Above it,
+  # writer group g writes to database g mod the count, at most one per
+  # group; database 0 keeps the store's control partition and its
+  # assignments, and reads across databases fan out and merge. With the
+  # database this chart brings, it brings one more for each past the first,
+  # <release>-lake-database-<d>, each with the brought database's
+  # standbys, read replicas and WAL archive; with one somebody else runs,
+  # lake.database.groupSecrets names each past the first.
+  databases: 1
   # How often its writer re-reads its record, at low priority (step 3b,
   # integrity at rest): every row and digest checked, the journal's chain
   # followed, each finding kept as an IntegrityFinding. 0 for never.
@@ -465,6 +538,10 @@ lake:
   database:
     existingSecret: ""
     key: ""
+    # A database somebody else runs, past the first (step 3d; section
+    # 6.4): one Secret name for each, in order, each read with this store's
+    # key, else database.key. Empty with the database this chart brings.
+    groupSecrets: []
     # A read replica's URL, in this Secret under the same key (contract
     # v30, stage B): a reader answers the record's past -- as of a time,
     # ranges, past dates, history -- from it once it has reached the read's
@@ -657,8 +734,9 @@ broker:
   # anybody to write by hand.
   existingSecret: ""
 
-  # The bundled broker's own image. Its version is yours.
-  image: nats:2.10-alpine
+  # The bundled broker's own image, pinned exactly (item 191): the release
+  # CI runs, never another a pull brings. Its version is yours.
+  image: nats:2.10.29-alpine
   instrumentKey: instrument
   conductorKey: conductor
   streetKey: street
@@ -800,6 +878,25 @@ pluginStorage:
   # non-root user can write it. Empty where the cluster assigns its own, as
   # OpenShift does; podSecurityContext.fsGroup, when set, wins.
   fsGroup: 65532
+  # An instance launched as several pods -- shards, or a standby pod (step
+  # 3d) -- shares one claim, `<release>-meridian-runtime-shared-storage-
+  # <instance>`, mounted by every pod of the instance: shard n writes only
+  # under `shard-<n>/`, and any pod reads every shard's, so a standby that
+  # takes a shard carries on its records and a ref from any shard resolves
+  # from any pod. On several nodes that takes a ReadWriteMany storage class
+  # (a cloud's file store, CephFS, NFS, Longhorn's RWX), named here; empty
+  # offers none, and the conductor refuses such a launch on several nodes
+  # naming this value. A deployment on one node needs none: the claim is
+  # then ReadWriteOnce, in storageClassName above, which every pod on the
+  # node mounts. An instance that ran as one pod has its own claim copied
+  # into the shared claim's `shard-0/` before its first launch as several
+  # pods; its own claim is kept as it was, and the launcher never deletes
+  # either.
+  shared:
+    storageClassName: ""
+    # The instance's, all its shards together, requested once when it is
+    # made.
+    size: 10Gi
 
 # An archive for an edge plugin's older records (contract v16;
 # spec/an-edge-plugins-older-records-move-to-the-archive): past a kind's
@@ -828,6 +925,23 @@ pluginStorage:
 # instance's pod runs as, so no key is ever handed to a plugin. `objectLock`
 # says the bucket was made with object lock in compliance mode, which alone
 # lets a hold need records that cannot be altered.
+#
+# An allowed instance of several pods -- shards, or a standby pod -- runs
+# instead under an account of its own, `<fullname>-shards-<instance>`
+# (`<release>-meridian-runtime-shards-<instance>` unless nameOverride or
+# fullnameOverride is set), which the launcher makes carrying
+# `serviceAccount`'s workload-identity annotations. A cloud trusts an
+# account by its name, so the bucket's identity
+# has to trust those accounts as well as `serviceAccount`:
+#   - EKS, IAM roles for service accounts: in the role's trust policy, a
+#     StringLike condition on the token's `sub` of
+#     `system:serviceaccount:<namespace>:<fullname>-shards-*`;
+#   - GKE Workload Identity: `roles/iam.workloadIdentityUser` on the Google
+#     service account, bound for each allowed instance's account alone,
+#     `serviceAccount:<project>.svc.id.goog[<namespace>/<fullname>-shards-<instance>]`
+#     -- never the namespace as a whole, which every pod in it would share;
+#   - Azure Workload Identity: a federated identity credential for each
+#     instance's account; EKS Pod Identity: an association for each.
 pluginArchive:
   path: ""
   existingClaim: ""
@@ -972,10 +1086,21 @@ sidecar:
   # climbs, and takes more a second than 200 across many accounts; a page
   # is at most 1 MiB, so 32 MiB holds every request in flight's answer
   # twice over.
+  #
+  # writeMiBPerSecond (step 3d; section 6.9; approved 2026-11-12) is a data
+  # plugin's lake write share, in MiB a second with a burst of a second's
+  # worth. Past it the sidecar holds the write's acknowledgement until the
+  # share covers it, and refuses RATE_LIMITED with a retry-after a write
+  # whose hold would outlast its caller's deadline; other plugins' writes
+  # are untouched. Set above what one lake writer group records, so it
+  # bounds a plugin that floods and never one that does not.
+  #
+  # An instance run as several shards holds each limit divided among them.
   limits:
     inFlight: 16
     requestsPerSecond: 400
     answerMiB: 32
+    writeMiBPerSecond: 8
 
 nameOverride: ""
 fullnameOverride: ""

@@ -171,6 +171,18 @@ impl ApiServer {
             .await
     }
 
+    /// The pods in this namespace carrying `selector`, as a list: read only,
+    /// for the launcher to see a stopped instance's pods have ended before
+    /// it removes their account (step 3d, review c5b L5 and c5b2 H1).
+    pub async fn pods_labelled(&self, selector: &str) -> Result<serde_json::Value, ClusterError> {
+        self.get_json(&format!(
+            "/api/v1/namespaces/{}/pods?labelSelector={}",
+            self.namespace,
+            selector.replace('=', "%3D").replace(',', "%2C")
+        ))
+        .await
+    }
+
     /// The Leases in this namespace, as a list: read only, for the
     /// conductor's resilience profile and the Resilience page, who writes
     /// each store (W6.39; its Role's `get` and `list` on Leases, ruled
@@ -378,6 +390,133 @@ impl ApiServer {
             serde_json::json!({ "data": data }),
         )
         .await
+    }
+
+    /// The namespace this pod runs in, and every call here reaches.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// A collection's path in this namespace: `root` is the group's
+    /// (`/api/v1`, `/apis/<group>/<version>`), `plural` the resource's.
+    fn collection(&self, root: &str, plural: &str) -> String {
+        format!("{root}/namespaces/{}/{plural}", self.namespace)
+    }
+
+    /// One named object in this namespace, or None where there is none:
+    /// what the launcher keeps for an instance of several pods (step 3d,
+    /// checkpoint 5, item 31).
+    pub async fn object(
+        &self,
+        root: &str,
+        plural: &str,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>, ClusterError> {
+        let path = format!("{}/{name}", self.collection(root, plural));
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))?;
+        if !(200..300).contains(&status) {
+            return Err(ClusterError(format!("GET {path} -> {status}: {body}")));
+        }
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|failed| ClusterError(format!("GET {path}: {failed}")))
+    }
+
+    /// Make an object in this namespace: true, or false where one by its
+    /// name is there already (409).
+    pub async fn make_object(
+        &self,
+        root: &str,
+        plural: &str,
+        manifest: &serde_json::Value,
+    ) -> Result<bool, ClusterError> {
+        let path = self.collection(root, plural);
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .body(manifest.to_string())
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("POST {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            return Ok(false);
+        }
+        if !(200..300).contains(&status) {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ClusterError(format!("POST {path} -> {status}: {detail}")));
+        }
+        Ok(true)
+    }
+
+    /// Write an object over the one in this namespace by its name,
+    /// conditional on the resourceVersion `manifest` carries.
+    pub async fn replace_object(
+        &self,
+        root: &str,
+        plural: &str,
+        manifest: &serde_json::Value,
+    ) -> Result<(), ClusterError> {
+        let name = manifest["metadata"]["name"].as_str().unwrap_or_default();
+        let path = format!("{}/{name}", self.collection(root, plural));
+        let response = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .body(manifest.to_string())
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("PUT {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ClusterError(format!("PUT {path} -> {status}: {detail}")));
+        }
+        Ok(())
+    }
+
+    /// Delete an object in this namespace by its name; false where it was
+    /// not there.
+    pub async fn delete_object(
+        &self,
+        root: &str,
+        plural: &str,
+        name: &str,
+    ) -> Result<bool, ClusterError> {
+        let path = format!("{}/{name}", self.collection(root, plural));
+        let response = self
+            .http
+            .delete(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|failed| ClusterError(format!("DELETE {path}: {failed}")))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(false);
+        }
+        if !(200..300).contains(&status) {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ClusterError(format!("DELETE {path} -> {status}: {detail}")));
+        }
+        Ok(true)
     }
 
     async fn patch(

@@ -27,6 +27,20 @@
 //! CreatePlugin carries one allowed, with its bound in bytes as
 //! MERIDIAN_ARCHIVE_MOST_BYTES where it has one. Refused where the chart
 //! gives none.
+//!
+//! And an instance of several pods -- shards, or a standby pod (step 3d,
+//! checkpoint 5, item 31) -- is given an account of its own,
+//! `<fullname>-shards-<instance>`: a ServiceAccount, and a Role and
+//! RoleBinding of that name granting `get` and `update` on its own shards'
+//! Leases alone, named one by one, since RBAC names no prefix and cannot
+//! narrow `create` to a name. So the launcher makes each shard's Lease
+//! before the instance's pods start, and never deletes one: a Lease's
+//! `leaseTransitions` then only grows, the floor of the shard's epoch. The
+//! Role is written again at each launch, so a launch at another count names
+//! that count's Leases; stopping removes the account, its Role and its
+//! binding, and keeps the Leases. An allowed bucket archive's workload
+//! identity moves onto that account: the annotations of the archive's own
+//! account are copied onto it.
 
 use meridian_domain::v1::CreatePluginRequest;
 
@@ -91,6 +105,10 @@ pub struct Shapes {
     /// What an allowed instance is given beside its storage, where the
     /// chart keeps archives (contract v16).
     pub archive: Option<String>,
+    /// The plugin shape as several pods of one instance, each run under its
+    /// instance's own account (step 3d; the resilience spec's section 7;
+    /// checkpoint 5, item 31).
+    pub shards: Option<String>,
 }
 
 /// An edge plugin's shapes (decisions/028), and which roles are the edge's.
@@ -100,6 +118,13 @@ pub struct StorageShapes {
     pub live: Option<String>,
     pub claim: String,
     pub edge_roles: Vec<String>,
+    /// Where the chart renders shards and standby pods: their shape
+    /// mounting the instance's shared storage, the shared claim it mounts,
+    /// and the pod that copies the instance's own claim into it (step 3d,
+    /// checkpoint 5, item 30).
+    pub shards: Option<String>,
+    pub shared_claim: Option<String>,
+    pub copy: Option<String>,
 }
 
 /// What a request is made from: the Deployment's template, and the claim's
@@ -355,10 +380,55 @@ pub fn with_archive(
             None => pod["volumes"] = serde_json::Value::Array(added.clone()),
         }
     }
+    // An instance of several pods keeps its own account: the archive's
+    // workload identity moves onto it ([`identity_of`]; item 31).
     if let Some(account) = shape["serviceAccountName"].as_str() {
-        pod["serviceAccountName"] = serde_json::Value::String(account.to_string());
+        if !several(request) {
+            pod["serviceAccountName"] = serde_json::Value::String(account.to_string());
+        }
     }
     Ok(manifest)
+}
+
+/// The account a bucket archive's shape runs an allowed instance under,
+/// whose workload identity is scoped to the bucket: none for a local
+/// archive, for a request carrying none allowed, or where the chart keeps
+/// none.
+pub fn archive_account(template: Option<&str>, request: &CreatePluginRequest) -> Option<String> {
+    if !archive_allowed(request) {
+        return None;
+    }
+    let shape: serde_json::Value = serde_json::from_str(template?).ok()?;
+    shape["serviceAccountName"].as_str().map(String::from)
+}
+
+/// The annotations a ServiceAccount's workload identity is: GKE's, EKS's
+/// (IRSA) and Azure Workload Identity's. The launcher's admission policy
+/// admits an instance's own account carrying these alone (review c5b L2).
+pub const IDENTITY_ANNOTATIONS: [&str; 8] = [
+    "iam.gke.io/gcp-service-account",
+    "eks.amazonaws.com/role-arn",
+    "eks.amazonaws.com/audience",
+    "eks.amazonaws.com/sts-regional-endpoints",
+    "eks.amazonaws.com/token-expiration",
+    "azure.workload.identity/client-id",
+    "azure.workload.identity/tenant-id",
+    "azure.workload.identity/service-account-token-expiration",
+];
+
+/// The workload identity a ServiceAccount carries, as its annotations, to
+/// copy onto an instance's own account (item 31: the archive's bucket
+/// identity moves onto it): those of [`IDENTITY_ANNOTATIONS`] alone. What a
+/// tool, the cluster or anyone else keeps on the account is not identity,
+/// and is left (review c5b L2).
+pub fn identity_of(account: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    account["metadata"]["annotations"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| value.is_string() && IDENTITY_ANNOTATIONS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// The Deployment with the instance's own share at its sidecar (contract
@@ -389,6 +459,12 @@ pub fn with_limits(
             "MERIDIAN_SIDECAR_ANSWER_MIB",
             "limits.answer_mib",
             limits.answer_mib,
+        ),
+        // A data plugin's lake write share (step 3d; section 6.9).
+        (
+            "MERIDIAN_SIDECAR_WRITE_MIB_PER_SECOND",
+            "limits.write_mib_per_second",
+            limits.write_mib_per_second,
         ),
     ];
     if said.iter().all(|(_, _, value)| *value == 0) {
@@ -441,6 +517,1196 @@ pub fn with_limits(
     Ok(manifest)
 }
 
+/// The shard count the launcher tells each sidecar of an instance run as
+/// several pods (approved 2026-11-15).
+pub const SHARDS_ENV: &str = crate::shards::SHARDS_ENV;
+
+/// Whether a request asks for several pods of its instance: shards above
+/// one, or a standby pod -- or, once [`one_pod_as_shard`] has said so, one
+/// shard on its instance's shared storage.
+pub fn several(request: &CreatePluginRequest) -> bool {
+    request.shards >= 1 || request.standby
+}
+
+/// A request as the launcher runs it: shards 1 alone is one pod, as 0 is
+/// (contract v30: "0 and 1 each one pod"); and an instance of one pod whose
+/// storage is shared since it ran as several -- `shared` -- runs as one
+/// shard of one on it, so it reaches every shard's records and writes its
+/// own under `shard-0/` (item 30; accepted under A 2026-11-17).
+pub fn one_pod_as_shard(mut request: CreatePluginRequest, shared: bool) -> CreatePluginRequest {
+    if request.shards == 1 && !request.standby {
+        request.shards = 0;
+    }
+    if shared && request.shards == 0 && !request.standby {
+        request.shards = 1;
+    }
+    request
+}
+
+/// Whether a launch, as the launcher runs it ([`one_pod_as_shard`],
+/// [`shards_template`]), runs on its instance's shared storage: several
+/// pods keeping storage, or one pod as one shard of storage shared since
+/// (PO item 91).
+pub fn runs_shared(claim: Option<&str>, request: &CreatePluginRequest) -> bool {
+    claim.is_some() && several(request)
+}
+
+/// The refusal of an instance of several pods keeping storage where the
+/// chart offers it none to share (item 30): approved by the product owner
+/// as item 69 (2026-11-17).
+pub fn no_shared_storage_said(instance: &str) -> String {
+    format!(
+        "{instance} was asked shards or a standby pod, and its plugin keeps storage: this \
+         deployment's chart offers no shared storage (pluginStorage.shared.storageClassName)"
+    )
+}
+
+/// The template an instance launched with shards or a standby pod is made
+/// from (step 3d; the resilience spec's section 7): the chart's shards
+/// shape in place of `chosen`, which is kept for any other request; for a
+/// plugin keeping storage, the shape mounting its instance's shared
+/// storage, and the shared claim (item 30). Refused where the chart renders
+/// none, for more shards than a declaration may name, and for a live
+/// instance.
+pub fn shards_template<'a>(
+    chosen: Chosen<'a>,
+    request: &CreatePluginRequest,
+    shapes: &'a Shapes,
+) -> Result<Chosen<'a>, String> {
+    if !several(request) {
+        return Ok(chosen);
+    }
+    let id = &request.instance_id;
+    if request.shards > crate::shards::MOST {
+        return Err(format!(
+            "shards: {id} was asked {} shards; at most {}",
+            request.shards,
+            crate::shards::MOST
+        ));
+    }
+    if request.live {
+        return Err(format!(
+            "{id} was asked for live with shards or a standby pod: a live instance is one pod"
+        ));
+    }
+    if chosen.claim.is_some() {
+        // Its pods share one claim, a folder per shard (item 30).
+        let storage = shapes.storage.as_ref();
+        return match storage.and_then(|storage| {
+            Some((storage.shards.as_deref()?, storage.shared_claim.as_deref()?))
+        }) {
+            Some((workload, claim)) => Ok(Chosen {
+                workload,
+                claim: Some(claim),
+            }),
+            None => Err(no_shared_storage_said(id)),
+        };
+    }
+    let workload = shapes.shards.as_deref().ok_or_else(|| {
+        format!(
+            "{id} was asked shards or a standby pod, and this deployment's chart renders no \
+             shape for them: its sidecars take their shards' Leases under an account the \
+             launcher makes for the instance, which the chart lets it make where a store runs a \
+             standby (the ha profile)"
+        )
+    })?;
+    Ok(Chosen {
+        workload,
+        claim: None,
+    })
+}
+
+/// The Deployment of an instance launched with shards or a standby pod: a
+/// pod per shard and one more for a standby, each sidecar told the shard
+/// count ([`SHARDS_ENV`]), 1 for a standby alone, and run under its
+/// instance's own account ([`shards_account`]). Unchanged for any other
+/// request.
+pub fn with_shards(
+    mut manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    if !several(request) {
+        return Ok(manifest);
+    }
+    let shards = request.shards.max(1);
+    manifest["spec"]["replicas"] = serde_json::json!(shards + u32::from(request.standby));
+    // Rolled a shard at a time, where the shape rolls: one pod may be
+    // away, and one more for a standby pod, which is never ready -- with
+    // fewer the rollout could stop no old pod, and with more it stops
+    // shards it need not.
+    if let Some(rolling) = manifest["spec"]["strategy"]["rollingUpdate"].as_object_mut() {
+        rolling.insert(
+            "maxUnavailable".into(),
+            serde_json::json!(1 + u32::from(request.standby)),
+        );
+    }
+    let env = manifest["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "sidecar"))
+        .and_then(|sidecar| sidecar["env"].as_array_mut())
+        .ok_or("the shards template has no sidecar container to tell the shard count")?;
+    if !env.iter().any(|e| e["name"] == SHARDS_ENV) {
+        return Err(format!(
+            "the shards template does not tell its sidecar {SHARDS_ENV}"
+        ));
+    }
+    // Each shard holds at least one of each limit, so shards above the
+    // in-flight or answer limit its sidecars are given -- the chart's, or
+    // the launch's own, written just before -- would together hold more
+    // than the instance's share (review finding 11; accepted 2026-11-15).
+    for (name, said) in [
+        ("MERIDIAN_SIDECAR_IN_FLIGHT", "sidecar.limits.inFlight"),
+        ("MERIDIAN_SIDECAR_ANSWER_MIB", "sidecar.limits.answerMiB"),
+    ] {
+        let limit = env
+            .iter()
+            .find(|e| e["name"] == name)
+            .and_then(|e| e["value"].as_str())
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if let Some(limit) = limit.filter(|limit| shards > *limit) {
+            return Err(format!(
+                "shards: {} was asked {shards} shards, and its {said} is {limit}: each shard                  holds at least one, so its shards together would hold more than the                  instance's share; at most {limit} shards, or a higher limit at its launch",
+                request.instance_id
+            ));
+        }
+    }
+    env.retain(|e| e["name"] != SHARDS_ENV);
+    env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
+    // And its plugin, the same value and meaning (PO item 73, 2026-11-17):
+    // which shard it serves it learns at registration.
+    if let Some(plugin) = manifest["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .and_then(|containers| containers.iter_mut().find(|c| c["name"] == "plugin"))
+    {
+        if !plugin["env"].is_array() {
+            plugin["env"] = serde_json::Value::Array(Vec::new());
+        }
+        let env = plugin["env"].as_array_mut().expect("made an array");
+        env.retain(|e| e["name"] != SHARDS_ENV);
+        env.push(serde_json::json!({"name": SHARDS_ENV, "value": shards.to_string()}));
+    }
+    shards_account(&manifest, request)?;
+    Ok(manifest)
+}
+
+/// The suffix of an instance's own account: `<fullname>-shards-<instance>`
+/// (item 31).
+fn account_suffix(instance: &str) -> String {
+    format!("-shards-{instance}")
+}
+
+/// The account an instance of several pods runs under, as its shards shape
+/// names it, filled in for the request: `<fullname>-shards-<instance>`
+/// (item 31). Refused for a shape that names another.
+pub fn shards_account(
+    manifest: &serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<String, String> {
+    let account = manifest["spec"]["template"]["spec"]["serviceAccountName"]
+        .as_str()
+        .unwrap_or_default();
+    let fullname = account
+        .strip_suffix(&account_suffix(&request.instance_id))
+        .unwrap_or_default();
+    if fullname.is_empty() {
+        return Err(format!(
+            "the shards template runs its pods under {account:?}, not the instance's own \
+             account, <fullname>-shards-{}",
+            request.instance_id
+        ));
+    }
+    Ok(account.to_string())
+}
+
+/// The account of `instance`, from the chart's shards shape, unfilled: what
+/// stopping removes (item 31). None where the chart renders no such shape.
+pub fn shards_account_of(template: Option<&str>, instance: &str) -> Option<String> {
+    let filled = template?.replace("__INSTANCE__", instance);
+    let shape: serde_json::Value = serde_json::from_str(&filled).ok()?;
+    let account = shape["spec"]["template"]["spec"]["serviceAccountName"].as_str()?;
+    account
+        .ends_with(&account_suffix(instance))
+        .then(|| account.to_string())
+}
+
+/// What the launcher keeps for an instance of several pods (item 31), and
+/// the one pod it makes, copying an instance's own storage (item 30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Lease,
+    ServiceAccount,
+    Role,
+    RoleBinding,
+    Pod,
+    PersistentVolumeClaim,
+}
+
+impl Kind {
+    /// Its API path below `/namespaces/<namespace>/`'s group root, and its
+    /// plural.
+    pub fn root_and_plural(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::Lease => ("/apis/coordination.k8s.io/v1", "leases"),
+            Kind::ServiceAccount => ("/api/v1", "serviceaccounts"),
+            Kind::Role => ("/apis/rbac.authorization.k8s.io/v1", "roles"),
+            Kind::RoleBinding => ("/apis/rbac.authorization.k8s.io/v1", "rolebindings"),
+            Kind::Pod => ("/api/v1", "pods"),
+            Kind::PersistentVolumeClaim => ("/api/v1", "persistentvolumeclaims"),
+        }
+    }
+}
+
+/// The API, as far as an instance's account and Leases need it; the real
+/// one is the in-cluster API server, and tests stand one in memory.
+pub trait Objects: Send + Sync {
+    /// One by name, or None where there is none.
+    fn get(
+        &self,
+        kind: Kind,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<serde_json::Value>, String>> + Send;
+    /// Made: true, or false where one by its name is there already (409).
+    fn create(
+        &self,
+        kind: Kind,
+        object: &serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+    /// Written over the one there, conditional on its resourceVersion.
+    fn replace(
+        &self,
+        kind: Kind,
+        object: &serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// Deleted: false where it was not there.
+    fn delete(
+        &self,
+        kind: Kind,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+}
+
+/// What an instance of several pods is given beside its Deployment (item
+/// 31): its shards' Leases, made free, and its account, Role and binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShardsAccount {
+    pub leases: Vec<serde_json::Value>,
+    pub account: serde_json::Value,
+    pub role: serde_json::Value,
+    pub binding: serde_json::Value,
+}
+
+/// The objects an instance of several pods is given, for its Deployment as
+/// made (`manifest`, after [`with_shards`]) in `namespace`: a Lease per
+/// shard, `<instance>-shard-<n>`, made free; the account its pods run
+/// under, carrying no secret and `identity` as its annotations; a Role of
+/// the account's name with one rule -- `get` and `update` on exactly those
+/// Leases, by name; and a binding of that Role to that account alone. Each
+/// labelled as the Deployment is, but for what says it is a sidecar.
+pub fn shards_objects(
+    manifest: &serde_json::Value,
+    request: &CreatePluginRequest,
+    namespace: &str,
+    identity: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ShardsAccount, String> {
+    let account = shards_account(manifest, request)?;
+    let mut labels = manifest["metadata"]["labels"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    labels.remove("meridian.dev/component");
+    labels.remove("meridian.dev/live");
+    if labels.get("meridian.dev/launched").and_then(|v| v.as_str()) != Some("true")
+        || labels.get("meridian.dev/instance").and_then(|v| v.as_str())
+            != Some(request.instance_id.as_str())
+    {
+        return Err(
+            "the shards template does not mark what it makes as the launcher's, for its instance"
+                .into(),
+        );
+    }
+    let names: Vec<String> = (0..request.shards.max(1))
+        .map(|shard| crate::shards::lease_name(&request.instance_id, shard))
+        .collect();
+    let leases = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {"name": name, "labels": labels},
+                "spec": {},
+            })
+        })
+        .collect();
+    let mut account_metadata = serde_json::json!({"name": account, "labels": labels});
+    if !identity.is_empty() {
+        account_metadata["annotations"] = serde_json::Value::Object(identity.clone());
+    }
+    Ok(ShardsAccount {
+        leases,
+        account: serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": account_metadata,
+            "automountServiceAccountToken": false,
+        }),
+        role: serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {"name": account, "labels": labels},
+            "rules": [{
+                "apiGroups": ["coordination.k8s.io"],
+                "resources": ["leases"],
+                "verbs": ["get", "update"],
+                "resourceNames": names,
+            }],
+        }),
+        binding: serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": account, "labels": labels},
+            "subjects": [{"kind": "ServiceAccount", "name": account, "namespace": namespace}],
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": account},
+        }),
+    })
+}
+
+/// Whether an object was made by the launcher.
+fn launchers(object: &serde_json::Value) -> bool {
+    object["metadata"]["labels"]["meridian.dev/launched"] == "true"
+}
+
+/// Make what [`shards_objects`] describes, before the instance's
+/// Deployment: each Lease where it is not there -- one there is kept as it
+/// is, its transitions with it -- and the account, Role and binding made,
+/// or written over the launcher's own, so a launch at another count names
+/// its own Leases. One there that the launcher did not make is never
+/// written over.
+pub async fn make_shards_account<O: Objects>(api: &O, made: &ShardsAccount) -> Result<(), String> {
+    for lease in &made.leases {
+        api.create(Kind::Lease, lease).await?;
+    }
+    for (kind, object) in [
+        (Kind::ServiceAccount, &made.account),
+        (Kind::Role, &made.role),
+        (Kind::RoleBinding, &made.binding),
+    ] {
+        let name = object["metadata"]["name"].as_str().unwrap_or_default();
+        match api.get(kind, name).await? {
+            None => {
+                if !api.create(kind, object).await? {
+                    return Err(format!(
+                        "{kind:?} {name} was made by another while the launcher made it; \
+                         launch again"
+                    ));
+                }
+            }
+            Some(there) if !launchers(&there) => {
+                return Err(format!(
+                    "{kind:?} {name} is there, and was not made by the launcher; it is kept, and \
+                     an administrator decides what becomes of it"
+                ));
+            }
+            Some(there) => {
+                let mut object = object.clone();
+                object["metadata"]["resourceVersion"] =
+                    there["metadata"]["resourceVersion"].clone();
+                api.replace(kind, &object).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove an instance's account, its Role and its binding, where the
+/// launcher made them; never its Leases (item 31). Says what it removed.
+pub async fn remove_shards_account<O: Objects>(
+    api: &O,
+    account: &str,
+) -> Result<Vec<Kind>, String> {
+    let mut removed = Vec::new();
+    for kind in [Kind::RoleBinding, Kind::Role, Kind::ServiceAccount] {
+        match api.get(kind, account).await? {
+            Some(there) if launchers(&there) => {
+                if api.delete(kind, account).await? {
+                    removed.push(kind);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(removed)
+}
+
+/// What is left of a stopped instance (review c5b2 H1, c5b3 L2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// Nothing: no Deployment of it, and none of its pods.
+    Nothing,
+    /// Its pods, still stopping after their Deployment was deleted.
+    Pods,
+    /// A Deployment of it: a launch made since the stop.
+    Relaunched,
+}
+
+/// What became of a stopped instance's account (review c5b L5, c5b3 L2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// Removed once its pods had ended: what was removed.
+    Removed(Vec<Kind>),
+    /// Kept: a launch of the instance made since writes it over, and is
+    /// the account's now.
+    Relaunched,
+    /// Kept: its pods had not ended in time; a later launch writes it over.
+    Stopping,
+}
+
+/// The cluster's workloads, as far as stopping an instance needs them; the
+/// real one is the in-cluster API server, and tests stand one in memory.
+pub trait Workloads: Send + Sync {
+    /// The Deployments carrying `selector`, as a list.
+    fn deployments(
+        &self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, String>> + Send;
+    /// The pods carrying `selector`, as a list.
+    fn pods(
+        &self,
+        selector: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Delete a Deployment at once, its pods left to stop on their own:
+    /// false where it was not there.
+    fn delete_deployment(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+}
+
+fn launched_of(instance: &str) -> String {
+    format!(
+        "{},{}={instance}",
+        crate::launched::LAUNCHED_SELECTOR,
+        crate::launched::INSTANCE_LABEL
+    )
+}
+
+fn names(list: &serde_json::Value) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["metadata"]["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// Stop an instance the launcher launched: each of its Deployments deleted
+/// at once, so a launch straight after -- a restart with an archive, a move
+/// to another version -- finds none (review c5b2 H1); its pods stop on their
+/// own. Says which were deleted.
+pub async fn stop_launched<W: Workloads>(api: &W, instance: &str) -> Result<Vec<String>, String> {
+    let mut deleted = Vec::new();
+    for name in names(&api.deployments(&launched_of(instance)).await?) {
+        if api.delete_deployment(&name).await? {
+            deleted.push(name);
+        }
+    }
+    Ok(deleted)
+}
+
+/// What is left of a stopped instance the launcher launched: a Deployment
+/// of it is a launch made since; else its pods, until each has stopped.
+pub async fn left_of<W: Workloads>(api: &W, instance: &str) -> Result<Left, String> {
+    let selector = launched_of(instance);
+    if !names(&api.deployments(&selector).await?).is_empty() {
+        return Ok(Left::Relaunched);
+    }
+    if !names(&api.pods(&selector).await?).is_empty() {
+        return Ok(Left::Pods);
+    }
+    Ok(Left::Nothing)
+}
+
+/// Remove an instance's account, Role and binding once its pods have ended
+/// (review c5b L5): removed while they run, its sidecars' tokens die with
+/// the account, so none can release its shard's Lease and a launch after
+/// waits out a whole lapse. `left` says what is left of the instance
+/// ([`left_of`]), and is asked every `every`, for `within` at most; a
+/// launch of it made since ends the wait at once, the account the new
+/// launch's (review c5b3 L2). Each ask, and the removal after it, is made
+/// holding `launching`, which a launch holds while it makes the account and
+/// its Deployment, so a launch between never loses the account it made.
+pub async fn remove_shards_account_once_ended<O, F, Asked>(
+    api: &O,
+    account: &str,
+    launching: &tokio::sync::Mutex<()>,
+    mut left: F,
+    every: std::time::Duration,
+    within: std::time::Duration,
+) -> Result<Removal, String>
+where
+    O: Objects,
+    F: FnMut() -> Asked,
+    Asked: std::future::Future<Output = Result<Left, String>>,
+{
+    let until = tokio::time::Instant::now() + within;
+    loop {
+        {
+            let _launching = launching.lock().await;
+            match left().await? {
+                Left::Nothing => {
+                    return remove_shards_account(api, account)
+                        .await
+                        .map(Removal::Removed)
+                }
+                Left::Relaunched => return Ok(Removal::Relaunched),
+                Left::Pods => {}
+            }
+        }
+        if tokio::time::Instant::now() >= until {
+            return Ok(Removal::Stopping);
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+// ── An instance's own storage, copied into its shared storage (item 30) ──
+
+/// The SDK's command an instance's own storage is copied, and waited for,
+/// with, in its own plugin image as its own user (PO items 86 and 88,
+/// 2026-11-17): `meridian-storage copy <claim>` in the copy pod,
+/// `meridian-storage copied <claim>` in its pods' init container. Its
+/// behaviour is [`copy`]'s, which its tests specify.
+pub const STORAGE_COMMAND: &str = "meridian-storage";
+
+/// The copy pod's template, filled in for a checked request: the chart's
+/// storage-copy shape, marked the launcher's, for its instance, run in its
+/// own plugin image (item 86).
+pub fn copy_pod(
+    template: &str,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    let filled = template
+        .replace("__INSTANCE__", &request.instance_id)
+        .replace("__IMAGE__", &request.image);
+    if let Some(left) = placeholder(&filled) {
+        return Err(format!(
+            "the storage copy template has a placeholder this does not fill: {left}"
+        ));
+    }
+    let pod: serde_json::Value = serde_json::from_str(&filled)
+        .map_err(|failed| format!("the storage copy template is not JSON: {failed}"))?;
+    let labels = &pod["metadata"]["labels"];
+    if pod["kind"] != "Pod"
+        || labels["meridian.dev/launched"] != "true"
+        || labels["meridian.dev/component"] != "storage-copy"
+        || labels["meridian.dev/instance"] != request.instance_id.as_str()
+    {
+        return Err(
+            "the storage copy template does not mark what it makes as the launcher's copy, for \
+             its instance"
+                .into(),
+        );
+    }
+    Ok(pod)
+}
+
+/// The init container an instance's pods wait in until its own claim is
+/// copied into its shared storage (item 30): the copy pod's own container,
+/// its plugin's image, as `meridian-storage copied` (items 86, 88), the
+/// shared storage mounted read only where the plugin mounts it, and
+/// nothing else.
+pub fn copied_gate(copy: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let container = &copy["spec"]["containers"][0];
+    let command = container["command"].as_array();
+    let claim = command
+        .filter(|command| {
+            command.len() == 3
+                && command[0] == STORAGE_COMMAND
+                && command[1] == "copy"
+                && container["args"].is_null()
+        })
+        .and_then(|command| command[2].as_str())
+        .ok_or("the storage copy template does not run meridian-storage copy")?;
+    let mut gate = serde_json::json!({
+        "name": "storage-copied",
+        "image": container["image"],
+        "command": [STORAGE_COMMAND, "copied", claim],
+        "securityContext": container["securityContext"],
+        "volumeMounts": [{
+            "name": "storage",
+            "mountPath": copy::STORAGE,
+            "readOnly": true,
+        }],
+    });
+    for field in ["imagePullPolicy", "resources"] {
+        if !container[field].is_null() {
+            gate[field] = container[field].clone();
+        }
+    }
+    Ok(gate)
+}
+
+/// The Deployment with `gate` before its containers: its pods start once
+/// the copy is whole. Refused for a shape with no storage to mount.
+pub fn with_gate(
+    mut manifest: serde_json::Value,
+    gate: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let pod = &mut manifest["spec"]["template"]["spec"];
+    let mounts_storage = pod["volumes"]
+        .as_array()
+        .is_some_and(|volumes| volumes.iter().any(|v| v["name"] == "storage"));
+    if !mounts_storage {
+        return Err("the shards storage template has no volume named storage to wait on".into());
+    }
+    match pod["initContainers"].as_array_mut() {
+        Some(held) => held.push(gate),
+        None => pod["initContainers"] = serde_json::Value::Array(vec![gate]),
+    }
+    Ok(manifest)
+}
+
+/// The pods of a list still running, or yet to, that mount `claim` --
+/// but the copy's own: an instance's earlier pods, which may still write
+/// their last records into it.
+pub fn holding(list: &serde_json::Value, claim: &str) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|pod| pod["metadata"]["labels"]["meridian.dev/component"] != "storage-copy")
+        .filter(|pod| {
+            !matches!(
+                pod["status"]["phase"].as_str(),
+                Some("Succeeded" | "Failed")
+            )
+        })
+        .filter(|pod| {
+            pod["spec"]["volumes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| v["persistentVolumeClaim"]["claimName"] == claim)
+        })
+        .filter_map(|pod| pod["metadata"]["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// The refusal of a first launch as several pods while the instance's
+/// earlier pods still stop, which may still write into its own claim:
+/// approved by the product owner as item 69 (2026-11-17).
+pub fn still_stopping_said(instance: &str) -> String {
+    format!(
+        "{instance}'s storage is copied into its shared storage before it runs as several \
+         pods, and its earlier pods are still stopping; launch it again once they have"
+    )
+}
+
+/// The words the SDK's `meridian-storage copy` ends with, its termination
+/// message, each written before the step it names (PO item 89, revised,
+/// 2026-11-17): no marker found, before anything is copied; the marker
+/// about to be written; copied; the marker there already, nothing written.
+pub const UNMARKED: &str = "unmarked";
+pub const MARKING: &str = "marking";
+pub const COPIED: &str = "copied";
+pub const COPIED_BEFORE: &str = "copied before";
+
+/// On an instance's shared claim: the own claim copied into it, kept once
+/// the launcher has read a copy pod that ended `copied` or `copied before`,
+/// so it holds once that pod is gone (item 89).
+pub const COPIED_ANNOTATION: &str = "meridian.dev/storage-copied";
+/// On a copy pod: made where the shared claim held no marker -- made with
+/// it, or after a copy that ended `unmarked` -- so it is the first to write
+/// one (item 89, review c5c86 L3). What was true as it was made: it never
+/// overrides what the pod said as it ended (review c5c89 M5).
+pub const UNMARKED_ANNOTATION: &str = "meridian.dev/storage-unmarked";
+
+/// What the copy pod there says of its instance's shared claim (item 89;
+/// review c5c86 M3): read from what it said as it ended, never from its
+/// absence or its phase alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyPod {
+    /// Copying: Pending within its pods' wait ([`copy::WAIT_LIMIT`]), or
+    /// Running however long, a copy of much storage.
+    Copying,
+    /// The marker is there: the shared claim says so, or the copy pod
+    /// ended `copied` or `copied before`.
+    Copied,
+    /// No marker: the copy pod failed saying `unmarked`, and nothing else
+    /// (PO item 89; review c5c89 M5).
+    Unmarked,
+    /// Not known: none there; one that failed saying anything but
+    /// `unmarked`, or nothing; one that succeeded without `copied`; one
+    /// Pending past its wait; or one made before this shared claim (stale).
+    /// Its marker is read by a copy pod made again.
+    Unknown,
+    /// On a lost node: Unknown, or being removed (review c5c86 M2), which
+    /// the API server keeps until its node answers or it is force-deleted.
+    Lost,
+}
+
+/// The copy pod `there` read against the shared claim `shared` (its
+/// `creationTimestamp` RFC 3339, as the API server writes it, so ordered
+/// as text), at `now_ns`, the moment of the launch.
+pub fn copy_pod_now(
+    there: Option<&serde_json::Value>,
+    shared: &serde_json::Value,
+    now_ns: i64,
+) -> CopyPod {
+    if !shared["metadata"]["annotations"][COPIED_ANNOTATION].is_null() {
+        return CopyPod::Copied;
+    }
+    let Some(pod) = there else {
+        return CopyPod::Unknown;
+    };
+    let phase = pod["status"]["phase"].as_str().unwrap_or_default();
+    if !pod["metadata"]["deletionTimestamp"].is_null() || phase == "Unknown" {
+        return CopyPod::Lost;
+    }
+    let made = pod["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default();
+    // Made before this shared claim: it says nothing of it (stale).
+    if shared["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap_or_default()
+        > made
+    {
+        return CopyPod::Unknown;
+    }
+    let said = pod["status"]["containerStatuses"][0]["state"]["terminated"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    match phase {
+        "Succeeded" if said == COPIED || said == COPIED_BEFORE => CopyPod::Copied,
+        "Running" => CopyPod::Copying,
+        "Pending" if !past_the_wait(pod, now_ns) => CopyPod::Copying,
+        "Failed" if said == UNMARKED => CopyPod::Unmarked,
+        _ => CopyPod::Unknown,
+    }
+}
+
+/// Whether a copy pod was made longer ago than its instance's pods wait for
+/// it: made at a time the API server wrote, before `now_ns` by more than
+/// [`copy::WAIT_LIMIT`].
+fn past_the_wait(pod: &serde_json::Value, now_ns: i64) -> bool {
+    let limit = i64::try_from(copy::WAIT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
+    pod["metadata"]["creationTimestamp"]
+        .as_str()
+        .and_then(meridian_config::registries::verify::rfc3339_ns)
+        .is_some_and(|made| now_ns.saturating_sub(made) > limit)
+}
+
+/// The copy step's refusals (item 30), asked before any claim is made, so
+/// a refused launch leaves its instance as it was, its storage not yet
+/// shared (review c5c L4): another plugin's claim, and the instance's
+/// earlier pods still mounting its own. The own claim's name, where there
+/// is one to copy.
+pub fn copy_refused(
+    own: Option<&serde_json::Value>,
+    pods: &serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<Option<String>, String> {
+    let Some(own) = own else {
+        return Ok(None);
+    };
+    reusable(own, request)?;
+    let claim = own["metadata"]["name"]
+        .as_str()
+        .ok_or("the instance's own claim has no name")?
+        .to_string();
+    if !holding(pods, &claim).is_empty() {
+        return Err(still_stopping_said(&request.instance_id));
+    }
+    Ok(Some(claim))
+}
+
+/// The copy step (item 30), before the Deployment of an instance of
+/// several pods keeping storage is made: where the launcher kept the
+/// instance's own claim -- for the same plugin, never another's -- and none
+/// of the instance's earlier pods still mounts it, the copy pod read
+/// ([`copy_pod_now`]) and kept, or made (again) to copy or to read the
+/// marker, and the Deployment's pods held until the marker is there. Says
+/// which claim this launch copies only where its copy pod is the first to
+/// write the marker -- the shared claim `fresh`, made by this launch, or an
+/// unmarked copy there -- so the conductor's record of the copy is a copy's
+/// that copied, never one that found it `copied before` (item 89, review
+/// c5c86 L3).
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_step<O: Objects>(
+    api: &O,
+    own: Option<&serde_json::Value>,
+    pods: &serde_json::Value,
+    copy_template: &str,
+    manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+    shared: &serde_json::Value,
+    fresh: bool,
+    now_ns: i64,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let Some(claim) = copy_refused(own, pods, request)? else {
+        return Ok((manifest, None));
+    };
+    let pod = copy_pod(copy_template, request)?;
+    let name = pod["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let there = api.get(Kind::Pod, &name).await?;
+    let now = match copy_pod_now(there.as_ref(), shared, now_ns) {
+        CopyPod::Lost => CopyPod::Lost,
+        _ if fresh => CopyPod::Unmarked,
+        now => now,
+    };
+    let copies = match now {
+        CopyPod::Copying => false,
+        CopyPod::Copied => {
+            mark_copied(api, shared, &claim).await;
+            false
+        }
+        CopyPod::Unmarked => {
+            let mut first = pod.clone();
+            first["metadata"]["annotations"][UNMARKED_ANNOTATION] = "true".into();
+            make_copy(api, there.as_ref(), &first, request).await?;
+            true
+        }
+        CopyPod::Unknown | CopyPod::Lost => {
+            make_copy(api, there.as_ref(), &pod, request).await?;
+            false
+        }
+    };
+    let manifest = with_gate(manifest, copied_gate(&pod)?)?;
+    Ok((manifest, copies.then_some(claim)))
+}
+
+/// The copy pod `pod` made, the one `there` removed first. One being
+/// removed from a lost node stays until that node answers or an
+/// administrator force-deletes it (review c5c86 M2): the launch is refused,
+/// naming it and its node.
+async fn make_copy<O: Objects>(
+    api: &O,
+    there: Option<&serde_json::Value>,
+    pod: &serde_json::Value,
+    request: &CreatePluginRequest,
+) -> Result<(), String> {
+    let name = pod["metadata"]["name"].as_str().unwrap_or_default();
+    if let Some(there) = there {
+        let lost = !there["metadata"]["deletionTimestamp"].is_null()
+            || there["status"]["phase"] == "Unknown";
+        api.delete(Kind::Pod, name).await?;
+        if let Some(still) = api.get(Kind::Pod, name).await? {
+            return Err(if lost {
+                lost_copy_said(&request.instance_id, name, &still)
+            } else {
+                format!("{name} is still being removed; launch again in a moment")
+            });
+        }
+    }
+    if !api.create(Kind::Pod, pod).await? {
+        return Err(format!(
+            "{name} was made by another meanwhile; launch again"
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of a launch whose copy pod is being removed from a node
+/// that does not answer (review c5c86 M2).
+pub fn lost_copy_said(instance: &str, name: &str, pod: &serde_json::Value) -> String {
+    let node = pod["spec"]["nodeName"].as_str().unwrap_or("no node");
+    format!(
+        "{name}, {instance}'s storage copy, is still being removed from {node}, which has not \
+         said it stopped; once an administrator has confirmed {node} is down and force-deleted \
+         {name}, launch again"
+    )
+}
+
+/// The refusal of a launch of one pod while its copy pod reads whether its
+/// copy was made (item 89).
+pub fn reading_copy_said(instance: &str) -> String {
+    format!("reading {instance}'s copy; launch again once it ends")
+}
+
+/// The shared claim `shared` marked as holding `from`'s copy, where it is
+/// not yet: kept so once the copy pod is gone (item 89). Best effort: the
+/// copy pod still says so where the write is refused.
+async fn mark_copied<O: Objects>(api: &O, shared: &serde_json::Value, from: &str) {
+    if !shared["metadata"]["annotations"][COPIED_ANNOTATION].is_null() {
+        return;
+    }
+    let mut marked = shared.clone();
+    marked["metadata"]["annotations"][COPIED_ANNOTATION] = from.into();
+    if let Err(failed) = api.replace(Kind::PersistentVolumeClaim, &marked).await {
+        tracing::warn!(
+            claim = shared["metadata"]["name"].as_str().unwrap_or_default(),
+            "its copy was not kept on it: {failed}"
+        );
+    }
+}
+
+/// The refusal of an instance of several pods whose shared storage, kept,
+/// was made for one node, where the chart now shares it across nodes
+/// (review c5c L5): approved by the product owner as item 81 (2026-11-17).
+pub fn not_shareable_said(instance: &str, name: &str, held: &str, wanted: &str) -> String {
+    format!(
+        "{name}, {instance}'s shared storage, was made {held}, for one node, and this \
+         deployment's chart now asks {wanted} (pluginStorage.shared.storageClassName); it is \
+         kept, and an administrator decides what becomes of it"
+    )
+}
+
+/// The instance's storage, there before its Deployment is: the claim it
+/// kept, when the same plugin launched as it before, or a new one; never
+/// another plugin's (decisions/028), nor a kept one that cannot be mounted
+/// as the chart now asks (review c5c L5). The claim as the API server
+/// holds it.
+pub async fn storage<O: Objects>(
+    api: &O,
+    template: &str,
+    request: &CreatePluginRequest,
+) -> Result<serde_json::Value, String> {
+    let wanted = claim(template, request)?;
+    let name = wanted["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(existing) = api.get(Kind::PersistentVolumeClaim, &name).await? {
+        reusable(&existing, request)?;
+        let modes = |claim: &serde_json::Value| -> Vec<String> {
+            claim["spec"]["accessModes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|mode| mode.as_str().map(String::from))
+                .collect()
+        };
+        // Kept for one node where the chart now asks it shared across
+        // nodes (item 81); kept ReadWriteMany, it mounts as ever, whatever
+        // the chart asks now (review c5c2fold L4).
+        let (held, asked) = (modes(&existing), modes(&wanted));
+        let many = "ReadWriteMany".to_string();
+        if asked.contains(&many) && !held.contains(&many) {
+            return Err(not_shareable_said(
+                &request.instance_id,
+                &name,
+                &held.join(", "),
+                &asked.join(", "),
+            ));
+        }
+        tracing::info!(
+            instance = request.instance_id,
+            claim = name,
+            "its storage, kept"
+        );
+        return Ok(existing);
+    }
+    if !api.create(Kind::PersistentVolumeClaim, &wanted).await? {
+        return Err(format!(
+            "{name} was made by another meanwhile; launch again"
+        ));
+    }
+    tracing::info!(
+        instance = request.instance_id,
+        claim = name,
+        "its storage, made"
+    );
+    api.get(Kind::PersistentVolumeClaim, &name)
+        .await?
+        .ok_or_else(|| format!("{name} was made and is not there; launch again"))
+}
+
+/// The refusal of an instance of several pods whose own claim is kept
+/// where the chart renders no copy pod (review c5c L9): approved by the
+/// product owner as item 80 (2026-11-17).
+pub fn no_copy_pod_said(instance: &str, claim: &str) -> String {
+    format!(
+        "{instance} was asked shards or a standby pod, and its own storage {claim} is kept: \
+         this deployment's chart renders no pod to copy it into its shared storage \
+         (pluginStorage.shared), so it is not launched as several"
+    )
+}
+
+/// The refusal of an instance whose storage is shared since it ran as
+/// several, where the chart renders no shape mounting shared storage
+/// (review c5c L4): approved by the product owner as item 83 (2026-11-17).
+pub fn no_shared_shape_said(instance: &str) -> String {
+    format!(
+        "{instance}'s storage is shared and kept, and this deployment's chart renders no pod \
+         that mounts shared storage (pluginStorage.shared), so it is not launched"
+    )
+}
+
+/// The shared claim beside an instance's own (item 30):
+/// `<fullname>-shared-storage-<instance>` for `<fullname>-storage-<instance>`.
+fn shared_name_of(own: &str, instance: &str) -> Option<String> {
+    own.strip_suffix(&format!("-storage-{instance}"))
+        .map(|fullname| format!("{fullname}-shared-storage-{instance}"))
+}
+
+/// Whether the instance's storage is shared since it ran as several: its
+/// shared claim there, made by the launcher for the same plugin (item 30).
+/// Where the chart no longer renders shared storage, its claim is looked
+/// for by name, and an instance whose storage is shared is refused rather
+/// than run on its own claim without its shards' records (review c5c L4;
+/// item 83).
+///
+/// Not shared yet where its own claim is kept and its copy pod failed
+/// saying `unmarked` (review c5c2fold M2; PO item 89): no pod of it has run
+/// on the shared claim, which they start on only once the copy is whole, so
+/// one pod runs on its own claim as it did. One that copied, runs or waits
+/// within the wait leaves the storage shared; anything else is read again
+/// ([`copied_or_copying`]). `pods` are the instance's launched pods: none
+/// of them may still mount its own claim while a copy pod is made (item 69;
+/// review c5c89 M3).
+pub async fn shared_kept<O: Objects>(
+    api: &O,
+    shapes: &Shapes,
+    request: &CreatePluginRequest,
+    pods: &serde_json::Value,
+    now_ns: i64,
+) -> Result<bool, String> {
+    let Some(storage) = shapes.storage.as_ref() else {
+        return Ok(false);
+    };
+    let rendered = storage.shards.is_some() && storage.shared_claim.is_some();
+    let name = match storage.shared_claim.as_deref() {
+        Some(template) => claim(template, request)?["metadata"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        None => {
+            let own = claim(&storage.claim, request)?;
+            let own = own["metadata"]["name"].as_str().unwrap_or_default();
+            match shared_name_of(own, &request.instance_id) {
+                Some(name) => name,
+                None => return Ok(false),
+            }
+        }
+    };
+    match api.get(Kind::PersistentVolumeClaim, &name).await? {
+        None => Ok(false),
+        Some(existing) => {
+            reusable(&existing, request)?;
+            if !rendered {
+                return Err(no_shared_shape_said(&request.instance_id));
+            }
+            copied_or_copying(api, storage, request, &existing, pods, now_ns).await
+        }
+    }
+}
+
+/// Whether an instance's shared claim, there, holds its storage now or will
+/// once its copy pod ends ([`shared_kept`]; item 89, review c5c86 M3): the
+/// copy pod read ([`copy_pod_now`]). Copied or copying, shared; failed
+/// `unmarked`, not -- no marker, so no shard ever ran on it (item 83) --
+/// and the failed pod left as it is, nothing running in it; not known, the
+/// copy pod made again to read the marker, once none of the instance's
+/// `pods` still mounts its own claim (item 69; review c5c89 M3), and the
+/// launch refused until it ends. A pod removed to be made again is gone
+/// before anything is answered (review c5c89 M2): one still there refuses
+/// the launch ([`make_copy`]).
+async fn copied_or_copying<O: Objects>(
+    api: &O,
+    storage: &StorageShapes,
+    request: &CreatePluginRequest,
+    shared: &serde_json::Value,
+    pods: &serde_json::Value,
+    now_ns: i64,
+) -> Result<bool, String> {
+    let Some(copy_template) = storage.copy.as_deref() else {
+        return Ok(true);
+    };
+    let own = claim(&storage.claim, request)?;
+    let own = own["metadata"]["name"].as_str().unwrap_or_default();
+    if api.get(Kind::PersistentVolumeClaim, own).await?.is_none() {
+        return Ok(true);
+    }
+    let pod = copy_pod(copy_template, request)?;
+    let name = pod["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let there = api.get(Kind::Pod, &name).await?;
+    match copy_pod_now(there.as_ref(), shared, now_ns) {
+        CopyPod::Copying => Ok(true),
+        CopyPod::Copied => {
+            mark_copied(api, shared, own).await;
+            Ok(true)
+        }
+        CopyPod::Unmarked => Ok(false),
+        CopyPod::Unknown | CopyPod::Lost => {
+            if !holding(pods, own).is_empty() {
+                return Err(still_stopping_said(&request.instance_id));
+            }
+            make_copy(api, there.as_ref(), &pod, request).await?;
+            Err(reading_copy_said(&request.instance_id))
+        }
+    }
+}
+
+/// An instance's storage and, for several pods keeping it, the copy of its
+/// own claim into its shared storage (item 30), in this order: the copy's
+/// refusals before any claim is made (review c5c L4); the claim kept or
+/// made ([`storage`]); then the copy step ([`copy_step`]), where the chart
+/// renders a copy pod. `pods` are the instance's launched pods, listed for
+/// a launch of several. Says which claim this launch copies, or none.
+pub async fn storage_and_copy<O: Objects>(
+    api: &O,
+    shapes: &Shapes,
+    claim_template: &str,
+    pods: &serde_json::Value,
+    manifest: serde_json::Value,
+    request: &CreatePluginRequest,
+    now_ns: i64,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let shaped = shapes.storage.as_ref().filter(|_| several(request));
+    let copying = shaped.and_then(|shaped| shaped.copy.as_deref());
+    let own = match shaped {
+        Some(shaped) => {
+            let own = claim(&shaped.claim, request)?;
+            let name = own["metadata"]["name"].as_str().unwrap_or_default();
+            api.get(Kind::PersistentVolumeClaim, name).await?
+        }
+        None => None,
+    };
+    // Its own claim kept, and no copy pod rendered: never started on a
+    // shard-0/ without it (review c5c L9; item 80).
+    if let (Some(own), None) = (&own, copying) {
+        return Err(no_copy_pod_said(
+            &request.instance_id,
+            own["metadata"]["name"].as_str().unwrap_or_default(),
+        ));
+    }
+    copy_refused(own.as_ref(), pods, request)?;
+    // Made by this launch: no marker in it yet (item 89).
+    let wanted = claim(claim_template, request)?;
+    let fresh = api
+        .get(
+            Kind::PersistentVolumeClaim,
+            wanted["metadata"]["name"].as_str().unwrap_or_default(),
+        )
+        .await?
+        .is_none();
+    let held = storage(api, claim_template, request).await?;
+    match copying {
+        Some(copy_template) => {
+            copy_step(
+                api,
+                own.as_ref(),
+                pods,
+                copy_template,
+                manifest,
+                request,
+                &held,
+                fresh,
+                now_ns,
+            )
+            .await
+        }
+        None => Ok((manifest, None)),
+    }
+}
+
 /// A `__NAME__` still in the text, which a newer chart's template would
 /// have and this launcher would not know to fill.
 fn placeholder(text: &str) -> Option<&str> {
@@ -458,6 +1724,8 @@ fn placeholder(text: &str) -> Option<&str> {
     }
     None
 }
+
+pub mod copy;
 
 #[cfg(test)]
 mod tests;

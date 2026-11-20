@@ -373,6 +373,18 @@ impl Plugins {
             ));
         }
         let widening = !declared.is_subset(&running.roles.iter().map(String::as_str).collect());
+        // Its shards and standby pod are kept: refused, before anything is
+        // removed, where the deployment has since left the lease right
+        // they run under.
+        if let Some(refusal) = super::several_or_storage_refused(
+            &request.instance_id,
+            (running.shards, running.standby),
+            || super::ran_as_several(self.store.as_ref(), &request.instance_id),
+            &version,
+            &self.several,
+        ) {
+            return Err(refusal);
+        }
         // Removed first, then recorded: the old launch ended as stopped,
         // the move noted on it, and the instance begun again on the new
         // version under its own ID.
@@ -437,13 +449,15 @@ impl Plugins {
             running.live,
             archive_allowed(&snapshot, &request.instance_id).cloned(),
             running.limits,
+            (running.shards, running.standby),
         );
         match self.ask_launcher::<_, CreatePluginReply>(
             CREATE_PLUGIN,
             "meridian.v1.CreatePluginRequest",
             create,
         ) {
-            Ok(_) => {
+            Ok(made) => {
+                self.pend_copy(&request.instance_id, &made)?;
                 tracing::info!(
                     instance = moved.instance_id,
                     from = format!("{} {}", running.name, running.version),

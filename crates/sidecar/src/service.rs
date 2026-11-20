@@ -190,6 +190,15 @@ pub struct Sidecar {
     /// The plugin's open subscriptions and the stream they deliver on
     /// (W4.3; contract v28, amended 2026-10-30).
     pub(crate) subscriptions: Arc<crate::subscriptions::Registry>,
+
+    /// The instance's shards, where it was launched with several or with a
+    /// standby pod (step 3d; the resilience spec's section 7): which this
+    /// sidecar is, and which live. None: the instance's one pod.
+    pub(crate) shards: Option<Arc<crate::shards::Shards>>,
+
+    /// A data plugin's lake write share (step 3d; section 6.9). None: no
+    /// share set, and nothing held.
+    pub(crate) write_share: Option<Arc<crate::share::WriteShare>>,
 }
 
 impl Sidecar {
@@ -261,7 +270,23 @@ impl Sidecar {
             daily: Arc::default(),
             calls,
             subscriptions: Arc::default(),
+            shards: None,
+            write_share: None,
         }
+    }
+
+    /// As one shard of its instance: its plugin is handed its own share of
+    /// what the lake wants ([`crate::shards`]).
+    pub fn as_shard(mut self, shards: Arc<crate::shards::Shards>) -> Self {
+        self.shards = Some(shards);
+        self
+    }
+
+    /// Holding its plugin's lake writes to a share
+    /// ([`crate::share::WriteShare`]).
+    pub fn with_write_share(mut self, share: Arc<crate::share::WriteShare>) -> Self {
+        self.write_share = Some(share);
+        self
     }
 
     /// Hold registration to `declaration` where no launch is known
@@ -639,6 +664,12 @@ impl SidecarService for Sidecar {
             // what it expected to be. Learning it is not declaring it.
             instance_id: self.identity.instance_id.clone(),
             roles: self.identity.roles.clone(),
+            // Which shard of its instance it serves and of how many, where
+            // this sidecar holds a shard's Lease (item 30): the pods are
+            // identical, so it learns here where its storage is its own.
+            // 0 and 0 for an instance of one pod.
+            shard: self.shards.as_ref().map_or(0, |shards| shards.mine()),
+            shards: self.shards.as_ref().map_or(0, |shards| shards.count()),
         }))
     }
 
@@ -1057,6 +1088,38 @@ mod tests {
                 .await
                 .admitted
         );
+    }
+
+    /// Item 30 (approved 2026-11-15, numbers 2026-11-17): a plugin learns
+    /// at registration which shard of its instance it serves and of how
+    /// many -- the pods are identical -- and an instance of one pod is told
+    /// 0 and 0; its report names the shard too.
+    #[tokio::test]
+    async fn a_shard_s_plugin_is_told_its_shard_and_the_count_at_registration() {
+        let one = sidecar()
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(one.admitted);
+        assert_eq!((one.shard, one.shards), (0, 0));
+        let shard = sidecar().as_shard(Arc::new(crate::shards::Shards::new(1).of(3)));
+        let told = shard
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(told.admitted);
+        assert_eq!((told.shard, told.shards), (1, 3));
+        assert_eq!(shard.report(0).shard, 1);
+        // A standby alone is shard 0 of 1.
+        let standby = sidecar().as_shard(Arc::new(crate::shards::Shards::new(0).of(1)));
+        let told = standby
+            .register(Request::new(register_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((told.shard, told.shards), (0, 1));
     }
 
     async fn admitted_sidecar() -> Sidecar {

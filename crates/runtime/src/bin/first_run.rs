@@ -296,101 +296,13 @@ impl Provisioner for Postgres {
     ) -> Result<(), String> {
         std::thread::scope(|threads| {
             threads
-                .spawn(|| connect_and_provision(privileged, password, plan))
+                .spawn(|| {
+                    meridian_runtime::provision::connect_and_provision(privileged, password, plan)
+                })
                 .join()
                 .unwrap_or_else(|_| Err("the database could not be made".into()))
         })
     }
-}
-
-/// Make the database and its roles, as the privileged login.
-///
-/// Idempotent throughout, because applying twice is how a partial apply is
-/// completed: a database or a role that is already there is kept, and only
-/// the password and the grants are set again.
-///
-/// Every name here becomes SQL, and DDL takes no parameters, so each one is
-/// checked before it is quoted. A name that is not an identifier is refused
-/// rather than escaped: this is a wizard somebody types into.
-fn connect_and_provision(
-    privileged: &DatabaseLogin,
-    password: &[u8],
-    plan: &Provision,
-) -> Result<(), String> {
-    let database = identifier(&plan.database)?;
-    let mut server = connect(privileged, password, &privileged.database)?;
-
-    let exists: bool = server
-        .query_one(
-            "select exists(select 1 from pg_database where datname = $1)",
-            &[&plan.database],
-        )
-        .map_err(|failed| format!("the server could not be asked about {database}: {failed}"))?
-        .get(0);
-    if !exists {
-        // Outside a transaction, which is what CREATE DATABASE requires.
-        server
-            .batch_execute(&format!("create database {database}"))
-            .map_err(|failed| format!("{database} could not be created: {failed}"))?;
-    }
-
-    for role in &plan.roles {
-        let name = identifier(&role.name)?;
-        let secret = literal(&role.password)?;
-        let held: bool = server
-            .query_one(
-                "select exists(select 1 from pg_roles where rolname = $1)",
-                &[&role.name],
-            )
-            .map_err(|failed| format!("the server could not be asked about {name}: {failed}"))?
-            .get(0);
-        let statement = match held {
-            // The password is set either way: a second apply with a
-            // regenerated one must still leave a deployment that can connect.
-            true => format!("alter role {name} with login password {secret}"),
-            false => format!("create role {name} with login password {secret}"),
-        };
-        server
-            .batch_execute(&statement)
-            .map_err(|failed| format!("{name} could not be made: {failed}"))?;
-        server
-            .batch_execute(&format!("grant connect on database {database} to {name}"))
-            .map_err(|failed| format!("{name} could not be let into {database}: {failed}"))?;
-    }
-
-    // Each component's own login, a member of the serving role with its
-    // password, and the serving session's statement_timeout on it (the
-    // resilience spec's section 10a).
-    if let Some(serving) = plan.roles.iter().find(|role| !role.may_create) {
-        meridian_changes::serving::ensure_logins(
-            &mut server,
-            &identifier(&serving.name)?,
-            &serving.password,
-            &database,
-        )?;
-    }
-
-    // The schema's grants are made from inside the database, by the only role
-    // entitled to make them. Postgres warns rather than refuses when somebody
-    // else tries, which is why this connects again rather than hoping.
-    let mut inside = connect(privileged, password, &plan.database)?;
-    for role in &plan.roles {
-        let name = identifier(&role.name)?;
-        inside
-            .batch_execute(&format!("grant usage on schema public to {name}"))
-            .map_err(|failed| format!("{name} could not be given the schema: {failed}"))?;
-        let schema = match role.may_create {
-            true => format!("grant create on schema public to {name}"),
-            // And from PUBLIC, which is where a role gets it without anybody
-            // granting anything on Postgres 14 and older.
-            false => format!("revoke create on schema public from {name}, public"),
-        };
-        inside.batch_execute(&schema).map_err(|failed| {
-            format!("{name}'s rights on the schema could not be set: {failed}")
-        })?;
-    }
-
-    Ok(())
 }
 
 /// The database this chart brings, when it renders one.
@@ -416,59 +328,32 @@ fn brought_server() -> Option<BroughtServer> {
         superuser_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD")?,
         serving_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD")?,
         migrating_password: var("MERIDIAN_FIRST_RUN_BROUGHT_MIGRATING_PASSWORD")?,
+        also: also_brought(),
     })
 }
 
-/// One connection, to whichever database is named.
-///
-/// The same shape the check builds, and separate from it because provisioning
-/// connects twice -- once to the server to make the database, and once inside
-/// it to grant on the schema, which only a role entitled to may do.
-fn connect(
-    login: &DatabaseLogin,
-    password: &[u8],
-    database: &str,
-) -> Result<postgres::Client, String> {
-    let mut config = postgres::Config::new();
-    config
-        .host(&login.host)
-        .port(if login.port == 0 {
-            5432
-        } else {
-            login.port as u16
-        })
-        .dbname(database)
-        .user(&login.role)
-        .password(String::from_utf8_lossy(password).as_ref())
-        .connect_timeout(std::time::Duration::from_secs(10));
-
-    // Over TLS where the deployment's internal TLS is on (ruling 1084).
-    let (config, tls) = meridian_changes::tls::secured(config, false)
-        .map_err(|failed| format!("the database's TLS: {failed}"))?;
-    config
-        .connect(tls)
-        .map_err(|failed| format!("{} could not connect to {database}: {failed}", login.role))
-}
-
-/// A name, if it is one. Refused rather than escaped.
-fn identifier(name: &str) -> Result<String, String> {
-    let ok = !name.is_empty()
-        && name.len() <= 63
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    match ok {
-        true => Ok(format!("\"{name}\"")),
-        false => Err(format!("{name} is not a name this can make")),
+/// Each database past the first the chart brings (step 3d; section 6.4):
+/// `<release>-<store>-database-<d>`, for d from 1 below each store's count
+/// the chart sets (MERIDIAN_LAKE_DATABASES, MERIDIAN_BOR_DATABASES), named
+/// from the first's StatefulSet, `<release>-database`.
+fn also_brought() -> Vec<String> {
+    let Some(first) = var("MERIDIAN_FIRST_RUN_BROUGHT_WORKLOAD") else {
+        return Vec::new();
+    };
+    let release = first
+        .strip_suffix("-database")
+        .unwrap_or(&first)
+        .to_string();
+    let mut also = Vec::new();
+    for store in ["lake", "bor"] {
+        let count: u32 = var(&meridian_changes::databases::count_var(store))
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(1);
+        for d in 1..count {
+            also.push(format!("{release}-{store}-database-{d}"));
+        }
     }
-}
-
-/// A string literal for a statement that cannot take a parameter.
-fn literal(value: &str) -> Result<String, String> {
-    if value.contains('\0') {
-        return Err("a password with a null in it is not one Postgres takes".into());
-    }
-    Ok(format!("'{}'", value.replace('\'', "''")))
+    also
 }
 
 impl DatabaseProbe for Postgres {

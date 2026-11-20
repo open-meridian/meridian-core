@@ -2,7 +2,8 @@
 """The desktop footprint (ruling 1058; spec/a-deployment-scales-out-and-fails-over-
 by-configuration section 13): the default profile's pods, memory and CPU,
 against v29's baseline in deploy/footprint-baseline.yaml, failing past its
-limits -- no new pod, memory requested and at peak each at most 15% over,
+limits -- no new pod, memory requested at most 15% over, memory at peak at
+most the baseline's ruled ceiling (PO 2026-11-20: 200 MiB) or else 15% over,
 CPU requested at most 15% over, disk at most 10% over.
 
 What a chart asks for is read from what it renders (`render`), the same on
@@ -137,17 +138,29 @@ def read_baseline(path: str) -> dict:
     return held
 
 
+# A figure the product owner ruled as a fixed ceiling, in place of its
+# percentage over v29: the peak's is 200 MiB (PO 2026-11-20).
+CEILINGS = {"memory_peak_mib": "memory_peak_ceiling_mib"}
+
+
+def most_for(baseline: dict, key: str) -> tuple[float, str]:
+    """The most a figure may be, and how that bound was set."""
+    ceiling = CEILINGS.get(key)
+    if ceiling and ceiling in baseline:
+        return baseline[ceiling], "the ruled ceiling"
+    allowed = LIMITS[key]
+    return baseline[key] * (1 + allowed), f"{allowed:.0%} over v29's {baseline[key]:g}"
+
+
 def held_to(baseline: dict, figures: dict) -> list[str]:
     problems = []
-    for key, allowed in LIMITS.items():
+    for key in LIMITS:
         if key not in baseline or key not in figures:
             continue
-        base, now = baseline[key], figures[key]
-        most = base * (1 + allowed)
+        now = figures[key]
+        most, why = most_for(baseline, key)
         if now > most + 1e-9:
-            problems.append(
-                f"{key} is {now:g}, past {most:g} ({allowed:.0%} over v29's {base:g})"
-            )
+            problems.append(f"{key} is {now:g}, past {most:g} ({why})")
     return problems
 
 
@@ -213,6 +226,13 @@ metadata:
     held, past = judge({"memory_peak_mib": 162}, {"a": 190, "b": 188, "c": 160})
     assert held == 188 and past, (held, past)
     assert median([1, 2, 3, 4]) == 2.5
+    # The ruled ceiling replaces 15% over for the peak: 189 passes, 201 does not.
+    ruled = {"memory_peak_mib": 162, "memory_peak_ceiling_mib": 200}
+    held, past = judge(ruled, {"a": 189, "b": 190, "c": 186})
+    assert held == 189 and past == [], (held, past)
+    held, past = judge(ruled, {"a": 201, "b": 200.5, "c": 199})
+    assert held == 200.5 and past, (held, past)
+    assert most_for(ruled, "memory_peak_mib") == (200, "the ruled ceiling")
 
 
 def main() -> int:
@@ -255,9 +275,9 @@ def main() -> int:
         held, problems = judge(baseline, peaks)
         for job, peak in sorted(peaks.items()):
             print(f"  {job}: peak {peak:g} MiB")
+        most, why = most_for(baseline, "memory_peak_mib") if "memory_peak_mib" in baseline else (0, "no baseline")
         print(f"  the highest {max(peaks.values()):g} MiB; the median {held:g} MiB, "
-              f"held to {baseline.get('memory_peak_mib', 0) * (1 + LIMITS['memory_peak_mib']):g} "
-              f"(15% over v29's {baseline.get('memory_peak_mib', 0):g})")
+              f"held to {most:g} ({why})")
         if problems:
             print("footprint FAILED: the cluster jobs' median peak is past v29's baseline (ruling 1058):", file=sys.stderr)
             for problem in problems:

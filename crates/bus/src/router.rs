@@ -248,7 +248,7 @@ pub struct Bus {
     backends: HashMap<String, Arc<dyn Backend>>,
     rules: Vec<RouteRule>,
     default_backend: String,
-    handlers: RwLock<HashMap<String, Handler>>,
+    handlers: Arc<RwLock<HashMap<String, Handler>>>,
     instance_id: String,
     default_timeout: Duration,
 
@@ -270,7 +270,63 @@ pub struct Bus {
     /// spec's section 1): the topics it serves, every other declined. Unset,
     /// as every writer and every other component, everything is served.
     serves_only: RwLock<Option<Serves>>,
+
+    /// Where this member hands a write its writer group does not own (step
+    /// 3d; the resilience spec's section 6.7): unset, as with one group,
+    /// nothing is handed on.
+    routing: Arc<RwLock<Option<Routing>>>,
+
+    /// Told to stop, and writing nothing more here
+    /// ([`Bus::stop_writing_here`]): every write is handed on.
+    handing: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Fenced while it served on, told to stop ([`Bus::refuse_from_here`]):
+    /// every topic served here is refused, to be asked again.
+    refusing: Arc<std::sync::atomic::AtomicBool>,
+
+    /// A sidecar's plugin shard and its epoch, stamped on every message it
+    /// sends once set (step 3d, checkpoint 5, item 32; [`Bus::stamp_shard`]).
+    /// Unset, as for every core component and every one-pod instance's
+    /// sidecar: shard and epoch 0, which no fence checks.
+    shard: Arc<std::sync::OnceLock<(u32, u64)>>,
+
+    /// What this bus may send now, asked before every publish and call
+    /// ([`Bus::gate_sends`]); unset, everything.
+    gate: Arc<std::sync::OnceLock<SendGate>>,
 }
+
+/// A bus's own gate on what it sends: `Err(why)` holds a topic back.
+pub type SendGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// A member's hand-off of writes to their owners.
+#[derive(Clone)]
+struct Routing {
+    /// The store's internal topic a write is handed on.
+    internal: String,
+    /// Which of its topics are writes.
+    writes: Serves,
+    /// The group a write is its owner's by, read from the request before
+    /// its handler runs any of its work: none where the request does not say
+    /// cheaply, and its handler finds out (step 3d; the ownership pre-check
+    /// decided 2026-11-13).
+    owner_of: Option<OwnerOf>,
+    /// This member's writer group.
+    group: u32,
+    backend: Arc<dyn Backend>,
+    timeout: Duration,
+}
+
+/// What a write's owning group is, read from its request (step 3d).
+pub type OwnerOf = Arc<dyn Fn(&str, &Envelope) -> Option<u32> + Send + Sync>;
+
+/// What a writer fenced while it served on says of each topic asked of it
+/// ([`Bus::refuse_from_here`]), after the topic's name.
+const NO_LONGER_WRITES: &str =
+    "was asked of a writer that no longer writes, another taking its place; ask again";
+
+/// What a write handed to its owner leaves of its caller's deadline for its
+/// answer's way back through this member.
+const HANDED_BACK: Duration = Duration::from_millis(250);
 
 /// Which topics a reader member serves.
 type Serves = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -350,14 +406,55 @@ impl Bus {
             backends,
             rules: Vec::new(),
             default_backend: "default".to_string(),
-            handlers: RwLock::new(HashMap::new()),
+            handlers: Arc::default(),
             instance_id: instance_id.into(),
             default_timeout: Duration::from_secs(5),
             clock,
             observer: RwLock::new(None),
             reads: Arc::default(),
             serves_only: RwLock::new(None),
+            routing: Arc::default(),
+            handing: Arc::default(),
+            refusing: Arc::default(),
+            shard: Arc::default(),
+            gate: Arc::default(),
         }
+    }
+
+    /// Stamp every message this bus sends from here on with its plugin's
+    /// shard and the epoch the lake answered its take with (step 3d,
+    /// checkpoint 5, item 32: `MessageMeta.shard`, `.shard_epoch`). A
+    /// sidecar's alone, set once, before it serves: never by a plugin, and
+    /// never changed after -- a shard lost ends its process.
+    pub fn stamp_shard(&self, shard: u32, epoch: u64) -> Result<(), String> {
+        self.shard
+            .set((shard, epoch))
+            .map_err(|_| "this bus already stamps a shard".to_string())
+    }
+
+    /// Hold back what `gate` refuses, from here on: every publish and call
+    /// asks it first (review c5a M1: a data shard's sidecar past its Lease's
+    /// renew deadline sends its lake record writes alone). Set once.
+    pub fn gate_sends(&self, gate: SendGate) -> Result<(), String> {
+        self.gate
+            .set(gate)
+            .map_err(|_| "this bus already gates its sends".to_string())
+    }
+
+    /// Whether this bus may send on `topic` now.
+    fn may_send(&self, topic: &str) -> crate::Result<()> {
+        match self.gate.get() {
+            Some(gate) => gate(topic).map_err(|why| BusError::NotSent {
+                topic: topic.to_string(),
+                why,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The shard and epoch this bus stamps; none where it stamps none.
+    pub fn shard_stamped(&self) -> Option<(u32, u64)> {
+        self.shard.get().copied()
     }
 
     /// Route the topics `rules` match to the backends they name, beside the
@@ -387,6 +484,17 @@ impl Bus {
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
         self
+    }
+
+    /// Every handler served and every subscription made on this bus so far
+    /// in force on each of its backends ([`Backend::subscribed`]): at a
+    /// broker, the broker holds them. A component says it serves after
+    /// this, never before.
+    pub async fn subscribed(&self) -> Result<(), BusError> {
+        for backend in self.backends.values() {
+            backend.subscribed().await?;
+        }
+        Ok(())
     }
 
     fn backend_for(&self, topic: &str) -> &Arc<dyn Backend> {
@@ -426,6 +534,7 @@ impl Bus {
         correlation_id: Option<&str>,
         causation_id: Option<&str>,
     ) -> crate::Result<String> {
+        self.may_send(topic)?;
         let message_id = uuid::Uuid::new_v4().to_string();
         let envelope = Envelope {
             meta: Some(self.meta(
@@ -466,7 +575,12 @@ impl Bus {
             let (_, rx) = tokio::sync::mpsc::channel(1);
             return Subscription::new(rx, pattern, Default::default());
         }
-        let group = format!("{}.{work}", self.instance_id);
+        // A store of several writer groups (step 3d): each group shares the
+        // work among its own members, and does it for its own partitions.
+        let group = match self.routing.read().expect("routing poisoned").as_ref() {
+            Some(route) => format!("{}.{work}.group-{}", self.instance_id, route.group),
+            None => format!("{}.{work}", self.instance_id),
+        };
         self.backend_for(pattern).subscribe_shared(pattern, &group)
     }
 
@@ -483,6 +597,8 @@ impl Bus {
             return;
         }
         let handler = self.held_to_read_after(topic, Arc::new(handler));
+        let handler = self.routed(topic, handler);
+        let handler = self.refused_once_fenced(topic, handler);
         self.handlers
             .write()
             .expect("handler lock poisoned")
@@ -492,14 +608,252 @@ impl Bus {
         // offer it, every copy of this component one group (contract v25),
         // so a request is answered once. The in-process backend does nothing
         // here, because the map above is already the answer.
+        // A write another writer group owns, as the request says, passed to
+        // its owner before it is admitted here (step 3d): never a slot of
+        // this member's held while the owner answers, nor admitted twice.
+        let routing = Arc::clone(&self.routing);
+        let refusing = Arc::clone(&self.refusing);
+        let asked = topic.to_string();
+        // Fenced while it served on: nothing is passed on by what this
+        // member last read of the owners; its handler refuses it.
+        let route = crate::backend::PreRoute::new(
+            move |envelope: &Envelope| {
+                let route = routing.read().expect("routing poisoned").clone()?;
+                if !(route.writes)(&asked) {
+                    return None;
+                }
+                let group = (route.owner_of.as_ref()?)(&asked, envelope)?;
+                (group != route.group).then(|| (route.internal.clone(), group))
+            },
+            refusing,
+        );
         self.backend_for(topic)
-            .serve(topic, &self.instance_id, handler);
+            .serve_routed(topic, &self.instance_id, handler, route);
     }
 
     /// This process's part in `read_after` (contract v30, stage B): a store's
     /// member keeps its position here, a sidecar its session.
     pub fn reads_after(&self) -> &Arc<crate::read_after::Reads> {
         &self.reads
+    }
+
+    /// Hand each write this member's writer group `group` does not own to
+    /// its owner (step 3d; the resilience spec's section 6.7): every topic
+    /// `writes` says is a write is answered as ever, but where its store
+    /// says, by [`crate::owners::hand_to`], that the write is another
+    /// group's, the request is handed on `internal`, unchanged and
+    /// addressed to that group, and answered with the owner's reply. And
+    /// `internal` offered to this group alone: a write handed here is
+    /// answered by its public topic's own handler, never handed on again.
+    /// With one writer group nothing calls this, and nothing is handed on.
+    pub fn hand_writes_on(
+        &self,
+        internal: &str,
+        group: u32,
+        writes: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) {
+        let writes: Serves = Arc::new(writes);
+        let owner_of = self
+            .routing
+            .read()
+            .expect("routing poisoned")
+            .as_ref()
+            .and_then(|routing| routing.owner_of.clone());
+        *self.routing.write().expect("routing poisoned") = Some(Routing {
+            internal: internal.to_string(),
+            writes: Arc::clone(&writes),
+            owner_of,
+            group,
+            backend: Arc::clone(self.backend_for(internal)),
+            timeout: self.default_timeout,
+        });
+        let handlers = Arc::clone(&self.handlers);
+        let handed_on: Handler = Arc::new(move |envelope: Envelope| {
+            let topic = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.topic.clone())
+                .unwrap_or_default();
+            if !writes(&topic) {
+                return Err(format!(
+                    "{topic:?} is no write of this store: only a write is handed on"
+                ));
+            }
+            let handler = handlers
+                .read()
+                .expect("handler lock poisoned")
+                .get(&topic)
+                .cloned()
+                .ok_or_else(|| format!("{topic:?} is not served here"))?;
+            crate::owners::arriving();
+            handler(envelope)
+        });
+        self.backend_for(internal).serve_group(
+            internal,
+            &format!("{}.group-{group}", self.instance_id),
+            group,
+            handed_on,
+        );
+    }
+
+    /// `envelope`, a write of `topic`, handed to writer group `group` on the
+    /// internal topic [`Bus::hand_writes_on`] named, and answered with the
+    /// owner's reply (step 3d): what a member does with each other group's
+    /// part of a write spanning several. Called from a handler, off the
+    /// runtime's own threads. Refused where no hand-off is configured.
+    pub fn hand_to_owner(&self, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
+        let route = self.routing.read().expect("routing poisoned").clone();
+        match route {
+            Some(route) => hand_unless_refusing(&self.refusing, &route, group, topic, envelope),
+            None => Err(format!(
+                "{topic} is writer group {group}'s to write, and this member hands nothing on"
+            )),
+        }
+    }
+
+    /// Decide a write's owning group from its request before its handler
+    /// runs (step 3d; section 6.7; the ownership pre-check decided
+    /// 2026-11-13): `owner_of` answers the group where the request says it
+    /// cheaply -- the book's account's placement, the lake's datasets' -- and
+    /// a write of another group's is handed to it at once, its handler
+    /// never run here. Where it answers none, the handler finds out as
+    /// before. Set after [`Bus::hand_writes_on`].
+    pub fn route_writes_by(
+        &self,
+        owner_of: impl Fn(&str, &Envelope) -> Option<u32> + Send + Sync + 'static,
+    ) {
+        if let Some(routing) = self.routing.write().expect("routing poisoned").as_mut() {
+            routing.owner_of = Some(Arc::new(owner_of));
+        }
+    }
+
+    /// Write nothing more here (step 3d, stage T's review, finding 3;
+    /// ruled 2026-11-15): from now on every write this member receives is
+    /// handed on, its own group's too -- to its group on the internal
+    /// topic, where its replacement answers once it serves -- and its
+    /// handler never run; the internal topic is no longer offered here, so
+    /// a write handed to its group reaches its replacement alone; `leaves`
+    /// names the topics it stops offering besides (its reads: its books
+    /// are no longer brought up to date by what it commits); and its
+    /// shared subscriptions end, their work its replacement's.
+    ///
+    /// What a store's writer with no lease does when it is told to stop
+    /// and serves on, so that the store's public write topics stay served
+    /// while it never commits beside its replacement. A write whose group
+    /// has no writer serving is not answered there, and its caller is
+    /// refused UNAVAILABLE at its deadline, to ask again: held, never lost.
+    /// False, and nothing done, where no hand-off is configured.
+    pub fn stop_writing_here(&self, leaves: impl Fn(&str) -> bool + Send + Sync + 'static) -> bool {
+        let Some(route) = self.routing.read().expect("routing poisoned").clone() else {
+            return false;
+        };
+        self.handing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let internal = route.internal.clone();
+        let what = crate::backend::Withdrawn {
+            topics: Arc::new(move |topic: &str| topic == internal || leaves(topic)),
+            shared_work: true,
+        };
+        for backend in self.backends.values() {
+            backend.withdraw(what.clone());
+        }
+        true
+    }
+
+    /// Whether [`Bus::stop_writing_here`] was called.
+    pub fn writes_nothing_here(&self) -> bool {
+        self.handing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Answer nothing more here (ruled 2026-11-18, item 110): from now on
+    /// every topic this member serves is refused UNAVAILABLE with a
+    /// retry-after, its handler never run and nothing handed on, so its
+    /// caller asks again and is answered by the member that serves by then.
+    ///
+    /// What a store's writer does when it is fenced while it serves on,
+    /// told to stop: its commits are refused by the epoch as ever, and until
+    /// another writer group's writer serves, or its serve-on's bound, the
+    /// store's public topics are still answered -- "ask again" -- where a
+    /// writer that ended at its fence left them served by nobody.
+    pub fn refuse_from_here(&self) {
+        self.refusing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Bus::refuse_from_here`] was called.
+    pub fn refuses_from_here(&self) -> bool {
+        self.refusing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A served topic's handler, refused once this member refuses from here
+    /// ([`Bus::refuse_from_here`]).
+    fn refused_once_fenced(&self, topic: &str, handler: Handler) -> Handler {
+        let refusing = Arc::clone(&self.refusing);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(no_longer_writes(&topic));
+            }
+            handler(envelope)
+        })
+    }
+
+    /// A write's handler, handed to its owner where its store says so.
+    fn routed(&self, topic: &str, handler: Handler) -> Handler {
+        let routing = Arc::clone(&self.routing);
+        let handing = Arc::clone(&self.handing);
+        let refusing = Arc::clone(&self.refusing);
+        let topic = topic.to_string();
+        Arc::new(move |envelope: Envelope| {
+            let hand = |route: &Routing, group: u32, topic: &str, envelope: Envelope| {
+                hand_unless_refusing(&refusing, route, group, topic, envelope)
+            };
+            let route = routing
+                .read()
+                .expect("routing poisoned")
+                .clone()
+                .filter(|route| (route.writes)(&topic));
+            let Some(route) = route else {
+                return handler(envelope);
+            };
+            let handed = crate::owners::take_arriving();
+            // Told to stop: nothing is written here. Its owner's where the
+            // request says it, else this member's own group's -- its
+            // replacement, this member no longer offering the internal
+            // topic -- which finds the owner as this one would have.
+            if handing.load(std::sync::atomic::Ordering::SeqCst) {
+                let group = route
+                    .owner_of
+                    .as_ref()
+                    .and_then(|owner_of| owner_of(&topic, &envelope))
+                    .unwrap_or(route.group);
+                return hand(&route, group, &topic, envelope);
+            }
+            // The owner decided from the request first: another group's
+            // write handed on before any of its handler's work.
+            if !handed {
+                if let Some(owner_of) = route.owner_of.as_ref() {
+                    if let Some(group) = owner_of(&topic, &envelope) {
+                        if group != route.group {
+                            return hand(&route, group, &topic, envelope);
+                        }
+                    }
+                }
+            }
+            crate::owners::begin(handed);
+            let kept = envelope.clone();
+            let answered = handler(envelope);
+            let named = crate::owners::take_named();
+            match crate::owners::take_hand_to() {
+                None => answered,
+                Some(_) if handed && !named => Err(crate::refusal_with_status(
+                    crate::RefusalStatus::Unavailable,
+                    &[],
+                    crate::owners::NOT_THIS_GROUPS,
+                )),
+                Some(group) => hand(&route, group, &topic, kept),
+            }
+        })
     }
 
     /// Serve only the topics `serves` says, from now on: a store's reader
@@ -712,6 +1066,7 @@ impl Bus {
         timeout: Option<Duration>,
         stamp: &Stamp,
     ) -> crate::Result<(String, Vec<u8>)> {
+        self.may_send(topic)?;
         let handler = self
             .handlers
             .read()
@@ -828,6 +1183,10 @@ impl Bus {
             // Contract v30's read_after (W4.4): a sidecar's session stamps
             // its plugin's reads (stage B); unset reads from the nearest member.
             read_after: stamp.read_after.clone(),
+            // A sidecar holding a shard (step 3d, checkpoint 5, item 32): its
+            // shard and epoch on every message, which the stores' fences check.
+            shard: self.shard.get().map_or(0, |(shard, _)| *shard),
+            shard_epoch: self.shard.get().map_or(0, |(_, epoch)| *epoch),
         }
     }
 }
@@ -1021,6 +1380,62 @@ mod tests {
         assert_eq!(super::calls_by_topic(&[]), "");
     }
 
+    /// Review c5a M1: a bus's own gate holds back what it refuses, a
+    /// publish and a call alike, before anything is sent; the rest go.
+    #[tokio::test]
+    async fn a_gated_bus_sends_nothing_its_gate_holds_back() {
+        let bus = bus();
+        bus.serve("platform.lake.command.record-prices", |_| {
+            Ok(("R".into(), vec![]))
+        });
+        bus.serve("platform.lake.command.renew-wants", |_| {
+            Ok(("R".into(), vec![]))
+        });
+        let mut heard = bus.subscribe_every("platform.lake.event.**");
+        bus.gate_sends(Arc::new(|topic: &str| {
+            if topic.contains("record-") {
+                Ok(())
+            } else {
+                Err("held".into())
+            }
+        }))
+        .unwrap();
+        assert!(bus
+            .call(
+                "platform.lake.command.record-prices",
+                "t",
+                vec![],
+                None,
+                None
+            )
+            .await
+            .is_ok());
+        let held = bus
+            .call("platform.lake.command.renew-wants", "t", vec![], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&held, BusError::NotSent { why, .. } if why == "held"),
+            "{held}"
+        );
+        let held = bus
+            .publish(
+                "platform.lake.event.want-withdrawn",
+                "t",
+                vec![],
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(held, BusError::NotSent { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), heard.recv())
+                .await
+                .is_err(),
+            "a message held back was heard"
+        );
+    }
+
     #[tokio::test]
     async fn the_time_stamped_is_the_clocks_it_was_given() {
         let clock = Arc::new(ManualClock::at(NOW));
@@ -1173,6 +1588,117 @@ mod tests {
         assert!(matches!(err, BusError::Timeout { .. }), "got {err:?}");
     }
 
+    /// Item 110 (ruled 2026-11-18): a writer fenced while it served on
+    /// answers every topic it serves "ask again" -- UNAVAILABLE, with a
+    /// retry-after -- and runs no handler.
+    #[tokio::test]
+    async fn a_member_refusing_from_here_answers_ask_again_and_runs_no_handler() {
+        let bus = bus();
+        let ran = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&ran);
+        bus.serve("platform.book.command.record-order", move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(("R".into(), vec![]))
+        });
+        let ask = || {
+            bus.call(
+                "platform.book.command.record-order",
+                "Q",
+                vec![],
+                None,
+                None,
+            )
+        };
+        ask().await.expect("answered while it writes");
+        assert!(!bus.refuses_from_here());
+        bus.refuse_from_here();
+        assert!(bus.refuses_from_here());
+        let detail = match ask().await {
+            Err(BusError::HandlerFailed { detail, .. }) => detail,
+            other => panic!("fenced while serving on, it answered {other:?}"),
+        };
+        assert_eq!(
+            crate::backend::read_refusal_status(&detail).map(|(status, _, _)| status),
+            Some(crate::RefusalStatus::Unavailable),
+            "{detail}"
+        );
+        assert_eq!(crate::backend::refusal_retry_after(&detail), Some(1));
+        assert!(detail.contains("ask again"), "{detail}");
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "its handler ran once it refused from here"
+        );
+    }
+
+    /// A handler already running when its writer is fenced while it serves
+    /// on hands nothing on after (ruled 2026-11-18, item 120; review-c5n5
+    /// F2): a part of a write spanning several groups
+    /// ([`Bus::hand_to_owner`]), or a write its handler found another
+    /// group's ([`crate::owners::hand_to`]), is refused to be asked again --
+    /// UNAVAILABLE, retry-after 1 -- not handed on by the owners it last
+    /// read. Before, each was handed on as if no fence had come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handler_running_at_the_fence_hands_nothing_on_after() {
+        for spanning in [true, false] {
+            let bus = Arc::new(bus());
+            let write = "platform.lake.command.record-prices";
+            bus.hand_writes_on("platform.lake.internal.command", 1, move |topic| {
+                topic == write
+            });
+            let (entered, running) = std::sync::mpsc::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (entered, released) = (
+                std::sync::Mutex::new(entered),
+                std::sync::Mutex::new(released),
+            );
+            let handing = Arc::downgrade(&bus);
+            bus.serve(write, move |envelope| {
+                entered.lock().unwrap().send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                if spanning {
+                    // The other group's part of a write spanning two.
+                    return handing.upgrade().unwrap().hand_to_owner(0, write, envelope);
+                }
+                // Found the other group's as it ran.
+                crate::owners::hand_to(0);
+                Err("another group's".into())
+            });
+            let asking = Arc::clone(&bus);
+            let asked =
+                tokio::spawn(async move { asking.call(write, "Q", vec![], None, None).await });
+            tokio::task::spawn_blocking(move || {
+                running.recv_timeout(Duration::from_secs(10)).unwrap()
+            })
+            .await
+            .unwrap();
+            bus.refuse_from_here();
+            release.send(()).unwrap();
+            let detail = match asked.await.unwrap() {
+                Err(BusError::HandlerFailed { detail, .. }) => detail,
+                other => panic!("fenced while it ran (spanning {spanning}), it answered {other:?}"),
+            };
+            assert_eq!(
+                crate::backend::read_refusal_status(&detail).map(|(status, _, _)| status),
+                Some(crate::RefusalStatus::Unavailable),
+                "spanning {spanning}: {detail}"
+            );
+            assert_eq!(
+                crate::backend::refusal_retry_after(&detail),
+                Some(1),
+                "spanning {spanning}: {detail}"
+            );
+            assert!(
+                detail.contains(NO_LONGER_WRITES),
+                "spanning {spanning}: handed on: {detail}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_failing_handler_reports_why() {
         let bus = bus();
@@ -1292,13 +1818,18 @@ mod tests {
                 backend: "reference".into(),
             }],
             default_backend: "default".into(),
-            handlers: RwLock::new(HashMap::new()),
+            handlers: Arc::default(),
             instance_id: "core-1".into(),
             default_timeout: Duration::from_secs(5),
             clock: Arc::new(ManualClock::at(NOW)),
             observer: RwLock::new(None),
             reads: Arc::default(),
             serves_only: RwLock::new(None),
+            routing: Arc::default(),
+            handing: Arc::default(),
+            refusing: Arc::default(),
+            shard: Arc::default(),
+            gate: Arc::default(),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");
@@ -1447,5 +1978,87 @@ mod acting_for {
             "https://directory.example.org|8812"
         );
         assert_eq!(subject_seen(None).await, "");
+    }
+}
+
+/// What a member that refuses from here ([`Bus::refuse_from_here`]) answers
+/// a request on `topic`: UNAVAILABLE, retry-after 1, to be asked again.
+fn no_longer_writes(topic: &str) -> String {
+    crate::refusal_status_retrying(
+        crate::RefusalStatus::Unavailable,
+        1,
+        format!("{topic} {NO_LONGER_WRITES}"),
+    )
+}
+
+/// [`hand`], unless this member refuses from here: a handler already
+/// running at its fence hands nothing on after by the owners it last read
+/// -- a part of a write spanning several groups, or a write it found
+/// another group's -- and its caller is answered "ask again" (ruled
+/// 2026-11-18, item 120; review-c5n5 F2).
+fn hand_unless_refusing(
+    refusing: &std::sync::atomic::AtomicBool,
+    route: &Routing,
+    group: u32,
+    topic: &str,
+    envelope: Envelope,
+) -> HandlerReply {
+    if refusing.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(no_longer_writes(topic));
+    }
+    hand(route, group, topic, envelope)
+}
+
+/// `envelope`, a write of `topic`, handed to writer group `group` on its
+/// store's internal topic, and answered with the owner's reply: its answer,
+/// or its refusal word for word. An owner that does not answer -- none
+/// serving, mid-failover, or past the caller's deadline -- is refused
+/// UNAVAILABLE, which the caller may ask again.
+fn hand(route: &Routing, group: u32, topic: &str, envelope: Envelope) -> HandlerReply {
+    let unavailable = |why: String| {
+        crate::refusal_with_status(
+            crate::RefusalStatus::Unavailable,
+            &[],
+            format!("{topic} is writer group {group}'s to write, and {why}; ask again"),
+        )
+    };
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| unavailable("this member has no runtime to hand it on".into()))?;
+    let timeout = match crate::read_after::deadline() {
+        Some(deadline) => deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .saturating_sub(HANDED_BACK),
+        None => route.timeout,
+    };
+    if timeout.is_zero() {
+        return Err(unavailable(
+            "the caller's deadline left no time to hand it on".into(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let answered = handle.block_on(route.backend.request_to_group(
+        &route.internal,
+        envelope,
+        timeout,
+        group,
+    ));
+    let took = started.elapsed();
+    let ms = format!("{:.1}", took.as_secs_f64() * 1e3);
+    if matches!(answered, Ok(_) | Err(BusError::HandlerFailed { .. })) {
+        crate::owners::note_handed(took);
+    }
+    match answered {
+        Ok(answer) => {
+            tracing::debug!(topic, group, ms, "a write handed to its owner: answered");
+            Ok((answer.payload_type, answer.payload))
+        }
+        Err(BusError::HandlerFailed { detail, .. }) => {
+            tracing::debug!(topic, group, ms, "a write handed to its owner: refused");
+            Err(detail)
+        }
+        Err(failed) => {
+            tracing::warn!(topic, group, ms, %failed, "a write handed to its owner: not answered");
+            Err(unavailable(format!("it did not answer ({failed})")))
+        }
     }
 }

@@ -19,6 +19,10 @@
 //! against a projection; the projections are written beside the entry, read
 //! by the reads, and rebuilt from the journal whole by [`Store::rebuild`].
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use meridian_changes::groups::Groups;
 use postgres::{GenericClient, IsolationLevel, Row, Transaction};
 use prost::Message;
 use r2d2_postgres::PostgresConnectionManager;
@@ -28,14 +32,15 @@ use meridian_domain::v1::{
 };
 
 use crate::book::{agreement_key, Book, Changes};
+use crate::group_commit::{Command, Decider, Lane, Pending};
 use crate::journal::{Body, Entry};
 use crate::migrations;
 use crate::order_reads;
 use crate::reads;
 use crate::store::{
-    first_partition_of, Acted, AttributesRead, BreaksRead, Decide, FiguresRead, HistoryRead,
-    InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead, Record,
-    Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
+    first_partition_of, Acted, AttributesRead, BreaksRead, Committed, Decide, Decided, FiguresRead,
+    HistoryRead, InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead,
+    Record, Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
 thread_local! {
@@ -46,6 +51,80 @@ thread_local! {
     /// The heads its snapshots read, the lowest of each where it took more
     /// than one.
     static SNAPSHOT_HEADS: std::cell::RefCell<Option<Mark>> = const { std::cell::RefCell::new(None) };
+    /// This database's share of a read of every account that fans out over
+    /// several databases ([`answering_for`]).
+    static WRITTEN_HERE: std::cell::RefCell<Option<Share>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A database's share of a read of every account over several databases
+/// (step 3d; the review's C5): the accounts placed in the partitions it
+/// writes, but those it is told to leave to another, and the accounts it
+/// is told to answer for besides -- an account between its move's close and
+/// its open, whose close here names a target that holds nothing of it yet,
+/// read here at its source and left out at its target (m9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Share {
+    /// The partitions this database writes.
+    pub partitions: Vec<String>,
+    /// Accounts answered here besides: closed here toward a database that
+    /// has not opened them.
+    pub also: Vec<String>,
+    /// Accounts placed in a partition written here left out: another
+    /// database answers for them.
+    pub not: Vec<String>,
+}
+
+/// `read` on this thread answering only the accounts of `share` -- those
+/// placed in the partitions this database writes -- in a read of every
+/// account over several databases (step 3d; the review's C5): each
+/// partition's accounts from the database writing it, so none is read
+/// twice, a move's copy in another database included, even for the moment
+/// of a switch; and an account between its close and its open from its
+/// source, so none is missed (m9).
+pub fn answering_for<T>(share: &Share, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Share>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            WRITTEN_HERE.with(|written| *written.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(WRITTEN_HERE.with(|written| written.replace(Some(share.clone()))));
+    read()
+}
+
+/// `values` as a SQL text array's literal.
+fn text_array(values: &[String]) -> String {
+    format!(
+        "ARRAY[{}]::text[]",
+        values
+            .iter()
+            .map(|value| format!("'{}'", value.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// A read's condition on `column`, an account: in this database's share,
+/// under [`answering_for`]; nothing otherwise. In the read's own statement,
+/// so its rows and their placements are one snapshot.
+fn written_here(column: &str) -> String {
+    WRITTEN_HERE.with(|written| match &*written.borrow() {
+        None => String::new(),
+        Some(share) => {
+            let mut placed = format!(
+                "{column} IN (SELECT account_id FROM book_account WHERE partition = ANY({}))",
+                text_array(&share.partitions)
+            );
+            if !share.not.is_empty() {
+                placed = format!("({placed} AND {column} <> ALL({}))", text_array(&share.not));
+            }
+            if !share.also.is_empty() {
+                placed = format!("({placed} OR {column} = ANY({}))", text_array(&share.also));
+            }
+            format!("AND {placed}")
+        }
+    })
 }
 
 /// The next reads on this thread each answer from one repeatable-read
@@ -105,6 +184,30 @@ pub struct PostgresStore {
     /// Its database's identity as its connections found it (contract v30,
     /// stage C): a new timeline raises the epoch before a command there.
     watch: std::sync::Arc<meridian_changes::timeline::Watch>,
+    /// Each partition's lane: the commands waiting for its transaction in
+    /// flight (step 3d, group commit).
+    lanes: Mutex<HashMap<String, Arc<Lane>>>,
+    /// The partition each account was last found in.
+    placed: Mutex<HashMap<String, String>>,
+    /// Told of each batch's commits, in their order, once it commits.
+    committed: Mutex<Option<Committed>>,
+    /// Its writer group and the book's count (step 3d; section 6.3): the
+    /// partitions it may commit to, and those it raises the epoch of.
+    groups: meridian_changes::groups::Groups,
+    /// One adoption at once where it may raise the epoch (several groups,
+    /// or one group's writer at its start).
+    adopting: Mutex<()>,
+    /// Its count of partitions (step 3d; `bor.partitions`): where a new
+    /// account is placed.
+    partitions: u32,
+    /// Every database's store, this one's among them, where the book has
+    /// several (step 3d; section 6.4): where an account placed in another
+    /// database is found.
+    databases: std::sync::OnceLock<Vec<std::sync::Weak<PostgresStore>>>,
+    /// The partitions this store, its group's home database, found no other
+    /// database holding further on under its group (step 3d; ruled
+    /// 2026-11-14): written here from then on, never asked again.
+    home_settled: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl PostgresStore {
@@ -115,8 +218,7 @@ impl PostgresStore {
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
         let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
+        let pool = meridian_changes::pool(pool_size)
             .connection_customizer(Box::new(meridian_changes::timeline::Watching(
                 std::sync::Arc::clone(&watch),
             )))
@@ -127,7 +229,56 @@ impl PostgresStore {
             snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
             fence: meridian_changes::Fence::new(),
             watch,
+            lanes: Mutex::default(),
+            placed: Mutex::default(),
+            committed: Mutex::default(),
+            groups: meridian_changes::groups::Groups::one(),
+            adopting: Mutex::new(()),
+            partitions: 1,
+            databases: std::sync::OnceLock::new(),
+            home_settled: Mutex::default(),
         })
+    }
+
+    /// The same store, placing new accounts over `count` partitions (step
+    /// 3d; section 6.3).
+    pub fn with_partitions(mut self, count: u32) -> Self {
+        self.partitions = count.max(1);
+        self
+    }
+
+    /// Each of `P0` to `P<count-1>`'s head row made where it is not, at the
+    /// control partition's epoch, as `migrate` makes them for
+    /// `bor.partitions` (step 3d; section 6.3). Lowering the count removes
+    /// none: the CLI's upgrade preflight refuses it.
+    pub fn make_partitions(&self, count: u32) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let names: Vec<String> = (0..count.max(1))
+            .map(crate::store::partition_named)
+            .collect();
+        let made = conn
+            .execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch)
+                 SELECT p, 0, (SELECT epoch FROM book_partition_head WHERE partition = 'control')
+                   FROM unnest($1::text[]) AS p
+                 ON CONFLICT (partition) DO NOTHING",
+                &[&names],
+            )
+            .map_err(unavailable)?;
+        Ok(made as usize)
+    }
+
+    /// The same store, writing for writer group `groups` (step 3d; section
+    /// 6.3): its acts commit only to the partitions its group owns, and its
+    /// takeover raises only theirs.
+    pub fn with_groups(mut self, groups: meridian_changes::groups::Groups) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// Its writer group and the book's count.
+    pub fn groups(&self) -> meridian_changes::groups::Groups {
+        self.groups
     }
 
     /// The same store, keeping a snapshot every `interval` entries (W9.10).
@@ -139,8 +290,19 @@ impl PostgresStore {
     /// Apply every migration not yet recorded, under a lock. Run once per
     /// release by `meridian-bor migrate`, never by a starting process.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
+        self.migrate_within(clock, meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST)
+    }
+
+    /// [`Self::migrate`], its schema lock waited for at most `lock_waits`:
+    /// what is left of the migration's bound when it is applied again
+    /// (meridian_runtime::migrate_once_it_answers; review c5s L3).
+    pub fn migrate_within(
+        &self,
+        clock: &dyn meridian_clock::Clock,
+        lock_waits: std::time::Duration,
+    ) -> Result<()> {
         let mut conn = self.conn()?;
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+        meridian_changes::take_schema_lock(&mut *conn, SCHEMA_LOCK, lock_waits)
             .map_err(unavailable)?;
         let outcome = apply_migrations(&mut conn, clock).and_then(|()| chain(&mut conn));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
@@ -214,6 +376,25 @@ impl PostgresStore {
     /// takeover raises it, adopted, and the takeover recorded with that
     /// cause. Nothing where it writes under no epoch.
     fn follow_on(&self, conn: &mut Connection) -> Result<meridian_changes::timeline::Timeline> {
+        self.follow_from(conn, None)
+    }
+
+    /// [`Self::follow_on`] from the partition a look read as this group's
+    /// just before (tests: read before a move's switch committed).
+    #[doc(hidden)]
+    pub fn follow_timeline_from(
+        &self,
+        anchor: &str,
+    ) -> Result<meridian_changes::timeline::Timeline> {
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        self.follow_from(&mut conn, Some(anchor))
+    }
+
+    fn follow_from(
+        &self,
+        conn: &mut Connection,
+        seen: Option<&str>,
+    ) -> Result<meridian_changes::timeline::Timeline> {
         use meridian_changes::timeline::Timeline;
         let _alone = self.watch.alone();
         let mine = self.fence.epoch();
@@ -227,17 +408,47 @@ impl PostgresStore {
             at_ns: meridian_changes::now_ns(),
         };
         let mut tx = conn.transaction().map_err(unavailable)?;
+        let anchor = match seen {
+            Some(seen) => Some(seen.to_string()),
+            None => anchor_of(&mut tx, self.groups)?,
+        };
+        let Some(anchor) = anchor else {
+            return Ok(Timeline::Same);
+        };
+        // A group past the first anchors on a partition it writes: held
+        // here against a move's switch while it is followed, and read again
+        // under that hold (step 3d; CI 43621875619). A partition moved away
+        // after it was read carries its new group's epoch, which is never
+        // this member's deposer: looked at again at the next look.
+        if !self.groups.holds_control() {
+            let still = tx
+                .query_opt(
+                    "SELECT partition, writer_group FROM book_partition_head
+                      WHERE partition = $1 AND epoch <> -1 FOR SHARE",
+                    &[&anchor],
+                )
+                .map_err(unavailable)?
+                .is_some_and(|row| owned_in_row(self.groups, &row));
+            if !still {
+                return Ok(Timeline::Same);
+            }
+        }
+        let groups = self.groups;
         let (found, identity) = meridian_changes::timeline::follow(
             &mut tx,
             "book_partition_head",
-            CONTROL_PARTITION,
+            &anchor,
             mine,
-            |tx| raise(tx, &by),
+            |tx| raise(tx, &by, groups),
         )
         .map_err(unavailable)?;
-        tx.commit().map_err(unavailable)?;
+        // Its own raise is its epoch before the raise can be read.
+        match &found {
+            Timeline::Moved(epoch) => self.fence.adopt_committing(*epoch, || tx.commit()),
+            _ => tx.commit(),
+        }
+        .map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
-            self.fence.adopt(epoch);
             tracing::warn!(
                 epoch,
                 identity,
@@ -288,7 +499,8 @@ impl PostgresStore {
         looking.commit().map_err(unavailable)?;
         drop(conn);
         let mut kept = 0;
-        for (account, partition) in due {
+        // Each writer group its own partitions' (step 3d).
+        for (account, partition) in due.into_iter().filter(|(_, p)| self.groups.owns(p)) {
             let mut conn = self.conn()?;
             let mut tx = conn.transaction().map_err(unavailable)?;
             meridian_changes::serving::unbounded(&mut tx).map_err(unavailable)?;
@@ -326,6 +538,31 @@ impl PostgresStore {
     }
 }
 
+/// Every table holding an account's rows by its `account_id`: what a move
+/// between databases copies, its row first (step 3d; section 6.4).
+const ACCOUNT_TABLES: &[&str] = &[
+    "book_account",
+    "book_entry",
+    "book_snapshot",
+    "book_position",
+    "book_lot",
+    "book_pending",
+    "book_break",
+    "book_figures",
+    "book_attributes",
+    "book_order",
+    "book_placement",
+    "book_execution",
+    "book_unplaced",
+    "book_locate",
+    "book_instruction",
+    "book_change_request",
+    "book_order_entry",
+    "book_booking",
+    "book_alert",
+    "book_block_member",
+];
+
 /// Follow every partition's chain (step 3b, integrity at rest): each
 /// entry's digest taken again of its canonical form after the digest it
 /// names, and the digest it names the one before it in its partition, so a
@@ -333,16 +570,20 @@ impl PostgresStore {
 /// bad one in each partition.
 pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity::Scrubbed> {
     let mut scrubbed = meridian_changes::integrity::Scrubbed::default();
-    let partitions: Vec<String> = conn
+    // Each partition's chain as far as its head here commits to it: an
+    // account moved in from another database brings entries of a partition
+    // this one does not write, which that database's own chain holds (step
+    // 3d; section 6.4).
+    let partitions: Vec<(String, i64)> = conn
         .query(
-            "SELECT partition FROM book_partition_head ORDER BY partition",
+            "SELECT partition, sequence FROM book_partition_head ORDER BY partition",
             &[],
         )
         .map_err(unavailable)?
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
-    for partition in partitions {
+    for (partition, head) in partitions {
         let mut after: i64 = 0;
         let mut previous: Option<Vec<u8>> = None;
         'partition: loop {
@@ -350,10 +591,10 @@ pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity:
                 .query(
                     &format!(
                         "SELECT {ENTRY_COLUMNS}, committed_at_ns FROM book_entry
-                          WHERE partition = $1 AND first_sequence > $2
+                          WHERE partition = $1 AND first_sequence > $2 AND first_sequence <= $3
                           ORDER BY first_sequence LIMIT 500"
                     ),
-                    &[&partition, &after],
+                    &[&partition, &after, &head],
                 )
                 .map_err(unavailable)?;
             if rows.is_empty() {
@@ -515,6 +756,12 @@ fn entry_of(row: &Row) -> Result<Entry> {
 }
 
 fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<Entry>> {
+    journal_rows(client, account_id).map(crate::journal::in_order)
+}
+
+/// An account's entries as its partitions hold them, by sequence: across a
+/// move, [`crate::journal::in_order`] puts them in the order written.
+fn journal_rows(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<Entry>> {
     client
         .query(
             &format!(
@@ -525,43 +772,67 @@ fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<E
         )
         .map_err(unavailable)?
         .iter()
-        // Each entry replayed is the one its digest was taken of (step 3b):
-        // a record changed beneath the book fails the replay loudly.
-        .map(|row| {
-            if !stored_verifies(row) {
-                let (_, _, digest) = stored_of(row);
-                return Err(StoreError::Unavailable(format!(
-                    "entry {} of partition {} (account {}) does not match its digest {}: the \
-                     record changed beneath the book, and it is not replayed from it",
-                    row.get::<_, i64>(4),
-                    row.get::<_, String>(2),
-                    row.get::<_, String>(1),
-                    meridian_changes::integrity::short(&digest)
-                )));
-            }
-            entry_of(row)
-        })
+        .map(verified_entry)
         .collect()
+}
+
+/// Each entry replayed is the one its digest was taken of (step 3b): a
+/// record changed beneath the book fails the replay loudly.
+fn verified_entry(row: &Row) -> Result<Entry> {
+    if !stored_verifies(row) {
+        let (_, _, digest) = stored_of(row);
+        return Err(StoreError::Unavailable(format!(
+            "entry {} of partition {} (account {}) does not match its digest {}: the \
+             record changed beneath the book, and it is not replayed from it",
+            row.get::<_, i64>(4),
+            row.get::<_, String>(2),
+            row.get::<_, String>(1),
+            meridian_changes::integrity::short(&digest)
+        )));
+    }
+    entry_of(row)
 }
 
 /// The entries of an account's journal numbered above `after`, in order.
 fn journal_after(
     client: &mut impl GenericClient,
     account_id: &str,
-    after: u64,
+    kept: &Book,
+    current: &str,
 ) -> Result<Vec<Entry>> {
-    client
+    let Some(last) = kept.entries.last().map(|entry| entry.first.clone()) else {
+        return journal_of(client, account_id);
+    };
+    let tail: Vec<Entry> = client
         .query(
             &format!(
-                "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND first_sequence > $2
+                "SELECT {ENTRY_COLUMNS} FROM book_entry
+                  WHERE account_id = $1 AND partition = $2 AND first_sequence > $3
                   ORDER BY first_sequence"
             ),
-            &[&account_id, &(after as i64)],
+            &[&account_id, &last.partition, &(last.sequence as i64)],
         )
         .map_err(unavailable)?
         .iter()
         .map(entry_of)
-        .collect()
+        .collect::<Result<_>>()?;
+    // The account moved since the snapshot (step 3d; W9.8): its tail is
+    // the rest of its journal in the order written, across partitions.
+    let moved = current != last.partition
+        || tail
+            .iter()
+            .any(|entry| crate::journal::closes(entry).is_some());
+    if !moved {
+        return Ok(tail);
+    }
+    let whole = journal_of(client, account_id)?;
+    let after = whole
+        .iter()
+        .position(|entry| {
+            entry.partition == last.partition && entry.first_sequence == last.sequence
+        })
+        .map_or(0, |at| at + 1);
+    Ok(whole.into_iter().skip(after).collect())
 }
 
 /// An account's latest usable snapshot (contract v25, W9.10): of this
@@ -632,20 +903,24 @@ fn book_from(
     account_id: &str,
     partition: &str,
 ) -> Result<(Book, Replayed)> {
-    match snapshot_of(client, account_id, None, None)? {
+    let (mut book, replayed) = match snapshot_of(client, account_id, None, None)? {
         Some(kept) => {
-            let tail = journal_after(client, account_id, crate::snapshot::last_sequence(&kept))?;
-            Ok((crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail)))
+            let tail = journal_after(client, account_id, &kept, partition)?;
+            (crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail))
         }
         None => {
             let entries = journal_of(client, account_id)?;
             let replayed = Replayed::of(&entries);
-            Ok((
+            (
                 Book::replay_lean(account_id, partition, &entries)?,
                 replayed,
-            ))
+            )
         }
-    }
+    };
+    // Acted on in the partition its placement names, read under that
+    // partition's lock (section 6.3), whichever its last entry is in.
+    book.partition = partition.to_string();
+    Ok((book, replayed))
 }
 
 /// A read's snapshot (v26's core; W9.10's note "when a snapshot is taken",
@@ -733,10 +1008,13 @@ fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64)
 
 /// The accounts the book holds, in order.
 fn accounts_of(client: &mut impl GenericClient) -> Result<Vec<String>> {
+    let written = written_here("account_id");
     Ok(client
         .query(
-            "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%'
-              ORDER BY account_id COLLATE \"C\"",
+            &format!(
+                "SELECT account_id FROM book_account WHERE account_id NOT LIKE '~%' {written}
+                  ORDER BY account_id COLLATE \"C\""
+            ),
             &[],
         )
         .map_err(unavailable)?
@@ -765,8 +1043,7 @@ fn book_as_of_in(
     let at = at.get(&partition).copied().unwrap_or(0);
     let (book, entries) = match snapshot_of(client, account_id, Some(at), until)? {
         Some(kept) => {
-            let after = crate::snapshot::last_sequence(&kept);
-            let tail = journal_after(client, account_id, after)?;
+            let tail = journal_after(client, account_id, &kept, &partition)?;
             (kept.resume_as_of(&tail, Some(at), until)?, tail)
         }
         None => {
@@ -788,6 +1065,12 @@ fn heads_of(client: &mut impl GenericClient) -> Result<Mark> {
 }
 
 /// A 32-bit hash of a partition's name, stable across releases (FNV-1a).
+/// The advisory lock a partition's batches and its move's switch take:
+/// what a test holds to stand for a batch that never finishes.
+pub fn partition_lock_key(partition: &str) -> i64 {
+    partition_lock(partition)
+}
+
 fn partition_lock(partition: &str) -> i64 {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in partition.bytes() {
@@ -1413,68 +1696,369 @@ fn decoded<M: Message + Default>(rows: Vec<Row>, column: usize) -> Result<Vec<M>
         .collect()
 }
 
-impl Store for PostgresStore {
-    fn act(
-        &self,
-        account_id: &str,
-        message_id: &str,
-        idempotency_key: &str,
-        request: &[u8],
-        decide: &mut Decide<'_>,
-    ) -> Result<Acted> {
-        // The writer's epoch, adopted before a connection is taken, so a
-        // store of one connection never waits on itself (step 3a).
-        if self.fence.epoch() == 0 {
-            self.adopt()?;
-        }
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        let partition: String = tx
+/// How many times an act follows its account to another partition before it
+/// is refused: a move between the guess and the lock is rare, two rarer.
+const MOVES_FOLLOWED: usize = 4;
+
+/// A batch's transaction that did not commit.
+enum Unbatched {
+    /// Nothing in it can commit now -- no connection, the epoch fenced, the
+    /// commit itself failed -- so each command is answered this.
+    Whole(StoreError),
+    /// An unexpected database error mid-batch: the batch is tried again one
+    /// command at a time, so it is refused only for the command it was.
+    Broken(StoreError),
+}
+
+/// The same refusal again, for each command of a batch.
+fn again(failed: &StoreError) -> StoreError {
+    match failed {
+        StoreError::Fenced(fenced) => StoreError::Fenced(*fenced),
+        StoreError::Unavailable(words) => StoreError::Unavailable(words.clone()),
+        StoreError::Held(words) => StoreError::Held(words.clone()),
+        StoreError::ShardFenced(fenced) => StoreError::ShardFenced(fenced.clone()),
+        StoreError::NotOwned { partition, group } => StoreError::NotOwned {
+            partition: partition.clone(),
+            group: *group,
+        },
+        other => StoreError::Unavailable(other.to_string()),
+    }
+}
+
+impl PostgresStore {
+    /// The partition `account_id` was last found in by this store; where it
+    /// has not been, the partition an account starts in.
+    fn placed(&self, account_id: &str) -> String {
+        self.placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| first_partition_of(account_id).to_string())
+    }
+
+    /// The partition the record holds `account_id` in now; where it holds
+    /// none, the partition an account starts in.
+    fn found(&self, account_id: &str) -> Result<String> {
+        let here: Option<String> = self
+            .conn()?
             .query_opt(
                 "SELECT partition FROM book_account WHERE account_id = $1",
                 &[&account_id],
             )
             .map_err(unavailable)?
-            .map(|row| row.get(0))
-            .unwrap_or_else(|| first_partition_of(account_id).to_string());
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&partition_lock(&partition)],
+            .map(|row| row.get(0));
+        // Placed in another database (step 3d; section 6.4): found there.
+        let found = here.or_else(|| {
+            self.databases.get().and_then(|stores| {
+                stores
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .filter(|store| !std::ptr::eq(store.as_ref(), self))
+                    .find_map(|store| store.placement_held(account_id))
+            })
+        });
+        Ok(found.unwrap_or_else(|| first_partition_of(account_id).to_string()))
+    }
+
+    fn place(&self, account_id: &str, partition: &str) {
+        let mut placed = self.placed.lock().expect("placements poisoned");
+        if placed.get(account_id).map(String::as_str) != Some(partition) {
+            placed.insert(account_id.to_string(), partition.to_string());
+        }
+    }
+
+    /// `partition`'s lane: the commands waiting for its transaction in flight.
+    fn lane(&self, partition: &str) -> Arc<Lane> {
+        Arc::clone(
+            self.lanes
+                .lock()
+                .expect("lanes poisoned")
+                .entry(partition.to_string())
+                .or_default(),
         )
-        .map_err(unavailable)?;
-        // The head under its lock, its epoch the writer's (step 3a): a
-        // command commits only while the head row's epoch is its own.
+    }
+
+    /// How many commands wait in `partition`'s lane for its transaction in
+    /// flight (section 6.5): what a test of group commit waits on, never a
+    /// sleep.
+    pub fn waiting(&self, partition: &str) -> usize {
+        self.lane(partition).waiting()
+    }
+
+    /// One batch of `partition`'s commands in one transaction (section 6.5),
+    /// each answered its own outcome in order. An unexpected database error
+    /// mid-batch tries the batch again one command at a time.
+    fn batch(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> Vec<Result<Acted>> {
+        // How long the partition's lane was busy (step 3d; the profile's
+        // advice on writer groups, approved 2026-11-14).
+        let began = std::time::Instant::now();
+        let outcomes = self.batch_timed(partition, batch, decider);
+        meridian_changes::busy::record(partition, began.elapsed(), meridian_changes::now_ns());
+        outcomes
+    }
+
+    fn batch_timed(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> Vec<Result<Acted>> {
+        let outcomes = match self.try_batch(partition, batch, decider) {
+            Ok(outcomes) => outcomes,
+            Err(Unbatched::Broken(failed)) if batch.len() > 1 => {
+                tracing::warn!(
+                    partition,
+                    commands = batch.len(),
+                    %failed,
+                    "a batch's transaction failed: each of its commands is tried alone"
+                );
+                batch
+                    .iter()
+                    .map(|pending| {
+                        match self.try_batch(partition, std::slice::from_ref(pending), decider) {
+                            Ok(mut alone) => alone.pop().unwrap_or_else(|| Err(again(&failed))),
+                            Err(Unbatched::Whole(failed) | Unbatched::Broken(failed)) => {
+                                Err(failed)
+                            }
+                        }
+                    })
+                    .collect()
+            }
+            Err(Unbatched::Whole(failed) | Unbatched::Broken(failed)) => {
+                return batch.iter().map(|_| Err(again(&failed))).collect();
+            }
+        };
+        // Its commits told in their order, the batch's whole page at once.
+        if let Some(observer) = self.committed.lock().expect("observer poisoned").as_ref() {
+            let committed: Vec<&Decided> = outcomes
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    Ok(Acted::Committed(decided)) => Some(decided.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if !committed.is_empty() {
+                observer(self.fence.epoch(), &committed);
+            }
+        }
+        outcomes
+    }
+
+    fn try_batch(
+        &self,
+        partition: &str,
+        batch: &[Pending],
+        decider: &mut Decider<'_, '_>,
+    ) -> std::result::Result<Vec<Result<Acted>>, Unbatched> {
+        let whole = |failed: postgres::Error| Unbatched::Whole(unavailable(failed));
+        let mut conn = self.conn().map_err(Unbatched::Whole)?;
+        let mut tx = conn.transaction().map_err(whole)?;
+        // Held while a move switches the partition (step 3d; section 6.8):
+        // its switch holds the lock, and a batch waits for it at most
+        // `moves.holdSeconds`, then is answered OVERLOADED with a
+        // retry-after.
+        // The bound set in the same statement as the lock, so a batch takes
+        // no more round trips than it did.
+        // Never past the caller's deadline (section 6.8).
+        let hold_ms = crate::moves::hold_now().as_millis().max(1).to_string();
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)
+               FROM (SELECT set_config('lock_timeout', $2, true)) AS bounded",
+            &[&partition_lock(partition), &hold_ms],
+        )
+        .map_err(|failed| match failed.code() {
+            Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                Unbatched::Whole(StoreError::Held(format!(
+                    "partition {partition} is switching to another writer group: ask again in a moment"
+                )))
+            }
+            _ => whole(failed),
+        })?;
+        // The head under its lock, its epoch the writer's (step 3a), checked
+        // once for the batch (section 6.5): a batch commits only while the
+        // head row's epoch is its own.
         let held = tx
-            .query_one(
-                "SELECT sequence, epoch, last_digest FROM book_partition_head WHERE partition = $1 FOR UPDATE",
+            .query_opt(
+                "SELECT sequence, epoch, last_digest, writer_group FROM book_partition_head
+                  WHERE partition = $1 FOR UPDATE",
                 &[&partition],
             )
-            .map_err(unavailable)?;
-        self.fence.admits(held.get::<_, i64>(1) as u64)?;
-        // The epoch the entry is committed under: the head row's, which the
-        // fence has just admitted as the writer's own -- never one read
+            .map_err(whole)?
+            .ok_or_else(|| {
+                Unbatched::Whole(StoreError::Unavailable(format!(
+                    "the book has no partition {partition}"
+                )))
+            })?;
+        // Another writer group named the partition's owner (step 3d; ruled
+        // 2026-11-14): moved to it, so the batch is handed to it -- read
+        // before the epoch, as a move is never a fence.
+        let named = held.get::<_, Option<i32>>(3).map(|group| group as u32);
+        self.groups.assign(partition, named);
+        if let Some(group) = named.filter(|group| *group != self.groups.mine()) {
+            if group < self.groups.count() {
+                return Err(Unbatched::Whole(StoreError::NotOwned {
+                    partition: partition.to_string(),
+                    group,
+                }));
+            }
+        }
+        // Written where its head is (step 3d; ruled 2026-11-14): another
+        // of the book's databases holding it further on under this group --
+        // the database count was raised and it is not moved home yet, or a
+        // move home has just switched it -- and the batch is this group's
+        // to write there: NotOwned naming this group, which its book routes
+        // again by head, never begun or committed twice.
+        if self.headed_elsewhere(partition, held.get::<_, i64>(0).max(0) as u64)? {
+            return Err(Unbatched::Whole(StoreError::NotOwned {
+                partition: partition.to_string(),
+                group: self.groups.mine(),
+            }));
+        }
+        let mut epoch = held.get::<_, i64>(1) as u64;
+        // A pointer (its epoch `POINTER_EPOCH`): a move between databases let it go here and
+        // its target has not opened it yet, or opened it elsewhere -- never
+        // written under, never a fence (the review's C3). The write waits.
+        if epoch == meridian_changes::moves::POINTER {
+            return Err(Unbatched::Whole(StoreError::Held(format!(
+                "partition {partition} is moving between databases: ask again in a moment"
+            ))));
+        }
+        // A head never written, made at the control partition's epoch for
+        // a partition another group owns (make_partitions, a raised
+        // `bor.partitions`): taken at its owner's epoch by its first batch,
+        // where this writer holds its group's epoch now (step 3d; CI
+        // 43626539705, an account's move into P1 refused "fenced ... this
+        // writer's 2, the partition's 1"). No entry is under it to protect,
+        // and a deposed writer of the group, its epoch not the group's, is
+        // still fenced.
+        let mine = self.fence.epoch();
+        if held.get::<_, i64>(0) == 0
+            && epoch != mine
+            && self.groups.several()
+            && self.groups.owns(partition)
+            && own_epoch(&mut tx, self.groups.mine()).map_err(Unbatched::Whole)? == Some(mine)
+        {
+            tx.execute(
+                "UPDATE book_partition_head SET epoch = $2 WHERE partition = $1",
+                &[&partition, &(mine as i64)],
+            )
+            .map_err(whole)?;
+            epoch = mine;
+        }
+        self.fence
+            .admits(epoch)
+            .map_err(|fenced| Unbatched::Whole(fenced.into()))?;
+        // The epoch the entries are committed under: the head row's, which
+        // the fence has just admitted as the writer's own -- never one read
         // before the connection was taken, which a connection opened on a
-        // new database timeline raises (contract v30, stage C). Read before,
-        // an entry was kept at the old epoch after the raise's first one
-        // (failover-repeat 43015006850, torn-write: "book: 1 commit(s) at
-        // an epoch below one before it").
-        let epoch = held.get::<_, i64>(1) as u64;
-        let head: i64 = held.get(0);
+        // new database timeline raises (contract v30, stage C; failover-
+        // repeat 43015006850, torn-write).
+        let mut head = held.get::<_, i64>(0).max(0) as u64;
         // The partition's last digest, its chain's end (step 3b).
-        let last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
+        let mut last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
+        let began = head;
+        // Each command's plugin shard's epoch, checked once for the batch
+        // under the head's lock (step 3d, checkpoint 5, item 32): a command
+        // under a lower one refused alone, its row held for the batch.
+        let stamps: Vec<Option<&crate::store::ShardStamp>> = batch
+            .iter()
+            .map(|pending| pending.command.shard.as_ref())
+            .collect();
+        let mut fenced = if stamps.iter().all(Option::is_none) {
+            vec![Ok(()); batch.len()]
+        } else {
+            meridian_changes::shard_fence::check(
+                &mut tx,
+                meridian_changes::shard_fence::BOOK,
+                &stamps,
+            )
+            .map_err(whole)?
+        }
+        .into_iter();
+        let mut outcomes = Vec::with_capacity(batch.len());
+        for pending in batch {
+            if let Some(Err(refused)) = fenced.next() {
+                tracing::warn!(
+                    detail = refused.detail(),
+                    "a command refused by its shard's epoch"
+                );
+                outcomes.push(Err(StoreError::ShardFenced(refused)));
+                continue;
+            }
+            let outcome = self
+                .one(
+                    &mut tx,
+                    partition,
+                    epoch,
+                    (&mut head, &mut last_digest),
+                    pending,
+                    decider,
+                )
+                .map_err(Unbatched::Broken)?;
+            outcomes.push(outcome);
+        }
+        if head != began {
+            tx.execute(
+                "UPDATE book_partition_head SET sequence = $1, last_digest = $3 WHERE partition = $2",
+                &[&(head as i64), &partition, &last_digest],
+            )
+            .map_err(|failed| Unbatched::Broken(unavailable(failed)))?;
+        }
+        tx.commit().map_err(whole)?;
+        Ok(outcomes)
+    }
 
+    /// One command of a batch, in its transaction: its outcome, or the
+    /// database error that broke the batch. A refusal is its own and
+    /// writes nothing; the batch goes on.
+    fn one(
+        &self,
+        tx: &mut Transaction<'_>,
+        partition: &str,
+        epoch: u64,
+        (head, last_digest): (&mut u64, &mut Vec<u8>),
+        pending: &Pending,
+        decider: &mut Decider<'_, '_>,
+    ) -> Result<Result<Acted>> {
+        let Command {
+            account_id,
+            message_id,
+            idempotency_key,
+            request,
+            ..
+        } = &pending.command;
+        // Its account's partition read again under the partition's lock
+        // (section 6.3): an account found in another is acted on there.
+        let now: String = tx
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_else(|| first_partition_of(account_id).to_string());
+        if now != partition {
+            return Ok(Err(StoreError::Moved(now)));
+        }
         // A duplicate is answered with the first's reply, nothing applied:
         // the same message, or the same command under the same key. Another
-        // command under a key the account holds is refused (Q12).
+        // command under a key the account holds is refused (Q12). A batch's
+        // earlier command is seen: it is in this transaction.
         if !message_id.is_empty() {
             if let Some(row) = tx
                 .query_opt(
                     "SELECT reply FROM book_entry WHERE message_id = $1",
-                    &[&message_id],
+                    &[message_id],
                 )
                 .map_err(unavailable)?
             {
-                return Ok(Acted::Duplicate(row.get(0)));
+                return Ok(Ok(Acted::Duplicate(row.get(0))));
             }
         }
         if !idempotency_key.is_empty() {
@@ -1482,30 +2066,51 @@ impl Store for PostgresStore {
                 .query_opt(
                     "SELECT reply, request FROM book_entry
                       WHERE account_id = $1 AND idempotency_key = $2",
-                    &[&account_id, &idempotency_key],
+                    &[account_id, idempotency_key],
                 )
                 .map_err(unavailable)?
             {
                 let held: Vec<u8> = row.get(1);
-                if held != request {
-                    return Err(StoreError::conflict(idempotency_key, account_id));
+                if &held != request {
+                    return Ok(Err(StoreError::conflict(idempotency_key, account_id)));
                 }
-                return Ok(Acted::Duplicate(row.get(0)));
+                return Ok(Ok(Acted::Duplicate(row.get(0))));
             }
         }
 
         // From its latest snapshot and the journal's tail (contract v25,
         // W9.10), never the whole journal once one is kept.
-        let (mut book, replayed) = book_from(&mut tx, account_id, &partition)?;
-        // Each entry's body the decision asks for, read in this transaction
-        // (contract v26, W9.10), and the decision made again with it.
-        let mut decided = crate::store::with_bodies(
-            &mut book,
-            |account, ids| bodies_of(&mut tx, account, ids),
-            |book| decide(book, head.max(0) as u64),
-        )?;
+        let (book, replayed) = book_from(tx, account_id, partition)?;
+        // Between its move's close and its open, the account is held but
+        // for the open (step 3d; the resilience spec's section 6.8).
+        if let Some(to) = &book.moved_to {
+            // Closed toward another partition this database does not see
+            // opened (a move between databases, step 3d): acted on there.
+            if to != partition {
+                return Ok(Err(StoreError::Moved(to.clone())));
+            }
+            if !crate::moves::is_open_key(idempotency_key) {
+                return Ok(Err(StoreError::Held(format!(
+                    "account {account_id} is moving to {to}: ask again in a moment"
+                ))));
+            }
+        }
+        // Decided by its own caller, each entry's body the decision asks for
+        // read in this transaction (contract v26, W9.10). A read that failed
+        // broke the transaction, and so the batch.
+        let mut broke = None;
+        let decided = pending.decide(decider, book, *head, |account, ids| {
+            bodies_of(tx, account, ids).inspect_err(|failed| broke = Some(again(failed)))
+        });
+        if let Some(failed) = broke {
+            return Err(failed);
+        }
+        let mut decided = match decided {
+            Ok(decided) => decided,
+            Err(refused) => return Ok(Err(refused)),
+        };
         // Its place in the partition's chain (step 3b, integrity at rest).
-        decided.entry.previous_digest = last_digest;
+        decided.entry.previous_digest = last_digest.clone();
         decided.entry.digest = meridian_changes::integrity::chained(
             &decided.entry.previous_digest,
             &decided.entry.canonical(),
@@ -1515,7 +2120,7 @@ impl Store for PostgresStore {
         tx.execute(
             "INSERT INTO book_account (account_id, partition) VALUES ($1, $2)
              ON CONFLICT (account_id) DO NOTHING",
-            &[&account_id, &partition],
+            &[account_id, &partition],
         )
         .map_err(unavailable)?;
         tx.execute(
@@ -1541,25 +2146,25 @@ impl Store for PostgresStore {
                 &entry.body.to_bytes(),
                 &decided.reply,
                 &actor_named(entry.meta.actor.as_ref()),
-                &request,
+                request,
                 &(epoch as i64),
                 &entry.previous_digest,
                 &entry.digest,
             ],
         )
         .map_err(unavailable)?;
-        tx.execute(
-            "UPDATE book_partition_head SET sequence = $1, last_digest = $3 WHERE partition = $2",
-            &[
-                &(entry.last_sequence as i64),
-                &entry.partition,
-                &entry.digest,
-            ],
-        )
-        .map_err(unavailable)?;
-        project(&mut tx, account_id, &decided.changes)?;
+        // A move's close moves the account's placement with it, in its own
+        // transaction (step 3d): its next act is the new partition's.
+        if let Some(to) = crate::journal::closes(entry) {
+            tx.execute(
+                "UPDATE book_account SET partition = $2 WHERE account_id = $1",
+                &[account_id, &to],
+            )
+            .map_err(unavailable)?;
+        }
+        project(tx, account_id, &decided.changes)?;
         project_order_entries(
-            &mut tx,
+            tx,
             account_id,
             &entry.entry_id,
             entry.first_sequence,
@@ -1568,10 +2173,447 @@ impl Store for PostgresStore {
         // A snapshot once the tail since the last one reaches the interval,
         // as at this entry, in the same transaction.
         if replayed.entries as u64 + 1 >= self.snapshot_interval {
-            keep_snapshot(&mut tx, &decided.book, entry.cause.committed_at_ns)?;
+            keep_snapshot(tx, &decided.book, entry.cause.committed_at_ns)?;
         }
+        *head = entry.last_sequence;
+        last_digest.clone_from(&entry.digest);
+        Ok(Ok(Acted::Committed(Box::new(decided))))
+    }
+}
+
+impl PostgresStore {
+    /// The writer's epoch, adopted from the control partition (step 3a)
+    /// -- with several writer groups, its group's, or its partitions taken
+    /// over where they were assigned to it (step 3d) -- where `starting`, at
+    /// the writer's start, else at a store's first act or rebuild.
+    fn adopt_epoch(&self, starting: bool) -> Result<u64> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE book_partition_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
+            &[&meridian_changes::origin()],
+        )
+        .map_err(unavailable)?;
+        if !self.groups.several() {
+            let epoch: i64 = conn
+                .query_one(
+                    "SELECT epoch FROM book_partition_head WHERE partition = $1",
+                    &[&CONTROL_PARTITION],
+                )
+                .map_err(unavailable)?
+                .get(0);
+            // One group, its writer starting (ruled 2026-11-18): a
+            // partition held at an epoch not the control partition's was
+            // another group's before the count was lowered, and is this
+            // writer's now. It takes them over, as several groups' adopt
+            // does, so it writes them under its own epoch and the writer
+            // that held them is fenced. Never at a store's first act: a
+            // store a tool opens at one group takes nothing over.
+            let _alone = starting.then(|| self.adopting.lock().expect("adopting poisoned"));
+            if starting && self.fence.epoch() == 0 {
+                let held_apart: bool = conn
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM book_partition_head
+                                         WHERE epoch <> $1 AND epoch <> $2)",
+                        &[&epoch, &meridian_changes::moves::POINTER_EPOCH],
+                    )
+                    .map_err(unavailable)?
+                    .get(0);
+                if held_apart {
+                    drop(conn);
+                    return self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED));
+                }
+            }
+            return Ok(self.fence.adopt_once(epoch as u64));
+        }
+        // Several groups (step 3d; section 6.3): the epoch its partitions
+        // share, where no other group's partition holds it; else they were
+        // assigned to it -- the count changed -- and it takes them over, so
+        // the writer that held them before is fenced.
+        let _alone = self.adopting.lock().expect("adopting poisoned");
+        if self.fence.epoch() != 0 {
+            return Ok(self.fence.epoch());
+        }
+        let (mine, others) = epochs_of(&mut *conn, self.groups)?;
+        // The group's own epoch (`book_writer_group`, step 3d): the control
+        // partition's for group 0; a later group's row, kept while it owns
+        // nothing, so a partition moved back to it carries its epoch.
+        let anchor = own_epoch(&mut *conn, self.groups.mine())?;
+        let shared = mine.iter().min() == mine.iter().max();
+        let adopted = match (anchor, mine.first()) {
+            // Its row, and every partition it owns under it.
+            (Some(epoch), _) if mine.iter().all(|e| *e == epoch) && !others.contains(&epoch) => {
+                Some(epoch)
+            }
+            // No row yet (a group writing before `book_writer_group`): its
+            // partitions' shared epoch, recorded as its own.
+            (None, Some(epoch)) if shared && !others.contains(epoch) => {
+                keep_own_epoch(&mut *conn, self.groups.mine(), *epoch)?;
+                Some(*epoch)
+            }
+            _ => None,
+        };
+        // An epoch no takeover recorded -- one an earlier release's move
+        // made for this group (CI 43820357549), or its partitions' shared
+        // one no takeover raised -- recorded now as this member's, before
+        // anything commits under it (review t7, M1 and L3).
+        if let Some(epoch) = adopted {
+            record_adopted(&mut *conn, self.groups, epoch)?;
+        }
+        drop(conn);
+        match adopted {
+            Some(epoch) => Ok(self.fence.adopt_once(epoch)),
+            // Its partitions were assigned to it -- the count changed -- or
+            // it has no epoch of its own yet: it takes them over, and its
+            // row records the epoch.
+            None => self.take_over(&by_this_member(meridian_changes::groups::ASSIGNED)),
+        }
+    }
+
+    /// One try of [`Store::act`].
+    fn act_once(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // The writer's epoch, adopted before a connection is taken, so a
+        // store of one connection never waits on itself (step 3a).
+        if self.fence.epoch() == 0 {
+            self.adopt_epoch(false)?;
+        }
+        let command = Command {
+            account_id: account_id.to_string(),
+            message_id: message_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            request: request.to_vec(),
+            shard: shard.cloned(),
+        };
+        // An account never placed, with several partitions: placed by its
+        // owner label first, never by its ID instead (step 3d; ruled
+        // 2026-11-13). The book's writer places it before its act.
+        if self.placement_needed(account_id)? {
+            return Err(StoreError::NotPlaced(format!(
+                "account {account_id} is not placed in a partition yet: its owner label was not read"
+            )));
+        }
+        // The partition the account was last found in: a guess its batch
+        // checks under the partition's lock (step 3d; section 6.3), and an
+        // account found elsewhere there is acted on in its partition.
+        let mut partition = self.placed(account_id);
+        for _ in 0..MOVES_FOLLOWED {
+            // Another writer group's partition: handed to its owner (step
+            // 3d; section 6.7), never committed here.
+            if !self.groups.owns(&partition) {
+                // Its owner read again where this database holds its head
+                // (step 3d; ruled 2026-11-14): a move may have brought it
+                // to this group since this member last looked.
+                self.read_owner(&partition)?;
+            }
+            if !self.groups.owns(&partition) {
+                // The guess read again from the record before the act is
+                // handed on: the account may have moved to this group's.
+                let found = self.found(account_id)?;
+                if found != partition {
+                    self.place(account_id, &found);
+                    partition = found;
+                    continue;
+                }
+                let group = self.groups.owner(&partition);
+                // The record's word where its head named the group just
+                // now; else the rendezvous owner, a guess.
+                if self.groups.assigned(&partition).is_some() {
+                    meridian_bus::owners::hand_to_named(group);
+                } else {
+                    meridian_bus::owners::hand_to(group);
+                }
+                return Err(StoreError::NotOwned { group, partition });
+            }
+            let lane = self.lane(&partition);
+            let acted =
+                crate::group_commit::act(&lane, command.clone(), decide, |batch, decider| {
+                    self.batch(&partition, batch, decider)
+                });
+            match acted {
+                Err(StoreError::Moved(now)) => {
+                    self.place(account_id, &now);
+                    partition = now;
+                }
+                other => {
+                    // Where it is now: its new partition once a move's
+                    // close commits (step 3d).
+                    match &other {
+                        Ok(Acted::Committed(decided)) => self.place(
+                            account_id,
+                            &crate::journal::closes(&decided.entry).unwrap_or(partition),
+                        ),
+                        Ok(_) => self.place(account_id, &partition),
+                        // Moved to another group under its lock (step 3d):
+                        // handed to it.
+                        // Its own group's, in another of its databases
+                        // (step 3d): routed again by its book, never handed.
+                        Err(StoreError::NotOwned { group, .. }) if *group != self.groups.mine() => {
+                            meridian_bus::owners::hand_to_named(*group);
+                        }
+                        Err(_) => {}
+                    }
+                    return other;
+                }
+            }
+        }
+        Err(StoreError::Unavailable(format!(
+            "account {account_id} was found in another partition {MOVES_FOLLOWED} times while it was acted on"
+        )))
+    }
+}
+
+impl Store for PostgresStore {
+    fn act_stamped(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        idempotency_key: &str,
+        request: &[u8],
+        shard: Option<&crate::store::ShardStamp>,
+        decide: &mut Decide<'_>,
+    ) -> Result<Acted> {
+        // Held while its move is between its close and its open (step 3d;
+        // section 6.8): tried again for at most the hold.
+        crate::moves::holding(crate::moves::hold_now(), || {
+            self.act_once(
+                account_id,
+                message_id,
+                idempotency_key,
+                request,
+                shard,
+                decide,
+            )
+        })
+    }
+
+    fn raise_shard(&self, instance: &str, shard: u32, epoch: u64) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let held = meridian_changes::shard_fence::raise_to(
+            &mut tx,
+            meridian_changes::shard_fence::BOOK,
+            instance,
+            shard,
+            epoch,
+            // The book takes no write from a stream (review c5a H2).
+            None,
+        )
+        .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
-        Ok(Acted::Committed(Box::new(decided)))
+        Ok(held)
+    }
+
+    fn writes(&self, account_id: &str) -> bool {
+        self.groups.owns(&self.placed(account_id))
+    }
+
+    fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO book_control_owed (key, kind, body, reason, kept_at_ns)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key) DO NOTHING",
+                &[
+                    &record.key,
+                    &record.kind,
+                    &record.body,
+                    &record.reason,
+                    &kept_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn control_records_owed(&self) -> Result<Vec<crate::control::Owed>> {
+        let journalled = self.journalled_keys()?;
+        let mut owed: Vec<crate::control::Owed> = self
+            .control_records_owed_in(0)?
+            .into_iter()
+            .filter(|owed| !journalled.contains(&owed.key))
+            .collect();
+        let mut conn = self.conn()?;
+        // Each partition's writer group, where its last assignment named
+        // another (none: group 0).
+        let mut assigned: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for row in conn
+            .query(
+                "SELECT idempotency_key FROM book_entry
+                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:owner:%'
+                  ORDER BY first_sequence",
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+        {
+            let key: String = row.get(0);
+            let mut said = key
+                .trim_start_matches("control-record:owner:")
+                .rsplitn(3, ':');
+            let (_, group, partition) = (said.next(), said.next(), said.next());
+            if let (Some(group), Some(partition)) = (group.and_then(|g| g.parse().ok()), partition)
+            {
+                assigned.insert(partition.to_string(), group);
+            }
+        }
+        for row in conn
+            .query(
+                "SELECT partition, epoch FROM book_partition_head ORDER BY partition",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let (partition, epoch): (String, i64) = (row.get(0), row.get(1));
+            let group = self.groups.owner(&partition);
+            if assigned.get(&partition).copied().unwrap_or(0) == group {
+                continue;
+            }
+            let record = meridian_domain::v1::PartitionOwner {
+                component: "bor".into(),
+                partition: partition.clone(),
+                group,
+                writer: String::new(),
+                epoch: (epoch as u64).max(1),
+            };
+            owed.push(crate::control::Owed {
+                key: format!("control-record:owner:{partition}:{group}:{epoch}"),
+                kind: crate::control::OWNER,
+                body: record.encode_to_vec(),
+                reason: format!("partition {partition} assigned to writer group {group}"),
+            });
+        }
+        Ok(owed)
+    }
+
+    fn placement_needed(&self, account_id: &str) -> Result<bool> {
+        if self.partitions < 2
+            || !crate::store::is_account(account_id)
+            || self
+                .placed
+                .lock()
+                .expect("placements poisoned")
+                .contains_key(account_id)
+        {
+            return Ok(false);
+        }
+        let found: Option<String> = self
+            .conn()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        match found {
+            Some(partition) => {
+                self.place(account_id, &partition);
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+
+    fn partition_count(&self) -> u32 {
+        self.partitions
+    }
+
+    fn partition_of(&self, account_id: &str) -> Option<String> {
+        if let Some(partition) = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+        {
+            return Some(partition.clone());
+        }
+        let found: Option<String> = self
+            .conn()
+            .ok()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .ok()?
+            .map(|row| row.get(0));
+        if let Some(partition) = &found {
+            self.place(account_id, partition);
+        }
+        found
+    }
+
+    fn place_first(&self, account_id: &str, key: &str) -> Result<String> {
+        let partition = crate::store::placement_of(key, self.partitions);
+        let mut conn = self.conn()?;
+        // Fixed at its creation: an account placed already keeps its own.
+        conn.execute(
+            "INSERT INTO book_account (account_id, partition, placement_key) VALUES ($1, $2, $3)
+             ON CONFLICT (account_id) DO NOTHING",
+            &[&account_id, &partition, &key],
+        )
+        .map_err(unavailable)?;
+        let placed: String = conn
+            .query_one(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        self.place(account_id, &placed);
+        Ok(placed)
+    }
+
+    fn writer_group_of(&self, account_id: &str) -> Option<u32> {
+        if !self.groups.several() {
+            return None;
+        }
+        // Where this member has seen it, else where the record holds it,
+        // learnt (step 3d): a guess from the partition an account starts in
+        // routes it wrong once the book has several partitions. An account
+        // not placed yet is no group's to route to: the member it reaches
+        // places it, and hands it on where it landed.
+        let cached = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+            .cloned();
+        let partition = match cached {
+            Some(partition) => partition,
+            None if !crate::store::is_account(account_id) => {
+                first_partition_of(account_id).to_string()
+            }
+            None => {
+                let found: Option<String> = self
+                    .conn()
+                    .ok()?
+                    .query_opt(
+                        "SELECT partition FROM book_account WHERE account_id = $1",
+                        &[&account_id],
+                    )
+                    .ok()?
+                    .map(|row| row.get(0));
+                match found {
+                    Some(partition) => {
+                        self.place(account_id, &partition);
+                        partition
+                    }
+                    None if self.partitions > 1 => return None,
+                    None => first_partition_of(account_id).to_string(),
+                }
+            }
+        };
+        Some(self.groups.owner(&partition))
+    }
+
+    fn on_commit(&self, observer: Committed) -> bool {
+        *self.committed.lock().expect("observer poisoned") = Some(observer);
+        true
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
@@ -1583,33 +2625,30 @@ impl Store for PostgresStore {
     }
 
     fn adopt(&self) -> Result<u64> {
-        let mut conn = self.conn()?;
-        conn.execute(
-            "UPDATE book_partition_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
-            &[&meridian_changes::origin()],
-        )
-        .map_err(unavailable)?;
-        let epoch: i64 = conn
-            .query_one(
-                "SELECT epoch FROM book_partition_head WHERE partition = $1",
-                &[&CONTROL_PARTITION],
-            )
-            .map_err(unavailable)?
-            .get(0);
-        Ok(self.fence.adopt_once(epoch as u64))
+        self.adopt_epoch(true)
     }
 
     fn epoch(&self) -> u64 {
         self.fence.epoch()
     }
 
+    fn group_of_partition(&self, partition: &str) -> u32 {
+        self.groups.owner(partition)
+    }
+
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // A deposed writer stopped mid-entry holds the head row it took.
-        meridian_changes::end_deposed_writers(&mut tx, &["book_partition_head"])
-            .map_err(unavailable)?;
-        let epoch = raise(&mut tx, by).map_err(unavailable)?;
+        if self.groups.several() {
+            // Only its own group's deposed writer: another group's sessions
+            // hold their own partitions, never this group's.
+            end_deposed_holders(&mut tx, self.groups).map_err(unavailable)?;
+        } else {
+            meridian_changes::end_deposed_writers(&mut tx, &["book_partition_head"])
+                .map_err(unavailable)?;
+        }
+        let epoch = raise(&mut tx, by, self.groups).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
@@ -1621,11 +2660,19 @@ impl Store for PostgresStore {
     }
 
     fn head_epoch(&self) -> Result<u64> {
-        let epoch: i64 = self
-            .conn()?
+        let mut conn = self.conn()?;
+        if self.groups.several() && !self.groups.holds_control() {
+            // A group past the first: its own row's (step 3d).
+            return Ok(own_epoch(&mut *conn, self.groups.mine())?.unwrap_or(0));
+        }
+        let anchor = anchor_of(&mut *conn, self.groups)?;
+        let Some(anchor) = anchor else {
+            return Ok(0);
+        };
+        let epoch: i64 = conn
             .query_one(
                 "SELECT epoch FROM book_partition_head WHERE partition = $1",
-                &[&CONTROL_PARTITION],
+                &[&anchor],
             )
             .map_err(unavailable)?
             .get(0);
@@ -1717,10 +2764,12 @@ impl Store for PostgresStore {
     ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
         // Each account's journal and its latest snapshot of this format, in
         // the order accounts are listed.
+        let written = written_here("a.account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT a.account_id,
+                &format!(
+                    "SELECT a.account_id,
                         (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id),
                         (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id
                             AND e.first_sequence > COALESCE(s.last_sequence, -1)),
@@ -1733,8 +2782,10 @@ impl Store for PostgresStore {
                   WHERE a.account_id NOT LIKE '~%'
                     AND a.account_id COLLATE \"C\" > $1
                     AND ($4::text IS NULL OR a.account_id = $4)
+                    {written}
                   ORDER BY a.account_id COLLATE \"C\"
-                  LIMIT $2",
+                  LIMIT $2"
+                ),
                 &[&after, &(limit as i64), &crate::snapshot::FORMAT, &only],
             )
             .map_err(unavailable)?
@@ -1801,13 +2852,16 @@ impl Store for PostgresStore {
     }
 
     fn accounts_holding(&self, instrument_id: &str) -> Result<Vec<String>> {
+        let written = written_here("account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT account_id FROM book_position WHERE instrument_id = $1 AND NOT removed
-                 UNION
-                 SELECT account_id FROM book_break WHERE instrument_id = $1 AND state = $2
-                 ORDER BY 1",
+                &format!(
+                    "SELECT account_id FROM book_position WHERE instrument_id = $1 AND NOT removed {written}
+                     UNION
+                     SELECT account_id FROM book_break WHERE instrument_id = $1 AND state = $2 {written}
+                     ORDER BY 1"
+                ),
                 &[&instrument_id, &(BreakState::Open as i32)],
             )
             .map_err(unavailable)?
@@ -1817,13 +2871,16 @@ impl Store for PostgresStore {
     }
 
     fn instruments_held(&self) -> Result<Vec<String>> {
+        let written = written_here("account_id");
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id FROM book_position WHERE NOT removed
-                 UNION
-                 SELECT instrument_id FROM book_break WHERE instrument_id <> '' AND state = $1
-                 ORDER BY 1",
+                &format!(
+                    "SELECT instrument_id FROM book_position WHERE NOT removed {written}
+                     UNION
+                     SELECT instrument_id FROM book_break WHERE instrument_id <> '' AND state = $1 {written}
+                     ORDER BY 1"
+                ),
                 &[&(BreakState::Open as i32)],
             )
             .map_err(unavailable)?
@@ -1848,12 +2905,13 @@ impl Store for PostgresStore {
         } else {
             UNUSED_MARK_AND_NOT_REMOVED
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_position
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND (account_id COLLATE \"C\", instrument_id COLLATE \"C\", side,
@@ -1901,12 +2959,13 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let states: Vec<i32> = read.states.iter().map(|state| *state as i32).collect();
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_break
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND (cardinality($5::integer[]) = 0 OR state = ANY($5))
@@ -1955,12 +3014,13 @@ impl Store for PostgresStore {
             UNUSED_MARK
         };
         let agreement = agreement_key(read.agreement.as_ref());
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_figures
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND ($5 = '' OR agreement_key = $5)
@@ -2011,12 +3071,13 @@ impl Store for PostgresStore {
         } else {
             UNUSED_MARK
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT record FROM book_attributes
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND {filter}
                             AND account_id COLLATE \"C\" > $5 COLLATE \"C\"
@@ -2045,7 +3106,7 @@ impl Store for PostgresStore {
 
     fn rebuild(&self) -> Result<usize> {
         if self.fence.epoch() == 0 {
-            self.adopt()?;
+            self.adopt_epoch(false)?;
         }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
@@ -2198,6 +3259,7 @@ impl Store for PostgresStore {
                 .to_string(),
             state => format!("AND state = {state}"),
         };
+        let written = written_here("account_id");
         self.reading(|tx| {
             let mut items = Vec::new();
             for (kind, (table, id)) in tables.iter().enumerate() {
@@ -2217,7 +3279,7 @@ impl Store for PostgresStore {
                     .query(
                         &format!(
                             "SELECT account_id, {id}, record FROM {table}
-                              WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                              WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                                 AND ($2 = '' OR account_id = $2)
                                 AND {filter}
                                 {state_filter}
@@ -2274,13 +3336,17 @@ impl Store for PostgresStore {
     fn order_history(&self, read: &HistoryRead) -> Result<Page<meridian_domain::v1::EntryMeta>> {
         read.scope.admit(&read.account_id)?;
         let scope = scope_param(&read.scope);
+        let written = written_here("o.account_id");
         let entries = self.reading(|tx| {
             tx.query(
-                "SELECT e.meta FROM book_order_entry o JOIN book_entry e USING (entry_id)
-                  WHERE o.order_id = $1
-                    AND ($2::text[] IS NULL OR o.account_id = ANY($2))
-                    AND ($3 = '' OR o.account_id = $3)
-                  ORDER BY e.first_sequence",
+                &format!(
+                    "SELECT e.meta FROM book_order_entry o JOIN book_entry e USING (entry_id)
+                      WHERE o.order_id = $1
+                        AND ($2::text[] IS NULL OR o.account_id = ANY($2))
+                        AND ($3 = '' OR o.account_id = $3)
+                        {written}
+                      ORDER BY e.first_sequence"
+                ),
                 &[&read.order_id, &scope, &read.account_id],
             )
             .map_err(unavailable)
@@ -2302,12 +3368,13 @@ impl Store for PostgresStore {
         // decoded and sorted for one page.
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, locate_record_id, record FROM book_locate
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND {filter}
@@ -2345,12 +3412,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT instruction_key, record FROM book_instruction
-                          WHERE {filter}
+                          WHERE {filter} {written}
                             AND ($3 = '' OR instruction_key COLLATE \"C\" > $3)
                           ORDER BY instruction_key COLLATE \"C\"
                           LIMIT $4"
@@ -2376,9 +3444,13 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT account_id, order_id FROM book_order
-                  WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 AND state = ANY($2)
-                  ORDER BY expires_at_ns, order_id",
+                &format!(
+                    "SELECT account_id, order_id FROM book_order
+                      WHERE expires_at_ns IS NOT NULL AND expires_at_ns <= $1 AND state = ANY($2)
+                        {}
+                      ORDER BY expires_at_ns, order_id",
+                    written_here("account_id")
+                ),
                 &[
                     &now_ns,
                     &vec![
@@ -2409,12 +3481,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, booking_id, record FROM book_booking
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
@@ -2460,12 +3533,13 @@ impl Store for PostgresStore {
         // The page's rows alone (stage M; audit item 7).
         let after = order_reads::keyed_after(&read.cursor)?;
         let rows_read = order_reads::keyed_rows(read.limit);
+        let written = written_here("account_id");
         self.reading(|tx| {
             let rows = tx
                 .query(
                     &format!(
                         "SELECT account_id, alert_id, record FROM book_alert
-                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1)) {written}
                             AND ($2 = '' OR account_id = $2)
                             AND account_id NOT LIKE '~%'
                             AND ($5 = 0 OR state = $5)
@@ -2505,11 +3579,14 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT m.account_id, m.block_order_id
+                &format!(
+                    "SELECT m.account_id, m.block_order_id
                    FROM book_block_member m
                    JOIN book_order o ON o.order_id = m.block_order_id
-                  WHERE m.member_order_id = $1 AND o.state = ANY($2)
+                  WHERE m.member_order_id = $1 AND o.state = ANY($2) {}
                   ORDER BY 2",
+                    written_here("m.account_id")
+                ),
                 &[
                     &member_order_id,
                     &vec![
@@ -2529,8 +3606,11 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id FROM book_order
-                  WHERE account_id NOT LIKE '~%' AND state = ANY($1)",
+                &format!(
+                    "SELECT instrument_id FROM book_order
+                      WHERE account_id NOT LIKE '~%' AND state = ANY($1) {}",
+                    written_here("account_id")
+                ),
                 &[&vec![
                     meridian_domain::v1::OrderState::Proposed as i32,
                     meridian_domain::v1::OrderState::Released as i32,
@@ -2648,35 +3728,1983 @@ fn unavailable(failed: impl std::error::Error + 'static) -> StoreError {
     StoreError::Unavailable(meridian_changes::serving::described(&failed))
 }
 
-/// Raise every partition's epoch in `tx`, and record who raised it and why
-/// (step 3b, `WriterTookOver`): answer the epoch. What a takeover does, and a
-/// writer on a new database timeline (contract v30, stage C).
+/// Raise the epoch of every partition `groups`' group owns in `tx` -- every
+/// partition and every group's own row, with one group -- past every epoch
+/// the book holds, and record
+/// who raised it and why (step 3b, `WriterTookOver`): answer the epoch. What
+/// a takeover does, and a writer on a new database timeline (contract v30,
+/// stage C). Another group's partitions keep theirs (step 3d).
 fn raise(
     tx: &mut postgres::Transaction<'_>,
     by: &meridian_changes::TookOver,
+    groups: Groups,
 ) -> std::result::Result<u64, postgres::Error> {
-    let epoch: i64 = tx
-        .query_one(
-            "WITH raised AS (
-                UPDATE book_partition_head
-                   SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
-                RETURNING epoch)
-             SELECT max(epoch) FROM raised",
+    let owned: Vec<String> = tx
+        .query(
+            "SELECT partition, writer_group FROM book_partition_head ORDER BY partition FOR UPDATE",
             &[],
         )?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let epoch: i64 = tx
+        .query_one(
+            "WITH next AS (
+                SELECT greatest((SELECT max(epoch) FROM book_partition_head),
+                                (SELECT coalesce(max(epoch), 0) FROM book_writer_group)) + 1
+                       AS epoch),
+             raised AS (
+                UPDATE book_partition_head
+                   SET epoch = (SELECT epoch FROM next)
+                 WHERE partition = ANY($1) AND epoch <> -1
+                RETURNING epoch)
+             SELECT coalesce(max(epoch), (SELECT epoch FROM next))
+               FROM raised",
+            &[&owned],
+        )?
         .get(0);
+    // A group past the first keeps its epoch in its own row (step 3d;
+    // `book_writer_group`), raised with its partitions'.
+    if groups.several() && !groups.holds_control() {
+        tx.execute(
+            "INSERT INTO book_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+             ON CONFLICT (writer_group) DO UPDATE SET epoch = EXCLUDED.epoch",
+            &[&(groups.mine() as i32), &epoch, &meridian_changes::origin()],
+        )?;
+    }
+    // At one writer group, every group's row with the rest (review c5r3,
+    // M1), as the lake's raise on a new timeline does: a writer of a group
+    // the count was lowered past, not stopped yet, sees the takeover in its
+    // own group's row, and its epoch's watch steps it down.
+    if !groups.several() {
+        tx.execute("UPDATE book_writer_group SET epoch = $1", &[&epoch])?;
+    }
     // Who raised it and why, in the same transaction (step 3b).
     tx.execute(
         "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
-         SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
-           FROM book_partition_head",
+         VALUES ($1, $2, $3, $4, $5, $6)",
         &[
             &epoch,
             &by.member,
+            &owned,
             &by.why,
             &meridian_changes::origin(),
             &by.at_ns,
         ],
     )?;
     Ok(epoch as u64)
+}
+
+/// A takeover made by this store's own writer for `why`, named by this
+/// process's member (review t7, I1: a record never names nobody).
+fn by_this_member(why: &str) -> meridian_changes::TookOver {
+    meridian_changes::TookOver {
+        member: meridian_changes::member().to_string(),
+        ..meridian_changes::TookOver::unnamed(why)
+    }
+}
+
+/// `epoch`, which `groups`' writer adopts, recorded as its takeover of the
+/// partitions it owns under it where no takeover recorded it (review t7, M1
+/// and L3): every epoch above the first is raised by a recorded takeover
+/// (decisions/031; ruling 1105). Named by this member, why the group's
+/// partitions were assigned to it, as a takeover at its start is. An epoch
+/// recorded already, or the first, is left as it is.
+fn record_adopted(client: &mut impl GenericClient, groups: Groups, epoch: u64) -> Result<()> {
+    if epoch <= 1 {
+        return Ok(());
+    }
+    let recorded = client
+        .query_opt(
+            "SELECT 1 FROM book_writer_took_over WHERE epoch = $1",
+            &[&(epoch as i64)],
+        )
+        .map_err(unavailable)?
+        .is_some();
+    if recorded {
+        return Ok(());
+    }
+    let partitions: Vec<String> = client
+        .query(
+            "SELECT partition, writer_group FROM book_partition_head WHERE epoch = $1
+              ORDER BY partition",
+            &[&(epoch as i64)],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let by = by_this_member(meridian_changes::groups::ASSIGNED);
+    client
+        .execute(
+            "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (epoch) DO NOTHING",
+            &[
+                &(epoch as i64),
+                &by.member,
+                &partitions,
+                &by.why,
+                &meridian_changes::origin(),
+                &by.at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+    tracing::warn!(
+        epoch,
+        partitions = partitions.len(),
+        "the book's writer adopted an epoch no takeover recorded: recorded now as its takeover"
+    );
+    Ok(())
+}
+
+/// The partition `groups`' group reads its epoch from: `control` with one
+/// group or for group 0, else the first partition it owns; none where it
+/// owns none.
+fn anchor_of(
+    client: &mut impl GenericClient,
+    groups: meridian_changes::groups::Groups,
+) -> Result<Option<String>> {
+    if groups.holds_control() {
+        return Ok(Some(CONTROL_PARTITION.to_string()));
+    }
+    Ok(client
+        .query(
+            "SELECT partition, writer_group FROM book_partition_head WHERE epoch <> -1
+              ORDER BY partition",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .find(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0)))
+}
+
+/// Whether `groups`' group owns the head `row` (its partition, then its
+/// `writer_group`): the group the row names, else the rendezvous owner
+/// (step 3d; ruled 2026-11-14). Read from the row, never the member's view,
+/// so an epoch is raised only on what the group owns now -- and never
+/// written into that view: a database the partition is not written in
+/// holds a head of it at 0 named by its rendezvous owner (a raised
+/// `bor.databases`), which is not its owner (PR CI 43648472142, tolerant:
+/// group 1 took group 0's P0 for its own and read an account's journal
+/// where none is). The view is each partition's furthest head's, as
+/// `read_owners_from` and a batch under its head's lock read it.
+fn owned_in_row(groups: Groups, row: &Row) -> bool {
+    let partition: String = row.get(0);
+    if partition == CONTROL_PARTITION {
+        return groups.holds_control();
+    }
+    let owner = row
+        .get::<_, Option<i32>>(1)
+        .map(|group| group as u32)
+        .filter(|group| *group < groups.count())
+        .unwrap_or_else(|| meridian_changes::groups::owner(&partition, groups.count()));
+    owner == groups.mine()
+}
+
+/// The epochs of the partitions `groups`' group owns, sorted, and the set of
+/// every other group's.
+fn epochs_of(
+    client: &mut impl GenericClient,
+    groups: meridian_changes::groups::Groups,
+) -> Result<(Vec<u64>, std::collections::BTreeSet<u64>)> {
+    let mut mine = Vec::new();
+    let mut others = std::collections::BTreeSet::new();
+    for row in client
+        .query(
+            "SELECT partition, writer_group, epoch FROM book_partition_head",
+            &[],
+        )
+        .map_err(unavailable)?
+    {
+        let epoch: i64 = row.get(2);
+        // A move's pointer is under no writer's epoch.
+        if epoch == meridian_changes::moves::POINTER_EPOCH {
+            continue;
+        }
+        if owned_in_row(groups, &row) {
+            mine.push(epoch as u64);
+        } else {
+            others.insert(epoch as u64);
+        }
+    }
+    // Every other group's own epoch, kept while it owns nothing (step 3d).
+    for row in client
+        .query(
+            "SELECT writer_group, epoch FROM book_writer_group WHERE writer_group <> $1",
+            &[&(groups.mine() as i32)],
+        )
+        .map_err(unavailable)?
+    {
+        others.insert(row.get::<_, i64>(1) as u64);
+    }
+    mine.sort_unstable();
+    Ok((mine, others))
+}
+
+/// End every other session holding a partition lock of `groups`' group
+/// before its takeover raises their epoch (step 3d): its own deposed writer
+/// stopped mid-batch, never another group's writer, which holds its own
+/// partitions' locks -- and never a session of another database on the
+/// same server (two of the book's databases, section 6.4), whose locks
+/// carry the same keys.
+fn end_deposed_holders(
+    tx: &mut postgres::Transaction<'_>,
+    groups: meridian_changes::groups::Groups,
+) -> std::result::Result<i64, postgres::Error> {
+    let partitions: Vec<String> = tx
+        .query(
+            "SELECT partition, writer_group FROM book_partition_head",
+            &[],
+        )?
+        .iter()
+        .filter(|row| owned_in_row(groups, row))
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    let keys: Vec<i64> = partitions.iter().map(|p| partition_lock(p)).collect();
+    let ended: i64 = tx
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, $2))
+               FROM (SELECT DISTINCT l.pid
+                       FROM pg_locks l
+                      WHERE l.locktype = 'advisory' AND l.granted
+                        AND l.pid <> pg_backend_pid()
+                        AND l.database = (SELECT oid FROM pg_database
+                                           WHERE datname = current_database())
+                        AND ((l.classid::bigint << 32) | l.objid::bigint) = ANY($1)) AS held",
+            &[&keys, &meridian_changes::DEPOSED_GONE_WITHIN_MS],
+        )?
+        .get(0);
+    if ended > 0 {
+        tracing::warn!(
+            sessions = ended,
+            "ended this writer group's deposed writer's sessions still holding its partitions' locks"
+        );
+    }
+    Ok(ended)
+}
+
+/// The book over several databases (step 3d; section 6.4): what its
+/// [`crate::spread::Spread`] asks of each database's store.
+/// Where a partition stands in one database, as a move reads it (step 3d;
+/// section 6.8): its head's sequence and digest, the last entry's sequence,
+/// digest and commit time this database holds of it, and the group its
+/// head names.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tip {
+    pub head: u64,
+    pub head_digest: Vec<u8>,
+    pub held: u64,
+    pub held_digest: Vec<u8>,
+    pub held_at_ns: i64,
+    pub writer_group: Option<u32>,
+    pub epoch: u64,
+}
+
+fn tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Option<Tip>> {
+    let Some(head) = client
+        .query_opt(
+            "SELECT sequence, last_digest, writer_group, epoch FROM book_partition_head
+              WHERE partition = $1",
+            &[&partition],
+        )
+        .map_err(unavailable)?
+    else {
+        return Ok(None);
+    };
+    let held = client
+        .query_opt(
+            "SELECT last_sequence, digest, committed_at_ns FROM book_entry
+              WHERE partition = $1 ORDER BY last_sequence DESC LIMIT 1",
+            &[&partition],
+        )
+        .map_err(unavailable)?;
+    Ok(Some(Tip {
+        head: head.get::<_, i64>(0).max(0) as u64,
+        head_digest: head.get::<_, Option<Vec<u8>>>(1).unwrap_or_default(),
+        writer_group: head.get::<_, Option<i32>>(2).map(|g| g as u32),
+        epoch: head.get::<_, i64>(3) as u64,
+        held: held
+            .as_ref()
+            .map_or(0, |row| row.get::<_, i64>(0).max(0) as u64),
+        held_digest: held
+            .as_ref()
+            .and_then(|row| row.get::<_, Option<Vec<u8>>>(1))
+            .unwrap_or_default(),
+        held_at_ns: held.as_ref().map_or(0, |row| row.get(2)),
+    }))
+}
+
+/// The epoch writer group `group` commits under in this database (step
+/// 3d): the control partition's for group 0; a later group's own row
+/// (`book_writer_group`), kept while it owns nothing, so a partition moved
+/// back to it carries the epoch its writer holds. A group with no row yet
+/// -- its writer has not taken over here -- has none, and a move never
+/// makes one: an epoch no takeover recorded (CI 43820357549, reconfigure:
+/// "commit(s) at an epoch no takeover recorded"). Its move waits at the
+/// gate until its writer has taken over ([`PostgresStore::group_ready`]).
+fn group_epoch(client: &mut impl GenericClient, group: u32) -> Result<u64> {
+    own_epoch(client, group)?.ok_or_else(|| {
+        StoreError::Unavailable(format!(
+            "writer group {group} has no epoch in this database yet: its writer has not taken over, \
+             so nothing is moved to it"
+        ))
+    })
+}
+
+/// Writer group `group`'s own epoch in this database: the control
+/// partition's for group 0, its `book_writer_group` row's past it; none
+/// where it has no row yet.
+fn own_epoch(client: &mut impl GenericClient, group: u32) -> Result<Option<u64>> {
+    let row = if group == 0 {
+        client.query_opt(
+            "SELECT epoch FROM book_partition_head WHERE partition = $1",
+            &[&CONTROL_PARTITION],
+        )
+    } else {
+        client.query_opt(
+            "SELECT epoch FROM book_writer_group WHERE writer_group = $1",
+            &[&(group as i32)],
+        )
+    }
+    .map_err(unavailable)?;
+    Ok(row.map(|row| row.get::<_, i64>(0) as u64))
+}
+
+/// `epoch` recorded as writer group `group`'s own where it has none yet (a
+/// group past the first; group 0's is the control partition's).
+fn keep_own_epoch(client: &mut impl GenericClient, group: u32, epoch: u64) -> Result<()> {
+    if group == 0 {
+        return Ok(());
+    }
+    client
+        .execute(
+            "INSERT INTO book_writer_group (writer_group, epoch, origin) VALUES ($1, $2, $3)
+             ON CONFLICT (writer_group) DO NOTHING",
+            &[
+                &(group as i32),
+                &(epoch as i64),
+                &meridian_changes::origin(),
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(())
+}
+
+/// How a move's switch ended (step 3d; section 6.8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Switched {
+    /// The target owns the partition from `closing` on, under `epoch`.
+    Moved { closing: u64, epoch: u64 },
+    /// The target's digest at the source's close differs: the source owns.
+    DigestDiffers {
+        closing: u64,
+        source: Vec<u8>,
+        target: Vec<u8>,
+        at_ns: i64,
+    },
+    /// The switch did not finish within its bound: the source owns.
+    TimedOut,
+    /// The source let go at `closing`, its head naming the target, and the
+    /// target's head is not opened yet: moved, its open owed to the control
+    /// group's sweep (the review's C3), under `epoch` as read before.
+    LetGo { closing: u64, epoch: u64 },
+}
+
+/// How long a switch between databases took, part by part (step 3d;
+/// section 6.8): what its hold is made of, said in the member's log and
+/// asserted by the crate's tests, so the hold stays short whatever the
+/// partition's size.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwitchTimes {
+    /// Before the hold: the target's chain taken again as far as warmed,
+    /// its accounts' projections copied, and the change log once more.
+    pub before: std::time::Duration,
+    /// Of `before`: the accounts' projections copied.
+    pub warming: std::time::Duration,
+    /// Waiting for the partition's lock: the source's batch in flight.
+    pub waited: std::time::Duration,
+    /// Under the lock: the rest of the change log copied.
+    pub tail: std::time::Duration,
+    /// Under the lock: the target's chain taken again to the close.
+    pub chain: std::time::Duration,
+    /// Under the lock: the accounts' rows and projections.
+    pub accounts: std::time::Duration,
+    /// From the lock taken to the switch's answer: the hold.
+    pub held: std::time::Duration,
+    /// The accounts whose projections were copied under the lock: those
+    /// written since they were copied before it.
+    pub copied: usize,
+    /// The accounts the partition places.
+    pub placed: usize,
+}
+
+impl PostgresStore {
+    /// `partition` as this database holds it; none where it has no head.
+    pub fn tip(&self, partition: &str) -> Result<Option<Tip>> {
+        let mut conn = self.conn()?;
+        tip_of(&mut *conn, partition)
+    }
+
+    /// The accounts this database places in `partition`.
+    pub fn accounts_in(&self, partition: &str) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id FROM book_account WHERE partition = $1 ORDER BY account_id",
+                &[&partition],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// `partition`'s entries copied from `from`'s database into this one
+    /// past the entry at `after` (step 3d; section 6.4, "a snapshot ... then
+    /// the change log"): in one snapshot of `from`, the partition's last
+    /// sequence read first and its entries up to it alone, so the copy is
+    /// whole up to the sequence it answers -- never a later entry ahead of
+    /// an earlier one missed (the review's C1). Its accounts are the
+    /// switch's to copy ([`Self::switch_partition`]): none is in this
+    /// database before the switch commits it under the partition's lock
+    /// (C5), each as the source holds it then (C6). From 0, the snapshot;
+    /// after, the change log. Answers the last sequence copied.
+    pub fn copy_partition_from(
+        &self,
+        from: &PostgresStore,
+        partition: &str,
+        after: u64,
+    ) -> Result<u64> {
+        use std::io::{Read, Write};
+        let mut source = from.conn()?;
+        let mut snapshot = source
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let copied: i64 = snapshot
+            .query_one(
+                "SELECT coalesce(max(last_sequence), $2) FROM book_entry WHERE partition = $1",
+                &[&partition, &(after as i64)],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        meridian_changes::moves::points::reached("book.copy.accounts", partition)
+            .and_then(|_| meridian_changes::moves::points::reached("book.copy.read", partition))
+            .map_err(StoreError::Unavailable)?;
+        let mut rows = Vec::new();
+        snapshot
+            .copy_out(&format!(
+                "COPY (SELECT * FROM book_entry WHERE partition = '{}' AND last_sequence > {after}
+                        AND last_sequence <= {copied}) TO STDOUT (FORMAT binary)",
+                partition.replace('\'', "''")
+            ))
+            .map_err(unavailable)?
+            .read_to_end(&mut rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        snapshot.commit().map_err(unavailable)?;
+        drop(source);
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(
+            "CREATE TEMP TABLE IF NOT EXISTS moving_partition (LIKE book_entry) ON COMMIT DROP",
+        )
+        .map_err(unavailable)?;
+        let mut writer = tx
+            .copy_in("COPY moving_partition FROM STDIN (FORMAT binary)")
+            .map_err(unavailable)?;
+        writer
+            .write_all(&rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        writer.finish().map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO book_entry SELECT * FROM moving_partition ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(copied as u64)
+    }
+
+    /// What `source` reads of `accounts` in each of `tables` copied into
+    /// `target`'s transaction, a table at a time (step 3d; section 6.4): a
+    /// partition's move between databases. What `target` held of them in a
+    /// projection's table is replaced; their rows take the source's
+    /// placement; their entries are added by their own keys, `partition`'s
+    /// left to the change log's copy. `staged` names the transaction's
+    /// temporary tables, one name a call.
+    fn copy_accounts(
+        source: &mut Transaction<'_>,
+        target: &mut Transaction<'_>,
+        accounts: &[String],
+        tables: &[&str],
+        partition: &str,
+        staged: &str,
+    ) -> Result<()> {
+        use std::io::{Read, Write};
+        if accounts.is_empty() {
+            return Ok(());
+        }
+        let theirs = format!("account_id = ANY({})", text_array(accounts));
+        for table in tables {
+            let (kept, on_conflict) = match *table {
+                "book_account" => (
+                    theirs.clone(),
+                    "ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition",
+                ),
+                "book_entry" => (
+                    format!(
+                        "{theirs} AND partition <> '{}'",
+                        partition.replace('\'', "''")
+                    ),
+                    "ON CONFLICT DO NOTHING",
+                ),
+                _ => {
+                    target
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE account_id = ANY($1)"),
+                            &[&accounts],
+                        )
+                        .map_err(unavailable)?;
+                    (theirs.clone(), "ON CONFLICT DO NOTHING")
+                }
+            };
+            let mut rows = Vec::new();
+            source
+                .copy_out(&format!(
+                    "COPY (SELECT * FROM {table} WHERE {kept}) TO STDOUT (FORMAT binary)"
+                ))
+                .map_err(unavailable)?
+                .read_to_end(&mut rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            target
+                .batch_execute(&format!(
+                    "CREATE TEMP TABLE {staged}_{table} (LIKE {table}) ON COMMIT DROP"
+                ))
+                .map_err(unavailable)?;
+            let mut writer = target
+                .copy_in(&format!("COPY {staged}_{table} FROM STDIN (FORMAT binary)"))
+                .map_err(unavailable)?;
+            writer
+                .write_all(&rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            writer.finish().map_err(unavailable)?;
+            target
+                .execute(
+                    &format!("INSERT INTO {table} SELECT * FROM {staged}_{table} {on_conflict}"),
+                    &[],
+                )
+                .map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
+    /// `partition`'s chain as this database holds it, from the entry after
+    /// `after` (whose digest is `previous`) to `upto`, taken again entry by
+    /// entry (step 3d; section 6.8, step 4's digest at N; the review's C9):
+    /// each entry following the one before it with no sequence missed, and
+    /// matching its digest. Answers the digest at `upto`, or what broke.
+    pub fn chain_of(
+        &self,
+        partition: &str,
+        after: u64,
+        previous: &[u8],
+        upto: u64,
+    ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let mut conn = self.conn()?;
+        let mut at = after;
+        let mut digest = previous.to_vec();
+        while at < upto {
+            let rows = conn
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS} FROM book_entry
+                          WHERE partition = $1 AND first_sequence > $2 AND first_sequence <= $3
+                          ORDER BY first_sequence LIMIT 1000"
+                    ),
+                    &[&partition, &(at as i64), &(upto as i64)],
+                )
+                .map_err(unavailable)?;
+            if rows.is_empty() {
+                return Ok(Err(format!("the entries after sequence {at} are missing")));
+            }
+            for row in &rows {
+                let first = row.get::<_, i64>(3) as u64;
+                let last = row.get::<_, i64>(4) as u64;
+                if first != at + 1 {
+                    return Ok(Err(format!(
+                        "sequences {} to {} are missing",
+                        at + 1,
+                        first.saturating_sub(1)
+                    )));
+                }
+                let (canonical, stored_previous, stored) = stored_of(row);
+                if !stored.is_empty() {
+                    if !digest.is_empty() && stored_previous != digest {
+                        return Ok(Err(format!(
+                            "the entry at sequence {last} does not follow the one before it"
+                        )));
+                    }
+                    let taken = meridian_changes::integrity::chained(&stored_previous, &canonical);
+                    if taken != stored {
+                        return Ok(Err(format!(
+                            "the entry at sequence {last} does not match its digest"
+                        )));
+                    }
+                    digest = taken;
+                }
+                at = last;
+            }
+        }
+        Ok(Ok(digest))
+    }
+
+    /// A move's switch of `partition`, held by this database, to writer
+    /// group `target` in `to`'s (step 3d; section 6.8, step 4), its target
+    /// warmed up to `warmed`: under the partition's lock, so the source's
+    /// batch in flight finishes first and the next waits (the hold), the
+    /// source's close at its head N; `to` brought to N where it is another
+    /// database, its chain taken again to N and compared with the source's
+    /// digest there. What grows with the partition is done before the lock
+    /// -- the chain as far as warmed, and its accounts' projections, copied
+    /// into a transaction of `to`'s that only the switch commits -- and
+    /// under it only what was written since: the rest of the change log,
+    /// the chain on to N, the accounts with an entry since, and each
+    /// account's row. So the hold stays short whatever the partition's
+    /// size (PR CI 43675491409: 35 accounts copied whole under the lock
+    /// held its writes 5.4 s). Within one database, the head named the target's at
+    /// its group's epoch. Across two, never two owners (the review's C3):
+    /// the target's head first made a pointer to the target (epoch `POINTER_EPOCH`, under
+    /// which nothing commits), then the source lets go -- its head named the
+    /// target, a pointer too -- and is committed; only then is the target's
+    /// head opened at N under its group's epoch. A failure between leaves
+    /// the source's pointer, the durable intent the control group's sweep
+    /// finishes from ([`Switched::LetGo`]). A move to the same group's own
+    /// database (a database count raised) opens the target first and makes
+    /// the source a pointer after: one group, which writes where its head
+    /// is. Within `bound` of its start until the source lets go, else
+    /// nothing changes. `differ` makes the digests differ (CI's
+    /// MERIDIAN_MOVE_DIGEST_FILE).
+    pub fn switch_partition(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+    ) -> Result<Switched> {
+        self.switch_partition_timed(to, partition, target, bound, differ, warmed)
+            .map(|(switched, _)| switched)
+    }
+
+    /// [`Self::switch_partition`], and how long each part of it took.
+    pub fn switch_partition_timed(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+    ) -> Result<(Switched, SwitchTimes)> {
+        let mut times = SwitchTimes::default();
+        let mut locked = None;
+        let switched = self.switch_within(
+            to,
+            partition,
+            target,
+            bound,
+            differ,
+            warmed,
+            &mut times,
+            &mut locked,
+        );
+        if let Some(locked) = locked {
+            times.held = locked.elapsed();
+        }
+        if !std::ptr::eq(self, to) {
+            tracing::info!(
+                partition,
+                target,
+                before_ms = times.before.as_millis() as u64,
+                warming_ms = times.warming.as_millis() as u64,
+                waited_ms = times.waited.as_millis() as u64,
+                tail_ms = times.tail.as_millis() as u64,
+                chain_ms = times.chain.as_millis() as u64,
+                accounts_ms = times.accounts.as_millis() as u64,
+                held_ms = times.held.as_millis() as u64,
+                copied = times.copied,
+                placed = times.placed,
+                "a partition's switch between databases: its hold, part by part"
+            );
+        }
+        switched.map(|switched| (switched, times))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn switch_within(
+        &self,
+        to: &PostgresStore,
+        partition: &str,
+        target: u32,
+        bound: std::time::Duration,
+        differ: bool,
+        warmed: u64,
+        times: &mut SwitchTimes,
+        locked: &mut Option<std::time::Instant>,
+    ) -> Result<Switched> {
+        let began = std::time::Instant::now();
+        let left = |began: std::time::Instant| bound.saturating_sub(began.elapsed());
+        let same = std::ptr::eq(self, to);
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let timed_out = |failed: &postgres::Error| {
+            matches!(
+                failed.code(),
+                Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+                    | Some(&postgres::error::SqlState::QUERY_CANCELED)
+            )
+        };
+        // Before the hold, between databases, what grows with the
+        // partition (growth is configuration: the hold stays short whatever
+        // its size): the target's chain taken again as far as warmed; then
+        // its accounts' projections, as one snapshot of the source holds
+        // them at its sequence `at`, copied into a transaction of the
+        // target's left open -- nothing of them is in the target for any
+        // read or any other writer until the switch commits it under the
+        // lock, and a switch that ends any other way leaves nothing (the
+        // review's C5); then the change log again, and the chain on to it,
+        // so the hold begins with a short tail.
+        let mut verified = None;
+        let mut warmed = warmed;
+        let mut at = 0u64;
+        let mut warmed_accounts: Vec<String> = Vec::new();
+        let copied_tables: Vec<&str> = ACCOUNT_TABLES
+            .iter()
+            .copied()
+            .filter(|table| *table != "book_account")
+            .collect();
+        let mut target_conn = if same { None } else { Some(to.conn()?) };
+        let mut warm = match target_conn.as_mut() {
+            Some(conn) => Some(conn.transaction().map_err(unavailable)?),
+            None => None,
+        };
+        if let Some(warm) = warm.as_mut() {
+            let upto = warmed.min(to.tip(partition)?.map_or(0, |tip| tip.held));
+            verified = to
+                .chain_of(partition, 0, &[], upto)?
+                .ok()
+                .map(|digest| (upto, digest));
+            let part = std::time::Instant::now();
+            // The whole partition's accounts, however many: without the
+            // serving session's statement_timeout (section 10a).
+            meridian_changes::serving::unbounded(warm).map_err(unavailable)?;
+            let mut reading = self.conn()?;
+            let mut snapshot = reading
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .map_err(unavailable)?;
+            meridian_changes::serving::unbounded(&mut snapshot).map_err(unavailable)?;
+            at = snapshot
+                .query_one(
+                    "SELECT coalesce(max(last_sequence), 0) FROM book_entry WHERE partition = $1",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+                .get::<_, i64>(0) as u64;
+            warmed_accounts = snapshot
+                .query(
+                    "SELECT account_id FROM book_account WHERE partition = $1 ORDER BY account_id",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            Self::copy_accounts(
+                &mut snapshot,
+                warm,
+                &warmed_accounts,
+                &copied_tables,
+                partition,
+                "warmed",
+            )?;
+            snapshot.commit().map_err(unavailable)?;
+            drop(reading);
+            times.warming = part.elapsed();
+            warmed = to.copy_partition_from(self, partition, warmed)?;
+            if let Some((after, previous)) = verified.take() {
+                verified = to
+                    .chain_of(partition, after, &previous, warmed)?
+                    .ok()
+                    .map(|digest| (warmed, digest));
+            }
+        }
+        times.before = began.elapsed();
+        let asked = std::time::Instant::now();
+        let bounded = left(began).as_millis().max(1).to_string();
+        if let Err(failed) = tx.execute(
+            "SELECT pg_advisory_xact_lock($1)
+               FROM (SELECT set_config('lock_timeout', $2, true),
+                            set_config('statement_timeout', $2, true)) AS bounded",
+            &[&partition_lock(partition), &bounded],
+        ) {
+            return if timed_out(&failed) {
+                Ok(Switched::TimedOut)
+            } else {
+                Err(unavailable(failed))
+            };
+        }
+        times.waited = asked.elapsed();
+        *locked = Some(std::time::Instant::now());
+        let source = tip_of(&mut tx, partition)?.ok_or_else(|| {
+            StoreError::Unavailable(format!("the book has no partition {partition}"))
+        })?;
+        tx.execute(
+            "SELECT 1 FROM book_partition_head WHERE partition = $1 FOR UPDATE",
+            &[&partition],
+        )
+        .map_err(unavailable)?;
+        let closing = source.head;
+        let from = source
+            .writer_group
+            .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()));
+        let differs = |target_digest: Vec<u8>| {
+            Ok(Switched::DigestDiffers {
+                closing,
+                source: source.head_digest.clone(),
+                target: target_digest,
+                at_ns: meridian_changes::now_ns(),
+            })
+        };
+        if same {
+            let mut target_digest = source.held_digest.clone();
+            if differ {
+                target_digest.push(0xff);
+            }
+            if source.held != closing || target_digest != source.head_digest {
+                return differs(target_digest);
+            }
+            let epoch = group_epoch(&mut tx, target)?;
+            tx.execute(
+                "UPDATE book_partition_head SET writer_group = $2, epoch = $3 WHERE partition = $1",
+                &[&partition, &(target as i32), &(epoch as i64)],
+            )
+            .map_err(unavailable)?;
+            return match tx.commit() {
+                Ok(()) => {
+                    self.groups.assign(partition, Some(target));
+                    Ok(Switched::Moved { closing, epoch })
+                }
+                Err(failed) if timed_out(&failed) => Ok(Switched::TimedOut),
+                Err(failed) => Err(unavailable(failed)),
+            };
+        }
+        // The target at N: the change log copied up to N while the source
+        // is held, its chain taken again from where it was before the hold.
+        let part = std::time::Instant::now();
+        to.copy_partition_from(self, partition, warmed)?;
+        times.tail = part.elapsed();
+        let part = std::time::Instant::now();
+        let (after, previous) = verified.unwrap_or((0, Vec::new()));
+        let chained = to.chain_of(partition, after, &previous, closing)?;
+        times.chain = part.elapsed();
+        let mut target_digest = match chained {
+            Ok(digest) => digest,
+            Err(broken) => {
+                tracing::warn!(
+                    partition,
+                    broken,
+                    "a move's target holds the partition broken"
+                );
+                Vec::new()
+            }
+        };
+        if differ {
+            target_digest.push(0xff);
+        }
+        if target_digest != source.head_digest {
+            return differs(target_digest);
+        }
+        if left(began).is_zero() {
+            return Ok(Switched::TimedOut);
+        }
+        // Its accounts as the source holds them at N: those with an entry
+        // since the sequence their projections were copied at, and any
+        // placed in it since, copied again; what was copied of one that
+        // left it since taken out; and each one's row, with which the
+        // target holds the account. Committed here, under the lock: none
+        // stale (the review's C6), and none in the target before.
+        let part = std::time::Instant::now();
+        let mut warm = warm
+            .take()
+            .expect("between databases: the target's transaction");
+        let mut reading = self.conn()?;
+        let mut current = reading
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let placed: Vec<String> = current
+            .query(
+                "SELECT account_id FROM book_account WHERE partition = $1 ORDER BY account_id",
+                &[&partition],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let written: std::collections::BTreeSet<String> = current
+            .query(
+                "SELECT DISTINCT account_id FROM book_entry
+                  WHERE partition = $1 AND first_sequence > $2",
+                &[&partition, &(at as i64)],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let stale: Vec<String> = placed
+            .iter()
+            .filter(|account| written.contains(*account) || !warmed_accounts.contains(account))
+            .cloned()
+            .collect();
+        let gone: Vec<String> = warmed_accounts
+            .iter()
+            .filter(|account| !placed.contains(account))
+            .cloned()
+            .collect();
+        if !gone.is_empty() {
+            // Its entries stay, as an account's warmed for its own move do.
+            for table in copied_tables.iter().filter(|table| **table != "book_entry") {
+                warm.execute(
+                    &format!("DELETE FROM {table} WHERE account_id = ANY($1)"),
+                    &[&gone],
+                )
+                .map_err(unavailable)?;
+            }
+        }
+        Self::copy_accounts(
+            &mut current,
+            &mut warm,
+            &stale,
+            &copied_tables,
+            partition,
+            "switched",
+        )?;
+        Self::copy_accounts(
+            &mut current,
+            &mut warm,
+            &placed,
+            &["book_account"],
+            partition,
+            "switched",
+        )?;
+        current.commit().map_err(unavailable)?;
+        drop(reading);
+        warm.commit().map_err(unavailable)?;
+        for account in &placed {
+            to.place(account, partition);
+        }
+        times.accounts = part.elapsed();
+        times.copied = stale.len();
+        times.placed = placed.len();
+        meridian_changes::moves::points::reached("book.switch.copied", partition)
+            .map_err(StoreError::Unavailable)?;
+        if left(began).is_zero() {
+            return Ok(Switched::TimedOut);
+        }
+        if from == target {
+            // The same group, home: the target opened first; the source a
+            // pointer after, so a write routed there goes home.
+            let epoch = to.open_at(partition, closing, target, &source.head_digest)?;
+            tx.execute(
+                "UPDATE book_partition_head SET epoch = -1 WHERE partition = $1",
+                &[&partition],
+            )
+            .map_err(unavailable)?;
+            if let Err(failed) = tx.commit() {
+                tracing::warn!(partition, %failed, "a partition moved home: its old head stays its group's, level with home");
+            }
+            return Ok(Switched::Moved { closing, epoch });
+        }
+        // Another group's: the target's head a pointer to it first, so a
+        // write that finds it there waits, never committed or fenced; then
+        // the source lets go.
+        let epoch = group_epoch(&mut *to.conn()?, target)?;
+        to.point_to(partition, target)?;
+        tx.execute(
+            "UPDATE book_partition_head SET writer_group = $2, epoch = -1 WHERE partition = $1",
+            &[&partition, &(target as i32)],
+        )
+        .map_err(unavailable)?;
+        let committed = tx
+            .commit()
+            .map_err(|failed| (timed_out(&failed), unavailable(failed)))
+            .and_then(|_| {
+                meridian_changes::moves::points::reached("book.switch.committed", partition)
+                    .map_err(|lost| (false, StoreError::Unavailable(lost)))
+            });
+        if let Err((timed_out, failed)) = committed {
+            // Committed, its answer lost, or not: as the source's head says
+            // now (the review's A1), never undone on the target's side.
+            let let_go = self.tip(partition)?.is_some_and(|tip| {
+                tip.writer_group == Some(target) && tip.epoch == meridian_changes::moves::POINTER
+            });
+            if !let_go {
+                return if timed_out {
+                    Ok(Switched::TimedOut)
+                } else {
+                    Err(failed)
+                };
+            }
+        }
+        self.groups.assign(partition, Some(target));
+        if let Err(failed) =
+            meridian_changes::moves::points::reached("book.switch.between", partition)
+        {
+            tracing::warn!(
+                partition,
+                failed,
+                "a partition let go: its target opens on the sweep"
+            );
+            return Ok(Switched::LetGo { closing, epoch });
+        }
+        match to.open_at(partition, closing, target, &source.head_digest) {
+            Ok(epoch) => Ok(Switched::Moved { closing, epoch }),
+            Err(failed) => {
+                tracing::warn!(partition, %failed, "a partition let go: its target opens on the sweep");
+                Ok(Switched::LetGo { closing, epoch })
+            }
+        }
+    }
+
+    /// Each account move's close this database holds with no open of it
+    /// here, committed before `before_ns` (step 3d): the opens the control
+    /// group's sweep owes, where no other database holds them either.
+    pub fn closes_without_opens(&self, before_ns: i64) -> Result<Vec<Entry>> {
+        self.conn()?
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry c
+                      WHERE c.idempotency_key LIKE 'account-move:%' AND c.committed_at_ns < $1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM book_entry o
+                             WHERE o.account_id = c.account_id
+                               AND o.idempotency_key = 'account-open:' || c.account_id || ':'
+                                                       || c.partition || ':' || c.first_sequence)"
+                ),
+                &[&before_ns],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(entry_of)
+            .collect()
+    }
+
+    /// Whether this database holds `account_id`'s entry kept by `key`.
+    pub fn holds_entry(&self, account_id: &str, key: &str) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM book_entry WHERE account_id = $1 AND idempotency_key = $2",
+                &[&account_id, &key],
+            )
+            .map_err(unavailable)?
+            .is_some())
+    }
+
+    /// When the entry of `partition` at `sequence` was committed, as this
+    /// database holds it; 0 where it holds none.
+    pub fn held_at(&self, partition: &str, sequence: u64) -> Result<i64> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT committed_at_ns FROM book_entry WHERE partition = $1 AND first_sequence <= $2
+                  ORDER BY first_sequence DESC LIMIT 1",
+                &[&partition, &(sequence as i64)],
+            )
+            .map_err(unavailable)?
+            .map_or(0, |row| row.get(0)))
+    }
+
+    /// `partition`'s head here a pointer to writer group `group` (its epoch `POINTER_EPOCH`):
+    /// nothing commits under it, and a write that finds it waits.
+    fn point_to(&self, partition: &str, group: u32) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO book_partition_head (partition, sequence, epoch, origin, writer_group)
+                 VALUES ($1, 0, -1, $3, $2)
+                 ON CONFLICT (partition) DO UPDATE SET writer_group = EXCLUDED.writer_group, epoch = -1",
+                &[&partition, &(group as i32), &meridian_changes::origin()],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// `partition`'s head here opened at `closing`, its digest `digest`,
+    /// named writer group `group`'s at its epoch in this database: a move's
+    /// target, once its source let go. Answers the epoch.
+    pub fn open_at(&self, partition: &str, closing: u64, group: u32, digest: &[u8]) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let epoch = group_epoch(&mut tx, group)?;
+        tx.execute(
+            "INSERT INTO book_partition_head (partition, sequence, epoch, origin,
+                                              last_digest, writer_group)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (partition) DO UPDATE
+                SET sequence = EXCLUDED.sequence, epoch = EXCLUDED.epoch,
+                    last_digest = EXCLUDED.last_digest,
+                    writer_group = EXCLUDED.writer_group",
+            &[
+                &partition,
+                &(closing as i64),
+                &(epoch as i64),
+                &meridian_changes::origin(),
+                &digest,
+                &(group as i32),
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(epoch)
+    }
+
+    /// What this database projected of the accounts `partition` places let
+    /// go, their entries kept: the partition moved to another database,
+    /// which holds them whole (as [`Self::forget_moved_out`] for an
+    /// account). Says how many accounts.
+    pub fn forget_partition(&self, partition: &str) -> Result<usize> {
+        let accounts = self.accounts_in(partition)?;
+        for account in &accounts {
+            self.forget_moved_out(account)?;
+        }
+        Ok(accounts.len())
+    }
+}
+
+impl PostgresStore {
+    /// Whether writer group `group` has an epoch of its own in this
+    /// database (step 3d): its writer has taken over here (or adopted the
+    /// epoch its partitions shared), so a partition moved to it is written
+    /// under an epoch a takeover recorded. Group 0's is the control
+    /// partition's, always there.
+    pub fn group_ready(&self, group: u32) -> Result<bool> {
+        Ok(own_epoch(&mut *self.conn()?, group)?.is_some())
+    }
+
+    /// `partition`'s `writer_group` read from this database's head row into
+    /// the member's view (step 3d; ruled 2026-11-14); nothing where this
+    /// database holds no head of it. Says whether a head was read.
+    pub fn read_owner(&self, partition: &str) -> Result<bool> {
+        if !self.groups.several() {
+            return Ok(false);
+        }
+        // Where the book has several databases, the head furthest on names
+        // it, as [`Self::read_owners_from`] reads every partition: a raised
+        // count's new database holds an empty head of each (CI 43626539705).
+        let linked: Vec<Arc<PostgresStore>> = self
+            .databases
+            .get()
+            .map(|stores| stores.iter().filter_map(std::sync::Weak::upgrade).collect())
+            .unwrap_or_default();
+        // Furthest on, a written head before a move's pointer at the same
+        // sequence (the review's C3).
+        let mut furthest: Option<((i64, bool), Option<u32>)> = None;
+        let mut read = |store: &PostgresStore| -> Result<()> {
+            if let Some(row) = store
+                .conn()?
+                .query_opt(
+                    "SELECT writer_group, sequence, epoch <> -1 FROM book_partition_head
+                      WHERE partition = $1",
+                    &[&partition],
+                )
+                .map_err(unavailable)?
+            {
+                let named = row.get::<_, Option<i32>>(0).map(|group| group as u32);
+                let at = (row.get::<_, i64>(1), row.get::<_, bool>(2));
+                if furthest.is_none_or(|(held, _)| held < at) {
+                    furthest = Some((at, named));
+                }
+            }
+            Ok(())
+        };
+        if linked.len() > 1 {
+            for store in &linked {
+                read(store)?;
+            }
+        } else {
+            read(self)?;
+        }
+        let read = furthest.is_some();
+        if let Some((_, named)) = furthest {
+            self.groups.assign(partition, named);
+        }
+        Ok(read)
+    }
+
+    /// Every partition's `writer_group` this database names, read into the
+    /// member's view (step 3d): at start and on the sweep. Says how many
+    /// were named.
+    pub fn read_owners(&self) -> Result<usize> {
+        if !self.groups.several() {
+            return Ok(0);
+        }
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT partition, writer_group FROM book_partition_head
+                  WHERE writer_group IS NOT NULL",
+                &[],
+            )
+            .map_err(unavailable)?;
+        for row in &rows {
+            let group: i32 = row.get(1);
+            self.groups
+                .assign(row.get::<_, &str>(0), Some(group as u32));
+        }
+        Ok(rows.len())
+    }
+
+    /// Each partition's writer group as its furthest head names it, over
+    /// every database of the book, read into each store's view (step 3d;
+    /// CI 43626539705). A database brought by a raised `bor.databases`
+    /// holds a head of every partition at 0, named by its rendezvous owner
+    /// when pinned; read one database after another, the last named won,
+    /// and a partition moved by hand in the first read as its rendezvous
+    /// owner's again: that group wrote it from an empty head (P0 to group
+    /// 1, "writer group 1 owns P0 already", and P0's entries numbered
+    /// twice). The head furthest on is where the partition is written; on
+    /// a tie, the first database's. Says how many were named.
+    pub fn read_owners_from(stores: &[Arc<PostgresStore>]) -> Result<usize> {
+        if !stores.first().is_some_and(|store| store.groups.several()) {
+            return Ok(0);
+        }
+        // Furthest on, a written head before a move's pointer at the same
+        // sequence: never two groups at once (the review's C3).
+        let mut furthest: std::collections::BTreeMap<String, ((i64, bool), u32)> =
+            std::collections::BTreeMap::new();
+        for store in stores {
+            for row in store
+                .conn()?
+                .query(
+                    "SELECT partition, writer_group, sequence, epoch <> -1 FROM book_partition_head
+                      WHERE writer_group IS NOT NULL",
+                    &[],
+                )
+                .map_err(unavailable)?
+            {
+                let (partition, group, at): (String, i32, (i64, bool)) =
+                    (row.get(0), row.get(1), (row.get(2), row.get(3)));
+                match furthest.get(&partition) {
+                    Some((held, _)) if *held >= at => {}
+                    _ => {
+                        furthest.insert(partition, (at, group as u32));
+                    }
+                }
+            }
+        }
+        for store in stores {
+            for (partition, (_, group)) in &furthest {
+                store.groups.assign(partition, Some(*group));
+            }
+        }
+        Ok(furthest.len())
+    }
+
+    /// Each partition whose `writer_group` is NULL given its rendezvous
+    /// owner at the store's count (step 3d; ruled 2026-11-14): what the
+    /// control partition's group does at its start, so a later change of
+    /// the count moves nothing until a move moves it. Says how many.
+    pub fn pin_owners(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let unnamed: Vec<String> = conn
+            .query(
+                "SELECT partition FROM book_partition_head
+                  WHERE writer_group IS NULL AND partition <> $1",
+                &[&CONTROL_PARTITION],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let mut pinned = 0;
+        for partition in unnamed {
+            let group = meridian_changes::groups::owner(&partition, self.groups.count()) as i32;
+            pinned += conn
+                .execute(
+                    "UPDATE book_partition_head SET writer_group = $2
+                      WHERE partition = $1 AND writer_group IS NULL",
+                    &[&partition, &group],
+                )
+                .map_err(unavailable)?;
+        }
+        self.read_owners()?;
+        Ok(pinned)
+    }
+
+    /// Every database's store, this one's among them: where an account
+    /// placed in another database is found.
+    pub fn link_databases(&self, stores: &[Arc<PostgresStore>]) {
+        let _ = self
+            .databases
+            .set(stores.iter().map(Arc::downgrade).collect());
+    }
+
+    /// Where `account_id` is placed as this store's database records it,
+    /// never as last found: none where it holds no row of the account.
+    pub fn account_row(&self, account_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0)))
+    }
+
+    /// The accounts this database places in a partition not among
+    /// `partitions`, each with that partition: moved toward another
+    /// database and not yet let go here (step 3d; m9).
+    pub fn accounts_placed_outside(&self, partitions: &[String]) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id, partition FROM book_account
+                  WHERE NOT (partition = ANY($1)) ORDER BY account_id",
+                &[&partitions],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Those of `accounts` this database holds a row of.
+    pub fn accounts_held(&self, accounts: &[String]) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT account_id FROM book_account WHERE account_id = ANY($1)",
+                &[&accounts],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// `account_id`'s entries of `partitions` alone, by sequence, each
+    /// verified (step 3d; section 6.4): the entries this database writes,
+    /// never the copies a move brought it of another database's.
+    pub fn journal_written_in(
+        &self,
+        account_id: &str,
+        partitions: &[String],
+    ) -> Result<Vec<Entry>> {
+        fn read(
+            client: &mut impl GenericClient,
+            account_id: &str,
+            partitions: &[String],
+        ) -> Result<Vec<Entry>> {
+            client
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS} FROM book_entry
+                          WHERE account_id = $1 AND partition = ANY($2)
+                          ORDER BY first_sequence"
+                    ),
+                    &[&account_id, &partitions],
+                )
+                .map_err(unavailable)?
+                .iter()
+                .map(verified_entry)
+                .collect()
+        }
+        if stamping() {
+            // A read replica's: one snapshot, its heads beside (stage C2).
+            return self.reading(|tx| read(tx, account_id, partitions));
+        }
+        read(&mut *self.conn()?, account_id, partitions)
+    }
+
+    /// An account's move warmed into this database from `from`'s (step 3d;
+    /// section 6.8): its entries copied here by their own keys, so a copy
+    /// made again adds only what is new, then compared with the source as
+    /// one snapshot of it read them. Only its entries: its row and its
+    /// projections come with its open, so the account is in one database
+    /// until then. An entry already here is kept as it is, never replaced,
+    /// so a copy that changed here differs.
+    pub fn warm_account_from(
+        &self,
+        from: &PostgresStore,
+        account_id: &str,
+    ) -> Result<crate::store::Warmed> {
+        use std::io::{Read, Write};
+        let quoted = format!("'{}'", account_id.replace('\'', "''"));
+        let mut source = from.conn()?;
+        let mut snapshot = source
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let theirs: Vec<(String, Vec<u8>)> = snapshot
+            .query(
+                "SELECT entry_id, digest FROM book_entry WHERE account_id = $1
+                  ORDER BY partition, first_sequence",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get::<_, Option<Vec<u8>>>(1).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let last_entry: String = snapshot
+            .query_opt(
+                "SELECT e.entry_id FROM book_entry e
+                   JOIN book_account a ON a.account_id = e.account_id AND a.partition = e.partition
+                  WHERE e.account_id = $1
+                  ORDER BY e.first_sequence DESC LIMIT 1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        snapshot
+            .copy_out(&format!(
+                "COPY (SELECT * FROM book_entry WHERE account_id = {quoted}) TO STDOUT (FORMAT binary)"
+            ))
+            .map_err(unavailable)?
+            .read_to_end(&mut rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        snapshot.commit().map_err(unavailable)?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute(
+            "CREATE TEMP TABLE IF NOT EXISTS warming_book_entry (LIKE book_entry) ON COMMIT DROP",
+        )
+        .map_err(unavailable)?;
+        let mut writer = tx
+            .copy_in("COPY warming_book_entry FROM STDIN (FORMAT binary)")
+            .map_err(unavailable)?;
+        writer
+            .write_all(&rows)
+            .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+        writer.finish().map_err(unavailable)?;
+        tx.execute(
+            "INSERT INTO book_entry SELECT * FROM warming_book_entry ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .map_err(unavailable)?;
+        // The copy's digest of each entry, taken again of what it holds.
+        let ours: Vec<(String, Vec<u8>)> = tx
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1
+                      ORDER BY partition, first_sequence"
+                ),
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let (canonical, previous, digest) = stored_of(row);
+                let taken = if digest.is_empty() {
+                    digest
+                } else {
+                    meridian_changes::integrity::chained(&previous, &canonical)
+                };
+                (row.get(0), taken)
+            })
+            .collect();
+        tx.commit().map_err(unavailable)?;
+        let fold = |entries: &[(String, Vec<u8>)]| {
+            entries.iter().fold(Vec::new(), |sum, (id, digest)| {
+                let mut named = id.as_bytes().to_vec();
+                named.push(0x1f);
+                named.extend_from_slice(digest);
+                meridian_changes::integrity::chained(&sum, &named)
+            })
+        };
+        let differs_at = (0..theirs.len().max(ours.len()))
+            .find(|n| theirs.get(*n) != ours.get(*n))
+            .and_then(|n| theirs.get(n).or(ours.get(n)))
+            .map(|(id, _)| id.clone());
+        Ok(crate::store::Warmed {
+            last_entry,
+            source: fold(&theirs),
+            copy: fold(&ours),
+            differs_at,
+        })
+    }
+
+    /// Everything `from`'s database holds of `account_id` copied into this
+    /// one, in one transaction (step 3d; section 6.4, "a move between
+    /// databases copies the data"): its row, its entries, its snapshots and
+    /// every projection of it, each table's rows by their own keys, so a
+    /// copy made again adds nothing. Its row takes `from`'s placement. Says
+    /// how many rows were added.
+    pub fn copy_account_from(&self, from: &PostgresStore, account_id: &str) -> Result<u64> {
+        use std::io::{Read, Write};
+        let quoted = format!("'{}'", account_id.replace('\'', "''"));
+        let mut source = from.conn()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut added = 0;
+        for table in ACCOUNT_TABLES {
+            let mut rows = Vec::new();
+            source
+                .copy_out(&format!(
+                    "COPY (SELECT * FROM {table} WHERE account_id = {quoted}) TO STDOUT (FORMAT binary)"
+                ))
+                .map_err(unavailable)?
+                .read_to_end(&mut rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            tx.batch_execute(&format!(
+                "CREATE TEMP TABLE IF NOT EXISTS moving_{table} (LIKE {table}) ON COMMIT DROP"
+            ))
+            .map_err(unavailable)?;
+            let mut writer = tx
+                .copy_in(&format!("COPY moving_{table} FROM STDIN (FORMAT binary)"))
+                .map_err(unavailable)?;
+            writer
+                .write_all(&rows)
+                .map_err(|failed| StoreError::Unavailable(failed.to_string()))?;
+            writer.finish().map_err(unavailable)?;
+            let on_conflict = if *table == "book_account" {
+                "ON CONFLICT (account_id) DO UPDATE SET partition = EXCLUDED.partition"
+            } else {
+                "ON CONFLICT DO NOTHING"
+            };
+            added += tx
+                .execute(
+                    &format!("INSERT INTO {table} SELECT * FROM moving_{table} {on_conflict}"),
+                    &[],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        if let Some(partition) = from.account_row(account_id)? {
+            self.place(account_id, &partition);
+        }
+        Ok(added)
+    }
+
+    /// What this database projected of `account_id` let go, its entries
+    /// kept (step 3d; section 6.4): the account moved to another database,
+    /// which holds it whole. Its row goes too, so no read of every account
+    /// here finds it; an act sent here finds its close and goes on there.
+    /// Says how many rows went.
+    pub fn forget_moved_out(&self, account_id: &str) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut gone = 0;
+        for table in ACCOUNT_TABLES
+            .iter()
+            .filter(|table| **table != "book_entry")
+        {
+            gone += tx
+                .execute(
+                    &format!("DELETE FROM {table} WHERE account_id = $1"),
+                    &[&account_id],
+                )
+                .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        self.placed
+            .lock()
+            .expect("placements poisoned")
+            .remove(account_id);
+        Ok(gone)
+    }
+
+    /// Where `account_id` is placed, as this store last found it or as its
+    /// own database holds it; none where it is placed in neither.
+    pub fn placement_held(&self, account_id: &str) -> Option<String> {
+        if let Some(partition) = self
+            .placed
+            .lock()
+            .expect("placements poisoned")
+            .get(account_id)
+        {
+            return Some(partition.clone());
+        }
+        let found: Option<String> = self
+            .conn()
+            .ok()?
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .ok()?
+            .map(|row| row.get(0));
+        if let Some(partition) = &found {
+            self.place(account_id, partition);
+        }
+        found
+    }
+
+    /// Where `account_id` was found in another database: this store routes
+    /// it there, never placing it again.
+    pub fn learn_placement(&self, account_id: &str, partition: &str) {
+        self.place(account_id, partition);
+    }
+
+    /// The takeovers and findings database `d`'s store keeps beside its
+    /// journal and this store's `~control` has not journalled, and its
+    /// partitions whose writer group this one's last assignment did not
+    /// name: owed to database 0's `~control`, each keyed with its database.
+    pub fn control_records_owed_of(
+        &self,
+        other: &PostgresStore,
+        d: u32,
+    ) -> Result<Vec<crate::control::Owed>> {
+        let journalled = self.journalled_keys()?;
+        let theirs = other.control_records_owed_in(d)?;
+        Ok(theirs
+            .into_iter()
+            .filter(|owed| !journalled.contains(&owed.key))
+            .collect())
+    }
+}
+
+impl PostgresStore {
+    /// Whether `partition`, this group's, is to be written in another of
+    /// the book's databases than this one, whose head stands at `here`
+    /// (step 3d; ruled 2026-11-14: each partition is written where its head
+    /// is). In the group's home database: another holds it further on under
+    /// this group -- not moved home yet -- asked until none does, then never
+    /// again. In any other: the home database's head is at or past this
+    /// one's -- moved home, its switch having raised the home head to the
+    /// close before the source let go -- so a write routed here before the
+    /// move goes home, never committed in both (the same-group fence).
+    fn headed_elsewhere(&self, partition: &str, here: u64) -> std::result::Result<bool, Unbatched> {
+        let Some(linked) = self.databases.get() else {
+            return Ok(false);
+        };
+        if linked.len() < 2 {
+            return Ok(false);
+        }
+        let stores: Vec<Arc<PostgresStore>> =
+            linked.iter().filter_map(std::sync::Weak::upgrade).collect();
+        let (mine, count) = (self.groups.mine(), linked.len() as u32);
+        let names_mine = |tip: &Tip| {
+            tip.writer_group
+                .filter(|group| *group < self.groups.count())
+                .unwrap_or_else(|| meridian_changes::groups::owner(partition, self.groups.count()))
+                == mine
+        };
+        let Some(home) = stores.get(meridian_changes::databases::of_group(mine, count) as usize)
+        else {
+            return Ok(false);
+        };
+        if std::ptr::eq(home.as_ref(), self) {
+            if self
+                .home_settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(partition)
+            {
+                return Ok(false);
+            }
+            for other in stores
+                .iter()
+                .filter(|other| !std::ptr::eq(other.as_ref(), self))
+            {
+                // A pointer (its epoch `POINTER_EPOCH`) is a move's, never where it is written.
+                let Some(tip) = other
+                    .tip(partition)
+                    .map_err(Unbatched::Whole)?
+                    .filter(|tip| tip.epoch != meridian_changes::moves::POINTER)
+                else {
+                    continue;
+                };
+                if tip.head > here && names_mine(&tip) {
+                    return Ok(true);
+                }
+                // Another group's head as far on or further, written: never
+                // both (the review's C3) -- the write goes to it.
+                if tip.head >= here && tip.head > 0 && !names_mine(&tip) {
+                    if let Some(group) = tip.writer_group.filter(|g| *g < self.groups.count()) {
+                        return Err(Unbatched::Whole(StoreError::NotOwned {
+                            partition: partition.to_string(),
+                            group,
+                        }));
+                    }
+                }
+            }
+            self.home_settled
+                .lock()
+                .expect("settled poisoned")
+                .insert(partition.to_string());
+            return Ok(false);
+        }
+        let home_head = home
+            .tip(partition)
+            .map_err(Unbatched::Whole)?
+            .filter(|tip| tip.epoch != meridian_changes::moves::POINTER && names_mine(tip))
+            .map(|tip| tip.head);
+        Ok(home_head.is_some_and(|head| head >= here))
+    }
+
+    /// This member seen in the book's members (step 3d; ruled 2026-11-15):
+    /// its row in this database, the book's database 0, made or brought up
+    /// to date.
+    pub fn member_seen(
+        &self,
+        member: &str,
+        revision: &str,
+        started_at_ns: i64,
+        now_ns: i64,
+    ) -> Result<()> {
+        meridian_changes::members::BOOK
+            .seen(&mut *self.conn()?, member, revision, started_at_ns, now_ns)
+            .map_err(unavailable)
+    }
+
+    /// This member seen, with what it serves as, in one statement (step
+    /// 3d, stage T; approved 2026-11-15; the review's finding 9): its
+    /// writer group, and its mode once it serves.
+    pub fn member_says(
+        &self,
+        member: &str,
+        revision: &str,
+        started_at_ns: i64,
+        now_ns: i64,
+        writer_group: u32,
+        mode: &str,
+    ) -> Result<()> {
+        meridian_changes::members::BOOK
+            .says(
+                &mut *self.conn()?,
+                member,
+                revision,
+                started_at_ns,
+                now_ns,
+                writer_group,
+                mode,
+            )
+            .map_err(unavailable)
+    }
+
+    /// Every other member's row, as each last said it: what a writer told
+    /// to stop watches ([`meridian_changes::members::Watch`]).
+    pub fn members_but(&self, member: &str) -> Result<Vec<meridian_changes::members::Said>> {
+        meridian_changes::members::BOOK
+            .others(&mut *self.conn()?, member)
+            .map_err(unavailable)
+    }
+
+    /// Commit nothing more through this store (step 3d, stage T's review,
+    /// finding 3): every commit from here is refused as a fenced one is.
+    /// What the book's writer does, told to stop, where no lease fences
+    /// its group and it serves on beside its replacement
+    /// ([`meridian_changes::Fence::stop`]).
+    pub fn stop_committing(&self) {
+        self.fence.stop();
+    }
+
+    /// The members seen within `within_ns` of `now_ns` running another
+    /// revision than `revision`: none once the book's rollout is complete.
+    pub fn members_behind(
+        &self,
+        revision: &str,
+        now_ns: i64,
+        within_ns: i64,
+    ) -> Result<Vec<meridian_changes::members::Behind>> {
+        meridian_changes::members::BOOK
+            .behind(&mut *self.conn()?, revision, now_ns, within_ns)
+            .map_err(unavailable)
+    }
+
+    /// Each partition's last move journalled on this store's `~control`
+    /// that was by hand (step 3d; section 6.8): the group the admin moved it
+    /// to. A partition whose last move was by a changed count is not named.
+    pub fn moved_by_hand(&self) -> Result<std::collections::BTreeMap<String, u32>> {
+        let mut out = std::collections::BTreeMap::new();
+        for row in self
+            .conn()?
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry
+                      WHERE account_id = $1 AND idempotency_key LIKE 'control-record:partition-moved:%'
+                      ORDER BY first_sequence"
+                ),
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+        {
+            let Some((_, body)) = entry_of(&row)?.body.record else {
+                continue;
+            };
+            let Ok(moved) = meridian_domain::v1::PartitionMoved::decode(&body[..]) else {
+                continue;
+            };
+            // A move to its own group's database places it nowhere new.
+            if moved.from_group == moved.to_group {
+                continue;
+            }
+            if moved.by_hand {
+                out.insert(moved.partition, moved.to_group);
+            } else {
+                out.remove(&moved.partition);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The keys of the records this store's `~control` has journalled.
+    fn journalled_keys(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT idempotency_key FROM book_entry
+                  WHERE account_id = $1 AND idempotency_key LIKE 'control-record:%'",
+                &[&crate::store::CONTROL_ACCOUNT],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// Each takeover and finding this store's database keeps beside its
+    /// journal, as a record owed to `~control`: keyed by its epoch or row,
+    /// and for a database `d` past the first by `<d>/` before it, as two
+    /// databases number their epochs and findings apart (step 3d).
+    fn control_records_owed_in(&self, d: u32) -> Result<Vec<crate::control::Owed>> {
+        use meridian_changes::records;
+        let place = |id: i64| {
+            if d == 0 {
+                id.to_string()
+            } else {
+                format!("{d}/{id}")
+            }
+        };
+        let mut conn = self.conn()?;
+        let mut owed = Vec::new();
+        // Each takeover, by its epoch, as it was kept in its own fencing.
+        for row in conn
+            .query(
+                "SELECT epoch, member, partitions, why, at_ns FROM book_writer_took_over
+                  ORDER BY epoch",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let epoch: i64 = row.get(0);
+            let by = meridian_changes::TookOver {
+                member: row.get(1),
+                previous: String::new(),
+                why: row.get(3),
+                at_ns: row.get(4),
+            };
+            let record = records::took_over("bor", &by, row.get(2), epoch as u64);
+            owed.push(crate::control::Owed {
+                key: format!("control-record:took-over:{}", place(epoch)),
+                kind: records::TOOK_OVER,
+                body: record.encode_to_vec(),
+                reason: format!("the book's writer took over: {}", by.why),
+            });
+        }
+        // Each account's move, by its open (step 3d): its record in control.
+        for row in conn
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE kind = $1
+                      ORDER BY partition, first_sequence"
+                ),
+                &[&crate::journal::ACCOUNT_MOVED],
+            )
+            .map_err(unavailable)?
+        {
+            let entry = entry_of(&row)?;
+            if !crate::journal::opens(&entry) {
+                continue;
+            }
+            let Some(moved) = crate::journal::moved_of(&entry) else {
+                continue;
+            };
+            owed.push(crate::control::Owed {
+                key: crate::moves::control_key(&moved),
+                kind: crate::journal::ACCOUNT_MOVED,
+                body: moved.encode_to_vec(),
+                reason: format!(
+                    "account {} moved from {} to {}: {}",
+                    moved.account_id, moved.from_partition, moved.to_partition, moved.reason
+                ),
+            });
+        }
+        // Each record a member of a group past the first kept for it (step
+        // 3d; `book_control_owed`), by its own key, in the order kept.
+        for row in conn
+            .query(
+                "SELECT key, kind, body, reason FROM book_control_owed ORDER BY kept_at_ns, key",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let kind: String = row.get(1);
+            let Some(kind) = crate::control::owed_kind(&kind) else {
+                tracing::warn!(
+                    kind,
+                    "a record owed to control is of no kind the book journals"
+                );
+                continue;
+            };
+            owed.push(crate::control::Owed {
+                key: row.get(0),
+                kind,
+                body: row.get(2),
+                reason: row.get(3),
+            });
+        }
+        // Each finding, by its row, as the scrub kept it.
+        for row in conn
+            .query(
+                "SELECT id, partition, sequence, committed_at_ns, what, found_at_ns
+                   FROM book_integrity_finding ORDER BY id",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let id: i64 = row.get(0);
+            let found = meridian_changes::integrity::Finding {
+                partition: row.get(1),
+                sequence: row.get::<_, i64>(2) as u64,
+                committed_at_ns: row.get(3),
+                what: row.get(4),
+            };
+            let record = records::finding(
+                "bor",
+                meridian_domain::v1::IntegrityCheck::JournalChain,
+                &found,
+                row.get(5),
+            );
+            owed.push(crate::control::Owed {
+                key: format!("control-record:finding:{}", place(id)),
+                kind: records::FINDING,
+                body: record.encode_to_vec(),
+                reason: format!("an integrity finding: {}", found.what),
+            });
+        }
+        Ok(owed)
+    }
 }

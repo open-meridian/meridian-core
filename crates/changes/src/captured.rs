@@ -415,13 +415,16 @@ impl Spec {
     /// (contract v30, stage C; [`crate::timeline`]): on a new one, the epoch
     /// raised as a takeover raises it, the takeover recorded with
     /// [`crate::timeline::DATABASE_TIMELINE`] by `member`, in one
-    /// transaction. Answers what was found, and the identity now.
+    /// transaction, and adopted by `fence` before it can be read
+    /// ([`crate::Fence::adopt_committing`]). Answers what was found, and the
+    /// identity now.
     pub fn follow_timeline(
         &self,
         client: &mut impl GenericClient,
-        mine: u64,
+        fence: &crate::Fence,
         member: &str,
     ) -> Result<(crate::timeline::Timeline, String), postgres::Error> {
+        let mine = fence.epoch();
         let mut tx = client.transaction()?;
         let by = crate::TookOver {
             member: member.to_string(),
@@ -431,7 +434,12 @@ impl Spec {
         };
         let found =
             crate::timeline::follow(&mut tx, self.head, CONTROL, mine, |tx| self.raise(tx, &by))?;
-        tx.commit()?;
+        match &found.0 {
+            crate::timeline::Timeline::Moved(epoch) => {
+                fence.adopt_committing(*epoch, || tx.commit())
+            }
+            _ => tx.commit(),
+        }?;
         Ok(found)
     }
 

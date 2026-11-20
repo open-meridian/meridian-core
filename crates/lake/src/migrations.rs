@@ -121,6 +121,112 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "unattributed_gap",
         sql: include_str!("../migrations/0017_unattributed_gap.sql"),
     },
+    // Writer groups (step 3d; approved 2026-11-12): each group past the
+    // first's epoch, which a dataset its writer begins is checked against.
+    Migration {
+        version: 18,
+        name: "writer_group",
+        sql: include_str!("../migrations/0018_writer_group.sql"),
+    },
+    // Hash ranges (step 3d; section 6.1, approved 2026-11-12): each range's
+    // own head row, and each row's range and anchor.
+    Migration {
+        version: 19,
+        name: "ranges",
+        sql: include_str!("../migrations/0019_ranges.sql"),
+    },
+    // lake_row partitioned online (step 3d; section 6.2): the rows kept so
+    // far said to name no range, checked without holding reads back, then
+    // the table kept so far made the new table's default partition, and
+    // `lake_latest` (approved 2026-11-12).
+    Migration {
+        version: 20,
+        name: "partitioned_prepare",
+        sql: include_str!("../migrations/0020_partitioned_prepare.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "partitioned_validate",
+        sql: include_str!("../migrations/0021_partitioned_validate.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "partitioned",
+        sql: include_str!("../migrations/0022_partitioned.sql"),
+    },
+    // lake_row's partitions made by lake_row's owner (step 3d): the lake
+    // serves under a login that may not create in the schema.
+    Migration {
+        version: 23,
+        name: "leaves",
+        sql: include_str!("../migrations/0023_leaves.sql"),
+    },
+    // A month's table analysed once its first batch is in (step 3d;
+    // `lake_analyze_month` approved 2026-11-14).
+    Migration {
+        version: 24,
+        name: "analyse_months",
+        sql: include_str!("../migrations/0024_analyse_months.sql"),
+    },
+    // A range's writer group (step 3d; ruled 2026-11-14): set by a move's
+    // switch, and filled with the rendezvous owner at start.
+    Migration {
+        version: 25,
+        name: "writer_group",
+        sql: include_str!("../migrations/0025_writer_group.sql"),
+    },
+    // A group's part of a write split across groups (step 3d; spec 6.7,
+    // ruled 2026-11-15): what its rows did, for the answering group to add.
+    Migration {
+        version: 26,
+        name: "write_ahead_part",
+        sql: include_str!("../migrations/0026_write_ahead_part.sql"),
+    },
+    // The lake's members and the revision each runs (step 3d; ruled
+    // 2026-11-15, item 9): what a move home waits on.
+    Migration {
+        version: 27,
+        name: "member",
+        sql: include_str!("../migrations/0027_member.sql"),
+    },
+    // Where a range's source stood in the stream at its last move (step
+    // 3d; `taken_from` ruled 2026-11-15): what its target leaves uncounted.
+    Migration {
+        version: 28,
+        name: "taken_from",
+        sql: include_str!("../migrations/0028_taken_from.sql"),
+    },
+    // A part's rows refused by the lake's rule 5, and the refusal (step 3d;
+    // `refused` and `refused_detail` ruled 2026-11-15): what the group
+    // answering the write answers it with.
+    Migration {
+        version: 29,
+        name: "part_refused",
+        sql: include_str!("../migrations/0029_part_refused.sql"),
+    },
+    // What each member serves as (step 3d, stage T; `writer_group` and
+    // `mode` approved 2026-11-15): what a writer told to stop waits on.
+    Migration {
+        version: 30,
+        name: "member_serves",
+        sql: include_str!("../migrations/0030_member_serves.sql"),
+    },
+    // A plugin shard's epoch as this database last saw it (step 3d,
+    // checkpoint 5, item 32): what a write stamped with an epoch is checked
+    // against, in its own transaction.
+    Migration {
+        version: 31,
+        name: "shard_fence",
+        sql: include_str!("../migrations/0031_shard_fence.sql"),
+    },
+    // The write-ahead stream a range's `taken_from` was taken in (step 3d;
+    // `taken_in` approved 2026-11-19, item 202): a place in another stream
+    // leaves nothing uncounted.
+    Migration {
+        version: 32,
+        name: "taken_in",
+        sql: include_str!("../migrations/0032_taken_in.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

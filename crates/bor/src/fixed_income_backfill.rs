@@ -143,6 +143,8 @@ fn record_control(bus: &Bus, store: &dyn Store, cutoff_ns: i64, done: bool) -> R
     match acted {
         Ok(_) => Ok(()),
         Err(StoreError::Invalid(said)) if said == NOTHING_OWED => Ok(()),
+        // Another writer group's account (step 3d): its own writer does it.
+        Err(StoreError::NotOwned { .. }) => Ok(()),
         Err(failed) => Err(failed.to_string()),
     }
 }
@@ -228,6 +230,8 @@ pub fn backfill(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
             }
             Ok(Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_OWED => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }

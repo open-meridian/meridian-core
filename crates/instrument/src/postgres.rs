@@ -170,8 +170,7 @@ impl PostgresStore {
             meridian_changes::tls::database_tls().map_err(unavailable)?,
         );
         let watch = std::sync::Arc::new(meridian_changes::timeline::Watch::default());
-        let pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1))
+        let pool = meridian_changes::pool(pool_size)
             .connection_customizer(Box::new(meridian_changes::timeline::Watching(
                 std::sync::Arc::clone(&watch),
             )))
@@ -225,10 +224,9 @@ impl PostgresStore {
             return Ok(Timeline::Same);
         }
         let (found, identity) = CHANGES
-            .follow_timeline(&mut **conn, mine, meridian_changes::member())
+            .follow_timeline(&mut **conn, &self.fence, meridian_changes::member())
             .map_err(unavailable)?;
         if let Timeline::Moved(epoch) = found {
-            self.fence.adopt(epoch);
             tracing::warn!(
                 epoch,
                 identity,
@@ -317,9 +315,20 @@ impl PostgresStore {
     /// once, for a record with no history yet. Under an advisory lock, because
     /// `IF NOT EXISTS` is not the concurrency answer it reads as.
     pub fn migrate(&self, clock: &dyn meridian_clock::Clock) -> Result<()> {
+        self.migrate_within(clock, meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST)
+    }
+
+    /// [`Self::migrate`], its schema lock waited for at most `lock_waits`:
+    /// what is left of the migration's bound when it is applied again
+    /// (meridian_runtime::migrate_once_it_answers; review c5s L3).
+    pub fn migrate_within(
+        &self,
+        clock: &dyn meridian_clock::Clock,
+        lock_waits: std::time::Duration,
+    ) -> Result<()> {
         let mut conn = self.conn()?;
 
-        conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+        meridian_changes::take_schema_lock(&mut *conn, SCHEMA_LOCK, lock_waits)
             .map_err(unavailable)?;
 
         let created = SCHEMA

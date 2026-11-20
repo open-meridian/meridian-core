@@ -20,6 +20,8 @@
 //! - a **reader** member answers from the store's primary database (its
 //!   primary's position kept by [`Reads::keep_primary`]), the handler told
 //!   so by [`answering_from_primary`] -- once the primary has reached it;
+//!   and its follower, told so ([`Reads::left_behind`]), reads what the
+//!   member lacks from the writer, so the next read is its own record's;
 //! - a **writer**, whose record is the primary, refuses UNAVAILABLE with no
 //!   reason code: it can be behind only after a database failover that lost
 //!   acknowledged rows, and the caller may ask again.
@@ -281,6 +283,11 @@ pub struct Reads {
     bound_ms: AtomicU64,
     waiting: AtomicUsize,
     session: RwLock<Option<Arc<dyn Session>>>,
+    /// The stores a read of was answered from the primary past its wait
+    /// since the member's follower last asked ([`Reads::left_behind`]): the
+    /// member's record is behind its primary there, and stays so where the
+    /// partition is not written again.
+    left_behind: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for Reads {
@@ -293,6 +300,7 @@ impl Default for Reads {
             bound_ms: AtomicU64::new(BOUND_DEFAULT.as_millis() as u64),
             waiting: AtomicUsize::new(0),
             session: RwLock::new(None),
+            left_behind: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -346,6 +354,27 @@ impl Reads {
             .expect("committed poisoned")
             .remove(domain);
         self.looked.lock().expect("looked poisoned").remove(domain);
+    }
+
+    /// Whether a read of `domain` was answered from the primary past its
+    /// wait since this was last asked: this member's record was behind its
+    /// primary's then. A reader's follower asks each time its writer answers
+    /// it, and reads what it lacks from the writer. The tail tells a follower
+    /// it missed a page only by the partition's next page, so a partition
+    /// not written again -- a store's `control`, most of the time -- stayed
+    /// behind for good, every read naming it waiting out its bound
+    /// (failover-repeat 43697279874, ha run 2: the book's reader, one
+    /// behind on `control` from a writer's hand-over to that partition's
+    /// next change, a minute later).
+    ///
+    /// Said with when the earliest such read came, its wait before it: the
+    /// member was behind from then, not from when its follower asks
+    /// (review-delta A3).
+    pub fn left_behind(&self, domain: &str) -> Option<Instant> {
+        self.left_behind
+            .lock()
+            .expect("left behind poisoned")
+            .remove(domain)
     }
 
     pub fn set_session(&self, session: Arc<dyn Session>) {
@@ -468,6 +497,15 @@ impl Reads {
                     waited_ms = waited.as_millis() as u64,
                     "a reader behind its read_after past its wait: answered from the primary"
                 );
+                let came = Instant::now()
+                    .checked_sub(waited)
+                    .unwrap_or_else(Instant::now);
+                self.left_behind
+                    .lock()
+                    .expect("left behind poisoned")
+                    .entry(domain.to_string())
+                    .and_modify(|earliest| *earliest = (*earliest).min(came))
+                    .or_insert(came);
                 return Ok(Held::FromPrimary);
             }
         }
@@ -744,6 +782,49 @@ mod tests {
             })
             .unwrap();
         assert!(!here);
+    }
+
+    /// A read answered from the primary past its wait leaves word that the
+    /// member's record is behind there, once, for its follower to take; a
+    /// read answered from its own record leaves none.
+    #[test]
+    fn a_read_answered_from_the_primary_says_its_member_was_left_behind() {
+        let reads = Reads::default();
+        reads.keep(
+            "book",
+            Arc::new(Lagging(Mutex::new([("control".to_string(), 23)].into()))),
+        );
+        reads.keep_primary(
+            "book",
+            Arc::new(Lagging(Mutex::new([("control".to_string(), 24)].into()))),
+        );
+        reads.set_bound(Duration::from_millis(50));
+        assert_eq!(
+            reads.hold("platform.book.query.list-orders", &mark("control", 23)),
+            Ok(Held::Here)
+        );
+        assert!(
+            reads.left_behind("book").is_none(),
+            "its own record answered"
+        );
+        let came = Instant::now();
+        assert_eq!(
+            reads.hold("platform.book.query.list-orders", &mark("control", 24)),
+            Ok(Held::FromPrimary)
+        );
+        assert!(
+            reads.left_behind("lake").is_none(),
+            "another store's is not said"
+        );
+        // Behind from when the read came, its wait before it (review-delta
+        // A3), never from when its follower asks.
+        let behind = reads.left_behind("book").unwrap();
+        assert!(
+            behind <= came + Duration::from_millis(20),
+            "behind from {} ms after the read came",
+            behind.saturating_duration_since(came).as_millis()
+        );
+        assert!(reads.left_behind("book").is_none(), "said once");
     }
 
     #[test]

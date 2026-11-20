@@ -803,6 +803,42 @@ impl Sidecar {
             _ => false,
         };
         let unmapped = account.is_none();
+        // A data plugin's lake write share (step 3d; the resilience spec's
+        // section 6.9): a write past it is acknowledged late, once the
+        // share covers it; one whose hold would outlast its caller's
+        // deadline is refused RATE_LIMITED with a retry-after, and never
+        // sent. It is held before it is sent, in its order: a caller that
+        // stops waiting mid-hold has then sent nothing past the share,
+        // whatever deadline it named (review finding 5). Its bytes are
+        // taken when it is asked, so the next waits behind it either way.
+        let held = match &self.write_share {
+            Some(share) if meridian_bus::write_ahead::TOPICS.contains(&&*topic) => {
+                let now = std::time::Instant::now();
+                let bytes = message.encode_to_vec().len();
+                match share.take(bytes, now, crate::share::call_within(now)) {
+                    Ok(held) => held,
+                    Err(refused) => {
+                        tracing::info!(
+                            instance = self.instance_id(),
+                            topic = &*topic,
+                            bytes,
+                            retry_after_seconds = refused.retry_after_seconds,
+                            "{}",
+                            refused.words
+                        );
+                        return Err(refused_for_load(
+                            RefusalReason::RateLimited,
+                            refused.retry_after_seconds,
+                            refused.words,
+                        ));
+                    }
+                }
+            }
+            _ => std::time::Duration::ZERO,
+        };
+        if !held.is_zero() {
+            tokio::time::sleep(held).await;
+        }
         let reply: Response<R> = self
             .ask_routed_demo(&topic, payload_type, message, &claims, scope, routed, demo)
             .await?;
@@ -1556,6 +1592,9 @@ pub(crate) fn refused(failed: BusError) -> Status {
     match failed {
         BusError::NoHandler(topic) => Status::unavailable(format!("nothing serves {topic}")),
         timeout @ BusError::Timeout { .. } => Status::deadline_exceeded(timeout.to_string()),
+        // Held back by the sidecar's own gate (review c5a M1): its shard's
+        // Lease is past its renew deadline; a renewal sends it again.
+        held @ BusError::NotSent { .. } => Status::unavailable(held.to_string()),
         // A component's refusal of its own (W9's book, contract v8), its
         // reason code carried beside the status and its words alone in it.
         // The fields it names as left out, where it names any, ride with it.
@@ -1592,6 +1631,19 @@ pub(crate) fn refused(failed: BusError) -> Status {
                     reason,
                     meridian_bus::refusal_retry_after(&detail).unwrap_or(1),
                     words.to_string(),
+                )
+            }
+            // A write under an epoch no longer its shard's (step 3d,
+            // checkpoint 5, item 32): FAILED_PRECONDITION to the plugin,
+            // and this sidecar ends its serving, as on a lost Lease, and
+            // stands by again (item 49).
+            Some((RefusalReason::ShardFenced, words)) => {
+                crate::shards::say_fenced(words);
+                refused_naming(
+                    Code::FailedPrecondition,
+                    words.to_string(),
+                    RefusalReason::ShardFenced,
+                    Vec::new(),
                 )
             }
             // A store that could not check the command, nothing recorded:

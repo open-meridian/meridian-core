@@ -40,6 +40,9 @@ pub fn reason_of(why: &str) -> TakeoverReason {
     match why {
         crate::LEASE_RELEASED => TakeoverReason::SteppedDown,
         crate::timeline::DATABASE_TIMELINE => TakeoverReason::DatabaseTimeline,
+        // Its partitions assigned to its writer group (step 3d): the group
+        // count changed, and they moved to it.
+        crate::groups::ASSIGNED => TakeoverReason::Moved,
         // The lease lapsed, or no member held it: the writer before (where
         // there was one) let it go without handing it over.
         _ => TakeoverReason::LeaseLapsed,

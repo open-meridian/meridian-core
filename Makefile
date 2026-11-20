@@ -9,12 +9,12 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: bench-book ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
-        build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
+        build test test-store check-store-leftovers check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger e2e-harness-check
 
 help:
 	@echo "  make pre-push       the fast gate the pre-push hook runs: lint, build, the changed crates' tests, the stages a path selects"
@@ -26,11 +26,13 @@ help:
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
 	@echo "  make bench          measure the stated capacity INSTALL.md gives (by hand)"
+	@echo "  make bench-book     the book's bench for one shape, headless: BENCH_DATABASE_URL, BENCH_OUT (JSON)"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
 	@echo "  make check-one-clock         every component reads the deployment's one clock, and nothing reads the wall clock"
 	@echo "  make check-test-targets      every integration test is named by a target that runs it"
+	@echo "  make e2e-harness-check       the cluster harnesses' own tests, no cluster: rollouts, the dashboard's forward"
 	@echo "  make licence-check-test      the suggestion-licence action decides as it should (no network)"
 	@echo "  make check-local-storage     the development cluster keeps its database across a restart"
 	@echo "  make e2e-settings-page  a plugin's Settings pages in a real browser: the entry grid, its most, one screen"
@@ -157,7 +159,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check e2e-harness-check
 	@$(GATE) end checks
 # The images at once (the CI images job is the run's critical path; step 3b
 # part 5): the release build beside the SDK's image and the harness's, which
@@ -273,7 +275,7 @@ pre-push-run: GATE_BUDGETS_COLD = $(PRE_PUSH_BUDGETS_COLD)
 pre-push-run: gate-start $(addprefix pre-push-,$(PRE_PUSH_STAGES))
 	@$(GATE) finish
 
-pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check advisories
+pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check e2e-harness-check advisories
 	@$(GATE) end checks
 pre-push-rust:     gate-begin-rust fast-rust
 	@$(GATE) end rust
@@ -505,25 +507,67 @@ test: tests-image
 # The store's tests need a database. A build stage has none, and a lightweight
 # in-process substitute is exactly what must not exist: a store that behaves
 # differently in development is a store nobody has tested.
+#
+# What the test database held before the run is read first, so a leftover of
+# an earlier run -- one killed, whose drops never ran -- is named as that and
+# never blamed on this one; and a failed run is checked for leftovers too, a
+# failed test's being what PO 65 is about (review c5p M2, L5).
 test-store: network tests-image
+	@$(COMPOSE_TEST) up -d --wait postgres >/dev/null 2>&1 \
+		&& $(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -Atc "$(STORE_LEFTOVERS)" \
+			>.test-store-before \
+		|| { echo "test-store FAILED: the test database could not be read before the run" >&2; exit 1; }
 	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
 		>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; exit 1; }
+		     tail -40 .test-store.log >&2; grep -h 'SPEED lake' .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before; exit 1; }
 	@# The lake's speed check's figures, on every run, passing or not.
 	@grep -h 'SPEED lake' .test-store.log || echo "test-store: the lake's speed check said nothing"
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE_TEST) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: serving:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: probe:: serving:: scratch:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
-		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, and the upgrade preflight reads every store as ready and a newer one as blocked"
+		     tail -40 .test-store.log >&2; \
+		     $(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before; exit 1; }
+	@$(MAKE) --no-print-directory check-store-leftovers STORE_BEFORE=.test-store-before
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, the upgrade preflight reads every store as ready and a newer one as blocked, a failed test's schemas and databases are dropped as it unwinds, and the tests left no schema or database behind"
+
+# PO 65 (2026-11-17): each schema and database a store test makes beside the
+# test database's own is dropped by the test that made it, a failed test's
+# too. What a run left there is listed by name, its run's figures cut off,
+# and fails it: left in a development database that outlives its runs, they
+# filled the VM's memory (`bor_fence_*` schemas and `lake2_*` databases).
+STORE_LEFTOVERS := SELECT 'database ' || datname FROM pg_database \
+	WHERE datname NOT IN ('meridian', 'postgres', 'template0', 'template1') \
+	UNION ALL SELECT 'schema ' || nspname FROM pg_namespace \
+	WHERE nspname NOT IN ('public', 'information_schema') AND nspname !~ '^pg_' ORDER BY 1
+#
+# STORE_BEFORE names a listing read before the run (test-store's): what it
+# holds is named as there before, and only what the run added fails it.
+check-store-leftovers:
+	@left=$$($(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -Atc "$(STORE_LEFTOVERS)") \
+		|| { echo "check-store-leftovers: the test database could not be read" >&2; exit 1; }; \
+	before=$$( [ -z "$(STORE_BEFORE)" ] || cat "$(STORE_BEFORE)"); \
+	listed() { printf '%s\n' "$$1" | sed '/^$$/d' | LC_ALL=C sort -u; }; \
+	named() { printf '%s\n' "$$1" | sed -E 's/[-_][0-9]+([-_][0-9]+)*$$//' | sort | uniq -c >&2; }; \
+	earlier=$$(LC_ALL=C comm -12 <(listed "$$before") <(listed "$$left")); \
+	added=$$(LC_ALL=C comm -13 <(listed "$$before") <(listed "$$left")); \
+	if [ -n "$$earlier" ]; then \
+		echo "check-store-leftovers: $$(printf '%s\n' "$$earlier" | wc -l | tr -d ' ') schemas and databases were there before this run, an earlier run's, not counted; drop them, or take the test database down:" >&2; \
+		named "$$earlier"; \
+	fi; \
+	if [ -n "$$added" ]; then \
+		echo "check-store-leftovers FAILED: the store tests left $$(printf '%s\n' "$$added" | wc -l | tr -d ' ') schemas and databases behind (PO 65), by name:" >&2; \
+		named "$$added"; \
+		exit 1; \
+	fi
 
 # The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
 # record and read rates and its latest read as a dataset grows, the plugin
@@ -551,6 +595,53 @@ bench: network
 		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
 	@grep -E '^CAPACITY |inversions' .bench.log
 	@$(COMPOSE) --profile tests down --remove-orphans >/dev/null 2>&1 || true
+
+# The book's bench for one shape, headless (step 3d, checkpoint 2; the PO's
+# ruling of 2026-11-13: decision-grade figures from a dedicated cloud VM):
+# BENCH_PROPOSALS proposals (100,000) at BENCH_IN_FLIGHT at once (64), over
+# BENCH_GROUPS writer groups and BENCH_PARTITIONS partitions, against the
+# Postgres BENCH_DATABASE_URL names and the broker BENCH_BROKER_URL names,
+# then a light run asked one at a time. Built and run with cargo at the
+# workspace's rust-version (1.90 or newer), optimised, so a plain Linux VM
+# runs it: no container. It writes JSON to BENCH_OUT -- each run's rate, p50,
+# p99 and most, timeouts and retries, the shape, the commit, the host's CPU
+# count and its load -- and the run's own output beside it, BENCH_OUT.log.
+# It prints only `done <path>`: core is public, and so are its CI logs, so
+# no figure is ever printed. Never wired into CI (stage T's write-scale is
+# separate).
+#
+# The open-loop mode (stage T; PO 2026-11-14): BENCH_RATE, proposals a
+# second -- or several rates, by commas -- adds a run at each rate after the
+# two above: BENCH_PROPOSALS proposals, each due at its own time whatever
+# the answers take, its latency counted from when it was due. One rate is a
+# point of the shape's latency/load curve; BENCH_PROPOSALS over the rate is
+# how long it runs.
+BENCH_GROUPS ?= 1
+BENCH_PARTITIONS ?= 1
+BENCH_IN_FLIGHT ?= 64
+BENCH_PROPOSALS ?= 100000
+BENCH_LIGHT ?= 2000
+BENCH_RATE ?=
+BENCH_BROKER_URL ?= nats://127.0.0.1:4222
+bench-book:
+	@test -n "$(BENCH_DATABASE_URL)" \
+		|| { echo "bench-book: set BENCH_DATABASE_URL=<a Postgres the bench may make schemas in>" >&2; exit 1; }
+	@test -n "$(BENCH_OUT)" || { echo "bench-book: set BENCH_OUT=<path for the JSON>" >&2; exit 1; }
+	@MERIDIAN_TEST_DATABASE_URL="$(BENCH_DATABASE_URL)" \
+	MERIDIAN_BENCH_BROKER_URL="$(BENCH_BROKER_URL)" \
+	MERIDIAN_BENCH_SHAPES="$(BENCH_GROUPS)x$(BENCH_PARTITIONS)" \
+	MERIDIAN_BENCH_IN_FLIGHT="$(BENCH_IN_FLIGHT)" \
+	MERIDIAN_BENCH_PROPOSALS="$(BENCH_PROPOSALS)" \
+	MERIDIAN_BENCH_LIGHT="$(BENCH_LIGHT)" \
+	MERIDIAN_BENCH_RATE="$(BENCH_RATE)" \
+	MERIDIAN_BENCH_JSON="$(abspath $(BENCH_OUT))" \
+	MERIDIAN_BENCH_COMMIT="$$(git rev-parse HEAD 2>/dev/null)" \
+	MERIDIAN_BENCH_LOAD_BEFORE="$$(cat /proc/loadavg 2>/dev/null || uptime)" \
+		cargo test --release --locked -p meridian-bor --test postgres \
+			-- --ignored --exact capacity_book_partitions --nocapture \
+		>"$(abspath $(BENCH_OUT)).log" 2>&1 \
+		|| { echo "bench-book FAILED; its output is in $(abspath $(BENCH_OUT)).log" >&2; exit 1; }
+	@echo "done $(abspath $(BENCH_OUT))"
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -663,8 +754,12 @@ e2e-cluster: network runtime-image analytics-image
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
 	@# Each image proved in the node, retried once, the run stopped with the
-	@# reason where one never arrives (e2e/cluster/image-load.sh).
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)),:)
+	@# reason where one never arrives (e2e/cluster/image-load.sh). The
+	@# database the wizard's deployment brings is handed over too, as the
+	@# backup and failover runs hand it: a node pulling it from Docker Hub
+	@# itself was refused for the rate limit, 429 for six minutes, and the
+	@# database never came (PR CI 43648472142, k3s v1.33.13).
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) postgres:16-alpine $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)),:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -1027,7 +1122,7 @@ e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image a
 	@$(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) $(E2E_POSTGRES_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-backup-claims.jsonl
+	@rm -f .e2e-backup-claims.jsonl .e2e-backup-figures.jsonl
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) \
@@ -1053,14 +1148,20 @@ footprint-judge:
 	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
 
 # The claims ledger (366; ruling 1113; spec/a-deployment-scales-out-and-
-# fails-over-by-configuration section 15): each failure class's recovery as
-# CI's green runs measured it, per profile and component, beside its bound
-# and RPO, in deploy/claims-ledger.json (tools/claims.py). claims-check holds
-# the ledger to its bounds in the gate; CI's claims-check job holds it, and
-# every one of the run's measurements, to them, and fails a class the ledger
-# holds that the run did not measure. claims-ledger writes it again from
-# runs' claims files -- CI keeps each as an artifact (failover-claims-<profile>,
-# backup-claims) -- a reviewed change naming the runs:
+# fails-over-by-configuration section 15): each failure class CI's green
+# runs measured, per profile and component, beside its bound and its RPO's,
+# in deploy/claims-ledger.json (tools/claims.py). Limits are public and
+# measured figures are private (PO 2026-11-15): a run's claims lines, and
+# the ledger here, say the class, its bounds and whether they were held;
+# the figures stay beside the run (.e2e-*-figures.jsonl), printed nowhere
+# and kept by no job, and a ledger with them is written outside the
+# checkout by `tools/claims.py figures` from a private run's. claims-check
+# holds the ledger to its bounds in the gate; CI's claims-check job holds
+# it, and every one of the run's lines, to them, and fails a class the
+# ledger holds that the run did not measure. claims-ledger writes it again
+# from runs' claims files -- CI keeps each as an artifact
+# (failover-claims-<profile>, backup-claims) -- a reviewed change naming the
+# runs:
 #
 #   gh run download <run> -p 'failover-claims-*' -p backup-claims -D .claims
 #   make claims-ledger CLAIMS="$(find .claims -name '*.jsonl')"
@@ -1073,6 +1174,16 @@ CLAIMS ?= $(wildcard .e2e-*-claims.jsonl)
 ci-tier-check:
 	@$(PY) tools/ci_tier.py --self-test >/dev/null
 	@$(PY) tools/ci_tier.py check
+
+# The cluster harnesses' own tests, no cluster (PR CI 44604574060): what a
+# finished rollout is (e2e/cluster/rollout.py), and the failover run's waits
+# after an upgrade and its client of the dashboard, whose forward ends with
+# the pod it landed on (e2e/failover/self_test.py).
+e2e-harness-check:
+	@$(PY) e2e/cluster/rollout.py --self-test
+	@said="$$($(PY) e2e/failover/self_test.py 2>&1)" \
+		|| { echo "$$said" >&2; echo "e2e-harness-check FAILED" >&2; exit 1; }
+	@echo "failover harness: self-test OK"
 
 claims-check:
 	@$(PY) tools/claims.py --self-test >/dev/null
@@ -1107,6 +1218,7 @@ FAILURE ?=
 # profiles run: built here, as the backup run builds its own.
 E2E_POSTGRES_IMAGE ?= meridian-postgres:local
 e2e-cluster-scaled:
+	@rm -f .e2e-write-scale.json
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
 
 # A live install moved between the profiles (step 3b part 3; spec section
@@ -1128,10 +1240,10 @@ e2e-cluster-scaled:
 e2e-cluster-reconfigure:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=reconfigure FAILURE=
 
-# The write driver's runs (every profile but scaled) run it in the SDK's
-# interop image (e2e/failover/driver.py), loaded into the cluster beside the
-# runtime's.
-E2E_FAILOVER_DRIVEN = $(if $(filter scaled,$(PROFILE)),,yes)
+# The write driver runs in the SDK's interop image (e2e/failover/driver.py),
+# loaded into the cluster beside the runtime's: in every profile, the scaled
+# run's too from stage T (its write-scale step's load).
+E2E_FAILOVER_DRIVEN = yes
 e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image) $(if $(E2E_FAILOVER_DRIVEN),interop-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
@@ -1139,7 +1251,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn .e2e-said-*.log
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-figures.jsonl .e2e-failover-history.edn .e2e-said-*.log .e2e-shards-*.log
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 	 E2E_K3D_LOG_LINES=$(E2E_K3D_LOG_LINES) \
@@ -1150,7 +1262,10 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	    echo "e2e-cluster-failover: the namespace is left for reading. Remove it with:" >&2; \
 	    echo "  kubectl delete namespace $(E2E_FAILOVER_NAMESPACE)" >&2; \
 	  else \
-	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait >/dev/null 2>&1; \
+	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait --timeout=600s >/dev/null 2>&1 || { \
+	      echo "e2e-cluster-failover: the namespace was not deleted within 600 s; a shard's Lease kept past its namespace's deletion would leave it so (PO item 57). Its conditions:" >&2; \
+	      kubectl get namespace $(E2E_FAILOVER_NAMESPACE) -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2; \
+	      held=1; }; \
 	  fi; \
 	  exit $$held
 
@@ -1367,6 +1482,11 @@ test-broker: network runtime-image tests-image
 	@$(COMPOSE_TEST) restart nats >/dev/null
 	@$(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
+	@# The three-server cluster the bus's tests ask across (stage T's review,
+	@# finding 5), its routes made before the tests start.
+	@$(COMPOSE_TEST) --profile tests up -d nats-a nats-b nats-c >/dev/null
+	@$(COMPOSE_TEST) --profile tests exec -T nats-b sh -c 'for i in $$(seq 1 60); do [ "$$(wget -qO- http://localhost:8222/routez 2>/dev/null | grep remote_name | sort -u | wc -l)" -ge 2 ] && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: the test cluster's servers did not find each other" >&2; exit 1; }
 	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \
@@ -1650,7 +1770,7 @@ e2e-settings-page: runtime-image settings-binary-image
 	docker network rm $(SETTINGS_NET) >/dev/null 2>&1 || true; \
 	if [ $$status -ne 0 ]; then grep -E "^FAILED|Error|Traceback" -A3 .e2e-settings-page.log | tail -30 >&2; \
 		echo "e2e-settings-page FAILED; the whole run is in .e2e-settings-page.log" >&2; exit 1; fi
-	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first; and the Service accounts tab, one line an account, one created from its dialog prepare only, and a role's Runs as on the Access tab, each dialog within the viewport; and a connectivity plugin's ems on its Access tab, withdrawn and made available again from its dialog, its link's dialog within the viewport, an ems's connectivity plugins, linked from its own page by its admin, and its venue account map read-only, and the Instruments page's Calendars tab and a calendar's year, one line each"
+	@echo "e2e-settings-page OK: on a table setting's own tab, beside Settings in the plugin's area and the admin portal, the kit's entry grid upgrades, adds rows past four and posts them, each stamped with who; a table takes its most, 200 rows, offers no 201st and refuses 201 posted, naming the most; without script the plain table, held rows and three blank, still posts; and Settings, each of its groups' tabs and each table's tab fit one screen at 1440x900 and 390x844 by the kit's own check, on a development deployment too; and the Access editor gives each plugin role a one-line row, paged, flags an entry on a role no longer held, holds a role's level posted, and it and a two-role plugin's Access tab fit both sizes; and an edge plugin's Summary, its parts as tabs, draws per kind what storage and the archive hold and the bytes each uses of the archive, in all against the bound, an archive withdrawn said so, the hold a window is under and its moves paged by the kit's om-pager, Allow archive and Withdraw answered back on it, and the deployment's Holds tab sets a hold, when each was set in full, every part and dialog fitting both sizes with no cell cut off; and the Accounts tab, the Books tab folded in, one line an account with its base currency and lot relief, searched, its Edit of two parts each its own form, saving to the book; and a secret's field saying who set it and when, or not set, with a Remove beside an optional one that asks first; and the Service accounts tab, one line an account, one created from its dialog prepare only, and a role's Runs as on the Access tab, each dialog within the viewport; and a connectivity plugin's ems on its Access tab, withdrawn and made available again from its dialog, its link's dialog within the viewport, an ems's connectivity plugins, linked from its own page by its admin, and its venue account map read-only, and the Instruments page's Calendars tab and a calendar's year, one line each; and the Resilience page's four tabs, the profile's advice among its lines, and the Partitions tab's Move, Split and Move account dialogs, each with a note and Cancel, at 375, 582 and 1280 px, light and dark, one screen, Move account posted back to its tab"
 
 # The plugin harness (deploy/harness/README.md), proven as a plugin uses it:
 # its own image, files only, built from this tree beside the runtime image,
@@ -2347,6 +2467,46 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker does not generate its permissions from the contract" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
 		&& { echo "chart-check FAILED: a deployment with its own broker got one from the chart as well" >&2; exit 1; }; true
+	@# Step 3d (decided 2026-11-14): the broker is ready only when its own full
+	@# health check says so -- routes, and with JetStream its place in the
+	@# metadata group -- read on its loopback by its startup and readiness
+	@# probes, alone and as three; and each server's name resolves before it
+	@# is ready, so no server waits on another's readiness to start. With
+	@# JetStream, ready also asks that the server is one of the metadata
+	@# group's peers by its own /raftz, which /healthz does not (CI
+	@# 43539633884, 43955282180); without, there is no group to ask. Its
+	@# liveness probe asks the same, over a long bound (CI 44556229125: a
+	@# server that passed its start once then failed every check for over
+	@# 30 minutes, never restarted, as no probe could restart it): a server
+	@# that stays unhealthy past 300 s is started again, as itself, on its
+	@# own volume.
+	@for profile in tolerant ha; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
+			--set resilience.profile=$$profile --show-only templates/broker.yaml 2>/dev/null)"; \
+		live="$$(echo "$$said" | awk '$$0 == "          livenessProbe:" { on = 1; print; next } on && /^          [^ ]/ { on = 0 } on')"; \
+		[ -n "$$live" ] \
+			|| { echo "chart-check FAILED: the broker has no liveness probe, so a server that stays unhealthy is never started again ($$profile; CI 44556229125)" >&2; exit 1; }; \
+		echo "$$live" | grep -q "GET /healthz HTTP/1.0" \
+			|| { echo "chart-check FAILED: the broker's liveness probe is not its full /healthz ($$profile)" >&2; exit 1; }; \
+		period=$$(echo "$$live" | sed -nE 's/^ +periodSeconds: ([0-9]+)$$/\1/p'); \
+		failures=$$(echo "$$live" | sed -nE 's/^ +failureThreshold: ([0-9]+)$$/\1/p'); \
+		[ -n "$$period" ] && [ -n "$$failures" ] && [ $$((period * failures)) -eq 300 ] \
+			|| { echo "chart-check FAILED: the broker's liveness bound is $${period:-?} s x $${failures:-?}, not 300 s ($$profile)" >&2; exit 1; }; \
+		if [ $$profile = ha ]; then echo "$$live" | grep -q 'GET /raftz?group=_meta_ HTTP/1.0.*-eq [$$][(][(]size - 1[)][)]' \
+			|| { echo "chart-check FAILED: the broker's liveness probe does not ask that the server is one of the metadata group's peers (ha)" >&2; exit 1; }; fi; \
+		[ "$$(echo "$$said" | grep -c "GET /healthz HTTP/1.0")" -eq 3 ] \
+			|| { echo "chart-check FAILED: the broker's startup, readiness and liveness probes are not its full /healthz ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q 'js-enabled-only' \
+			&& { echo "chart-check FAILED: the broker's probe reads only that JetStream is on ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  publishNotReadyAddresses: true$$' \
+			|| { echo "chart-check FAILED: a broker server's name does not resolve before it is ready ($$profile)" >&2; exit 1; }; \
+		echo "$$said" | grep -q '^  podManagementPolicy: Parallel$$' \
+			|| { echo "chart-check FAILED: the broker's servers do not start in parallel ($$profile)" >&2; exit 1; }; \
+		members=$$(echo "$$said" | grep -c 'GET /raftz?group=_meta_ HTTP/1.0.*-eq [$$][(][(]size - 1[)][)]'); \
+		want=0; [ $$profile = ha ] && want=3; \
+		[ "$$members" -eq $$want ] \
+			|| { echo "chart-check FAILED: $$members of the broker's probes ask that the server is one of JetStream's metadata group's peers, not $$want ($$profile; CI 43539633884)" >&2; exit 1; }; \
+	done; true
 	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
 	@# a broker credential of its own, made by the bundled broker and read by
 	@# its pod, not the runtime's shared one.
@@ -2436,8 +2596,8 @@ chart-check:
 	launcher="$$(doc Role check-meridian-runtime-launcher)"; \
 	[ -n "$$launcher" ] && [ "$$(echo "$$launcher" | grep -c 'resources:')" = 2 ] \
 		&& echo "$$launcher" | grep -q 'resources: \["deployments"\]' \
-		&& echo "$$launcher" | grep -A1 'resources: \["persistentvolumeclaims"\]' | grep -q 'verbs: \["create", "get"\]$$' \
-		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019) and make and read edge plugins' storage, never delete it (decisions/028):" >&2; echo "$$launcher" >&2; exit 1; }; \
+		&& echo "$$launcher" | grep -A1 'resources: \["persistentvolumeclaims"\]' | grep -q 'verbs: \["create", "get", "update"\]$$' \
+		|| { echo "chart-check FAILED: the launcher may touch something besides Deployments (decisions/019) and make, read and mark edge plugins' storage, never delete it (decisions/028):" >&2; echo "$$launcher" >&2; exit 1; }; \
 	template="$$(doc ConfigMap check-meridian-runtime-launcher-template)"; \
 	echo "$$template" | grep -q 'meridian.dev/launched' && echo "$$template" | grep -q 'check-meridian-runtime-broker-launched' \
 		|| { echo "chart-check FAILED: the launcher's template does not mark its workloads, or takes their credential from anywhere but the launched plugins' Secret" >&2; exit 1; }; \
@@ -2719,13 +2879,27 @@ chart-check:
 		echo "$$said" | grep -q 'serviceAccountName: check-meridian-runtime-conductor$$' \
 			|| { echo "chart-check FAILED: the conductor does not run under its own account ($${profile:-tolerant})" >&2; exit 1; }; \
 	done
-	@# Stage D (W6.39; approved 2026-11-11): the chart's values the resilience
-	@# profile reads reach the conductor alone, as JSON resolved by the
-	@# profile, and carry no secret, credential or address.
+	@# Stage D (W6.39; approved 2026-11-11) and step 3d (item 34, approved
+	@# 2026-11-15): the chart's values the resilience profile reads reach
+	@# the conductor and the dashboard -- which offers shards and a standby
+	@# pod only where a store runs a standby -- and nothing else, as JSON
+	@# resolved by the profile, and carry no secret, credential or address.
+	@# Once in each of the two, and twice in the whole render: so in no
+	@# third component.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	all="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
-		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor, or not at all" >&2; exit 1; }; \
+	[ "$$(echo "$$all" | grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 2 ] \
+		|| { echo "chart-check FAILED: MERIDIAN_RESILIENCE_VALUES is set on something besides the conductor and the dashboard, or on one of them not at all" >&2; exit 1; }; \
+	for holder in conductor dashboard; do \
+		[ "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/$$holder.yaml 2>/dev/null \
+			| grep -c 'name: MERIDIAN_RESILIENCE_VALUES$$')" = 1 ] \
+			|| { echo "chart-check FAILED: the $$holder is not told the chart's values once" >&2; exit 1; }; \
+	done; \
+	[ "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/conductor.yaml 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')" \
+	  = "$$($(HELM_TEMPLATE) check deploy/chart $$base --show-only templates/dashboard.yaml 2>/dev/null \
+		| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')" ] \
+		|| { echo "chart-check FAILED: the dashboard is told other values than the conductor" >&2; exit 1; }; \
 	for profile in "" "--set resilience.profile=ha --set key.existingSecret=k --set key.generate=false"; do \
 		value="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --show-only templates/conductor.yaml 2>/dev/null \
 			| grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | sed -n 's/^ *value: //p')"; \
@@ -2736,6 +2910,144 @@ chart-check:
 		echo "$$value" | grep -q "$$want" && echo "$$value" | grep -q 'brought' \
 			|| { echo "chart-check FAILED: the resilience values are not the profile's ($${profile:-tolerant}): $$value" >&2; exit 1; }; \
 	done
+	@# Step 3d, stage G (the resilience spec's sections 6.1, 6.3, 6.7 and 11;
+	@# names approved 2026-11-12): lake.writerGroups and bor.writerGroups, 1
+	@# by default and nothing changed; above it each group past the first a
+	@# writer Deployment of its own, <release>-<store>-group-<g>, its group
+	@# and the count in its environment, its own Lease, and with a standby
+	@# its standby and PodDisruptionBudget; the resilience values carry the
+	@# count; the lake's above 1 with the write-ahead stream on rendered
+	@# from stage H, each group's writer with its own Lease; and 0 refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -q "MERIDIAN_WRITER_GROUP\|-group-[0-9]" \
+		&& { echo "chart-check FAILED: one writer group, the default, renders a writer group's Deployment or environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render at two writer groups for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store.writerGroups=2 renders no writer Deployment check-meridian-runtime-$$store-group-1 (step 3d)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^  name: check-meridian-runtime-$$store-group-2$$" \
+			&& { echo "chart-check FAILED: $$store.writerGroups=2 renders a third group's Deployment" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-group-1$$" \
+			|| { echo "chart-check FAILED: $$store's writer group 1 is not labelled $$store-group-1, apart from group 0's members" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUPS$$' | grep -c 'value: "2"')" = 4 ] \
+		|| { echo "chart-check FAILED: each writer group's member of the lake and the book is not told the count, 2 (MERIDIAN_WRITER_GROUPS)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "1"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-1 writers are not told their group, 1 (MERIDIAN_WRITER_GROUP)" >&2; exit 1; }; \
+	[ "$$(echo "$$two" | grep -A1 'name: MERIDIAN_WRITER_GROUP$$' | grep -c 'value: "0"')" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's group-0 writers are not told their group, 0" >&2; exit 1; }; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with the book at two writer groups" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-bor-group-1"' \
+		|| { echo "chart-check FAILED: the book's writer group 1 does not take a Lease of its own, check-meridian-runtime-bor-group-1" >&2; exit 1; }; \
+	echo "$$ha" | grep -A2 "kind: PodDisruptionBudget" | grep -q "name: check-meridian-runtime-bor-group-1$$" \
+		|| { echo "chart-check FAILED: the book's writer group 1 has no PodDisruptionBudget of its own" >&2; exit 1; }; \
+	echo "$$ha" | awk '/^  name: check-meridian-runtime-bor-group-1$$/{f=1} f&&/^  replicas:/{print; exit}' | grep -q "replicas: 2" \
+		|| { echo "chart-check FAILED: bor.standby does not count per writer group: group 1 runs no standby beside its writer" >&2; exit 1; }; \
+	echo "$$ha" | grep -A1 'name: MERIDIAN_RESILIENCE_VALUES$$' | grep -q '\\"writerGroups\\":2' \
+		|| { echo "chart-check FAILED: the resilience values do not carry bor.writerGroups" >&2; exit 1; }; \
+	lake_ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set key.existingSecret=k --set key.generate=false --set lake.writerGroups=2 2>&1)" \
+		|| { echo "chart-check FAILED: lake.writerGroups=2 did not render with the write-ahead stream on (stage H: each group reads the stream itself): $$lake_ha" >&2; exit 1; }; \
+	echo "$$lake_ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q 'value: "check-meridian-runtime-lake-group-1"' \
+		|| { echo "chart-check FAILED: the lake's writer group 1 in ha does not take a Lease of its own, check-meridian-runtime-lake-group-1" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.writerGroups=0 rendered; a store has one writer group at least" >&2; exit 1; }; true
+	@# Step 3d, stage B (section 6.3; MERIDIAN_BOR_PARTITIONS ruled
+	@# 2026-11-13): bor.partitions, 1 by default, told to every bor member
+	@# and the migrate Job, which makes the partitions' head rows; 0 and 65
+	@# refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	[ "$$(echo "$$one" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "1"')" -ge 2 ] \
+		|| { echo "chart-check FAILED: the book and its migrate Job are not told bor.partitions, 1 by default (MERIDIAN_BOR_PARTITIONS)" >&2; exit 1; }; \
+	four="$$($(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=4 --set bor.writerGroups=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render bor.partitions=4" >&2; exit 1; }; \
+	[ "$$(echo "$$four" | grep -A1 'name: MERIDIAN_BOR_PARTITIONS$$' | grep -c 'value: "4"')" -ge 3 ] \
+		|| { echo "chart-check FAILED: bor.partitions=4 is not told to each writer group's member and the migrate Job" >&2; exit 1; }; \
+	for bad in 0 65; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set bor.partitions=$$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: bor.partitions=$$bad rendered; 1 to 64" >&2; exit 1; }; \
+	done; true
+	@# Step 3d, stage D (section 6.4; lake.databases, bor.databases,
+	@# <store>.database.groupSecrets and <release>-<store>-database-<d>
+	@# approved 2026-11-12; the variables 2026-11-14): 1 by default and
+	@# nothing changed; at 2 with the database this chart brings, each
+	@# store's second database, labelled apart from the first, its URLs
+	@# beside its passwords, migrated by a container of its own given its
+	@# superuser, told to every member of the store and started by first
+	@# run, in its own stanza of the WAL archive with its own offline act;
+	@# with one somebody else runs, the Secret named, nothing brought; more
+	@# databases than writer groups, and missing Secrets, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	one="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$one" | grep -Eq "database-[1-9][0-9]*$$|_DATABASES$$|DATABASE_URL_[0-9]" \
+		&& { echo "chart-check FAILED: one database, the default, renders a database past the first or its environment (step 3d: nothing changes)" >&2; exit 1; }; \
+	two="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set bor.writerGroups=2 --set bor.databases=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render two databases for the lake and the book" >&2; exit 1; }; \
+	for store in lake bor; do \
+		name="check-meridian-runtime-$$store-database-1"; \
+		for kind in StatefulSet Service Secret NetworkPolicy; do \
+			echo "$$two" | grep -A2 "^kind: $$kind$$" | grep -q "^  name: $$name$$" \
+				|| { echo "chart-check FAILED: $$store.databases=2 renders no $$kind $$name (step 3d)" >&2; exit 1; }; \
+		done; \
+		echo "$$two" | grep -q "^  name: $$name-passwords$$" \
+			|| { echo "chart-check FAILED: $$store's second database keeps no passwords of its own" >&2; exit 1; }; \
+		echo "$$two" | grep -q "meridian.dev/component: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: $$store's second database is not labelled $$store-database-1, apart from the first" >&2; exit 1; }; \
+		STORE=$$(echo $$store | tr a-z A-Z); \
+		[ "$$(echo "$$two" | grep -A4 "name: MERIDIAN_$${STORE}_DATABASE_URL_1$$" | grep -c "name: $$name$$")" -ge 2 ] \
+			|| { echo "chart-check FAILED: $$store's members are not each told its second database (MERIDIAN_$${STORE}_DATABASE_URL_1)" >&2; exit 1; }; \
+		echo "$$two" | grep -q "^        - name: $$store-database-1$$" \
+			|| { echo "chart-check FAILED: the migrate Job has no container $$store-database-1 (approved 2026-11-14)" >&2; exit 1; }; \
+		echo "$$two" | grep -A1 "name: MERIDIAN_$${STORE}_DATABASES$$" | grep -q 'value: "2"' \
+			|| { echo "chart-check FAILED: first run and the members are not told $$store.databases, 2" >&2; exit 1; }; \
+	done; \
+	arch="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=2 --set lake.databases=2 --set backup.recipient=age1check --set backup.path=/var/lib/check --set backup.walArchive.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases did not render with the WAL archive" >&2; exit 1; }; \
+	echo "$$arch" | grep -q "archive_command=pgbackrest --stanza=lake-database-1 archive-push" \
+		&& echo "$$arch" | grep -q "^ *\[lake-database-1\]$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-offline$$" \
+		&& echo "$$arch" | grep -q "^  name: check-meridian-runtime-lake-database-1-tls$$" \
+		|| { echo "chart-check FAILED: the lake's second database does not archive into its own stanza, lake-database-1, with its own certificates and offline act" >&2; exit 1; }; \
+	ext="$$($(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set lake.writerGroups=2 --set lake.databases=2 --set 'lake.database.groupSecrets[0]=lake-two' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: two databases somebody else runs did not render with their Secret named" >&2; exit 1; }; \
+	echo "$$ext" | grep -A4 "name: MERIDIAN_LAKE_DATABASE_URL_1$$" | grep -q 'name: "lake-two"' \
+		&& ! echo "$$ext" | grep -q "check-meridian-runtime-lake-database-1" \
+		|| { echo "chart-check FAILED: a database somebody else runs is not read from the Secret lake.database.groupSecrets names, or one is brought" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set lake.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: lake.databases=2 rendered with one writer group; at most one database for each" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.enabled=false --set database.existingSecret=d --set bor.writerGroups=2 --set bor.databases=2 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=2 rendered on a database somebody else runs with no group Secret named" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.databases=0 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: bor.databases=0 rendered; one database at least" >&2; exit 1; }; true
+	@# Step 3d, stage M (section 6.8; MERIDIAN_MOVES_HOLD_SECONDS approved
+	@# 2026-11-14): the book's members told moves.holdSeconds, the hold an
+	@# act waits while its account moves.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for hold in 5 8; do \
+		set="$$( [ $$hold = 5 ] || echo --set moves.holdSeconds=$$hold )"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_HOLD_SECONDS$$" | grep -q "value: \"$$hold\"" \
+			|| { echo "chart-check FAILED: the book's members are not told moves.holdSeconds, $$hold, as MERIDIAN_MOVES_HOLD_SECONDS (step 3d)" >&2; exit 1; }; \
+	done
+	@# MERIDIAN_MOVES_SWITCH_SECONDS (approved 2026-11-14): the lake's and the
+	@# book's members each told moves.switchSeconds and moves.holdSeconds,
+	@# and a switch shorter than its hold, or of no seconds, refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for switch in 30 45; do \
+		set="$$( [ $$switch = 30 ] || echo --set moves.switchSeconds=$$switch )"; \
+		told=$$($(HELM_TEMPLATE) check deploy/chart $$base $$set 2>/dev/null | grep -A1 "name: MERIDIAN_MOVES_SWITCH_SECONDS$$" | grep -c "value: \"$$switch\""); \
+		[ "$$told" = 2 ] \
+			|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.switchSeconds, $$switch, as MERIDIAN_MOVES_SWITCH_SECONDS (told $$told) (step 3d)" >&2; exit 1; }; \
+	done; \
+	told=$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -c "name: MERIDIAN_MOVES_HOLD_SECONDS$$"); \
+	[ "$$told" = 2 ] \
+		|| { echo "chart-check FAILED: the lake's and the book's members are not each told moves.holdSeconds (told $$told) (step 3d)" >&2; exit 1; }; \
+	for bad in moves.switchSeconds=0 moves.switchSeconds=4 moves.holdSeconds=0; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set $$bad >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$bad rendered; a switch is at least as long as its hold, each of a second at least" >&2; exit 1; }; \
+	done; true
 	@# Stage M2 (section 10a, "The database"; ruled 2026-11-11): in both
 	@# profiles the migration's conductor alone is given the brought
 	@# database's superuser, to make each component's own login there, and
@@ -2854,6 +3166,139 @@ chart-check:
 		&& { echo "chart-check FAILED: a conductor standby rendered with a generated key no second node can mount" >&2; exit 1; }; \
 	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
 		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
+	@# A required spread holds through a rollout (CI run 44343480916: the
+	@# book's writer and standby on one node and in one zone, so a paused
+	@# node and a stopped one took both). A spread is judged as a pod is
+	@# scheduled, over every pod its selector matches, the revision being
+	@# rolled away included: a rollout's last new pod, scheduled while the
+	@# old pod it replaces still counted, found one pod on every node and
+	@# might join the new revision's first. So every `DoNotSchedule` spread
+	@# the ha profile renders, with zones and without, counts its own
+	@# revision alone (matchLabelKeys: pod-template-hash); and the check is
+	@# shown to find a spread without it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k --set resilience.profile=ha"; \
+	judge='function shut() { if (need && !has) bad++; need = 0; has = 0; open = 0 } { match($$0, /^ */); ind = RLENGTH } open && ind <= at && $$0 !~ /^ *$$/ { shut() } /^ *- maxSkew:/ { open = 1; at = ind } open && /whenUnsatisfiable: DoNotSchedule/ { need = 1; found++ } open && /^ *- pod-template-hash$$/ { has = 1 } END { shut(); print found + 0, bad + 0 }'; \
+	for zones in "" "--set zones={zone-a,zone-b,zone-c}"; do \
+		made="$$($(HELM_TEMPLATE) check deploy/chart $$base $$zones 2>&1)" \
+			|| { echo "chart-check FAILED: the ha profile did not render ($$zones): $$made" >&2; exit 1; }; \
+		said="$$(echo "$$made" | awk "$$judge")"; \
+		[ "$${said%% *}" -ge 6 ] \
+			|| { echo "chart-check FAILED: the ha profile ($$zones) renders $${said%% *} required spreads; each of the six stores has one at least" >&2; exit 1; }; \
+		[ "$${said##* }" = 0 ] \
+			|| { echo "chart-check FAILED: $${said##* } of the ha profile's $${said%% *} required spreads ($$zones) count the pods of a revision being rolled away (no matchLabelKeys: pod-template-hash): a rollout can leave a writer and its standby on one node" >&2; exit 1; }; \
+	done; \
+	said="$$(echo "$$made" | awk '/^ *- pod-template-hash$$/ && !gone { gone = 1; next } { print }' | awk "$$judge")"; \
+	[ "$${said##* }" = 1 ] \
+		|| { echo "chart-check FAILED: the required-spread check does not find a spread whose matchLabelKeys is taken away ($$said)" >&2; exit 1; }
+	@# Step 3d (the resilience spec's section 7): a plugin instance as
+	@# shards with a standby pod. The default renders no lease right and the
+	@# launcher no shape for them (standbys are configuration, ruling 1052);
+	@# `ha` renders the shape, under its instance's own account with its
+	@# token mounted in the sidecar's container alone, rolled a shard at a
+	@# time. A sidecars[] entry given shards and a standby is a pod each,
+	@# told the count, under its own account (checkpoint 5, item 31): a
+	@# ServiceAccount, Role and RoleBinding `<fullname>-shards-<instance>`,
+	@# the Role naming its shards' Leases alone, each Lease rendered and
+	@# kept, and the members' account the stores' alone -- the check shown
+	@# to find each violation planted in a render as well as passing it.
+	@# With storage of its own it is refused, saying why. The shapes are
+	@# read, not grepped (tools/chart_shards.py; the review of 95d68904,
+	@# S6): a word in a render says nothing of which container holds it.
+	@# Where the cluster can, the launcher's admission policy pins the
+	@# account its Deployments run under (S2) and the shape of what it
+	@# makes for an instance (item 31); the launcher may make that and no
+	@# more, with no escalate and no bind.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | $(PY) tools/chart_shards.py default || exit 1; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: the ha profile did not render: $$ha" >&2; exit 1; }; \
+	echo "$$ha" | $(PY) tools/chart_shards.py ha || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py downward || exit 1; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set development=true 2>/dev/null | $(PY) tools/chart_shards.py downward || exit 1; \
+	echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName in' \
+		&& echo "$$ha" | grep -q '\["", "default"\] ||' \
+		&& echo "$$ha" | grep -q 'object.spec.template.spec.serviceAccountName == variables.own' \
+		&& echo "$$ha" | grep -q "the token is mounted in the sidecar's container alone" \
+		&& echo "$$ha" | grep -q "the launcher's Role grants get and update on its instance's shard Leases alone" \
+		&& echo "$$ha" | grep -q "the launcher's RoleBinding binds its instance's shards Role to the same-named account alone" \
+		&& echo "$$ha" | grep -q "the launcher's ServiceAccount carries no secrets" \
+		|| { echo "chart-check FAILED: the launcher's admission policy does not pin the account a launched plugin runs under, its token to the sidecar, or what it makes for an instance to its shape (step 3d, S2, item 31)" >&2; exit 1; }; \
+	echo "$$ha" | grep -q '"check-meridian-runtime-member"' \
+		&& { echo "chart-check FAILED: a launched plugin may still run under the members' account, the stores' alone (item 31)" >&2; exit 1; }; \
+	echo "$$ha" | grep -Eq '^ *verbs:.*"(escalate|bind)"' \
+		&& { echo "chart-check FAILED: a Role in the ha render holds escalate or bind (item 31: the launcher holds neither)" >&2; exit 1; }; \
+	sharded="--set sidecars[0].instanceId=feed-1 --set sidecars[0].roles={data} --set sidecars[0].plugin.image=example/plugin:1 --set sidecars[0].shards=2 --set sidecars[0].standby=true"; \
+	made="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false 2>&1)" \
+		|| { echo "chart-check FAILED: a sidecars[] entry with shards and a standby did not render: $$made" >&2; exit 1; }; \
+	echo "$$made" | $(PY) tools/chart_shards.py sharded feed-1 3 2 || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py trio feed-1 2 || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py downward || exit 1; \
+	echo "$$made" | grep -q "name: check-meridian-runtime-member$$" \
+		&& { echo "chart-check FAILED: a sharded sidecars[] entry alone renders the members' account, the stores' alone (item 31)" >&2; exit 1; }; \
+	withstores="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false --set resilience.profile=ha 2>&1)" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry under the ha profile did not render: $$withstores" >&2; exit 1; }; \
+	echo "$$withstores" | $(PY) tools/chart_shards.py trio feed-1 2 || exit 1; \
+	for plant in 's/verbs: \["get", "update"\]$$/verbs: ["get", "update", "create"]/' \
+		's/^      - "feed-1-shard-1"$$/      - "other-1-shard-0"/' \
+		's/^    name: check-meridian-runtime-shards-feed-1$$/    name: check-meridian-runtime-conductor/' \
+		's/^  name: feed-1-shard-1$$/  name: feed-1-shard-x/' \
+		's/serviceAccountName: check-meridian-runtime-shards-feed-1$$/serviceAccountName: check-meridian-runtime-member/'; do \
+		echo "$$withstores" | sed "$$plant" | $(PY) tools/chart_shards.py trio feed-1 2 2>/dev/null \
+			&& { echo "chart-check FAILED: the item 31 check passed a render with a violation planted ($$plant), so it proves nothing" >&2; exit 1; }; \
+	done; \
+	echo "$$ha" | grep -q 'operations: \["DELETE"\]' \
+		&& echo "$$ha" | grep -q '^  name: check-meridian-runtime-shard-leases$$' \
+		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:namespace-controller",' \
+		&& echo "$$ha" | grep -q '"system:serviceaccount:kube-system:generic-garbage-collector",' \
+		&& echo "$$ha" | grep -q 'has(namespaceObject.metadata.deletionTimestamp)' \
+		&& echo "$$ha" | grep -q 'oldObject.metadata.name.matches("^\[a-z\]' \
+		&& echo "$$ha" | grep -q '(request.operation == "CREATE" ||$$' \
+		&& echo "$$ha" | grep -q 'object.metadata.annotations.all(key, key in \[' \
+		&& echo "$$ha" | grep -q 'variables.labelled.matches(' \
+		|| { echo "chart-check FAILED: the launcher's admission policy does not refuse a shard Lease's delete with the namespace controller and garbage collector exempt while the namespace is deleted alone (PO item 57, review c5b2 M1), or does not hold an update to what the launcher made, an account's annotations or an instance label to their shape (review c5b L1-L3)" >&2; exit 1; }; \
+	alone="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=false --set launcher.enabled=false \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry without the launcher did not render: $$alone" >&2; exit 1; }; \
+	echo "$$alone" | grep -q '^  name: check-meridian-runtime-shard-leases$$' \
+		&& echo "$$alone" | grep -q "a plugin shard's Lease is never deleted: it goes only with its namespace" \
+		|| { echo "chart-check FAILED: a sharded sidecars[] entry's Leases render without their delete guard where the launcher does not (PO item 57, review c5b2 L2)" >&2; exit 1; }; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: the default profile with ValidatingAdmissionPolicy did not render: $$plain" >&2; exit 1; }; \
+	echo "$$plain" | grep -q 'check-meridian-runtime-shard-leases' \
+		&& { echo "chart-check FAILED: the shard Leases' delete guard renders where no shard Lease does" >&2; exit 1; }; \
+	archive="$$(sed -n '/^# An archive for an edge plugin/,/^pluginArchive:/p' deploy/chart/values.yaml)"; \
+	echo "$$archive" | grep -q '<fullname>-shards-<instance>' \
+		&& echo "$$archive" | grep -q 'StringLike' \
+		&& echo "$$archive" | grep -q 'system:serviceaccount:<namespace>:<fullname>-shards-\*' \
+		&& echo "$$archive" | grep -qF 'svc.id.goog[<namespace>/<fullname>-shards-<instance>]' \
+		&& ! echo "$$archive" | grep -q 'principal set' \
+		&& echo "$$archive" | grep -q 'Azure' \
+		&& echo "$$archive" | grep -q 'Pod Identity' \
+		|| { echo "chart-check FAILED: values.yaml's pluginArchive does not name the <fullname>-shards-<instance> accounts a bucket's identity must trust, and each cloud's step, GKE's a binding per account (PO items 60, 63)" >&2; exit 1; }; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$sharded --set pluginStorage.enabled=true 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: a sharded instance rendered with storage of its own, which is one pod's" >&2; exit 1; }; \
+	echo "$$said" | grep -q "storage is one pod's" \
+		|| { echo "chart-check FAILED: a sharded instance with storage was refused without saying why: $$said" >&2; exit 1; }; \
+	echo "$$ha" | $(PY) tools/chart_shards.py shared || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py copy-fixture crates/runtime/src/launcher/tests.rs || exit 1; \
+	echo "$$ha" | sed 's/runAsNonRoot\\":true/runAsNonRoot\\":false/' \
+		| $(PY) tools/chart_shards.py copy-fixture crates/runtime/src/launcher/tests.rs 2>/dev/null \
+		&& { echo "chart-check FAILED: the copy-fixture check passed a copy pod other than the launcher tests' COPY, so it proves nothing" >&2; exit 1; }; \
+	rwx="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set pluginStorage.shared.storageClassName=files \
+		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>&1)" \
+		|| { echo "chart-check FAILED: the ha profile with a shared storage class did not render: $$rwx" >&2; exit 1; }; \
+	echo "$$rwx" | $(PY) tools/chart_shards.py shared files || exit 1; \
+	echo "$$ha" | $(PY) tools/chart_shards.py plugin-shards || exit 1; \
+	echo "$$made" | $(PY) tools/chart_shards.py plugin-shards || exit 1; \
+	echo "$$made" | sed '/^        - name: plugin$$/,$$ s/MERIDIAN_PLUGIN_SHARDS/MERIDIAN_PLUGIN_SHARDZ/' | $(PY) tools/chart_shards.py plugin-shards 2>/dev/null \
+		&& { echo "chart-check FAILED: the PO item 73 check passed a plugin container not told its shard count, so it proves nothing" >&2; exit 1; }; \
+	echo "$$ha" | $(PY) tools/chart_shards.py shared files 2>/dev/null \
+		&& { echo "chart-check FAILED: the item 30 check found a ReadWriteMany claim where no class is named, so it proves nothing" >&2; exit 1; }; \
+	echo "$$rwx" | $(PY) tools/chart_shards.py shared 2>/dev/null \
+		&& { echo "chart-check FAILED: the item 30 check passed a ReadWriteMany claim as the one-node claim, so it proves nothing" >&2; exit 1; }; \
+	echo "$$rwx" | grep -qF 'pluginStorage\":{\"enabled\":true,\"shared\":{\"storageClassName\":\"files\"}}' \
+		|| { echo "chart-check FAILED: the conductor is not told the shared storage class it refuses several pods keeping storage on several nodes without (item 30)" >&2; exit 1; }
 	@# Step 3b part 2: resilience.profile. `tolerant`, the default, is one of
 	@# everything: one broker server as a StatefulSet, the database alone on
 	@# postgres:16-alpine with page checksums at initdb, one dashboard. `ha`
@@ -2888,6 +3333,26 @@ chart-check:
 		echo "$$ha" | grep -q -- "$$held" \
 			|| { echo "chart-check FAILED: the ha profile renders no $$held" >&2; exit 1; }; \
 	done; \
+	jsset="$$(echo "$$ha" | awk '/^---/ { if (doc ~ /kind: StatefulSet/ && doc ~ /\n  name: check-meridian-runtime-broker-jetstream\n/) print doc; doc = ""; next } { doc = doc $$0 "\n" } END { if (doc ~ /kind: StatefulSet/ && doc ~ /\n  name: check-meridian-runtime-broker-jetstream\n/) print doc }')"; \
+	[ -n "$$jsset" ] || { echo "chart-check FAILED: the ha profile renders no JetStream broker set" >&2; exit 1; }; \
+	echo "$$jsset" | grep -A2 "^  persistentVolumeClaimRetentionPolicy:$$" | grep -q "^    whenDeleted: Delete$$" \
+		&& echo "$$jsset" | grep -A2 "^  persistentVolumeClaimRetentionPolicy:$$" | grep -q "^    whenScaled: Retain$$" \
+		|| { echo "chart-check FAILED: the JetStream broker set keeps its volumes when it goes: leaving ha deletes them, so a return starts JetStream afresh (item 191)" >&2; exit 1; }; \
+	[ "$$(echo "$$ha" | grep -c 'persistentVolumeClaimRetentionPolicy:')" = 1 ] \
+		|| { echo "chart-check FAILED: a set besides the JetStream broker set deletes its volumes when it goes (item 191 names that set alone)" >&2; exit 1; }; \
+	tolerant="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the tolerant profile did not render" >&2; exit 1; }; \
+	echo "$$tolerant" | grep -q "^  name: check-meridian-runtime-broker$$" \
+		|| { echo "chart-check FAILED: the tolerant profile renders no broker set" >&2; exit 1; }; \
+	echo "$$tolerant" | grep -q 'persistentVolumeClaimRetentionPolicy:' \
+		&& { echo "chart-check FAILED: the broker set without JetStream renders a volume retention policy" >&2; exit 1; }; \
+	for rendered in "$$ha" "$$tolerant"; do \
+		[ "$$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" = '          image: "nats:2.10.29-alpine"' ] \
+			|| { echo "chart-check FAILED: the broker's image is not pinned exactly to nats:2.10.29-alpine (item 191): $$(echo "$$rendered" | grep -E '^ +image: "?nats:' | sort -u)" >&2; exit 1; }; \
+	done; \
+	composed="$$(grep -hE '^ +image: "?nats:' docker-compose.yaml deploy/harness/compose.yaml | tr -d ' ' | sort -u)"; \
+	[ "$$composed" = 'image:nats:2.10.29-alpine' ] \
+		|| { echo "chart-check FAILED: the compose files' broker is not pinned exactly to nats:2.10.29-alpine, as the chart's is (item 191's review, finding 9): $$composed" >&2; exit 1; }; \
 	[ "$$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget')" = 11 ] \
 		|| { echo "chart-check FAILED: the ha profile renders $$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget') disruption budgets, not 11 (six stores, the database, the broker, the dashboard, two analytics sets)" >&2; exit 1; }; \
 	echo "$$ha" | grep -q "runAsUser" \
@@ -2936,37 +3401,75 @@ chart-check:
 	true
 	@# The brought database's max_connections, counted from what the chart
 	@# deploys (ruled 2026-11-08): each store member's pool and what is
-	@# beside it, the lake's write-ahead writer's in ha (stage E), a
-	@# rollout's surge, the dashboard's copies, the jobs, the superuser's and
-	@# Patroni's reserve, and a quarter's room -- 82 tolerant, 220 ha --
+	@# beside it, the lake's and the book's for each of the 2 writer groups
+	@# they allow by default (PO items 104 and 106), the lake's write-ahead
+	@# writer's in ha (stage E), a rollout's surge, the dashboard's copies, the jobs, the superuser's and
+	@# Patroni's reserve, and a quarter's room -- 107 tolerant, 303 ha --
 	@# given to the server alone and under Patroni and to the preflight's
 	@# memory judge; one set below what the pods hold is refused, saying how
 	@# many they hold. Its memory in ha is the judge's count of it with a
-	@# quarter's room, 1280Mi, given to the members and to the judge.
+	@# quarter's room, 1728Mi, given to the members and to the judge.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
-	echo "$$plain" | grep -q -- "- max_connections=82$$" \
-		|| { echo "chart-check FAILED: the tolerant database is not given max_connections=82, the count of what the chart deploys" >&2; exit 1; }; \
-	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "82"' \
-		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 82 connections" >&2; exit 1; }; \
+	echo "$$plain" | grep -q -- "- max_connections=107$$" \
+		|| { echo "chart-check FAILED: the tolerant database is not given max_connections=107, the count of what the chart deploys" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "107"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 107 connections" >&2; exit 1; }; \
 	patroni="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha 2>/dev/null)"; \
-	echo "$$patroni" | grep -q "^ *max_connections: 220$$" \
-		|| { echo "chart-check FAILED: the ha database is not given max_connections: 220 under Patroni" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q 'max_connections\\":220' \
-		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 220" >&2; exit 1; }; \
-	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1280Mi"' \
-		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1280Mi" >&2; exit 1; }; \
-	echo "$$patroni" | grep -q "^ *memory: 1280Mi$$" \
-		|| { echo "chart-check FAILED: the ha database is not given the 1280Mi the memory judge counts at 220 connections" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *max_connections: 303$$" \
+		|| { echo "chart-check FAILED: the ha database is not given max_connections: 303 under Patroni" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q 'max_connections\\":303' \
+		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 303" >&2; exit 1; }; \
+	echo "$$patroni" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1728Mi"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the ha database's memory against its 1728Mi" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q "^ *memory: 1728Mi$$" \
+		|| { echo "chart-check FAILED: the ha database is not given the 1728Mi the memory judge counts at 303 connections" >&2; exit 1; }; \
 	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY" | grep -q 'value: "1Gi"' \
 		|| { echo "chart-check FAILED: the tolerant database's memory is not its own 1Gi" >&2; exit 1; }; \
 	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha --set database.brought.maxConnections=100 2>&1 >/dev/null)" \
 		&& { echo "chart-check FAILED: database.brought.maxConnections=100 rendered under ha, below what its pods hold" >&2; exit 1; }; \
-	echo "$$said" | grep -q "hold up to 172 connections" \
+	echo "$$said" | grep -q "hold up to 238 connections" \
 		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
 		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }
+	@# A writer-group count changed within its store's most (PO items 104
+	@# and 106, 2026-11-18: lake.maxWriterGroups and bor.maxWriterGroups, 2
+	@# by default, 1 to 64) never restarts the database: its
+	@# max_connections, and the ha members' memory counted from it, are
+	@# counted at the most groups each store allows, so two renders
+	@# differing only in writerGroups give the same database StatefulSet,
+	@# tolerant and ha, at the default most and at one raised. A count above
+	@# its store's most is refused, naming the value and the one restart
+	@# raising it takes; a most of 0 or above 64 is refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
+	db() { awk '/^---/{if(d~/\nkind: StatefulSet\n/ && d~/\n  name: check-meridian-runtime-database\n/)printf "%s",d; d="\n"; next} {d=d $$0 "\n"} END{if(d~/\nkind: StatefulSet\n/ && d~/\n  name: check-meridian-runtime-database\n/)printf "%s",d}'; }; \
+	for profile in "" "$$ha"; do \
+		one="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile 2>/dev/null | db)"; \
+		[ "$$(echo "$$one" | grep -c 'max_connections')" -ge 1 ] \
+			|| { echo "chart-check FAILED: no database StatefulSet giving max_connections found in the $${profile:+ha }render, so the comparison below proves nothing" >&2; exit 1; }; \
+		two="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile --set lake.writerGroups=2 --set bor.writerGroups=2 2>/dev/null | db)"; \
+		[ "$$one" = "$$two" ] \
+			|| { echo "chart-check FAILED: lake.writerGroups and bor.writerGroups raised from 1 to 2, within their most, change the $${profile:+ha }database's StatefulSet, so the change restarts the database (PO item 104):" >&2; diff <(echo "$$one") <(echo "$$two") >&2; exit 1; }; \
+		most="--set lake.maxWriterGroups=4 --set bor.maxWriterGroups=4"; \
+		low="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile $$most 2>/dev/null | db)"; \
+		high="$$($(HELM_TEMPLATE) check deploy/chart $$base $$profile $$most --set lake.writerGroups=4 --set bor.writerGroups=3 2>/dev/null | db)"; \
+		[ -n "$$low" ] && [ "$$low" = "$$high" ] \
+			|| { echo "chart-check FAILED: at a most of 4, writer groups raised from 1 to 4 and 3 change the $${profile:+ha }database's StatefulSet (PO item 104)" >&2; exit 1; }; \
+		[ "$$low" != "$$one" ] \
+			|| { echo "chart-check FAILED: a most of 4 writer groups gives the $${profile:+ha }database the same StatefulSet as the default 2, so the most counts nothing" >&2; exit 1; }; \
+	done; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set lake.writerGroups=3 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: lake.writerGroups=3 rendered above lake.maxWriterGroups, 2 by default" >&2; exit 1; }; \
+	echo "$$said" | grep -q "lake.writerGroups is 3 and lake.maxWriterGroups 2" && echo "$$said" | grep -q "restarts the database once" \
+		|| { echo "chart-check FAILED: a count above its store's most was refused without naming lake.maxWriterGroups and the restart raising it takes: $$said" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set bor.writerGroups=3 --set bor.maxWriterGroups=3 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: bor.writerGroups=3 did not render at bor.maxWriterGroups=3" >&2; exit 1; }; \
+	for refused in "bor.maxWriterGroups=0" "lake.maxWriterGroups=65"; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$refused rendered; a store's most writer groups is 1 to 64" >&2; exit 1; }; \
+	done; true
 	@# Patroni's REST API over TLS whenever internal TLS is on (ruled
 	@# 2026-11-08): served with the database's certificate, each member
 	@# reached by its own Service's name (one per member, which the

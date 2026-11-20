@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use meridian_changes::scratch::Scratch;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn base_url() -> String {
@@ -28,19 +30,15 @@ fn base_url() -> String {
     )
 }
 
-/// A schema of this test's own.
-fn scratch_schema(tag: &str) -> String {
+/// A schema of this test's own, dropped with the value (PO 65).
+fn scratch_schema(tag: &str) -> Scratch {
     let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let schema = format!("waiting_{tag}_{nanos}_{seq}");
-    postgres::Client::connect(&base_url(), postgres::NoTls)
-        .expect("could not reach the test database")
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("could not create a schema");
-    schema
+    Scratch::schema(&base_url(), &schema)
 }
 
 /// The test database's URL, reaching `schema`, at `address` in place of its
@@ -239,11 +237,11 @@ fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
     // The dashboard's tables made where it will find them, and the
     // dashboard pointed at a port where nothing answers yet.
     let schema = scratch_schema("dashboard");
-    meridian_dashboard::database::Database::connect(&url_for(&schema, None), 1)
+    meridian_dashboard::database::Database::connect(&url_for(schema.name(), None), 1)
         .and_then(|database| database.migrate(&meridian_clock::SystemClock))
         .expect("could not make the dashboard's tables");
     let database = free_port();
-    let through = url_for(&schema, Some(&format!("127.0.0.1:{database}")));
+    let through = url_for(schema.name(), Some(&format!("127.0.0.1:{database}")));
     let listen = free_port();
 
     let mut dashboard = Running::start(
@@ -289,7 +287,8 @@ fn a_dashboard_started_before_its_database_waits_for_it_and_serves() {
 
 #[test]
 fn a_store_started_before_its_migration_waits_for_it_and_is_ready_after() {
-    let url = url_for(&scratch_schema("street"), None);
+    let schema = scratch_schema("street");
+    let url = url_for(schema.name(), None);
     let ready = std::env::temp_dir().join(format!(
         "meridian-street-ready-{}-{}",
         std::process::id(),
@@ -342,7 +341,8 @@ fn a_store_started_before_its_migration_waits_for_it_and_is_ready_after() {
 fn a_store_whose_schema_is_newer_than_it_refuses_rather_than_waits() {
     // Waiting never fixes a database a newer release migrated, so this one
     // exits, saying so, where the one above waits.
-    let url = url_for(&scratch_schema("ahead"), None);
+    let schema = scratch_schema("ahead");
+    let url = url_for(schema.name(), None);
     meridian_street::PostgresStore::connect(&url, 1)
         .and_then(|store| store.migrate(&meridian_clock::SystemClock))
         .expect("could not migrate");
@@ -388,7 +388,7 @@ fn a_migration_started_before_its_database_waits_for_it_and_applies() {
     // component waited for a schema that never came (CI run 36631603926).
     let schema = scratch_schema("migrate");
     let database = free_port();
-    let through = url_for(&schema, Some(&format!("127.0.0.1:{database}")));
+    let through = url_for(schema.name(), Some(&format!("127.0.0.1:{database}")));
 
     let mut migration = Running::start_with(
         env!("CARGO_BIN_EXE_meridian-conductor"),
@@ -416,7 +416,7 @@ fn a_migration_started_before_its_database_waits_for_it_and_applies() {
         said.contains("the configuration store's schema is applied"),
         "it did not say it migrated:\n{said}"
     );
-    meridian_config::PostgresStore::connect(&url_for(&schema, None), 1)
+    meridian_config::PostgresStore::connect(&url_for(schema.name(), None), 1)
         .and_then(|store| store.verify())
         .expect("it said it migrated and the schema is not there");
 }
@@ -426,7 +426,8 @@ fn a_migration_that_fails_once_connected_fails_at_once() {
     // Only the connection is waited for. A migration that fails against a
     // database that answers stops the release, which is why the Job does not
     // retry, so it must not wait here either.
-    let url = url_for(&scratch_schema("broken"), None);
+    let schema = scratch_schema("broken");
+    let url = url_for(schema.name(), None);
     postgres::Client::connect(&url, postgres::NoTls)
         .unwrap()
         .batch_execute("CREATE VIEW schema_migration AS SELECT 1 AS not_a_version")

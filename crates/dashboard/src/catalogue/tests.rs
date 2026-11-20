@@ -143,6 +143,13 @@ fn conductor(bus: &Bus) {
                     }),
                     shards: 2,
                     standby: true,
+                    storage_copied: Some(meridian_domain::v1::PluginStorageCopied {
+                        instance_id: "snaptrade-1".into(),
+                        from_claim: "r-storage-snaptrade-1".into(),
+                        to_claim: "r-shared-storage-snaptrade-1".into(),
+                        at_ns: 1_790_380_800_000_000_000,
+                        launched_by: "local|ada".into(),
+                    }),
                     ..Default::default()
                 }],
             }
@@ -209,6 +216,22 @@ fn conductor(bus: &Bus) {
         let request = LaunchPluginRequest::decode(&envelope.payload[..]).unwrap();
         if request.approved_roles != vec!["custody".to_string()] {
             return Err("the approval names roles none, and snaptrade 0.1.0 declares custody; an approval of something other than what runs is no approval".into());
+        }
+        // The conductor's refusals framed with a status and the fields
+        // they name (item 30's storage refusal; shards past most_shards).
+        if request.shards > 2 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["shards".to_string()],
+                "shards is 3, and snaptrade 0.1.0 allows at most 2 pod(s) of one instance (its most_shards)",
+            ));
+        }
+        if request.shards == 2 {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::FailedPrecondition,
+                &["shards".to_string()],
+                "shards was asked for snaptrade-2, and its pods keep storage on 3 nodes",
+            ));
         }
         Ok((
             "meridian.v1.PluginLaunch".into(),
@@ -816,6 +839,17 @@ async fn the_catalogue_launching_and_stopping() {
     );
     assert_eq!(listed["launches"][0]["shards"], 2);
     assert_eq!(listed["launches"][0]["standby"], true);
+    // Item 30 (item 70): its own storage's copy into its shared storage,
+    // read by `meridian plugin list`; null where none was copied.
+    assert_eq!(
+        listed["launches"][0]["storage_copied"],
+        serde_json::json!({
+            "from_claim": "r-storage-snaptrade-1",
+            "to_claim": "r-shared-storage-snaptrade-1",
+            "at_ns": 1_790_380_800_000_000_000_i64,
+            "launched_by": "local|ada",
+        })
+    );
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
@@ -842,6 +876,38 @@ async fn the_catalogue_launching_and_stopping() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("declares custody"), "showing both: {body}");
+    // A refusal framed with a status: that status, its words alone and the
+    // fields it names, as a store's refusal of any other terminal act (the
+    // CLI's follow-up, 2026-11-17): 409 for a precondition, 422 for an
+    // argument, never the bus's framing.
+    let sharded = |shards: u32| {
+        serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
+                           "approved_roles": ["custody"], "shards": shards})
+        .to_string()
+    };
+    for (shards, expected, words) in [
+        (2, StatusCode::CONFLICT, "its pods keep storage on 3 nodes"),
+        (3, StatusCode::UNPROCESSABLE_ENTITY, "at most 2 pod(s)"),
+    ] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/plugins/launch",
+            Some(&h.ada),
+            &sharded(shards),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            said["fields"],
+            serde_json::json!([{"path": "shards"}]),
+            "{body}"
+        );
+        let error = said["error"].as_str().unwrap();
+        assert!(error.contains(words), "{body}");
+        assert!(!error.contains("[refusal-"), "the bus's framing: {body}");
+    }
 
     let (status, _, body) = send(
         &h,
@@ -1111,4 +1177,380 @@ fn a_launchs_limits_are_read_each_empty_for_the_deployments() {
         let refused = super::sidecar_limits(in_flight, per_second, answer).unwrap_err();
         assert!(refused.contains(named), "{refused}");
     }
+}
+
+/// Step 3d (approved 2026-11-15): the moves, the split and the read behind
+/// `meridian partition split|move` and `meridian account move`, each a
+/// deployment admin's, stamped, sent to the store that holds it and
+/// answered as its `dashboard__` tool answers; a store's refusal its
+/// words, one for load with its retry-after.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_moves_the_split_and_the_resilience_read_are_a_deployment_admins_from_a_terminal() {
+    use meridian_domain::v1 as domain;
+    let h = harness().await;
+    let asked: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+    let note = |asked: &Arc<std::sync::Mutex<Vec<(String, String)>>>, topic: &str, what: String| {
+        asked.lock().unwrap().push((topic.to_string(), what));
+    };
+    let splitting = Arc::clone(&asked);
+    h.app
+        .bus
+        .serve("platform.lake.command.split-partition", move |envelope| {
+            stamped(&envelope)?;
+            let request = domain::SplitPartitionRequest::decode(&envelope.payload[..]).unwrap();
+            note(
+                &splitting,
+                "lake split",
+                format!("{} {}", request.partition, request.reason),
+            );
+            if request.partition == "feed:busy" {
+                return Err(meridian_bus::overloaded(&meridian_budget::Overloaded {
+                    retry_after_seconds: 3,
+                    words: "overloaded: the lake's budget is full".into(),
+                }));
+            }
+            Ok((
+                "meridian.v1.SplitPartitionReply".into(),
+                domain::SplitPartitionReply {
+                    split: Some(domain::PartitionSplit {
+                        parent: request.partition.clone(),
+                        children: vec![
+                            format!("{}/0000-7fff", request.partition),
+                            format!("{}/8000-ffff", request.partition),
+                        ],
+                        closing_sequence: 41,
+                        split_by: "ada".into(),
+                        reason: request.reason,
+                        split_at_ns: T0,
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+    for (topic, store) in [
+        ("platform.lake.command.move-partition", "lake move"),
+        ("platform.book.command.move-partition", "book move"),
+    ] {
+        let moving = Arc::clone(&asked);
+        h.app.bus.serve(topic, move |envelope| {
+            stamped(&envelope)?;
+            let request = domain::MovePartitionRequest::decode(&envelope.payload[..]).unwrap();
+            note(
+                &moving,
+                store,
+                format!("{} to {}", request.partition, request.target_group),
+            );
+            if request.target_group == 9 {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["target_group".to_string()],
+                    "target_group: the deployment has no writer group 9",
+                ));
+            }
+            Ok((
+                "meridian.v1.MovePartitionReply".into(),
+                domain::MovePartitionReply {
+                    from_group: 0,
+                    started_at_ns: T0,
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
+    let accounting = Arc::clone(&asked);
+    h.app
+        .bus
+        .serve("platform.book.command.move-account", move |envelope| {
+            stamped(&envelope)?;
+            let request = domain::MoveAccountRequest::decode(&envelope.payload[..]).unwrap();
+            note(
+                &accounting,
+                "account move",
+                format!("{} to {}", request.account_id, request.target_partition),
+            );
+            Ok((
+                "meridian.v1.MoveAccountReply".into(),
+                domain::MoveAccountReply {
+                    moved: Some(domain::AccountMoved {
+                        account_id: request.account_id,
+                        from_partition: "P0".into(),
+                        closing_sequence: 7,
+                        to_partition: request.target_partition,
+                        opening_sequence: 1,
+                        moved_by: "ada".into(),
+                        reason: request.reason,
+                        moved_at_ns: T0,
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+    h.app
+        .bus
+        .serve(crate::admin::resilience::READ_RESILIENCE, |envelope| {
+            stamped(&envelope)?;
+            let request = domain::ReadResilienceRequest::decode(&envelope.payload[..]).unwrap();
+            Ok((
+                "meridian.v1.ReadResilienceReply".into(),
+                domain::ReadResilienceReply {
+                    partitions: vec![domain::PartitionOwner {
+                        component: "bor".into(),
+                        partition: "P1".into(),
+                        group: 1,
+                        ..Default::default()
+                    }],
+                    history: vec![
+                        domain::ResilienceHistoryItem {
+                            item: Some(domain::resilience_history_item::Item::PartitionMoved(
+                                domain::PartitionMoved {
+                                    component: "bor".into(),
+                                    partition: "P1".into(),
+                                    from_group: 0,
+                                    to_group: 1,
+                                    epoch: 4,
+                                    moved_at_ns: T0,
+                                    ..Default::default()
+                                },
+                            )),
+                        },
+                        domain::ResilienceHistoryItem {
+                            item: Some(domain::resilience_history_item::Item::PartitionSplit(
+                                domain::PartitionSplit {
+                                    parent: "feed:prices".into(),
+                                    split_at_ns: T0,
+                                    ..Default::default()
+                                },
+                            )),
+                        },
+                    ],
+                    next_cursor: format!("after-{}", request.page_size),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+
+    // Each is a deployment admin's alone.
+    for (method, path, body) in [
+        ("GET", "/terminal/resilience", ""),
+        (
+            "POST",
+            "/terminal/partitions/split",
+            r#"{"partition":"feed:prices","note":"hot"}"#,
+        ),
+        (
+            "POST",
+            "/terminal/partitions/move",
+            r#"{"partition":"P1","target_group":1,"note":"spread"}"#,
+        ),
+        (
+            "POST",
+            "/terminal/accounts/move",
+            r#"{"account_id":"ACC-1","target_partition":"P1","note":"spread"}"#,
+        ),
+    ] {
+        assert_eq!(
+            send(&h, method, path, Some(&h.bob), body).await.0,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    assert!(asked.lock().unwrap().is_empty(), "nothing sent for another");
+
+    // The split, as the tool answers it.
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/partitions/split",
+        Some(&h.ada),
+        r#"{"partition":"feed:prices","note":"hot"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["split"]["parent"], "feed:prices", "{body}");
+    assert_eq!(read["split"]["children"][1], "feed:prices/8000-ffff");
+    assert_eq!(read["split"]["closing_sequence"], 41);
+    assert_eq!(read["split"]["reason"], "hot");
+
+    // A move, sent to the store that holds the partition: begun.
+    for (partition, store) in [("P1", "book move"), ("feed:prices/0000-7fff", "lake move")] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/partitions/move",
+            Some(&h.ada),
+            &serde_json::json!({"partition": partition, "target_group": 1, "note": "spread"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(read["move"]["partition"], partition, "{body}");
+        assert_eq!(read["move"]["from_group"], 0);
+        assert_eq!(read["move"]["started_at_ns"], T0.to_string());
+        assert_eq!(
+            asked.lock().unwrap().last().unwrap(),
+            &(store.to_string(), format!("{partition} to 1"))
+        );
+    }
+
+    // An account's move, as recorded.
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/accounts/move",
+        Some(&h.ada),
+        r#"{"account_id":"ACC-1","target_partition":"P1","note":"spread"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["moved"]["account_id"], "ACC-1", "{body}");
+    assert_eq!(read["moved"]["to_partition"], "P1");
+    assert_eq!(read["moved"]["opening_sequence"], 1);
+
+    // The read, its history items naming their store and partition.
+    let (status, _, body) = send(
+        &h,
+        "GET",
+        "/terminal/resilience?page_size=20",
+        Some(&h.ada),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["partitions"][0]["partition"], "P1", "{body}");
+    assert_eq!(read["next_cursor"], "after-20");
+    let moved = &read["history"][0];
+    assert_eq!(
+        (&moved["kind"], &moved["component"], &moved["partition"]),
+        (
+            &serde_json::json!("partition_moved"),
+            &serde_json::json!("bor"),
+            &serde_json::json!("P1")
+        ),
+        "{body}"
+    );
+    assert!(moved["words"].as_str().unwrap().starts_with("bor P1:"));
+    let split = &read["history"][1];
+    assert_eq!(split["component"], "lake");
+    assert_eq!(split["partition"], "feed:prices");
+    assert_eq!(
+        send(
+            &h,
+            "GET",
+            "/terminal/resilience?page_size=201",
+            Some(&h.ada),
+            ""
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // Review finding 12: a body's names are read as the tools read their
+    // own, trimmed: a book partition given with a space or a newline is
+    // still sent to the book, as named; one that is only spaces is refused
+    // naming it, and nothing is sent.
+    for given in [" P1", "P1\n"] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/partitions/move",
+            Some(&h.ada),
+            &serde_json::json!({"partition": given, "target_group": 1, "note": "spread"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{given:?}: {body}");
+        assert_eq!(
+            asked.lock().unwrap().last().unwrap(),
+            &("book move".to_string(), "P1 to 1".to_string()),
+            "{given:?}"
+        );
+    }
+    let before = asked.lock().unwrap().len();
+    for (path, body, named) in [
+        (
+            "/terminal/accounts/move",
+            r#"{"account_id":"  ","target_partition":"P1","note":"spread"}"#,
+            "account_id",
+        ),
+        (
+            "/terminal/accounts/move",
+            r#"{"account_id":"ACC-1","target_partition":"\t","note":"spread"}"#,
+            "target_partition",
+        ),
+        (
+            "/terminal/partitions/move",
+            r#"{"partition":" ","target_group":1,"note":"spread"}"#,
+            "partition",
+        ),
+        (
+            "/terminal/partitions/split",
+            r#"{"partition":" ","note":"hot"}"#,
+            "partition",
+        ),
+    ] {
+        let (status, _, answered) = send(&h, "POST", path, Some(&h.ada), body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {answered}"
+        );
+        assert!(answered.contains(named), "{answered}");
+    }
+    assert_eq!(asked.lock().unwrap().len(), before, "nothing was sent");
+
+    // Refusals: no note, nothing sent; the store's own words and status;
+    // one for load with its retry-after.
+    let before = asked.lock().unwrap().len();
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/partitions/split",
+        Some(&h.ada),
+        r#"{"partition":"feed:prices","note":" "}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("note"), "{body}");
+    assert_eq!(asked.lock().unwrap().len(), before);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/partitions/move",
+        Some(&h.ada),
+        r#"{"partition":"P1","target_group":9,"note":"spread"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        read["error"],
+        "target_group: the deployment has no writer group 9"
+    );
+    // The fields the store named, as the tools' details carry them
+    // (review finding 12; accepted 2026-11-15).
+    assert_eq!(
+        read["fields"],
+        serde_json::json!([{"path": "target_group"}]),
+        "{body}"
+    );
+    let (status, headers, body) = send(
+        &h,
+        "POST",
+        "/terminal/partitions/split",
+        Some(&h.ada),
+        r#"{"partition":"feed:busy","note":"hot"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["error"], "overloaded: the lake's budget is full");
+    assert_eq!(read["reason"], "overloaded");
+    assert_eq!(read["retry_after_seconds"], 3);
+    assert_eq!(headers["retry-after"], "3");
 }

@@ -160,6 +160,139 @@ pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
 /// dataset's liveness, which only the writer's commands set. The answer
 /// never depends on which member takes the read.
 pub const READ_FROM_WRITER: &str = "platform.lake.internal.read-from-writer";
+/// A write handed to the writer group owning its datasets (step 3d; the
+/// resilience spec's section 6.7): the public write, unchanged.
+pub const INTERNAL_RECORD: &str = "platform.lake.internal.record";
+
+/// Whether `topic` is a lake write of datasets' rows, which a member hands
+/// to the writer group owning each dataset: every `record-` command but a
+/// dataset's liveness and an assessment, which are group 0's own.
+pub fn is_record_write(topic: &str) -> bool {
+    (topic
+        .strip_prefix("platform.lake.")
+        .is_some_and(|rest| rest.starts_with("command.record-"))
+        && topic != RECORD_LIVENESS
+        && topic != RECORD_QUALITY_ASSESSMENTS)
+        // A range's split is its writer's one transaction (step 3d).
+        || topic == SPLIT_PARTITION
+}
+
+/// The writer group a lake write is its owner's by, read from its request
+/// before its handler checks any row (step 3d; the ownership pre-check
+/// decided 2026-11-13): a write answering a want is group 0's, which holds
+/// the wants; one whose rows are every one of one other group's datasets is
+/// that group's; a split is its range's dataset's group's. None where the
+/// write spans groups or is this group's own, which its handler takes.
+pub fn owner_of_write(
+    groups: meridian_changes::groups::Groups,
+    topic: &str,
+    envelope: &Envelope,
+) -> Option<u32> {
+    if topic == SPLIT_PARTITION {
+        let request =
+            meridian_domain::v1::SplitPartitionRequest::decode(envelope.payload.as_slice()).ok()?;
+        return Some(groups.owner_by(
+            &request.partition,
+            crate::range::dataset_of(&request.partition),
+        ));
+    }
+    let (_, rows, want_id) = rows_of(topic, envelope).ok()?;
+    if !want_id.is_empty() {
+        return Some(0);
+    }
+    // A dataset whose open ranges span groups is the handler's to split.
+    let mut owners = rows.iter().map(|row| whole_owner(groups, row.dataset()));
+    let first = owners.next()??;
+    owners.all(|group| group == Some(first)).then_some(first)
+}
+
+/// The group owning each of `rows` of `dataset` (step 3d; ruling 2 of
+/// 2026-11-14): the group of the open range holding the row's anchor, as
+/// `groups` last read the ranges. The anchor is the hash of the row's first
+/// subject, except for a key restated under the record that replaced its
+/// first version's subject: its anchor is read from `store`, in one look
+/// for the batch, and only where the dataset's open ranges span groups.
+pub fn owners_of_rows(
+    groups: meridian_changes::groups::Groups,
+    store: &dyn Store,
+    dataset: &str,
+    rows: &[Observation],
+) -> Vec<u32> {
+    if let Some(group) = whole_owner(groups, dataset) {
+        return vec![group; rows.len()];
+    }
+    ranges_of_rows(groups, store, dataset, rows)
+        .iter()
+        .map(|range| groups.owner_by(range, dataset))
+        .collect()
+}
+
+/// The open range each of `rows` of `dataset` goes to, as this member last
+/// read its ranges (step 3d; ruling 2 of 2026-11-14): its key's anchor's --
+/// its subject's hash, or, for a subject an alias stays as, the anchor its
+/// key was first recorded under -- the dataset itself where it has none.
+pub fn ranges_of_rows(
+    groups: meridian_changes::groups::Groups,
+    store: &dyn Store,
+    dataset: &str,
+    rows: &[Observation],
+) -> Vec<String> {
+    let open = crate::range::leaves(&groups.ranges_of(dataset));
+    if open.is_empty() {
+        return vec![dataset.to_string(); rows.len()];
+    }
+    let stays: BTreeSet<String> = store
+        .aliases()
+        .map(|aliases| aliases.into_values().collect())
+        .unwrap_or_default();
+    let probe: Vec<(i16, String)> = rows
+        .iter()
+        .filter(|row| stays.contains(row.subject()))
+        .map(|row| (row.data_type().code(), row.meta().row_key.clone()))
+        .collect();
+    let anchors = if probe.is_empty() {
+        BTreeMap::new()
+    } else {
+        store.anchors(dataset, &probe).unwrap_or_else(|failed| {
+            tracing::warn!(dataset, %failed, "the restated keys' anchors were not read");
+            BTreeMap::new()
+        })
+    };
+    rows.iter()
+        .map(|row| {
+            let anchor = anchors
+                .get(&(row.data_type().code(), row.meta().row_key.clone()))
+                .copied()
+                .unwrap_or_else(|| crate::range::hash(row.subject()));
+            open.iter()
+                .find(|(range, _)| range.holds(anchor))
+                .map_or_else(|| dataset.to_string(), |(range, _)| range.partition.clone())
+        })
+        .collect()
+}
+
+/// The group owning every open range of `dataset`, as this member last read
+/// them (step 3d; ruling 2 of 2026-11-14); none where its ranges span
+/// groups.
+pub fn whole_owner(groups: meridian_changes::groups::Groups, dataset: &str) -> Option<u32> {
+    let named = groups.ranges_of(dataset);
+    if named.is_empty() {
+        return Some(groups.owner(dataset));
+    }
+    let open = crate::range::leaves(&named);
+    let first = open.first().map(|(_, group)| *group)?;
+    open.iter()
+        .all(|(_, group)| *group == first)
+        .then_some(first)
+}
+
+/// A deployment admin halves a lake range (step 3d; section 6.1, approved
+/// 2026-11-12): answered by the range's writer once the split commits.
+pub const SPLIT_PARTITION: &str = "platform.lake.command.split-partition";
+/// A sidecar that took a shard's Lease has the lake raise the shard's epoch
+/// (step 3d, checkpoint 5, item 32; approved 2026-11-16): answered by the
+/// control writer once every lake and book writer group has raised it.
+pub const TAKE_SHARD: &str = "platform.lake.command.take-shard";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
 pub const ENTITLEMENTS_CHANGED: &str = "platform.config.event.entitlements-changed";
 pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-replaced";
@@ -410,6 +543,27 @@ pub struct Lake {
     /// recorded their switches (contract v30, W10.6; the resilience spec's
     /// section 8): rebuilt from the records at start.
     switches: Mutex<crate::switches::Switches>,
+    /// Each dataset's lane (step 3d, group commit; the resilience spec's
+    /// section 6.5): the batches waiting for its transaction in flight.
+    /// The book's count of writer groups ([`Lake::with_book_groups`]).
+    book_groups: std::sync::atomic::AtomicU32,
+    /// The broker holding the write-ahead stream, in `ha`
+    /// ([`Lake::with_write_ahead`]): where a shard's raise reads the
+    /// stream's place (review c5a H2).
+    write_ahead: std::sync::OnceLock<async_nats::Client>,
+    /// The write-ahead stream's identity, its creation time (ns), as the
+    /// writer last read it: stamped with each write's place (c5a2 N4).
+    stream: std::sync::atomic::AtomicI64,
+    lanes: meridian_changes::group_commit::Lanes<
+        LanePart,
+        Result<crate::store::Recorded, crate::store::StoreError>,
+    >,
+    /// Its writer group and the lake's count (step 3d; section 6.1): the
+    /// datasets it writes, and those it hands to their owners.
+    groups: meridian_changes::groups::Groups,
+    /// Called before each standing want a take delivers again is published.
+    #[cfg(test)]
+    pub(crate) resending: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// A gap asked again of its data plugin (W10.14): recovered once every want
@@ -501,6 +655,99 @@ pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
 /// as before; only its publication is left out, since every reader's sidecar
 /// would drop it for the later one anyway. A row every version of which is
 /// delivered -- a trade, an outcome, a filing -- is never superseded.
+/// A member's heads as `read_after` holds a read to them (step 3d; section
+/// 6.1): a range split, whose children this member holds, meets any
+/// sequence named of it -- "a `read_after` naming the parent is met by a
+/// child once that child is open" -- since a delivery of a child's row names
+/// its dataset and a sequence past the parent's close.
+pub(crate) fn met_by_children(mut heads: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    let mut parents: BTreeSet<String> = BTreeSet::new();
+    for child in heads.keys() {
+        let (dataset, lo, hi) = crate::range::parse(child);
+        if (lo, hi) == (0, crate::range::TOP) {
+            continue;
+        }
+        // Its dataset's full range, and every wider range of it held.
+        parents.insert(dataset.to_string());
+        for wider in heads.keys() {
+            let (of, from, to) = crate::range::parse(wider);
+            if of == dataset && from <= lo && hi <= to && (from, to) != (lo, hi) {
+                parents.insert(wider.clone());
+            }
+        }
+    }
+    for parent in parents {
+        heads.insert(parent, u64::MAX);
+    }
+    heads
+}
+
+/// The way back of a take's answer to its sidecar, inside its wait (review
+/// c5a2 L1).
+const TAKE_ANSWER_BACK: Duration = Duration::from_millis(250);
+
+/// When a take received at `now` (`now_ns` on the lake's clock) must be
+/// answered by: its sidecar's wait counted from `sent_at_ns`, the take's
+/// `published_at_ns`, less the way back (review c5a3 L1); from `now` where
+/// it says none. A sender's clock ahead of the lake's never stretches it
+/// past the wait counted from receipt; one behind only brings it earlier,
+/// and the sidecar asks again.
+pub(crate) fn take_deadline(
+    now: std::time::Instant,
+    now_ns: i64,
+    sent_at_ns: i64,
+) -> std::time::Instant {
+    let wait = meridian_changes::shard_fence::TAKE_WITHIN.saturating_sub(TAKE_ANSWER_BACK);
+    let age = if sent_at_ns > 0 {
+        Duration::from_nanos(now_ns.saturating_sub(sent_at_ns).max(0) as u64)
+    } else {
+        Duration::ZERO
+    };
+    now + wait.saturating_sub(age)
+}
+
+/// A take past its sidecar's wait: refused, recorded nowhere.
+fn late_take() -> String {
+    refusal_with_status(
+        RefusalStatus::Unavailable,
+        &[],
+        "the take was answered after its sidecar stopped waiting: not recorded; its next take \
+         asks again",
+    )
+}
+
+/// One part waiting in a dataset's lane: its rows, its time, and its
+/// plugin shard's stamp (step 3d, checkpoint 5, item 32).
+type LanePart = (Vec<Observation>, i64, Option<crate::store::ShardStamp>);
+
+/// A write's plugin shard and epoch as its sidecar stamped the envelope
+/// (step 3d, checkpoint 5, item 32): none where it stamped no epoch.
+pub(crate) fn shard_of(envelope: &Envelope) -> Option<crate::store::ShardStamp> {
+    let meta = envelope.meta.as_ref()?;
+    crate::store::ShardStamp::of(&meta.publisher_instance_id, meta.shard, meta.shard_epoch)
+}
+
+/// Each row's data type and row key, in the request's order: where a
+/// refusal naming one row finds its place (`<field>[i]`).
+fn row_keys(rows: &[Observation]) -> Vec<(i16, String)> {
+    rows.iter()
+        .map(|row| (row.data_type().code(), row.meta().row_key.clone()))
+        .collect()
+}
+
+/// A store's refusal of a write as its plugin hears it: a restatement the
+/// lake's rule 5 refuses is INVALID_ARGUMENT naming the field at the first
+/// row of the write under that key (`series[3].meta.valid_from_ns`); every
+/// other failure as the bus carries it ([`StoreError::on_the_bus`]).
+///
+/// [`StoreError::on_the_bus`]: crate::store::StoreError::on_the_bus
+fn refusal_of(failed: crate::store::StoreError, field: &str, keys: &[(i16, String)]) -> String {
+    if let Some(refused) = crate::store::key_fixed_refusal(&failed, field, keys) {
+        return refused;
+    }
+    failed.on_the_bus()
+}
+
 pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
     let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut superseded = BTreeSet::new();
@@ -512,6 +759,18 @@ pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
         }
     }
     superseded
+}
+
+/// Whether `answer`, a write's `RecordObservationsReply`, counts no row:
+/// none recorded, restated or found unchanged.
+pub fn counts_nothing(answer: &[u8]) -> bool {
+    RecordObservationsReply::decode(answer).is_ok() && counted(answer) == 0
+}
+
+/// The rows `answer`, a write's `RecordObservationsReply`, counts.
+pub fn counted(answer: &[u8]) -> u32 {
+    RecordObservationsReply::decode(answer)
+        .map_or(0, |reply| reply.recorded + reply.restated + reply.unchanged)
 }
 
 /// A write's rows as the lake records them, by the topic it was asked on
@@ -737,15 +996,31 @@ fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, 
 }
 
 fn watermark(heads: &BTreeMap<String, u64>, datasets: &BTreeSet<String>) -> Watermark {
-    Watermark {
-        partitions: datasets
-            .iter()
-            .map(|d| PartitionSequence {
-                partition: d.clone(),
-                sequence: heads.get(d).copied().unwrap_or(0),
-            })
-            .collect(),
+    // Each dataset's own partition, and every range split from it (step 3d;
+    // section 6.1), each at its head: a reader's catch-up reads each range
+    // after its own sequence.
+    let mut partitions: Vec<PartitionSequence> = Vec::new();
+    for dataset in datasets {
+        partitions.push(PartitionSequence {
+            partition: dataset.clone(),
+            sequence: heads.get(dataset).copied().unwrap_or(0),
+        });
+        let ranges = heads
+            .range::<str, _>((
+                std::ops::Bound::Excluded(format!("{dataset}/").as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(partition, _)| partition.starts_with(&format!("{dataset}/")));
+        for (partition, sequence) in ranges {
+            if crate::range::is_of(partition, dataset) {
+                partitions.push(PartitionSequence {
+                    partition: partition.clone(),
+                    sequence: *sequence,
+                });
+            }
+        }
     }
+    Watermark { partitions }
 }
 
 fn subject_ref(subject: &str) -> Option<SubjectRef> {
@@ -802,8 +1077,112 @@ impl Lake {
             read_handlers: RwLock::new(BTreeMap::new()),
             refetching: Mutex::new(BTreeMap::new()),
             switches: Mutex::new(switches),
+            lanes: Default::default(),
+            groups: meridian_changes::groups::Groups::one(),
+            book_groups: std::sync::atomic::AtomicU32::new(1),
+            write_ahead: std::sync::OnceLock::new(),
+            stream: std::sync::atomic::AtomicI64::new(0),
             store,
+            #[cfg(test)]
+            resending: Mutex::default(),
         })
+    }
+
+    /// The book's count of writer groups (`bor.writerGroups`; step 3d,
+    /// checkpoint 5, item 32): each is asked to raise a shard's epoch before
+    /// a take is answered. 1 unless told; 0 where no book runs.
+    pub fn with_book_groups(&self, count: u32) {
+        self.book_groups
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The broker holding the write-ahead stream (`ha`): a shard's raise
+    /// keeps the stream's last sequence with the epoch, and a write the
+    /// stream held at or below it is admitted whatever its epoch (review c5a
+    /// H2). None in `tolerant`, where no write comes from a stream.
+    pub fn with_write_ahead(&self, client: async_nats::Client) {
+        let _ = self.write_ahead.set(client);
+    }
+
+    /// The write-ahead stream's identity as its writer read it (c5a2 N4).
+    pub fn with_stream(&self, identity: i64) {
+        self.stream
+            .store(identity, std::sync::atomic::Ordering::SeqCst);
+        // A move's switch keeps its places in this stream (item 191).
+        self.store.in_stream(identity);
+    }
+
+    fn stream_identity(&self) -> i64 {
+        self.stream.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A write's stamp, with its place in the write-ahead stream where this
+    /// member knows the stream's identity; checked as a write from no
+    /// stream where it does not, so a place is never stamped in stream 0
+    /// (review c5a3 L2).
+    pub(crate) fn in_stream(
+        &self,
+        stamp: crate::store::ShardStamp,
+        sequence: u64,
+    ) -> crate::store::ShardStamp {
+        match self.stream_identity() {
+            0 => stamp,
+            identity => stamp.in_stream(sequence, identity),
+        }
+    }
+
+    /// Its writer group and the lake's count (step 3d).
+    pub fn groups(&self) -> meridian_changes::groups::Groups {
+        self.groups
+    }
+
+    /// The same lake, writing for writer group `groups` (step 3d).
+    pub(crate) fn grouped(
+        bus: Arc<Bus>,
+        store: Arc<dyn Store>,
+        clock: Arc<dyn Clock>,
+        groups: meridian_changes::groups::Groups,
+    ) -> Arc<Lake> {
+        let mut lake = Lake::new(bus, store, clock);
+        if let Some(only) = Arc::get_mut(&mut lake) {
+            only.groups = groups;
+            // A writer of a group past the first serves its writes alone,
+            // and is no reader: it keeps what it writes.
+            if !groups.holds_control() {
+                only.reads_only = false;
+            }
+        }
+        lake
+    }
+
+    /// Each dataset's writer group recorded where it changed (step 3d;
+    /// section 6.1): its `PartitionOwner`, in the control partition, and
+    /// told on its tail. Group 0's: at its start, and with several groups at
+    /// each sweep, a dataset begun since recorded at the next.
+    pub fn assign(&self) {
+        match self
+            .store
+            .record_assignments(self.groups, self.clock.now_ns())
+        {
+            Ok(0) => {}
+            Ok(recorded) => {
+                tracing::info!(
+                    recorded,
+                    groups = self.groups.count(),
+                    "the datasets' writer groups recorded where they changed"
+                );
+                self.publish_control();
+            }
+            Err(failed) => tracing::warn!(%failed, "the datasets' writer groups were not recorded"),
+        }
+    }
+
+    /// Whether this member does the lake's own work -- its control records,
+    /// its wants and its sweeps -- as a writer of the group holding the
+    /// control partition does; a reader member and a writer of another
+    /// group do none of it (step 3d).
+    fn keeps(&self) -> bool {
+        !self.reads_only && self.groups.holds_control()
     }
 
     /// Each dataset's latest sign of life, its liveness over every venue
@@ -1877,14 +2256,287 @@ impl Lake {
         want_id: &str,
         envelope: &Envelope,
     ) -> Result<RecordObservationsReply, String> {
-        let by_dataset = self.prepared(field, rows, envelope)?;
+        let keys = row_keys(&rows);
+        let mut pending = self.prepared(field, rows, envelope)?;
         let now = self.clock.now_ns();
+        let shard = shard_of(envelope);
         let mut said = Said::default();
-        for (dataset, rows) in by_dataset {
-            let done = self.write_one(&dataset, rows, want_id, now)?;
-            self.published(&dataset, &done, &mut said);
+        // A range a move is switching holds its rows -- its siblings'
+        // commit -- until the switch ends, at most `moves.holdSeconds`;
+        // they are then routed again, to the group it moved to (step 3d;
+        // section 6.8, the hold) -- and never past the caller's deadline:
+        // answered OVERLOADED with a retry-after while the caller still
+        // waits, as the book's held write is.
+        let until = std::time::Instant::now() + meridian_changes::moves::hold_now();
+        let mut again = false;
+        loop {
+            let mine = if self.groups.several() {
+                match self.routed(pending, want_id, envelope, &mut said, again)? {
+                    Some(mine) => mine,
+                    None => return Err("handed to the lake's writer group 0".into()),
+                }
+            } else {
+                pending
+            };
+            let mut held = BTreeMap::new();
+            for (dataset, rows) in mine {
+                let kept = self.groups.several().then(|| rows.clone());
+                match self.write_one(&dataset, rows, want_id, shard.as_ref(), now) {
+                    Ok(done) => self.published(&dataset, &done, &mut said),
+                    Err(
+                        failed @ (crate::store::StoreError::Held(_)
+                        | crate::store::StoreError::NotOwned { .. }),
+                    ) if std::time::Instant::now() < until => {
+                        tracing::debug!(dataset, %failed, "a write's rows held: routed again");
+                        held.insert(dataset, kept.unwrap_or_default());
+                    }
+                    Err(failed) => return Err(refusal_of(failed, field, &keys)),
+                }
+            }
+            if held.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            pending = held;
+            again = true;
+        }
+        // Every part written here or by its owner, and counted: a part the
+        // store said another group's on the way was routed there since, so
+        // the write is never handed on whole after it (section 6.7).
+        if again {
+            meridian_bus::owners::answered_here();
+        }
+        // A write with rows answered with none of them counted: never
+        // meant, and seen right after a range's move between databases (PR
+        // CI 43680214054). Said here with how it was routed, so the member
+        // that answered it names the path.
+        //
+        // And never answered a success (ruled 2026-11-15): a write whose
+        // counts do not account for every row it sent is refused OVERLOADED
+        // with a retry-after, and its plugin sends it again -- a row is
+        // recorded once by its key. Every row is counted here: one kept,
+        // one served and not kept, one a group it was handed to took. A
+        // write handed here is held to it by the member that handed it,
+        // which this group's part alone answers.
+        let counted = said.reply.recorded + said.reply.restated + said.reply.unchanged;
+        let handed = self.groups.several() && meridian_bus::owners::handed();
+        if (counted as usize) < keys.len() && (!handed || again) {
+            tracing::warn!(
+                rows = keys.len(),
+                counted,
+                group = self.groups.mine(),
+                handed,
+                routed_again = again,
+                datasets = ?said.datasets,
+                "a write is refused: its answer does not account for every row it sent"
+            );
+            return Err(crate::write_ahead::unaccounted(counted, keys.len() as u32));
+        }
+        if counted == 0 && !keys.is_empty() {
+            tracing::warn!(
+                rows = keys.len(),
+                group = self.groups.mine(),
+                handed,
+                routed_again = again,
+                datasets = ?said.datasets,
+                "a write's rows were answered with none of them counted"
+            );
         }
         self.answered(said, want_id, envelope, now)
+    }
+
+    /// A write's datasets with several writer groups (step 3d; the
+    /// resilience spec's section 6.7): this group's own answered here, and
+    /// each other group's handed to it -- the public write unchanged,
+    /// addressed to its writer group, which takes its own datasets of it --
+    /// and counted in `said` once it committed. A write handed here is this
+    /// group's part alone. A write answering a want is group 0's to answer,
+    /// since its reads and their wants are held there: handed to it whole
+    /// (`None`), and its parts handed on from there.
+    fn routed(
+        &self,
+        by_dataset: BTreeMap<String, Vec<Observation>>,
+        want_id: &str,
+        envelope: &Envelope,
+        said: &mut Said,
+        again: bool,
+    ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
+        self.routed_by(by_dataset, want_id, envelope, said, again, false)
+    }
+
+    /// [`Self::routed`]; `stale` once the ranges' owners were read again
+    /// for this write, handed here with none of its rows this group's.
+    fn routed_by(
+        &self,
+        by_dataset: BTreeMap<String, Vec<Observation>>,
+        want_id: &str,
+        envelope: &Envelope,
+        said: &mut Said,
+        again: bool,
+        stale: bool,
+    ) -> Result<Option<BTreeMap<String, Vec<Observation>>>, String> {
+        let handed = meridian_bus::owners::handed();
+        if !again && !handed && !want_id.is_empty() && !self.groups.holds_control() {
+            meridian_bus::owners::hand_to(0);
+            return Ok(None);
+        }
+        // Rows held by a switch and routed again are handed on wherever
+        // they now belong: their range moved since this member took them.
+        let coordinates = again || !handed || (!want_id.is_empty() && self.groups.holds_control());
+        let mut mine: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
+        let mut theirs: BTreeMap<u32, Vec<(String, Vec<Observation>)>> = BTreeMap::new();
+        for (dataset, rows) in by_dataset {
+            // Each row by its range's group (ruling 2 of 2026-11-14): a
+            // dataset split across groups is split by them.
+            let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+            let mut split: BTreeMap<u32, Vec<Observation>> = BTreeMap::new();
+            for (row, group) in rows.into_iter().zip(owners) {
+                split.entry(group).or_default().push(row);
+            }
+            for (group, rows) in split {
+                if group == self.groups.mine() {
+                    mine.entry(dataset.clone()).or_default().extend(rows);
+                } else {
+                    theirs
+                        .entry(group)
+                        .or_default()
+                        .push((dataset.clone(), rows));
+                }
+            }
+        }
+        if !coordinates {
+            // Handed here, and by this member's view none of it is this
+            // group's: the member that handed it read the ranges' owners
+            // after a move this one has not seen (PR CI 43680214054,
+            // tolerant: two prices answered recorded 0, restated 0,
+            // unchanged 0 in the half second after their range moved to
+            // group 1 in another database). Never answered as though it
+            // had no rows: the owners are read again and the write routed
+            // by them -- this group's taken here; another's, as the record
+            // names it now, handed on to it.
+            if handed && mine.is_empty() && !theirs.is_empty() {
+                if stale {
+                    let named: BTreeSet<u32> = theirs.keys().copied().collect();
+                    return match (named.len(), named.first()) {
+                        (1, Some(group)) => {
+                            meridian_bus::owners::hand_to_named(*group);
+                            Err(format!("handed to the lake's writer group {group}"))
+                        }
+                        _ => Err(meridian_bus::refusal_with_status(
+                            RefusalStatus::Unavailable,
+                            &[],
+                            "none of this write's rows are this writer group's: their ranges' \
+                             route has changed; ask again"
+                                .to_string(),
+                        )),
+                    };
+                }
+                if let Err(failed) = self.read_owners_again() {
+                    tracing::debug!(%failed, "the ranges' owners were not read again");
+                }
+                let again: BTreeMap<String, Vec<Observation>> = theirs
+                    .into_values()
+                    .flatten()
+                    .fold(BTreeMap::new(), |mut all, (dataset, rows)| {
+                        all.entry(dataset).or_default().extend(rows);
+                        all
+                    });
+                return self.routed_by(again, want_id, envelope, said, false, true);
+            }
+            return Ok(Some(mine));
+        }
+        let config = self.config();
+        // A part a group did not take whole -- its view of the ranges
+        // differs from this member's: a range moved between -- is routed
+        // again by the owners read again, within the hold, never refused
+        // inside it (CI 43636763392; section 6.8, the hold), which ends
+        // before the caller's deadline.
+        let until = std::time::Instant::now() + meridian_changes::moves::hold_now();
+        let mut queue: Vec<(u32, Parts)> = theirs.into_iter().collect();
+        while let Some((group, parts)) = queue.pop() {
+            let topic = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.topic.clone())
+                .unwrap_or_default();
+            let (_, answer) = self.bus.hand_to_owner(group, &topic, envelope.clone())?;
+            let reply = RecordObservationsReply::decode(answer.as_slice()).map_err(|failed| {
+                format!("writer group {group}'s answer did not read: {failed}")
+            })?;
+            // Every row handed was taken: a group whose view of the ranges
+            // differs from this member's may have left some (step 3d).
+            let handed_rows: usize = parts.iter().map(|(_, rows)| rows.len()).sum();
+            let taken = (reply.recorded + reply.restated + reply.unchanged) as usize;
+            if taken < handed_rows && std::time::Instant::now() < until {
+                if let Err(failed) = self.read_owners_again() {
+                    tracing::debug!(%failed, "the ranges' owners were not read again");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut again: BTreeMap<u32, Parts> = BTreeMap::new();
+                for (dataset, rows) in parts {
+                    let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+                    let mut split: BTreeMap<u32, Vec<Observation>> = BTreeMap::new();
+                    for (row, owner) in rows.into_iter().zip(owners) {
+                        split.entry(owner).or_default().push(row);
+                    }
+                    for (owner, rows) in split {
+                        if owner == self.groups.mine() {
+                            mine.entry(dataset.clone()).or_default().extend(rows);
+                        } else {
+                            again
+                                .entry(owner)
+                                .or_default()
+                                .push((dataset.clone(), rows));
+                        }
+                    }
+                }
+                queue.extend(again);
+                continue;
+            }
+            // Past the hold: OVERLOADED with a retry-after, as every
+            // write whose rows are not all accounted for (ruled
+            // 2026-11-15), so its plugin sends it again.
+            if taken < handed_rows {
+                return Err(meridian_bus::refusal_retrying(
+                    meridian_pb::v1::RefusalReason::Overloaded as i32,
+                    meridian_changes::moves::HELD_RETRY_SECONDS,
+                    format!(
+                        "writer group {group} took {taken} of the {handed_rows} rows handed to \
+                         it: their ranges' route has changed; ask again"
+                    ),
+                ));
+            }
+            let named: BTreeSet<&str> = reply
+                .watermark
+                .iter()
+                .flat_map(|watermark| watermark.partitions.iter())
+                .map(|at| at.partition.as_str())
+                .collect();
+            for (dataset, rows) in parts {
+                if !named.contains(dataset.as_str()) {
+                    return Err(meridian_bus::refusal_with_status(
+                        RefusalStatus::Unavailable,
+                        &[],
+                        format!(
+                            "writer group {group} did not take dataset {dataset}'s rows: its \
+                             route has changed; ask again"
+                        ),
+                    ));
+                }
+                said.subjects
+                    .extend(rows.iter().flat_map(|row| row.subjects()));
+                // What another group served of a dataset kept nowhere, to
+                // the reads here waiting on the want it answers (W10.7).
+                if !config.licence(&dataset).kept {
+                    self.hand_to_waiting(want_id, Heard::Served(rows));
+                }
+                said.datasets.insert(dataset);
+            }
+            said.reply.recorded += reply.recorded;
+            said.reply.restated += reply.restated;
+            said.reply.unchanged += reply.unchanged;
+        }
+        Ok(Some(mine))
     }
 
     /// A batch's bound and every row checked, as [`Lake::checked`] checks
@@ -1944,16 +2596,12 @@ impl Lake {
         dataset: &str,
         rows: Vec<Observation>,
         want_id: &str,
+        shard: Option<&crate::store::ShardStamp>,
         now: i64,
-    ) -> Result<crate::store::Recorded, String> {
+    ) -> Result<crate::store::Recorded, crate::store::StoreError> {
         let config = self.config();
         if config.licence(dataset).kept {
-            let done = self
-                .store
-                .record(dataset, rows, now)
-                .map_err(|failed| failed.to_string())?;
-            self.publish_changes(dataset, &done, None, now);
-            return Ok(done);
+            return self.recorded_together(dataset, rows, shard, now);
         }
         let readers: Vec<String> = self
             .wants
@@ -1965,13 +2613,54 @@ impl Lake {
             .unwrap_or_else(|| config.entitled(dataset));
         let served = self
             .store
-            .serve_unkept(dataset, rows, &readers, now)
-            .map_err(|failed| failed.to_string())?;
+            .serve_unkept(dataset, rows, &readers, shard, now)?;
         // The reads waiting on the want hear what was served (W10.7; ruling
         // 734): the lake keeps none of it.
         self.publish_changes(dataset, &served, Some(&readers), now);
         self.hand_to_waiting(want_id, Heard::Served(served.rows.clone()));
         Ok(served)
+    }
+
+    /// One dataset's rows of a batch kept through its lane (step 3d, group
+    /// commit; the resilience spec's section 6.5): at once where no
+    /// transaction of the dataset is in flight, else with the batches that
+    /// arrived meanwhile, in one transaction of at most 512 KiB. Its change
+    /// log's page is published by the batch, every part's in order, before
+    /// any part is answered.
+    fn recorded_together(
+        &self,
+        dataset: &str,
+        rows: Vec<Observation>,
+        shard: Option<&crate::store::ShardStamp>,
+        now: i64,
+    ) -> Result<crate::store::Recorded, crate::store::StoreError> {
+        let bytes: usize = rows.iter().map(Observation::encoded_len).sum();
+        self.lanes.lane(dataset).commit(
+            (rows, now, shard.cloned()),
+            bytes,
+            |batch| {
+                // Recorded at the latest time of the batch's parts.
+                let now = batch.iter().map(|(_, at, _)| *at).max().unwrap_or(now);
+                let (parts, shards): (Vec<_>, Vec<_>) = batch
+                    .into_iter()
+                    .map(|(rows, _, shard)| (rows, shard))
+                    .unzip();
+                self.store
+                    .record_parts(dataset, parts, &shards, now)
+                    .into_iter()
+                    .map(|done| {
+                        let done = done?;
+                        self.publish_changes(dataset, &done, None, now);
+                        Ok(done)
+                    })
+                    .collect()
+            },
+            || {
+                Err(crate::store::StoreError::Unavailable(format!(
+                    "the batch of {dataset} this write waited in stopped before it committed"
+                )))
+            },
+        )
     }
 
     /// One dataset's part of a batch, once it committed: each row recorded
@@ -2050,6 +2739,12 @@ impl Lake {
         Ok(reply)
     }
 
+    /// Now, on the lake's clock: what its write-ahead writer counts a
+    /// write's caller's wait against (step 3d; spec 6.8).
+    pub fn now_ns(&self) -> i64 {
+        self.clock.now_ns()
+    }
+
     /// The lake's position in its write-ahead stream `stream` (the `ha`
     /// profile): where its writer goes on from.
     pub fn write_ahead_position(
@@ -2057,6 +2752,100 @@ impl Lake {
         stream: &str,
     ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
         self.store.write_ahead_position(stream)
+    }
+
+    /// The places a lake before item 191 kept of its write-ahead stream by
+    /// its name alone, `from`, carried to its key with its identity, `to`,
+    /// where they were taken in this stream ([`Store::write_ahead_carried`];
+    /// the review of item 191's finding 1).
+    pub fn write_ahead_carried(
+        &self,
+        from: &str,
+        to: &str,
+        made_ns: i64,
+    ) -> Result<bool, crate::store::StoreError> {
+        self.store.write_ahead_carried(from, to, made_ns)
+    }
+
+    /// The ranges' writer groups read again into this member's view (step
+    /// 3d; spec 6.1): a write-ahead writer whose position a move took back.
+    pub fn read_owners_again(&self) -> Result<(), crate::store::StoreError> {
+        self.store.read_owners_again()
+    }
+
+    /// Writer group `group`'s position in the write-ahead stream kept as
+    /// `key` (step 3d): what an answer spanning groups waits on.
+    pub fn group_position(
+        &self,
+        key: &str,
+        group: u32,
+    ) -> Result<Option<crate::store::WriteAheadPosition>, crate::store::StoreError> {
+        self.store.group_position(key, group)
+    }
+
+    /// Whether a range of `dataset` is between two databases, let go by a
+    /// move's switch and not yet opened (step 3d; sections 6.4 and 6.8).
+    pub fn range_between(&self, dataset: &str) -> Result<bool, crate::store::StoreError> {
+        self.store.range_between(dataset)
+    }
+
+    /// What writer group `group`'s rows of the stream's write `sequence`
+    /// did, as it kept them under `key` (step 3d; spec 6.7).
+    pub fn write_ahead_part(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<crate::store::Counts>, crate::store::StoreError> {
+        self.store.write_ahead_part(key, group, sequence)
+    }
+
+    /// The refusal writer group `group` kept with its part of the stream's
+    /// write `sequence` (step 3d; spec 6.7; ruled 2026-11-15).
+    pub fn write_ahead_refused(
+        &self,
+        key: &str,
+        group: u32,
+        sequence: u64,
+    ) -> Result<Option<String>, crate::store::StoreError> {
+        self.store.write_ahead_refused(key, group, sequence)
+    }
+
+    /// An answer made again once every group's part of its write has
+    /// committed (step 3d; spec 6.7): counting each part -- this group's
+    /// `own` as it kept it, in place of what the take that made the answer
+    /// did alone, and the `others`' -- and its watermark read again, each
+    /// partition of its datasets at its head now, the other groups' among
+    /// them; `dataset` named where only another group committed rows of it.
+    pub fn answer_again(
+        &self,
+        payload: &[u8],
+        own: Option<crate::store::Counts>,
+        others: crate::store::Counts,
+        dataset: &str,
+    ) -> Result<Vec<u8>, String> {
+        let mut reply = RecordObservationsReply::decode(payload)
+            .map_err(|failed| format!("an answer did not read: {failed}"))?;
+        if let Some(own) = own {
+            reply.recorded = own.recorded;
+            reply.restated = own.restated;
+            reply.unchanged = own.unchanged;
+        }
+        reply.recorded += others.recorded;
+        reply.restated += others.restated;
+        reply.unchanged += others.unchanged;
+        let mut datasets: BTreeSet<String> = reply
+            .watermark
+            .iter()
+            .flat_map(|watermark| watermark.partitions.iter())
+            .map(|at| crate::range::dataset_of(&at.partition).to_string())
+            .collect();
+        if !dataset.is_empty() && reply.recorded + reply.restated + reply.unchanged > 0 {
+            datasets.insert(dataset.to_string());
+        }
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        reply.watermark = Some(watermark(&heads, &datasets));
+        Ok(reply.encode_to_vec())
     }
 
     /// What the lake found its write-ahead stream `stream` dropped, and each
@@ -2095,9 +2884,16 @@ impl Lake {
     ) -> Result<crate::write_ahead::Recorded, crate::store::StoreError> {
         struct Kept {
             want_id: String,
+            shard: Option<crate::store::ShardStamp>,
             envelope: Envelope,
             kept: Vec<(String, usize)>,
             unkept: Vec<(String, Vec<Observation>)>,
+            field: &'static str,
+            keys: Vec<(i16, String)>,
+            /// What it sent, and whether its answer waits on other groups'
+            /// parts and is held to it there.
+            sent: crate::write_ahead::Sent,
+            spans: bool,
         }
         let now = self.clock.now_ns();
         let config = self.config();
@@ -2113,11 +2909,23 @@ impl Lake {
         let mut valid: BTreeMap<String, i64> = BTreeMap::new();
         let mut written: Vec<Result<Kept, String>> = Vec::with_capacity(writes.len());
         for write in writes {
+            // Its plugin shard's stamp (step 3d, checkpoint 5, item 32),
+            // checked with each of its parts in the batch's transaction, by
+            // its place in the stream too: one the stream held before the
+            // take reached this group is admitted (review c5a H2).
+            let shard =
+                shard_of(&write.envelope).map(|stamp| self.in_stream(stamp, write.sequence));
             let prepared =
                 rows_of(&write.topic, &write.envelope).and_then(|(field, rows, want)| {
-                    Ok((self.prepared(field, rows, &write.envelope)?, want))
+                    let keys = row_keys(&rows);
+                    Ok((
+                        self.prepared(field, rows, &write.envelope)?,
+                        want,
+                        field,
+                        keys,
+                    ))
                 });
-            let (by_dataset, want_id) = match prepared {
+            let (by_dataset, want_id, field, keys) = match prepared {
                 Ok(prepared) => prepared,
                 Err(refused) => {
                     if write.after_gap.is_some() {
@@ -2133,11 +2941,20 @@ impl Lake {
             };
             let mut kept = Kept {
                 want_id,
+                shard: shard.clone(),
                 envelope: write.envelope,
                 kept: Vec::new(),
                 unkept: Vec::new(),
+                field,
+                keys,
+                sent: crate::write_ahead::Sent::default(),
+                spans: write.counted.is_some(),
             };
             for (dataset, rows) in by_dataset {
+                // Every row of a dataset the lake keeps, whichever group's.
+                if config.licence(&dataset).kept {
+                    kept.sent.kept += rows.len() as u32;
+                }
                 if let Some(dropped) = write.after_gap.as_ref() {
                     batch.gaps.push(
                         self.gap_found(
@@ -2153,15 +2970,51 @@ impl Lake {
                         ),
                     );
                 }
+                // A dataset whose ranges span groups (step 3d; spec 6.1,
+                // ruling 2 of 2026-11-14): every group's consumer sees the
+                // whole write and commits its own ranges' rows alone; the
+                // rest are their owners' consumers' to commit.
+                let rows = if self.groups.several() {
+                    let owners = owners_of_rows(self.groups, self.store.as_ref(), &dataset, &rows);
+                    let mine: Vec<Observation> = rows
+                        .into_iter()
+                        .zip(owners)
+                        .filter(|(_, group)| *group == self.groups.mine())
+                        .map(|(row, _)| row)
+                        .collect();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    mine
+                } else {
+                    rows
+                };
                 if config.licence(&dataset).kept {
                     let latest = rows.iter().map(|row| row.meta().valid_from_ns).max();
                     if let Some(latest) = latest {
                         let at = valid.entry(dataset.clone()).or_insert(latest);
                         *at = (*at).max(latest);
                     }
+                    if let Some(sequence) = write.counted {
+                        match batch.counted.last_mut() {
+                            Some(counted) if counted.sequence == sequence => {
+                                counted.parts.push(batch.parts.len())
+                            }
+                            _ => batch.counted.push(crate::store::Counted {
+                                sequence,
+                                parts: vec![batch.parts.len()],
+                                field: field.to_string(),
+                                keys: kept.keys.clone(),
+                                ..Default::default()
+                            }),
+                        }
+                    }
                     kept.kept.push((dataset.clone(), batch.parts.len()));
+                    batch.shards.resize(batch.parts.len(), None);
+                    batch.shards.push(shard.clone());
                     batch.parts.push((dataset, rows));
                 } else {
+                    kept.sent.served += rows.len() as u32;
                     kept.unkept.push((dataset, rows));
                 }
             }
@@ -2170,11 +3023,15 @@ impl Lake {
         batch.valid = valid.into_iter().collect();
         let gaps = batch.gaps.clone();
         let valid = batch.valid.clone();
-        let mut done: Vec<Option<crate::store::Recorded>> = self
+        let mut done: Vec<Option<Result<crate::store::Recorded, crate::store::StoreError>>> = self
             .store
             .record_write_ahead(batch, now)?
             .into_iter()
             .map(Some)
+            .collect();
+        let sent: Vec<crate::write_ahead::Sent> = written
+            .iter()
+            .map(|write| write.as_ref().map(|write| write.sent).unwrap_or_default())
             .collect();
         let answers = written
             .into_iter()
@@ -2183,13 +3040,41 @@ impl Lake {
                 let mut said = Said::default();
                 // In the datasets' order, as a batch asked of the lake is
                 // written: what it keeps, then what it serves.
+                // A part the store refused alone (the lake's rule 5) is the
+                // write's answer; its other parts committed with the batch.
+                let mut refused = None;
                 for (dataset, part) in &write.kept {
-                    let recorded = done[*part].take().unwrap_or_default();
-                    self.publish_changes(dataset, &recorded, None, now);
-                    self.published(dataset, &recorded, &mut said);
+                    match done[*part].take().unwrap_or_else(|| Ok(Default::default())) {
+                        Ok(recorded) => {
+                            self.publish_changes(dataset, &recorded, None, now);
+                            self.published(dataset, &recorded, &mut said);
+                        }
+                        Err(failed) => {
+                            refused.get_or_insert(refusal_of(failed, write.field, &write.keys));
+                        }
+                    }
+                }
+                if let Some(refused) = refused {
+                    return Err(refused);
+                }
+                // Every row of a kept dataset accounted for (ruled
+                // 2026-11-15); a write whose ranges span groups is held to
+                // it once every group's part is in, where it is answered.
+                let counted = said.reply.recorded + said.reply.restated + said.reply.unchanged;
+                if !write.spans && counted < write.sent.kept {
+                    tracing::warn!(
+                        counted,
+                        sent = write.sent.kept,
+                        group = self.groups.mine(),
+                        datasets = ?said.datasets,
+                        "a write of the stream is refused: its answer does not account for every row it sent"
+                    );
+                    return Err(crate::write_ahead::unaccounted(counted, write.sent.kept));
                 }
                 for (dataset, rows) in write.unkept {
-                    let served = self.write_one(&dataset, rows, &write.want_id, now)?;
+                    let served = self
+                        .write_one(&dataset, rows, &write.want_id, write.shard.as_ref(), now)
+                        .map_err(|failed| refusal_of(failed, write.field, &write.keys))?;
                     self.published(&dataset, &served, &mut said);
                 }
                 let reply = self.answered(said, &write.want_id, &write.envelope, now)?;
@@ -2204,7 +3089,11 @@ impl Lake {
         for gap in gaps {
             self.gap_recorded(gap);
         }
-        Ok(crate::write_ahead::Recorded { answers, valid })
+        Ok(crate::write_ahead::Recorded {
+            answers,
+            valid,
+            sent,
+        })
     }
 
     /// A new gap's ID, at the lake's time.
@@ -2612,7 +3501,7 @@ impl Lake {
         let done = self
             .store
             .record(lake::EXECUTION_COST_DATASET, rows, self.clock.now_ns())
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         Ok(RecordObservationsReply {
             recorded: done.recorded,
@@ -2884,6 +3773,7 @@ impl Lake {
                         || crate::store::ClosedDayAmendment {
                             dataset: dataset.to_string(),
                             sequence: row.meta().sequence,
+                            row_key: row.meta().row_key.clone(),
                             closed_day: now_flag,
                             why: format!(
                                 "calendar {} version {} applied",
@@ -3042,30 +3932,34 @@ impl Lake {
         }
         let epoch = self.store.epoch();
         let origin = meridian_changes::origin();
-        // The partition's head before this batch: what its page follows.
-        let after = done
-            .rows
-            .first()
-            .map_or(done.head, |row| row.meta().sequence)
-            .saturating_sub(1);
-        let changes: Vec<meridian_changes::Change> = match served_to {
-            None => done
-                .rows
+        // A page a range (step 3d; section 6.1): each follows its own
+        // partition's head before the batch.
+        let mut at = 0;
+        while at < done.rows.len() {
+            let partition = done.partition_of(dataset, at);
+            let run = done.rows[at..]
                 .iter()
-                .map(|row| crate::store::row_change(dataset, row, epoch, origin))
-                .collect(),
-            Some(readers) => {
-                let first = done
-                    .rows
-                    .first()
-                    .map_or(done.head, |row| row.meta().sequence);
-                let served = crate::memory::served_of(
-                    dataset, &done.rows, first, done.head, readers, now_ns,
-                );
-                vec![crate::store::served_change(&served, epoch, origin)]
-            }
-        };
-        meridian_changes::publish(&self.bus, "lake", after, &changes);
+                .enumerate()
+                .take_while(|(i, _)| done.partition_of(dataset, at + i) == partition)
+                .count();
+            let rows = &done.rows[at..at + run];
+            at += run;
+            let first = rows[0].meta().sequence;
+            let after = first.saturating_sub(1);
+            let changes: Vec<meridian_changes::Change> = match served_to {
+                None => rows
+                    .iter()
+                    .map(|row| crate::store::row_change(partition, row, epoch, origin))
+                    .collect(),
+                Some(readers) => {
+                    let last = rows.last().map_or(first, |row| row.meta().sequence);
+                    let served =
+                        crate::memory::served_of(partition, rows, first, last, readers, now_ns);
+                    vec![crate::store::served_change(&served, epoch, origin)]
+                }
+            };
+            meridian_changes::publish(&self.bus, "lake", after, &changes);
+        }
     }
 
     /// A want's subjects answered or declined, recorded; a want every
@@ -3416,7 +4310,11 @@ impl Lake {
         let config = self.config();
         for dataset in config.datasets.keys() {
             let licence = config.licence(dataset);
-            if licence.retention_days == 0 {
+            // Each writer group its own ranges', in its own database, as
+            // the store's rows name them (step 3d): a dataset's ranges may
+            // sit in several groups and databases.
+            if licence.retention_days == 0 || !(self.groups.several() || self.groups.owns(dataset))
+            {
                 continue;
             }
             let before = now - i64::from(licence.retention_days) * 86_400 * 1_000_000_000;
@@ -3820,7 +4718,9 @@ impl Lake {
         if let When::After(watermark) = &read.when {
             let readable = config.readable(&reader, read.data_type);
             let heads = self.store.heads().map_err(|failed| failed.to_string())?;
-            for (dataset, sequence) in watermark {
+            for (partition, sequence) in watermark {
+                // A range's dataset's (step 3d).
+                let dataset = &crate::range::dataset_of(partition).to_string();
                 let reason = if !readable.contains(dataset) {
                     Some(
                         if config.datasets.contains_key(dataset)
@@ -3834,10 +4734,10 @@ impl Lake {
                 } else if !config.licence(dataset).kept {
                     Some(UnansweredReason::NotKept)
                 } else {
-                    let head = heads.get(dataset).copied().unwrap_or(0);
+                    let head = heads.get(partition).copied().unwrap_or(0);
                     let lowest = self
                         .store
-                        .lowest_kept(dataset)
+                        .lowest_kept(partition)
                         .map_err(|failed| failed.to_string())?;
                     let removed = match lowest {
                         Some(lowest) => lowest > sequence + 1,
@@ -3919,8 +4819,28 @@ impl Lake {
         reader: &Reader,
     ) -> Result<crate::pages::Placed, String> {
         // At most so many built at once (rulings 957, 958); never while
-        // waiting for a source below, which builds nothing.
-        let building = self.building.enter();
+        // waiting for a source below, which builds nothing. A request's
+        // read waits for its place in its caller's turn and no longer than
+        // the request's own wait, then is refused for load with a
+        // retry-after (the resilience spec's section 10a): it holds one of
+        // the member's turns while it waits, and with every turn taken by
+        // reads waiting here a caller heard nothing until its own deadline.
+        let building = match meridian_budget::waiting() {
+            Some(waiting) => self
+                .building
+                .enter_by(&waiting.caller, waiting.until)
+                .map_err(|over| {
+                    tracing::info!(
+                        caller = waiting.caller,
+                        retry_after_seconds = over.retry_after_seconds,
+                        "{}",
+                        over.words
+                    );
+                    meridian_budget::count_refusal();
+                    meridian_bus::overloaded(&over)
+                })?,
+            None => self.building.enter(),
+        };
         self.built
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answered = read::choose(self.store.as_ref(), read, against)?;
@@ -5025,6 +5945,362 @@ impl Lake {
         })
     }
 
+    /// `SplitPartition` (step 3d; section 6.1): a deployment admin's, its
+    /// reason kept with its record. The range's writer halves it in one
+    /// transaction; a range of another group's is handed to that group's
+    /// writer by the store's refusal. Refused INVALID_ARGUMENT naming
+    /// `partition` for the control partition, a book partition, a range
+    /// not open and one hash value; REASON_REQUIRED naming `reason` with
+    /// none. The page, the tool and the CLI that ask it are stage M's.
+    /// A sidecar took a shard's Lease (step 3d, checkpoint 5, item 32): the
+    /// shard's epoch numbered by the control writer, then raised in every
+    /// lake and book writer group, each asked on its own and asked again
+    /// until it confirms, and only then `ShardTookOver` recorded in the
+    /// control partition and the epoch answered. Past [`CONFIRM_WITHIN`],
+    /// refused UNAVAILABLE, nothing recorded, and the sidecar does not
+    /// serve. A take whose Lease's transitions are below the highest a take
+    /// of the shard was numbered with is refused FAILED_PRECONDITION,
+    /// SHARD_FENCED (review c5a M2).
+    ///
+    /// [`CONFIRM_WITHIN`]: meridian_changes::shard_fence::CONFIRM_WITHIN
+    pub(crate) fn take_shard(
+        &self,
+        request: meridian_domain::v1::TakeShardRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ShardTookOver, String> {
+        // Answered inside the sidecar's wait, counted from when it sent the
+        // take, the way back allowed for, or not recorded at all (reviews
+        // c5a2 L1, c5a3 L1).
+        let sent_at = envelope
+            .meta
+            .as_ref()
+            .map_or(0, |meta| meta.published_at_ns);
+        let until = take_deadline(std::time::Instant::now(), self.clock.now_ns(), sent_at);
+        self.take_shard_until(request, envelope, until)
+    }
+
+    /// [`Lake::take_shard`], recorded only before `until`: a take answered
+    /// after its sidecar gave up records no holder that never served. The
+    /// take as recorded, which its caller answers with its epoch and then
+    /// delivers the instance's standing wants again
+    /// ([`Lake::deliver_standing_again`]).
+    pub(crate) fn take_shard_until(
+        &self,
+        request: meridian_domain::v1::TakeShardRequest,
+        envelope: &Envelope,
+        until: std::time::Instant,
+    ) -> Result<meridian_domain::v1::ShardTookOver, String> {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        if request.instance.is_empty() || request.instance != meta.publisher_instance_id {
+            return Err(refusal_with_status(
+                RefusalStatus::PermissionDenied,
+                &["instance".to_string()],
+                "instance: a sidecar takes its own instance's shards alone",
+            ));
+        }
+        if request.holder.is_empty() {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["holder".to_string()],
+                "holder: the Lease's holder the sidecar wrote",
+            ));
+        }
+        if request.lease_uid.is_empty() {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["lease_uid".to_string()],
+                "lease_uid: the uid of the Lease the sidecar took",
+            ));
+        }
+        if std::time::Instant::now() >= until {
+            return Err(late_take());
+        }
+        // The stream's place before the numbering, kept with the epoch in
+        // database 0's row: group 0's raise finds the epoch there already
+        // (review c5a3 M1).
+        let taking = meridian_changes::shard_fence::Taking {
+            lease_transitions: request.lease_transitions,
+            lease_uid: request.lease_uid.clone(),
+            admit: self.stream_place()?,
+        };
+        let took = meridian_domain::v1::ShardTookOver {
+            instance: request.instance,
+            shard: request.shard,
+            epoch: 0,
+            holder: request.holder,
+            previous_holder: request.previous_holder,
+            reason: request.reason,
+            took_over_at_ns: self.clock.now_ns(),
+        };
+        // Numbered first, raised in every group, and only then recorded and
+        // answered (review c5a M4): a take not confirmed writes no record;
+        // the fences it raised are harmless, as the next take numbers past
+        // them.
+        let took = self
+            .store
+            .take_shard(took, &taking)
+            .map_err(|failed| refusal_of(failed, "lease_transitions", &[]))?;
+        self.confirm_shard(&took)?;
+        if std::time::Instant::now() >= until {
+            return Err(late_take());
+        }
+        self.store
+            .record_shard_take(&took)
+            .map_err(crate::store::StoreError::on_the_bus)?;
+        if std::time::Instant::now() >= until {
+            // Its record's commit ran past the sidecar's wait: the sidecar
+            // has given up, and is answered nothing it could act on.
+            tracing::warn!(
+                instance = took.instance,
+                shard = took.shard,
+                epoch = took.epoch,
+                "a shard's take was recorded after its sidecar stopped waiting: its holder never serves at that epoch"
+            );
+            return Err(late_take());
+        }
+        tracing::info!(
+            instance = took.instance,
+            shard = took.shard,
+            epoch = took.epoch,
+            holder = took.holder,
+            previous = took.previous_holder,
+            "a shard was taken: its epoch raised in every writer group"
+        );
+        Ok(took)
+    }
+
+    /// A shard of `instance` taken (ruling 184, option B; item 33): each of
+    /// the instance's standing wants still asked for delivered again at
+    /// once, as the sweep delivers it again -- the same want under the same
+    /// ID, no change to it and so no record of it -- so the taker hands its
+    /// plugin its share within the lapse, not at the next redelivery. The
+    /// taker's sidecar listens from before it asks to take.
+    ///
+    /// Run after the take is answered, on its own thread (review c5z F3):
+    /// however many wants there are, the take's answer never waits on them.
+    /// The sweep's redelivery stays, counted from `answered_at_ns`, when the
+    /// take was answered: the taker's hold counts from its answer too.
+    ///
+    /// Each is delivered while the wants are held (review c5z F2): a sweep
+    /// that withdraws one publishes its withdrawal after this delivery, never
+    /// before it; and one the sweep withdrew first is no longer open here.
+    pub(crate) fn deliver_standing_again(&self, instance: &str, answered_at_ns: i64) {
+        let now = self.clock.now_ns();
+        let mut wants = self.wants.lock().expect("wants poisoned");
+        for open in wants.open.values_mut() {
+            if !open.event.standing
+                || now - open.asked_at_ns > lapses_after(open)
+                || meridian_domain::lake::instance_of(&open.event.dataset) != Some(instance)
+            {
+                continue;
+            }
+            open.published_at_ns = open.published_at_ns.max(answered_at_ns);
+            #[cfg(test)]
+            if let Some(resending) = self.resending.lock().unwrap().as_ref() {
+                resending();
+            }
+            tracing::debug!(
+                want_id = open.event.want_id,
+                dataset = open.event.dataset,
+                "a standing want delivered again at a take of its instance's shard"
+            );
+            if let Err(failed) = self.bus.publish(
+                OBSERVATIONS_WANTED,
+                "meridian.v1.ObservationsWantedEvent",
+                open.event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(%failed, "a standing want was not delivered again at a take");
+            }
+        }
+    }
+
+    /// Every lake and book writer group asked to raise `took`'s shard to its
+    /// epoch, each on its own topic, those not yet confirmed asked again,
+    /// within [`meridian_changes::shard_fence::CONFIRM_WITHIN`].
+    fn confirm_shard(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<(), String> {
+        use meridian_changes::shard_fence::{raise_topic, ASK_EACH, CONFIRM_WITHIN};
+        let unconfirmed = |groups: &[String], why: &str| {
+            refusal_with_status(
+                RefusalStatus::Unavailable,
+                &[],
+                format!(
+                    "the shard's epoch {} was not confirmed by {} within {} ms ({why}): the \
+                     sidecar does not serve; its next take asks again",
+                    took.epoch,
+                    groups.join(", "),
+                    CONFIRM_WITHIN.as_millis()
+                ),
+            )
+        };
+        let mut asking: Vec<String> = (0..self.groups.count())
+            .map(|group| raise_topic("lake", group))
+            .chain(
+                (0..self.book_groups.load(std::sync::atomic::Ordering::SeqCst))
+                    .map(|group| raise_topic("book", group)),
+            )
+            .collect();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| unconfirmed(&asking, "this member has no runtime to ask with"))?;
+        let body = took.encode_to_vec();
+        let until = std::time::Instant::now() + CONFIRM_WITHIN;
+        let mut last = String::new();
+        loop {
+            let asked = handle.block_on(async {
+                let mut asks = tokio::task::JoinSet::new();
+                for (at, topic) in asking.iter().enumerate() {
+                    let (bus, topic, body) = (Arc::clone(&self.bus), topic.clone(), body.clone());
+                    asks.spawn(async move {
+                        let answer = bus
+                            .call(
+                                &topic,
+                                "meridian.v1.ShardTookOver",
+                                body,
+                                None,
+                                Some(ASK_EACH),
+                            )
+                            .await
+                            .map_err(|failed| failed.to_string())
+                            .and_then(|(_, reply)| {
+                                meridian_domain::v1::TakeShardReply::decode(reply.as_slice())
+                                    .map_err(|failed| failed.to_string())
+                            });
+                        (at, answer)
+                    });
+                }
+                let mut answers = Vec::new();
+                while let Some(joined) = asks.join_next().await {
+                    if let Ok(answer) = joined {
+                        answers.push(answer);
+                    }
+                }
+                answers
+            });
+            let mut confirmed = BTreeSet::new();
+            for (at, answer) in asked {
+                match answer {
+                    Ok(raised) if raised.epoch >= took.epoch => {
+                        confirmed.insert(at);
+                    }
+                    Ok(raised) => last = format!("one held {} after its raise", raised.epoch),
+                    Err(failed) => last = failed,
+                }
+            }
+            asking = asking
+                .into_iter()
+                .enumerate()
+                .filter(|(at, _)| !confirmed.contains(at))
+                .map(|(_, topic)| topic)
+                .collect();
+            if asking.is_empty() {
+                return Ok(());
+            }
+            // No round started that could not end inside the window: the
+            // sidecar's wait covers it whole (review c5a M3).
+            if std::time::Instant::now() + ASK_EACH > until {
+                tracing::warn!(
+                    instance = took.instance,
+                    shard = took.shard,
+                    epoch = took.epoch,
+                    unconfirmed = ?asking,
+                    last,
+                    "a shard's take was not confirmed by every writer group in time"
+                );
+                return Err(unconfirmed(&asking, &last));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The write-ahead stream's place as this member reads it now, within
+    /// half a raise's ask; none where it writes no stream.
+    fn stream_place(&self) -> Result<Option<meridian_changes::shard_fence::Admit>, String> {
+        let Some(client) = self.write_ahead.get() else {
+            return Ok(None);
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "this member has no runtime to read the stream's place with")?;
+        let client = client.clone();
+        handle
+            .block_on(async move {
+                tokio::time::timeout(
+                    meridian_changes::shard_fence::ASK_EACH / 2,
+                    crate::write_ahead::place(&client),
+                )
+                .await
+                .map_err(|_| "the write-ahead stream's place was not read in time".to_string())?
+            })
+            .map(Some)
+    }
+
+    /// This writer group's part of a take (step 3d, checkpoint 5, item 32):
+    /// the shard's epoch raised in every database it writes, and the epoch
+    /// held after answered.
+    pub(crate) fn raise_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+    ) -> Result<meridian_domain::v1::TakeShardReply, String> {
+        // The stream's place as this raise finds it: a write the stream
+        // held through it was sent before the take reached this group
+        // (review c5a H2). Not read, the raise is not confirmed, and the
+        // control writer asks again.
+        let admit = self.stream_place()?;
+        let epoch = self
+            .store
+            .raise_shard(&took.instance, took.shard, took.epoch, admit)
+            .map_err(crate::store::StoreError::on_the_bus)?;
+        Ok(meridian_domain::v1::TakeShardReply { epoch })
+    }
+
+    pub(crate) fn split_partition(
+        &self,
+        request: meridian_domain::v1::SplitPartitionRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::SplitPartitionReply, String> {
+        let meta = envelope.meta.clone().unwrap_or_default();
+        if meta.acting_for_subject.is_empty() {
+            return Err(
+                "a split is a deployment admin's to make, and this is sent for nobody".into(),
+            );
+        }
+        let reason = request.reason.trim();
+        if reason.is_empty() {
+            return Err(meridian_bus::refusal_naming(
+                meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                &["reason".to_string()],
+                "reason: a split says why",
+            ));
+        }
+        if request.reason.chars().count() > 2_000 {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["reason".to_string()],
+                "reason: at most 2,000 characters",
+            ));
+        }
+        let split = self
+            .store
+            .split_partition(
+                &request.partition,
+                &meta.acting_for_subject,
+                &request.reason,
+                self.clock.now_ns(),
+            )
+            .map_err(|failed| match failed {
+                crate::store::StoreError::Invalid { field, words } => {
+                    refusal_with_status(RefusalStatus::InvalidArgument, &[field.to_string()], words)
+                }
+                other => other.on_the_bus(),
+            })?;
+        tracing::info!(
+            parent = split.parent,
+            closing_sequence = split.closing_sequence,
+            "a range was split: its children number on from its close"
+        );
+        Ok(meridian_domain::v1::SplitPartitionReply { split: Some(split) })
+    }
+
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
         // Each dataset's liveness, which only the writer's commands set and
         // only it holds: the writer's to answer (contract v30, stage B).
@@ -5345,7 +6621,7 @@ impl Lake {
         }
         self.store
             .assess(&journal)
-            .map_err(|failed| failed.to_string())?;
+            .map_err(crate::store::StoreError::on_the_bus)?;
         self.publish_control();
         Ok(RecordQualityAssessmentsReply {
             recorded: request.assessments.len() as u32,
@@ -5435,7 +6711,7 @@ impl Lake {
         match self
             .store
             .set_priority(&priority, request.against_updated_at_ns)
-            .map_err(|failed| failed.to_string())?
+            .map_err(crate::store::StoreError::on_the_bus)?
         {
             Ok(set) => {
                 self.publish_control();
@@ -5658,8 +6934,8 @@ impl Lake {
         *self.config.write().expect("config poisoned") = DataConfig::from_event(event);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // A reader holds it; the writer keeps it.
-        if self.reads_only {
+        // A reader holds it; the writer keeps it, group 0's (step 3d).
+        if !self.keeps() {
             return;
         }
         if let Err(failed) = self.store.keep_configuration(event) {
@@ -6617,9 +7893,30 @@ impl Lake {
 /// Register every handler, and subscribe to every event the lake hears,
 /// before returning; the loops consuming them are spawned.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc<Lake> {
+    serve_grouped(bus, store, clock, meridian_changes::groups::Groups::one())
+}
+
+/// [`serve`], for writer group `groups` of the lake's (step 3d; section 6.7):
+/// with several groups, each write's datasets of another group handed to
+/// it. A group past the first serves its writes and the change log alone
+/// (the member's bus serves only those); group 0 does the lake's own work.
+pub fn serve_grouped(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    groups: meridian_changes::groups::Groups,
+) -> Arc<Lake> {
     // Lake::new reads the configuration last heard from the store, which
     // blocks: off the runtime's own threads.
-    let lake = tokio::task::block_in_place(|| Lake::new(Arc::clone(&bus), store, clock));
+    let lake = tokio::task::block_in_place(|| {
+        let lake = Lake::grouped(Arc::clone(&bus), store, clock, groups);
+        // Each dataset's group as it starts, where it changed: the count
+        // raised, or lowered back to one.
+        if lake.keeps() {
+            lake.assign();
+        }
+        lake
+    });
     // The change log, asked a page at a time by the lake's own members and
     // the analytics component (step 3a; topics.md, "Component topics").
     meridian_changes::serve(&bus, "lake", Arc::new(LakeLog(Arc::clone(&lake.store))));
@@ -6629,7 +7926,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     bus.reads_after().keep(
         "lake",
         Arc::new(meridian_bus::read_after::AllHeads(move || {
-            heads.heads().map_err(|failed| failed.to_string())
+            heads
+                .heads()
+                .map(met_by_children)
+                .map_err(|failed| failed.to_string())
         })),
     );
     serve_on(
@@ -7287,6 +8587,62 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     serve_on(
         &bus,
         &lake,
+        SPLIT_PARTITION,
+        (
+            "meridian.v1.SplitPartitionRequest",
+            "meridian.v1.SplitPartitionReply",
+        ),
+        |lake, request: meridian_domain::v1::SplitPartitionRequest, envelope| {
+            lake.split_partition(request, envelope)
+        },
+    );
+    // A sidecar's take of a shard (step 3d, checkpoint 5, item 32): the
+    // control writer's, which raises the shard's epoch in every group. The
+    // take answered first, and its instance's standing wants delivered
+    // again after, on their own thread (ruling 184; review c5z F3).
+    {
+        let resending = Arc::clone(&lake);
+        serve_on(
+            &bus,
+            &lake,
+            TAKE_SHARD,
+            ("meridian.v1.TakeShardRequest", "meridian.v1.TakeShardReply"),
+            move |lake, request: meridian_domain::v1::TakeShardRequest, envelope| {
+                let took = lake.take_shard(request, envelope)?;
+                let answered_at_ns = lake.clock.now_ns();
+                let resending = Arc::clone(&resending);
+                let instance = took.instance.clone();
+                if let Err(failed) = std::thread::Builder::new()
+                    .name("lake-take-resend".into())
+                    .spawn(move || resending.deliver_standing_again(&instance, answered_at_ns))
+                {
+                    tracing::warn!(
+                        %failed,
+                        "a take's standing wants were not delivered again: the sweep's redelivery serves"
+                    );
+                }
+                Ok(meridian_domain::v1::TakeShardReply { epoch: took.epoch })
+            },
+        );
+    }
+    // This writer group's raise of a shard's epoch, which the control
+    // writer asks of every group before it answers a take.
+    {
+        let raising = Arc::clone(&lake);
+        let topic = meridian_changes::shard_fence::raise_topic("lake", lake.groups.mine());
+        bus.serve(&topic, move |envelope| {
+            let took: meridian_domain::v1::ShardTookOver =
+                decode(&envelope, "meridian.v1.ShardTookOver")?;
+            let raised = raising.raise_shard(took)?;
+            Ok((
+                "meridian.v1.TakeShardReply".to_string(),
+                raised.encode_to_vec(),
+            ))
+        });
+    }
+    serve_on(
+        &bus,
+        &lake,
         SET_SOURCE_PRIORITY,
         (
             "meridian.v1.SetSourcePriorityRequest",
@@ -7391,8 +8747,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             every.tick().await;
             let lake = Arc::clone(&sweeping);
             let _ = tokio::task::spawn_blocking(move || {
-                if !lake.reads_only {
+                if lake.keeps() {
                     lake.sweep_wants();
+                    if lake.groups.several() {
+                        lake.assign();
+                    }
                 }
                 lake.return_freed();
             })
@@ -7440,8 +8799,9 @@ impl Lake {
                     let said = (record.asset_class, record.instrument_type);
                     let stays = record.instrument_id;
                     if !event.replaced_instrument_id.is_empty() && !stays.is_empty() {
-                        // A reader holds what it heard; the writer keeps it.
-                        if !self.reads_only {
+                        // A reader holds what it heard; the writer keeps it,
+                        // group 0's (step 3d).
+                        if self.keeps() {
                             if let Err(failed) =
                                 self.store
                                     .keep_alias(&event.replaced_instrument_id, &stays, now)
@@ -7463,7 +8823,7 @@ impl Lake {
             "meridian.v1.MissingInstrumentDetectedEvent"
             | "meridian.v1.MissingVenueDetectedEvent"
             | "meridian.v1.CalendarAppliedEvent"
-                if self.reads_only => {}
+                if !self.keeps() => {}
             "meridian.v1.MissingInstrumentDetectedEvent" => {
                 if let Ok(event) = MissingInstrumentDetectedEvent::decode(&envelope.payload[..]) {
                     self.miss(&event.publisher_instance_id, now);
@@ -7523,3 +8883,6 @@ impl Lake {
         Date::of_utc_instant(self.clock.now_ns())
     }
 }
+
+/// A write's parts for one writer group: each dataset's rows.
+type Parts = Vec<(String, Vec<Observation>)>;

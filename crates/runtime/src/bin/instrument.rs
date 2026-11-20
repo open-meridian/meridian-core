@@ -99,9 +99,9 @@ fn run() -> Result<(), String> {
             "the instrument store's database",
             &url,
             |url| PostgresStore::connect(url, 1).map_err(|failed| failed.to_string()),
-            |store| {
+            |store, lock_waits| {
                 store
-                    .migrate(&*clock())
+                    .migrate_within(&*clock(), lock_waits)
                     .map_err(|failed| failed.to_string())
             },
         )
@@ -248,6 +248,14 @@ fn run() -> Result<(), String> {
             move || writing.epoch(),
             move || watched.head_epoch().map_err(|failed| failed.to_string()),
         );
+        // Its partitions in its report: its log's own and its control
+        // partition (CI 44556229125: a writer named none).
+        holding.report_partitions(|| {
+            Ok(meridian_instrument::postgres::CHANGES
+                .partitions()
+                .map(String::from)
+                .to_vec())
+        });
         // A new database timeline raises the epoch (contract v30, stage C).
         let following = postgres.clone();
         holding.follow_timeline(&bus, "reference", move || {
@@ -283,7 +291,7 @@ fn run() -> Result<(), String> {
             "reference",
         );
 
-        let service = InstrumentService::new(bus, Arc::clone(&store), clock());
+        let service = InstrumentService::new(bus.clone(), Arc::clone(&store), clock());
 
         // Registered and subscribed before this returns, so nothing is
         // published into the gap between starting and listening.
@@ -297,7 +305,7 @@ fn run() -> Result<(), String> {
         });
 
         tracing::info!(instance_id, "the instrument store is serving");
-        ready.serving();
+        ready.serving_on(&bus).await;
 
         tokio::select! {
             _ = running => {

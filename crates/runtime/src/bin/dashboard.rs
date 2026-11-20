@@ -60,7 +60,7 @@ fn run() -> Result<(), String> {
             "the dashboard's database",
             &url,
             |url| Database::connect(url, 1),
-            |database| database.migrate(&*clock()),
+            |database, lock_waits| database.migrate_within(&*clock(), lock_waits),
         )
         .map_err(|failed| format!("the dashboard's schema could not be applied: {failed}"))?;
         tracing::info!("the dashboard's schema is applied");
@@ -552,6 +552,14 @@ fn run() -> Result<(), String> {
             );
         }
 
+        // Whether an instance of several pods has a lease right to run
+        // under (step 3d): the Launch sheet and the launch tool offer
+        // shards and a standby pod only where it has.
+        meridian_dashboard::registry::set_lease_right(
+            meridian_runtime::resilience::values_from_env()
+                .filter(|values| values.stated)
+                .map(|values| values.lease_right()),
+        );
         let app = Arc::new(App {
             first_run,
             wizard: Arc::new(WizardSession::suggesting(

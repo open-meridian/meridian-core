@@ -468,6 +468,16 @@ fn each_stores_change_log_is_held_by_its_members_and_no_plugin() {
         instrument,
         "platform.lake.internal.read-from-writer"
     ));
+    // A write handed to its owning writer group (step 3d): each store's
+    // members alone, never another component.
+    for internal in [
+        "platform.lake.internal.record",
+        "platform.book.internal.command",
+    ] {
+        assert!(holds(runtime, internal));
+        assert!(!holds(analytics, internal));
+        assert!(!holds(instrument, internal));
+    }
     for other in users
         .iter()
         .filter(|u| !["runtime", "instrument", "analytics"].contains(&u.user.as_str()))
@@ -481,5 +491,51 @@ fn each_stores_change_log_is_held_by_its_members_and_no_plugin() {
             "{} carries a component's own topic",
             other.user
         );
+    }
+}
+
+/// Step 3d (section 6.7): a write is passed to its owner on the store's
+/// internal topic with its caller's own envelope and reply address, so only
+/// the store's own members may publish there -- the book's
+/// `internal.command`, the lake's `internal.record`. A plugin of any role,
+/// the dashboard or any other component holding a credential of its own is
+/// refused it, and cannot pass a write as if it were a member.
+#[test]
+fn only_the_stores_own_members_may_hand_a_write_on() {
+    let users = users(
+        &contract(),
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("reporting-test-1", &["reporting"]),
+            Instance::plugin("oms-test-1", &["oms", "custody", "reporting"]),
+        ],
+    )
+    .expect("generates");
+    let covers = |pattern: &str, subject: &str| {
+        pattern == subject
+            || pattern == ">"
+            || pattern
+                .strip_suffix(".>")
+                .is_some_and(|head| subject.starts_with(&format!("{head}.")))
+            || {
+                let (said, asked): (Vec<&str>, Vec<&str>) =
+                    (pattern.split('.').collect(), subject.split('.').collect());
+                said.len() == asked.len()
+                    && said.iter().zip(&asked).all(|(p, s)| *p == "*" || p == s)
+            }
+    };
+    for internal in [
+        "platform.book.internal.command",
+        "platform.lake.internal.record",
+    ] {
+        for user in &users {
+            let may = user.publish.iter().any(|pattern| covers(pattern, internal));
+            assert_eq!(
+                may,
+                user.user == "runtime",
+                "{} may publish {internal}: {may}",
+                user.user
+            );
+        }
     }
 }

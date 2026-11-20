@@ -455,3 +455,461 @@ fn a_conflated_rows_later_value_replaces_the_one_waiting() {
     assert_eq!(waiting.pop().unwrap().meta.unwrap().row, "other");
     assert!(waiting.pop().is_none());
 }
+
+/// A registered data plugin `feed-1`, as shard `mine` of its instance.
+async fn shard(bus: &Arc<Bus>, mine: u32) -> (Sidecar, Arc<crate::shards::Shards>) {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.event.observations-wanted\tevent\tlake\tdata\n\
+         platform.lake.event.want-withdrawn\tevent\tlake\tdata\n\
+         platform.config.event.entitlements-changed\tevent\tconductor\tlake,sidecar\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\ndata\trole\nlake\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
+    )
+    .unwrap();
+    let shards = Arc::new(crate::shards::Shards::new(mine));
+    let sidecar = Sidecar::under(
+        &contract,
+        Arc::clone(bus),
+        "DEP-test",
+        Identity::new("feed-1", vec!["data".into()]),
+    )
+    .as_shard(Arc::clone(&shards));
+    let reply = sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v7".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.admitted, "{}", reply.refusal_reason);
+    (sidecar, shards)
+}
+
+fn wanted_subjects(delivery: &plugin::Delivery) -> (String, Vec<String>) {
+    match delivery.item.as_ref().expect("an item") {
+        plugin::delivery::Item::ObservationsWanted(want) => (
+            want.want_id.clone(),
+            want.subjects.iter().map(|s| s.entity_id.clone()).collect(),
+        ),
+        other => panic!("not a want: {other:?}"),
+    }
+}
+
+/// Step 3d (the resilience spec's section 7): two shards of one instance
+/// hear the same want, and each hands its plugin its own subjects alone;
+/// when one's Lease lapses the other hands its plugin the rest at once, and
+/// gives them back when it returns.
+#[tokio::test]
+async fn two_shards_share_a_want_s_subjects_and_a_lost_shard_s_are_handed_on_at_once() {
+    use meridian_domain::v1::{ObservationsWantedEvent, SubjectRef, WantWithdrawnEvent};
+    let bus = Arc::new(Bus::single(
+        "feed-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    let (first, at_first) = shard(&bus, 0).await;
+    let (second, at_second) = shard(&bus, 1).await;
+    at_first.set_live([1]);
+    at_second.set_live([0]);
+    let mut to_first = first
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut to_second = second
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let want = ObservationsWantedEvent {
+        want_id: "want-1".into(),
+        dataset: "feed-1:prices".into(),
+        data_type: "meridian.v1.Price".into(),
+        subjects: names
+            .iter()
+            .map(|entity| SubjectRef {
+                entity_id: entity.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        standing: true,
+        ..Default::default()
+    };
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        want.encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    let (id, mut held_first) = wanted_subjects(&next(&mut to_first).await);
+    let (_, held_second) = wanted_subjects(&next(&mut to_second).await);
+    assert_eq!(id, "want-1", "the want's own ID at each shard");
+    assert!(!held_first.is_empty() && !held_second.is_empty());
+    let mut both: Vec<String> = held_first.iter().chain(&held_second).cloned().collect();
+    both.sort();
+    assert_eq!(both, names, "each subject handed to exactly one shard");
+
+    // The second shard's Lease lapsed: the first is handed every subject,
+    // without the lake saying anything again.
+    at_first.set_live([]);
+    let (id, all) = wanted_subjects(&next(&mut to_first).await);
+    assert_eq!((id.as_str(), &all), ("want-1", &names));
+
+    // It returned: the first holds its own again.
+    at_first.set_live([1]);
+    let (_, mut again) = wanted_subjects(&next(&mut to_first).await);
+    again.sort();
+    held_first.sort();
+    assert_eq!(again, held_first);
+
+    // The lake withdraws it: each shard's plugin hears it, having held some.
+    bus.publish(
+        "platform.lake.event.want-withdrawn",
+        "meridian.v1.WantWithdrawnEvent",
+        WantWithdrawnEvent {
+            want_id: "want-1".into(),
+            dataset: "feed-1:prices".into(),
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    for stream in [&mut to_first, &mut to_second] {
+        match next(stream).await.item.unwrap() {
+            plugin::delivery::Item::WantWithdrawn(gone) => assert_eq!(gone.want_id, "want-1"),
+            other => panic!("not a withdrawal: {other:?}"),
+        }
+    }
+
+    // A want none of whose subjects is the first shard's is the second's
+    // alone: the first's plugin hears nothing of it.
+    let theirs = names
+        .iter()
+        .find(|name| !at_first.keeps(name))
+        .unwrap()
+        .clone();
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        ObservationsWantedEvent {
+            want_id: "want-2".into(),
+            subjects: vec![SubjectRef {
+                entity_id: theirs.clone(),
+                ..Default::default()
+            }],
+            ..want.clone()
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        wanted_subjects(&next(&mut to_second).await),
+        ("want-2".to_string(), vec![theirs])
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), to_first.next())
+            .await
+            .is_err(),
+        "the first shard's plugin was handed a want that is not its own"
+    );
+}
+
+/// `feed-1`'s bus in memory, the conductor's answer to its configuration
+/// served on it.
+fn feed_bus() -> Arc<Bus> {
+    let bus = Arc::new(Bus::single(
+        "feed-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    bus
+}
+
+/// The lake's standing want `id` of `feed-1`'s prices, naming `names`.
+fn publish_want(bus: &Bus, id: &str, names: &[String]) {
+    use meridian_domain::v1::{ObservationsWantedEvent, SubjectRef};
+    bus.publish(
+        "platform.lake.event.observations-wanted",
+        "meridian.v1.ObservationsWantedEvent",
+        ObservationsWantedEvent {
+            want_id: id.into(),
+            dataset: "feed-1:prices".into(),
+            data_type: "meridian.v1.Price".into(),
+            subjects: names
+                .iter()
+                .map(|entity| SubjectRef {
+                    entity_id: entity.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            standing: true,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+fn publish_withdrawn(bus: &Bus, id: &str) {
+    bus.publish(
+        "platform.lake.event.want-withdrawn",
+        "meridian.v1.WantWithdrawnEvent",
+        meridian_domain::v1::WantWithdrawnEvent {
+            want_id: id.into(),
+            dataset: "feed-1:prices".into(),
+        }
+        .encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+/// What the stream delivers until it is quiet for `quiet`: each want's ID
+/// and subjects, each withdrawal's ID with none, each loss as "lost".
+async fn drained(
+    stream: &mut super::Deliveries,
+    quiet: std::time::Duration,
+) -> Vec<(String, Vec<String>)> {
+    let mut heard = Vec::new();
+    while let Ok(Some(delivery)) = tokio::time::timeout(quiet, stream.next()).await {
+        match delivery.expect("a delivery").item.expect("an item") {
+            plugin::delivery::Item::ObservationsWanted(want) => heard.push((
+                want.want_id,
+                want.subjects.into_iter().map(|s| s.entity_id).collect(),
+            )),
+            plugin::delivery::Item::WantWithdrawn(gone) => heard.push((gone.want_id, Vec::new())),
+            plugin::delivery::Item::Lost(_) => heard.push(("lost".into(), Vec::new())),
+            _ => {}
+        }
+    }
+    heard
+}
+
+/// Ruling 184 (option B): a taker's hold is handed to its plugin as its
+/// stream opens, through the shard's own path -- its share alone, each want
+/// once though the take's delivery and the sweep's both came, none
+/// withdrawn in the window -- and the stream hears on from where the hold
+/// left off: a withdrawal after it reaches the plugin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_s_hold_is_handed_as_its_stream_opens_each_want_once() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.set_live([1]);
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let mine: Vec<String> = names.iter().filter(|n| shards.keeps(n)).cloned().collect();
+    assert!(!mine.is_empty() && mine.len() < names.len());
+    publish_want(&bus, "want-1", &names);
+    publish_want(&bus, "want-2", &names);
+    // Held, then withdrawn.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    publish_withdrawn(&bus, "want-2");
+    // The sweep's redelivery of want-1 in the same window.
+    publish_want(&bus, "want-1", &names);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        drained(&mut stream, std::time::Duration::from_millis(300)).await,
+        vec![("want-1".to_string(), mine)],
+        "not want-1's share alone, once"
+    );
+    publish_withdrawn(&bus, "want-1");
+    assert_eq!(
+        drained(&mut stream, std::time::Duration::from_millis(300)).await,
+        vec![("want-1".to_string(), Vec::new())],
+        "the withdrawal after the hold did not reach the plugin"
+    );
+}
+
+/// Publishes `n` standing wants of `feed-1`'s naming `subject`,
+/// `want-<from + i>`, a few at a time, so the bus's own queue never drops,
+/// and waits for the sidecar to read them.
+async fn publish_many(bus: &Bus, from: usize, n: usize, subject: &str) {
+    for i in from..from + n {
+        publish_want(bus, &format!("want-{i}"), &[subject.to_string()]);
+        if i % 100 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+/// Review c5u2 N1, a withdrawal: a shard's plugin was handed a want, and its
+/// queue is full when the lake withdraws it. The withdrawal is never
+/// dropped: nothing would tell it again, and the want would be served for
+/// good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_s_withdrawal_of_a_want_handed_is_never_dropped_from_a_full_queue() {
+    let bus = feed_bus();
+    let (sidecar, _shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    publish_want(&bus, "first", &["INS-1".to_string()]);
+    assert_eq!(wanted_subjects(&next(&mut stream).await).0, "first");
+    // The queue filled, and past it.
+    publish_many(&bus, 0, QUEUE + 5, "INS-1").await;
+    publish_withdrawn(&bus, "first");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        heard.contains(&("first".to_string(), Vec::new())),
+        "the withdrawal was dropped: {} delivered, the last {:?}",
+        heard.len(),
+        heard.last()
+    );
+}
+
+/// Review c5u2 N1, a part: a want heard while the queue is full is dropped,
+/// and so is not kept as handed: the next sharing hands it, rather than
+/// skipping it as handed until the lake's next redelivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_s_part_dropped_from_a_full_queue_is_handed_at_the_next_sharing() {
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    // A subject shard 0 keeps whether or not shard 1 lives: its part is the
+    // same either side of the change below.
+    let ours = (0..200)
+        .map(|i| format!("INS-{i:03}"))
+        .find(|name| {
+            crate::shards::keeper(name, &std::collections::BTreeSet::from([0, 1])) == Some(0)
+        })
+        .unwrap();
+    // The queue filled and past it (the stream's own sending holds two
+    // more), every filler's part unchanged by the change below too.
+    publish_many(&bus, 0, QUEUE + 10, &ours).await;
+    publish_want(&bus, "dropped", std::slice::from_ref(&ours));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        !heard.iter().any(|(id, _)| id == "dropped"),
+        "the queue was not full: {} delivered",
+        heard.len()
+    );
+    // Shard 1 comes up: every standing want is shared again.
+    shards.set_live([1]);
+    let again = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(
+        again.contains(&("dropped".to_string(), vec![ours])),
+        "the dropped part was kept as handed: {} delivered, {:?}",
+        again.len(),
+        again.iter().take(3).collect::<Vec<_>>()
+    );
+}
+
+/// Review c5z F1: the live shards change just as a taker's stream is
+/// handed its hold, before the stream would hear their next change. The
+/// change is shared all the same: the want the hold handed is shared again
+/// over the shards now live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_change_at_the_hold_s_hand_over_is_shared_again() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.set_live([1]);
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    let names: Vec<String> = (0..40).map(|i| format!("INS-{i:03}")).collect();
+    let mine: Vec<String> = names.iter().filter(|n| shards.keeps(n)).cloned().collect();
+    assert!(!mine.is_empty() && mine.len() < names.len());
+    publish_want(&bus, "want-1", &names);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The other shard is gone at the hand-over.
+    let at = Arc::downgrade(&shards);
+    shards.at_hand_over(move || {
+        if let Some(shards) = at.upgrade() {
+            shards.set_live([]);
+        }
+    });
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        heard.last(),
+        Some(&("want-1".to_string(), names)),
+        "the change at the hand-over was not shared: {} of 40 handed",
+        heard.last().map_or(0, |(_, subjects)| subjects.len())
+    );
+}
+
+/// Review c5z F2 (b): a want and its withdrawal are two topics, read by two
+/// forwarders, so the withdrawal can be heard first. The want heard after
+/// it is never handed: the lake has forgotten it, and nothing would
+/// withdraw it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_want_heard_on_the_stream_after_its_withdrawal_is_never_handed() {
+    let bus = feed_bus();
+    let (sidecar, _shards) = shard(&bus, 0).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    publish_withdrawn(&bus, "late");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    publish_want(&bus, "late", &["INS-1".to_string()]);
+    let heard = drained(&mut stream, std::time::Duration::from_millis(500)).await;
+    assert!(heard.is_empty(), "handed after its withdrawal: {heard:?}");
+}
+
+/// Review c5z, a nit: a want the take's hold handed carries the message it
+/// was heard in, as every other delivery does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_want_is_handed_with_the_message_it_was_heard_in() {
+    crate::shards::clear_fenced();
+    let bus = feed_bus();
+    let (sidecar, shards) = shard(&bus, 0).await;
+    shards.hold_wants(&bus, "feed-1", std::time::Duration::from_secs(60));
+    publish_want(&bus, "want-1", &["INS-1".to_string()]);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut stream = sidecar
+        .receive(Request::new(plugin::ReceiveRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let delivery = next(&mut stream).await;
+    assert_eq!(wanted_subjects(&delivery).0, "want-1");
+    let meta = delivery.meta.expect("its meta");
+    assert!(
+        !meta.message_id.is_empty() && meta.published_at_ns > 0,
+        "handed without its message: {meta:?}"
+    );
+}

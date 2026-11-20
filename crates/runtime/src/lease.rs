@@ -88,6 +88,16 @@ pub struct Record {
     pub renew_time: String,
     pub transitions: u64,
     pub resource_version: String,
+    /// The Lease object's `metadata.uid`, the API server's: one Lease made
+    /// again has another (step 3d, checkpoint 5, review c5a2 N5). Empty
+    /// before a read.
+    pub uid: String,
+    /// The Lease's `metadata` as read, less the fields the API server keeps
+    /// itself (`managedFields`); `Null` before a read. Written back with
+    /// every write: a PUT replaces the whole object, so a take, a renew or a
+    /// release keeps the labels, annotations and owners the chart or the
+    /// launcher gave it -- Helm's `keep` among them (review c5b M1).
+    pub metadata: serde_json::Value,
 }
 
 /// What a write of a Lease answered.
@@ -120,6 +130,19 @@ pub trait Leases: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Wrote, String>> + Send;
 }
 
+/// A shared API is one too: several leases read through one client.
+impl<L: Leases> Leases for std::sync::Arc<L> {
+    async fn get(&self, name: &str) -> Result<Option<Record>, String> {
+        (**self).get(name).await
+    }
+    async fn create(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+        (**self).create(name, record).await
+    }
+    async fn update(&self, name: &str, record: &Record) -> Result<Wrote, String> {
+        (**self).update(name, record).await
+    }
+}
+
 /// Where a member stands after a look at its lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Standing {
@@ -137,9 +160,28 @@ pub struct Elector<L: Leases> {
     observed: Option<(Record, Instant)>,
     /// When this member last wrote the lease as its holder.
     renewed_at: Option<Instant>,
-    /// Whom it took the lease from, the last time it took it: `Some("")`
-    /// where it was released, `None` where nobody had ever held it.
+    /// Whom it took the lease from, the last time it took it
+    /// ([`Elector::took_from`]).
     took_from: Option<Option<String>>,
+    /// Whether the lease was free when it took it: released, or never held.
+    took_free: bool,
+    /// The last holder other than this member it saw hold the lease: whom
+    /// a lease released since was released by (review c5a L3).
+    last_other: Option<String>,
+    /// Whether this member gave the lease up ([`Elector::release`]): it is
+    /// stopping, and never takes or renews it again.
+    gave_up: bool,
+    /// The monotonic clock, read when a request has answered: a record is
+    /// held seen, and a lapse judged, by when its read answered
+    /// ([`Elector::seen_as_answered`]). None: by when the look began.
+    answered: Option<fn() -> Instant>,
+    /// Whether a look that failed leaves what was seen as it was
+    /// ([`Elector::of_a_holder_that_stops`]); else it drops it, and an
+    /// unobserved stretch is never counted toward a lapse.
+    keeps_seen: bool,
+    /// Whether a lease not there is waited for rather than made
+    /// ([`Elector::makes_none`]).
+    makes_none: bool,
 }
 
 impl<L: Leases> Elector<L> {
@@ -150,18 +192,131 @@ impl<L: Leases> Elector<L> {
             observed: None,
             renewed_at: None,
             took_from: None,
+            took_free: false,
+            last_other: None,
+            gave_up: false,
+            answered: None,
+            keeps_seen: false,
+            makes_none: false,
         }
     }
 
+    /// A lease this member never makes (step 3d, checkpoint 5, item 31): a
+    /// plugin shard's, which the launcher -- or the chart, for a sidecars[]
+    /// instance -- makes before any pod of the instance starts, and never
+    /// deletes, so its `leaseTransitions` only grows; its sidecar holds no
+    /// right to make one. A look that finds none fails, saying so, and
+    /// takes nothing: the member waits for it.
+    pub fn makes_none(mut self) -> Self {
+        self.makes_none = true;
+        self
+    }
+
+    /// For a lease whose holder stops once it has gone its renew deadline
+    /// unrenewed, since nothing else fences it (step 3d: a plugin's shard
+    /// of a role its epoch cannot stop, an order path's above all; a data
+    /// shard writes on, as a store's writer does). Two things follow,
+    /// neither true of a store's member, which writes on:
+    /// - **a record is held seen when its read answered,** by `clock`, not
+    ///   when the look began: the write it shows may have landed anywhere
+    ///   between, and a lapse counted from before it lets a standby take
+    ///   the lease while its holder may still act;
+    /// - **a look that failed leaves what was seen as it was.** A record
+    ///   read unchanged after a stretch unobserved was not renewed in it,
+    ///   and its holder has stopped by its own deadline, so that stretch
+    ///   counts toward its lapse: one failed read costs a standby no
+    ///   second lapse.
+    pub fn of_a_holder_that_stops(mut self, clock: fn() -> Instant) -> Self {
+        self.answered = Some(clock);
+        self.keeps_seen = true;
+        self
+    }
+
+    /// A record held seen when its read answered, by `clock`, and a lapse
+    /// judged by when the look that reads it again answered -- Kubernetes'
+    /// observedTime, read after the Get (PO item 54, 2026-11-16: a data
+    /// shard's standby). A look that failed still drops what was seen (review
+    /// c5a5 F4): only [`Elector::of_a_holder_that_stops`] keeps it.
+    pub fn seen_as_answered(mut self, clock: fn() -> Instant) -> Self {
+        self.answered = Some(clock);
+        self
+    }
+
+    /// [`Elector::of_a_holder_that_stops`], given to a member once it holds
+    /// the lease (review c5a6 M1): a data shard's own Lease, whose standby
+    /// counts only what it saw (F4) but whose holder keeps what it saw
+    /// through a failed look -- else one API error after its take leaves
+    /// it no transitions to raise its epoch by and nothing to release.
+    pub fn keep_seen_through_failures(&mut self, clock: fn() -> Instant) {
+        self.answered = Some(clock);
+        self.keeps_seen = true;
+    }
+
+    /// When a record just read is held to have been seen: when its read
+    /// answered where this lease's holder stops unrenewed, else `now`.
+    fn seen_at(&self, now: Instant) -> Instant {
+        self.answered.map_or(now, |clock| clock().max(now))
+    }
+
+    /// Whether this member gave the lease up: its looks take nothing from
+    /// then on.
+    pub fn gave_up(&self) -> bool {
+        self.gave_up
+    }
+
     /// Whom this member took the lease from: `Some(Some(holder))` from a
-    /// holder whose lease lapsed, `Some(Some(""))` where it was released,
-    /// `Some(None)` where none was held; `None` before it took it.
+    /// holder whose lease lapsed, or which released it (the last holder this
+    /// member saw), itself where it took back its own name's lease (a
+    /// container restarted in its pod); `Some(None)` where it never saw a
+    /// holder; `None` before it took it (review c5a L3).
     pub fn took_from(&self) -> Option<Option<String>> {
         self.took_from.clone()
     }
 
+    /// Why this member last took the lease, as a store's takeover record
+    /// says it, and from whom: from another holder whose lease lapsed; from
+    /// one that released it (its record names nobody, as it always has);
+    /// or free -- never held, or its own name's taken back after its
+    /// container restarted. A release is never said to have lapsed (CI
+    /// 43920761210: review c5a L3's names of a release's holder read as
+    /// lapses in every store's rollout).
+    pub fn takeover(&self) -> (&'static str, String) {
+        match (&self.took_from, self.took_free) {
+            (Some(Some(_)), true) => (meridian_changes::LEASE_RELEASED, String::new()),
+            (Some(Some(holder)), false)
+                if !holder.is_empty() && *holder != self.settings.holder =>
+            {
+                (meridian_changes::LEASE_LAPSED, holder.clone())
+            }
+            _ => (meridian_changes::LEASE_FREE, String::new()),
+        }
+    }
+
+    /// Whether the lease was free when this member last took it: released
+    /// by its holder, or never held.
+    pub fn took_free(&self) -> bool {
+        self.took_free
+    }
+
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// The Lease's `leaseTransitions` as this member last wrote or read
+    /// it: one more on every take by another holder (step 3d, checkpoint 5,
+    /// item 32: the floor of a plugin shard's epoch). None before a read.
+    pub fn transitions(&self) -> Option<u64> {
+        self.observed.as_ref().map(|(record, _)| record.transitions)
+    }
+
+    /// The Lease object's uid as this member last read it: what the lake
+    /// keeps a shard's floor of transitions on (review c5a2 N5). None
+    /// before a read of it.
+    pub fn uid(&self) -> Option<String> {
+        self.observed
+            .as_ref()
+            .map(|(record, _)| record.uid.clone())
+            .filter(|uid| !uid.is_empty())
     }
 
     /// When this member last renewed as holder.
@@ -175,7 +330,7 @@ impl<L: Leases> Elector<L> {
     /// by an election).
     pub async fn look(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let looked = self.look_once(now, wall_ns).await;
-        if looked.is_err() {
+        if looked.is_err() && !self.keeps_seen {
             // Not watched while the API server did not answer (contract v30,
             // stage C): a lease's expiry is observed, and an unobserved
             // stretch is never counted as its holder's silence -- else a
@@ -186,10 +341,53 @@ impl<L: Leases> Elector<L> {
         looked
     }
 
+    /// Who holds the lease now, by looking alone: nothing is written, so a
+    /// member that watches never takes it (step 3d: a plugin's shard reads
+    /// which of its instance's other shards live). None where nobody holds
+    /// it, it was released, or its holder has not renewed for its duration
+    /// as this member observed it.
+    pub async fn watch(&mut self, now: Instant) -> Result<Option<String>, String> {
+        let current = match self.api.get(&self.settings.name).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                self.observed = None;
+                return Ok(None);
+            }
+            Err(failed) => {
+                // Unobserved, as in [`Elector::look`].
+                if !self.keeps_seen {
+                    self.observed = None;
+                }
+                return Err(failed);
+            }
+        };
+        let at = self.seen_at(now);
+        let changed = self
+            .observed
+            .as_ref()
+            .is_none_or(|(seen, _)| !same_spec(seen, &current));
+        if changed {
+            self.observed = Some((current.clone(), at));
+        }
+        let seen_at = self.observed.as_ref().map_or(at, |(_, at)| *at);
+        let lapse = Duration::from_secs(current.duration_seconds.max(1));
+        if current.holder.is_empty() || at.duration_since(seen_at) >= lapse {
+            return Ok(None);
+        }
+        Ok(Some(current.holder))
+    }
+
     async fn look_once(&mut self, now: Instant, wall_ns: i64) -> Result<Standing, String> {
         let me = self.settings.holder.clone();
         let stamp = micro_time(wall_ns);
         let Some(current) = self.api.get(&self.settings.name).await? else {
+            if self.makes_none {
+                return Err(format!(
+                    "{} is not there; a shard's Lease is made by the launcher or the chart, \
+                     never by its sidecar, so this pod waits for it",
+                    self.settings.name
+                ));
+            }
             let record = Record {
                 holder: me.clone(),
                 duration_seconds: self.settings.duration.as_secs(),
@@ -197,27 +395,45 @@ impl<L: Leases> Elector<L> {
                 renew_time: stamp,
                 transitions: 0,
                 resource_version: String::new(),
+                uid: String::new(),
+                metadata: serde_json::Value::Null,
             };
             return match self.api.create(&self.settings.name, &record).await? {
                 Wrote::Done(version) => {
                     self.wrote(record, version, now);
                     self.took_from = Some(None);
+                    self.took_free = true;
                     Ok(Standing::Held)
                 }
                 Wrote::Conflict => Ok(Standing::HeldBy(String::new())),
             };
         };
+        // When this read answered: what it shows is held seen from then,
+        // and a lapse is judged at then, never at when the look began.
+        let at = self.seen_at(now);
         let changed = self
             .observed
             .as_ref()
             .is_none_or(|(seen, _)| !same_spec(seen, &current));
         if changed {
-            self.observed = Some((current.clone(), now));
+            self.observed = Some((current.clone(), at));
         }
-        let seen_at = self.observed.as_ref().map_or(now, |(_, at)| *at);
+        if !current.holder.is_empty() && current.holder != me {
+            self.last_other = Some(current.holder.clone());
+        }
+        // Given up: whoever holds it, never this member again. A released
+        // lease's holder is empty, free to the first member that looks, and
+        // the member that released it went on looking while it stopped: it
+        // took its own lease back, wrote on until it was killed, and left
+        // the lease to lapse with nobody serving (failover-repeat
+        // 43705797988, ha run 3: the book's writer, twice).
+        if self.gave_up {
+            return Ok(Standing::HeldBy(current.holder));
+        }
+        let seen_at = self.observed.as_ref().map_or(at, |(_, at)| *at);
         let lapse = Duration::from_secs(current.duration_seconds.max(1));
         let mine = current.holder == me;
-        if !current.holder.is_empty() && !mine && now.duration_since(seen_at) < lapse {
+        if !current.holder.is_empty() && !mine && at.duration_since(seen_at) < lapse {
             return Ok(Standing::HeldBy(current.holder));
         }
         let record = Record {
@@ -235,18 +451,43 @@ impl<L: Leases> Elector<L> {
                 current.transitions + 1
             },
             resource_version: current.resource_version.clone(),
+            uid: current.uid.clone(),
+            metadata: current.metadata.clone(),
         };
         match self.api.update(&self.settings.name, &record).await? {
             Wrote::Done(version) => {
                 self.wrote(record, version, now);
                 if !mine {
-                    self.took_from = Some(Some(current.holder));
+                    // Released: from whoever this member last saw hold it.
+                    self.took_free = current.holder.is_empty();
+                    self.took_from = Some(Some(if self.took_free {
+                        self.last_other.clone().unwrap_or_default()
+                    } else {
+                        current.holder
+                    }));
+                } else if self.took_from.is_none() {
+                    // Its own name's lease, held by this pod before this
+                    // process: taken back from itself.
+                    self.took_free = false;
+                    self.took_from = Some(Some(me));
                 }
                 Ok(Standing::Held)
             }
             Wrote::Conflict => {
                 self.renewed_at = None;
-                Ok(Standing::HeldBy(current.holder))
+                // Written meanwhile: this member's own renewal landing late,
+                // or another member's take. Read again, within the caller's
+                // bound as the first read was, so a writer whose lease was
+                // taken steps down in this renewal, never one renew later
+                // still ready (review c5i L4). Where that read fails, or
+                // names this member or nobody, the first read's holder
+                // stands.
+                match self.api.get(&self.settings.name).await {
+                    Ok(Some(again)) if !again.holder.is_empty() && again.holder != me => {
+                        Ok(Standing::HeldBy(again.holder))
+                    }
+                    _ => Ok(Standing::HeldBy(current.holder)),
+                }
             }
         }
     }
@@ -259,7 +500,11 @@ impl<L: Leases> Elector<L> {
 
     /// Give the lease up, where this member holds it: a planned stop hands
     /// over at once rather than after the lease lapses. Best effort.
+    ///
+    /// From here this member neither takes nor renews it, released or not:
+    /// where the release was not written, the lease lapses on its own.
     pub async fn release(&mut self, wall_ns: i64) {
+        self.gave_up = true;
         let Some((seen, _)) = self.observed.clone() else {
             return;
         };
@@ -283,6 +528,79 @@ impl<L: Leases> Elector<L> {
         }
         self.renewed_at = None;
     }
+}
+
+impl<L: Leases> Elector<L> {
+    /// Give the lease up as a writer steps down (ruled 2026-11-16): read
+    /// again, and released only where it still names this member, by a
+    /// write conditional on the version read. A lease another member took
+    /// meanwhile is never touched. Says whether it was released. From here
+    /// this member neither takes nor renews it.
+    pub async fn release_if_mine(&mut self, wall_ns: i64) -> Result<bool, String> {
+        self.gave_up = true;
+        self.renewed_at = None;
+        Ok(self.release_once(wall_ns).await? == Released::Yes)
+    }
+
+    /// [`Elector::release_if_mine`], tried again until it is written or the
+    /// lease names another member or nobody: a read or a write the API
+    /// server failed, and a write another came before -- this member's own
+    /// renewal whose answer was lost, landing late -- each tried again
+    /// `every` after, while `until` allows. Says whether it was released,
+    /// or why not where `until` came first. Bounded by the caller: a request
+    /// out at `until` is the caller's to cut.
+    pub async fn release_if_mine_by(
+        &mut self,
+        wall_ns: i64,
+        until: tokio::time::Instant,
+        every: Duration,
+    ) -> Result<bool, String> {
+        self.gave_up = true;
+        self.renewed_at = None;
+        loop {
+            let why = match self.release_once(wall_ns).await {
+                Ok(Released::Yes) => return Ok(true),
+                Ok(Released::NotMine) => return Ok(false),
+                Ok(Released::Raced) => "another write came first".to_string(),
+                Err(failed) => failed,
+            };
+            if tokio::time::Instant::now() + every >= until {
+                return Err(why);
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// One read, and one release written on it where it names this member.
+    async fn release_once(&self, wall_ns: i64) -> Result<Released, String> {
+        let Some(current) = self.api.get(&self.settings.name).await? else {
+            return Ok(Released::NotMine);
+        };
+        if current.holder != self.settings.holder {
+            return Ok(Released::NotMine);
+        }
+        let record = Record {
+            holder: String::new(),
+            duration_seconds: 1,
+            renew_time: micro_time(wall_ns),
+            ..current
+        };
+        Ok(match self.api.update(&self.settings.name, &record).await? {
+            Wrote::Done(_) => Released::Yes,
+            Wrote::Conflict => Released::Raced,
+        })
+    }
+}
+
+/// What one release found ([`Elector::release_if_mine`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Released {
+    /// Written: the lease names nobody.
+    Yes,
+    /// It names another member or nobody, or is not there: left alone.
+    NotMine,
+    /// Another write came between the read and the release.
+    Raced,
 }
 
 /// Whether two records are the same holding unrenewed: any write, a renew
@@ -325,10 +643,26 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// How a [`KubeLeases`] makes its client: again after a request that did
+/// not answer.
+type MakeClient = Box<dyn Fn() -> Result<reqwest::Client, String> + Send + Sync>;
+
 /// The in-cluster API, reached with the pod's own service account, for the
 /// Leases of its own namespace and nothing else.
+///
+/// **A request that did not answer closes the client's connections**: the
+/// next one dials afresh, as the kubelet closes its connections when a
+/// heartbeat fails. Its client keeps one HTTP/2 connection for every
+/// request; one whose packets were dropped stays in the pool, and the
+/// requests after it waited on TCP's retransmission backoff for up to 12 s
+/// after the API server could be reached again (CI 43973174092: a data
+/// standby blind 11 s after an outage ended took a shard 10.85 s after its
+/// holder was cut).
 pub struct KubeLeases {
-    http: reqwest::Client,
+    /// The client, and how many times it was made again: a request that
+    /// did not answer replaces only the client it went by (review c5a10 L1).
+    http: std::sync::Mutex<(u64, reqwest::Client)>,
+    make: MakeClient,
     base: String,
     namespace: String,
     token_path: String,
@@ -354,18 +688,65 @@ impl KubeLeases {
             .map_err(|failed| format!("no cluster CA for the lease: {failed}"))?;
         let ca = reqwest::Certificate::from_pem(&ca)
             .map_err(|failed| format!("the cluster CA is unreadable: {failed}"))?;
-        let http = reqwest::Client::builder()
-            .add_root_certificate(ca)
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .build()
-            .map_err(|failed| failed.to_string())?;
+        let make = move || {
+            reqwest::Client::builder()
+                .add_root_certificate(ca.clone())
+                .timeout(timeout)
+                .connect_timeout(timeout)
+                .build()
+                .map_err(|failed| failed.to_string())
+        };
+        Self::through(
+            format!("https://{host}:{port}"),
+            namespace.trim(),
+            TOKEN_PATH,
+            Box::new(make),
+        )
+    }
+
+    /// The API at `base`, its client made by `make`, and made again after
+    /// a request that did not answer.
+    fn through(
+        base: String,
+        namespace: &str,
+        token_path: &str,
+        make: MakeClient,
+    ) -> Result<Self, String> {
         Ok(Self {
-            http,
-            base: format!("https://{host}:{port}"),
-            namespace: namespace.trim().to_string(),
-            token_path: TOKEN_PATH.to_string(),
+            http: std::sync::Mutex::new((0, make()?)),
+            make,
+            base,
+            namespace: namespace.to_string(),
+            token_path: token_path.to_string(),
         })
+    }
+
+    /// The client now, and which it is.
+    fn client(&self) -> (u64, reqwest::Client) {
+        self.http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Its connections closed: a fresh client in place of client `made`,
+    /// which dials afresh. Where `made` was replaced already -- a request
+    /// on it failed first -- the client since is kept, as is the old one
+    /// where none can be made.
+    fn dial_afresh(&self, made: u64) {
+        let mut http = self
+            .http
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if http.0 != made {
+            return;
+        }
+        match (self.make)() {
+            Ok(fresh) => *http = (made + 1, fresh),
+            Err(failed) => {
+                tracing::warn!(%failed, "the API server's client could not be made again")
+            }
+        }
     }
 
     /// The token, read at each request: a projected token is rotated under
@@ -389,10 +770,20 @@ impl KubeLeases {
         }
     }
 
+    /// The Lease as written: its metadata as read, but for its name, its
+    /// namespace and the version the write is conditional on; its spec the
+    /// record's.
     fn body(&self, name: &str, record: &Record) -> serde_json::Value {
-        let mut metadata = serde_json::json!({ "name": name, "namespace": self.namespace });
-        if !record.resource_version.is_empty() {
-            metadata["resourceVersion"] = serde_json::json!(record.resource_version);
+        let mut metadata = record.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert("name".into(), serde_json::json!(name));
+        metadata.insert("namespace".into(), serde_json::json!(self.namespace));
+        if record.resource_version.is_empty() {
+            metadata.remove("resourceVersion");
+        } else {
+            metadata.insert(
+                "resourceVersion".into(),
+                serde_json::json!(record.resource_version),
+            );
         }
         serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -408,19 +799,41 @@ impl KubeLeases {
         })
     }
 
+    /// One request. Where it does not answer -- it failed to send, timed
+    /// out, or was given up by its caller -- the client dials afresh for
+    /// the next.
     async fn send(
         &self,
-        request: reqwest::RequestBuilder,
+        request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
         what: &str,
     ) -> Result<(u16, String), String> {
-        let response = request
-            .bearer_auth(self.token()?)
+        let token = self.token()?;
+        let (made, http) = self.client();
+        let mut unanswered = Unanswered(Some((self, made)));
+        let response = request(&http)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|failed| format!("{what}: {failed}"))?;
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .map_err(|failed| format!("{what}: {failed}"))?;
+        unanswered.0 = None;
         Ok((status, body))
+    }
+}
+
+/// Dials afresh, in place of the client its request went by, when dropped
+/// before that request answered.
+struct Unanswered<'a>(Option<(&'a KubeLeases, u64)>);
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if let Some((leases, made)) = self.0 {
+            leases.dial_afresh(made);
+        }
     }
 }
 
@@ -435,17 +848,24 @@ pub fn record_of(lease: &serde_json::Value) -> Record {
         renew_time: text(&spec["renewTime"]),
         transitions: spec["leaseTransitions"].as_u64().unwrap_or(0),
         resource_version: text(&lease["metadata"]["resourceVersion"]),
+        uid: text(&lease["metadata"]["uid"]),
+        metadata: match &lease["metadata"] {
+            serde_json::Value::Object(read) => {
+                let mut kept = read.clone();
+                kept.remove("managedFields");
+                serde_json::Value::Object(kept)
+            }
+            _ => serde_json::Value::Null,
+        },
     }
 }
 
 impl Leases for KubeLeases {
     async fn get(&self, name: &str) -> Result<Option<Record>, String> {
         let path = self.path(Some(name));
+        let url = format!("{}{path}", self.base);
         let (status, body) = self
-            .send(
-                self.http.get(format!("{}{path}", self.base)),
-                &format!("GET {path}"),
-            )
+            .send(|http| http.get(url), &format!("GET {path}"))
             .await?;
         match status {
             404 => Ok(None),
@@ -458,12 +878,17 @@ impl Leases for KubeLeases {
 
     async fn create(&self, name: &str, record: &Record) -> Result<Wrote, String> {
         let path = self.path(None);
+        let (url, body) = (
+            format!("{}{path}", self.base),
+            self.body(name, record).to_string(),
+        );
         let (status, body) = self
             .send(
-                self.http
-                    .post(format!("{}{path}", self.base))
-                    .header("Content-Type", "application/json")
-                    .body(self.body(name, record).to_string()),
+                |http| {
+                    http.post(url)
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                },
                 &format!("POST {path}"),
             )
             .await?;
@@ -472,12 +897,17 @@ impl Leases for KubeLeases {
 
     async fn update(&self, name: &str, record: &Record) -> Result<Wrote, String> {
         let path = self.path(Some(name));
+        let (url, body) = (
+            format!("{}{path}", self.base),
+            self.body(name, record).to_string(),
+        );
         let (status, body) = self
             .send(
-                self.http
-                    .put(format!("{}{path}", self.base))
-                    .header("Content-Type", "application/json")
-                    .body(self.body(name, record).to_string()),
+                |http| {
+                    http.put(url)
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                },
                 &format!("PUT {path}"),
             )
             .await?;

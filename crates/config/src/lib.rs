@@ -45,7 +45,9 @@ pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use plugins::serve_plugins;
 pub use plugins::serve_plugins_with;
-pub use plugins::{serve_plugins_and_registries, serve_plugins_reaching, LocalRegistry};
+pub use plugins::{
+    serve_plugins_and_registries, serve_plugins_on, serve_plugins_reaching, LocalRegistry, Several,
+};
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{

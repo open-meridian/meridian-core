@@ -14,6 +14,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use meridian_changes::scratch::Scratch;
 use meridian_instrument::store::{
     Asked, Change, Conflict, Field, Identifier, IdentifierSet, Instrument, Offer, Replaced, Source,
     Stood, Store, Version, Written,
@@ -459,10 +460,7 @@ fn what_a_release_before_v10_held_is_sourced_once() {
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
     let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let scratch = format!("before_v10_{}", unique("t").replace('-', "_"));
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
-        .unwrap();
-    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let scoped = Scratch::schema(&url, &scratch);
     // What a release before v10 made, and held.
     admin
         .batch_execute(&format!(
@@ -545,10 +543,6 @@ fn what_a_release_before_v10_held_is_sourced_once() {
         Some("INS-USD".into())
     );
     store.verify().unwrap();
-
-    admin
-        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
-        .unwrap();
 }
 
 #[test]
@@ -557,13 +551,9 @@ fn a_start_against_a_database_with_no_schema_refuses_and_names_the_fix() {
     // has no right to create a table, by design, so a start that tried met
     // `permission denied for schema public` and said nothing about migrating.
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let scratch = format!("verify_{}", unique("t").replace('-', "_"));
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
-        .unwrap();
 
-    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let scoped = Scratch::schema(&url, &scratch);
     let store = PostgresStore::connect(&scoped, 1).unwrap();
 
     let refused = store
@@ -580,10 +570,6 @@ fn a_start_against_a_database_with_no_schema_refuses_and_names_the_fix() {
         .migrate(&meridian_clock::SystemClock)
         .expect("could not apply the schema");
     store.verify().expect("a migrated database must verify");
-
-    admin
-        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
-        .unwrap();
 }
 
 #[test]
@@ -594,10 +580,7 @@ fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleare
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
     let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let scratch = format!("classes_{}", unique("t").replace('-', "_"));
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {scratch}"))
-        .unwrap();
-    let scoped = format!("{url}?options=-csearch_path%3D{scratch}");
+    let scoped = Scratch::schema(&url, &scratch);
     let store = PostgresStore::connect(&scoped, 1).unwrap();
     store.migrate(&meridian_clock::SystemClock).unwrap();
 
@@ -630,10 +613,6 @@ fn a_free_text_class_becomes_the_enums_and_one_it_did_not_plainly_mean_is_cleare
     assert_eq!(class("INS-C"), "", "not guessed: cleared, and reported");
     assert_eq!(class("INS-D"), "");
     assert_eq!(class("INS-E"), "ASSET_CLASS_DEBT");
-
-    admin
-        .batch_execute(&format!("DROP SCHEMA {scratch} CASCADE"))
-        .unwrap();
 }
 
 #[test]
@@ -1005,15 +984,11 @@ fn every_company_version_is_kept_once_and_an_identifier_it_carried_finds_it() {
 
 /// A store over a schema of its own: its log begins with it, and a takeover
 /// raises no other test's epoch.
-fn isolated() -> (String, PostgresStore) {
+/// A store over a schema of its own, dropped with the URL's last clone
+/// (PO 65).
+fn isolated() -> (Scratch, PostgresStore) {
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
-    let schema = unique("ins_log").replace('-', "_").to_lowercase();
-    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
-    admin
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .expect("a schema of its own");
-    let joined = if url.contains('?') { "&" } else { "?" };
-    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let url = Scratch::schema(&url, &unique("ins_log").replace('-', "_").to_lowercase());
     let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&meridian_clock::SystemClock)
@@ -1346,6 +1321,93 @@ fn a_new_database_timeline_raises_a_captured_stores_epoch() {
         .unwrap()
         .get(0);
     assert_eq!(why, meridian_changes::timeline::DATABASE_TIMELINE);
+}
+
+/// PR CI 44283011761 (the lake's writer stepped down from its own raise):
+/// the store's own raise on a new database timeline is its epoch from the
+/// moment the raise can be read, and a raise whose commit fails leaves the
+/// epoch it had. Held at the raise's commit by a deferred trigger waiting
+/// on an advisory lock this test holds.
+#[test]
+fn a_raise_on_a_new_timeline_is_a_captured_stores_epoch_before_its_commit_can_be_read() {
+    use meridian_changes::timeline::Timeline;
+    let (url, store) = isolated();
+    let store = Arc::new(store);
+    let epoch = store.adopt().unwrap();
+    assert_eq!(store.follow_timeline().unwrap(), Timeline::First);
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hold: i64 = 0x6335_7234;
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE raise_fails (fails boolean NOT NULL);
+             INSERT INTO raise_fails VALUES (false);
+             CREATE FUNCTION held_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               PERFORM pg_advisory_xact_lock({hold});
+               IF (SELECT fails FROM raise_fails) THEN
+                 RAISE EXCEPTION 'the raise''s commit fails';
+               END IF;
+               RETURN NULL;
+             END $$;
+             CREATE CONSTRAINT TRIGGER held_raise AFTER UPDATE ON instrument_change_head
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+               WHEN (NEW.epoch <> OLD.epoch) EXECUTE FUNCTION held_raise();"
+        ))
+        .unwrap();
+    let moved = |admin: &mut postgres::Client, to: &str| {
+        admin
+            .execute(
+                "UPDATE instrument_change_head SET database_identity = $1 WHERE partition = 'control'",
+                &[&to],
+            )
+            .unwrap();
+    };
+    moved(&mut admin, "another/00000002");
+    admin
+        .execute("SELECT pg_advisory_lock($1)", &[&hold])
+        .unwrap();
+    let following = Arc::clone(&store);
+    let raise = std::thread::spawn(move || following.follow_timeline());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let waiting: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                   AND classid = 0 AND objid = $1::bigint::oid AND objsubid = 1",
+                &[&hold],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the raise never reached its commit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        store.epoch(),
+        epoch + 1,
+        "the raise can be read the moment it commits, and the writer's epoch was not yet its own"
+    );
+    admin
+        .execute("SELECT pg_advisory_unlock($1)", &[&hold])
+        .unwrap();
+    assert_eq!(raise.join().unwrap().unwrap(), Timeline::Moved(epoch + 1));
+    assert_eq!(store.head_epoch().unwrap(), epoch + 1);
+    // Another new timeline, its raise's commit failing: the epoch it had.
+    admin
+        .execute("UPDATE raise_fails SET fails = true", &[])
+        .unwrap();
+    moved(&mut admin, "yet another/00000003");
+    assert!(
+        store.follow_timeline().is_err(),
+        "the raise's commit failed"
+    );
+    assert_eq!(store.epoch(), epoch + 1);
+    assert_eq!(store.head_epoch().unwrap(), epoch + 1);
 }
 
 /// A record read on a read replica answers from one snapshot and says its

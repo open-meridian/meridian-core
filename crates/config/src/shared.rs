@@ -287,6 +287,30 @@ impl Store for Shared {
         said
     }
 
+    fn pend_storage_copy(&self, instance_id: &str, from_claim: &str, after_ns: i64) -> Result<()> {
+        self.inner
+            .pend_storage_copy(instance_id, from_claim, after_ns)
+    }
+
+    fn keep_ran_shared(&self, instance_id: &str) -> Result<()> {
+        self.inner.keep_ran_shared(instance_id)
+    }
+
+    fn record_storage_copied(
+        &self,
+        instance_id: &str,
+        reported_at_ns: i64,
+        at_ns: i64,
+    ) -> Result<Option<meridian_domain::v1::PluginStorageCopied>> {
+        let said = self
+            .inner
+            .record_storage_copied(instance_id, reported_at_ns, at_ns);
+        if matches!(said, Ok(Some(_))) {
+            self.changed();
+        }
+        said
+    }
+
     fn end_launch(&self, instance_id: &str, ending: &Ending) -> Result<Option<PluginLaunch>> {
         let said = self.inner.end_launch(instance_id, ending);
         self.changed();

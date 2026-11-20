@@ -16,7 +16,14 @@
   since its image, from a folder it shares with its sidecar; and storage: an
   edge plugin's shape (decisions/028), which mounts its instance's claim,
   `<fullname>-storage-<instance>`, in the plugin's container alone, at the
-  path MERIDIAN_STORAGE_DIR names.
+  path MERIDIAN_STORAGE_DIR names; and shards and standby (step 3d; the
+  resilience spec's section 7): the instance as several pods of this one
+  Deployment, one per shard and one more for a standby, each sidecar told
+  the shard count and given its instance's own account,
+  `<fullname>-shards-<instance>` -- in its own container alone, never the
+  plugin's -- to take a Lease `<instance>-shard-<n>`, made for it (item
+  31). Unset, or one shard and no standby, the instance's one pod as
+  ever, with no lease.
 
   A plugin's sidecar, one Deployment each. The plugin runs as a second
   container in this pod, because the sidecar binds loopback: a sidecar
@@ -28,6 +35,22 @@
 */}}
 {{- define "meridian-runtime.plugin" -}}
 {{- $top := .top -}}
+{{- $shards := max 1 (int (.shards | default 1)) -}}
+{{- $several := or (gt $shards 1) .standby -}}
+{{- if gt $shards 64 -}}
+{{- fail (printf "%s is given %d shards; at most 64 (PluginDeclaration.most_shards)" .instance $shards) -}}
+{{- end -}}
+{{- /* A launched instance of several pods keeping storage shares one claim,
+       its shared storage (item 30), which the launcher makes, copying the
+       instance's own claim into it first where one is kept. A sidecars[]
+       instance has no launcher to copy its own claim, so its storage stays
+       one pod's. */ -}}
+{{- if and $several .storage (not .launched) -}}
+{{- fail (printf "%s is given shards or a standby pod and its own storage: a sidecars[] instance's storage is one pod's; launch it from the catalogue to run it as several pods on shared storage (pluginStorage.shared.storageClassName)" .instance) -}}
+{{- end -}}
+{{- if and $several .live -}}
+{{- fail (printf "%s is given shards or a standby pod and the live shape: a live instance is one pod" .instance) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,14 +72,29 @@ metadata:
     meridian.dev/roles: {{ .roles | quote }}
   {{- end }}
 spec:
-  replicas: 1
+  replicas: {{ if $several }}{{ add $shards (ternary 1 0 (.standby | default false)) }}{{ else }}1{{ end }}
   revisionHistoryLimit: {{ $top.Values.revisionHistoryLimit }}
+  {{- if $several }}
+  # Several pods of the instance (step 3d), each fenced by its shard's
+  # Lease: a new pod starts beside the old as a standby, an old pod gives
+  # its Lease up as it stops, and the new one takes it -- a shard at a time,
+  # the rest serving throughout. Recreate would stop every shard and the
+  # standby together. A standby pod is never ready, by design, so it is one
+  # more that may be unavailable: with none allowed the rollout could never
+  # stop an old pod.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: {{ add 1 (ternary 1 0 (.standby | default false)) }}
+  {{- else }}
   # One copy of an instance at a time, always: a rolling update would start the
   # new pod beside the old, two plugins under one instance's name, hostname
   # and credential. The old stops first, and the page is away for the moment
   # between.
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" $top }}
@@ -79,10 +117,27 @@ spec:
         Named for its instance under the one Service every plugin shares
         (sidecars.yaml), so `{instance}.{release}-sidecars` resolves to this
         pod and nothing else: how the dashboard reaches its front door, with
-        no Service made per plugin (the registry spec, decision 4).
+        no Service made per plugin (the registry spec, decision 4). An
+        instance of several pods (step 3d) resolves to each of its shards
+        that is ready -- never its standby, whose front door is closed --
+        and a page request reaches any one of them: the instance's page is
+        its settings and its own state, the same at each; what a shard
+        keeps of the instance's subjects is its sidecar's, not its page's.
       */}}
       hostname: {{ .instance }}
       subdomain: {{ include "meridian-runtime.fullname" $top }}-sidecars
+      {{- if $several }}
+      {{- /*
+        Several pods of the instance (step 3d): each sidecar takes a shard's
+        Lease under its instance's own account, whose Role names that
+        instance's shards' Leases alone (checkpoint 5, item 31): made by the
+        launcher for a launched instance, by this chart for a sidecars[]
+        one (meridian-runtime.shardsAccount). Its token is mounted in the
+        sidecar's container alone, below; the plugin's holds none.
+      */}}
+      serviceAccountName: {{ include "meridian-runtime.fullname" $top }}-shards-{{ .instance }}
+      automountServiceAccountToken: false
+      {{- end }}
       {{- /*
         Live: the plugin (65532) and its sidecar share the live folder, each
         replacing what the other wrote, so the pod shares a group they both
@@ -172,6 +227,22 @@ spec:
               value: {{ .roles | quote }}
             - name: RUST_LOG
               value: {{ $top.Values.logLevel | quote }}
+            {{- if $several }}
+            {{- /* Its instance's shard count, this pod's name and the
+                   leases' timing (step 3d; approved 2026-11-15): it serves
+                   its plugin once a shard's Lease is its own. */}}
+            {{- include "meridian-runtime.leaseTiming" $top }}
+            - name: MERIDIAN_PLUGIN_SHARDS
+              value: {{ $shards | quote }}
+            - name: MERIDIAN_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MERIDIAN_LEASE_RENEW_SECONDS
+              value: {{ $top.Values.leases.renewSeconds | quote }}
+            - name: MERIDIAN_LEASE_DURATION_SECONDS
+              value: {{ $top.Values.leases.durationSeconds | quote }}
+            {{- end }}
             {{- /* In `ha`, a data plugin's lake writes held by the lake's
                    write-ahead stream before they are recorded (contract v30,
                    stage E); the sidecar of any other role ignores it. */}}
@@ -232,9 +303,22 @@ spec:
           ports:
             - name: front-door
               containerPort: {{ $top.Values.sidecar.frontDoorPort }}
+          {{- if $several }}
+          {{- /* A standby's front door is closed until it holds a shard:
+                 not ready, so the sidecars' Service never names it. */}}
+          readinessProbe:
+            tcpSocket:
+              port: front-door
+            periodSeconds: 2
           {{- end }}
-          {{- if or $top.Values.dashboard.enabled .live $top.Values.tls.internal.enabled }}
+          {{- end }}
+          {{- if or $top.Values.dashboard.enabled .live $top.Values.tls.internal.enabled $several }}
           volumeMounts:
+            {{- if $several }}
+            - name: member-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
             {{- if $top.Values.dashboard.enabled }}
             - name: dashboard-keys
               mountPath: /etc/meridian/dashboard-keys
@@ -292,9 +376,30 @@ spec:
           env:
             - name: MERIDIAN_SIDECAR_ADDRESS
               value: {{ $top.Values.sidecar.address | quote }}
+            {{- /*
+              Where it runs and as which account, from the downward API (PO
+              item 64): what the SDK names when the archive's bucket refuses
+              the account (item 60).
+            */}}
+            - name: MERIDIAN_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MERIDIAN_POD_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             {{- if $.live }}
             - name: MERIDIAN_LIVE_DIR
               value: /plugin/live
+            {{- end }}
+            {{- if $several }}
+            {{- /* Its instance's shard count, the value and meaning its
+                   sidecar is given (PO item 73, 2026-11-17); unset, an
+                   instance of one pod. Which shard it serves it learns at
+                   registration (RegisterReply.shard). */}}
+            - name: MERIDIAN_PLUGIN_SHARDS
+              value: {{ $shards | quote }}
             {{- end }}
             {{- if $.storage }}
             {{- /*
@@ -339,8 +444,27 @@ spec:
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
-      {{- if or .plugin $top.Values.dashboard.enabled $top.Values.tls.internal.enabled }}
+      {{- if or .plugin $top.Values.dashboard.enabled $top.Values.tls.internal.enabled $several }}
       volumes:
+        {{- if $several }}
+        - name: member-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- end }}
         {{- with (include "meridian-runtime.internalTlsVolume" $top) }}{{ . | nindent 8 }}{{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" $top "server" "sidecars")) }}{{ . | nindent 8 }}{{- end }}
@@ -357,7 +481,13 @@ spec:
         {{- if and .storage .plugin }}
         - name: storage
           persistentVolumeClaim:
+            {{- if $several }}
+            {{- /* Several pods of the instance share its storage, a folder
+                   per shard (step 3d, checkpoint 5, item 30). */}}
+            claimName: {{ include "meridian-runtime.fullname" $top }}-shared-storage-{{ .instance }}
+            {{- else }}
             claimName: {{ include "meridian-runtime.fullname" $top }}-storage-{{ .instance }}
+            {{- end }}
         {{- end }}
         {{- if $top.Values.dashboard.enabled }}
         {{- /*
@@ -370,4 +500,73 @@ spec:
             name: {{ include "meridian-runtime.fullname" $top }}-dashboard-keys
         {{- end }}
       {{- end }}
+{{- end -}}
+
+{{/*
+  A sidecars[] instance of several pods' own account (step 3d, checkpoint 5,
+  item 31), as the launcher makes a launched one's: a ServiceAccount, and a
+  Role and RoleBinding of its name, `<fullname>-shards-<instance>`, the Role
+  granting `get` and `update` on exactly the instance's shards' Leases, by
+  name -- RBAC names no prefix and cannot narrow `create` to a name -- so
+  each Lease is made here too, free, and kept: never deleted, by an upgrade
+  or an uninstall, so its leaseTransitions only grows. Takes a dict: top,
+  instance, shards (the count).
+*/}}
+{{- define "meridian-runtime.shardsAccount" -}}
+{{- $top := .top -}}
+{{- $name := printf "%s-shards-%s" (include "meridian-runtime.fullname" $top) .instance -}}
+{{- $count := int (max 1 (int (.shards | default 1))) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "update"]
+    resourceNames:
+      {{- range $shard := until $count }}
+      - {{ printf "%s-shard-%d" $.instance $shard | quote }}
+      {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/instance: {{ .instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $top.Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+{{- range $shard := until $count }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ printf "%s-shard-%d" $.instance $shard }}
+  labels:
+    meridian.dev/instance: {{ $.instance | quote }}
+    {{- include "meridian-runtime.labels" $top | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec: {}
+{{- end }}
 {{- end -}}

@@ -395,6 +395,10 @@ pub struct Book {
     /// The entries' bodies it holds (contract v26, W9.10): none in a
     /// snapshot, and after a store's build only those a decision asked for.
     pub bodies: Bodies,
+    /// The partition the account is moving to, between its move's close
+    /// and its open (step 3d; the resilience spec's section 6.8): its acts
+    /// are held until the open. None otherwise.
+    pub moved_to: Option<String>,
 }
 
 /// How an agreement is keyed: the statement's external account and segment
@@ -427,6 +431,7 @@ impl Book {
             ledger: crate::orders::Ledger::default(),
             waits_stated: false,
             bodies: Bodies::default(),
+            moved_to: None,
         }
     }
 
@@ -596,6 +601,14 @@ impl Book {
     /// read back must have the one this gives it, or the journal is not what
     /// the book wrote.
     pub fn apply(&mut self, entry: &Entry, lenient: bool) -> Result<Changes> {
+        // An account follows its entries across a move (step 3d; W9.8):
+        // each records in the partition its entry is in.
+        if !entry.partition.is_empty() && entry.partition != self.partition {
+            self.partition = entry.partition.clone();
+        }
+        // A move's close leaves the account between partitions; its open,
+        // and any entry after, in the one it is in.
+        self.moved_to = crate::journal::closes(entry);
         let body = &entry.body;
         let keys = self.touched(body);
         let mut previous: BTreeMap<Key, Exact> = BTreeMap::new();
@@ -686,6 +699,11 @@ impl Book {
             .map(|id| (id.clone(), take(self, Chain::Alert)))
             .collect();
         for _ in &touched.settings {
+            take(self, Chain::Setting);
+        }
+        // A `~control` record (step 3d; section 6.3, option (c)): one record,
+        // numbered as a setting is.
+        if body.record.is_some() {
             take(self, Chain::Setting);
         }
         let Some(first) = first else {
@@ -1106,11 +1124,41 @@ impl Book {
                 crate::orders::Act::BookingOpened { booking, .. } => {
                     if let Some(held) = self.ledger.bookings.get_mut(&booking.booking_id) {
                         held.booked_at = entry.first_sequence;
+                        // Step 3d (section 6.3): its clearing lines, and the
+                        // children it awaits in other partitions.
+                        held.clearing = (entry.entry_id.clone(), 0, entry.body.clearing.len());
+                        held.pending = entry.body.pending.clone();
+                        held.posted = entry.body.pending.is_empty();
+                        held.pending_since_ns = entry.cause.committed_at_ns;
                     }
                 }
                 crate::orders::Act::BookingReplaced { booking_id, .. } => {
                     if let Some(held) = self.ledger.bookings.get_mut(booking_id) {
                         held.booked_at = entry.first_sequence;
+                        // The version before's clearing lines reversed
+                        // first, then the new version's.
+                        let reversed = held.clearing.2.min(entry.body.clearing.len());
+                        held.clearing = (
+                            entry.entry_id.clone(),
+                            reversed,
+                            entry.body.clearing.len() - reversed,
+                        );
+                        held.pending = entry.body.pending.clone();
+                        held.posted = entry.body.pending.is_empty();
+                        held.pending_since_ns = entry.cause.committed_at_ns;
+                    }
+                }
+                crate::orders::Act::AllocationReceived {
+                    booking_id,
+                    allocation,
+                    ..
+                } => {
+                    if let Some(held) = self
+                        .ledger
+                        .received
+                        .get_mut(&(booking_id.clone(), allocation.allocation_id.clone()))
+                    {
+                        held.clearing = (entry.entry_id.clone(), 0, entry.body.clearing.len());
                     }
                 }
                 // Whose own order it is, and when it opened: the instance

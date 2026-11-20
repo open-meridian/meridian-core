@@ -17,9 +17,12 @@ pub mod lease;
 pub mod member;
 pub mod preflight;
 pub mod probe;
+pub mod provision;
 pub mod replicas;
 pub mod resilience;
 pub mod scrub;
+pub mod shards;
+pub mod sidecar_serving;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -206,6 +209,13 @@ fn wait_within<T>(
 /// minutes rather than never.
 pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
 
+// A migration waits for its schema lock no longer than this
+// (meridian_changes::take_schema_lock; review c5w3 L-c), and applied again,
+// no longer than what is left of it (migrate_once_connected; review c5s, L3).
+const _: () = assert!(
+    MIGRATION_WAITS_AT_MOST.as_secs() == meridian_changes::SCHEMA_LOCK_WAITS_AT_MOST.as_secs()
+);
+
 /// A store's schema applied: once its database answers, and then once.
 ///
 /// The migration Job starts beside everything else an upgrade changes, and on
@@ -218,7 +228,11 @@ pub const MIGRATION_WAITS_AT_MOST: Duration = Duration::from_secs(300);
 /// Only the connection. A migration that fails once it is connected fails
 /// at once: the Job runs with no retries so that a failed migration stops the
 /// release rather than being tried again into it, and waiting on one would
-/// undo that.
+/// undo that. A migration whose connection its database cut, restarting or
+/// handing its primary on, did not fail: it is waited for and applied again
+/// within the same bound (ruled 2026-11-18; c5w2's ha run, a writer-group
+/// count changed). `migrate` is given how long it may wait for its schema
+/// lock: what is left of the bound (review c5s, L3).
 ///
 /// And, on the database the chart brings, the server this release starts:
 /// one allowing the connections the release gives it ([`BROUGHT_DATABASE`]).
@@ -233,7 +247,7 @@ pub fn migrate_once_it_answers<S>(
     what: &str,
     url: &str,
     connect: impl Fn(&str) -> Result<S, String>,
-    migrate: impl FnOnce(S) -> Result<(), String>,
+    migrate: impl FnMut(S, Duration) -> Result<(), String>,
 ) -> Result<(), String> {
     let brought = brought_database();
     migrate_once_connected(
@@ -356,11 +370,58 @@ fn migrate_once_connected<S>(
     what: &str,
     at_most: Duration,
     every: Duration,
-    connect: impl FnMut() -> Result<S, Wait>,
-    migrate: impl FnOnce(S) -> Result<(), String>,
+    mut connect: impl FnMut() -> Result<S, Wait>,
+    mut migrate: impl FnMut(S, Duration) -> Result<(), String>,
 ) -> Result<(), String> {
-    let store = wait_within(what, Some(at_most), every, connect)?;
-    migrate(store)
+    let started = std::time::Instant::now();
+    loop {
+        let left = at_most.saturating_sub(started.elapsed());
+        let store = wait_within(what, Some(left), every, &mut connect)?;
+        // The schema lock waited for within what is left of the bound, so
+        // the two bounds nest (review c5s, L3): a session this migration's
+        // last attempt left holding it is waited for no longer than that.
+        let lock_waits = at_most
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1));
+        match migrate(store, lock_waits) {
+            Ok(()) => return Ok(()),
+            // Cut off by its database restarting -- an upgrade that changes
+            // the database's pod restarts it beside the migration Job (c5w2's
+            // ha run, a writer-group count changed): waited for and applied
+            // again once it answers, within the same bound, as a component
+            // waits for its schema (ruled 2026-11-18). A migration's
+            // statements commit together with its version, so one cut off
+            // left nothing applied to apply twice.
+            Err(failed) if cut_off(&failed) && started.elapsed() < at_most => {
+                tracing::warn!(
+                    %failed,
+                    "{what}: the migration was cut off by its database restarting; applied again \
+                     once it answers"
+                );
+                std::thread::sleep(every);
+            }
+            Err(failed) => return Err(failed),
+        }
+    }
+}
+
+/// Whether a migration's failure is its connection cut by its database
+/// restarting or handing its primary on, not the migration failing: what
+/// the Postgres client says of a closed connection, a server shutting down
+/// or starting, a connection ended by its administrator, or a server that
+/// is a standby now.
+fn cut_off(failed: &str) -> bool {
+    const SAID: [&str; 8] = [
+        "connection closed",
+        "error communicating with the server",
+        "terminating connection due to administrator command",
+        "the database system is shutting down",
+        "the database system is starting up",
+        "the database system is in recovery mode",
+        "server closed the connection unexpectedly",
+        "in a read-only transaction",
+    ];
+    SAID.iter().any(|said| failed.contains(said))
 }
 
 /// Whether the database at `url` answers, by one connection made and closed.
@@ -534,7 +595,10 @@ impl Ready {
     /// Serving: said once everything this component needs is there and its
     /// handlers are registered.
     pub fn serving(&self) {
-        let Some(path) = &self.0 else { return };
+        let Some(path) = &self.0 else {
+            member::set_serving(true);
+            return;
+        };
         match std::fs::write(path, b"serving\n") {
             Ok(()) => {
                 tracing::debug!(path = %path.display(), "marked ready");
@@ -546,6 +610,48 @@ impl Ready {
                 %failed,
                 "this component serves and could not say so; its readiness probe will fail"
             ),
+        }
+    }
+}
+
+impl Ready {
+    /// [`Ready::serving`], said only once `bus` holds every handler this
+    /// component has served and every subscription it has made
+    /// ([`meridian_bus::Bus::subscribed`]; step 3d, stage T). A broker's
+    /// subscriptions are made after `serve` returns: said before the broker
+    /// held them, a pod was ready, its rollout stopped the member that did
+    /// serve, and its topics were served by nobody. A bus that cannot say
+    /// so yet is asked again every second, the pod not ready meanwhile.
+    pub async fn serving_on(&self, bus: &Bus) {
+        let mut waiting = false;
+        while let Err(failed) = bus.subscribed().await {
+            if !waiting {
+                tracing::warn!(
+                    %failed,
+                    "not ready yet: the bus does not hold this component's subscriptions"
+                );
+                waiting = true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        self.serving();
+    }
+
+    /// [`Ready::serving_on`], unless this process is told to stop first
+    /// (`told`, from [`stopping`]): false then, nothing said. A writer that
+    /// holds its lease waits here for as long as the broker does not hold
+    /// its subscriptions -- a broker rolling in the same upgrade -- and,
+    /// told to stop meanwhile, goes on to give its lease up rather than be
+    /// ended where it stands (stage T's review, finding 6).
+    pub async fn serving_on_unless(
+        &self,
+        bus: &Bus,
+        told: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            _ = told.wait_for(|told| *told) => false,
+            () = self.serving_on(bus) => true,
         }
     }
 }
@@ -565,6 +671,9 @@ impl Drop for Ready {
 /// unset. Beside it, `member.json` says the member's mode, lag and
 /// partitions, which `meridian status` reads in the pod (the probe shape).
 pub fn mark_ready(serving: bool) {
+    // Said in the process too, whether or not a file says it: what the
+    // member says of itself in its store's members (stage T).
+    member::set_serving(serving);
     let Some(path) = var("MERIDIAN_READY_FILE").map(std::path::PathBuf::from) else {
         return;
     };
@@ -1112,6 +1221,48 @@ pub async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Told to stop, heard from this call on: true once either signal lands.
+///
+/// [`shutdown`] listens from when it is first polled, and each call is a
+/// new listener that has not heard a signal already delivered. A process
+/// that waits in more than one place -- a sidecar for its shard, then
+/// while it serves -- asks once here and passes the answer on, so a signal
+/// landing between two waits, or while neither is polled, is still heard
+/// (step 3d, review finding 6). Call it inside the runtime.
+pub fn stopping() -> tokio::sync::watch::Receiver<bool> {
+    let (tell, told) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // Listening before this returns, not when a task is first run.
+        let listeners = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        );
+        tokio::spawn(async move {
+            match listeners {
+                (Ok(mut term), Ok(mut int)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                }
+                _ => shutdown().await,
+            }
+            let _ = tell.send(true);
+            // Kept, so a waiter that asks later still reads it.
+            tell.closed().await;
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        shutdown().await;
+        let _ = tell.send(true);
+        tell.closed().await;
+    });
+    told
+}
+
 /// The platform, as the configuration store needs it (W5.22, W5.23), over the
 /// conductor's own client and key.
 ///
@@ -1515,6 +1666,9 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
         format!("grant usage on schema {schema} to {role}"),
         format!("grant select, insert, update, delete on all tables in schema {schema} to {role}"),
         format!("grant usage, select on all sequences in schema {schema} to {role}"),
+        // What the stores' own functions do in the owner's stead (the lake's
+        // partitions, step 3d): run by the serving role, never written.
+        format!("grant execute on all functions in schema {schema} to {role}"),
         format!(
             "alter default privileges in schema {schema} \
              grant select, insert, update, delete on tables to {role}"
@@ -1540,6 +1694,38 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// Review finding 6, shown both ways: a SIGTERM that lands while
+    /// nothing waits is heard by [`stopping`], asked once before; a
+    /// [`shutdown`] first asked after it never hears it.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_that_lands_while_nothing_waits_is_heard_by_the_one_listener_asked_before() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stop = super::stopping();
+                assert!(!*stop.borrow());
+                // SAFETY: a signal to this process, which listens for it.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                // The runtime runs on meanwhile, as it does under a look
+                // in flight: the signal is delivered to who listens now.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let late =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), super::shutdown());
+                assert!(
+                    late.await.is_err(),
+                    "a listener made after the signal heard it"
+                );
+                let heard = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    crate::shards::told(&mut stop),
+                );
+                assert!(heard.await.is_ok(), "the listener made before it did not");
+            });
+    }
+
     /// A migration waits for a primary: a server in recovery is waited past,
     /// never migrated (PR CI 43058388339, e2e-cluster-reconfigure).
     #[test]
@@ -1786,7 +1972,7 @@ mod tests {
                     Ok("connected")
                 }
             },
-            |store| {
+            |store, _| {
                 assert_eq!(store, "connected");
                 migrated.set(migrated.get() + 1);
                 Ok(())
@@ -1811,7 +1997,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Ok(())
             },
-            |()| {
+            |(), _| {
                 migrated.set(migrated.get() + 1);
                 Err("column \"note\" is of the wrong type".into())
             },
@@ -1826,6 +2012,100 @@ mod tests {
     }
 
     #[test]
+    fn a_migration_cut_off_by_its_database_restarting_is_applied_once_it_answers_again() {
+        // c5w2's ha run 2: a writer-group count changed restarted every
+        // Patroni member, and the migration, connected, was cut off ("the
+        // book is unavailable: connection closed"); the Job failed at its
+        // backoff limit. A cut connection is the database restarting, not
+        // the migration failing: it is waited for and applied again, within
+        // the same bound (ruled 2026-11-18).
+        let tried = Cell::new(0);
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            AT_MOST,
+            EVERY,
+            || {
+                tried.set(tried.get() + 1);
+                Ok(())
+            },
+            |(), _| {
+                migrated.set(migrated.get() + 1);
+                if migrated.get() == 1 {
+                    Err("the book is unavailable: connection closed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(done, Ok(()));
+        assert_eq!(
+            (tried.get(), migrated.get()),
+            (2, 2),
+            "not connected again and applied again once the database answered"
+        );
+    }
+
+    #[test]
+    fn a_migration_cut_off_again_and_again_is_given_up_on_within_its_bound() {
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            Duration::from_millis(30),
+            EVERY,
+            || Ok(()),
+            |(), _| {
+                migrated.set(migrated.get() + 1);
+                Err(
+                    "the book is unavailable: db error: FATAL: terminating connection due to \
+                     administrator command"
+                        .into(),
+                )
+            },
+        );
+        let said = done.expect_err("it tried for ever");
+        assert!(
+            said.contains("terminating connection due to administrator command"),
+            "it did not say why: {said}"
+        );
+        assert!(migrated.get() > 1, "it gave up without trying again");
+    }
+
+    /// Review c5s L3: a migration cut off near the end of its bound, applied
+    /// again, waits for the schema lock its cut-off session still holds only
+    /// for what is left of the bound, so the two bounds nest rather than add.
+    #[test]
+    fn a_migration_applied_again_waits_for_its_lock_within_what_is_left_of_its_bound() {
+        let at_most = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let migrated = Cell::new(0);
+        let done = migrate_once_connected(
+            "the database",
+            at_most,
+            EVERY,
+            || Ok(()),
+            |(), lock_waits| {
+                migrated.set(migrated.get() + 1);
+                if migrated.get() == 1 {
+                    std::thread::sleep(at_most - Duration::from_millis(200));
+                    return Err("the book is unavailable: connection closed".into());
+                }
+                // The lock the cut-off session holds, waited for as
+                // take_schema_lock does: refused once its wait is spent.
+                std::thread::sleep(lock_waits);
+                Err("the book is unavailable: canceling statement due to lock timeout".into())
+            },
+        );
+        let waited = started.elapsed();
+        assert!(done.is_err(), "the lock was taken: {done:?}");
+        assert_eq!(migrated.get(), 2, "it was not applied again");
+        assert!(
+            waited <= at_most + Duration::from_millis(500),
+            "it waited {waited:?}, past its bound of {at_most:?}"
+        );
+    }
+
+    #[test]
     fn a_database_that_never_answers_is_given_up_on() {
         let tried = Cell::new(0);
         let done = migrate_once_connected(
@@ -1836,7 +2116,7 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Err(Wait::NotYet("error connecting to server".into()))
             },
-            |()| panic!("it migrated without a connection"),
+            |(), _| panic!("it migrated without a connection"),
         );
         let said = done.expect_err("it waited for ever");
         assert!(
@@ -1858,9 +2138,79 @@ mod tests {
                 tried.set(tried.get() + 1);
                 Err(Wait::Refused("the database URL is unreadable".into()))
             },
-            |()| panic!("it migrated without a connection"),
+            |(), _| panic!("it migrated without a connection"),
         );
         assert_eq!(done, Err("the database URL is unreadable".into()));
         assert_eq!(tried.get(), 1);
+    }
+
+    /// A broker that never holds this component's subscriptions: it is
+    /// restarting, with the same upgrade.
+    struct NeverHeld(meridian_bus::MemoryBackend);
+
+    impl meridian_bus::Backend for NeverHeld {
+        fn publish(
+            &self,
+            topic: &str,
+            envelope: meridian_bus::Envelope,
+        ) -> Result<u64, meridian_bus::BusError> {
+            self.0.publish(topic, envelope)
+        }
+        fn subscribe(&self, pattern: &str) -> meridian_bus::Subscription {
+            self.0.subscribe(pattern)
+        }
+        fn subscribe_shared(&self, pattern: &str, group: &str) -> meridian_bus::Subscription {
+            self.0.subscribe_shared(pattern, group)
+        }
+        fn dropped(&self) -> u64 {
+            self.0.dropped()
+        }
+        fn subscribed(&self) -> meridian_bus::Settled<'_> {
+            Box::pin(async {
+                Err(meridian_bus::BusError::HandlerFailed {
+                    topic: "the broker".into(),
+                    detail: "it does not answer".into(),
+                })
+            })
+        }
+    }
+
+    /// Stage T's review, finding 6: a writer that holds its lease and is
+    /// still waiting on the broker to hold its subscriptions, told to stop,
+    /// stops waiting -- and goes on to give its lease up. Before, it
+    /// waited on the broker alone, and the signal ended it where it stood:
+    /// its lease lapsed, and the standby recorded a lapse.
+    #[tokio::test]
+    async fn a_member_told_to_stop_while_the_broker_holds_nothing_stops_waiting_to_serve() {
+        let bus = meridian_bus::Bus::single(
+            "bor-1",
+            std::sync::Arc::new(NeverHeld(meridian_bus::MemoryBackend::new())),
+            std::sync::Arc::new(meridian_clock::SystemClock),
+        );
+        let ready = super::Ready(None);
+        let (tell, mut told) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = tell.send(true);
+            tell.closed().await;
+        });
+        let serving = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            ready.serving_on_unless(&bus, &mut told),
+        )
+        .await;
+        assert_eq!(
+            serving,
+            Ok(false),
+            "told to stop, it stopped waiting on the broker, and never said it serves"
+        );
+        // And one never told serves once the broker holds its subscriptions.
+        let held = meridian_bus::Bus::single(
+            "bor-1",
+            std::sync::Arc::new(meridian_bus::MemoryBackend::new()),
+            std::sync::Arc::new(meridian_clock::SystemClock),
+        );
+        let (_quiet, mut never) = tokio::sync::watch::channel(false);
+        assert!(ready.serving_on_unless(&held, &mut never).await);
     }
 }

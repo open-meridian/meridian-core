@@ -28,6 +28,14 @@
       "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within) (printf "%s-database-0.%s" $full $within) (printf "%s-database-1.%s" $full $within) (printf "%s-database-2.%s" $full $within) (printf "%s-database-3.%s" $full $within))
       "broker" (list (printf "%s-broker" $full) (printf "%s-broker.%s" $full $ns) (printf "%s-broker.%s.svc" $full $ns) (printf "%s-broker.%s" $full $within) (printf "*.%s-broker-members.%s" $full $within) (printf "*.%s-broker-jetstream-members.%s" $full $within))
       "sidecars" (list (printf "*.%s-sidecars.%s" $full $within) (printf "*.%s-sidecars.%s.svc" $full $ns)) }}
+{{- /* Each database past the first the chart brings (step 3d; section 6.4)
+       is a database server too, under its own names. */}}
+{{- $databases := index $servers "database" }}
+{{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+{{- $n := $extra.name }}
+{{- $databases = concat $databases (list $n (printf "%s.%s" $n $ns) (printf "%s.%s.svc" $n $ns) (printf "%s.%s" $n $within) (printf "*.%s-members.%s" $n $within) (printf "%s-0.%s" $n $within) (printf "%s-1.%s" $n $within) (printf "%s-2.%s" $n $within) (printf "%s-3.%s" $n $within)) }}
+{{- end }}
+{{- $_ := set $servers "database" $databases }}
 ---
 # The internal CA: its certificate, which every component is given, and its
 # key, which no pod mounts.

@@ -19,6 +19,8 @@ target/
 
 # Written by `make test-store` when it fails.
 .test-store.log
+# What the test database held before `make test-store`'s run.
+.test-store-before
 .interop.log
 .interop.positions
 .e2e-book.before
@@ -53,6 +55,11 @@ meridian-backup-e2e-*/
 .e2e-failover-claims.jsonl
 .e2e-failover-history.edn
 .e2e-backup-claims.jsonl
+# The same runs' figures: private, read by a private run for the ledger with
+# figures (tools/claims.py figures). No job keeps them.
+.e2e-failover-figures.jsonl
+.e2e-backup-figures.jsonl
+.e2e-write-scale.json
 
 # Written by `make ci-local` while it runs: the gate's disk samples and stages
 # (tools/gate.py).

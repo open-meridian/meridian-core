@@ -42,6 +42,8 @@ unicode-normalization.workspace = true
 pulldown-cmark.workspace = true
 
 [dev-dependencies]
+# The schemas and databases its tests make, dropped with them (PO 65).
+meridian-changes = { path = "../changes", features = ["scratch"] }
 # The real sidecar's front door, so a test proves what it verifies.
 tonic.workspace = true
 async-trait.workspace = true

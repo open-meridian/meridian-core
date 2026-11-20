@@ -51,14 +51,61 @@ struct Held {
 pub struct MemoryStore {
     held: Mutex<Held>,
     fence: meridian_changes::Fence,
+    /// Each plugin shard's highest epoch seen (step 3d, checkpoint 5, item
+    /// 32): `lake_shard_fence`, as Postgres keeps it.
+    shards: meridian_changes::shard_fence::Memory,
+    /// A dataset whose next write is refused as another writer group's,
+    /// once, as a store whose view of a range was stale refuses it.
+    #[cfg(test)]
+    said_moved: Mutex<Option<(String, u32)>>,
+    /// A dataset whose writes are refused as held until a time, as a store
+    /// refuses a range a move is switching.
+    #[cfg(test)]
+    held_until: Mutex<Option<(String, std::time::Instant)>>,
+    /// What reading the ranges' owners again does, as a store's record
+    /// corrects a member's view.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    owners_read: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl MemoryStore {
+    /// Refuse `dataset`'s next write, once, as writer group `group`'s: what
+    /// a store does that finds its view of a range stale under the range's
+    /// lock, the request marked to be handed to that group.
+    #[cfg(test)]
+    pub(crate) fn say_moved_once(&self, dataset: &str, group: u32) {
+        *self.said_moved.lock().unwrap() = Some((dataset.to_string(), group));
+    }
+
+    /// Refuse `dataset`'s writes as held for `long` from now: what a store
+    /// does while a move switches a range of it.
+    #[cfg(test)]
+    pub(crate) fn hold_for(&self, dataset: &str, long: std::time::Duration) {
+        *self.held_until.lock().unwrap() =
+            Some((dataset.to_string(), std::time::Instant::now() + long));
+    }
+
+    /// `read` run whenever the ranges' owners are read again: the record
+    /// correcting a member's stale view.
+    #[cfg(test)]
+    pub(crate) fn on_owners_read(&self, read: impl Fn() + Send + 'static) {
+        *self.owners_read.lock().unwrap() = Some(Box::new(read));
+    }
+
     /// Hold this store's writer at `epoch`, as a deposed writer holds the
     /// one it had: what a test of the fence does.
     #[cfg(test)]
     pub(crate) fn fence_for_test(&self, epoch: u64) {
         self.fence.adopt(epoch);
+    }
+
+    /// Commit nothing more, as a writer told to stop does
+    /// ([`meridian_changes::Fence::stop`]): what a test of a stopped
+    /// writer does.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.fence.stop();
     }
 
     pub fn new() -> Self {
@@ -107,6 +154,92 @@ pub(crate) fn number(
     number_parts(vec![rows], head, now_ns, latest, previous)
         .pop()
         .unwrap_or_default()
+}
+
+/// The-lake rule 5 (step 3d; ruled 2026-11-12): a row key fixes its valid
+/// time and its first subject. A part restating a key held -- or one an
+/// earlier part of the batch keeps -- under another valid time, or another
+/// first subject that is not the record replacing or merged into it
+/// (`same_record`, which follows the alias), is refused whole, naming the
+/// field. A key's every new version keeps it, a confirmation's too (a fact
+/// a later filing repeats or restates carries its own published time in
+/// its source times, under the key's first valid time). `None` for a part
+/// that keeps the rule; a refused part's keys are not held for the parts
+/// after it.
+pub(crate) fn rule_five(
+    parts: &[Vec<Observation>],
+    mut latest: impl FnMut(&Observation) -> Option<Observation>,
+    mut same_record: impl FnMut(&str, &str) -> bool,
+) -> Vec<Option<StoreError>> {
+    // Each key's last row in the parts before, and in this part so far: by
+    // reference, one look a row (step 3d).
+    let mut kept: std::collections::HashMap<(i16, &str), &Observation> =
+        std::collections::HashMap::new();
+    parts
+        .iter()
+        .map(|rows| {
+            let mut mine: std::collections::HashMap<(i16, &str), &Observation> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let key = (row.data_type().code(), row.meta().row_key.as_str());
+                let fetched;
+                let held = match mine.get(&key).or_else(|| kept.get(&key)) {
+                    Some(held) => Some(*held),
+                    None => {
+                        fetched = latest(row);
+                        fetched.as_ref()
+                    }
+                };
+                if let Some(held) = held {
+                    let (was, is) = (held.meta().valid_from_ns, row.meta().valid_from_ns);
+                    if was != is {
+                        return Some(StoreError::KeyFixed {
+                            data_type: row.data_type(),
+                            row_key: key.1.to_string(),
+                            field: crate::store::VALID_TIME_FIELD,
+                            words: format!(
+                                "row key {:?} was recorded valid from {was} and is restated valid from {is}: a row key fixes its valid time; cancel the old key and record a new one",
+                                row.meta().row_key
+                            ),
+                        });
+                    }
+                    let (was, is) = (held.subject(), row.subject());
+                    if was != is && !same_record(was, is) {
+                        return Some(StoreError::KeyFixed {
+                            data_type: row.data_type(),
+                            row_key: key.1.to_string(),
+                            field: crate::store::FIRST_SUBJECT_FIELD,
+                            words: format!(
+                                "row key {:?} was recorded about {was} and is restated about {is}: a row key fixes its first subject; cancel the old key and record a new one",
+                                row.meta().row_key
+                            ),
+                        });
+                    }
+                }
+                mine.insert(key, row);
+            }
+            kept.extend(mine);
+            None
+        })
+        .collect()
+}
+
+/// Whether two subjects name one record: either replaced by, or merged
+/// into, the other, followed through `aliases` (replaced to the one that
+/// stays) as the lake follows a placeholder's replacement.
+pub(crate) fn same_record(aliases: &BTreeMap<String, String>, was: &str, is: &str) -> bool {
+    let reaches = |from: &str, to: &str| {
+        let mut at = from;
+        for _ in 0..64 {
+            match aliases.get(at) {
+                Some(next) if next == to => return true,
+                Some(next) => at = next,
+                None => return false,
+            }
+        }
+        false
+    };
+    was == is || reaches(was, is) || reaches(is, was)
 }
 
 /// [`number`], for several batches of one dataset numbered in turn as one
@@ -205,11 +338,62 @@ pub(crate) fn as_of(
 }
 
 impl Store for MemoryStore {
+    /// One group's store: no part of a write is another group's.
+    fn write_ahead_refused(&self, _: &str, _: u32, _: u64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn read_owners_again(&self) -> Result<()> {
+        // One store, no ranges' rows to read: a test's stand-in for them.
+        #[cfg(test)]
+        if let Some(read) = self.owners_read.lock().unwrap().as_ref() {
+            read();
+        }
+        Ok(())
+    }
+
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        #[cfg(test)]
+        {
+            let mut said = self.said_moved.lock().unwrap();
+            if said.as_ref().is_some_and(|(moved, _)| moved == dataset) {
+                let (partition, group) = said.take().unwrap();
+                meridian_bus::owners::hand_to(group);
+                return Err(StoreError::NotOwned { partition, group });
+            }
+            let held = self.held_until.lock().unwrap();
+            if held.as_ref().is_some_and(|(moving, until)| {
+                moving == dataset && std::time::Instant::now() < *until
+            }) {
+                return Err(StoreError::Held(format!(
+                    "range {dataset} is switching to another writer group: ask again in a moment"
+                )));
+            }
+        }
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);
         let stored = held.rows.clone();
+        let latest_held = |row: &Observation| {
+            stored
+                .iter()
+                .filter(|h| {
+                    h.dataset() == dataset
+                        && h.data_type() == row.data_type()
+                        && h.meta().row_key == row.meta().row_key
+                })
+                .max_by_key(|h| h.meta().version)
+                .cloned()
+        };
+        let aliases = held.aliases.clone();
+        if let Some(Some(refused)) =
+            rule_five(std::slice::from_ref(&rows), latest_held, |was, is| {
+                same_record(&aliases, was, is)
+            })
+            .pop()
+        {
+            return Err(refused);
+        }
         let done = number(
             rows,
             &mut head,
@@ -247,11 +431,108 @@ impl Store for MemoryStore {
         Ok(done)
     }
 
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        shards: &[Option<crate::store::ShardStamp>],
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>> {
+        // Each part's plugin shard's epoch checked first, as Postgres checks
+        // it in the parts' transaction (step 3d, checkpoint 5, item 32).
+        let stamps: Vec<_> = (0..parts.len())
+            .map(|at| crate::store::shard_at(shards, at))
+            .collect();
+        let fenced = self.shards.check(&stamps);
+        parts
+            .into_iter()
+            .zip(fenced)
+            .map(|(rows, fenced)| match fenced {
+                Err(fenced) => Err(StoreError::ShardFenced(fenced)),
+                Ok(()) => self.record(dataset, rows, now_ns),
+            })
+            .collect()
+    }
+
     fn write_ahead_position(&self, stream: &str) -> Result<Option<WriteAheadPosition>> {
         Ok(self.lock().write_ahead.get(stream).copied())
     }
 
-    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let mut held = self.lock();
+        if held.write_ahead.contains_key(to) {
+            return Ok(false);
+        }
+        let Some(at) = held.write_ahead.get(from).copied() else {
+            return Ok(false);
+        };
+        if at.at_ns < made_ns {
+            return Ok(false);
+        }
+        held.write_ahead.insert(to.to_string(), at);
+        if let Some(runs) = held.dropped.get(from).cloned() {
+            held.dropped.insert(to.to_string(), runs);
+        }
+        let times: Vec<(String, i64)> = held
+            .valid
+            .iter()
+            .filter(|((stream, _), _)| stream == from)
+            .map(|((_, dataset), valid)| (dataset.clone(), *valid))
+            .collect();
+        for (dataset, valid) in times {
+            held.valid.insert((to.to_string(), dataset), valid);
+        }
+        Ok(true)
+    }
+
+    fn take_shard(
+        &self,
+        mut took: meridian_domain::v1::ShardTookOver,
+        taking: &meridian_changes::shard_fence::Taking,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        let mut held = self.lock();
+        // Checked before anything is raised, as Postgres checks it.
+        self.fenced(&mut held)?;
+        took.epoch = self
+            .shards
+            .take(&took.instance, took.shard, taking)
+            .map_err(|behind| crate::postgres::take_behind(&took, taking, behind))?;
+        Ok(took)
+    }
+
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        use prost::Message as _;
+        let mut held = self.lock();
+        let entry = (
+            crate::store::CONTROL_SHARD_TOOK_OVER,
+            took.encode_to_vec(),
+            took.took_over_at_ns,
+        );
+        self.log_control(&mut held, vec![entry])
+    }
+
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
+    ) -> Result<u64> {
+        Ok(self
+            .shards
+            .raise_admitting(instance, shard, epoch, admit.unwrap_or_default()))
+    }
+
+    fn reseat_shards(&self) -> Result<usize> {
+        // One store, which numbers the takes itself: its own epochs.
+        Ok(0)
+    }
+
+    fn record_write_ahead(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let at = held.write_ahead.get(&batch.stream).copied();
@@ -261,15 +542,58 @@ impl Store for MemoryStore {
                 batch.stream, batch.after
             )));
         }
-        let mut answered = vec![Recorded::default(); batch.parts.len()];
+        let mut answered: Vec<Result<Recorded>> = batch
+            .parts
+            .iter()
+            .map(|_| Ok(Recorded::default()))
+            .collect();
         let mut by_dataset: BTreeMap<String, Vec<(usize, Vec<Observation>)>> = BTreeMap::new();
-        for (at, (dataset, rows)) in batch.parts.into_iter().enumerate() {
+        // Each part's plugin shard's epoch checked first (step 3d,
+        // checkpoint 5, item 32): a part under a lower one refused alone.
+        let stamps: Vec<_> = (0..batch.parts.len())
+            .map(|at| crate::store::shard_at(&batch.shards, at))
+            .collect();
+        let fenced = self.shards.check(&stamps);
+        for (at, ((dataset, rows), fenced)) in batch.parts.into_iter().zip(fenced).enumerate() {
+            if let Err(fenced) = fenced {
+                answered[at] = Err(StoreError::ShardFenced(fenced));
+                continue;
+            }
             by_dataset.entry(dataset).or_default().push((at, rows));
         }
         for (dataset, parts) in by_dataset {
             let mut head = held.heads.get(&dataset).copied().unwrap_or(0);
             let stored = &held.rows;
             let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = parts.into_iter().unzip();
+            // The-lake rule 5: a part restating a key's valid time or first
+            // subject refused alone (step 3d).
+            let refused = rule_five(
+                &rows,
+                |row| {
+                    stored
+                        .iter()
+                        .filter(|h| {
+                            h.dataset() == dataset
+                                && h.data_type() == row.data_type()
+                                && h.meta().row_key == row.meta().row_key
+                        })
+                        .max_by_key(|h| h.meta().version)
+                        .cloned()
+                },
+                |was, is| same_record(&held.aliases, was, is),
+            );
+            let (places, rows): (Vec<usize>, Vec<Vec<Observation>>) = places
+                .into_iter()
+                .zip(rows)
+                .zip(refused)
+                .filter_map(|((place, rows), refused)| match refused {
+                    Some(refused) => {
+                        answered[place] = Err(refused);
+                        None
+                    }
+                    None => Some((place, rows)),
+                })
+                .unzip();
             let done = number_parts(
                 rows,
                 &mut head,
@@ -305,7 +629,7 @@ impl Store for MemoryStore {
                         .insert((dataset.clone(), row.meta().sequence), epoch);
                 }
                 held.rows.extend(done.rows.iter().cloned());
-                answered[place] = done;
+                answered[place] = Ok(done);
             }
         }
         held.dropped
@@ -398,8 +722,12 @@ impl Store for MemoryStore {
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&crate::store::ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded> {
+        if let Some(Err(fenced)) = self.shards.check(&[shard]).pop() {
+            return Err(StoreError::ShardFenced(fenced));
+        }
         let mut held = self.lock();
         let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);
@@ -442,19 +770,30 @@ impl Store for MemoryStore {
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let held = self.lock();
-        let by_place: BTreeMap<(&str, u64), &Observation> = held
+        let by_place: BTreeMap<(&str, u64, u32), &Observation> = held
             .rows
             .iter()
             .filter(|row| row.data_type() == data_type)
-            .map(|row| ((row.dataset(), row.meta().sequence), row))
+            .map(|row| {
+                (
+                    (
+                        row.dataset(),
+                        row.meta().sequence,
+                        crate::range::key_hash(&row.meta().row_key),
+                    ),
+                    row,
+                )
+            })
             .collect();
         let mut out: Vec<Observation> = places
             .iter()
-            .filter_map(|(dataset, sequence)| by_place.get(&(dataset.as_str(), *sequence)))
+            .filter_map(|(dataset, sequence, key_hash)| {
+                by_place.get(&(dataset.as_str(), *sequence, *key_hash))
+            })
             .map(|row| (*row).clone())
             .collect();
         as_flagged(&mut out, &held.amendments, as_of_ns);

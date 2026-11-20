@@ -265,9 +265,10 @@ fn plugin_row(
             .iter()
             .map(|l| {
                 format!(
-                    "<span title=\"{i}\">{v}</span>",
+                    "<span title=\"{i}\">{v}</span>{pods}",
                     i = escape(&l.instance_id),
-                    v = escape(&l.version)
+                    v = escape(&l.version),
+                    pods = pods_said(l),
                 )
             })
             .collect::<Vec<_>>()
@@ -701,6 +702,77 @@ pub(super) async fn launch_sheet(
     }
 }
 
+/// The Launch sheet's Pods (contract v30, W8.3): Shards only where the
+/// version declares more than one, at most its most_shards, beside a
+/// standby pod for any, on one line under the Limits. Which roles may be
+/// sharded is the conductor's to refuse, naming shards. Neither is
+/// offered where the deployment renders no lease right for several pods
+/// of an instance (no store runs a standby): what cannot be launched is
+/// not asked for. A refusal naming shards or the standby pod is shown
+/// under them, in place of the hint (it says the bound), or alone where
+/// nothing is offered (a launch not sent from this sheet).
+fn pods_group(
+    most: u32,
+    lease_right: Option<bool>,
+    entered: &Entered,
+    refused_shards: Option<&str>,
+) -> String {
+    let refused = refused_shards.map_or(String::new(), |words| {
+        format!(
+            "<p class=\"field-refused\" id=\"shards-refused\" role=\"alert\" data-refused=\"shards\">{}</p>",
+            escape(words)
+        )
+    });
+    let group = |inside: String| {
+        format!("<div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods>{inside}</div>")
+    };
+    if lease_right == Some(false) {
+        return if refused.is_empty() {
+            String::new()
+        } else {
+            group(refused)
+        };
+    }
+    let (hint, shards) = if most > 1 {
+        (
+            if refused_shards.is_some() {
+                String::new()
+            } else {
+                format!("<p class=\"hint\">At most {most} shards; empty runs one pod.</p>")
+            },
+            format!(
+                "<label class=\"num\">Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
+                 inputmode=\"numeric\" value=\"{value}\"{invalid}></label>",
+                value = escape(&entered.shards),
+                invalid = if refused_shards.is_some() {
+                    " aria-invalid=\"true\" aria-describedby=\"shards-refused\" autofocus"
+                } else {
+                    ""
+                },
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    group(format!(
+        "{shards}<label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label>{refused}{hint}",
+        standby = if entered.standby { " checked" } else { "" },
+    ))
+}
+
+/// An instance's pods as its launch asked them, beside its version: its
+/// shards where more than one, and its standby pod -- which is never
+/// ready, by design, and is read as a standby, not as a pod that is down.
+fn pods_said(launch: &PluginLaunch) -> String {
+    let said = match (launch.shards, launch.standby) {
+        (shards, true) if shards > 1 => format!("{shards} shards + standby pod"),
+        (shards, false) if shards > 1 => format!("{shards} shards"),
+        (_, true) => "+ standby pod".to_string(),
+        (_, false) => return String::new(),
+    };
+    format!(" <span class=\"faint\">{said}</span>")
+}
+
 /// The Launch sheet for one version, with what was entered and a refusal
 /// shown at the field it names; None where the version is not installed.
 fn draw_launch_sheet(
@@ -733,39 +805,12 @@ fn draw_launch_sheet(
             .find(|id| !taken.contains(&id.as_str()))
             .unwrap_or_default()
     });
-    // Its pods (contract v30, W8.3): Shards only where the version declares
-    // more than one, at most its most_shards, beside a standby pod for any,
-    // on one line under the Limits; a refusal naming shards under them, in
-    // place of the hint (it says the bound), or alone where the version
-    // offers no Shards (a launch not sent from this sheet).
-    let most = most_shards(version);
-    let refused = refused_shards.map_or(String::new(), |words| {
-        format!(
-            "<p class=\"field-refused\" id=\"shards-refused\" role=\"alert\" data-refused=\"shards\">{}</p>",
-            escape(words)
-        )
-    });
-    let (hint, shards) = if most > 1 {
-        (
-            if refused_shards.is_some() {
-                String::new()
-            } else {
-                format!("<p class=\"hint\">At most {most} shards; empty runs one pod.</p>")
-            },
-            format!(
-                "<label class=\"num\">Shards <input type=\"number\" name=\"shards\" min=\"1\" max=\"{most}\" step=\"1\" \
-                 inputmode=\"numeric\" value=\"{value}\"{invalid}></label>",
-                value = escape(&entered.shards),
-                invalid = if refused_shards.is_some() {
-                    " aria-invalid=\"true\" aria-describedby=\"shards-refused\" autofocus"
-                } else {
-                    ""
-                },
-            ),
-        )
-    } else {
-        (String::new(), String::new())
-    };
+    let pods = pods_group(
+        most_shards(version),
+        super::lease_right(),
+        entered,
+        refused_shards,
+    );
     let page = format!(
         "<section class=\"sheet-dialog\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">Launch {n} {v}</h1>\
          <dl class=\"facts\"><dt>Source</dt><dd>{source}</dd><dt>Roles approved</dt><dd>{r}</dd></dl>\
@@ -778,8 +823,7 @@ fn draw_launch_sheet(
          <label class=\"num\">Requests a second <input type=\"number\" name=\"requests_per_second\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{per_second}\"></label>\
          <label class=\"num\">Answers in flight, MiB <input type=\"number\" name=\"answer_mib\" min=\"1\" step=\"1\" inputmode=\"numeric\" value=\"{answer_mib}\"></label>\
          </fieldset>\
-         <div class=\"pods\" role=\"group\" aria-label=\"Pods\" data-pods>{shards}\
-         <label><input type=\"checkbox\" name=\"standby\"{standby}> Standby pod</label>{refused}{hint}</div>\
+         {pods}\
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{back}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">Launch</button></div></form></section>",
         n = escape(name),
@@ -794,7 +838,6 @@ fn draw_launch_sheet(
         in_flight = escape(&entered.in_flight),
         per_second = escape(&entered.requests_per_second),
         answer_mib = escape(&entered.answer_mib),
-        standby = if entered.standby { " checked" } else { "" },
         back = escape(&versions_path(name)),
     );
     Some(Html(crate::html::page_with(
@@ -879,7 +922,7 @@ pub(super) async fn launch(
     )
     .await;
     match launched {
-        Err((named, refused)) if named.iter().any(|f| f == "shards") => {
+        Err((named, refused)) if named.iter().any(|f| f == "shards" || f == "standby") => {
             launch_sheet_refused(&app, &session, &name, &version, &fields, refused).await
         }
         launched => to_versions(
@@ -1097,6 +1140,69 @@ pub fn pulled_said(listing: &ListedVersion) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruled 2026-11-15 (the review of 95d68904, S4; item 34): the Launch
+    /// sheet offers shards where the version declares more than one, and
+    /// neither shards nor a standby pod where the deployment renders no
+    /// lease right for them. A refusal naming either is still shown.
+    #[test]
+    fn the_sheet_offers_pods_only_where_the_deployment_can_run_them() {
+        let entered = Entered::default();
+        // A version of four shards, the lease right rendered or unsaid.
+        for lease_right in [Some(true), None] {
+            let drawn = pods_group(4, lease_right, &entered, None);
+            assert!(
+                drawn.contains("name=\"shards\" min=\"1\" max=\"4\""),
+                "{drawn}"
+            );
+            assert!(drawn.contains("name=\"standby\""), "{drawn}");
+        }
+        // One declaring none: a standby pod, no Shards.
+        let drawn = pods_group(0, Some(true), &entered, None);
+        assert!(!drawn.contains("name=\"shards\""), "{drawn}");
+        assert!(drawn.contains("name=\"standby\""), "{drawn}");
+        // No lease right: neither is offered.
+        for most in [0, 4] {
+            assert_eq!(pods_group(most, Some(false), &entered, None), "");
+        }
+        // A refusal is shown wherever it came from.
+        let drawn = pods_group(4, Some(false), &entered, Some("standby was asked"));
+        assert!(
+            drawn.contains("role=\"alert\"") && drawn.contains("standby was asked"),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("<input"), "{drawn}");
+    }
+
+    /// A standby pod is never ready, by design: an instance launched with
+    /// one, or with shards, says so beside its version, so its pods are
+    /// read as what was asked.
+    #[test]
+    fn an_instance_s_shards_and_standby_pod_are_said_beside_its_version() {
+        let launch = |shards, standby| PluginLaunch {
+            shards,
+            standby,
+            ..Default::default()
+        };
+        assert_eq!(pods_said(&launch(0, false)), "");
+        assert_eq!(pods_said(&launch(1, false)), "");
+        assert_eq!(
+            pods_said(&launch(1, true)),
+            " <span class=\"faint\">+ standby pod</span>"
+        );
+        assert_eq!(
+            pods_said(&launch(0, true)),
+            " <span class=\"faint\">+ standby pod</span>"
+        );
+        assert_eq!(
+            pods_said(&launch(3, false)),
+            " <span class=\"faint\">3 shards</span>"
+        );
+        assert_eq!(
+            pods_said(&launch(3, true)),
+            " <span class=\"faint\">3 shards + standby pod</span>"
+        );
+    }
 
     #[test]
     fn versions_sort_newest_first_by_semver_with_a_prerelease_below_its_release() {

@@ -1452,7 +1452,72 @@ async fn the_deployments_accounts_are_read_for_a_deployment_admin_with_what_desc
             None,
         )
         .await;
-    assert!(for_nobody.is_err(), "for nobody, nothing is answered");
+    let refused = for_nobody
+        .expect_err("for nobody, nothing is answered")
+        .to_string();
+    assert!(refused.contains("permission-denied"), "{refused}");
+}
+
+/// The book reads every account's record as itself, to place a new one by
+/// its owner label (step 3d; ReadAccountsForPlacement, ruled 2026-11-13):
+/// told by the bus identity it arrived on. The same unscoped read from any
+/// other instance is refused PERMISSION_DENIED.
+#[tokio::test]
+async fn the_book_reads_every_account_as_itself_and_no_one_else_reads_them_for_nobody() {
+    assert_eq!(
+        crate::service::book_beside("meridian-runtime-conductor").as_deref(),
+        Some("meridian-runtime-bor")
+    );
+    assert_eq!(
+        crate::service::book_beside("conductor-1").as_deref(),
+        Some("bor-1")
+    );
+    assert_eq!(crate::service::book_beside("dashboard-1"), None);
+    for (instance, answered) in [
+        (crate::service::BOOK, true),
+        ("oms-1", false),
+        ("snaptrade-1", false),
+    ] {
+        let h = harness(instance);
+        let fund = define(
+            &h,
+            DefineAccountRequest {
+                name: "Growth".into(),
+                owner: "Fund I".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let plain = account(&h, "Income").await;
+        let asked = h
+            .bus
+            .call(
+                ACCOUNTS,
+                "meridian.v1.AccountsRequest",
+                AccountsRequest {}.encode_to_vec(),
+                None,
+                None,
+            )
+            .await;
+        if answered {
+            let (_, bytes) = asked.expect("the book reads as itself");
+            let read = Accounts::decode(&bytes[..]).unwrap();
+            assert_eq!(
+                read.accounts,
+                [fund.clone(), plain.clone()],
+                "every account, owner included"
+            );
+        } else {
+            let refused = asked
+                .expect_err("an unscoped read from another instance")
+                .to_string();
+            assert!(
+                refused.contains("permission-denied"),
+                "{instance}: {refused}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1707,6 +1772,64 @@ async fn reported_by(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("the report was not kept");
+}
+
+/// Review c5c L8: the conductor's trigger of the copy's record. oms-1's
+/// launch copied its own claim, the launcher answering at 50: a report from
+/// another publisher about it records nothing, nor one not registered; its
+/// own sidecar's registered report records it once, on the launch that
+/// copied (item 30).
+#[tokio::test]
+async fn a_registered_report_from_its_own_sidecar_records_the_copy() {
+    let h = harness("conductor-1");
+    let launch = meridian_domain::v1::PluginLaunch {
+        instance_id: "oms-1".into(),
+        name: "oms".into(),
+        version: "0.1.0".into(),
+        launched_by: "local|ada".into(),
+        launched_at_ns: 10,
+        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+        ..Default::default()
+    };
+    assert!(h.store.begin_launch(&launch, "").unwrap());
+    h.store
+        .pend_storage_copy("oms-1", "check-meridian-runtime-storage-oms-1", 50)
+        .unwrap();
+    let copied = || {
+        h.store
+            .launches()
+            .unwrap()
+            .into_iter()
+            .find(|held| held.instance_id == "oms-1")
+            .unwrap()
+            .storage_copied
+    };
+    reported_by(&h, "street", true, declared(), 60).await;
+    reported(&h, false, declared(), 70).await;
+    assert_eq!(copied(), None, "not its own sidecar's, or not registered");
+    reported(&h, true, declared(), 80).await;
+    // Written just after the report is kept.
+    for _ in 0..200 {
+        if copied().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let held = copied().expect("recorded once its own sidecar is heard registered");
+    assert_eq!(
+        (
+            held.from_claim.as_str(),
+            held.to_claim.as_str(),
+            held.launched_by.as_str()
+        ),
+        (
+            "check-meridian-runtime-storage-oms-1",
+            "check-meridian-runtime-shared-storage-oms-1",
+            "local|ada"
+        )
+    );
+    reported(&h, true, declared(), 90).await;
+    assert_eq!(copied(), Some(held), "once");
 }
 
 /// Set as the dashboard's form does: against the record as it was read
@@ -4061,6 +4184,7 @@ async fn a_relaunched_instance_is_held_to_its_running_version_s_uploaded_declara
             "meridian.v1.CreatePluginReply".into(),
             CreatePluginReply {
                 workload: "plugin-oms-1".into(),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
@@ -4278,4 +4402,270 @@ async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
     assert_eq!(back.version, 3);
     assert_eq!(back.routes[1].implementation, "built-in");
     assert_eq!(h.store.model_routing_changes().unwrap().len(), 2);
+}
+
+/// Item 30: the storage copy's record, on the memory store (the Postgres
+/// store's in tests/postgres.rs).
+mod storage_copied {
+    use crate::store::{Ending, Store};
+    use meridian_domain::v1::{PluginLaunch, PluginLaunchState};
+
+    fn launch(instance: &str) -> PluginLaunch {
+        PluginLaunch {
+            instance_id: instance.into(),
+            name: "snaptrade".into(),
+            version: "0.1.0".into(),
+            state: PluginLaunchState::Launched as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Item 30 (approved 2026-11-17, item 68): the launcher's copy of an
+    /// instance's own claim into its shared storage is recorded once a pod of
+    /// it is heard registered after the launcher answered -- its pods start
+    /// only once the copy is whole -- as `PluginStorageCopied`, on the launch
+    /// that copied, once per launch that copied: an earlier pod's report
+    /// records nothing, a later report nothing again, nor a later launch the
+    /// launcher said copied none, having found it copied. A second copy, into a
+    /// shared claim made again, is recorded on its own launch; and a copy whose
+    /// launch stopped before a pod was heard is recorded on that launch, by
+    /// its launcher, once a later launch's pod is heard (review c5c L6).
+    fn a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+        store: &dyn Store,
+    ) {
+        use meridian_domain::v1::PluginStorageCopied;
+        let mut launch = launch("feed-1");
+        launch.launched_by = "local|ada".into();
+        launch.launched_at_ns = 10;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        assert_eq!(
+            store.record_storage_copied("feed-1", 100, 100).unwrap(),
+            None
+        );
+        store
+            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 50)
+            .unwrap();
+        assert_eq!(
+            store.record_storage_copied("feed-1", 50, 60).unwrap(),
+            None,
+            "a report from before the launcher answered is an earlier pod's"
+        );
+        let copied = PluginStorageCopied {
+            instance_id: "feed-1".into(),
+            from_claim: "check-meridian-runtime-storage-feed-1".into(),
+            to_claim: "check-meridian-runtime-shared-storage-feed-1".into(),
+            at_ns: 70,
+            launched_by: "local|ada".into(),
+        };
+        assert_eq!(
+            store.record_storage_copied("feed-1", 51, 70).unwrap(),
+            Some(copied.clone())
+        );
+        assert_eq!(
+            store.record_storage_copied("feed-1", 80, 90).unwrap(),
+            None,
+            "once"
+        );
+        let on = |store: &dyn Store, at: i64| {
+            store
+                .launches()
+                .unwrap()
+                .into_iter()
+                .find(|held| held.instance_id == "feed-1" && held.launched_at_ns == at)
+                .unwrap()
+                .storage_copied
+        };
+        assert_eq!(on(store, 10), Some(copied.clone()));
+        // Stopped and launched again, the copy pod found done: the launcher
+        // says none, and nothing more is recorded.
+        let stop = Ending {
+            prepared_call_id: Default::default(),
+            state: PluginLaunchState::Stopped,
+            by: "local|ada".into(),
+            delegation: String::new(),
+            client: String::new(),
+            note: String::new(),
+            at_ns: 150,
+            failure: String::new(),
+        };
+        store.end_launch("feed-1", &stop).unwrap().unwrap();
+        launch.launched_at_ns = 200;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        assert_eq!(
+            store.record_storage_copied("feed-1", 220, 230).unwrap(),
+            None
+        );
+        assert_eq!(on(store, 200), None);
+        assert_eq!(on(store, 10), Some(copied.clone()));
+        // Its shared claim made again, the copy made again: recorded on its
+        // own launch.
+        let stopped_at = |at_ns: i64| Ending {
+            at_ns,
+            ..stop.clone()
+        };
+        store
+            .end_launch("feed-1", &stopped_at(250))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 300;
+        launch.launched_by = "local|bo".into();
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-1", "check-meridian-runtime-storage-feed-1", 310)
+            .unwrap();
+        let again = PluginStorageCopied {
+            at_ns: 330,
+            launched_by: "local|bo".into(),
+            ..copied.clone()
+        };
+        assert_eq!(
+            store.record_storage_copied("feed-1", 320, 330).unwrap(),
+            Some(again.clone())
+        );
+        assert_eq!(on(store, 300), Some(again));
+        assert_eq!(on(store, 10), Some(copied));
+        // A launch that copied, stopped before a pod of it was heard; the next
+        // finds it copied: recorded on the launch that copied, by its launcher,
+        // once the next one's pod is heard.
+        launch.instance_id = "feed-2".into();
+        launch.launched_at_ns = 10;
+        launch.launched_by = "local|ada".into();
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-2", "check-meridian-runtime-storage-feed-2", 50)
+            .unwrap();
+        store
+            .end_launch("feed-2", &stopped_at(60))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 100;
+        launch.launched_by = "local|bo".into();
+        // As several pods: on the shared storage, so its pod is heard only once
+        // the marker is there.
+        launch.shards = 2;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        let theirs = store.record_storage_copied("feed-2", 120, 130).unwrap();
+        assert_eq!(
+            theirs.as_ref().map(|c| (c.launched_by.as_str(), c.at_ns)),
+            Some(("local|ada", 130))
+        );
+        let on_2 = |at: i64| {
+            store
+                .launches()
+                .unwrap()
+                .into_iter()
+                .find(|held| held.instance_id == "feed-2" && held.launched_at_ns == at)
+                .unwrap()
+                .storage_copied
+        };
+        assert_eq!(on_2(10), theirs);
+        assert_eq!(on_2(100), None);
+        // A launch that copied, whose copy never wrote the marker, stopped; the
+        // next as one pod, on its own claim: its pod heard says nothing of the
+        // copy, so none is recorded (item 89, review c5c86 L3).
+        launch.instance_id = "feed-3".into();
+        launch.launched_at_ns = 10;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        store
+            .pend_storage_copy("feed-3", "check-meridian-runtime-storage-feed-3", 50)
+            .unwrap();
+        store
+            .end_launch("feed-3", &stopped_at(60))
+            .unwrap()
+            .unwrap();
+        launch.launched_at_ns = 100;
+        launch.shards = 0;
+        assert!(store.begin_launch(&launch, "").unwrap());
+        assert_eq!(
+            store.record_storage_copied("feed-3", 120, 130).unwrap(),
+            None,
+            "a later launch of one pod"
+        );
+    }
+
+    /// Review c5c89 M4 and PO item 91 (2026-11-17): only a later launch that
+    /// ran on the instance's own claim keeps an earlier launch's copy
+    /// unrecorded. One that failed ran nothing, and one that ran as one shard on
+    /// the shared storage (`ran_shared`) waited for the copy: the copy is
+    /// recorded once a pod is heard, and once only.
+    fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(store: &dyn Store) {
+        let ended = |at_ns: i64, state: PluginLaunchState| Ending {
+            prepared_call_id: Default::default(),
+            state,
+            by: "local|ada".into(),
+            delegation: String::new(),
+            client: String::new(),
+            note: String::new(),
+            at_ns,
+            failure: if state == PluginLaunchState::Failed {
+                "refused".into()
+            } else {
+                String::new()
+            },
+        };
+        let copied_by = |instance: &str, later: &dyn Fn(&dyn Store)| {
+            let mut first = launch(instance);
+            first.launched_by = "local|ada".into();
+            first.launched_at_ns = 10;
+            first.shards = 2;
+            assert!(store.begin_launch(&first, "").unwrap());
+            store
+                .pend_storage_copy(
+                    instance,
+                    &format!("check-meridian-runtime-storage-{instance}"),
+                    50,
+                )
+                .unwrap();
+            store
+                .end_launch(instance, &ended(60, PluginLaunchState::Stopped))
+                .unwrap()
+                .unwrap();
+            let mut next = launch(instance);
+            next.launched_by = "local|bo".into();
+            next.launched_at_ns = 100;
+            next.shards = 0;
+            assert!(store.begin_launch(&next, "").unwrap());
+            later(store);
+            store
+                .record_storage_copied(instance, 120, 130)
+                .unwrap()
+                .map(|copied| (copied.launched_by, copied.at_ns))
+        };
+        // A later launch of one pod that failed.
+        assert_eq!(
+            copied_by("feed-4", &|store| {
+                store
+                    .end_launch("feed-4", &ended(110, PluginLaunchState::Failed))
+                    .unwrap()
+                    .unwrap();
+            }),
+            Some(("local|ada".to_string(), 130)),
+            "a failed later launch ran nothing"
+        );
+        // A later launch of one pod, run as one shard on the shared storage.
+        assert_eq!(
+            copied_by("feed-5", &|store| store.keep_ran_shared("feed-5").unwrap()),
+            Some(("local|ada".to_string(), 130)),
+            "a later launch on the shared storage"
+        );
+        assert_eq!(
+            store.record_storage_copied("feed-5", 140, 150).unwrap(),
+            None,
+            "once"
+        );
+        // A later launch of one pod on its own claim: nothing.
+        assert_eq!(copied_by("feed-6", &|_| {}), None, "on its own claim");
+    }
+
+    #[test]
+    fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_memory() {
+        only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded(&crate::MemoryStore::new());
+    }
+
+    #[test]
+    fn the_storage_copy_is_recorded_once_in_memory() {
+        a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(
+            &crate::MemoryStore::new(),
+        );
+    }
 }

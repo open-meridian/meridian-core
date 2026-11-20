@@ -14,7 +14,9 @@
   or configured. Its volumes may be what holds nothing durable -- an
   emptyDir, a ConfigMap, a Secret, a projected or downward-API volume, which
   a cluster's own admission (a service account's token, a mesh's proxy) may
-  add -- or the claim `<fullname>-storage-<its instance>`. A claim of any
+  add -- or the claim `<fullname>-storage-<its instance>`, or, for an
+  instance of several pods, `<fullname>-shared-storage-<its instance>`, the
+  storage its pods share (step 3d, checkpoint 5, item 30). A claim of any
   other name, a host path, an ephemeral claim or any other volume source is
   refused, and so is its own claim on a pod whose sidecar holds no edge role.
 
@@ -42,6 +44,10 @@ spec:
       expression: >-
         '{{ $full }}-storage-' +
         object.metadata.labels[?"meridian.dev/instance"].orValue("")
+    - name: shared
+      expression: >-
+        '{{ $full }}-shared-storage-' +
+        object.metadata.labels[?"meridian.dev/instance"].orValue("")
     - name: archive
       expression: >-
         {{ $archive | squote }}
@@ -61,6 +67,7 @@ spec:
           has(v.emptyDir) || has(v.configMap) || has(v.secret) ||
           has(v.projected) || has(v.downwardAPI) ||
           (has(v.persistentVolumeClaim) && (v.persistentVolumeClaim.claimName == variables.claim ||
+            v.persistentVolumeClaim.claimName == variables.shared ||
             (variables.archive != "" && v.persistentVolumeClaim.claimName == variables.archive))))
       message: >-
         a plugin's pod mounts no storage but its own instance's claim

@@ -158,6 +158,16 @@ spec:
             # transit never leaves the cluster.
             - name: MERIDIAN_FIRST_RUN_BROUGHT_WORKLOAD
               value: {{ printf "%s-database" (include "meridian-runtime.fullname" .) | quote }}
+            {{- /* Each store's databases past the first it brings (step 3d;
+                   section 6.4), started with the first. */}}
+            {{- range $component := list "lake" "bor" }}
+            {{- $context := dict "top" $ "component" $component "values" (index $.Values $component) }}
+            {{- $count := int (include "meridian-runtime.storeDatabases" $context) }}
+            {{- if and (gt $count 1) (include "meridian-runtime.storeBringsDatabases" $context) }}
+            - name: MERIDIAN_{{ upper $component }}_DATABASES
+              value: {{ $count | quote }}
+            {{- end }}
+            {{- end }}
             - name: MERIDIAN_FIRST_RUN_BROUGHT_HOST
               value: {{ printf "%s-database.%s.svc.cluster.local" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
             - name: MERIDIAN_FIRST_RUN_BROUGHT_PORT

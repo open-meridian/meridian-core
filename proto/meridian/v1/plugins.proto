@@ -325,6 +325,12 @@ message PluginLaunch {
   // Tags, retired with them (decisions/026).
   reserved 6;
   reserved "tags";
+
+  // Step 3d, checkpoint 5, item 30: its own storage claim copied into its
+  // shared storage's shard-0/ before this launch's pods started, once a pod
+  // of the instance was heard registered after it (PO item 82: once per
+  // launch that copied); unset where it copied none, or not yet.
+  PluginStorageCopied storage_copied = 26;
 }
 
 // The conductor to the launcher: create this plugin, in the chart's plugin
@@ -358,14 +364,56 @@ message CreatePluginRequest {
   // the sidecar's MERIDIAN_SIDECAR_* over the chart's sidecar.limits.
   SidecarLimits limits = 9;
 
+  // Contract v30, built with 3d (W8.3;
+  // spec/a-deployment-scales-out-and-fails-over-by-configuration section 7;
+  // approved 2026-11-15): the launch's shards and standby pod, as
+  // LaunchPluginRequest carries them. The launcher makes one pod per shard
+  // and one more for a standby, pods of the one instance, and tells each
+  // sidecar the shard count; each takes a Lease `<instance>-shard-<n>`. 0
+  // or 1 with no standby: the instance's one pod, as before.
+  uint32 shards = 10;
+  bool standby = 11;
+
   // Tags, retired with them (decisions/026).
   reserved 4;
   reserved "tags";
 }
 
+// Step 3d, checkpoint 5, item 30 (approved 2026-11-17, item 68): an
+// instance's own storage claim copied into its shared storage's shard-0/
+// before its first launch as several pods, as its own record
+// (decisions/031). Recorded by the conductor when it first hears one of the
+// instance's pods registered after the launch that copied: the pods start
+// only once the copy is whole, so `at_ns` is a true "copied by". A failed
+// copy leaves none; the old claim is kept as it was.
+message PluginStorageCopied {
+  string instance_id = 1;
+  // `<fullname>-storage-<instance>`, the instance's own claim, kept.
+  string from_claim = 2;
+  // `<fullname>-shared-storage-<instance>`, into its folder shard-0/.
+  string to_claim = 3;
+  int64 at_ns = 4;
+  // Who made the launch that copied.
+  string launched_by = 5;
+}
+
 message CreatePluginReply {
   // The workload the launcher made, which it alone may later remove.
   string workload = 1;
+
+  // Step 3d, checkpoint 5, item 30: the instance's own storage claim the
+  // launcher copies into its shared storage's shard-0/ before its first
+  // launch as several pods, `<fullname>-storage-<instance>`, kept as it was;
+  // empty where it copies none. The instance's pods start once the copy has
+  // finished.
+  string storage_copied_from = 2;
+
+  // Step 3d, checkpoint 5, PO item 91: true where the launcher made the
+  // instance's pods on its shared storage -- several pods, or one pod as one
+  // shard of storage shared since it ran as several; false where they run on
+  // its own claim, or it keeps none. Kept on the launch's record, so only a
+  // later launch on its own claim keeps a copy unrecorded.
+  bool ran_shared = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

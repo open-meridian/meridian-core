@@ -40,6 +40,11 @@ import sys
 import tempfile
 import time
 
+# What a claims line says in public, and its verdict: the ledger's own tool,
+# so the run and CI's claims-check judge a line by one rule.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+import claims as claims_tool  # noqa: E402
+
 NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-backup-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "backup-e2e")
 FULL = f"{RELEASE}-meridian-runtime"
@@ -146,7 +151,7 @@ def cli(workdir, *args):
          "-v", f"{CHART}:/chart:ro",
          CLI_IMAGE, *args],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     for line in (done.stdout + done.stderr).splitlines():
         print(f"    | {line}", flush=True)
     return done
@@ -230,6 +235,16 @@ def opened(key, plugin, name, sealed):
 
 # ── What the deployment holds, read the same way before and after ────────────
 
+def book_as_held(lines):
+    """The book's lines, less the records its control journal keeps of its
+    own takeovers, findings and assignments (step 3d; section 6.3, option
+    (c)): a restore is followed by its writer's takeover, journalled as its
+    own record after it, as every change is (decisions/031) -- not a change
+    to what the book held."""
+    return "\n".join(line for line in lines.splitlines()
+                     if not line.startswith("entry|~control|meridian.v1."))
+
+
 def held():
     """Everything the run compares, as hashes and stable lines."""
     sealed_hex = psql(
@@ -253,7 +268,7 @@ def held():
         ),
         "secret opens to its value": value is not None
         and hashlib.sha256(value.encode()).hexdigest() == hashlib.sha256(SECRET_VALUE.encode()).hexdigest(),
-        "book": psql(open(BOOK_SQL).read()),
+        "book": book_as_held(psql(open(BOOK_SQL).read())),
         "settings key": digest(secret(f"{FULL}-settings-key")),
         "dashboard signing key": digest(secret(f"{FULL}-dashboard-signing")),
         "dashboard public keys": digest(keys),
@@ -783,11 +798,18 @@ def claim(s, failure, component, seconds, bound, extra=None):
         "run": os.environ.get("GITHUB_RUN_ID", "local"),
     }
     line.update(extra or {})
-    print(f"CLAIM {json.dumps(line)}", flush=True)
+    # Limits are public and measured figures are private (PO 2026-11-15):
+    # what is printed, and kept for CI, names the class, its bounds and
+    # whether they were held; the line with its figures is kept beside the
+    # run, which nothing prints and no job keeps.
+    said = claims_tool.public(line)
+    print(f"CLAIM {json.dumps(said)}", flush=True)
     with open(os.environ.get("E2E_BACKUP_CLAIMS", ".e2e-backup-claims.jsonl"), "a", encoding="utf-8") as kept:
+        kept.write(json.dumps(said) + "\n")
+    with open(os.environ.get("E2E_BACKUP_FIGURES", ".e2e-backup-figures.jsonl"), "a", encoding="utf-8") as kept:
         kept.write(json.dumps(line) + "\n")
     if bound is not None:
-        s.check(line["held"], f"{failure}: {component} in {seconds:.1f}s, within {bound}s")
+        s.check(line["held"], f"{failure}: {component} within {bound}s")
 
 
 PROBE = "e2e_point_in_time"

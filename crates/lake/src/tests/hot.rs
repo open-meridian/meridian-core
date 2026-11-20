@@ -95,11 +95,12 @@ fn tick(hot: &Lake, round: i64) {
             rows.push(bad);
         }
         if round % 5 == 2 && round > 0 {
-            // A restatement of an earlier tick.
+            // A restatement of an earlier tick: its value, never its valid
+            // time (the lake's rule 5).
             rows.push(quote_of(
                 subject,
                 &format!("{subject}-{}", round - 1),
-                at + 2,
+                at - 1_000,
                 "123",
             ));
         }

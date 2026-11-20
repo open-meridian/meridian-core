@@ -1000,13 +1000,25 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     )
                 }
             };
+            // A repeat under the same key, after a lost reply, is answered
+            // as already recorded and mints no second charge, as a
+            // value-date roll's is (step 3d, PO item 74). The key is looked
+            // up only in an account the sender's scope holds: a charge
+            // outside it is kept unplaced naming no account, keyed or not,
+            // never answered with the account's charge nor refused naming
+            // it (review c5k, L3).
+            let key = if orders::fact_in_scope(&ctx, &account) {
+                request.idempotency_key.as_str()
+            } else {
+                ""
+            };
             act(
                 &bus2,
                 store.as_ref(),
                 &envelope,
                 ctx,
                 &account,
-                "",
+                key,
                 "meridian.v1.FactReply",
                 &|book, head, ctx| {
                     let made = orders::report_charge(book, head, ctx, &request)?;
@@ -1401,7 +1413,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             .map_err(|failed| failed.on_the_bus())?;
         let mut reply = ListOrdersReply {
             orders: page.orders,
-            as_of: Some(watermark_of(&page.as_of)),
+            as_of: Some(crate::store::watermark_for(
+                reading.as_ref(),
+                &request.account_id,
+                &page.as_of,
+            )),
             next_cursor: page.next_cursor,
             placements: page.placements,
             executions: page.executions,
@@ -1487,7 +1503,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             "meridian.v1.ListLocatesReply".to_string(),
             ListLocatesReply {
                 locates: page.records,
-                as_of: Some(watermark_of(&page.as_of)),
+                as_of: Some(crate::store::watermark_for(
+                    reading.as_ref(),
+                    &request.account_id,
+                    &page.as_of,
+                )),
                 next_cursor: page.next_cursor,
             }
             .encode_to_vec(),
@@ -1542,6 +1562,8 @@ pub fn expire_due(bus: &Bus, store: &Arc<dyn Store>) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }
@@ -1619,6 +1641,8 @@ pub fn backfill_waits(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
             }
             Ok(crate::store::Acted::Duplicate(_)) => {}
             Err(StoreError::Invalid(said)) if said == NOTHING_DUE => {}
+            // Another writer group's account (step 3d): its own writer does it.
+            Err(StoreError::NotOwned { .. }) => {}
             Err(failed) => return Err(failed.to_string()),
         }
     }

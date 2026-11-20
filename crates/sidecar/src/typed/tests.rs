@@ -2796,3 +2796,169 @@ async fn a_component_refusing_for_load_is_resource_exhausted_with_its_retry_afte
     assert_eq!(refusal.retry_after_seconds, 4);
     assert_eq!(refused.message(), "overloaded: the book's budget is full");
 }
+
+/// Step 3d (the resilience spec's section 6.9): a data plugin's lake write
+/// share. A write within it is answered as it comes; one past it is sent,
+/// in its order, and its acknowledgement held until the share covers it;
+/// one whose hold would outlast its caller's deadline is refused
+/// RATE_LIMITED with a retry-after and never sent. A call that is no lake
+/// row's write is never counted.
+#[tokio::test(start_paused = true)]
+async fn a_write_past_the_plugin_s_share_is_held_and_one_past_its_deadline_is_refused_unsent() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.command.record-prices\tcommand\tdata\tlake\n\
+         platform.lake.command.decline-want\tcommand\tdata\tlake\n\
+         platform.config.query.plugin-configuration\tquery\tsidecar\tconductor\n",
+        "name\tkind\ndata\trole\nlake\tcomponent\nsidecar\tcomponent\nconductor\tcomponent\n",
+    )
+    .unwrap();
+    let bus = Arc::new(Bus::single(
+        "feed-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let recorded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = Arc::clone(&recorded);
+    bus.serve("platform.lake.command.record-prices", move |_| {
+        counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((
+            "meridian.v1.RecordObservationsReply".into(),
+            meridian_domain::v1::RecordObservationsReply::default().encode_to_vec(),
+        ))
+    });
+    bus.serve("platform.lake.command.decline-want", |_| {
+        Ok((
+            "meridian.v1.DeclineWantReply".into(),
+            meridian_domain::v1::DeclineWantReply::default().encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::configuration::PLUGIN_CONFIGURATION, |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration::default().encode_to_vec(),
+        ))
+    });
+    // One KiB a second, a KiB's burst: a MiB a second among 1,024 shards.
+    let share = crate::share::WriteShare::new(1, 1024);
+    let sidecar = Sidecar::under(
+        &contract,
+        bus,
+        "DEP-test",
+        Identity::new("feed-1", vec!["data".into()]),
+    )
+    .with_write_share(Arc::clone(&share));
+    sidecar
+        .register(Request::new(RegisterRequest {
+            schema_version: "v10".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let batch = |bytes: usize| meridian_domain::v1::RecordPricesRequest {
+        want_id: "w".repeat(bytes),
+        ..Default::default()
+    };
+    let record = |bytes: usize| {
+        sidecar.command_typed::<_, meridian_pb::plugin::v1::RecordPricesResult>(
+            "platform.lake.command.record-prices",
+            "meridian.v1.RecordPricesRequest",
+            batch(bytes),
+            None,
+            None,
+        )
+    };
+    let sent = || recorded.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Within its share: answered as it comes.
+    let began = tokio::time::Instant::now();
+    record(300).await.unwrap();
+    assert!(began.elapsed() < std::time::Duration::from_millis(50));
+    assert_eq!(sent(), 1);
+
+    // Past it: sent, and its answer held until the share covers it.
+    let began = tokio::time::Instant::now();
+    record(1_500).await.unwrap();
+    let held = began.elapsed();
+    assert_eq!(sent(), 2, "a write held is a write sent");
+    assert!(
+        held >= std::time::Duration::from_millis(700) && held < std::time::Duration::from_secs(2),
+        "held {held:?} for about three quarters of a KiB past a KiB a second"
+    );
+
+    // A write whose hold would outlast its caller's wait: refused, unsent.
+    let refused = record(16_000).await.unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    let carried = refused
+        .metadata()
+        .get_bin(crate::REFUSAL_METADATA)
+        .expect("a refusal");
+    let refusal = Refusal::decode(carried.to_bytes().unwrap().as_ref()).unwrap();
+    assert_eq!(refusal.reason, RefusalReason::RateLimited as i32);
+    assert!(refusal.retry_after_seconds >= 1, "{refusal:?}");
+    assert!(refused
+        .message()
+        .contains("sidecar.limits.writeMiBPerSecond"));
+    assert_eq!(sent(), 2, "a refused write is never sent");
+    assert_eq!(share.refused(), 1);
+
+    // No lake row's write: a decline is not counted against the share.
+    let began = tokio::time::Instant::now();
+    sidecar
+        .command_typed::<_, meridian_pb::plugin::v1::DeclineWantResult>(
+            "platform.lake.command.decline-want",
+            "meridian.v1.DeclineWantRequest",
+            meridian_domain::v1::DeclineWantRequest {
+                want_id: "w".repeat(16_000),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(began.elapsed() < std::time::Duration::from_millis(50));
+
+    // Review finding 5: a write past the share is held before it is sent,
+    // so a caller that stops waiting mid-hold -- an RPC reset -- has sent
+    // nothing past the share; and what it asked still counts, so the write
+    // after it waits behind it.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let before = sent();
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), record(1_500)).await;
+    assert!(
+        dropped.is_err(),
+        "the write was held past the caller's stop"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(sent(), before, "a write dropped while held was never sent");
+    let began = tokio::time::Instant::now();
+    record(100).await.unwrap();
+    assert!(
+        began.elapsed() >= std::time::Duration::from_millis(300),
+        "the next write waited {:?} behind the dropped one",
+        began.elapsed()
+    );
+    assert_eq!(sent(), before + 1);
+}
+
+/// Item 32 (step 3d, checkpoint 5): a store's refusal of a write under an
+/// epoch no longer its shard's reaches the plugin FAILED_PRECONDITION with
+/// REFUSAL_REASON_SHARD_FENCED and the words, and says to the process that
+/// this shard is fenced -- what its sidecar ends its serving on, as on a
+/// lost Lease, and stands by again (item 49).
+#[tokio::test]
+async fn a_write_refused_as_fenced_is_failed_precondition_and_the_sidecar_is_told_it_is_fenced() {
+    let words = "fenced: this shard's epoch is no longer the instance's";
+    let status = super::refused(meridian_bus::BusError::HandlerFailed {
+        topic: "platform.lake.command.record-prices".into(),
+        detail: meridian_bus::refusal(RefusalReason::ShardFenced as i32, words),
+    });
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), words);
+    assert_eq!(reason(&status), Some(RefusalReason::ShardFenced));
+    assert!(crate::shards::was_fenced());
+    tokio::time::timeout(std::time::Duration::from_secs(1), crate::shards::fenced())
+        .await
+        .expect("the process is told");
+}

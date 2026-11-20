@@ -162,6 +162,10 @@ struct Shape {
     waits_stated: bool,
     #[serde(default)]
     lifecycle_events: Vec<(String, String)>,
+    /// Step 3d: the partition the account is moving to, between its move's
+    /// close and its open.
+    #[serde(default)]
+    moved_to: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,6 +285,20 @@ struct BookingShape {
     version: u32,
     held_alert: String,
     booked_at: u64,
+    /// Step 3d (section 6.3): absent from a snapshot made before.
+    #[serde(default)]
+    clearing: (String, usize, usize),
+    #[serde(default)]
+    pending: Vec<(String, String, String)>,
+    #[serde(default = "posted_before")]
+    posted: bool,
+    #[serde(default)]
+    pending_since_ns: i64,
+}
+
+/// A booking in a snapshot made before step 3d awaited nothing.
+fn posted_before() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,6 +309,9 @@ struct ReceivedShape {
     member_order_id: String,
     lines: (String, usize, usize),
     withdrawn: bool,
+    /// Step 3d: absent from a snapshot made before.
+    #[serde(default)]
+    clearing: (String, usize, usize),
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────────
@@ -314,6 +335,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
         // The bodies a decision asked for: the journal's, never a
         // snapshot's (format 2).
         bodies: _,
+        moved_to,
     } = book;
     let shape = Shape {
         format: FORMAT,
@@ -333,6 +355,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
         chains: chains.to_vec(),
         ledger: ledger_shape(ledger),
         waits_stated: *waits_stated,
+        moved_to: moved_to.clone(),
     };
     serde_json::to_vec(&shape).expect("a snapshot's shape always serializes")
 }
@@ -579,6 +602,10 @@ fn booking_shape(held: &BookingHeld) -> BookingShape {
         version,
         held_alert,
         booked_at,
+        clearing,
+        pending,
+        posted,
+        pending_since_ns,
     } = held;
     BookingShape {
         booking: pb(booking),
@@ -588,6 +615,10 @@ fn booking_shape(held: &BookingHeld) -> BookingShape {
         version: *version,
         held_alert: held_alert.clone(),
         booked_at: *booked_at,
+        clearing: clearing.clone(),
+        pending: pending.clone(),
+        posted: *posted,
+        pending_since_ns: *pending_since_ns,
     }
 }
 
@@ -599,6 +630,7 @@ fn received_shape(held: &ReceivedHeld) -> ReceivedShape {
         member_order_id,
         lines,
         withdrawn,
+        clearing,
     } = held;
     ReceivedShape {
         booking_id: booking_id.clone(),
@@ -607,6 +639,7 @@ fn received_shape(held: &ReceivedHeld) -> ReceivedShape {
         member_order_id: member_order_id.clone(),
         lines: lines.clone(),
         withdrawn: *withdrawn,
+        clearing: clearing.clone(),
     }
 }
 
@@ -651,6 +684,7 @@ pub fn decode(bytes: &[u8]) -> Result<Book> {
         ledger: ledger_from(shape.ledger)?,
         waits_stated: shape.waits_stated,
         bodies: Default::default(),
+        moved_to: shape.moved_to,
     })
 }
 
@@ -822,6 +856,10 @@ fn booking_from(shape: BookingShape) -> Result<BookingHeld> {
         version: shape.version,
         held_alert: shape.held_alert,
         booked_at: shape.booked_at,
+        clearing: shape.clearing,
+        pending: shape.pending,
+        posted: shape.posted,
+        pending_since_ns: shape.pending_since_ns,
     })
 }
 
@@ -833,6 +871,7 @@ fn received_from(shape: ReceivedShape) -> Result<ReceivedHeld> {
         member_order_id: shape.member_order_id,
         lines: shape.lines,
         withdrawn: shape.withdrawn,
+        clearing: shape.clearing,
     })
 }
 

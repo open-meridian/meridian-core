@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meridian_bus::Delivery as Heard;
+use meridian_bus::MessageMeta;
 use meridian_pb::plugin::v1 as plugin;
+use prost::Message as _;
 use tokio::sync::{watch, Notify};
 use tokio_stream::Stream;
 use tonic::{Response, Status};
@@ -150,12 +152,32 @@ impl Waiting {
     /// when the queue is full.
     #[cfg(test)]
     fn push(&self, delivery: plugin::Delivery, row: &str) {
-        self.push_keyed(delivery, row, None)
+        self.push_keyed(delivery, row, None);
     }
 
     /// A delivery queued, or, for a conflated row whose key already waits,
     /// put in its place: a superseded value is dropped, never the latest.
-    fn push_keyed(&self, delivery: plugin::Delivery, row: &str, key: Option<String>) {
+    /// Answers whether it was queued: false where the queue was full and
+    /// it was dropped, the loss counted.
+    fn push_keyed(&self, delivery: plugin::Delivery, row: &str, key: Option<String>) -> bool {
+        self.enqueue(delivery, row, key, false)
+    }
+
+    /// [`Waiting::push_keyed`], never dropped: a shard's withdrawal of a
+    /// want its plugin was handed (review c5u2 N1), which nothing would
+    /// tell again. Past the queue's bound by at most the wants a shard
+    /// keeps handed, since each was queued only where the queue had room.
+    fn push_keyed_always(&self, delivery: plugin::Delivery, row: &str, key: Option<String>) {
+        self.enqueue(delivery, row, key, true);
+    }
+
+    fn enqueue(
+        &self,
+        delivery: plugin::Delivery,
+        row: &str,
+        key: Option<String>,
+        always: bool,
+    ) -> bool {
         let mut queue = self.queue.lock().expect("receive queue poisoned");
         if let Some(key) = &key {
             if let Some(waiting) = queue
@@ -166,10 +188,11 @@ impl Waiting {
                 waiting.1 = delivery;
                 drop(queue);
                 self.ready.notify_one();
-                return;
+                return true;
             }
         }
-        if queue.waiting >= QUEUE {
+        let queued = always || queue.waiting < QUEUE;
+        if !queued {
             if queue.lost.is_none() {
                 tracing::warn!(row, "the plugin's delivery queue is full; dropping");
             }
@@ -186,6 +209,7 @@ impl Waiting {
         }
         drop(queue);
         self.ready.notify_one();
+        queued
     }
 
     /// Deliveries lost before they reached this, said in the stream's order.
@@ -270,6 +294,9 @@ impl Sidecar {
             subscriptions: Arc::clone(&self.subscriptions),
             chosen: Arc::new(chosen_names),
             generation,
+            shards: self.shards.clone(),
+            wanted: rows.iter().find(|row| row.name == WANTED),
+            withdrawn: rows.iter().find(|row| row.name == WITHDRAWN),
         };
         self.entitled.watch(&self.bus);
 
@@ -312,8 +339,72 @@ impl Sidecar {
                 Arc::new(move |row: &'static str| waiting.lose(None, Some(row))),
             );
         }
+        // Told of each change of the live shards from before the hold's
+        // hand-over and the first want forwarded (review c5z F1): a change
+        // between them and the sharing's start is shared, not missed until
+        // the next change or the lake's redelivery.
+        let changes = lake
+            .shards
+            .as_ref()
+            .filter(|_| lake.chosen.contains(WANTED))
+            .map(|shards| shards.changes());
+        // A taker's hold (ruling 184): what it heard of its instance's wants
+        // since before its take, handed first through the shard's own path,
+        // each with the message it came in, then its two subscriptions
+        // forwarded from where the hold left them.
+        let mut forwarded: BTreeSet<&'static str> = BTreeSet::new();
+        if let (Some(shards), true) = (lake.shards.as_ref(), lake.chosen.contains(WANTED)) {
+            if let Some(held) = shards.take_held().await {
+                let crate::shards::Held {
+                    wants,
+                    wanted,
+                    withdrawn,
+                    lost,
+                    ..
+                } = held;
+                if lost {
+                    waiting.lose(None, Some(WANTED));
+                }
+                for (want, meta) in wants {
+                    shards.heard_then(want, |handed| hand_on_as(handed, &lake, &waiting, &meta));
+                }
+                for (row, subscription) in [(lake.wanted, wanted), (lake.withdrawn, withdrawn)] {
+                    let Some(row) = row.filter(|row| lake.chosen.contains(row.name)) else {
+                        continue;
+                    };
+                    forwarded.insert(row.name);
+                    tokio::spawn(forward(
+                        row,
+                        subscription,
+                        Arc::clone(&waiting),
+                        self.configuration.clone(),
+                        hearer.clone(),
+                        lake.clone(),
+                        closed.clone(),
+                        None,
+                    ));
+                }
+            }
+        }
         for row in chosen {
-            start(row);
+            if !forwarded.contains(row.name) {
+                start(row);
+            }
+        }
+        #[cfg(test)]
+        if let Some(shards) = &lake.shards {
+            shards.handed_over();
+        }
+        // A shard's wants shared again whenever the live shards change
+        // (step 3d): a lost shard's subjects handed to its plugin at once.
+        if let (Some(shards), Some(changes)) = (lake.shards.clone(), changes) {
+            tokio::spawn(share_again(
+                shards,
+                changes,
+                lake.clone(),
+                Arc::clone(&waiting),
+                closed.clone(),
+            ));
         }
         let registry = Arc::clone(&self.subscriptions);
 
@@ -344,6 +435,88 @@ impl Sidecar {
     }
 }
 
+/// The rows a data plugin hears what the lake wants of it by (W10.7).
+const WANTED: &str = "ObservationsWanted";
+const WITHDRAWN: &str = "WantWithdrawn";
+
+/// What a shard hands its plugin of a want, queued as the row it is: the
+/// want naming its own subjects, or its withdrawal here; under the want's
+/// key, so a later one replaces one not yet delivered. Answers whether it
+/// was taken: a part dropped from a full queue was not, and is kept as not
+/// handed (review c5u2 N1); a withdrawal is never dropped.
+fn hand_on(handed: crate::shards::Handed, lake: &Lake, waiting: &Waiting) -> bool {
+    hand_on_as(handed, lake, waiting, &MessageMeta::default())
+}
+
+/// [`hand_on`], a part carrying `meta`: the message it was heard in, as
+/// every other row's delivery does.
+fn hand_on_as(
+    handed: crate::shards::Handed,
+    lake: &Lake,
+    waiting: &Waiting,
+    meta: &MessageMeta,
+) -> bool {
+    use crate::shards::Handed;
+    let (row, want_id, payload, withdrawal) = match handed {
+        Handed::Nothing => return true,
+        Handed::Part(part) => (
+            lake.wanted,
+            part.want_id.clone(),
+            part.encode_to_vec(),
+            false,
+        ),
+        Handed::Withdrawn(gone) => (
+            // Heard only by a stream that hears withdrawals.
+            lake.withdrawn.filter(|row| lake.chosen.contains(row.name)),
+            gone.want_id.clone(),
+            gone.encode_to_vec(),
+            true,
+        ),
+    };
+    let Some(row) = row else { return true };
+    let Ok(read) = (row.read)(&payload) else {
+        waiting.lose(Some(1), Some(row.name));
+        return false;
+    };
+    let delivery = plugin::Delivery {
+        meta: Some(plugin::DeliveryMeta {
+            message_id: meta.message_id.clone(),
+            correlation_id: meta.correlation_id.clone(),
+            causation_id: meta.causation_id.clone(),
+            published_at_ns: meta.published_at_ns,
+            row: row.name.to_string(),
+            ..Default::default()
+        }),
+        item: Some(read.item),
+    };
+    let key = Some(format!("want|{want_id}"));
+    if withdrawal {
+        waiting.push_keyed_always(delivery, row.name, key);
+        true
+    } else {
+        waiting.push_keyed(delivery, row.name, key)
+    }
+}
+
+/// Each standing want shared again when the live shards change, as
+/// `changes` tells from when the stream subscribed to them, until the
+/// stream ends.
+async fn share_again(
+    shards: Arc<crate::shards::Shards>,
+    mut changes: watch::Receiver<u64>,
+    lake: Lake,
+    waiting: Arc<Waiting>,
+    mut closed: watch::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            _ = closed.changed() => return,
+        }
+        shards.shared_again_then(|handed| hand_on(handed, &lake, &waiting));
+    }
+}
+
 /// Who hears: this plugin's instance and the roles it was launched with,
 /// what a directed row is held to (contract v22).
 #[derive(Clone)]
@@ -364,6 +537,12 @@ struct Lake {
     /// generation, which its subscriptions are delivered on.
     chosen: Arc<BTreeSet<&'static str>>,
     generation: u64,
+    /// The instance's shards, where it runs as several (step 3d): a want is
+    /// handed on naming this shard's subjects alone.
+    shards: Option<Arc<crate::shards::Shards>>,
+    /// The rows a want and its withdrawal are handed on as.
+    wanted: Option<&'static Row>,
+    withdrawn: Option<&'static Row>,
 }
 
 /// One row's forwarding started on the stream: a row naming its dataset in
@@ -578,6 +757,47 @@ async fn deliver(
         if said.is_want {
             if !by_stream || meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
                 return;
+            }
+            // One shard of several (step 3d; the resilience spec's section
+            // 7): its own subjects of the want alone, by rendezvous hashing
+            // over the live shards; none of them, nothing.
+            //
+            // Handed, and kept as handed only where it was queued, under the
+            // shard's one lock (review c5u2 N1): a part the full queue
+            // dropped is handed at the next sharing or redelivery, and a
+            // withdrawal of a want its plugin was handed is never dropped.
+            if let Some(shards) = &lake.shards {
+                if envelope.payload_type != row.payload_type {
+                    tracing::warn!(
+                        row = row.name,
+                        payload_type = envelope.payload_type,
+                        "a delivery under another type than its row's; not delivered"
+                    );
+                    waiting.lose(Some(1), Some(row.name));
+                    return;
+                }
+                let meta = envelope.meta.clone().unwrap_or_default();
+                if row.name == WANTED {
+                    let Ok(want) =
+                        meridian_domain::v1::ObservationsWantedEvent::decode(&envelope.payload[..])
+                    else {
+                        waiting.lose(Some(1), Some(row.name));
+                        return;
+                    };
+                    shards.heard_then(want, |handed| hand_on_as(handed, lake, waiting, &meta));
+                    return;
+                } else if row.name == WITHDRAWN {
+                    let Ok(gone) =
+                        meridian_domain::v1::WantWithdrawnEvent::decode(&envelope.payload[..])
+                    else {
+                        waiting.lose(Some(1), Some(row.name));
+                        return;
+                    };
+                    if shards.withdrawn(&gone.want_id) {
+                        hand_on_as(crate::shards::Handed::Withdrawn(gone), lake, waiting, &meta);
+                    }
+                    return;
+                }
             }
         } else {
             let Some(fields) = lake.entitled.fields(&said.dataset) else {

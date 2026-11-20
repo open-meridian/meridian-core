@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.request
 
+import rollout
+
 # What home's header shows a deployment admin and nobody else: the gear to
 # Settings, named for a screen reader.
 ADMIN_HOME = 'href="/admin" aria-label="Settings"'
@@ -186,7 +188,7 @@ def free_registry_port():
         ["kubectl", "get", "pods", "--all-namespaces", "-o",
          "jsonpath={.items[*].spec.containers[*].ports[*].hostPort}"],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     if held.returncode != 0:
         raise SystemExit(f"the cluster's host ports could not be read\n{held.stderr}")
     taken = {int(port) for port in held.stdout.split()}
@@ -277,7 +279,7 @@ class Scorecard:
 
 def run(*command, **kwargs):
     """A command that must work, with its output returned."""
-    done = subprocess.run(command, capture_output=True, text=True, **kwargs)
+    done = subprocess.run(command, capture_output=True, text=True, errors="replace", **kwargs)
     if done.returncode != 0:
         raise SystemExit(
             f"{' '.join(command)} failed ({done.returncode})\n{done.stdout}\n{done.stderr}"
@@ -306,7 +308,7 @@ def psql(sql, database="meridian"):
         [*where, "psql", "-U", "postgres", "-d", database, "-Atc", sql],
         capture_output=True,
         text=True,
-    )
+    errors="replace", )
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
@@ -546,7 +548,7 @@ def by_cli(s, deployment_id, enrolment_code):
         "--plain-http",
     ]
     done = subprocess.run(
-        command, capture_output=True, text=True, env={**os.environ, **environment}
+        command, capture_output=True, text=True, errors="replace", env={**os.environ, **environment}
     )
     os.unlink(params.name)
     os.unlink(registry.name)
@@ -568,7 +570,7 @@ def apply(manifest):
     done = subprocess.run(
         ["kubectl", "--namespace", NAMESPACE, "apply", "-f", "-"],
         input=manifest, capture_output=True, text=True,
-    )
+    errors="replace", )
     if done.returncode != 0:
         raise SystemExit(f"kubectl apply failed\n{done.stdout}\n{done.stderr}")
 
@@ -586,6 +588,30 @@ def wait_for(what, ready, seconds=420):
             pass
         time.sleep(1)
     raise SystemExit(f"{what} never happened")
+
+
+def rolled_out(s, what, seconds=600):
+    """After an upgrade, every Deployment and StatefulSet of the release
+    rolled out, as `meridian upgrade-deployment` waits for it before it says
+    the upgrade is done (e2e/cluster/rollout.py), not only Available;
+    checked, and says whether."""
+    def left():
+        items = {kind: json.loads(kubectl("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}",
+                                          "-o", "json"))["items"]
+                 for kind in ("deployments", "statefulsets")}
+        return rollout.unfinished(items["deployments"], items["statefulsets"])
+    said = ["not read"]
+    for _ in range(seconds // 5):
+        try:
+            said = left()
+        except SystemExit as failed:
+            said = [str(failed)[:200]]
+        if not said:
+            break
+        time.sleep(5)
+    s.check(not said, f"{what}: every workload of the release rolled out"
+            + (f"; not: {'; '.join(said[:4])}" if said else ""))
+    return not said
 
 
 def main():
@@ -868,6 +894,17 @@ def main():
 
     if UPGRADE_FROM:
         upgraded(s)
+        # The lake's rows partitioned by the upgrade's own migration (step
+        # 3d, stage T; the resilience spec's section 15, the online
+        # conversions): `lake_row` a partitioned table over what the release
+        # before kept. That every read answers each row once while its
+        # writer copies them behind, under write load, is the lake's own
+        # test against Postgres (lake_rows_are_partitioned_online_under_
+        # write_load_with_equal_answers): this install holds no rows to read.
+        kind = psql("select relkind from pg_class where relname = 'lake_row' "
+                    "and relnamespace = 'public'::regnamespace")
+        s.check(kind.strip() == "p",
+                f"after the upgrade the lake's rows are a partitioned table ({kind.strip() or 'not read'})")
         # And the deployment it upgraded is the same one: the administrator
         # the wizard named signs in to the new version.
         status, session = signed_in(*WAY_IN["administrator"])
@@ -1247,6 +1284,7 @@ spec:
                 break
             time.sleep(1)
         s.check(gone, "turned off, the live instance is removed by the restarted launcher")
+        rolled_out(s, "turned off")
         template = kubectl("get", "configmap", f"{RELEASE}-meridian-runtime-launcher-template", "-o", "json")
         s.check("plugin-live.json" not in template, "and the launcher holds no live shape to make")
         s.check(
@@ -1311,7 +1349,7 @@ def edge_storage(s):
         done = subprocess.run(
             ["kubectl", "--namespace", NAMESPACE, "create", "--dry-run=server", "-f", "-"],
             input=manifest, capture_output=True, text=True,
-        )
+        errors="replace", )
         return done.returncode == 0, (done.stdout + done.stderr).strip()
 
     claim = lambda name: {"persistentVolumeClaim": {"claimName": name}}
@@ -1387,7 +1425,7 @@ def footprint(s):
                     "--peak-to", os.environ.get("E2E_FOOTPRINT_PEAK", ".e2e-footprint-peak.txt")]
     if disk is not None:
         command += ["--disk-mib", f"{disk:.1f}"]
-    done = subprocess.run(command, capture_output=True, text=True)
+    done = subprocess.run(command, capture_output=True, text=True, errors="replace")
     s.note((done.stdout + done.stderr).strip())
     s.check(done.returncode == 0, "the default profile's footprint is within v29's baseline (ruling 1058)")
 
@@ -1426,7 +1464,7 @@ def upgraded(s):
          "--reset-then-reuse-values", "--wait", "--timeout", "10m", *conflicts,
          "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
         capture_output=True, text=True,
-    )
+    errors="replace", )
     for line in (done.stdout + done.stderr).splitlines():
         print(f"    | {line}", flush=True)
     s.check(
@@ -1435,6 +1473,7 @@ def upgraded(s):
         f"{int(time.time() - started)}s",
     )
     revision = int(json.loads(run(HELM, "status", RELEASE, "--namespace", NAMESPACE, "-o", "json"))["version"])
+    rolled_out(s, "upgraded in place")
 
     def pods():
         return json.loads(kubectl("get", "pods", "-o", "json"))["items"]

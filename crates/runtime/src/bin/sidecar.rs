@@ -12,16 +12,16 @@
 //! Who this serves is launch configuration and never what registers: a plugin
 //! that named its own roles would be choosing its own privileges.
 
+use meridian_runtime::lease::KubeLeases;
+use meridian_runtime::sidecar_serving::{serve, serve_as_shards, MakeBus, Serving};
 use meridian_runtime::{
-    bus_from_env, bus_from_env_writing_ahead, names_from, required, shutdown, var,
+    bus_from_env, bus_from_env_writing_ahead, names_from, required, stopping, var,
 };
 use std::sync::Arc;
 
-use meridian_sidecar::front_door::{self, FrontDoor, Verifier};
-use meridian_sidecar::share::{Limits, Share, Shared};
-use meridian_sidecar::{
-    Identity, OlderPagesRead, PluginOperationsServer, Sidecar, SidecarServiceServer, DEFAULT_BIND,
-};
+use meridian_sidecar::front_door::Verifier;
+use meridian_sidecar::share::Limits;
+use meridian_sidecar::{Identity, DEFAULT_BIND};
 
 /// Where the chart mounts the dashboard's public keys, one file per key id.
 const DASHBOARD_KEYS: &str = "/etc/meridian/dashboard-keys";
@@ -131,153 +131,92 @@ fn run() -> Result<(), String> {
     // set it to something that is not one.
     let limits = Limits::from_env()?;
 
+    // Its instance's shards (step 3d; the resilience spec's section 7): set
+    // by the launcher on a launch with several shards or a standby pod.
+    // Each shard holds the instance's share divided by the count.
+    let shard_count =
+        meridian_runtime::shards::count(var(meridian_runtime::shards::SHARDS_ENV).as_deref())?;
+    let limits = limits.per_shard(shard_count.unwrap_or(1));
+    // A data plugin's lake write share (section 6.9), refused at start
+    // where it is not one; no other role writes the lake's rows.
+    let write_share = meridian_sidecar::share::WriteShare::from_env(shard_count.unwrap_or(1))?
+        .filter(|_| writes_rows);
+
+    // What every serving of this sidecar is made from: read once.
+    let declaration = var("MERIDIAN_PLUGIN_DECLARATION")
+        .map(|path| declaration_from(&path).map(|declared| (path, declared)))
+        .transpose()?;
+    // Each serving's bus, from the environment. A data plugin's lake writes
+    // go by the lake's write-ahead stream in `ha` (the resilience spec's
+    // section 4): held by the stream before the lake records them, so none
+    // it was answered for is lost.
+    let bus: MakeBus = {
+        let instance_id = instance_id.clone();
+        Arc::new(move || {
+            let instance_id = instance_id.clone();
+            Box::pin(async move {
+                if writes_rows {
+                    bus_from_env_writing_ahead(&instance_id).await
+                } else {
+                    bus_from_env(&instance_id).await
+                }
+            })
+        })
+    };
+    let serving = Arc::new(Serving {
+        deployment_id,
+        identity,
+        verifier,
+        front,
+        listening,
+        instance_id,
+        limits,
+        write_share,
+        declaration,
+        bus,
+    });
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            // Told to stop once, heard from here on: a SIGTERM that lands
+            // while this pod waits for a shard, or between its shard and
+            // its serving, is not one a later listener would have missed.
+            let stop = stopping();
             // Its own budget (stage M), inside the desktop footprint's +15 %
             // (1058): the plugin's share keeps a flood off it. The plugin's
             // answers in flight (answerMiB) and its read_after session are
             // held apart, so what is left is the sidecar's own work's,
             // whatever the plugin does; a share that leaves it nothing is
-            // refused at start, as the chart refuses it.
+            // refused at start, as the chart refuses it. Once per process:
+            // a shard's pod serves many times in it.
             meridian_budget::install(
                 "sidecar",
-                limits.held_apart(),
+                serving.limits.held_apart(),
                 meridian_budget::permits_from_env(),
             )?;
-            // A data plugin's lake writes go by the lake's write-ahead stream
-            // in `ha` (the resilience spec's section 4): held by the stream
-            // before the lake records them, so none it was answered for is
-            // lost.
-            let bus = if writes_rows {
-                bus_from_env_writing_ahead(&instance_id).await?
-            } else {
-                bus_from_env(&instance_id).await?
+            let Some(count) = shard_count else {
+                // An instance's one pod: served once, its process its own.
+                return serve::<KubeLeases>(serving, None, stop).await.map(|_| ());
             };
-            // Its own hops' ages -- a record batch accepted, a row delivered
-            // -- to the monitor, under its plugin's instance (W4.16; 606).
-            tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
-            let mut sidecar = Sidecar::new(bus, &deployment_id, identity);
-            if let Some(verifier) = verifier {
-                sidecar = sidecar.with_verifier(verifier);
-            }
-            // A harness's sidecar, which no launch made, holds its plugin's
-            // registration to the declaration an upload would carry (W4.1,
-            // contract v25): the SDK's JSON, as `meridian-declaration`
-            // prints it. The launcher never sets it.
-            if let Some(path) = var("MERIDIAN_PLUGIN_DECLARATION") {
-                sidecar = sidecar.held_to(declaration_from(&path)?);
-                tracing::info!(path, "registration held to the declaration in this file");
-            }
-            let sidecar = Arc::new(sidecar);
-
-            // A live instance of a development deployment: the development
-            // endpoint behind the front door (spec/live-plugin-development).
-            // Both told, or none.
-            if let Some(live) = meridian_sidecar::live::Live::from_env(
-                var("MERIDIAN_LIVE_DIR"),
-                var("MERIDIAN_DEVELOPMENT").as_deref() == Some("true"),
-                sidecar.clock(),
-            ) {
-                sidecar.go_live(Arc::new(live));
-                tracing::info!("live: the development endpoint is on");
-            }
-
-            tracing::info!(instance_id, %listening, "the sidecar is serving");
-
-            // What it knows of its plugin, for the conductor and the
-            // dashboard (W4.8): now, on each registration, and every 30s.
-            tokio::spawn(meridian_sidecar::report::report_forever(Arc::clone(&sidecar)));
-
-            let door = match front {
-                None => None,
-                Some((at, verifier, tls)) => {
-                    let door = FrontDoor::new(Arc::clone(&sidecar), verifier)?;
-                    let listener = tokio::net::TcpListener::bind(at)
-                        .await
-                        .map_err(|failed| format!("the front door could not bind {at}: {failed}"))?;
-                    tracing::info!(%at, tls = tls.is_some(), "the front door is open to the dashboard");
-                    Some(serve_door(listener, front_door::router(door), tls))
+            let whole = |name: &str, default: u64| -> Result<u64, String> {
+                match var(name) {
+                    None => Ok(default),
+                    Some(said) => said
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("{name} is {said:?}; a whole number")),
                 }
             };
-            let front_door = async {
-                match door {
-                    Some(serving) => serving
-                        .await
-                        .map_err(|failed| format!("the front door stopped: {failed}")),
-                    None => std::future::pending().await,
-                }
-            };
-
-            // The plugin's own share (stage M; the resilience spec's section
-            // 10a): past it, only this plugin is refused.
-            tracing::info!(
-                in_flight = limits.in_flight,
-                requests_per_second = limits.requests_per_second,
-                answer_mib = limits.answer_mib,
-                "the plugin's share at its sidecar"
-            );
-            let share = Share::new(limits);
-            let serving = tonic::transport::Server::builder()
-                // An older plugin's admin pages, read as pages at `admin`
-                // while its contract is accepted (W4.8).
-                .add_service(Shared::new(
-                    OlderPagesRead::new(SidecarServiceServer::from_arc(Arc::clone(&sidecar))),
-                    Arc::clone(&share),
-                ))
-                // The typed operations (spec/typed-sidecar-operations).
-                .add_service(Shared::new(PluginOperationsServer::from_arc(sidecar), share))
-                .serve(listening);
-
-            tokio::select! {
-                // A port already taken lands here, and so does a surface that
-                // stopped later. Either way no plugin can reach this sidecar,
-                // so it exits non-zero and an orchestrator restarts it rather
-                // than leaving it up and unreachable.
-                served = serving => {
-                    served.map_err(|failed| format!("the sidecar surface at {listening} stopped: {failed}"))
-                }
-                // The page is how a person reaches the plugin, so a door that
-                // stopped is a sidecar to restart, as the surface is.
-                stopped = front_door => stopped,
-                _ = shutdown() => {
-                    tracing::info!("stopping");
-                    Ok(())
-                }
-            }
+            let renew = std::time::Duration::from_secs(whole("MERIDIAN_LEASE_RENEW_SECONDS", 2)?);
+            let duration =
+                std::time::Duration::from_secs(whole("MERIDIAN_LEASE_DURATION_SECONDS", 6)?);
+            // Each request gives up within half a renewal: a shard stops at
+            // its renew deadline whatever is in flight, and one request lost
+            // leaves it a second try before that.
+            let leases = || KubeLeases::in_cluster(renew / 2).map(Arc::new);
+            serve_as_shards(serving, count, leases, (renew, duration), stop).await
         })
-}
-
-/// The front door served: over TLS where the deployment's internal TLS is
-/// on, each connection's handshake its own task so one slow client holds up
-/// no other; in the clear, as axum serves it, otherwise.
-fn serve_door(
-    listener: tokio::net::TcpListener,
-    router: axum::Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
-    let Some(tls) = tls else {
-        return Box::pin(async move { axum::serve(listener, router).await });
-    };
-    Box::pin(async move {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let tls = tls.clone();
-            let service = hyper_util::service::TowerToHyperService::new(router.clone());
-            tokio::spawn(async move {
-                // A client that does not speak TLS -- plaintext, the
-                // refusal internal TLS promises -- ends here.
-                let Ok(stream) = tls.accept(stream).await else {
-                    return;
-                };
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
-                .await;
-            });
-        }
-    })
 }

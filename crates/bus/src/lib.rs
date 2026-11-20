@@ -21,6 +21,7 @@
 //! bus as messages. Plugins make calls through their sidecar and never serve
 //! them, so nothing outside this process needs a way to answer one.
 
+pub mod owners;
 pub mod read_after;
 pub mod topic;
 pub mod write_ahead;
@@ -32,15 +33,16 @@ mod router;
 
 pub use backend::{
     overloaded, read_refusal, read_refusal_status, refusal, refusal_fields, refusal_naming,
-    refusal_retry_after, refusal_retrying, refusal_with_status, Answer, Backend, BusError,
-    Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Subscription,
+    refusal_retry_after, refusal_retrying, refusal_status_retrying, refusal_with_status, Answer,
+    Backend, BusError, Delivery, DropCount, Handler, HandlerReply, RefusalStatus, Settled,
+    Subscription, Withdrawn,
 };
 pub use memory::MemoryBackend;
-pub use nats::{NatsBackend, INTERNAL_TLS_CA};
+pub use nats::{header_words, servers_asked, NatsBackend, INTERNAL_TLS_CA};
 pub use router::{caller_of, CANCELLED_QUERY};
 pub use router::{
-    calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, Stamp,
-    TimedCall,
+    calls_by_topic, calls_said, expired_requests, timed, Bus, CallObserver, RouteRule, SendGate,
+    Stamp, TimedCall,
 };
 
 /// Envelope and metadata, re-exported so consumers need not depend on the

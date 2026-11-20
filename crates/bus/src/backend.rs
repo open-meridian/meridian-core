@@ -24,6 +24,12 @@ pub enum BusError {
     #[error("the bus is shutting down")]
     ShuttingDown,
 
+    /// Held back by the sender's own gate ([`crate::Bus::gate_sends`]): a
+    /// plugin shard's sidecar whose Lease has gone its renew deadline
+    /// unrenewed sends nothing but its lake record writes (review c5a M1).
+    #[error("`{topic}` was not sent: {why}")]
+    NotSent { topic: String, why: String },
+
     /// A question past what the broker carries, refused before it was sent
     /// rather than lost on the way.
     #[error("a question to `{topic}` is {size} bytes, past the broker's limit of {most} bytes, and was not sent")]
@@ -88,6 +94,21 @@ pub fn refusal_retrying(
     )
 }
 
+/// A refusal with a status and how long to wait before asking again, at
+/// least a second (step 3d): UNAVAILABLE where what the answer needs is not
+/// there yet and will be.
+pub fn refusal_status_retrying(
+    status: RefusalStatus,
+    retry_after_seconds: u32,
+    words: impl std::fmt::Display,
+) -> String {
+    format!(
+        "{REFUSAL_STATUS_PREFIX}{} {REFUSAL_RETRY}{}] {words}",
+        status.word(),
+        retry_after_seconds.max(1)
+    )
+}
+
 /// A component's refusal of a request its budget had no room for
 /// (REFUSAL_REASON_OVERLOADED), with its retry-after.
 pub fn overloaded(over: &meridian_budget::Overloaded) -> String {
@@ -100,7 +121,15 @@ pub fn overloaded(over: &meridian_budget::Overloaded) -> String {
 
 /// How long a refusal for load says to wait, in seconds; none on any other.
 pub fn refusal_retry_after(detail: &str) -> Option<u32> {
-    refusal_parts(detail).and_then(|(_, _, retry, _)| retry)
+    refusal_parts(detail)
+        .and_then(|(_, _, retry, _)| retry)
+        .or_else(|| {
+            let rest = detail.strip_prefix(REFUSAL_STATUS_PREFIX)?;
+            let (head, _) = rest.split_once("] ")?;
+            head.split(' ')
+                .find_map(|part| part.strip_prefix(REFUSAL_RETRY))
+                .and_then(|seconds| seconds.parse().ok())
+        })
 }
 
 /// The code, the fields, the retry-after and the words, where the detail
@@ -200,18 +229,21 @@ pub fn refusal_with_status(
 pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, &str)> {
     let rest = detail.strip_prefix(REFUSAL_STATUS_PREFIX)?;
     let (head, words) = rest.split_once("] ")?;
-    let (word, fields) = match head.split_once(' ') {
-        Some((word, named)) => (
-            word,
-            named
-                .strip_prefix(REFUSAL_FIELDS)?
-                .split(';')
-                .filter(|field| !field.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        None => (head, Vec::new()),
-    };
+    let mut parts = head.split(' ');
+    let word = parts.next()?;
+    let mut fields = Vec::new();
+    for part in parts {
+        if let Some(named) = part.strip_prefix(REFUSAL_FIELDS) {
+            fields.extend(
+                named
+                    .split(';')
+                    .filter(|field| !field.is_empty())
+                    .map(str::to_string),
+            );
+        } else if part.strip_prefix(REFUSAL_RETRY).is_none() {
+            return None;
+        }
+    }
     let status = match word {
         "invalid-argument" => RefusalStatus::InvalidArgument,
         "permission-denied" => RefusalStatus::PermissionDenied,
@@ -259,6 +291,20 @@ mod refusal_status_tests {
             Some((RefusalStatus::FailedPrecondition, vec!["pack".to_string()]))
         );
         assert!(read_refusal_status("[refusal-reason 21] words").is_none());
+        // Step 3d: a status with a retry-after, at least a second.
+        let later = refusal_status_retrying(RefusalStatus::Unavailable, 5, "not placed yet");
+        assert_eq!(
+            read_refusal_status(&later).map(|(status, fields, words)| (
+                status,
+                fields.len(),
+                words
+            )),
+            Some((RefusalStatus::Unavailable, 0, "not placed yet"))
+        );
+        assert_eq!(refusal_retry_after(&later), Some(5));
+        let soon = refusal_status_retrying(RefusalStatus::Unavailable, 0, "now");
+        assert_eq!(refusal_retry_after(&soon), Some(1));
+        assert!(read_refusal(&later).is_none(), "never a reason code");
     }
 
     #[test]
@@ -394,12 +440,72 @@ pub type HandlerReply = std::result::Result<(String, Vec<u8>), String>;
 /// A registered answer to one topic.
 pub type Handler = std::sync::Arc<dyn Fn(Envelope) -> HandlerReply + Send + Sync>;
 
+/// Where a request is to be handed before it is admitted here (step 3d;
+/// section 6.7): the internal topic and the writer group that owns the
+/// write, where it is another group's; none where it is this member's to
+/// answer, or the request says nothing of its owner, or this member
+/// refuses from here ([`crate::Bus::refuse_from_here`]).
+#[derive(Clone)]
+pub struct PreRoute {
+    owner: OwnerOf,
+    refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A request's owner, decided from it: the internal topic and the group.
+type OwnerOf = std::sync::Arc<dyn Fn(&Envelope) -> Option<(String, u32)> + Send + Sync>;
+
+impl PreRoute {
+    /// `owner` decides a request's owner; `refusing` is set once this
+    /// member refuses from here.
+    pub fn new(
+        owner: impl Fn(&Envelope) -> Option<(String, u32)> + Send + Sync + 'static,
+        refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            owner: std::sync::Arc::new(owner),
+            refusing,
+        }
+    }
+
+    /// The internal topic and the owning group, where the request is
+    /// another group's to write and this member still passes writes on.
+    /// It may read the owner's record, and blocks.
+    pub fn owner(&self, envelope: &Envelope) -> Option<(String, u32)> {
+        if self.refuses() {
+            return None;
+        }
+        (self.owner)(envelope)
+    }
+
+    /// Whether this member refuses from here: nothing passed on by the
+    /// owners it last read, looked at again just before the request is
+    /// passed (ruled 2026-11-18, item 120; review-c5n5 F2), a fence that
+    /// landed while its owner was decided included.
+    pub fn refuses(&self) -> bool {
+        self.refusing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// A future a backend returns, boxed so the trait stays object-safe.
 ///
 /// Only the call path pays for this. `publish` and `subscribe` stay
 /// synchronous, which is the whole reason this trait is not async.
 pub type Answer<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Envelope, BusError>> + Send + 'a>>;
+
+/// What [`Backend::subscribed`] returns, boxed as [`Answer`] is.
+/// What a member leaves to its group's other members ([`Backend::withdraw`]).
+#[derive(Clone)]
+pub struct Withdrawn {
+    /// The topics it no longer offers.
+    pub topics: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Whether its shared subscriptions end too: the work each message
+    /// brings is then another member's.
+    pub shared_work: bool,
+}
+
+pub type Settled<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BusError>> + Send + 'a>>;
 
 /// A transport the bus can route onto.
 ///
@@ -443,6 +549,29 @@ pub trait Backend: Send + Sync {
         Box::pin(async move { Err(BusError::NoHandler(topic.to_string())) })
     }
 
+    /// Ask writer group `group` of whoever serves `topic` (step 3d; the
+    /// resilience spec's section 6.7): a write handed to its partition's
+    /// owner. Defaulted to an unaddressed ask: a backend with one member of
+    /// everything has one group.
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: u32,
+    ) -> Answer<'a> {
+        let _ = group;
+        self.request(topic, envelope, timeout)
+    }
+
+    /// Offer `topic` to writer group `group`'s callers alone, one member of
+    /// `queue` taking each: a request addressed to another group is left
+    /// unanswered, for that group's member.
+    fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
+        let _ = group;
+        self.serve(topic, queue, handler);
+    }
+
     /// Offer this topic's answer to callers in other processes.
     ///
     /// Defaulted to nothing, because an in-process backend has nowhere else to
@@ -452,6 +581,17 @@ pub trait Backend: Send + Sync {
     /// it as one `group` (the component's name), so each request is answered
     /// once, not once per copy with all but the first answer thrown away.
     fn serve(&self, _topic: &str, _group: &str, _handler: Handler) {}
+
+    /// [`Backend::serve`], each request first offered to `route`: one it
+    /// names another writer group's is passed to that group on the internal
+    /// topic as it came, its caller's reply address kept, so the owner
+    /// answers the caller itself -- never admitted here, never waited on
+    /// here (step 3d). Defaulted to serving alone: an in-process backend's
+    /// router hands it on in its handler.
+    fn serve_routed(&self, topic: &str, group: &str, handler: Handler, route: PreRoute) {
+        let _ = route;
+        self.serve(topic, group, handler);
+    }
 
     /// The same, and signal once an answer has actually reached the broker.
     ///
@@ -466,6 +606,30 @@ pub trait Backend: Send + Sync {
     fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
         self.serve(topic, group, handler);
         delivered.notify_one();
+    }
+
+    /// Every `serve` and `subscribe` asked of this backend so far in force
+    /// where its messages are routed: what a component waits for before it
+    /// says it serves (step 3d, stage T: a pod ready before the broker held
+    /// its subscriptions left its topics served by nobody).
+    ///
+    /// Defaulted to at once: a backend with no wire holds a subscription
+    /// from the moment it is asked for.
+    fn subscribed(&self) -> Settled<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Leave what `what` names, from now on (step 3d, stage T's review,
+    /// finding 3): each topic offered that it names is no longer offered
+    /// here -- another member of its queue group is asked instead, and
+    /// what had already arrived is still answered -- and, where it says
+    /// so, every shared subscription is ended. What a writer does when it
+    /// is told to stop and serves on beside its replacement.
+    ///
+    /// Defaulted to nothing: a backend with no wire has no other member to
+    /// leave a topic to.
+    fn withdraw(&self, what: Withdrawn) {
+        let _ = what;
     }
 
     /// Messages dropped across every subscription on this backend: a

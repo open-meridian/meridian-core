@@ -228,7 +228,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_catalogue",
         "Read the plugin catalogue",
-        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop. A page at a time (next_cursor): the versions by name, then the launches as they were made; one plugin's alone by name, one version of it by name and version, or the launches alone (launches_only).",
+        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop; its shards and standby pod, and its own storage copied into its shared storage before it first ran as several pods (storage_copied, null for none). A page at a time (next_cursor): the versions by name, then the launches as they were made; one plugin's alone by name, one version of it by name and version, or the launches alone (launches_only).",
         true,
         Gate::DeploymentAdmin,
         catalogue_schema,
@@ -834,6 +834,18 @@ fn launch_json(launch: &PluginLaunch) -> Value {
             "in_flight": l.in_flight,
             "requests_per_second": l.requests_per_second,
             "answer_mib": l.answer_mib,
+        })),
+        // Its shards and standby pod (contract v30, W8.3) and its own
+        // storage copied into its shared storage before it first ran as
+        // several pods (item 30; item 70), null for none: what the
+        // catalogue's JSON says of it.
+        "shards": launch.shards,
+        "standby": launch.standby,
+        "storage_copied": launch.storage_copied.as_ref().map(|c| json!({
+            "from_claim": c.from_claim,
+            "to_claim": c.to_claim,
+            "at_ns": c.at_ns,
+            "launched_by": c.launched_by,
         })),
     })
 }
@@ -2533,6 +2545,14 @@ impl Context<'_> {
             0
         });
         let standby = boolean(top, "standby", &mut problems);
+        // Neither where the deployment renders no lease right for several
+        // pods of an instance (ruled 2026-11-15): said here, at the field,
+        // as the Launch sheet does not offer them.
+        if let Some((field, words)) =
+            several_not_offered(shards, standby, crate::registry::lease_right())
+        {
+            problems.add(field, words);
+        }
         // Its own share at its sidecar (contract v30): each a whole number
         // above 0, absent for the deployment's.
         let mut limits = meridian_domain::v1::SidecarLimits::default();
@@ -3652,3 +3672,54 @@ pub const PARITY: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests;
+
+/// The field a launch may not set where the deployment renders no lease
+/// right for several pods of an instance, and why: `shards` above 1, else
+/// `standby`; none where the right is rendered or unsaid.
+fn several_not_offered(
+    shards: u32,
+    standby: bool,
+    lease_right: Option<bool>,
+) -> Option<(&'static str, &'static str)> {
+    const WHY: &str = "this deployment runs no store standby, so it renders no lease right for \
+                       several pods of one instance: set a store's standby (the ha profile sets \
+                       each), or launch one pod";
+    if lease_right != Some(false) {
+        return None;
+    }
+    if shards > 1 {
+        Some(("shards", WHY))
+    } else if standby {
+        Some(("standby", WHY))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod several_tests {
+    use super::several_not_offered;
+
+    /// Ruled 2026-11-15 (the review of 95d68904, S4): the tool takes
+    /// neither shards nor a standby pod where the deployment renders no
+    /// lease right, naming the field.
+    #[test]
+    fn the_tool_takes_no_shards_or_standby_where_no_lease_right_is_rendered() {
+        assert_eq!(
+            several_not_offered(2, true, Some(false)).unwrap().0,
+            "shards"
+        );
+        assert_eq!(
+            several_not_offered(1, true, Some(false)).unwrap().0,
+            "standby"
+        );
+        assert_eq!(
+            several_not_offered(0, true, Some(false)).unwrap().0,
+            "standby"
+        );
+        assert_eq!(several_not_offered(1, false, Some(false)), None);
+        for said in [Some(true), None] {
+            assert_eq!(several_not_offered(4, true, said), None);
+        }
+    }
+}

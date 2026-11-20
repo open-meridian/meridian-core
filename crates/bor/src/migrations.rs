@@ -72,6 +72,56 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "database_identity",
         sql: include_str!("../migrations/0010_database_identity.sql"),
     },
+    // An account's placement key (step 3d; section 6.3): what it was placed
+    // in its partition by, kept at its creation.
+    Migration {
+        version: 11,
+        name: "placement",
+        sql: include_str!("../migrations/0011_placement.sql"),
+    },
+    // A partition's writer group (step 3d; ruled 2026-11-14): set by a
+    // move's switch, and filled with the rendezvous owner at start.
+    Migration {
+        version: 12,
+        name: "writer_group",
+        sql: include_str!("../migrations/0012_writer_group.sql"),
+    },
+    // Each writer group's epoch (step 3d; `book_writer_group` approved
+    // 2026-11-14): kept while the group owns no partition.
+    Migration {
+        version: 13,
+        name: "writer_group_epoch",
+        sql: include_str!("../migrations/0013_writer_group_epoch.sql"),
+    },
+    // The records owed to `~control` by a member that does not write it
+    // (step 3d; `book_control_owed` approved 2026-11-14).
+    Migration {
+        version: 14,
+        name: "control_owed",
+        sql: include_str!("../migrations/0014_control_owed.sql"),
+    },
+    // The book's members and the revision each runs (step 3d;
+    // `book_member` ruled 2026-11-15, item 9): what a move home waits on.
+    Migration {
+        version: 15,
+        name: "member",
+        sql: include_str!("../migrations/0015_member.sql"),
+    },
+    // What each member serves as (step 3d, stage T; `writer_group` and
+    // `mode` approved 2026-11-15): what a writer told to stop waits on.
+    Migration {
+        version: 16,
+        name: "member_serves",
+        sql: include_str!("../migrations/0016_member_serves.sql"),
+    },
+    // A plugin shard's epoch as this database last saw it (step 3d,
+    // checkpoint 5, item 32): what a write stamped with an epoch is checked
+    // against, in its own transaction.
+    Migration {
+        version: 17,
+        name: "shard_fence",
+        sql: include_str!("../migrations/0017_shard_fence.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

@@ -431,6 +431,7 @@ fn a_database_to_be_made_is_not_made_by_testing_it() {
         superuser_password: "generated".into(),
         serving_password: "generated".into(),
         migrating_password: "generated".into(),
+        also: Vec::new(),
     });
     let reply = run.check(&FirstRunCheckRequest {
         answer: Some(Answer::RuntimeDatabase(RuntimeDatabaseAnswer {

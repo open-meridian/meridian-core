@@ -138,6 +138,18 @@
           "intent": "a standby took a store's writer lease and raised its partitions' epoch, and why, in the store's control partition (contract v30, W6.39)"
         },
         {
+          "message": "meridian.v1.ShardTookOver",
+          "intent": "a pod took a plugin instance's shard and the lake raised the shard's epoch, and why, in the lake's control partition (contract v30, W8.3, W6.39)"
+        },
+        {
+          "message": "meridian.v1.TakeShardRequest",
+          "intent": "a sidecar that took a shard's Lease asks the lake to raise the shard's epoch before it serves (contract v30, W8.3)"
+        },
+        {
+          "message": "meridian.v1.TakeShardReply",
+          "intent": "the shard's epoch, raised and confirmed in every lake and book writer group, under which the sidecar stamps its writes (contract v30, W8.3)"
+        },
+        {
           "message": "meridian.v1.IntegrityFinding",
           "intent": "a store's record found changed where it rests, by a checksum, a digest, the chain or two members' digests, in the store's control partition (contract v30, W6.39)"
         }
@@ -16920,6 +16932,19 @@
       "store": "bor"
     },
     {
+      "name": "meridian.v1.ReportChargeRequest.idempotency_key",
+      "type": "text",
+      "empty": "empty is none: the fact is applied once by its message identifier alone",
+      "intent": "lets the report be retried after a lost reply and applied once",
+      "meaning": "the plugin's own key for the report; a second with the same key and the same content is answered as the first was, no second charge recorded; one with other content is refused REFUSAL_REASON_IDEMPOTENCY_CONFLICT",
+      "not_meaning": "the envelope's message identifier; or the venue's charge or fill ID, from which the plugin may derive it",
+      "filled": "as-reported",
+      "filled_by": "connectivity",
+      "since": "v30",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
       "name": "meridian.v1.ReportValueDateRollRequest.venue_account_code",
       "type": "text",
       "empty": "never empty",
@@ -25563,6 +25588,19 @@
       "store": "conductor"
     },
     {
+      "name": "meridian.v1.ReadResilienceProfileReply.advice",
+      "type": "repeated message ResilienceLine",
+      "empty": "none: nothing the members' reports call for",
+      "intent": "advises a store's partitions or writer groups beyond the levels (W6.39; spec section 6.8; approved 2026-11-14)",
+      "meaning": "each a line in a failure line's shape: its subject a store's partitions or writer group, its reason the measured cause -- a partition count not above the writer-group count, a writer group busy past its bound (ComponentReport.peak_write_busy_percent) or refusing work as overloaded -- and its changes the chart value to set and what it costs",
+      "not_meaning": "a change made: the profile names a change and never makes one",
+      "filled": "derived",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
       "name": "meridian.v1.ResilienceLine.subject",
       "type": "text",
       "empty": "never empty",
@@ -25982,6 +26020,19 @@
       "store": "conductor"
     },
     {
+      "name": "meridian.v1.ResilienceHistoryItem.shard_took_over",
+      "type": "message ShardTookOver",
+      "empty": "unset unless the item is a plugin shard's takeover",
+      "intent": "carries a plugin shard's takeover in the history (W6.39; the record approved 2026-11-16)",
+      "meaning": "the record as the lake keeps it; the page and dashboard__read_resilience show it with component the instance and partition the shard",
+      "not_meaning": "a store writer's takeover, which writer_took_over carries",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
       "name": "meridian.v1.WriterTookOver.component",
       "type": "text",
       "empty": "never empty",
@@ -26076,6 +26127,10 @@
         {
           "value": "TAKEOVER_REASON_DATABASE_TIMELINE",
           "meaning": "the writer found its database on a new timeline or system identifier, after a failover or a restore that can have lost a committed tail, and raised the epoch (approved 2026-11-11)"
+        },
+        {
+          "value": "TAKEOVER_REASON_RELEASED",
+          "meaning": "the lease was free: released by its holder's planned stop, or never held (approved 2026-11-16); a plugin shard's take (ShardTookOver)"
         }
       ],
       "empty": "never unspecified",
@@ -26098,6 +26153,259 @@
       "not_meaning": "when the old writer stopped",
       "filled": "decided",
       "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.instance",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the plugin instance whose shard was taken (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardRequest.instance",
+      "not_meaning": "a store",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.shard",
+      "type": "integer",
+      "unit": "shards of the instance, numbered from 0",
+      "empty": "0 for shard 0",
+      "intent": "names the shard taken (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardRequest.shard",
+      "not_meaning": "a count of shards",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.epoch",
+      "type": "integer",
+      "unit": "epochs of the shard",
+      "empty": "never zero",
+      "intent": "states the shard's epoch raised (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardReply.epoch",
+      "not_meaning": "a count of takeovers",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.holder",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names who took the shard (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardRequest.holder",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.previous_holder",
+      "type": "text",
+      "empty": "empty where the Lease was free",
+      "intent": "names who held the shard before (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardRequest.previous_holder",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.reason",
+      "type": "enum TakeoverReason",
+      "allowed": [
+        {
+          "value": "TAKEOVER_REASON_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "TAKEOVER_REASON_LEASE_LAPSED",
+          "meaning": "the previous holder's Lease lapsed unrenewed"
+        },
+        {
+          "value": "TAKEOVER_REASON_STEPPED_DOWN",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_MOVED",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_DATABASE_TIMELINE",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_RELEASED",
+          "meaning": "the Lease was free: released by its holder's planned stop, or never held"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says why the shard was taken (W8.3; approved 2026-11-16)",
+      "meaning": "as TakeShardRequest.reason",
+      "not_meaning": "a pod's exit code",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.ShardTookOver.took_over_at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never zero",
+      "intent": "states when the shard's epoch was raised (W8.3)",
+      "meaning": "by the lake's clock, at the raise's commit",
+      "not_meaning": "when the Lease was taken",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.instance",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the plugin instance whose shard was taken (W8.3; approved 2026-11-16)",
+      "meaning": "the instance the sidecar serves; refused where it is not the envelope's publisher_instance_id",
+      "not_meaning": "a pod or a member",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.shard",
+      "type": "integer",
+      "unit": "shards of the instance, numbered from 0",
+      "empty": "0 for shard 0, and for a standby pod alone",
+      "intent": "names the shard taken (W8.3; approved 2026-11-16)",
+      "meaning": "the shard whose Lease, <instance>-shard-<n>, the sidecar now holds",
+      "not_meaning": "a count of shards",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.lease_transitions",
+      "type": "integer",
+      "unit": "takes of the Lease",
+      "empty": "0 for a Lease nobody held before",
+      "intent": "gives the epoch's floor (W8.3; approved 2026-11-16)",
+      "meaning": "the Lease's leaseTransitions as the sidecar wrote it taking the Lease; the lake raises the shard's epoch to the greater of the epoch it holds plus one and this",
+      "not_meaning": "the epoch itself, which the lake decides",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.lease_uid",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the Lease object the floor was seen on (W8.3; approved 2026-11-16, review c5a2 N5)",
+      "meaning": "the Lease's metadata.uid as the sidecar read it taking the Lease; a take naming another uid than the one the lake's floor of lease_transitions was seen on -- a Lease made again, whose transitions start at 0 -- starts that floor afresh",
+      "not_meaning": "a pod's or a holder's identity",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.holder",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names who took the shard (W8.3; approved 2026-11-16)",
+      "meaning": "the Lease's holderIdentity the sidecar wrote: its pod's name and its process",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.previous_holder",
+      "type": "text",
+      "empty": "empty where the Lease was free: released, or never held",
+      "intent": "names who held the shard before (W8.3; approved 2026-11-16)",
+      "meaning": "the Lease's holderIdentity as the sidecar read it before taking it",
+      "not_meaning": "a person",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardRequest.reason",
+      "type": "enum TakeoverReason",
+      "allowed": [
+        {
+          "value": "TAKEOVER_REASON_UNSPECIFIED",
+          "meaning": "not known; never sent"
+        },
+        {
+          "value": "TAKEOVER_REASON_LEASE_LAPSED",
+          "meaning": "the previous holder's Lease lapsed unrenewed"
+        },
+        {
+          "value": "TAKEOVER_REASON_STEPPED_DOWN",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_MOVED",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_DATABASE_TIMELINE",
+          "meaning": "a store writer's; never sent for a shard"
+        },
+        {
+          "value": "TAKEOVER_REASON_RELEASED",
+          "meaning": "the Lease was free: released by its holder's planned stop, or never held"
+        }
+      ],
+      "empty": "never unspecified",
+      "intent": "says why the shard was taken (W8.3; approved 2026-11-16)",
+      "meaning": "as the sidecar found the Lease",
+      "not_meaning": "a pod's exit code",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "conductor"
+    },
+    {
+      "name": "meridian.v1.TakeShardReply.epoch",
+      "type": "integer",
+      "unit": "epochs of the shard",
+      "empty": "never zero",
+      "intent": "gives the shard's new epoch (W8.3; approved 2026-11-16)",
+      "meaning": "max(the epoch held + 1, lease_transitions), at least 1, recorded as ShardTookOver in the lake's control partition and raised in every lake and book writer group's fence before it is answered; the sidecar stamps it on every write as MessageMeta.shard_epoch. A group that does not confirm within the takeover's budget fails the take, and the sidecar does not serve",
+      "not_meaning": "a store partition's epoch",
+      "filled": "decided",
+      "filled_by": "lake",
       "since": "v30",
       "stability": "preview",
       "store": "conductor"
@@ -27646,6 +27954,34 @@
       "intent": "names the watermark a read must not be answered behind (W4.4; approved by 1057)",
       "meaning": "the highest watermark the plugin's sidecar has seen for that instance on the store's partitions, from its own acknowledged writes, the deliveries it passed on and the watermark each of its reads was answered at, stamped by the sidecar, never by the plugin (approved 2026-11-09 and 2026-11-10): session consistency, read-your-writes and monotonic reads for the instance; a member behind it waits up to its bound or the call's remaining deadline, whichever is sooner, then answers from the store's primary database; a writer still behind it refuses UNAVAILABLE; no member answers from behind it",
       "not_meaning": "a point in time to read as of, which as_of_ns and book_at name; a plugin-facing field; or a demand to read from the writer: a member at or past it answers",
+      "filled": "stamped",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "envelope"
+    },
+    {
+      "name": "meridian.v1.MessageMeta.shard",
+      "type": "integer",
+      "unit": "shards of the instance, numbered from 0",
+      "empty": "0 on a write from an instance that runs one pod, which takes no Lease; then shard_epoch is 0 too",
+      "intent": "names the shard of its instance whose pod sent the write (W8.3; approved 2026-11-15)",
+      "meaning": "the shard whose Lease the sending pod's sidecar holds, stamped by the sidecar on every message it sends for its plugin while it holds it, never by the plugin (decisions/014); a standby that took a shard stamps that shard",
+      "not_meaning": "a writer group, a lake range, or a plugin-facing field",
+      "filled": "stamped",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "envelope"
+    },
+    {
+      "name": "meridian.v1.MessageMeta.shard_epoch",
+      "type": "integer",
+      "unit": "epochs of the shard",
+      "empty": "0 on a write from an instance that runs one pod: no fence checks it",
+      "intent": "states the shard's epoch the write was sent under, its fencing token (W8.3; approved 2026-11-15)",
+      "meaning": "the epoch the lake answered the sidecar's TakeShard with when it took the shard's Lease, stamped by the sidecar on every message it sends for its plugin, never by the plugin (decisions/014); each lake and book writer group's database checks it in the write's own transaction against the highest it holds for the shard (lake_shard_fence, book_shard_fence): lower is refused FAILED_PRECONDITION with REFUSAL_REASON_SHARD_FENCED, equal passes, higher raises it",
+      "not_meaning": "a store partition's epoch (WriterTookOver.epoch), or the Lease's leaseTransitions, which is only its floor",
       "filled": "stamped",
       "filled_by": "sidecar",
       "since": "v30",
@@ -37975,7 +38311,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of prices",
-      "meaning": "1 to 500 prices, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 prices, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets: each row is recorded in its own dataset's partition",
       "filled": "as-reported",
       "filled_by": "data",
@@ -38007,7 +38343,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of bars",
-      "meaning": "1 to 500 bars, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 bars, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -38039,7 +38375,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of trades",
-      "meaning": "1 to 500 trades, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 trades, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets: each row is recorded in its own dataset's partition",
       "filled": "as-reported",
       "filled_by": "data",
@@ -38071,7 +38407,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of quotes",
-      "meaning": "1 to 500 quotes, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 quotes, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -40351,7 +40687,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of outcomes (W10.4)",
-      "meaning": "1 to 500 outcomes, recorded whole or refused naming the item and field; each stage of a contract's determination a new version under its one row key",
+      "meaning": "1 to 500 outcomes, each dataset's recorded whole or refused naming the item and field; each stage of a contract's determination a new version under its one row key",
       "not_meaning": "the payout to holders, which is servicing's",
       "filled": "as-reported",
       "filled_by": "data",
@@ -40993,7 +41329,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of rates (W10.4)",
-      "meaning": "1 to 500 rates, recorded whole or refused naming the item and field; answered with RecordObservationsReply, a version whose only change is its raw reference a confirmation, not counted as a restatement",
+      "meaning": "1 to 500 rates, each dataset's recorded whole or refused naming the item and field; answered with RecordObservationsReply, a version whose only change is its raw reference a confirmation, not counted as a restatement",
       "not_meaning": "a transaction across datasets: each row is recorded in its own dataset's partition",
       "filled": "as-reported",
       "filled_by": "data",
@@ -42150,7 +42486,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of listed series (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a request to mint",
       "filled": "as-reported",
       "filled_by": "data",
@@ -42768,7 +43104,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of statistics (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -43533,7 +43869,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of derived values (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field; from a data plugin, publishers' figures, each naming whose (amended 2026-10-31, ruling 955)",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field; from a data plugin, publishers' figures, each naming whose (amended 2026-10-31, ruling 955)",
       "not_meaning": "a publisher's figure presented as the plugin's own measure",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -43973,7 +44309,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of filings (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -44436,7 +44772,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of reported facts (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -44849,7 +45185,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of holdings reports (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -44881,7 +45217,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of holdings (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -45310,7 +45646,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of announced corporate actions (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -45683,7 +46019,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of rating actions (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500 rows, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "a transaction across datasets",
       "filled": "as-reported",
       "filled_by": "data",
@@ -46176,7 +46512,7 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of assessments (W10.12)",
-      "meaning": "1 to 500, recorded whole or refused naming the item and field",
+      "meaning": "1 to 500, each dataset's recorded whole or refused naming the item and field",
       "not_meaning": "rows",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -47671,7 +48007,7 @@
     {
       "name": "meridian.v1.DatasetGap.dataset",
       "type": "identifier dataset",
-      "empty": "empty: not yet known -- the unattributed gap the writer records the moment the stream's sequence passes rows it never committed, before any dataset's next write names its own (approved 2026-11-11)",
+      "empty": "empty: not yet known -- the unattributed gap the writer records the moment the stream's sequence, its own stream's numbering from 1 (item 203), passes rows it never committed, before any dataset's next write names its own (approved 2026-11-11)",
       "intent": "names the dataset with a gap (W10.14; the record approved 2026-11-09; empty as not yet known approved 2026-11-11)",
       "meaning": "the dataset whose rows were dropped",
       "not_meaning": "an entitlement",
@@ -47738,7 +48074,7 @@
         },
         {
           "value": "GAP_CAUSE_WRITE_AHEAD_BOUND",
-          "meaning": "rows the lake's write-ahead stream dropped at its bound before the lake committed them: a writer gone longer than the bound"
+          "meaning": "rows the lake's write-ahead stream dropped at its bound before the lake committed them: a writer gone longer than the bound; counted in the writer group's own stream's numbering, from 1, so a stream made again after ha was left never counts the old stream's writes as lost (item 203)"
         }
       ],
       "empty": "never unspecified",
@@ -50739,6 +51075,34 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.v1.RegisterReply.shard",
+      "type": "integer",
+      "unit": "shard, from 0",
+      "empty": "0: shard 0, or an instance of one pod (shards 0)",
+      "intent": "tells the plugin which shard of its instance it serves",
+      "meaning": "the shard whose Lease this pod's sidecar took; the plugin writes its storage under shard-<n>/ of its instance's shared storage and reads every shard's",
+      "not_meaning": "a setting or an environment variable: an instance's pods are identical; nor fixed for the pod: a pod that loses its shard and takes another registers again",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.RegisterReply.shards",
+      "type": "integer",
+      "unit": "shards",
+      "empty": "0: an instance of one pod, which holds no Lease and keeps its storage as before",
+      "intent": "tells the plugin how many shards its instance runs",
+      "meaning": "the shard count its launch set, 1 for a standby pod alone; from 1, its storage is its instance's shared claim, a folder per shard",
+      "not_meaning": "the shards live now, which the Leases say",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.v1.HeartbeatRequest.healthy",
       "type": "boolean",
       "empty": "false is not healthy, detail saying why",
@@ -52729,6 +53093,11 @@
         {
           "value": "REFUSAL_REASON_RATE_LIMITED",
           "meaning": "beside RESOURCE_EXHAUSTED: the plugin past its own share at its sidecar -- requests at once, requests a second, or answers held or paged in flight for it (W4.4) -- refused alone; nothing recorded, and retry_after_seconds says when to send it again",
+          "since": "v30"
+        },
+        {
+          "value": "REFUSAL_REASON_SHARD_FENCED",
+          "meaning": "beside FAILED_PRECONDITION: a write stamped with an epoch lower than the one the store holds for its shard -- another pod took the shard's Lease and the lake raised its epoch (W8.3; approved 2026-11-15) -- refused alone, nothing of it recorded, worded \"fenced: this shard's epoch is no longer the instance's\"; the sidecar then exits as on a lost Lease, and its pod comes back as the standby",
           "since": "v30"
         }
       ],
@@ -58235,7 +58604,7 @@
       "type": "boolean",
       "empty": "false: no standby pod",
       "intent": "asks for an instance's standby pod (W8.3; the launch setting approved by 1057)",
-      "meaning": "true: a second pod whose sidecar holds no lease and whose role classes' run() starts only when it takes the instance's Lease; recommended for oms, ems, connectivity and live data instances; kept on the launch from 3c, the pod built with 3d",
+      "meaning": "true: a second pod whose sidecar holds no Lease and withholds its plugin's Register until it takes a shard's Lease (<instance>-shard-<n>; <instance>-shard-0 with one shard), so its role classes' run() start only then; recommended for oms, ems, connectivity and live data instances; kept on the launch from 3c, the pod built with 3d",
       "not_meaning": "a second instance, or a shard: a standby shares nothing until it takes over",
       "filled": "entered",
       "filled_by": "dashboard",
@@ -58271,6 +58640,85 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.v1.PluginLaunch.storage_copied",
+      "type": "message PluginStorageCopied",
+      "empty": "unset where the launch copied no storage, or not yet: until a pod of the instance is heard registered after it",
+      "intent": "records that the instance's own storage claim was copied into its shared storage before this launch's pods started",
+      "meaning": "the PluginStorageCopied record of this launch, its own record (decisions/031), kept once per launch that copied",
+      "not_meaning": "that the old claim was removed: it is kept as it was",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginStorageCopied.instance_id",
+      "type": "identifier instance",
+      "empty": "never empty",
+      "intent": "names the instance whose storage was copied",
+      "meaning": "the instance the launch that copied ran",
+      "not_meaning": "the copy pod",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginStorageCopied.from_claim",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the claim copied",
+      "meaning": "the instance's own claim, <fullname>-storage-<instance>, read only during the copy and kept as it was",
+      "not_meaning": "a claim the launcher deleted: it deletes none",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginStorageCopied.to_claim",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the shared storage it was copied into",
+      "meaning": "<fullname>-shared-storage-<instance>, into its folder shard-0/: a one-pod instance's records are shard 0's",
+      "not_meaning": "the folder of the shard serving the instance's subjects now",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginStorageCopied.at_ns",
+      "type": "moment",
+      "unit": "nanoseconds since the epoch",
+      "empty": "never 0",
+      "intent": "says by when the copy was whole",
+      "meaning": "when the conductor first heard one of the instance's pods registered after the launch that copied; its pods start only once the copy is whole, so the copy was whole by then",
+      "not_meaning": "when the copy started, or the moment it ended",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.PluginStorageCopied.launched_by",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names who made the launch that copied",
+      "meaning": "the person or service account the launch's record names",
+      "not_meaning": "the launcher, which made the copy for it",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.v1.LaunchPluginRequest.limits",
       "type": "message SidecarLimits",
       "empty": "unset: every limit the chart's sidecar.limits",
@@ -58297,12 +58745,71 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.v1.CreatePluginReply.storage_copied_from",
+      "type": "text",
+      "empty": "empty where the launcher copies no storage",
+      "intent": "tells the conductor the instance's own claim the launcher copies into its shared storage (item 30)",
+      "meaning": "<fullname>-storage-<instance>, copied into the shared storage's shard-0/ before the instance's pods start, by a copy pod the launcher makes; the conductor records PluginStorageCopied once a pod is heard registered after",
+      "not_meaning": "that the copy is whole yet",
+      "filled": "decided",
+      "filled_by": "launcher",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.CreatePluginReply.ran_shared",
+      "type": "boolean",
+      "empty": "false: the launch ran on the instance's own claim, or it keeps no storage",
+      "intent": "tells the conductor whether the launcher ran the launch on the instance's shared storage (PO item 91)",
+      "meaning": "true where the launcher made the instance's pods on its shared storage: several pods, or one pod as one shard of storage shared since it ran as several; kept on the launch's record, so only a later launch on the instance's own claim, not failed, keeps an earlier copy unrecorded",
+      "not_meaning": "that the copy is whole yet: those pods start once it is",
+      "filled": "decided",
+      "filled_by": "launcher",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.v1.CreatePluginRequest.limits",
       "type": "message SidecarLimits",
       "empty": "unset: every limit the chart's sidecar.limits",
       "intent": "tells the launcher an instance's own share at its sidecar (W8.3; approved 2026-11-11)",
       "meaning": "as the instance's launch asked: the launcher writes each field set into the sidecar's environment over the chart's sidecar.limits",
       "not_meaning": "a change to a running sidecar: it takes effect as the pod starts",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.CreatePluginRequest.shards",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "64"
+        }
+      },
+      "unit": "pods of one instance",
+      "empty": "0: one pod, as 1 is",
+      "intent": "tells the launcher the shards an instance was launched with (W8.3; approved 2026-11-15)",
+      "meaning": "as the instance's launch asked (LaunchPluginRequest.shards): the launcher runs a pod per shard, each holding its Lease <instance>-shard-<n>, under the instance's own account <fullname>-shards-<instance>; only where the chart renders the shards' Lease right (ha), and past 1 only for a data instance",
+      "not_meaning": "separate instances: a shard is a pod of the one instance",
+      "filled": "decided",
+      "filled_by": "conductor",
+      "since": "v30",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.v1.CreatePluginRequest.standby",
+      "type": "boolean",
+      "empty": "false: no standby pod",
+      "intent": "tells the launcher whether an instance runs a standby pod (W8.3; approved 2026-11-15)",
+      "meaning": "as the instance's launch asked (LaunchPluginRequest.standby): one more pod, holding no Lease, whose sidecar withholds its plugin's Register until it takes a shard's Lease; with one shard the Lease is <instance>-shard-0; only where the chart renders the Lease right (ha)",
+      "not_meaning": "a second instance, or a shard: a standby serves nothing until it takes over",
       "filled": "decided",
       "filled_by": "conductor",
       "since": "v30",

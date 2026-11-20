@@ -45,6 +45,14 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 /// answer's shape and a refusal is not an answer of that shape.
 pub(crate) const REFUSAL_HEADER: &str = "Meridian-Refusal";
 
+/// Words carried in a header, on one line: a header's value may hold no
+/// line break, and the client panics on one, so the answer is never sent and
+/// its caller waits out its whole timeout (step 3d; CI 43621875619, a
+/// database's error with its DETAIL line). Each line break read as a space.
+pub fn header_words(words: &str) -> String {
+    words.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
 /// How long a request's caller waits for its answer, in milliseconds, carried
 /// beside the request as gRPC's own `grpc-timeout` is: relative, so no two
 /// clocks are compared. The answering side holds a read to its `read_after`
@@ -62,6 +70,10 @@ pub(crate) const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
 /// which every credential holds (`_INBOX.>`).
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const UNANSWERED: Duration = Duration::from_secs(2);
+
+/// How long [`Backend::subscribed`] waits for the subscriptions to be made,
+/// and then for the broker's answer: a caller asks again.
+const SUBSCRIBED_WITHIN: Duration = Duration::from_secs(5);
 
 pub struct NatsBackend {
     client: async_nats::Client,
@@ -90,6 +102,63 @@ pub struct NatsBackend {
     /// Every live subscription's drop count, each counted a loss when the
     /// connection is lost (the resilience spec's section 10a).
     listening: Arc<Listening>,
+
+    /// The subscriptions asked for and not yet made at the broker: each is
+    /// made on a task of its own, so `serve` and `subscribe` return before
+    /// the broker has them ([`Backend::subscribed`]).
+    pending: Arc<tokio::sync::watch::Sender<usize>>,
+
+    /// The subscriptions asked for that were not made: the broker refused
+    /// one, or its task never ran. None is ever made later, so a backend
+    /// with any is never [`Backend::subscribed`] (stage T's review,
+    /// finding 5).
+    unmade: Arc<AtomicU64>,
+
+    /// What this member has left to its group's other members
+    /// ([`Backend::withdraw`]); every offer and shared subscription
+    /// watches it.
+    withdrawn: Arc<tokio::sync::watch::Sender<Option<crate::backend::Withdrawn>>>,
+
+    /// The URL it connected by, for a connection of its own to each other
+    /// server of the broker's cluster ([`Backend::subscribed`]).
+    url: String,
+}
+
+/// One subscription being made at the broker, counted until it is made --
+/// or counted unmade, where the broker refused it or its task was dropped
+/// unrun.
+struct Subscribing {
+    pending: Arc<tokio::sync::watch::Sender<usize>>,
+    unmade: Arc<AtomicU64>,
+    made: bool,
+}
+
+impl Subscribing {
+    fn begun(pending: &Arc<tokio::sync::watch::Sender<usize>>, unmade: &Arc<AtomicU64>) -> Self {
+        pending.send_modify(|count| *count += 1);
+        Self {
+            pending: Arc::clone(pending),
+            unmade: Arc::clone(unmade),
+            made: false,
+        }
+    }
+
+    /// The broker took it.
+    fn made(mut self) {
+        self.made = true;
+    }
+}
+
+impl Drop for Subscribing {
+    fn drop(&mut self) {
+        // Counted unmade before it stops being pending: whoever waits for
+        // none pending then reads the count.
+        if !self.made {
+            self.unmade.fetch_add(1, Ordering::SeqCst);
+        }
+        self.pending
+            .send_modify(|count| *count = count.saturating_sub(1));
+    }
 }
 
 /// Every live subscription's drop count, so a connection lost counts a loss
@@ -156,11 +225,24 @@ impl NatsBackend {
         let (options, address) = credential_in(url);
         let listening = Arc::new(Listening::default());
         let dropped = Arc::new(AtomicU64::new(0));
+        let unmade = Arc::new(AtomicU64::new(0));
         let options = options.event_callback({
             let (listening, dropped) = (Arc::clone(&listening), Arc::clone(&dropped));
+            let unmade = Arc::clone(&unmade);
             move |event| {
                 let (listening, dropped) = (Arc::clone(&listening), Arc::clone(&dropped));
+                let unmade = Arc::clone(&unmade);
                 async move {
+                    // A subscription the server refused -- this member's
+                    // login may not subscribe there -- is said so here, and
+                    // nowhere else: counted, so the member never says it
+                    // serves a topic the broker does not hold for it.
+                    if let async_nats::Event::ServerError(error) = &event {
+                        if refused_a_subscription(error) {
+                            unmade.fetch_add(1, Ordering::SeqCst);
+                            tracing::error!(%error, "the broker refused a subscription");
+                        }
+                    }
                     if matches!(event, async_nats::Event::Disconnected) {
                         let lost = listening.lost();
                         dropped.fetch_add(lost, Ordering::Relaxed);
@@ -199,6 +281,10 @@ impl NatsBackend {
             outbox,
             heartbeat,
             listening,
+            pending: Arc::new(tokio::sync::watch::channel(0).0),
+            unmade,
+            withdrawn: Arc::new(tokio::sync::watch::channel(None).0),
+            url: url.to_string(),
         })
     }
 
@@ -424,6 +510,358 @@ impl Backend for NatsBackend {
     /// different problems to whoever is holding a pager: one is a deployment
     /// missing a component, the other is a component that is too slow or gone.
     fn request<'a>(&'a self, topic: &'a str, envelope: Envelope, timeout: Duration) -> Answer<'a> {
+        self.ask(topic, envelope, timeout, None)
+    }
+
+    /// The same, addressed to writer group `group` (step 3d, approved
+    /// 2026-11-12): [`crate::owners::WRITER_GROUP_HEADER`] beside the
+    /// timeout, so every other group's member leaves it unanswered.
+    fn request_to_group<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: u32,
+    ) -> Answer<'a> {
+        self.ask(topic, envelope, timeout, Some(group))
+    }
+
+    /// Offer a local handler's answer to writer group `group` alone.
+    fn serve_group(&self, topic: &str, queue: &str, group: u32, handler: Handler) {
+        self.offer(topic, queue, handler, None, Some(group), None);
+    }
+    /// Offer a local handler's answer to callers in other processes.
+    fn serve(&self, topic: &str, group: &str, handler: Handler) {
+        self.offer(topic, group, handler, None, None, None);
+    }
+
+    /// The same, each request another writer group owns passed to it first.
+    fn serve_routed(
+        &self,
+        topic: &str,
+        group: &str,
+        handler: Handler,
+        route: crate::backend::PreRoute,
+    ) {
+        self.offer(topic, group, handler, None, None, Some(route));
+    }
+
+    /// The same, signalling once each answer is on the wire.
+    fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
+        self.offer(topic, group, handler, Some(delivered), None, None);
+    }
+
+    /// One of a queue group at the broker (contract v25): each message to one
+    /// member of the group.
+    fn subscribe_shared(&self, pattern: &str, group: &str) -> Subscription {
+        self.listen(pattern, Some(group.to_string()))
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    fn withdraw(&self, what: crate::backend::Withdrawn) {
+        self.withdrawn.send_replace(Some(what));
+    }
+
+    /// Every subscription asked for so far made at the broker, and every
+    /// server of the broker shown to hold them.
+    ///
+    /// **Made.** Each is sent on this connection in order. One the broker
+    /// refused, or whose task never ran, is never made later: with any, this
+    /// is refused for good, and the member never says it serves (stage T's
+    /// review, finding 5).
+    ///
+    /// **Held by the server it is connected to.** A message of this
+    /// client's own, published after them to a subject subscribed after
+    /// them and heard back, went through that server after it took every
+    /// one.
+    ///
+    /// **Held by every other server** (finding 5: a caller connected to
+    /// another server of a three-server broker was told nothing serves
+    /// while its server had not yet heard of the subscriptions). NATS
+    /// gives a subscriber no acknowledgement that interest has reached the
+    /// other servers of a cluster, so it is shown by a round trip through
+    /// each: on a connection of its own to each server the broker
+    /// advertises (`connect_urls` in its INFO), the same subject is asked,
+    /// and this client's subscription answers. A server routes a request
+    /// only once it holds the interest, and answers "no responders" at
+    /// once where it does not; and a server sends its clients' interest to
+    /// each other server on one route, in the order it took it, so the
+    /// last subscription heard there says every one before it is. A server
+    /// that cannot be reached routes nobody's call either, and is passed
+    /// over; one that is reached and does not hold the subscription yet
+    /// refuses this, and the member asks again.
+    fn subscribed(&self) -> crate::backend::Settled<'_> {
+        Box::pin(async move {
+            let unsettled = |detail: String| BusError::HandlerFailed {
+                topic: "the broker".into(),
+                detail,
+            };
+            let mut pending = self.pending.subscribe();
+            tokio::time::timeout(SUBSCRIBED_WITHIN, pending.wait_for(|count| *count == 0))
+                .await
+                .map_err(|_| unsettled("its subscriptions were not made in time".into()))?
+                .map_err(|_| unsettled("the connection is gone".into()))?;
+            let inbox = self.client.new_inbox();
+            let mut back = self
+                .client
+                .subscribe(inbox.clone())
+                .await
+                .map_err(|failed| unsettled(failed.to_string()))?;
+            self.client
+                .publish(inbox.clone(), Vec::new().into())
+                .await
+                .map_err(|failed| unsettled(failed.to_string()))?;
+            self.client
+                .flush()
+                .await
+                .map_err(|failed| unsettled(failed.to_string()))?;
+            match tokio::time::timeout(SUBSCRIBED_WITHIN, futures_util::StreamExt::next(&mut back))
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(unsettled("the connection is gone".into())),
+                Err(_) => {
+                    return Err(unsettled(
+                        "the broker did not answer once the subscriptions were sent".into(),
+                    ))
+                }
+            }
+            // A subscription the server refused is said after the fact, on
+            // the client's events, which a task of its own reads: given a
+            // moment to be counted. The server said it before it sent the
+            // message heard above.
+            tokio::time::sleep(REFUSALS_COUNTED_WITHIN).await;
+            let unmade = self.unmade.load(Ordering::SeqCst);
+            if unmade > 0 {
+                return Err(unsettled(format!(
+                    "{unmade} of its subscriptions could not be made at the broker, and are \
+                     never made later: this member does not serve"
+                )));
+            }
+            self.held_by_every_server(&inbox, &mut back).await
+        })
+    }
+}
+
+/// How long a refused subscription is given to be counted, once the broker
+/// has answered past it.
+const REFUSALS_COUNTED_WITHIN: Duration = Duration::from_millis(50);
+
+/// Whether the broker's server refused a subscription, by what it said: its
+/// `-ERR 'Permissions Violation for Subscription to ...'`.
+fn refused_a_subscription(error: &async_nats::ServerError) -> bool {
+    let said = error.to_string().to_lowercase();
+    said.contains("permissions violation") && said.contains("subscription")
+}
+
+impl NatsBackend {
+    /// `probe`, which this client is subscribed to as `back`, asked through
+    /// every server the broker advertises, each on a connection of its own,
+    /// and answered here ([`Backend::subscribed`]).
+    async fn held_by_every_server(
+        &self,
+        probe: &str,
+        back: &mut async_nats::Subscriber,
+    ) -> Result<(), BusError> {
+        let info = self.client.server_info();
+        let (_, first) = credential_in(&self.url);
+        let scheme = first
+            .first()
+            .and_then(|address| address.split_once("://"))
+            .map_or("nats", |(scheme, _)| scheme)
+            .to_string();
+        for advertised in &info.connect_urls {
+            let address = match advertised.split_once("://") {
+                Some(_) => advertised.clone(),
+                None => format!("{scheme}://{advertised}"),
+            };
+            let (options, _) = credential_in(&self.url);
+            let other = match options
+                .ignore_discovered_servers()
+                .connection_timeout(OTHER_SERVER_WITHIN)
+                .connect(&address)
+                .await
+            {
+                Ok(other) => other,
+                Err(failed) => {
+                    tracing::debug!(%failed, "a server of the broker was not reached: passed over");
+                    continue;
+                }
+            };
+            let server = other.server_info().server_name;
+            if other.server_info().server_id == info.server_id {
+                continue;
+            }
+            SERVERS_ASKED.fetch_add(1, Ordering::Relaxed);
+            let asked = other.send_request(
+                probe.to_string(),
+                async_nats::Request::new()
+                    .payload(Vec::new().into())
+                    .timeout(Some(SUBSCRIBED_WITHIN)),
+            );
+            tokio::pin!(asked);
+            let answered = loop {
+                tokio::select! {
+                    answered = &mut asked => break answered,
+                    Some(message) = futures_util::StreamExt::next(back) => {
+                        if let Some(reply) = message.reply {
+                            let _ = self.client.publish(reply, Vec::new().into()).await;
+                        }
+                    }
+                }
+            };
+            if let Err(failed) = answered {
+                return Err(BusError::HandlerFailed {
+                    topic: "the broker".into(),
+                    detail: format!(
+                        "its server {server} does not hold this member's subscriptions yet ({failed})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The other servers asked so far, by every backend of this process.
+static SERVERS_ASKED: AtomicU64 = AtomicU64::new(0);
+
+/// How many times another server of the broker's cluster was asked whether
+/// it holds a member's subscriptions ([`Backend::subscribed`]): what a test
+/// reads to see the round trip went through each.
+pub fn servers_asked() -> u64 {
+    SERVERS_ASKED.load(Ordering::Relaxed)
+}
+
+/// How long another server of the broker is given to take a connection and
+/// answer, before it is passed over as one that routes nobody's call.
+const OTHER_SERVER_WITHIN: Duration = Duration::from_secs(2);
+
+/// End a subscription at the broker, and have the broker know it before
+/// anything more is done: what it had already sent is still read.
+async fn leave(client: &async_nats::Client, subscription: &mut async_nats::Subscriber, what: &str) {
+    if let Err(failed) = subscription.unsubscribe().await {
+        tracing::warn!(topic = what, %failed, "could not leave a subscription at the broker");
+        return;
+    }
+    if let Err(failed) = client.flush().await {
+        tracing::warn!(topic = what, %failed, "the broker was not told a subscription was left");
+    }
+    tracing::info!(
+        topic = what,
+        "left to this member's group: no longer offered here"
+    );
+}
+
+impl NatsBackend {
+    /// A subscription at the broker: plain, every subscriber hearing every
+    /// message, or one of a queue group (contract v25).
+    fn listen(&self, pattern: &str, group: Option<String>) -> Subscription {
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+        let subject = Self::subject(pattern);
+        let client = self.client.clone();
+        let owned = pattern.to_string();
+        let dropped = DropCount::default();
+        self.listening.hold(&dropped);
+        let counted = dropped.clone();
+        let total = Arc::clone(&self.dropped);
+        let subscribing = Subscribing::begun(&self.pending, &self.unmade);
+        let shared = group.is_some();
+        let mut withdrawing = self.withdrawn.subscribe();
+
+        self.handle.spawn(async move {
+            let subscribed = match group {
+                None => client.subscribe(subject.clone()).await,
+                Some(group) => client.queue_subscribe(subject.clone(), group).await,
+            };
+            let mut messages = match subscribed {
+                Ok(messages) => {
+                    subscribing.made();
+                    messages
+                }
+                Err(failed) => {
+                    tracing::error!(pattern = owned, %failed, "could not subscribe at the broker");
+                    return;
+                }
+            };
+
+            let lose = || {
+                counted.add();
+                total.fetch_add(1, Ordering::Relaxed);
+            };
+
+            let mut sequence = 0u64;
+            // A shared subscription ends where this member leaves its
+            // shared work to its group's others ([`Backend::withdraw`]).
+            let mut watching = shared;
+            loop {
+                let message = tokio::select! {
+                    biased;
+                    told = withdrawing.changed(), if watching => {
+                        let leaves = withdrawing
+                            .borrow_and_update()
+                            .as_ref()
+                            .is_some_and(|what| what.shared_work);
+                        if told.is_err() {
+                            watching = false;
+                        } else if leaves {
+                            watching = false;
+                            leave(&client, &mut messages, &owned).await;
+                        }
+                        continue;
+                    }
+                    message = futures_util::StreamExt::next(&mut messages) => message,
+                };
+                let Some(message) = message else {
+                    break;
+                };
+                let envelope = match Envelope::decode(message.payload) {
+                    Ok(envelope) => envelope,
+                    Err(failed) => {
+                        // Something on our subjects that is not ours. Dropped
+                        // and counted rather than passed up: a consumer cannot
+                        // do anything with bytes that are not an envelope.
+                        lose();
+                        tracing::warn!(pattern = owned, %failed, "undecodable message");
+                        continue;
+                    }
+                };
+
+                sequence += 1;
+                // Never waits for room. Waiting here backed the broker's
+                // stream up behind one slow consumer and lost nothing that
+                // anyone could count; dropping loses this message for this
+                // subscriber alone, and says so.
+                match tx.try_send(Delivery { envelope, sequence }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        lose();
+                        tracing::warn!(pattern = owned, "subscriber queue full; message dropped");
+                    }
+                    // The subscription was dropped. Ending the task is what
+                    // unsubscribes at the broker, since the client goes with it.
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
+        Subscription::new(rx, pattern, dropped)
+    }
+}
+
+impl NatsBackend {
+    /// Ask whoever serves `topic`, addressed to a writer group where
+    /// `group` names one.
+    fn ask<'a>(
+        &'a self,
+        topic: &'a str,
+        envelope: Envelope,
+        timeout: Duration,
+        group: Option<u32>,
+    ) -> Answer<'a> {
         let client = self.client.clone();
         let subject = topic.to_string();
 
@@ -459,6 +897,12 @@ impl Backend for NatsBackend {
                             let mut headers = async_nats::HeaderMap::new();
                             headers
                                 .insert(TIMEOUT_HEADER, timeout.as_millis().to_string().as_str());
+                            if let Some(group) = group {
+                                headers.insert(
+                                    crate::owners::WRITER_GROUP_HEADER,
+                                    group.to_string().as_str(),
+                                );
+                            }
                             headers
                         })
                         .timeout(Some(timeout)),
@@ -508,117 +952,79 @@ impl Backend for NatsBackend {
         })
     }
 
-    /// Offer a local handler's answer to callers in other processes.
-    fn serve(&self, topic: &str, group: &str, handler: Handler) {
-        self.offer(topic, group, handler, None);
-    }
-
-    /// The same, signalling once each answer is on the wire.
-    fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
-        self.offer(topic, group, handler, Some(delivered));
-    }
-
-    /// One of a queue group at the broker (contract v25): each message to one
-    /// member of the group.
-    fn subscribe_shared(&self, pattern: &str, group: &str) -> Subscription {
-        self.listen(pattern, Some(group.to_string()))
-    }
-
-    fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-}
-
-impl NatsBackend {
-    /// A subscription at the broker: plain, every subscriber hearing every
-    /// message, or one of a queue group (contract v25).
-    fn listen(&self, pattern: &str, group: Option<String>) -> Subscription {
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
-        let subject = Self::subject(pattern);
-        let client = self.client.clone();
-        let owned = pattern.to_string();
-        let dropped = DropCount::default();
-        self.listening.hold(&dropped);
-        let counted = dropped.clone();
-        let total = Arc::clone(&self.dropped);
-
-        self.handle.spawn(async move {
-            let subscribed = match group {
-                None => client.subscribe(subject.clone()).await,
-                Some(group) => client.queue_subscribe(subject.clone(), group).await,
-            };
-            let mut messages = match subscribed {
-                Ok(messages) => messages,
-                Err(failed) => {
-                    tracing::error!(pattern = owned, %failed, "could not subscribe at the broker");
-                    return;
-                }
-            };
-
-            let lose = || {
-                counted.add();
-                total.fetch_add(1, Ordering::Relaxed);
-            };
-
-            let mut sequence = 0u64;
-            while let Some(message) = futures_util::StreamExt::next(&mut messages).await {
-                let envelope = match Envelope::decode(message.payload) {
-                    Ok(envelope) => envelope,
-                    Err(failed) => {
-                        // Something on our subjects that is not ours. Dropped
-                        // and counted rather than passed up: a consumer cannot
-                        // do anything with bytes that are not an envelope.
-                        lose();
-                        tracing::warn!(pattern = owned, %failed, "undecodable message");
-                        continue;
-                    }
-                };
-
-                sequence += 1;
-                // Never waits for room. Waiting here backed the broker's
-                // stream up behind one slow consumer and lost nothing that
-                // anyone could count; dropping loses this message for this
-                // subscriber alone, and says so.
-                match tx.try_send(Delivery { envelope, sequence }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        lose();
-                        tracing::warn!(pattern = owned, "subscriber queue full; message dropped");
-                    }
-                    // The subscription was dropped. Ending the task is what
-                    // unsubscribes at the broker, since the client goes with it.
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                }
-            }
-        });
-
-        Subscription::new(rx, pattern, dropped)
-    }
-}
-
-impl NatsBackend {
-    fn offer(&self, topic: &str, group: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
+    fn offer(
+        &self,
+        topic: &str,
+        group: &str,
+        handler: Handler,
+        delivered: Option<Arc<Notify>>,
+        writer_group: Option<u32>,
+        route: Option<crate::backend::PreRoute>,
+    ) {
         let client = self.client.clone();
         let subject = topic.to_string();
         let group = group.to_string();
+        let subscribing = Subscribing::begun(&self.pending, &self.unmade);
+        let mut withdrawing = self.withdrawn.subscribe();
 
         self.handle.spawn(async move {
             // One of the component's queue group (contract v25): each request
             // reaches one copy of the component, which answers it.
-            let mut requests = match client.queue_subscribe(subject.clone(), group).await {
-                Ok(requests) => requests,
+            let subscribed = client.queue_subscribe(subject.clone(), group).await;
+            let mut requests = match subscribed {
+                Ok(requests) => {
+                    subscribing.made();
+                    requests
+                }
                 Err(failed) => {
                     tracing::error!(topic = subject, %failed, "could not offer a handler");
                     return;
                 }
             };
 
-            while let Some(message) = futures_util::StreamExt::next(&mut requests).await {
+            // No longer offered once this member leaves the topic to its
+            // group's others ([`Backend::withdraw`]): what had already
+            // arrived is still answered.
+            let mut watching = true;
+            loop {
+                let message = tokio::select! {
+                    biased;
+                    told = withdrawing.changed(), if watching => {
+                        let leaves = withdrawing
+                            .borrow_and_update()
+                            .as_ref()
+                            .is_some_and(|what| (what.topics)(&subject));
+                        if told.is_err() {
+                            watching = false;
+                        } else if leaves {
+                            watching = false;
+                            leave(&client, &mut requests, &subject).await;
+                        }
+                        continue;
+                    }
+                    message = futures_util::StreamExt::next(&mut requests) => message,
+                };
+                let Some(message) = message else {
+                    break;
+                };
                 // A publish on a topic somebody also serves: there is nobody
                 // to answer, so there is nothing to do with it here.
                 let Some(reply_to) = message.reply.clone() else {
                     continue;
                 };
+
+                // A hand-off addressed to another writer group (step 3d):
+                // its own member answers it, so this one leaves it be.
+                if let Some(mine) = writer_group {
+                    let addressed = message
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get(crate::owners::WRITER_GROUP_HEADER))
+                        .and_then(|said| said.to_string().parse::<u32>().ok());
+                    if addressed != Some(mine) {
+                        continue;
+                    }
+                }
 
                 // When its caller stops waiting, from what it said as it
                 // asked, counted from now (contract v30, ruled 2026-11-10).
@@ -629,6 +1035,7 @@ impl NatsBackend {
                     .and_then(|said| said.to_string().parse::<u64>().ok())
                     .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
 
+                let passed = message.payload.clone();
                 let asked = match Envelope::decode(message.payload) {
                     Ok(envelope) => envelope,
                     Err(failed) => {
@@ -641,6 +1048,7 @@ impl NatsBackend {
                 let client = client.clone();
                 let topic = subject.clone();
                 let delivered = delivered.clone();
+                let route = route.clone();
 
                 // Each request on its own task, so one slow handler does not
                 // hold up the next, and on a blocking pool, because a handler
@@ -650,6 +1058,64 @@ impl NatsBackend {
                 // HANDLERS_AT_ONCE answering at once -- and its working memory
                 // reserved; or refused for load with a retry-after.
                 tokio::spawn(async move {
+                    // Another writer group's write, as the request says (step
+                    // 3d; section 6.7): passed to its owner as it came, its
+                    // caller's reply address kept and what is left of its
+                    // wait, so the owner answers the caller; nothing held or
+                    // waited on here. Decided off the runtime: the owner's
+                    // record may be read.
+                    if let Some(route) = route {
+                        let started = std::time::Instant::now();
+                        let looked = asked.clone();
+                        let deciding = route.clone();
+                        let owner = tokio::task::spawn_blocking(move || deciding.owner(&looked))
+                            .await
+                            .ok()
+                            .flatten();
+                        // A wait spent while it was decided: dropped here,
+                        // below, as any request whose caller stopped waiting
+                        // -- never passed on to be run late. A fence that
+                        // landed meanwhile: refused here, below, by its
+                        // handler, never passed on (review-c5n5 F2).
+                        let spent = deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                        if let Some((internal, group)) =
+                            owner.filter(|_| !spent && !route.refuses())
+                        {
+                            let mut headers = async_nats::HeaderMap::new();
+                            headers.insert(
+                                crate::owners::WRITER_GROUP_HEADER,
+                                group.to_string().as_str(),
+                            );
+                            if let Some(deadline) = deadline {
+                                let left = deadline
+                                    .saturating_duration_since(std::time::Instant::now())
+                                    .as_millis()
+                                    .max(1);
+                                // What is left of it, the owner's to keep.
+                                headers.insert(TIMEOUT_HEADER, left.to_string().as_str());
+                            }
+                            match client
+                                .publish_with_reply_and_headers(
+                                    internal,
+                                    reply_to.clone(),
+                                    headers,
+                                    passed,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    crate::owners::note_passed(started.elapsed());
+                                    return;
+                                }
+                                Err(failed) => {
+                                    // Answered here instead: its handler
+                                    // hands it on as before.
+                                    tracing::warn!(topic, %failed, "a write could not be passed to its owner");
+                                }
+                            }
+                        }
+                    }
                     let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
 
                     let (payload_type, payload, refusal) = match answered {
@@ -698,7 +1164,7 @@ impl NatsBackend {
                         None => client.publish(reply_to, encoded.into()).await,
                         Some(detail) => {
                             let mut headers = async_nats::HeaderMap::new();
-                            headers.insert(REFUSAL_HEADER, detail.as_str());
+                            headers.insert(REFUSAL_HEADER, header_words(&detail).as_str());
                             client
                                 .publish_with_headers(reply_to, headers, encoded.into())
                                 .await

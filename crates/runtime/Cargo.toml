@@ -98,6 +98,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The schemas and databases its tests make, dropped with them (PO 65).
+meridian-changes = { path = "../changes", features = ["scratch"] }
 prost.workspace = true
 # The lease's election over a simulated network, in virtual time, with
 # links cut and held on a seeded schedule (ruling 1105).
@@ -108,3 +110,5 @@ rand = { version = "0.8", features = ["small_rng"] }
 # the plugin's scope stream, in the wiring test.
 ed25519-dalek.workspace = true
 tokio-stream.workspace = true
+# The shard loops on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }

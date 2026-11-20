@@ -37,10 +37,19 @@ use meridian_bus::Bus;
 pub use meridian_domain::v1::{Change, ReadChangesReply, ReadChangesRequest};
 use prost::Message;
 
+pub mod busy;
 pub mod captured;
+pub mod databases;
+pub mod group_commit;
+pub mod groups;
 pub mod integrity;
+pub mod members;
+pub mod moves;
 pub mod records;
+#[cfg(feature = "scratch")]
+pub mod scratch;
 pub mod serving;
+pub mod shard_fence;
 pub mod timeline;
 pub mod tls;
 
@@ -84,6 +93,23 @@ pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
     // A serving process's own login and its session's bounds (section 10a).
     serving::applied(&mut config);
     Ok(config)
+}
+
+/// How many connections a store's pool keeps open while it is idle (PO 67,
+/// 2026-11-17). Each one is a database backend held for nothing while the
+/// store is quiet, and the desktop footprint (ruling 1058) counts them. A
+/// pool still opens more, up to its size, as they are wanted, and each it
+/// opens reads the database's timeline first ([`timeline::Watching`]).
+pub const IDLE_CONNECTIONS: u32 = 2;
+
+/// A store's pool of at most `size` connections, keeping
+/// [`IDLE_CONNECTIONS`] open while idle (fewer where it is smaller). Before
+/// PO 67 a pool kept its whole size open from its start.
+pub fn pool<M: r2d2::ManageConnection>(size: u32) -> r2d2::Builder<M> {
+    let size = size.max(1);
+    r2d2::Pool::builder()
+        .max_size(size)
+        .min_idle(Some(IDLE_CONNECTIONS.min(size)))
 }
 
 /// Where a store's members ask a partition's changes after a sequence.
@@ -529,13 +555,32 @@ pub fn now_ns() -> i64 {
 pub struct Fence {
     /// 0 until adopted.
     epoch: AtomicU64,
+    /// Told to stop, and committing nothing more ([`Fence::stop`]).
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl Fence {
     pub const fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Commit nothing more under this fence: every commit from here is
+    /// refused as a fenced one is, whatever the head's epoch (step 3d,
+    /// stage T's review, finding 3). What a writer with no lease does when
+    /// told to stop while it serves on: its replacement starts beside it
+    /// under the same epoch, which fences neither, so the one stopping
+    /// stops committing itself, at once and for good. No epoch is raised
+    /// and no takeover recorded; this process is not told it was deposed.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Fence::stop`] was called.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// The epoch adopted; 0 if none yet.
@@ -546,6 +591,28 @@ impl Fence {
     /// Adopt `epoch`: what a writer does at start, and after it takes over.
     pub fn adopt(&self, epoch: u64) {
         self.epoch.store(epoch, Ordering::SeqCst);
+    }
+
+    /// Adopt `epoch`, which this writer raised in the transaction `commit`
+    /// commits, before that commit can be read; where it fails, the epoch
+    /// held before is kept (PR CI 44283011761). A commit of this writer's
+    /// own that waits behind the raise's locks reads the raised head row
+    /// the moment it lands: adopted only after, that commit was refused as
+    /// fenced by a newer writer, and the member stepped down from its own
+    /// raise.
+    pub fn adopt_committing<T, E>(
+        &self,
+        epoch: u64,
+        commit: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let before = self.epoch.swap(epoch, Ordering::SeqCst);
+        let committed = commit();
+        if committed.is_err() {
+            let _ = self
+                .epoch
+                .compare_exchange(epoch, before, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        committed
     }
 
     /// Adopt `epoch` where nothing was adopted yet, and answer the one held.
@@ -564,6 +631,12 @@ impl Fence {
     /// ([`fenced_seen`]), whose member steps down (step 3b).
     pub fn admits(&self, head_epoch: u64) -> Result<(), Fenced> {
         let mine = self.epoch();
+        if self.stopped() {
+            return Err(Fenced {
+                mine: Fenced::STOPPED,
+                head: head_epoch,
+            });
+        }
         if mine == head_epoch {
             Ok(())
         } else {
@@ -634,8 +707,41 @@ pub struct Fenced {
 /// The words a fenced commit is refused with, everywhere.
 pub const FENCED: &str = "fenced: this writer's epoch is no longer the partition's";
 
+/// The words a commit is refused with once its writer was told to stop.
+pub const STOPPED: &str = "this writer was told to stop and commits nothing more";
+
+impl Fenced {
+    /// `mine` where no epoch refused the commit: its writer was told to
+    /// stop, and commits nothing more ([`Fence::stop`]).
+    pub const STOPPED: u64 = u64::MAX;
+
+    /// As the bus carries it to the caller: UNAVAILABLE with retry-after 1,
+    /// asked again of the writer that serves by then (ruled 2026-11-18,
+    /// items 110 and 120; the resilience spec's section 5). Nothing of the
+    /// commit was made. What every store answers a fenced commit with
+    /// (review-c5n5 F1): in plain words the sidecar said it ABORTED, with
+    /// no retry-after.
+    pub fn on_the_bus(&self) -> String {
+        meridian_bus::refusal_status_retrying(
+            meridian_bus::RefusalStatus::Unavailable,
+            FENCED_RETRY_SECONDS,
+            self,
+        )
+    }
+}
+
+/// How long a caller refused by a fenced writer waits before it asks again
+/// ([`Fenced::on_the_bus`]; ruled 2026-11-18, item 120).
+pub const FENCED_RETRY_SECONDS: u32 = 1;
+
 impl std::fmt::Display for Fenced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.mine == Self::STOPPED {
+            return write!(
+                f,
+                "{STOPPED}; its group's writer that replaces it commits it: ask again"
+            );
+        }
         write!(
             f,
             "{FENCED} (this writer's {}, the partition's {}); another writer took it over, \
@@ -646,6 +752,33 @@ impl std::fmt::Display for Fenced {
 }
 
 impl std::error::Error for Fenced {}
+
+/// How long a migration waits for its schema's advisory lock: the
+/// runtime's bound on a migration's wait (MIGRATION_WAITS_AT_MOST).
+pub const SCHEMA_LOCK_WAITS_AT_MOST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A migration's schema lock (`pg_advisory_lock(key)`, held by the session
+/// until it lets it go), waited for at most `wait` (review c5w3 L-c). Cut
+/// off by the network alone, a migration's server session lives on holding
+/// the lock until its keepalive ends it; the migration applied again
+/// (meridian_runtime::migrate_once_it_answers) would wait for it past its
+/// bound. Only the lock's wait is bounded: the migration's own statements
+/// wait as they did. Refused past `wait` (SQLSTATE 55P03, lock not
+/// available).
+pub fn take_schema_lock(
+    client: &mut impl postgres::GenericClient,
+    key: i64,
+    wait: std::time::Duration,
+) -> Result<(), postgres::Error> {
+    client.batch_execute(&format!(
+        "SET lock_timeout = '{}ms'",
+        wait.as_millis().max(1)
+    ))?;
+    let taken = client.execute("SELECT pg_advisory_lock($1)", &[&key]);
+    let reset = client.batch_execute("RESET lock_timeout");
+    taken?;
+    reset
+}
 
 #[cfg(test)]
 mod tests;

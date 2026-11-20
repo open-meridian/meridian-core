@@ -14,6 +14,7 @@ use meridian_domain::v1::{
 };
 
 use crate::row::{DataType, Observation};
+pub use meridian_changes::shard_fence::{ShardFenced, ShardStamp};
 use meridian_changes::{Change, ReadChangesReply, ReadError};
 
 #[derive(Debug, thiserror::Error)]
@@ -36,7 +37,80 @@ pub enum StoreError {
     /// position again and goes on from there.
     #[error("{0}")]
     PositionMoved(String),
+
+    /// A write to a dataset another writer group owns (step 3d; the
+    /// resilience spec's section 6.7): handed to that group's writer.
+    #[error("dataset {partition} is writer group {group}'s to write; this member's group does not own it")]
+    NotOwned { partition: String, group: u32 },
+
+    /// A write to a range a move is switching (step 3d; section 6.8, the
+    /// hold): tried again until the switch ends, at most
+    /// `moves.holdSeconds`, then refused OVERLOADED with a retry-after.
+    #[error("{0}")]
+    Held(String),
+
+    /// A restatement that changes its row key's valid time or first subject
+    /// (step 3d; the-lake rule 5, ruled 2026-11-12): refused
+    /// INVALID_ARGUMENT naming the field, `field` its path within the row
+    /// (`meta.valid_from_ns`, `meta.subjects[0].entity_id`). The plugin
+    /// cancels the old key and records a new one.
+    #[error("{words}")]
+    KeyFixed {
+        data_type: DataType,
+        row_key: String,
+        field: &'static str,
+        words: String,
+    },
+
+    /// A partition act refused, naming the field (step 3d; section 6.1):
+    /// `SplitPartition`'s INVALID_ARGUMENT naming `partition`.
+    #[error("{words}")]
+    Invalid { field: &'static str, words: String },
+
+    /// A write refused by its plugin shard's epoch (step 3d, checkpoint 5,
+    /// item 32): another pod took the shard and the lake has seen its
+    /// epoch. FAILED_PRECONDITION, REFUSAL_REASON_SHARD_FENCED; nothing of
+    /// the part is recorded, and its sidecar exits.
+    #[error("{0}")]
+    ShardFenced(#[from] ShardFenced),
 }
+
+impl StoreError {
+    /// As the bus carries it to the writer's caller: held past the hold,
+    /// OVERLOADED with its retry-after (section 6.8); a plugin shard's
+    /// epoch passed, SHARD_FENCED, and its sidecar exits (step 3d,
+    /// checkpoint 5, item 32); this writer fenced, UNAVAILABLE with
+    /// retry-after 1, to be asked again (items 110 and 120; review-c5n5
+    /// F1); every other failure as the store said it.
+    pub fn on_the_bus(self) -> String {
+        match self {
+            StoreError::Held(words) => meridian_bus::refusal_retrying(
+                meridian_pb::v1::RefusalReason::Overloaded as i32,
+                meridian_changes::moves::HELD_RETRY_SECONDS,
+                words,
+            ),
+            StoreError::ShardFenced(fenced) => {
+                meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
+            }
+            StoreError::Fenced(fenced) => fenced.on_the_bus(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// The shard stamp of a batch's part at `place`: none where the part was
+/// sent by no shard, or the batch names none ([`WriteAheadBatch::shards`]).
+pub fn shard_at(shards: &[Option<ShardStamp>], place: usize) -> Option<&ShardStamp> {
+    shards.get(place).and_then(Option::as_ref)
+}
+
+/// The field a restated row's valid time is refused by (the-lake rule 5),
+/// within the row: kept exact, since SDK 0.36.3's `SeriesTimes` reads a
+/// series re-send refused naming `series[i].meta.valid_from_ns` as recorded.
+pub const VALID_TIME_FIELD: &str = "meta.valid_from_ns";
+
+/// The field a restated row's first subject is refused by, within the row.
+pub const FIRST_SUBJECT_FIELD: &str = "meta.subjects[0].entity_id";
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -110,6 +184,12 @@ pub struct WriteAheadBatch {
     /// The position the batch commits.
     pub through: WriteAheadPosition,
     pub parts: Vec<(String, Vec<Observation>)>,
+    /// Each part's plugin shard and epoch, by the part's place, as its
+    /// sidecar stamped the write (step 3d, checkpoint 5, item 32): checked
+    /// in the batch's transaction, a part whose epoch is lower than the
+    /// shard's held refused alone. A place past its end, or none, is a part
+    /// sent by no shard.
+    pub shards: Vec<Option<ShardStamp>>,
     /// Sequences the stream dropped before the lake took them, found by
     /// this batch: kept, so a later write naming one is known to follow a
     /// gap (W10.14).
@@ -120,7 +200,178 @@ pub struct WriteAheadBatch {
     /// Each gap the batch found, as first recorded (W10.14): its own record,
     /// in the same transaction, so no gap found is lost with its batch.
     pub gaps: Vec<meridian_domain::v1::DatasetGap>,
+    /// Each write of a dataset whose ranges span writer groups (step 3d;
+    /// spec 6.7, ruled 2026-11-15): what this group's rows of it did, kept
+    /// under the batch's stream and the write's sequence in the same
+    /// transaction as the rows and the position, for the group answering
+    /// the write to add.
+    pub counted: Vec<Counted>,
 }
+
+/// One write's parts in a [`WriteAheadBatch`] whose counts are kept.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Counted {
+    /// The write's sequence in the stream.
+    pub sequence: u64,
+    /// Its parts' places in the batch's `parts`.
+    pub parts: Vec<usize>,
+    /// What its parts committed in another database, before this batch,
+    /// did.
+    pub already: Counts,
+    /// The field its request names its rows by, and every row's key in the
+    /// write's order: what a refusal of a part names its row with.
+    pub field: String,
+    pub keys: Vec<(i16, String)>,
+    /// The rows of its parts refused in another database, before this
+    /// batch, by the lake's rule 5, and the first such refusal as the
+    /// write's plugin hears it (`lake_write_ahead_part.refused` and
+    /// `refused_detail`; ruled 2026-11-15).
+    pub refused: u32,
+    pub refused_detail: String,
+}
+
+/// A row key restated against the lake's rule 5, as the write's plugin
+/// hears it: INVALID_ARGUMENT naming the field at the first row of the
+/// write under that key (`series[3].meta.valid_from_ns`), `keys` every
+/// row's key in the write's order. None for any other failure.
+pub fn key_fixed_refusal(
+    failed: &StoreError,
+    field: &str,
+    keys: &[(i16, String)],
+) -> Option<String> {
+    let StoreError::KeyFixed {
+        data_type,
+        row_key,
+        field: path,
+        words,
+    } = failed
+    else {
+        return None;
+    };
+    let at = keys
+        .iter()
+        .position(|(code, key)| *code == data_type.code() && key == row_key)
+        .unwrap_or(0);
+    Some(meridian_bus::refusal_with_status(
+        meridian_bus::RefusalStatus::InvalidArgument,
+        &[format!("{field}[{at}].{path}")],
+        words,
+    ))
+}
+
+impl Counted {
+    /// A part of this write refused by the lake's rule 5, its `rows` kept
+    /// as refused with the first such refusal's words: what the group
+    /// answering the write answers it with (ruled 2026-11-15). Nothing for
+    /// any other failure.
+    pub fn refuse(&mut self, failed: &StoreError, rows: usize) {
+        if let Some(detail) = key_fixed_refusal(failed, &self.field, &self.keys) {
+            self.refused += rows as u32;
+            if self.refused_detail.is_empty() {
+                self.refused_detail = detail;
+            }
+        }
+    }
+
+    /// Whether a row of this write found unchanged in a range is counted,
+    /// `taken_from` the stream sequence the range's source had committed
+    /// through when the range last moved to this group
+    /// (`lake_partition.taken_from`; none where it never moved): its row in
+    /// a write at or before that was committed, and counted, by the source,
+    /// and the copy the move brought is what this group finds unchanged; in
+    /// a later write it is a row sent again unchanged, which nobody has
+    /// counted.
+    pub fn counts_unchanged(&self, taken_from: Option<u64>) -> bool {
+        taken_from.is_none_or(|taken| self.sequence > taken)
+    }
+
+    /// What `done`, a part of this write in `dataset`, did, as its group
+    /// keeps it: every row recorded or restated, and each row found
+    /// unchanged that [`Counted::counts_unchanged`]. A write this group
+    /// takes again finds the rows its first take counted unchanged too:
+    /// those are taken off where the part is kept, by what it holds
+    /// already.
+    pub fn did(
+        &self,
+        dataset: &str,
+        done: &Recorded,
+        taken_from: &dyn Fn(&str) -> Option<u64>,
+    ) -> Counts {
+        let named: u32 = done.unchanged_in.iter().map(|(_, rows)| *rows).sum();
+        // Rows found unchanged that no range was named for: the dataset's
+        // own full range.
+        let whole = (dataset.to_string(), done.unchanged.saturating_sub(named));
+        let unchanged = done
+            .unchanged_in
+            .iter()
+            .chain(std::iter::once(&whole))
+            .filter(|(range, _)| self.counts_unchanged(taken_from(range)))
+            .map(|(_, rows)| *rows)
+            .sum();
+        Counts {
+            recorded: done.recorded,
+            restated: done.restated,
+            unchanged,
+        }
+    }
+
+    /// [`Counted::did`], and `done` left counting the same: a row found
+    /// unchanged that another take counted is not in the take's own answer
+    /// either. A group keeps no part where its rows of a write did nothing
+    /// it counts, and its answer is then the take's own: left as taken, the
+    /// group answering a write it took again after its range moved in
+    /// counted the row its source had counted (PR CI 43684440785's shape,
+    /// its answering group the move's target: recorded 1, unchanged 1 for
+    /// one row).
+    pub fn did_and_answers(
+        &self,
+        dataset: &str,
+        done: &mut Recorded,
+        taken_from: &dyn Fn(&str) -> Option<u64>,
+    ) -> Counts {
+        let did = self.did(dataset, done, taken_from);
+        done.unchanged = did.unchanged;
+        did
+    }
+}
+
+/// What a group's rows of one write did (`lake_write_ahead_part`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub recorded: u32,
+    pub restated: u32,
+    pub unchanged: u32,
+}
+
+impl Counts {
+    pub fn of(done: &Recorded) -> Counts {
+        Counts {
+            recorded: done.recorded,
+            restated: done.restated,
+            unchanged: done.unchanged,
+        }
+    }
+
+    pub fn add(&mut self, more: Counts) {
+        self.recorded += more.recorded;
+        self.restated += more.restated;
+        self.unchanged += more.unchanged;
+    }
+
+    pub fn none(&self) -> bool {
+        self.all() == 0
+    }
+
+    /// Every row counted.
+    pub fn all(&self) -> u32 {
+        self.recorded + self.restated + self.unchanged
+    }
+}
+
+/// How long a group's part of a write is kept (`lake_write_ahead_part`):
+/// the stream's own default bound on a write's age. The group answering
+/// reads it within the hold; none waits for an answer this long.
+pub const PART_KEPT_NS: i64 = 10 * 60 * 1_000_000_000;
 
 /// A run of the write-ahead stream's sequences it dropped at its bound
 /// before the lake took them (W10.14): the first and last, the stream's
@@ -153,6 +404,18 @@ pub const CONTROL_GAP: &str = "meridian.v1.DatasetGap";
 /// resilience spec's section 8): its control change's kind.
 pub const CONTROL_SWITCH: &str = "meridian.v1.SourceSwitched";
 
+/// A dataset's assignment to a writer group (step 3d; section 6.1, approved
+/// 2026-11-12): its `PartitionOwner`, in the `control` partition, recorded
+/// only when its group changes. None recorded means group 0.
+pub const CONTROL_OWNER: &str = "meridian.v1.PartitionOwner";
+
+/// A range's split (step 3d; section 6.1, approved 2026-11-12): its
+/// `PartitionSplit`, in the `control` partition.
+pub const CONTROL_SPLIT: &str = "meridian.v1.PartitionSplit";
+/// A plugin shard's take (step 3d, checkpoint 5, item 32): its
+/// `ShardTookOver`, in the `control` partition.
+pub const CONTROL_SHARD_TOOK_OVER: &str = "meridian.v1.ShardTookOver";
+
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Recorded {
@@ -165,6 +428,41 @@ pub struct Recorded {
     pub unchanged: u32,
     /// The partition's head once the batch committed.
     pub head: u64,
+    /// Each row's partition, in step with `rows` (step 3d; section 6.1):
+    /// empty where every row is in the dataset's own full range.
+    pub partitions: Vec<String>,
+    /// How many rows were found unchanged in each range, where its ranges
+    /// were written apart (step 3d; spec 6.7): what a write's part counts
+    /// by the range ([`Counted::did`]).
+    pub unchanged_in: Vec<(String, u32)>,
+}
+
+impl Recorded {
+    /// The partition `rows[at]` was recorded in.
+    pub fn partition_of<'a>(&'a self, dataset: &'a str, at: usize) -> &'a str {
+        self.partitions.get(at).map_or(dataset, String::as_str)
+    }
+
+    /// Another range's part of the same batch added to this one: its rows
+    /// after these, its counts added.
+    pub fn joined(&mut self, dataset: &str, more: Recorded, partition: &str) {
+        if !self.partitions.is_empty() || partition != dataset {
+            // Rows before these, unnamed, are in the dataset's own range.
+            self.partitions.resize(self.rows.len(), dataset.to_string());
+            self.partitions
+                .extend(std::iter::repeat_n(partition.to_string(), more.rows.len()));
+        }
+        if more.unchanged > 0 {
+            self.unchanged_in
+                .push((partition.to_string(), more.unchanged));
+        }
+        self.unchanged_in.extend(more.unchanged_in);
+        self.rows.extend(more.rows);
+        self.recorded += more.recorded;
+        self.restated += more.restated;
+        self.unchanged += more.unchanged;
+        self.head = self.head.max(more.head);
+    }
 }
 
 /// A change to a want, its own record (decisions/031).
@@ -247,6 +545,10 @@ pub struct Removal {
 pub struct ClosedDayAmendment {
     pub dataset: String,
     pub sequence: u64,
+    /// The row's key (step 3d): two ranges split from one number on from
+    /// the same sequence. Empty on a re-check kept before 3d, of the one
+    /// row its dataset held at that sequence.
+    pub row_key: String,
     /// The flag as re-checked; None where the day is no longer closed.
     pub closed_day: Option<DateCheck>,
     /// Why: the calendar version applied.
@@ -266,12 +568,16 @@ pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], a
     if amendments.is_empty() {
         return;
     }
-    let mut latest: BTreeMap<(&str, u64), &ClosedDayAmendment> = BTreeMap::new();
+    let mut latest: BTreeMap<(&str, u64, &str), &ClosedDayAmendment> = BTreeMap::new();
     for amendment in amendments {
         if as_of_ns != 0 && amendment.at_ns > as_of_ns {
             continue;
         }
-        let key = (amendment.dataset.as_str(), amendment.sequence);
+        let key = (
+            amendment.dataset.as_str(),
+            amendment.sequence,
+            amendment.row_key.as_str(),
+        );
         match latest.get(&key) {
             Some(held) if held.at_ns > amendment.at_ns => {}
             _ => {
@@ -280,8 +586,14 @@ pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], a
         }
     }
     for row in rows.iter_mut() {
-        let key = (row.dataset().to_string(), row.meta().sequence);
-        if let Some(amendment) = latest.get(&(key.0.as_str(), key.1)) {
+        let (dataset, sequence) = (row.dataset().to_string(), row.meta().sequence);
+        let row_key = row.meta().row_key.clone();
+        // The row's own re-check; one kept before 3d names no row key.
+        let found = [row_key.as_str(), ""]
+            .into_iter()
+            .filter_map(|key| latest.get(&(dataset.as_str(), sequence, key)))
+            .max_by_key(|amendment| amendment.at_ns);
+        if let Some(amendment) = found {
             row.meta_mut().closed_day = amendment.closed_day.clone();
         }
     }
@@ -338,6 +650,7 @@ pub fn amendment_body(amendment: &ClosedDayAmendment) -> Vec<u8> {
     serde_json::json!({
         "dataset": amendment.dataset,
         "sequence": amendment.sequence,
+        "row_key": amendment.row_key,
         "closed_day": amendment.closed_day.as_ref().map(|check| {
             base64::engine::general_purpose::STANDARD.encode(check.encode_to_vec())
         }),
@@ -436,18 +749,25 @@ pub fn as_assessed(rows: &mut [Observation], assessments: &[Assessment], as_of_n
     if assessments.is_empty() {
         return;
     }
-    let mut of: BTreeMap<(&str, u64), Vec<&Assessment>> = BTreeMap::new();
+    // By the row's dataset, sequence and key: two ranges split from one
+    // number on from the same sequence (step 3d).
+    let mut of: BTreeMap<(&str, u64, &str), Vec<&Assessment>> = BTreeMap::new();
     for assessment in assessments {
         if as_of_ns != 0 && assessment.at_ns > as_of_ns {
             continue;
         }
-        of.entry((assessment.dataset.as_str(), assessment.sequence))
-            .or_default()
-            .push(assessment);
+        of.entry((
+            assessment.dataset.as_str(),
+            assessment.sequence,
+            assessment.row_key.as_str(),
+        ))
+        .or_default()
+        .push(assessment);
     }
     for row in rows.iter_mut() {
         let dataset = row.dataset().to_string();
-        let Some(found) = of.get(&(dataset.as_str(), row.meta().sequence)) else {
+        let row_key = row.meta().row_key.clone();
+        let Some(found) = of.get(&(dataset.as_str(), row.meta().sequence, row_key.as_str())) else {
             continue;
         };
         let meta = row.meta_mut();
@@ -498,16 +818,47 @@ pub trait Store: Send + Sync {
     /// row key, a restatement, or unchanged; recorded at `now_ns`.
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded>;
 
+    /// Several batches of one dataset recorded as one (step 3d, group
+    /// commit; the resilience spec's section 6.5): numbered in turn, each
+    /// decided as [`Store::record`] decides a batch against what is held and
+    /// what the parts before it numbered, and answered with what it did, in
+    /// the parts' order. A store that commits them together tries each
+    /// again alone after an unexpected database error.
+    ///
+    /// `shards` is each part's plugin shard and epoch, by its place (step
+    /// 3d, checkpoint 5, item 32): checked in the parts' transaction, a part
+    /// under an epoch lower than its shard's held refused alone
+    /// ([`StoreError::ShardFenced`]), a higher one raising it.
+    fn record_parts(
+        &self,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
+        now_ns: i64,
+    ) -> Vec<Result<Recorded>>;
+
     /// A batch of a dataset whose licence forbids keeping it: numbered from
     /// its partition's head as any batch is, each row version 1, its values
     /// kept nowhere; only that it was served, and to whom (W10.7).
+    ///
+    /// `shard` is the write's plugin shard and epoch (step 3d, checkpoint
+    /// 5, item 32), checked in the same transaction as a kept part's is.
     fn serve_unkept(
         &self,
         dataset: &str,
         rows: Vec<Observation>,
         readers: &[String],
+        shard: Option<&ShardStamp>,
         now_ns: i64,
     ) -> Result<Recorded>;
+
+    /// The identity of the write-ahead stream the lake's writer takes from
+    /// (the `ha` profile; item 191): a move's switch reads and takes back
+    /// the places its writer groups keep in that stream, never in one made
+    /// before it under the same name. Nothing in a store that keeps none.
+    fn in_stream(&self, identity: i64) {
+        let _ = identity;
+    }
 
     /// The lake's position in its write-ahead stream `stream`, none before
     /// its first batch from it (the `ha` profile).
@@ -522,7 +873,14 @@ pub trait Store: Send + Sync {
     /// decides a batch, and the stream's position moved to `through` in the
     /// same transaction, so the rows and the position commit or roll back
     /// together. Answered with what each part did, in the parts' order.
-    fn record_write_ahead(&self, batch: WriteAheadBatch, now_ns: i64) -> Result<Vec<Recorded>> {
+    /// Each part's answer in the batch's order: a part refused alone (the
+    /// lake's rule 5) is its own refusal, the batch and its position
+    /// committed without it.
+    fn record_write_ahead(
+        &self,
+        batch: WriteAheadBatch,
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
         let _ = (batch, now_ns);
         Err(no_write_ahead())
     }
@@ -533,6 +891,78 @@ pub trait Store: Send + Sync {
     fn write_ahead_found(&self, stream: &str) -> Result<(Vec<Dropped>, BTreeMap<String, i64>)> {
         let _ = stream;
         Err(no_write_ahead())
+    }
+
+    /// What a lake before item 191 kept of the write-ahead stream under
+    /// `from`, its name alone -- the position, the runs it found dropped,
+    /// each dataset's latest valid time and its parts of writes -- carried
+    /// to `to`, the stream's key with its identity, in one transaction (the
+    /// review of item 191's finding 1): where nothing is kept under `to` yet,
+    /// and the position under `from` was taken in this stream, at or after
+    /// `made_ns`, its making. A position taken before it was taken in a
+    /// stream made before this one under the same name, and is never
+    /// carried. Whether it carried them; nothing where nothing is kept.
+    fn write_ahead_carried(&self, from: &str, to: &str, made_ns: i64) -> Result<bool> {
+        let _ = (from, to, made_ns);
+        Ok(false)
+    }
+
+    /// A plugin shard taken (step 3d, checkpoint 5, item 32): its epoch
+    /// numbered max(the epoch held + 1, the Lease's transitions), at least
+    /// 1, kept with the stream's place the control writer found (review
+    /// c5a3 M1), and answered in `took`. Nothing is recorded yet:
+    /// [`Store::record_shard_take`] records it once every writer group
+    /// raised it (review c5a M4). Refused [`StoreError::ShardFenced`] where
+    /// the transitions are below the highest a take of the shard was
+    /// numbered with on the same Lease (M2, c5a2 N5). The control writer's
+    /// (group 0's): its database holds the epoch takes are numbered by.
+    fn take_shard(
+        &self,
+        took: meridian_domain::v1::ShardTookOver,
+        taking: &meridian_changes::shard_fence::Taking,
+    ) -> Result<meridian_domain::v1::ShardTookOver> {
+        let _ = (took, taking);
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: the lake's control writer does".into(),
+        ))
+    }
+
+    /// A take every writer group raised, recorded as its `ShardTookOver` in
+    /// the `control` partition (decisions/031): the control writer's.
+    fn record_shard_take(&self, took: &meridian_domain::v1::ShardTookOver) -> Result<()> {
+        let _ = took;
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: the lake's control writer does".into(),
+        ))
+    }
+
+    /// A plugin shard's epoch raised to `epoch` where this group's
+    /// database holds it lower -- a take its control writer asked it to
+    /// raise -- and the epoch held after (step 3d, checkpoint 5, item 32).
+    /// In every database the group writes. `admit` is the write-ahead
+    /// stream's place as the raise found it (none with no stream): a write
+    /// that stream held at or below it is admitted whatever its epoch
+    /// (review c5a H2, c5a2 N4).
+    fn raise_shard(
+        &self,
+        instance: &str,
+        shard: u32,
+        epoch: u64,
+        admit: Option<meridian_changes::shard_fence::Admit>,
+    ) -> Result<u64> {
+        let _ = (instance, shard, epoch, admit);
+        Err(StoreError::Unavailable(
+            "this store keeps no shard epochs: a writer does".into(),
+        ))
+    }
+
+    /// Every plugin shard database 0 numbers made, with its epoch and place,
+    /// in every database this member writes that holds none of it: as a
+    /// member starts, so a database added later holds it before it serves
+    /// (review c5a L1). A row a database holds is never raised (c5a3 H1).
+    /// Answers how many were made.
+    fn reseat_shards(&self) -> Result<usize> {
+        Ok(0)
     }
 
     /// A dataset gap's next state, its own record (W10.14; decisions/031),
@@ -558,7 +988,48 @@ pub trait Store: Send + Sync {
     }
 
     /// Every switch recorded, in the order recorded (W10.6).
+    /// Each dataset whose writer group under `groups` is not the one its
+    /// assignments last recorded (none recorded: group 0) recorded in the
+    /// `control` partition as its `PartitionOwner` (step 3d): its group and
+    /// its epoch now. Answers how many it recorded. A store with no
+    /// partitions records none.
+    fn record_assignments(
+        &self,
+        groups: meridian_changes::groups::Groups,
+        at_ns: i64,
+    ) -> Result<usize> {
+        let _ = (groups, at_ns);
+        Ok(0)
+    }
+
     fn source_switches(&self) -> Result<Vec<meridian_domain::v1::SourceSwitched>> {
+        Ok(Vec::new())
+    }
+
+    /// Halve the open range `partition` at its midpoint (step 3d;
+    /// `SplitPartition`, section 6.1): in one transaction of its writer, the
+    /// parent closed at its head N and both children opened after it,
+    /// numbering from N + 1 and staying with the parent's group, and the
+    /// split's `PartitionSplit` recorded in the `control` partition. Copies
+    /// nothing. Refused [`StoreError::Invalid`] naming `partition` for the
+    /// control partition, a book partition, a range not open and a range of
+    /// one hash value.
+    fn split_partition(
+        &self,
+        partition: &str,
+        split_by: &str,
+        reason: &str,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::PartitionSplit> {
+        let _ = (split_by, reason, now_ns);
+        Err(StoreError::Invalid {
+            field: "partition",
+            words: format!("{partition} is not a range this lake has open"),
+        })
+    }
+
+    /// Every split recorded, in the order recorded (section 6.1).
+    fn splits(&self) -> Result<Vec<meridian_domain::v1::PartitionSplit>> {
         Ok(Vec::new())
     }
 
@@ -590,10 +1061,13 @@ pub trait Store: Send + Sync {
     /// answer's later page reads, its rows held by their places alone
     /// (found on dev 2026-11-09: a chain's statistics, 49,412 rows, held
     /// whole or answered again whole at each page).
+    /// The rows at `places`, each named by its dataset, sequence and its row
+    /// key's hash ([`crate::range::key_hash`]; step 3d: two ranges split
+    /// from one number on from the same sequence).
     fn rows_at(
         &self,
         data_type: DataType,
-        places: &[(String, u64)],
+        places: &[(String, u64, u32)],
         as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
 
@@ -675,6 +1149,62 @@ pub trait Store: Send + Sync {
 
     /// Each replaced record and the record that stays.
     fn aliases(&self) -> Result<BTreeMap<String, String>>;
+
+    /// The anchor each of `keys` (data type code, row key) of `dataset` is
+    /// placed by -- its first version's first subject's hash -- where the
+    /// lake holds one (step 3d; ruling 2 of 2026-11-14): what a write's
+    /// router reads, in one look, for a key restated under the record that
+    /// replaced its subject. None where the store keeps no ranges.
+    fn anchors(
+        &self,
+        dataset: &str,
+        keys: &[(i16, String)],
+    ) -> Result<BTreeMap<(i16, String), u16>> {
+        let _ = (dataset, keys);
+        Ok(BTreeMap::new())
+    }
+
+    /// The ranges' writer groups read again into the member's view (step
+    /// 3d): by a write-ahead writer whose position a move took back, before
+    /// it takes the stream again. Nothing with one group. Every store says
+    /// its own, a layer in front of another asking the one behind it: with
+    /// a default here, the hot layer answered for the record and a member
+    /// behind it never read a move (PR CI 43684440785).
+    fn read_owners_again(&self) -> Result<()>;
+
+    /// Writer group `group`'s position in the write-ahead stream, kept as
+    /// `key` in the database it writes (step 3d): how far that group has
+    /// committed its own rows of the stream's writes.
+    fn group_position(&self, key: &str, group: u32) -> Result<Option<WriteAheadPosition>> {
+        let _ = group;
+        self.write_ahead_position(key)
+    }
+
+    /// Whether a range of `dataset` is between two databases (step 3d;
+    /// sections 6.4 and 6.8): a move's switch has let it go where it was,
+    /// and its target has not opened it yet. Nobody commits its rows
+    /// meanwhile, and its target's place in the stream is taken back only
+    /// with the open. Never within one database, where a switch is one
+    /// transaction.
+    fn range_between(&self, dataset: &str) -> Result<bool> {
+        let _ = dataset;
+        Ok(false)
+    }
+
+    /// What writer group `group`'s rows of the stream's write `sequence`
+    /// did, as it kept them under `key` with its position (step 3d; spec
+    /// 6.7): none where it committed no row of the write.
+    fn write_ahead_part(&self, key: &str, group: u32, sequence: u64) -> Result<Option<Counts>> {
+        let _ = (key, group, sequence);
+        Ok(None)
+    }
+
+    /// The refusal writer group `group` kept with its part of the stream's
+    /// write `sequence` under `key`, as the write's plugin hears it (step
+    /// 3d; spec 6.7; ruled 2026-11-15): rows of the write it refused by the
+    /// lake's rule 5. None where it refused none. Every store says its
+    /// own, a layer in front of another asking the one behind it.
+    fn write_ahead_refused(&self, key: &str, group: u32, sequence: u64) -> Result<Option<String>>;
 
     /// The data configuration as last heard.
     fn keep_configuration(&self, event: &EntitlementsChangedEvent) -> Result<()>;
@@ -777,8 +1307,11 @@ pub trait Store: Send + Sync {
     fn assessments(&self) -> Result<Vec<Assessment>>;
 
     /// The writer's epoch, adopted from the `control` partition where none
-    /// was yet (step 3a): what a starting lake does before its first batch,
-    /// and what a store not started as a writer does at its first.
+    /// was yet (step 3a): what a starting lake does before its first batch;
+    /// a store not started as a writer adopts its own at its first. At one
+    /// writer group, a starting writer takes over every range held at
+    /// another epoch, as several groups' does (ruled 2026-11-18): the count
+    /// was lowered.
     fn adopt(&self) -> Result<u64>;
 
     /// The epoch this store's batches commit under; 0 before it adopted one.

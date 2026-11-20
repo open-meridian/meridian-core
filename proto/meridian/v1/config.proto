@@ -1155,6 +1155,10 @@ message ResilienceHistoryItem {
     // A move of a partition or an account that did not switch, with its
     // cause (approved 2026-11-12).
     PartitionMoveAborted partition_move_aborted = 7;
+    // A plugin instance's shard taken by a pod, its epoch raised (step 3d,
+    // checkpoint 5, item 32; approved 2026-11-16): shown with component the
+    // instance and partition the shard.
+    ShardTookOver shard_took_over = 8;
   }
 }
 
@@ -1192,6 +1196,64 @@ enum TakeoverReason {
   // its partitions' epoch, so a follower that applied the lost tail drops it
   // (approved 2026-11-11).
   TAKEOVER_REASON_DATABASE_TIMELINE = 4;
+  // The lease was free: released by its holder's planned stop, or never
+  // held (approved 2026-11-16). A plugin shard's take (ShardTookOver).
+  TAKEOVER_REASON_RELEASED = 5;
+}
+
+// A pod took a plugin instance's shard (W8.3; step 3d, checkpoint 5, item
+// 32; the record approved 2026-11-16): the lake raised the shard's epoch to
+// max(the epoch held + 1, the Lease's transitions), and records this as its
+// own record in its control partition (decisions/031). One per take.
+message ShardTookOver {
+  // The plugin instance.
+  string instance = 1;
+  // Its shard, numbered from 0: the Lease `<instance>-shard-<n>`.
+  uint32 shard = 2;
+  // The shard's new epoch, which its sidecar stamps on every write
+  // (MessageMeta.shard_epoch). Never zero.
+  uint64 epoch = 3;
+  // Who took it: the Lease's holderIdentity, its pod and process.
+  string holder = 4;
+  // Who held it before; empty where the Lease was free.
+  string previous_holder = 5;
+  // LEASE_LAPSED or RELEASED.
+  TakeoverReason reason = 6;
+  // By the lake's clock, at the raise's commit.
+  int64 took_over_at_ns = 7;
+}
+
+// A sidecar that took a shard's Lease asks the lake to raise the shard's
+// epoch before it serves (W8.3; step 3d, checkpoint 5, item 32; the act and
+// its topic platform.lake.command.take-shard approved 2026-11-16). The
+// lake's control writer raises it, records ShardTookOver, and answers once
+// every lake and book writer group has raised its fence row to it. Refused
+// PERMISSION_DENIED for an instance not the envelope's publisher; UNAVAILABLE
+// where a writer group did not confirm within the takeover's budget, and the
+// sidecar does not serve.
+message TakeShardRequest {
+  // The instance the sidecar serves.
+  string instance = 1;
+  // The shard whose Lease it now holds.
+  uint32 shard = 2;
+  // The Lease's leaseTransitions as the sidecar wrote it taking the Lease:
+  // the epoch's floor.
+  uint64 lease_transitions = 3;
+  // The Lease's holderIdentity the sidecar wrote.
+  string holder = 4;
+  // The holderIdentity it read before taking it; empty where it was free.
+  string previous_holder = 5;
+  // LEASE_LAPSED or RELEASED, as the sidecar found the Lease.
+  TakeoverReason reason = 6;
+  // The Lease's metadata.uid as the sidecar read it: a take naming another
+  // uid than the one the epoch's floor was seen on -- a Lease made again --
+  // starts the floor afresh.
+  string lease_uid = 7;
+}
+
+message TakeShardReply {
+  // The shard's new epoch, raised in every writer group. Never zero.
+  uint64 epoch = 1;
 }
 
 // A store's record found changed where it rests (W6.39, plan 5j; the record
@@ -1275,6 +1337,14 @@ message ReadResilienceProfileReply {
   repeated NeverBlindLine never_blind = 5;
   // When the profile was computed.
   int64 computed_at_ns = 6;
+  // What the profile advises beyond the levels (step 3d; the resilience
+  // spec's sections 6.8 and 12; approved 2026-11-14): each a line in a
+  // failure line's shape, its subject a store's partitions or writer group,
+  // its reason the measured cause, its changes the chart value to set and
+  // what it costs. A partition count not above the writer-group count, a
+  // writer group busy past its bound or refusing work as overloaded. A
+  // change named, never a change made.
+  repeated ResilienceLine advice = 7;
 }
 
 // One line of the profile: a failure class or a tier.

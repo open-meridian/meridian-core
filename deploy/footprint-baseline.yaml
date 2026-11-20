@@ -24,10 +24,18 @@
 # alone (branch footprint-v29, run 41464704832, 2026-11-02) -- on the five
 # e2e-cluster jobs, the pinned k3s and 1.33 to 1.37: peak 160 to 162 MiB,
 # disk 34.9 MiB each; the highest is kept.
+#
+# The peak's ceiling: the product owner ruled 2026-11-20 that the cluster
+# jobs' median peak is held to 200 MiB, not 15% over 162 (186.3). Measured
+# on c30d the median moved 182 to 190 MiB run to run with no growth in what
+# the pods hold (the swing is file pages counted in the working set), and
+# 186.3 left no room for it. The ceiling replaces the percentage for the
+# peak alone; every other figure keeps its limit.
 v29:
   pods: 12
   memory_requested_mib: 1216
   memory_limited_mib: 6912
   cpu_requested_millicores: 700
   memory_peak_mib: 162
+  memory_peak_ceiling_mib: 200
   disk_mib: 34.9

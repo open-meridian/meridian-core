@@ -47,6 +47,37 @@ data:
   {{- range $key := list "ca.crt" "tls.crt" "tls.key" "client.crt" "client.key" }}
   {{ $key }}: {{ index $tls $key | quote }}
   {{- end }}
+{{- /* Each database past the first a store's writer groups write to (step
+       3d; section 6.4): its own server's and the Job's certificates, from a
+       CA of its own, as the first database's, beside it as `<name>-tls`. */}}
+{{- range $extra := include "meridian-runtime.extraDatabases" . | fromJsonArray }}
+{{- $tlsName := printf "%s-tls" $extra.name }}
+{{- $existing := lookup "v1" "Secret" $.Release.Namespace $tlsName }}
+{{- $tls := dict }}
+{{- if and $existing $existing.data }}
+{{- $tls = $existing.data }}
+{{- else }}
+{{- $ca := genCA "meridian-archive" 3650 }}
+{{- $host := $extra.name }}
+{{- $names := list $host (printf "%s.%s" $host $.Release.Namespace) (printf "%s.%s.svc" $host $.Release.Namespace) (printf "%s.%s.svc.cluster.local" $host $.Release.Namespace) }}
+{{- $server := genSignedCert $host nil $names 3650 $ca }}
+{{- $client := genSignedCert "meridian-backup" nil nil 3650 $ca }}
+{{- $tls = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($server.Cert | b64enc) "tls.key" ($server.Key | b64enc) "client.crt" ($client.Cert | b64enc) "client.key" ($client.Key | b64enc) }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tlsName }}
+  labels:
+    meridian.dev/component: {{ printf "%s-database-%d" $extra.component (int $extra.d) }}
+    {{- include "meridian-runtime.labels" $ | nindent 4 }}
+type: Opaque
+data:
+  {{- range $key := list "ca.crt" "tls.crt" "tls.key" "client.crt" "client.key" }}
+  {{ $key }}: {{ index $tls $key | quote }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap
