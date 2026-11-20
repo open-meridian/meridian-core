@@ -728,7 +728,7 @@ mod tests {
                     &store,
                     lead(holder, at),
                     holder,
-                    Some(&[report.clone()]),
+                    Some(std::slice::from_ref(&report)),
                     Some(&records),
                     at,
                 )
