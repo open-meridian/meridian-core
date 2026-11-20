@@ -49,7 +49,7 @@ services:
     # Its monitoring endpoint (-m) for the tests' own reads of why a client
     # was closed (a slow consumer, section 10a); on this network alone.
     command: ["-c", "/etc/nats/dev.conf", "-DV", "-m", "8222"]
-    environment:
+    environment: &broker-dev-passwords
       # Development passwords, and obviously so. A deployment's come from a
       # secret, one per identity, mounted into that container alone.
       MERIDIAN_NATS_RUNTIME: runtime-dev-only
@@ -107,6 +107,41 @@ services:
     networks:
       meridian:
         aliases: [core-test-nats-c]
+
+  # Three JetStream servers on the generated permissions, dev.conf, as `ha`
+  # runs JetStream (broker.jetstream.replicas: 3): the analytics units'
+  # queue end to end under the analytics component's own
+  # credential (review C, X1; the review of #132, item 3). Started afresh
+  # by `make test-jetstream`, their streams kept in the container and gone
+  # with it; never part of a deployment.
+  jetstream-a: &test-jetstream-server
+    profiles: [tests]
+    image: nats:2.10.29-alpine
+    command: ["-c", "/etc/nats/dev.conf", "-js", "-sd", "/tmp/jetstream", "-n", "core-test-jetstream-a",
+              "-m", "8222", "--cluster_name", "core-test-jetstream", "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://core-test-jetstream-a:6222,nats://core-test-jetstream-b:6222,nats://core-test-jetstream-c:6222"]
+    environment: *broker-dev-passwords
+    volumes:
+      - ./deploy/nats:/etc/nats:ro
+    networks:
+      meridian:
+        aliases: [core-test-jetstream-a]
+  jetstream-b:
+    <<: *test-jetstream-server
+    command: ["-c", "/etc/nats/dev.conf", "-js", "-sd", "/tmp/jetstream", "-n", "core-test-jetstream-b",
+              "-m", "8222", "--cluster_name", "core-test-jetstream", "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://core-test-jetstream-a:6222,nats://core-test-jetstream-b:6222,nats://core-test-jetstream-c:6222"]
+    networks:
+      meridian:
+        aliases: [core-test-jetstream-b]
+  jetstream-c:
+    <<: *test-jetstream-server
+    command: ["-c", "/etc/nats/dev.conf", "-js", "-sd", "/tmp/jetstream", "-n", "core-test-jetstream-c",
+              "-m", "8222", "--cluster_name", "core-test-jetstream", "--cluster", "nats://0.0.0.0:6222",
+              "--routes", "nats://core-test-jetstream-a:6222,nats://core-test-jetstream-b:6222,nats://core-test-jetstream-c:6222"]
+    networks:
+      meridian:
+        aliases: [core-test-jetstream-c]
 
   # The street store. Its own process, its own database credential, and no key:
   # it does not talk to the platform, which is why it cannot.
@@ -548,6 +583,9 @@ services:
       # Two servers of the three-server test cluster: a member at the first,
       # its caller at the second (stage T's review, finding 5).
       MERIDIAN_TEST_BROKER_CLUSTER_URLS: nats://core-test-nats-a:4222,nats://core-test-nats-b:4222
+      # The three JetStream servers, under the analytics component's own
+      # credential (`make test-jetstream`).
+      MERIDIAN_TEST_JETSTREAM_CLUSTER_URL_ANALYTICS: nats://analytics:analytics-dev-only@core-test-jetstream-a:4222
       # The firm's directory, which the dashboard now binds to itself rather
       # than having an identity server broker for it (decisions/018).
       MERIDIAN_TEST_LDAP_URL: ldap://ldap:1389

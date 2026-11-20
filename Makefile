@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: bench-book ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: bench-book ci-tier-check migrate test-broker test-jetstream nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -171,7 +171,7 @@ stage-images:     gate-begin-images
 	@$(GATE) end images
 stage-compile:    gate-begin-compile test-images build
 	@$(GATE) end compile
-stage-tests:      gate-begin-tests gate-mark-tests test test-store test-broker test-directory
+stage-tests:      gate-begin-tests gate-mark-tests test test-store test-broker test-jetstream test-directory
 	@$(GATE) release tests
 	@$(GATE) end tests --drop $(GATE_DROP_tests)
 stage-settings-page: gate-begin-settings-page e2e-settings-page
@@ -327,7 +327,7 @@ gate-begin-%:
 # binary it serves from Dockerfile.rust's settings-binary, compiled over the
 # cargo caches the gate keeps, not from the whole set.
 gate-mark-tests:
-	@$(GATE) mark tests postgres nats ldap ldap-tls
+	@$(GATE) mark tests postgres nats jetstream-a jetstream-b jetstream-c ldap ldap-tls
 
 ci-local-deep: ci-local
 
@@ -1493,6 +1493,28 @@ test-broker: network runtime-image tests-image
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
 		     tail -40 .test-broker.log >&2; exit 1; }
 	@echo "test-broker OK: messages cross a process boundary through the broker"
+
+# The analytics units' work queue end to end on three JetStream servers, as
+# `ha` runs them, under the analytics component's own credential and the
+# permissions generated a moment ago (review C, X1; the review of #132, item
+# 3): its stream and consumer made, every unit delivered and acknowledged,
+# and the lake's write-ahead stream not answered to it. As test-broker's
+# cluster: the servers made afresh on the new config, so it is the one in
+# force, and their routes made before the test starts.
+test-jetstream: network runtime-image tests-image
+	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
+	@$(COMPOSE_TEST) --profile tests up -d --force-recreate jetstream-a jetstream-b jetstream-c >/dev/null
+	@$(COMPOSE_TEST) --profile tests exec -T jetstream-b sh -c 'for i in $$(seq 1 60); do [ "$$(wget -qO- http://localhost:8222/routez 2>/dev/null | grep remote_name | sort -u | wc -l)" -ge 2 ] && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-jetstream FAILED: the three JetStream servers did not find each other" >&2; exit 1; }
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-analytics --lib -- --ignored --exact queue::tests::the_queue_runs_end_to_end_under_the_analytics_credential \
+		>.test-jetstream.log 2>&1 \
+		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+		     tail -40 .test-jetstream.log >&2; exit 1; }
+	@grep -q 'the_queue_runs_end_to_end_under_the_analytics_credential' .test-jetstream.log \
+		|| { echo "test-jetstream FAILED: the queue's test did not run (.test-jetstream.log)" >&2; exit 1; }
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and
