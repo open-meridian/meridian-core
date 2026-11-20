@@ -49,6 +49,10 @@ pub struct Sample {
     pub restarts: u32,
 }
 
+/// Asks in a row the conductor has not answered before its silence is a
+/// notice (`component-unheard`, approved 2026-11-20): three minutes.
+pub const UNHEARD_ASKS: u32 = 3;
+
 /// A member's kept samples, and which of its conditions stand open.
 #[derive(Debug, Default)]
 struct Kept {
@@ -60,13 +64,25 @@ struct Kept {
     climbing: bool,
 }
 
+/// The conductor's silence: asks unanswered in a row, since when, and
+/// whether its notice is open.
+#[derive(Debug, Default)]
+struct Unheard {
+    asks: u32,
+    since_ns: i64,
+    open: bool,
+}
+
 /// Where the health judge is (one judge per deployment; [`crate::judges`]):
-/// each member's restarts and sheds as last judged and its open conditions.
-/// What its one judge keeps with the notices it files, and what a copy that
-/// comes to judge next takes up.
+/// each member's restarts and sheds as last judged and its open conditions,
+/// and whether the conductor's silence is open. What its one judge keeps
+/// with the notices it files, and what a copy that comes to judge next
+/// takes up.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Place {
     pub members: BTreeMap<String, MemberPlace>,
+    pub unheard_open: bool,
+    pub unheard_since_ns: i64,
 }
 
 /// One member's part of [`Place`].
@@ -90,8 +106,9 @@ pub struct Opened {
     /// What it is of, its kind and its window (review-F headline 2), the
     /// notice's keyed ID: a second guard behind the one judge
     /// ([`crate::judges`]). A restart's window is the cluster's time of it;
-    /// every other kind's, the hour it opened in, so one condition opening
-    /// again within the hour files none again (decision 40).
+    /// the conductor's silence, the ask it was first unheard at; every
+    /// other kind's, the hour it opened in, so one condition opening again
+    /// within the hour files none again (decision 40).
     pub event: String,
     pub window_ns: i64,
 }
@@ -100,6 +117,7 @@ pub struct Opened {
 #[derive(Debug, Default)]
 pub struct Judge {
     members: BTreeMap<String, Kept>,
+    unheard: Unheard,
 }
 
 fn mib(bytes: u64) -> u64 {
@@ -110,6 +128,8 @@ impl Judge {
     /// Each member's latest report judged against what it said before; the
     /// notices that open. A member not heard for 24 hours is let go.
     pub fn judge(&mut self, members: &[ComponentReport], now_ns: i64) -> Vec<Opened> {
+        // Heard: its silence over, and noticed again should it fall silent.
+        self.unheard = Unheard::default();
         let mut opened = Vec::new();
         for report in members {
             let key = if report.member.is_empty() {
@@ -250,6 +270,35 @@ impl Judge {
         opened
     }
 
+    /// The conductor did not answer at `now_ns`: its silence opens a notice
+    /// to the deployment admins at the [`UNHEARD_ASKS`]th ask in a row,
+    /// once until it answers again (`component-unheard`, approved
+    /// 2026-11-20). No member's health is judged meanwhile.
+    pub fn unanswered(&mut self, now_ns: i64) -> Vec<Opened> {
+        let unheard = &mut self.unheard;
+        if unheard.asks == 0 {
+            unheard.since_ns = now_ns;
+        }
+        unheard.asks = unheard.asks.saturating_add(1);
+        if unheard.open || unheard.asks < UNHEARD_ASKS {
+            return Vec::new();
+        }
+        unheard.open = true;
+        let kind = "component-unheard".to_string();
+        vec![Opened {
+            of: "conductor".into(),
+            plugin: false,
+            event: format!("{kind}|conductor|{}", unheard.since_ns),
+            about: format!(
+                "the conductor has not answered for {} asks in a row, since {}: no component's or plugin's health is judged until it does",
+                unheard.asks,
+                crate::custody::utc(unheard.since_ns)
+            ),
+            kind,
+            window_ns: unheard.since_ns,
+        }]
+    }
+
     /// Where it is, to keep: see [`Place`].
     pub fn place(&self) -> Place {
         Place {
@@ -270,12 +319,14 @@ impl Judge {
                     ))
                 })
                 .collect(),
+            unheard_open: self.unheard.open,
+            unheard_since_ns: self.unheard.since_ns,
         }
     }
 
     /// `place` taken up: each member it names judged next from its
     /// restarts, sheds and open conditions there, keeping the samples this
-    /// copy heard.
+    /// copy heard; the conductor's silence open or not as it says.
     pub fn restore(&mut self, place: &Place) {
         for (key, at) in &place.members {
             let kept = self.members.entry(key.clone()).or_default();
@@ -283,6 +334,10 @@ impl Judge {
             kept.over_budget = at.over_budget;
             kept.repeatedly = at.repeatedly;
             kept.climbing = at.climbing;
+        }
+        self.unheard.open = place.unheard_open;
+        if place.unheard_open {
+            self.unheard.since_ns = place.unheard_since_ns;
         }
     }
 
@@ -362,7 +417,8 @@ pub const JUDGE: &str = "component-health";
 /// One judging by this copy, at `now_ns` (one judge per deployment;
 /// [`crate::judges`]): where it has just come to hold the lease under
 /// `term`, `judge`'s place restored from what the last holder kept; the
-/// conductor's answer judged; and where it holds the lease, what opened filed with the place, to the
+/// conductor's answer judged, or its silence where `asked` is none; and
+/// where it holds the lease, what opened filed with the place, to the
 /// people `records` tell. Where the records are stale, nothing is filed,
 /// and it is judged again from the place last kept until they are read
 /// again. How many notices were filed.
@@ -373,7 +429,7 @@ pub fn judge_once(
     store: &dyn crate::latency::notices::NoticeStore,
     term: Option<i64>,
     holder: &str,
-    members: &[ComponentReport],
+    asked: Option<&[ComponentReport]>,
     records: Option<&AccessRecords>,
     now_ns: i64,
 ) -> Result<usize, String> {
@@ -389,7 +445,10 @@ pub fn judge_once(
             }
         }
     }
-    let opened = judge.judge(members, now_ns);
+    let opened = match asked {
+        Some(members) => judge.judge(members, now_ns),
+        None => judge.unanswered(now_ns),
+    };
     if !judging.files() {
         return Ok(0);
     }
@@ -413,7 +472,8 @@ pub fn judge_once(
     Ok(filed)
 }
 
-/// Ask the conductor every [`ASK_EVERY`] and judge its answer, filing what opened on the latency judge's path where this copy
+/// Ask the conductor every [`ASK_EVERY`] and judge its answer, or its
+/// silence, filing what opened on the latency judge's path where this copy
 /// holds the judges' lease ([`judge_once`]). The task is handed back, for
 /// the component to end before its runtime stops.
 pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
@@ -433,17 +493,20 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                     None,
                 )
                 .await;
-            let Ok((_, bytes)) = asked else {
-                tracing::debug!(
-                    "the conductor did not answer ReadComponentHealth; asked again in a minute"
-                );
-                continue;
+            let members = match asked {
+                Ok((_, bytes)) => match ReadComponentHealthReply::decode(&bytes[..]) {
+                    Ok(reply) => Some(reply.members),
+                    Err(_) => {
+                        // An answer, if not one that reads: not silence.
+                        tracing::warn!("a ReadComponentHealthReply did not decode");
+                        continue;
+                    }
+                },
+                Err(failed) => {
+                    tracing::debug!(%failed, "the conductor did not answer ReadComponentHealth; asked again in a minute");
+                    None
+                }
             };
-            let Ok(reply) = ReadComponentHealthReply::decode(&bytes[..]) else {
-                tracing::warn!("a ReadComponentHealthReply did not decode");
-                continue;
-            };
-            let members = reply.members;
             let now = app.clock.now_ns();
             let records = app.records.current(now).ok();
             let judge = Arc::clone(&judge);
@@ -461,7 +524,7 @@ pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                             &*crate::latency::notices::store(),
                             crate::judges::term(),
                             crate::judges::holder(),
-                            &members,
+                            members.as_deref(),
                             records.as_ref(),
                             now,
                         )
@@ -662,7 +725,7 @@ mod tests {
                     &store,
                     lead(holder, at),
                     holder,
-                    &[report.clone()],
+                    Some(&[report.clone()]),
                     Some(&records),
                     at,
                 )
@@ -700,7 +763,7 @@ mod tests {
                 &store,
                 lead("a", at),
                 "a",
-                &[report],
+                Some(&[report]),
                 Some(&records),
                 at,
             )
@@ -718,7 +781,7 @@ mod tests {
                 &store,
                 term,
                 "b",
-                &[lake(700 * MIB, 0, 3, 0)],
+                Some(&[lake(700 * MIB, 0, 3, 0)]),
                 Some(&records),
                 at,
             )
@@ -733,6 +796,56 @@ mod tests {
             .collect();
         filed.sort();
         assert_eq!(filed, ["component-over-budget", "component-shedding"]);
+    }
+
+    /// The conductor silent (`component-unheard`, approved 2026-11-20):
+    /// its third unanswered ask in a row is one notice to the deployment
+    /// admins, filed by the judge holding the lease, and none again while it
+    /// stays silent, the lease passing or not; once it answers, a silence
+    /// again is another.
+    #[test]
+    fn a_silent_conductor_is_one_notice_until_it_answers_again() {
+        use crate::judges::{Judging, LASTS_NS, LEASE};
+        use crate::latency::notices::{InMemory, NoticeStore as _};
+        let records = records();
+        let store = InMemory::default();
+        let mut judge = Judge::default();
+        let mut judging = Judging::new(JUDGE);
+        let heard = [lake(MIB, 0, 0, 0)];
+        let mut ask = |asked: Option<&[ComponentReport]>, at: i64| {
+            // A minute apart, so each ask takes the lease up again under a
+            // new term, from the place kept.
+            let term = store.lead(LEASE, "a", at, at + LASTS_NS).unwrap();
+            judge_once(
+                &mut judge,
+                &mut judging,
+                &store,
+                term,
+                "a",
+                asked,
+                Some(&records),
+                at,
+            )
+            .unwrap()
+        };
+        assert_eq!(ask(Some(&heard), T0), 0);
+        let filed: Vec<usize> = (1..=5).map(|m| ask(None, T0 + m * MINUTE)).collect();
+        assert_eq!(filed, [0, 0, 1, 0, 0]);
+        let notices = store.notices("local|dee", 50).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:#?}");
+        assert_eq!(notices[0].kind, "component-unheard");
+        assert_eq!(notices[0].plugin_instance_id, "conductor");
+        assert!(
+            notices[0].about.contains("3 asks in a row"),
+            "{}",
+            notices[0].about
+        );
+        assert!(crate::latency::notices::rows(&notices).contains(">Unheard<"));
+        // Answered, then silent again.
+        assert_eq!(ask(Some(&heard), T0 + 6 * MINUTE), 0);
+        let filed: Vec<usize> = (7..=9).map(|m| ask(None, T0 + m * MINUTE)).collect();
+        assert_eq!(filed, [0, 0, 1]);
+        assert_eq!(store.notices("local|dee", 50).unwrap().len(), 2);
     }
 
     #[test]
