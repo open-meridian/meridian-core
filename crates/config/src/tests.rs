@@ -1051,6 +1051,46 @@ async fn a_sidecar_is_told_its_own_plugins_configuration_and_no_other() {
     assert_eq!(read.links[0].account_id, growth_account.account_id);
 }
 
+/// v31a, item 3 (the access audit's mismatch 1): a sidecar's configuration,
+/// secret settings opened, is answered for the instance whose credential
+/// asked -- the owner of the request's reply inbox -- and a request naming
+/// another instance as its sender is refused, nothing told.
+/// INTERIM(v32): deleted with the reply-inbox check.
+#[test]
+fn a_configuration_asked_as_another_instance_is_refused() {
+    use meridian_bus::inbox::within_asker;
+    let asked = |claimed: &str| meridian_bus::Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: claimed.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let forged = within_asker(Some("custody-test-1".into()), || {
+        crate::service::asking_plugin(&asked("oms-1"))
+    });
+    let refused = forged.expect_err("a forged sender is refused");
+    assert!(
+        refused.contains("publisher_instance_id"),
+        "the refusal names the field: {refused}"
+    );
+    assert_eq!(
+        within_asker(Some("oms-1".into()), || crate::service::asking_plugin(
+            &asked("oms-1")
+        )),
+        Ok("oms-1".to_string())
+    );
+    assert!(within_asker(Some(String::new()), || {
+        crate::service::asking_plugin(&asked("oms-1"))
+    })
+    .is_err());
+    // In this process, not by the broker: as before.
+    assert_eq!(
+        within_asker(None, || crate::service::asking_plugin(&asked("oms-1"))),
+        Ok("oms-1".to_string())
+    );
+}
+
 #[tokio::test]
 async fn a_sidecar_is_told_the_accounts_its_links_name_and_when_one_is_renamed() {
     // W4.11: the plugin's links reach it with each account's name, so a

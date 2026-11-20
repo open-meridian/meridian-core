@@ -1264,6 +1264,28 @@ fn book_reading(envelope: &Envelope) -> bool {
     })
 }
 
+/// The plugin a sidecar's ask for its configuration is for: the instance it
+/// says it is, where its own credential asked.
+///
+/// INTERIM(v32): the sender a request names is its sidecar's to set, and
+/// the answer carries that plugin's secret settings opened, so a request
+/// naming another instance is refused unless that instance's credential
+/// asked -- the owner of the inbox it is answered on (v31a, item 3; the
+/// access audit's mismatch 1). Deleted when v32 binds the sender at the
+/// broker by the request's subject.
+pub(crate) fn asking_plugin(envelope: &Envelope) -> Result<String, String> {
+    let plugin = publisher(envelope);
+    if !meridian_bus::inbox::asked_as(&plugin) {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::PermissionDenied,
+            &["publisher_instance_id".to_string()],
+            "publisher_instance_id: a sidecar asks for its own plugin's configuration alone, \
+             with its own credential",
+        ));
+    }
+    Ok(plugin)
+}
+
 fn publisher(envelope: &Envelope) -> String {
     envelope
         .meta
@@ -2947,7 +2969,7 @@ pub fn serve_with(
             "meridian.v1.PluginConfiguration",
         ),
         |cx, _: PluginConfigurationRequest, envelope| {
-            let plugin = publisher(envelope);
+            let plugin = asking_plugin(envelope)?;
             Ok(configuration(&*cx.snapshot()?, &plugin, &cx.key))
         },
     );

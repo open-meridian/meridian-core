@@ -869,6 +869,48 @@ async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
     assert_eq!(payload, format!("{tag}:mine").into_bytes());
 }
 
+/// v31a, item 3 (INTERIM(v32)): a handler knows which credential asked, as
+/// the owner of the inbox its answer goes to -- whatever sender the request
+/// names, which its sidecar sets.
+#[tokio::test]
+async fn a_handler_knows_the_credential_that_asked_by_its_inbox() {
+    let asking = Bus::single(
+        "custody-test-2",
+        Arc::new(as_custody().await),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "conductor",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    // Every sidecar asks it, and the conductor answers it; no other test
+    // here serves it.
+    let topic = "platform.config.query.plugin-access";
+    answering.serve(topic, |_| {
+        Ok((
+            "meridian.test.Asker".to_string(),
+            meridian_bus::inbox::asked_by()
+                .unwrap_or_else(|| "nobody".into())
+                .into_bytes(),
+        ))
+    });
+    settle().await;
+
+    // The bus names itself custody-test-2; its credential is custody-test-1's.
+    let (_, payload) = asking
+        .call(topic, "meridian.test.Question", Vec::new(), None, None)
+        .await
+        .expect("answered");
+    assert_eq!(String::from_utf8_lossy(&payload), "custody-test-1");
+}
+
 #[tokio::test]
 async fn the_instrument_store_asks_for_the_plugin_catalogue_with_its_own_credential() {
     // Contract v20 (the product owner, 2026-10-11): the instrument store reads

@@ -1120,7 +1120,16 @@ impl NatsBackend {
                             }
                         }
                     }
-                    let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
+                    // INTERIM(v32): who asked, by the inbox its answer goes
+                    // to, which only its credential hears; empty where that
+                    // inbox is no user's (v31a, item 3).
+                    let asker = Some(
+                        crate::inbox::owner(&reply_to)
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let answered =
+                        crate::router::admitted(&topic, asked, handler, deadline, asker).await;
 
                     let (payload_type, payload, refusal) = match answered {
                         Ok(Ok((payload_type, payload))) => (payload_type, payload, None),
@@ -1272,13 +1281,19 @@ mod bounded_tests {
                 payload: Vec::new(),
             };
             tasks.push(tokio::spawn(async move {
-                crate::router::admitted("platform.lake.query.list-quotes", asked, handler, None)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .parse::<usize>()
-                    .unwrap()
+                crate::router::admitted(
+                    "platform.lake.query.list-quotes",
+                    asked,
+                    handler,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .parse::<usize>()
+                .unwrap()
             }));
         }
         let mut answered = Vec::new();

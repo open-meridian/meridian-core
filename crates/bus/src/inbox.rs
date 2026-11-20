@@ -36,6 +36,42 @@ pub fn owner(subject: &str) -> Option<&str> {
     (!user.is_empty() && !tail.is_empty() && !user.contains(['*', '>'])).then_some(user)
 }
 
+thread_local! {
+    /// INTERIM(v32): the credential whose inbox the request being answered
+    /// on this thread is to be answered on, where it came by the broker.
+    static ASKED_BY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// INTERIM(v32): run `answer` with the credential that asked known to it --
+/// the owner of the reply inbox of a request that came by the broker, empty
+/// where that inbox is no user's; none where it did not come by the broker.
+/// Deleted when v32 binds a request's sender at the broker by its subject.
+pub fn within_asker<R>(asker: Option<String>, answer: impl FnOnce() -> R) -> R {
+    let before = ASKED_BY.with(|held| held.replace(asker));
+    let answered = answer();
+    ASKED_BY.with(|held| *held.borrow_mut() = before);
+    answered
+}
+
+/// INTERIM(v32): the credential that asked the request this thread answers,
+/// by its reply inbox; none where it did not come by the broker.
+pub fn asked_by() -> Option<String> {
+    ASKED_BY.with(|held| held.borrow().clone())
+}
+
+/// INTERIM(v32): whether the request this thread answers was asked by
+/// `claimed`'s own credential (v31a, item 3; the access audit's S2,
+/// interim). A request that came by the broker is answered on its reply
+/// inbox, which only its asker's credential hears: a sender named otherwise
+/// is forged, and one under no user's prefix names nobody. One that did not
+/// come by the broker came from this process, and is as it says.
+pub fn asked_as(claimed: &str) -> bool {
+    match asked_by() {
+        None => true,
+        Some(asker) => !claimed.is_empty() && asker == claimed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +95,29 @@ mod tests {
         assert_eq!(owner("platform.config.query.enrolment"), None);
         assert_eq!(owner("_INBOX..x"), None);
         assert_eq!(owner("_INBOX.a."), None);
+    }
+
+    /// v31a, item 3: a request's sender is the credential its reply inbox
+    /// is under, which alone hears the answer; a sender the request names
+    /// otherwise is forged. One that did not come by the broker came from
+    /// this process.
+    #[test]
+    fn a_request_is_asked_as_the_credential_its_inbox_is_under() {
+        assert!(within_asker(Some("custody-test-1".into()), || asked_as(
+            "custody-test-1"
+        )));
+        assert!(!within_asker(Some("custody-test-1".into()), || asked_as(
+            "custody-test-2"
+        )));
+        assert!(!within_asker(Some(String::new()), || asked_as("")));
+        assert!(!within_asker(Some(String::new()), || asked_as(
+            "custody-test-1"
+        )));
+        assert!(!within_asker(Some("custody-test-1".into()), || asked_as(
+            ""
+        )));
+        assert!(within_asker(None, || asked_as("custody-test-1")));
+        assert_eq!(asked_by(), None, "set only while answering");
     }
 
     #[test]

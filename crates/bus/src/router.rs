@@ -161,11 +161,15 @@ fn expired(topic: &str, caller: &str) -> String {
 /// Admit a request on `topic` at this process's gate and budget, and run
 /// `handler` on the blocking pool within its reservation; refused for load,
 /// with its retry-after, where it waited its while (section 10a).
+///
+/// `asker` is the credential whose inbox it is answered on, where it came
+/// by the broker (INTERIM(v32): [`crate::inbox::asked_by`]).
 pub(crate) async fn admitted(
     topic: &str,
     envelope: Envelope,
     handler: Handler,
     deadline: Option<std::time::Instant>,
+    asker: Option<String>,
 ) -> std::result::Result<HandlerReply, tokio::task::JoinError> {
     let class = meridian_budget::Class::of_topic(topic);
     let caller = caller_of(envelope.meta.as_ref());
@@ -201,8 +205,11 @@ pub(crate) async fn admitted(
         }
         Ok(admitted) => {
             let answered = tokio::task::spawn_blocking(move || {
-                admitted
-                    .within(|| crate::read_after::within_deadline(deadline, || handler(envelope)))
+                admitted.within(|| {
+                    crate::inbox::within_asker(asker, || {
+                        crate::read_after::within_deadline(deadline, || handler(envelope))
+                    })
+                })
             })
             .await;
             Ok(cancelled_for_load(topic, answered?))
@@ -1215,6 +1222,7 @@ mod expired_tests {
             Envelope::default(),
             handler,
             Some(gone),
+            None,
         )
         .await
         .unwrap();

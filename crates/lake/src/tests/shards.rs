@@ -177,6 +177,39 @@ async fn a_take_a_writer_group_does_not_confirm_is_refused_and_another_s_shard_i
     assert!(other.contains("its own instance's shards"), "{other}");
 }
 
+/// v31a, item 3 (the access audit's mismatch 1): a take names its own
+/// instance, and its sender is the credential the request's reply inbox is
+/// under; a take sent by another instance's credential, naming this one, is
+/// refused before anything is numbered or raised.
+/// INTERIM(v32): deleted with the reply-inbox check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_asked_as_another_instance_is_refused() {
+    let (_bus, _zero, _one, lake) = two_groups();
+    let envelope = meridian_bus::Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: INSTANCE.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let request = TakeShardRequest {
+        instance: INSTANCE.into(),
+        shard: 0,
+        holder: "feed-pod-b_1".into(),
+        lease_uid: "uid-1".into(),
+        ..Default::default()
+    };
+    let forged = tokio::task::spawn_blocking(move || {
+        meridian_bus::inbox::within_asker(Some("feed-2".into()), || {
+            lake.take_shard(request, &envelope)
+        })
+    })
+    .await
+    .unwrap();
+    let refused = forged.expect_err("a take asked as another instance is refused");
+    assert!(refused.contains("sent by"), "{refused}");
+}
+
 /// Review c5a M3: the lake answers a take -- here refused, a book group
 /// confirming nothing, each ask taking all but its whole window -- inside
 /// the sidecar's wait, one constant shared: it starts no round it cannot
