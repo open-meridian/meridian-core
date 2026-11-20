@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS config_known_plugin (
     plugin_instance_id  text   PRIMARY KEY,
     role                text   NOT NULL,
     tags                text[] NOT NULL DEFAULT '{}',
+    -- When the report last kept was made: its first, or the one that changed
+    -- what it is launched as. A report saying what is kept already writes
+    -- nothing (item 210), so this is not its latest report's time.
     last_reported_at_ns bigint NOT NULL
 );
 

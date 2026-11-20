@@ -66,6 +66,7 @@ fn inputs(url: &str) -> Inputs {
             ("dashboard", url.to_string()),
         ],
         volume: Some(64 * 1024 * 1024 * 1024),
+        filesystem: None,
         memory_limit: None,
         max_connections: None,
         max_payload: 1024 * 1024,

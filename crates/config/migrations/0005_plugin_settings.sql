@@ -2,8 +2,11 @@
 -- deployment admin gave it, and who changed which setting when.
 
 -- What a plugin declared when it last registered, carried on its report.
--- Replaced whole by the report of a registered plugin, and left alone by one
--- that is not, so a plugin between registrations keeps its form.
+-- Kept as the report of a registered plugin declares it, and left alone by
+-- one that is not, so a plugin between registrations keeps its form. Written
+-- only where a report differs from what is kept (item 210): a row is one
+-- setting's while it is kept, and `position` orders the rows without being
+-- consecutive.
 CREATE TABLE IF NOT EXISTS config_plugin_setting_declaration (
     plugin_instance_id text     NOT NULL REFERENCES config_known_plugin ON DELETE CASCADE,
     position           integer  NOT NULL,

@@ -117,6 +117,19 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
     ],
 };
 
+/// One row of `config_plugin_setting_declaration` as it is kept, or as a
+/// report would keep it: equal when the row need not be written.
+#[derive(PartialEq)]
+struct KeptDeclaration {
+    position: i32,
+    name: String,
+    r#type: i16,
+    required: bool,
+    secret: bool,
+    description: String,
+    declared: Option<Vec<u8>>,
+}
+
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
@@ -1153,11 +1166,16 @@ impl Store for PostgresStore {
     fn record_plugin(&self, plugin: &KnownPlugin) -> Result<()> {
         self.conn()?
             .execute(
+                // Written when it is first heard and when its roles change,
+                // never for a report that says what is kept already: a
+                // report comes every 30 s, and each rewrite was a change
+                // record (item 210).
                 "INSERT INTO config_known_plugin (plugin_instance_id, roles, last_reported_at_ns)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (plugin_instance_id) DO UPDATE
                     SET roles = excluded.roles,
-                        last_reported_at_ns = excluded.last_reported_at_ns",
+                        last_reported_at_ns = excluded.last_reported_at_ns
+                  WHERE config_known_plugin.roles IS DISTINCT FROM excluded.roles",
                 &[
                     &plugin.plugin_instance_id,
                     &plugin.roles,
@@ -1176,20 +1194,41 @@ impl Store for PostgresStore {
     ) -> Result<Vec<String>> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        // What it declared before, as far as a held value is concerned: each
-        // setting's type and whether it is secret.
-        let before: Vec<SettingDeclaration> = tx
+        // One instance's declarations in turn: two conductors hearing the
+        // same report never interleave their rows.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('config_plugin_setting_declaration:' || $1))",
+            &[&plugin_instance_id],
+        )
+        .map_err(unavailable)?;
+        // What it declared before, each row as it is kept, in its order.
+        let kept: Vec<KeptDeclaration> = tx
             .query(
-                "SELECT name, type, secret FROM config_plugin_setting_declaration
-                  WHERE plugin_instance_id = $1",
+                "SELECT position, name, type, required, secret, description, declared
+                   FROM config_plugin_setting_declaration
+                  WHERE plugin_instance_id = $1 ORDER BY position",
                 &[&plugin_instance_id],
             )
             .map_err(unavailable)?
             .iter()
+            .map(|row| KeptDeclaration {
+                position: row.get(0),
+                name: row.get(1),
+                r#type: row.get(2),
+                required: row.get(3),
+                secret: row.get(4),
+                description: row.get(5),
+                declared: row.get(6),
+            })
+            .collect();
+        // As far as a held value is concerned: each setting's type and
+        // whether it is secret.
+        let before: Vec<SettingDeclaration> = kept
+            .iter()
             .map(|row| SettingDeclaration {
-                name: row.get(0),
-                r#type: i32::from(row.get::<_, i16>(1)),
-                secret: row.get(2),
+                name: row.name.clone(),
+                r#type: i32::from(row.r#type),
+                secret: row.secret,
                 ..Default::default()
             })
             .collect();
@@ -1202,26 +1241,84 @@ impl Store for PostgresStore {
             .iter()
             .map(|row| row.get(0))
             .collect();
-        tx.execute(
-            "DELETE FROM config_plugin_setting_declaration WHERE plugin_instance_id = $1",
-            &[&plugin_instance_id],
-        )
-        .map_err(unavailable)?;
-        for (position, declaration) in declared.iter().enumerate() {
+        // Only what differs is written (item 210): a plugin reports what it
+        // declared every 30 s, and replacing the rows whole each time left a
+        // delete and an insert in the change log for every setting of every
+        // report, nothing having changed. A row that stands is not touched,
+        // so it leaves no record; and each record names the setting it is
+        // about (decisions/031): a row is one setting's for as long as it is
+        // kept, updated in place only under the same name, so a setting no
+        // longer declared leaves a delete naming it and one newly declared
+        // an insert naming it. Positions order the rows and need not be
+        // consecutive: a setting keeps its position while the order allows,
+        // and one that must move is deleted there and inserted where it goes.
+        let mut placed: Vec<(i32, KeptDeclaration, Option<&KeptDeclaration>)> = Vec::new();
+        let mut next = 0i32;
+        for declaration in declared {
+            let stays = kept
+                .iter()
+                .find(|row| row.position >= next && row.name == declaration.name);
+            let position = stays.map_or(next, |row| row.position);
+            next = position + 1;
+            placed.push((
+                position,
+                KeptDeclaration {
+                    position,
+                    name: declaration.name.clone(),
+                    r#type: declaration.r#type as i16,
+                    required: declaration.required,
+                    secret: declaration.secret,
+                    description: declaration.description.clone(),
+                    declared: Some(declaration.encode_to_vec()),
+                },
+                stays,
+            ));
+        }
+        // First every row that does not stay, so no position is taken twice.
+        let gone: Vec<i32> = kept
+            .iter()
+            .filter(|row| {
+                !placed
+                    .iter()
+                    .any(|(position, _, stays)| stays.is_some() && *position == row.position)
+            })
+            .map(|row| row.position)
+            .collect();
+        if !gone.is_empty() {
             tx.execute(
-                "INSERT INTO config_plugin_setting_declaration
-                        (plugin_instance_id, position, name, type, required, secret, description,
-                         declared)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "DELETE FROM config_plugin_setting_declaration
+                  WHERE plugin_instance_id = $1 AND position = ANY($2)",
+                &[&plugin_instance_id, &gone],
+            )
+            .map_err(unavailable)?;
+        }
+        for (_, now, stays) in &placed {
+            let statement = match stays {
+                Some(row) if *row == now => continue,
+                Some(_) => {
+                    "UPDATE config_plugin_setting_declaration
+                        SET name = $3, type = $4, required = $5, secret = $6, description = $7,
+                            declared = $8
+                      WHERE plugin_instance_id = $1 AND position = $2"
+                }
+                None => {
+                    "INSERT INTO config_plugin_setting_declaration
+                            (plugin_instance_id, position, name, type, required, secret,
+                             description, declared)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                }
+            };
+            tx.execute(
+                statement,
                 &[
                     &plugin_instance_id,
-                    &(position as i32),
-                    &declaration.name,
-                    &(declaration.r#type as i16),
-                    &declaration.required,
-                    &declaration.secret,
-                    &declaration.description,
-                    &declaration.encode_to_vec(),
+                    &now.position,
+                    &now.name,
+                    &now.r#type,
+                    &now.required,
+                    &now.secret,
+                    &now.description,
+                    &now.declared,
                 ],
             )
             .map_err(unavailable)?;

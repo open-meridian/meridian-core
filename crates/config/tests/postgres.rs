@@ -901,6 +901,195 @@ fn what_a_plugin_declared_is_replaced_whole_and_read_back_in_order() {
     );
 }
 
+/// How many change records of one kind the store's log holds.
+fn change_records(client: &mut postgres::Client, kind: &str) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM config_change WHERE kind = $1",
+            &[&kind],
+        )
+        .unwrap()
+        .get(0)
+}
+
+/// Item 210: a plugin reports every 30 s, and a report saying the roles kept
+/// already was written all the same, each a change record. Its first report
+/// and a change of its roles are records; the reports between are none.
+#[test]
+fn a_plugin_reporting_the_roles_kept_already_leaves_no_change_record() {
+    let (url, store) = store_at("known_unchanged");
+    let mut log = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let report = |roles: &[&str], at: i64| {
+        store
+            .record_plugin(&KnownPlugin {
+                plugin_instance_id: "snaptrade-1".into(),
+                roles: roles.iter().map(|role| role.to_string()).collect(),
+                last_reported_at_ns: at,
+            })
+            .unwrap()
+    };
+    report(&["custody"], 1);
+    assert_eq!(change_records(&mut log, "config_known_plugin.insert"), 1);
+    for at in 2..=20 {
+        report(&["custody"], at);
+    }
+    assert_eq!(
+        change_records(&mut log, "config_known_plugin.update"),
+        0,
+        "nineteen reports of the same roles are no change"
+    );
+    assert_eq!(store.snapshot().unwrap().plugins[0].last_reported_at_ns, 1);
+
+    // A real change still leaves its own record (decisions/031).
+    report(&["custody", "data"], 21);
+    assert_eq!(change_records(&mut log, "config_known_plugin.update"), 1);
+    let kept = &store.snapshot().unwrap().plugins[0];
+    assert_eq!(kept.roles, ["custody", "data"]);
+    assert_eq!(kept.last_reported_at_ns, 21);
+}
+
+/// Item 210: what a plugin declared was deleted and inserted again at every
+/// report, a delete and an insert in the change log for each setting, nothing
+/// having changed. Declared the same again, nothing is written; a setting
+/// that changed, came or went leaves its own record and no other's.
+#[test]
+fn a_plugin_declaring_the_same_settings_again_leaves_no_change_record() {
+    let (url, store) = store_at("declared_unchanged");
+    let mut log = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "snaptrade-1".into(),
+            roles: vec!["custody".into()],
+            last_reported_at_ns: 1,
+        })
+        .unwrap();
+    let mut declared = vec![
+        declaration("key_type", SettingType::Choice, false),
+        declaration("api_key", SettingType::String, true),
+        declaration("poll_minutes", SettingType::Integer, false),
+    ];
+    let records = |log: &mut postgres::Client| -> (i64, i64, i64) {
+        (
+            change_records(log, "config_plugin_setting_declaration.insert"),
+            change_records(log, "config_plugin_setting_declaration.update"),
+            change_records(log, "config_plugin_setting_declaration.delete"),
+        )
+    };
+    store
+        .record_declared_settings("snaptrade-1", &declared, 1)
+        .unwrap();
+    assert_eq!(records(&mut log), (3, 0, 0));
+    for at in 2..=20 {
+        store
+            .record_declared_settings("snaptrade-1", &declared, at)
+            .unwrap();
+    }
+    assert_eq!(
+        records(&mut log),
+        (3, 0, 0),
+        "nineteen reports declaring the same are no change"
+    );
+
+    // One setting described anew: its row's record, alone.
+    declared[2].description = "how often it asks, in minutes".into();
+    store
+        .record_declared_settings("snaptrade-1", &declared, 21)
+        .unwrap();
+    assert_eq!(records(&mut log), (3, 1, 0));
+    // One more declared: its insert, alone.
+    declared.push(declaration("synthetic", SettingType::Boolean, false));
+    store
+        .record_declared_settings("snaptrade-1", &declared, 22)
+        .unwrap();
+    assert_eq!(records(&mut log), (4, 1, 0));
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared
+    );
+    // The first no longer declared: one delete, naming it. The settings
+    // after it stand where they are, and no record names them (review
+    // finding 1: matched by position, the delete named the last setting and
+    // nothing named the one that went).
+    declared.remove(0);
+    store
+        .record_declared_settings("snaptrade-1", &declared, 23)
+        .unwrap();
+    assert_eq!(records(&mut log), (4, 1, 1));
+    assert_eq!(
+        named(&mut log, "config_plugin_setting_declaration.delete"),
+        ["key_type"]
+    );
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared
+    );
+    // One declared between two: an insert naming it; the first, which
+    // stands, is named by no record, and each setting that makes room is
+    // deleted where it was and inserted where it goes, under its own name.
+    declared.insert(1, declaration("account", SettingType::String, false));
+    store
+        .record_declared_settings("snaptrade-1", &declared, 24)
+        .unwrap();
+    let inserted = named(&mut log, "config_plugin_setting_declaration.insert");
+    assert_eq!(inserted.iter().filter(|name| *name == "account").count(), 1);
+    assert_eq!(
+        inserted.iter().filter(|name| *name == "api_key").count(),
+        1,
+        "api_key stands: its first insert is its only record"
+    );
+    let deleted = named(&mut log, "config_plugin_setting_declaration.delete");
+    assert!(!deleted
+        .iter()
+        .any(|name| name == "api_key" || name == "account"));
+    assert_eq!(
+        store.snapshot().unwrap().declared_settings["snaptrade-1"],
+        declared
+    );
+    // Every record of the table names the setting its row holds: an update
+    // never turns one setting's row into another's.
+    let renamed: i64 = log
+        .query_one(
+            "SELECT count(*) FROM config_change u
+              WHERE u.kind = 'config_plugin_setting_declaration.update'
+                AND NOT EXISTS (
+                    SELECT 1 FROM config_change i
+                     WHERE i.kind = 'config_plugin_setting_declaration.insert'
+                       AND i.body->>'position' = u.body->>'position'
+                       AND i.body->>'name' = u.body->>'name'
+                       AND i.sequence < u.sequence)",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(renamed, 0);
+    // None declared: every row goes, each delete naming its own.
+    let kept_before = declared.len() as i64;
+    let (_, _, deletes_before) = records(&mut log);
+    store
+        .record_declared_settings("snaptrade-1", &[], 25)
+        .unwrap();
+    assert_eq!(records(&mut log).2, deletes_before + kept_before);
+    assert!(!store
+        .snapshot()
+        .unwrap()
+        .declared_settings
+        .contains_key("snaptrade-1"));
+}
+
+/// The setting each change record of one kind names, in the order recorded.
+fn named(client: &mut postgres::Client, kind: &str) -> Vec<String> {
+    client
+        .query(
+            "SELECT body->>'name' FROM config_change WHERE kind = $1
+              ORDER BY sequence, ordinal",
+            &[&kind],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
 #[test]
 fn a_secret_is_at_rest_only_sealed_and_a_change_is_recorded_without_a_secrets_value() {
     let (url, store) = store_at("settings");
