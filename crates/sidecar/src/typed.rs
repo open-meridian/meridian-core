@@ -216,9 +216,10 @@ const CONNECTIVITY: &str = "connectivity";
 const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
 
 /// Whether claims are a service account's (W4.9, contract v21): set only by
-/// the dashboard, for a call it admitted through the act's door (W4.15).
+/// the dashboard, for a call it admitted through the act's door (W4.15); by
+/// the one rule ([`meridian_domain::is_service_account`]).
 pub(crate) fn is_service_account(claims: &CallerClaims) -> bool {
-    claims.subject_kind == SubjectKind::ServiceAccount as i32
+    meridian_domain::is_service_account(&claims.subject, claims.subject_kind, &claims.owner_subject)
 }
 
 /// What the sidecar stamps on what it sends with `claims` (W4.9): the
