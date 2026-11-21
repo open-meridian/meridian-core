@@ -2577,7 +2577,9 @@ pub fn serve_with(
                     &["new_account_name".to_string()],
                     format!(
                         "{by} is not a deployment admin: a link names an existing account, and \
-                         only a deployment admin names a new one"
+                         only a deployment admin names a new one. A deployment admin by a \
+                         directory group may need to sign in again: their groups are read from \
+                         their latest stored sign-in"
                     ),
                 ));
             }

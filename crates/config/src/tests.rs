@@ -1442,13 +1442,17 @@ async fn a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_adm
         .await
         .unwrap_err();
     let at = failed.find("[refusal-status").expect("a refusal's status");
-    let (said, fields, _) = meridian_bus::read_refusal_status(&failed[at..]).expect("readable");
+    let (said, fields, words) = meridian_bus::read_refusal_status(&failed[at..]).expect("readable");
     assert_eq!(
         said,
         meridian_bus::RefusalStatus::PermissionDenied,
         "{failed}"
     );
     assert_eq!(fields, ["new_account_name"], "{failed}");
+    // The second review of v31a-core-2, finding 4: the conductor reads the
+    // directory groups of the person's latest stored sign-in, so a lost or
+    // late one refuses an admin by group, who is told to sign in again.
+    assert!(words.contains("sign in again"), "{words}");
     let read = records(&h).await;
     assert!(read.accounts.is_empty(), "no account was made");
     assert!(read.links.is_empty(), "nothing was linked");
