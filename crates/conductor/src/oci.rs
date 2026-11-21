@@ -19,6 +19,9 @@ use std::time::Duration;
 
 use sha2::Digest;
 
+/// The longest one request to a registry may take, a blob's copy among them.
+pub const REQUEST_WITHIN: Duration = Duration::from_secs(600);
+
 const INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
     application/vnd.oci.image.index.v1+json, \
@@ -66,7 +69,7 @@ impl Oci {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
+            .timeout(REQUEST_WITHIN)
             .build()
             .map_err(|failed| format!("the registry client could not be built: {failed}"))?;
         Ok(Oci {

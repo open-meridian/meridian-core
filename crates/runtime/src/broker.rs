@@ -547,6 +547,16 @@ pub fn instance_user(
     })
 }
 
+/// How long a responder may send its one answer to a request it was
+/// delivered, whatever its grants say (`allow_responses`; the review of
+/// v31a-core-2, F2). The broker's default is two minutes, after which an
+/// answer is dropped. The longest a caller waits on the bus is an install
+/// or an update of a plugin or a pack (the dashboard's `INSTALLING`, five
+/// minutes), and one request to a registry within it may take the OCI
+/// client's ten (the conductor's `oci::REQUEST_WITHIN`): fifteen covers
+/// both, with a margin.
+pub const ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(900);
+
 /// The users, as the broker's own configuration.
 pub fn rendered(header: &str, users: &[User]) -> String {
     let mut out = String::from(header);
@@ -555,7 +565,7 @@ pub fn rendered(header: &str, users: &[User]) -> String {
         out.push_str(&format!("    # {}\n", user.note));
         out.push_str(&format!(
             "    {{ user: {}, password: {}, permissions: {{ publish: {{ allow: {} }}, \
-             subscribe: {{ allow: {} }}, allow_responses: true }} }}\n",
+             subscribe: {{ allow: {} }}, allow_responses: {{ max: 1, expires: \"{}s\" }} }} }}\n",
             user.user,
             match &user.password {
                 Password::Env(variable) => format!("${variable}"),
@@ -565,6 +575,7 @@ pub fn rendered(header: &str, users: &[User]) -> String {
             },
             list(&user.publish),
             list(&user.subscribe),
+            ANSWERED_WITHIN.as_secs(),
         ));
     }
     out.push_str("  ]\n}\n");

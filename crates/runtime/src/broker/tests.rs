@@ -378,6 +378,49 @@ fn only_the_dashboards_credential_may_publish_an_access_change() {
     }
 }
 
+/// The review of v31a-core-2, F2: `allow_responses: true` lets a responder
+/// answer within the broker's default two minutes, and an answer after that
+/// is dropped. An install or an update of a plugin or a pack is waited on for
+/// INSTALLING, and one request to a registry within it may take the OCI
+/// client's whole timeout: every user's one answer is allowed for longer
+/// than either, with a minute's margin.
+#[test]
+fn an_answer_is_allowed_for_longer_than_the_longest_wait_for_one() {
+    let rendered = rendered(
+        "# test\n",
+        &users(
+            &contract(),
+            &[
+                Instance::plugin("custody-test-1", &["custody"]),
+                Instance::component("dashboard-1", "dashboard"),
+            ],
+        )
+        .expect("generates"),
+    );
+    let margin = std::time::Duration::from_secs(60);
+    let lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.trim_start().starts_with("{ user:"))
+        .collect();
+    assert!(lines.len() >= 3, "{rendered}");
+    for line in lines {
+        let said = line
+            .split_once("allow_responses: { max: 1, expires: \"")
+            .and_then(|(_, rest)| rest.split_once("s\" }"))
+            .map(|(secs, _)| secs.parse::<u64>().expect("seconds"))
+            .unwrap_or_else(|| panic!("no expiring answer allowance in {line}"));
+        let expires = std::time::Duration::from_secs(said);
+        assert!(
+            expires >= meridian_dashboard::registry::INSTALLING + margin,
+            "{line}"
+        );
+        assert!(
+            expires >= meridian_conductor::oci::REQUEST_WITHIN + margin,
+            "{line}"
+        );
+    }
+}
+
 #[test]
 fn a_password_is_named_and_never_written() {
     let rendered = rendered(
