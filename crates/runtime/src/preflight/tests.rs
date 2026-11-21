@@ -473,19 +473,24 @@ fn a_component_login_not_made_is_named_with_the_sql_that_makes_it_and_warns() {
 }
 
 /// The review of v31a-core-2 (review-core-2c, finding 1): a launched plugin
-/// keeps the sidecar it was launched with, and an earlier release's sidecar
-/// asks on `_INBOX.<nuid>`, which this release's grants refuse. Preflight
-/// answered Ready over it.
+/// keeps the sidecar it was launched with, and one launched before
+/// per-credential inboxes asks on `_INBOX.<nuid>`, which this release's
+/// grants refuse. Preflight answered Ready over it. It blocks on exactly
+/// those, told by the label the launcher's template stamps, whatever the
+/// image: a later upgrade over a labelled plugin is not blocked.
 #[test]
-fn a_launched_plugin_on_an_older_sidecar_blocks_the_upgrade_naming_the_way_through() {
-    let release = "ghcr.io/open-meridian/meridian-core:b2c3d4e";
+fn a_launched_plugin_from_before_per_credential_inboxes_blocks_the_upgrade() {
+    let sidecar = |instance: &str, image: &str, inboxes: &str| Sidecar {
+        instance: instance.into(),
+        image: image.into(),
+        inboxes: inboxes.into(),
+    };
     let older = "ghcr.io/open-meridian/meridian-core:a1b2c3d";
     let launched = vec!["custody-1".to_string(), "reporting-1".to_string()];
     let sidecars = Sidecars {
-        release: release.to_string(),
         running: vec![
-            ("custody-1".to_string(), older.to_string()),
-            ("reporting-1".to_string(), release.to_string()),
+            sidecar("custody-1", older, ""),
+            sidecar("reporting-1", older, "per-credential"),
         ],
     };
     let blocked = judge_plugins(&launched, Some(&sidecars));
@@ -506,13 +511,12 @@ fn a_launched_plugin_on_an_older_sidecar_blocks_the_upgrade_naming_the_way_throu
         blocked.why
     );
 
-    // Every one on this release's sidecar, or with no Deployment running.
-    let current = Sidecars {
-        release: release.to_string(),
-        running: vec![("reporting-1".to_string(), release.to_string())],
+    // Labelled on an older image, or with no Deployment running: Ready.
+    let labelled = Sidecars {
+        running: vec![sidecar("reporting-1", older, "per-credential")],
     };
     assert_eq!(
-        judge_plugins(&launched, Some(&current)).verdict,
+        judge_plugins(&launched, Some(&labelled)).verdict,
         Verdict::Ready
     );
     // None launched.
@@ -523,25 +527,29 @@ fn a_launched_plugin_on_an_older_sidecar_blocks_the_upgrade_naming_the_way_throu
 
 #[test]
 fn the_sidecars_read_as_the_chart_writes_them() {
-    assert_eq!(Sidecars::read(None, Some("a=b".into())), None);
+    assert_eq!(Sidecars::read(false, Some("a=b=".into())), None);
     assert_eq!(
         Sidecars::read(
-            Some("r:new".into()),
-            Some("custody-1=r:old  reporting-1=r@sha256:00 nonsense".into())
+            true,
+            Some("custody-1=r:old=  reporting-1=r@sha256:00=per-credential nonsense".into())
         ),
         Some(Sidecars {
-            release: "r:new".into(),
             running: vec![
-                ("custody-1".into(), "r:old".into()),
-                ("reporting-1".into(), "r@sha256:00".into()),
+                Sidecar {
+                    instance: "custody-1".into(),
+                    image: "r:old".into(),
+                    inboxes: "".into(),
+                },
+                Sidecar {
+                    instance: "reporting-1".into(),
+                    image: "r@sha256:00".into(),
+                    inboxes: "per-credential".into(),
+                },
             ],
         })
     );
     assert_eq!(
-        Sidecars::read(Some("r:new".into()), None),
-        Some(Sidecars {
-            release: "r:new".into(),
-            running: vec![],
-        })
+        Sidecars::read(true, None),
+        Some(Sidecars { running: vec![] })
     );
 }
