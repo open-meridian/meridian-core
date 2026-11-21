@@ -1171,6 +1171,29 @@ fn link_request(plugin: &str, account: &str, new_name: &str) -> LinkExternalAcco
     }
 }
 
+/// The review of v31a-core-2, F3: a link naming a new account is a deployment
+/// admin's, so ADA is made one -- by her login, and anybody who signed in in
+/// `meridian-admins` by that group -- as a claim code or the first run makes
+/// the first admin.
+fn ada_is_a_deployment_admin(h: &Harness) {
+    let group = UserGroup {
+        user_group_id: "ug-admins".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec!["meridian-admins".into()],
+        logins: vec![ADA.into()],
+    };
+    let permission = Permission {
+        permission_id: "perm-admins".into(),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+    assert!(h
+        .store
+        .install_first_admin(&group, &[permission], &crate::Author::default(), 0)
+        .unwrap());
+}
+
 /// A link as a plugin's sidecar sends it: from the plugin, for `by`.
 async fn link_for(
     h: &Harness,
@@ -1195,6 +1218,7 @@ async fn link_for(
 #[tokio::test]
 async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
     let ghost = harness("ghost-1");
+    ada_is_a_deployment_admin(&ghost);
     let unknown = link_for(&ghost, link_request("ghost-1", "", "A new one"), ADA).await;
     assert!(unknown.unwrap_err().contains("plugin that has reported"));
 
@@ -1225,6 +1249,7 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
     // Contract v25 (the v24 tutorial walk): never a handler's failure with
     // no category, so the plugin reads a refusal naming the field.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let detail = |failed: String| {
         let at = failed.find("[refusal-status").expect("a refusal's status");
         failed[at..].to_string()
@@ -1260,6 +1285,7 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
 async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
     // W6.4: from the plugin's own admin page, for the deployment admin.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let linked = link_for(&h, link_request("oms-1", "", "  Fidelity Brokerage "), ADA)
         .await
@@ -1318,6 +1344,7 @@ async fn a_new_account_made_by_a_link_carries_what_the_plugin_sent_of_it() {
     // W6.4: the plugin pre-fills the custodian and type from the venue, and
     // the admin may change them; held to W6.3's bounds.
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let linked = link_for(
         &h,
         LinkExternalAccountRequest {
@@ -1384,6 +1411,7 @@ async fn a_new_accounts_fields_are_ignored_when_the_link_names_an_existing_one()
 #[tokio::test]
 async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_nothing() {
     let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
     let growth = account(&h, "Growth").await;
     let both = link_for(
         &h,
@@ -1399,6 +1427,85 @@ async fn a_link_naming_both_an_account_and_a_new_one_is_refused_and_changes_noth
     let read = records(&h).await;
     assert_eq!(read.accounts.len(), 1, "no account was made");
     assert!(read.links.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_admin() {
+    // The review of v31a-core-2, F3 (decision 47): a link naming a new account
+    // creates it and grants it to the plugin, an access change. Sent by a
+    // plugin's credential for a person who is not a deployment admin -- past
+    // the sidecar's own check, as a raw client may -- the conductor refuses
+    // it, and nothing is made, linked or granted.
+    let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
+    let failed = link_for(&h, link_request("oms-1", "", "Mine now"), "someone")
+        .await
+        .unwrap_err();
+    let at = failed.find("[refusal-status").expect("a refusal's status");
+    let (said, fields, _) = meridian_bus::read_refusal_status(&failed[at..]).expect("readable");
+    assert_eq!(
+        said,
+        meridian_bus::RefusalStatus::PermissionDenied,
+        "{failed}"
+    );
+    assert_eq!(fields, ["new_account_name"], "{failed}");
+    let read = records(&h).await;
+    assert!(read.accounts.is_empty(), "no account was made");
+    assert!(read.links.is_empty(), "nothing was linked");
+    assert!(
+        h.store
+            .snapshot()
+            .unwrap()
+            .linkable
+            .get("oms-1")
+            .is_none_or(|granted| granted.account_ids.is_empty()),
+        "nothing was granted"
+    );
+
+    // A link naming an account that exists stays the plugin admin's (W4.9),
+    // which the sidecar checks.
+    let growth = account(&h, "Growth").await;
+    let linked = link_for(&h, link_request("oms-1", &growth.account_id, ""), "someone")
+        .await
+        .unwrap();
+    assert_eq!(linked.account_id, growth.account_id);
+}
+
+#[tokio::test]
+async fn the_conductor_holds_a_deployment_admin_as_their_claims_do() {
+    // The review of v31a-core-2, F3: for a call made by no delegation, the
+    // conductor's deployment admin is the one the person's claims carry --
+    // their access from their logins and the directory groups their latest
+    // sign-in stored (`prepared::access_of` at the dashboard) -- by login, by
+    // directory group, and not at all.
+    let h = harness("oms-1");
+    ada_is_a_deployment_admin(&h);
+    for (subject, groups) in [
+        ("grace", vec!["meridian-admins".to_string()]),
+        ("someone", vec!["trading-desk".to_string()]),
+    ] {
+        h.store
+            .record_sign_in(&SignInRecord {
+                subject: subject.into(),
+                display_name: subject.into(),
+                directory_groups: groups,
+                signed_in_at_ns: 1,
+            })
+            .unwrap();
+    }
+    let records = h.store.snapshot().unwrap().records;
+    for (subject, admin) in [(ADA, true), ("grace", true), ("someone", false)] {
+        let stored = records
+            .people
+            .iter()
+            .find(|person| person.subject == subject)
+            .map(|person| person.directory_groups.clone())
+            .unwrap_or_default();
+        let claims = meridian_access::person_access(&records, subject, &stored).deployment_admin;
+        assert_eq!(claims, admin, "{subject}'s claims");
+        let linked = link_for(&h, link_request("oms-1", "", subject), subject).await;
+        assert_eq!(linked.is_ok(), claims, "{subject}: {linked:?}");
+    }
 }
 
 #[tokio::test]

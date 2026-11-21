@@ -1220,6 +1220,23 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
     Ok(by)
 }
 
+/// Whether `subject` is a deployment admin as their claims hold them for a
+/// call made through no delegation: by their logins and the directory groups
+/// their latest sign-in stored, as the dashboard derives a person's access
+/// (`prepared::access_of`).
+fn deployment_admin_as_signed_in(
+    records: &meridian_domain::v1::AccessRecords,
+    subject: &str,
+) -> bool {
+    let stored = records
+        .people
+        .iter()
+        .find(|person| person.subject == subject)
+        .map(|person| person.directory_groups.as_slice())
+        .unwrap_or_default();
+    meridian_access::person_access(records, subject, stored).deployment_admin
+}
+
 /// The delegation the person acted through, when they acted through a
 /// client (decisions/029); empty otherwise.
 pub(crate) fn delegation(envelope: &Envelope) -> String {
@@ -2543,6 +2560,27 @@ pub fn serve_with(
                 ));
             }
             let before = cx.snapshot()?;
+            // A link naming a new account creates it and grants it to the
+            // plugin: an access change, which a plugin's credential may
+            // publish, so the conductor checks the right itself (decision 47;
+            // the review of v31a-core-2, F3) as well as the sidecar
+            // (W6.3, W6.4). The person it is sent for must be a deployment
+            // admin as their claims hold one. A delegation is not read here:
+            // a real admin's call through one that does not cover admin
+            // still passes, until v31b binds the assertion and v32's S2 the
+            // sender.
+            if !request.new_account_name.is_empty()
+                && !deployment_admin_as_signed_in(&before.records, &by)
+            {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &["new_account_name".to_string()],
+                    format!(
+                        "{by} is not a deployment admin: a link names an existing account, and \
+                         only a deployment admin names a new one"
+                    ),
+                ));
+            }
             rules::link(&before, &request)?;
             let mut link = ExternalAccountLink {
                 plugin_instance_id: request.plugin_instance_id,

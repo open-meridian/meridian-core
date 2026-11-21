@@ -401,6 +401,16 @@ async fn a_link_made_through_the_operation_reaches_the_plugins_scope_stream() {
         },
     )
     .unwrap();
+    // Ada is a deployment admin in the conductor's records, as her claims
+    // say: a link naming a new account is checked there too (the review of
+    // v31a-core-2, F3).
+    assert!(meridian_config::install_named_administrator(
+        store.as_ref(),
+        bus.clock().as_ref(),
+        "",
+        "local|ada",
+    )
+    .unwrap());
 
     let key = SigningKey::from_bytes(&[9u8; 32]);
     let sidecar = Sidecar::new(

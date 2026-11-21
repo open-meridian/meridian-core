@@ -326,10 +326,20 @@ const ACCESS_CHANGES: [&str; 7] = [
     "platform.config.command.set-linkable-accounts",
 ];
 
+/// The access changes a plugin's own credential publishes (the review of
+/// v31a-core-2, F3), with the role that may: a link naming a new account
+/// creates it and grants it to the custody plugin sending it. The conductor
+/// checks the actor's admin right on it itself (meridian-config's
+/// `a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_admin`).
+const ACCESS_CHANGES_A_PLUGIN_SENDS: [(&str, &str); 1] =
+    [("platform.config.command.link-external-account", "custody")];
+
 /// v31a, item 14 (decision 47), the triage: the conductor checks an access
 /// change's shape, not its actor's admin right, so the question is whether
 /// any credential but the dashboard's may publish one. None may: not a
-/// plugin of any role, nor one holding every role, nor a component.
+/// plugin of any role, nor one holding every role, nor a component -- but
+/// for the ones a plugin sends, which only that role's credentials may, and
+/// on which the conductor checks the actor's right.
 #[test]
 fn only_the_dashboards_credential_may_publish_an_access_change() {
     let roles: Vec<&str> = include_str!("../../../../deploy/roles.tsv")
@@ -375,6 +385,20 @@ fn only_the_dashboards_credential_may_publish_an_access_change() {
             .map(|user| user.user.as_str())
             .collect();
         assert_eq!(may, vec!["dashboard-1"], "who may publish {topic}");
+    }
+    for (topic, role) in ACCESS_CHANGES_A_PLUGIN_SENDS {
+        let mut may: Vec<&str> = users
+            .iter()
+            .filter(|user| user.publish.iter().any(|grant| grants(grant, topic)))
+            .map(|user| user.user.as_str())
+            .collect();
+        may.sort_unstable();
+        let holding = format!("{role}-1");
+        assert_eq!(
+            may,
+            vec![holding.as_str(), "every-role-1"],
+            "who may publish {topic}"
+        );
     }
 }
 
