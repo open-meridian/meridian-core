@@ -905,6 +905,7 @@ def main():
         # upgrade's revision is rendered while the broker holds its credential.
         launched_stand_in(s)
         held = co_owned(s)
+        told_by_helms_own_entry(s)
         upgraded(s)
         kept_by_the_first_upgrade(s, held)
         # The lake's rows partitioned by the upgrade's own migration (step
@@ -1649,6 +1650,121 @@ def co_owned(s):
     else:
         s.note("no Helm 3 here (E2E_HELM_3): what the chart renders for a client-side merge is not asked")
     return held
+
+
+def stated_over(helm, release, namespace, values):
+    """The launched plugins' Secret of `release` in `namespace` as this
+    checkout's chart renders it for `helm`, by a server dry run of an
+    install over a Secret already there, which reads the cluster as an
+    upgrade does: each key it states, with a digest of its value; None, and
+    why, where it could not be rendered."""
+    done = subprocess.run(
+        [helm, "install", release, CHART, "--namespace", namespace, "--dry-run=server", "-o", "json", *values],
+        capture_output=True, text=True, errors="replace",
+    )
+    # Its output holds every Secret the chart renders: read, never printed.
+    if done.returncode != 0:
+        return None, f"exit {done.returncode}: {done.stderr.strip()[-300:]}"
+    try:
+        manifest = json.loads(done.stdout).get("manifest") or ""
+    except ValueError:
+        return None, "its output was not JSON"
+    name = f"{release}-meridian-runtime-broker-launched"
+    for document in manifest.split("\n---"):
+        lines = document.splitlines()
+        if "kind: Secret" not in lines or f"  name: {name}" not in lines:
+            continue
+        data = {}
+        if "data:" in lines:
+            for line in lines[lines.index("data:") + 1:]:
+                if not line.startswith("  "):
+                    break
+                key, _, value = line.strip().partition(": ")
+                data[key] = value.strip("'\"")
+        return digests(data), ""
+    return None, f"its manifest states no Secret {name}"
+
+
+def told_by_helms_own_entry(s):
+    """Whose server-side apply the chart reads the launched Secret's managed
+    fields for (review review-135, findings 4 and 6): Helm's, by the release
+    annotation Helm states on everything it applies, and no other's.
+
+    A release a Helm 3 installed is merged client-side by a Helm 4 too
+    (`--server-side=auto` follows the revision before), and a client-side
+    merge deletes what the manifest before stated and the new one does not.
+    So over such a release's Secret this checkout's chart must state every
+    key as held, for a Helm 4: as a Helm 3 left it, and still once somebody
+    else's server-side apply has written to it (`kubectl apply
+    --server-side` of a label, say), which leaves an `Apply` entry that is
+    not Helm's. Only Helm's own entry says Helm applies server-side here.
+
+    Rendered, not upgraded: a stand-in Secret in a namespace of its own, as
+    each case leaves one, and the chart's server dry run of an install over
+    it. A whole second deployment, installed by a Helm 3 and upgraded by a
+    Helm 4, is what this stands in for.
+    """
+    import base64
+    import secrets as random
+
+    if not run(HELM, "version", "--short").startswith("v4"):
+        s.note("no Helm 4 here: whose server-side apply the chart reads is asked of a Helm 4's render")
+        return
+    print("U: the chart reads Helm's own server-side apply of the launched Secret, and no other's", flush=True)
+    namespace, release = f"{NAMESPACE}-owners", "owners"
+    name = f"{release}-meridian-runtime-broker-launched"
+    values = ["--set", "deployment.id=DEP-e2e-owners", "--set", "deployment.enrolmentCode=ENR-e2e-owners",
+              "--set", f"platform.address={PLATFORM_FROM_POD}"]
+
+    def there(*args, **kwargs):
+        return subprocess.run(["kubectl", "--namespace", namespace, *args],
+                              capture_output=True, text=True, errors="replace", **kwargs)
+
+    run("kubectl", "create", "namespace", namespace)
+    # As a Helm 3 leaves it: made by a client-side create with the release's
+    # metadata, its keys written by the broker's merge patch. No `Apply`.
+    helms = {
+        "labels": {"app.kubernetes.io/managed-by": "Helm"},
+        "annotations": {"meta.helm.sh/release-name": release, "meta.helm.sh/release-namespace": namespace,
+                        "helm.sh/resource-policy": "keep"},
+    }
+    made = there("create", "-f", "-", input=json.dumps(
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"name": name, **helms}}))
+    held = {f"e2e-owners.{key}": base64.b64encode(random.token_bytes(24)).decode() for key in ("password", "url")}
+    written = there("patch", "secret", name, "--type=merge", "-p", json.dumps({"data": held}))
+    s.check(made.returncode == 0 and written.returncode == 0,
+            f"a launched Secret as a Helm 3's release holds one, in {namespace}: "
+            f"exit {made.returncode} and {written.returncode}")
+
+    def entries():
+        fields = json.loads(there("get", "secret", name, "--show-managed-fields", "-o", "json").stdout or "{}")
+        return sorted(f"{entry.get('operation')}:{entry.get('manager')}"
+                      for entry in (fields.get("metadata") or {}).get("managedFields") or [])
+
+    def asked(case, expected):
+        stated, why = stated_over(HELM, release, namespace, values)
+        s.check(
+            stated is not None and stated == digests(expected),
+            f"{case}, this chart states {'every key as held' if expected else 'no key'} for a Helm 4: "
+            + (f"{sorted(stated)} of {sorted(held)}, the Secret's entries {entries()}"
+               if stated is not None else f"not rendered ({why})"),
+        )
+
+    asked("over a Secret a Helm 3's release holds, no server-side apply ever made", held)
+
+    labelled = there("apply", "--server-side", "--field-manager", "ops", "-f", "-", input=json.dumps(
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "labels": {"e2e.meridian.dev/ops": "true"}}}))
+    s.note(f"a label applied server-side by another manager, ops: exit {labelled.returncode} {labelled.stderr.strip()[-200:]}")
+    asked("over that Secret once another manager's server-side apply has labelled it", held)
+
+    applied_by_helm = there("apply", "--server-side", "--force-conflicts", "--field-manager", "helm", "-f", "-",
+                            input=json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                                              "metadata": {"name": name, **helms}}))
+    s.note(f"and Helm's own server-side apply of it, stating no key: exit {applied_by_helm.returncode} "
+           f"{applied_by_helm.stderr.strip()[-200:]}")
+    asked("over that Secret once Helm's own server-side apply has written it, the keys the broker's", {})
+
+    subprocess.run(["kubectl", "delete", "namespace", namespace, "--wait=false"], capture_output=True)
 
 
 def kept_by_the_first_upgrade(s, held):
