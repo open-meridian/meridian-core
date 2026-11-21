@@ -28,35 +28,40 @@ use meridian_sidecar::Contract;
 /// its own answers and no other's. A responder replies to whoever asked by
 /// the broker's `allow_responses`: one answer on the reply subject of each
 /// request it was delivered, whatever its grants say -- the one way into
-/// another credential's inbox, short of the lake's below.
+/// another credential's inbox, but for the runtime's below.
 fn own_inbox(user: &str) -> String {
     inbox::grant(user)
 }
 
-/// Whether an instance writes to the lake's write-ahead stream: a data
-/// plugin whose name stands in a subject ([`permissions_entitled`]).
-fn writes_ahead(instance: &Instance) -> bool {
-    matches!(
-        instance,
-        Instance::Plugin { instance_id, roles, .. }
-            if roles.iter().any(|role| role == "data") && dataset_reads(instance_id)
-    )
-}
-
-/// The runtime's credential answers each data plugin that writes ahead on
-/// that plugin's inboxes: the lake's writer answers a write it took from the
-/// stream on the inbox the write named (W10.4), which no request carried to
-/// it, so the broker's answer-once rule does not cover it. By name, those
-/// plugins' alone; the lake answers only an inbox of the instance whose
-/// subject the write came on (`meridian_lake::write_ahead`).
-pub fn answer_writes_ahead(users: &mut [User], instance: &Instance) {
-    if !writes_ahead(instance) {
-        return;
-    }
+/// The runtime's credential publishes -- never subscribes -- on every other
+/// credential's inboxes (the second review of v31a-core-2, finding 2; option
+/// A, approved by consensus 2026-11-20): every plugin instance's, the
+/// components' with credentials of their own, and the chart's component
+/// instances'. The runtime answers every one of them already, and an answer
+/// the broker's answer-once rule would have to admit leaves a reply entry on
+/// the answering connection for as long as `allow_responses` lasts when it
+/// is never sent -- a write handed between writer groups left one on each
+/// member that did not answer it, enough at small batches to exhaust the
+/// broker's memory. With the grant, the broker keeps none on the runtime's
+/// connections. It also covers the lake's writer, which answers a write it
+/// took from the write-ahead stream on the inbox the write named (W10.4),
+/// carried there by no request; the lake answers only an inbox of the
+/// instance whose subject the write came on (`meridian_lake::write_ahead`).
+///
+/// Subscribe stays each credential's own: only X hears `_INBOX.X.>`, and no
+/// grant holds `_INBOX.>`. No plugin credential publishes into another's
+/// inboxes. Called once every user is made, and again whenever one is added.
+pub fn runtime_answers_every_inbox(users: &mut [User]) {
+    let theirs: Vec<String> = users
+        .iter()
+        .filter(|user| user.user != "runtime")
+        .map(|user| own_inbox(&user.user))
+        .collect();
     if let Some(runtime) = users.iter_mut().find(|user| user.user == "runtime") {
-        let theirs = own_inbox(instance.id());
-        if !runtime.publish.contains(&theirs) {
-            runtime.publish.push(theirs);
+        for inbox in theirs {
+            if !runtime.publish.contains(&inbox) {
+                runtime.publish.push(inbox);
+            }
         }
     }
 }
@@ -487,8 +492,8 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
             instance,
             Password::Env(variable(instance.id())),
         )?);
-        answer_writes_ahead(&mut users, instance);
     }
+    runtime_answers_every_inbox(&mut users);
 
     Ok(users)
 }

@@ -284,33 +284,78 @@ fn each_credential_holds_its_own_inboxes_and_no_one_holds_every_inbox() {
     }
 }
 
-/// The lake answers a write it took from its write-ahead stream on the inbox
-/// the write named (W10.4): no request carried it there, so the broker's
-/// answer-once rule does not let it through. Its credential, the runtime's,
-/// is granted the inboxes of the data plugins that write ahead, by name, and
-/// no other plugin's.
+/// The second review of v31a-core-2, finding 2 (option A, approved by
+/// consensus 2026-11-20): the runtime's credential publishes on every other
+/// credential's inboxes -- each plugin instance's, the components' with
+/// credentials of their own, the chart's component instances' -- so the
+/// broker keeps no reply entry on its connections for an answer it never
+/// sends, and the lake answers a write-ahead write on its sender's. It
+/// subscribes on its own alone, no grant holds `_INBOX.>`, and no other
+/// credential publishes or subscribes on any inbox but its own.
 #[test]
-fn the_runtime_answers_on_the_inboxes_of_the_data_plugins_alone() {
+fn the_runtime_publishes_on_every_credentials_inboxes_and_hears_its_own_alone() {
     let users = users(
         Contract::embedded(),
         &[
             Instance::plugin("truefx", &["data"]),
             Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("reference-1", &[]),
+            Instance::component("dashboard-1", "dashboard"),
         ],
     )
     .expect("generates");
     let runtime = user(&users, "runtime");
-    let inboxes: Vec<&str> = runtime
+    let mut inboxes: Vec<&str> = runtime
         .publish
         .iter()
         .map(String::as_str)
         .filter(|g| g.starts_with("_INBOX"))
         .collect();
-    assert_eq!(inboxes, vec!["_INBOX.runtime.>", "_INBOX.truefx.>"]);
-    assert!(!runtime
+    inboxes.sort_unstable();
+    let mut every: Vec<String> = users
+        .iter()
+        .map(|user| format!("_INBOX.{}.>", user.user))
+        .collect();
+    every.sort_unstable();
+    assert_eq!(inboxes, every);
+    for named in [
+        "_INBOX.truefx.>",
+        "_INBOX.custody-test-1.>",
+        "_INBOX.reference-1.>",
+        "_INBOX.dashboard-1.>",
+        "_INBOX.first-run.>",
+        "_INBOX.instrument.>",
+        "_INBOX.analytics.>",
+    ] {
+        assert!(inboxes.contains(&named), "{named}");
+    }
+    let heard: Vec<&str> = runtime
         .subscribe
         .iter()
-        .any(|g| g.as_str() == "_INBOX.truefx.>"));
+        .map(String::as_str)
+        .filter(|g| g.starts_with("_INBOX"))
+        .collect();
+    assert_eq!(heard, vec!["_INBOX.runtime.>"]);
+    for user in &users {
+        assert!(
+            !user
+                .publish
+                .iter()
+                .chain(&user.subscribe)
+                .any(|g| g == "_INBOX.>"),
+            "{} holds every inbox",
+            user.user
+        );
+        if user.user == "runtime" {
+            continue;
+        }
+        let own = format!("_INBOX.{}.>", user.user);
+        for granted in [&user.publish, &user.subscribe] {
+            let inboxes: Vec<&String> =
+                granted.iter().filter(|g| g.starts_with("_INBOX")).collect();
+            assert_eq!(inboxes, vec![&own], "{}", user.user);
+        }
+    }
 }
 
 /// The conductor's access changes (decision 47; the access audit's

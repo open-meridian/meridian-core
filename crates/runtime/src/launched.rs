@@ -169,7 +169,7 @@ pub fn configuration(
     launched: &[Launched],
     hashes: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<String>), String> {
-    use crate::broker::{answer_writes_ahead, instance_user, rendered, users, Password};
+    use crate::broker::{instance_user, rendered, runtime_answers_every_inbox, users, Password};
     let mut admitted = users(contract, chart)?;
     let mut left_out = Vec::new();
     for plugin in launched {
@@ -183,13 +183,13 @@ pub fn configuration(
             continue;
         };
         match instance_user(contract, &plugin.instance(), Password::Bcrypt(hash.clone())) {
-            Ok(user) => {
-                admitted.push(user);
-                answer_writes_ahead(&mut admitted, &plugin.instance());
-            }
+            Ok(user) => admitted.push(user),
             Err(refusal) => left_out.push(refusal),
         }
     }
+    // The runtime answers a launched plugin on its inboxes too (the second
+    // review of v31a-core-2, finding 2).
+    runtime_answers_every_inbox(&mut admitted);
     Ok((rendered(header, &admitted), left_out))
 }
 

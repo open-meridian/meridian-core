@@ -823,6 +823,60 @@ async fn a_credential_cannot_publish_into_another_credentials_inbox() {
     );
 }
 
+/// The second review of v31a-core-2, finding 2 (option A, approved by
+/// consensus 2026-11-20), as the broker carries it: into each of a plugin's,
+/// a component instance's and an own-credential component's inboxes, a
+/// message no request carried is refused from every other credential here --
+/// and carried from the runtime's alone, the stated exception, which answers
+/// every one of them and so leaves no reply entry on its connections.
+#[tokio::test]
+async fn only_the_runtime_publishes_into_another_credentials_inbox() {
+    const CREDENTIALS: [(&str, &str); 7] = [
+        ("custody-test-1", "MERIDIAN_TEST_BROKER_URL_CUSTODY"),
+        ("custody-test-2", "MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO"),
+        ("reference-1", "MERIDIAN_TEST_BROKER_URL_REFERENCE"),
+        ("dashboard-1", "MERIDIAN_TEST_BROKER_URL_DASHBOARD"),
+        ("instrument", "MERIDIAN_TEST_BROKER_URL_INSTRUMENT"),
+        ("analytics", "MERIDIAN_TEST_BROKER_URL_ANALYTICS"),
+        ("runtime", "MERIDIAN_TEST_BROKER_URL_RUNTIME"),
+    ];
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let mut clients = Vec::new();
+    for (name, variable) in CREDENTIALS {
+        clients.push((name, raw(variable).await));
+    }
+    for owner in ["custody-test-2", "dashboard-1", "instrument"] {
+        let theirs = format!("_INBOX.{owner}.unasked");
+        let mut inbox = listening.subscribe(theirs.clone()).await.unwrap();
+        listening.flush().await.unwrap();
+        settle().await;
+        let mut sent = Vec::new();
+        for (name, client) in &clients {
+            let said = mark(&format!("{name}-into-{owner}"));
+            client
+                .publish(theirs.clone(), said.clone().into())
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+            sent.push((*name, said));
+        }
+        use futures_util::StreamExt;
+        let mut arrived = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
+            arrived.push(String::from_utf8_lossy(&message.payload).to_string());
+        }
+        for (name, said) in sent {
+            let carried = arrived.contains(&said);
+            let expected = name == owner || name == "runtime";
+            assert_eq!(
+                carried, expected,
+                "{name} into {owner}'s inbox: carried {carried}, expected {expected}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
     // Asked as custody-test-1 on what every sidecar asks, answered by the

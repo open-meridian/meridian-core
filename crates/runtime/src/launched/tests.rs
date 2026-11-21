@@ -187,11 +187,12 @@ fn a_launched_plugin_is_admitted_by_a_hash_and_its_roles_topics() {
     );
 }
 
-/// A data plugin launched after install writes ahead too (v31a, item 2):
-/// the lake's credential is granted its inboxes, as a chart's data plugin's,
-/// so its writes are answered; a launched plugin of another role's are not.
+/// A plugin launched after install is answered on its inboxes as a chart's
+/// is (the second review of v31a-core-2, finding 2): the runtime's
+/// credential publishes on them, whatever its roles -- a data plugin's
+/// write-ahead answers among them -- and hears none of them.
 #[test]
-fn the_runtime_answers_a_launched_data_plugin_on_its_inboxes_alone() {
+fn the_runtime_answers_a_launched_plugin_on_its_inboxes() {
     let contract = meridian_sidecar::Contract::embedded();
     let launched = [
         Launched {
@@ -214,13 +215,19 @@ fn the_runtime_answers_a_launched_data_plugin_on_its_inboxes_alone() {
         .lines()
         .find(|line| line.contains("user: runtime,"))
         .expect("admitted");
-    let publish = runtime
-        .split("publish: { allow: ")
-        .nth(1)
-        .and_then(|rest| rest.split(" }").next())
-        .expect("a publish list");
-    assert!(publish.contains("\"_INBOX.kraken-2.>\""), "{publish}");
-    assert!(!publish.contains("_INBOX.snaptrade-2"), "{publish}");
+    let list = |side: &str| {
+        runtime
+            .split(&format!("{side}: {{ allow: "))
+            .nth(1)
+            .and_then(|rest| rest.split(" }").next())
+            .expect("a list")
+            .to_string()
+    };
+    let (publish, subscribe) = (list("publish"), list("subscribe"));
+    for theirs in ["\"_INBOX.kraken-2.>\"", "\"_INBOX.snaptrade-2.>\""] {
+        assert!(publish.contains(theirs), "{publish}");
+        assert!(!subscribe.contains(theirs), "{subscribe}");
+    }
     assert!(!written.contains("\"_INBOX.>\""), "{written}");
 }
 
