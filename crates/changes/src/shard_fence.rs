@@ -61,6 +61,7 @@
 //! below, so a batch never upgrades a lock it holds shared. A batch checks
 //! its shards in one order, before any other lock it takes.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -267,8 +268,8 @@ fn answers(
 /// The writes' stamps checked in `tx`, the batch's own transaction, against
 /// `table` ([`LAKE`] or [`BOOK`]): each answered in turn, a write with no
 /// stamp passing, and one stamped past [`EPOCH_MOST`] refused, raising
-/// nothing. A shard's row is held for the transaction ([module
-/// docs](self)).
+/// nothing but answered with the epoch its shard holds. A shard's row is
+/// held for the transaction ([module docs](self)).
 pub fn check(
     tx: &mut postgres::Transaction<'_>,
     table: &'static str,
@@ -282,7 +283,45 @@ pub fn check(
         let now = hold(tx, table, &instance, shard, epoch, None)?;
         held.insert((instance, shard), now);
     }
+    // A shard stamped only past the most is read, not raised, so its
+    // refusal names the epoch it holds (review-core-2c, finding 4).
+    for stamp in stamps.iter().flatten() {
+        if let Entry::Vacant(at) = held.entry(stamp.key()) {
+            at.insert(held_now(tx, table, &stamp.instance, stamp.shard)?.unwrap_or_default());
+        }
+    }
     Ok(answers(stamps, &held))
+}
+
+/// One shard's row, held shared, where there is one.
+fn held_now(
+    tx: &mut postgres::Transaction<'_>,
+    table: &'static str,
+    instance: &str,
+    shard: u32,
+) -> Result<Option<Held>, postgres::Error> {
+    Ok(tx
+        .query_opt(&read_held(table), &[&instance, &i64::from(shard)])?
+        .map(held_of))
+}
+
+/// A shard's row read and held shared, `$1` its instance and `$2` its shard.
+fn read_held(table: &str) -> String {
+    format!(
+        "SELECT epoch, admit_through, admit_stream FROM {table}
+          WHERE instance = $1 AND shard = $2 FOR SHARE"
+    )
+}
+
+/// What a row read by [`read_held`] holds.
+fn held_of(row: postgres::Row) -> Held {
+    Held {
+        epoch: row.get::<_, i64>(0) as u64,
+        admit: Admit {
+            through: row.get::<_, i64>(1) as u64,
+            stream: row.get::<_, i64>(2),
+        },
+    }
 }
 
 /// One shard's row raised to `epoch` where it is below, made where there is
@@ -311,23 +350,13 @@ fn hold(
               WHERE instance = $1 AND shard = $2 AND epoch < $3"
         ),
     };
-    let read = format!(
-        "SELECT epoch, admit_through, admit_stream FROM {table}
-          WHERE instance = $1 AND shard = $2 FOR SHARE"
-    );
-    let held = |row: postgres::Row| Held {
-        epoch: row.get::<_, i64>(0) as u64,
-        admit: Admit {
-            through: row.get::<_, i64>(1) as u64,
-            stream: row.get::<_, i64>(2),
-        },
-    };
+    let read = read_held(table);
     let given = admit.unwrap_or_default();
     let (shard, epoch) = (i64::from(shard), epoch as i64);
     let (through, stream) = (given.through as i64, given.stream);
     tx.execute(&raise, &[&instance, &shard, &epoch, &through, &stream])?;
     if let Some(row) = tx.query_opt(&read, &[&instance, &shard])? {
-        return Ok(held(row));
+        return Ok(held_of(row));
     }
     tx.execute(
         &format!(
@@ -338,7 +367,7 @@ fn hold(
     )?;
     // Made by another at once: raised where it is below ours.
     tx.execute(&raise, &[&instance, &shard, &epoch, &through, &stream])?;
-    Ok(held(tx.query_one(&read, &[&instance, &shard])?))
+    Ok(held_of(tx.query_one(&read, &[&instance, &shard])?))
 }
 
 /// A take's numbering, refused.

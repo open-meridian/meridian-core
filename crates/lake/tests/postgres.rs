@@ -12844,6 +12844,36 @@ fn a_write_stamped_past_an_int32_epoch_is_refused_and_raises_nothing() {
     );
 }
 
+/// The final review of v31a-core-2 (review-core-2c), finding 4: a write
+/// stamped past `EPOCH_MOST` raises nothing, so its shard's row was never
+/// read, and its refusal said the epoch held was 0. It names the epoch the
+/// shard holds.
+#[test]
+fn a_write_stamped_past_the_most_epoch_names_the_epoch_held() {
+    use meridian_lake::store::{ShardStamp, StoreError};
+    let store = store();
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    assert_eq!(
+        store
+            .take_shard(took(&instance, 1), &lease(5))
+            .unwrap()
+            .epoch,
+        5
+    );
+    let done = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "a", &subject, "2026-11-20", 1)]],
+        &[ShardStamp::of(&instance, 1, u64::MAX)],
+        1_000,
+    );
+    match &done[0] {
+        Err(StoreError::ShardFenced(fenced)) => assert_eq!(fenced.held, 5, "{fenced}"),
+        other => panic!("a write stamped u64::MAX: {other:?}"),
+    }
+}
+
 /// The review of v31a-core-2, F1(b): a shard whose row a forged write raised
 /// past an int32 before the check above -- kept as -1, or as i64::MAX -- is
 /// refused its take, never numbered an epoch that wraps: u64::MAX + 1
