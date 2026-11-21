@@ -182,26 +182,38 @@ data:
 # a name. Kept with what it holds, as the credentials above are.
 #
 # Its keys are the broker's, never the release's. Where Helm applies
-# server-side (Helm 4), the chart states none of the broker's: Helm then owns
-# none, an upgrade leaves every key as the broker wrote it, and no revision's
-# manifest carries a credential. Rendered from what the Secret held, as this
-# was, a revision kept each plugin's credential as it was that day, and a
-# rollback to it was refused once one had been made again: `helm rollback`
-# applies the stored manifest, and the broker owns the field with another
-# value (the dev deployment's revision 69, 2026-11-20).
+# server-side (Helm 4), the chart states none the broker also owns: Helm
+# then owns none of those, an upgrade leaves each as the broker wrote it,
+# and the revision's manifest carries no such credential. Rendered from what
+# the Secret held, as this was, a revision kept each plugin's credential as
+# it was that day, and a rollback to it was refused once one had been made
+# again: `helm rollback` applies the stored manifest, and the broker owns
+# the field with another value (the dev deployment's revision 69,
+# 2026-11-20).
 #
-# Where Helm merges client-side instead, a manifest that stops stating the
-# keys would delete them, so there they are still rendered as held,
-# unchanged. Which it is cannot be asked of Helm, so it is read two ways,
-# and the keys are left out only where both say server-side:
+# Revisions still carry credentials in two cases, both below: every one a
+# client-side merge was rendered for (a Helm 3's), and under server-side
+# apply a key that is Helm's alone.
 #
-#   - the Secret: server-side apply leaves an `Apply` entry in its managed
-#     fields, and a client-side merge never does;
-#   - the client: Helm 3 only ever merges client-side, whatever applied the
-#     release before it.
+# Where Helm merges client-side, a manifest that stops stating the keys
+# would delete them, so there they are still rendered as held, unchanged.
+# Which it is cannot be asked of Helm, so it is read two ways, and the keys
+# are left out only where both say server-side:
+#
+#   - the Secret: Helm's server-side apply leaves an `Apply` entry in its
+#     managed fields, and a client-side merge never does. Helm's own entry
+#     only: one that owns the release annotation
+#     (`meta.helm.sh/release-name`), which Helm states on everything it
+#     applies. Another manager's server-side apply (`kubectl apply
+#     --server-side` of a label) leaves an `Apply` entry too, over a release
+#     Helm still merges client-side;
+#   - the client: Helm 4 or later, by its version. Helm 3 only ever merges
+#     client-side, whatever applied the release before it; and a version
+#     that does not read as one is taken for a client-side merge, where
+#     stating every key deletes nothing.
 #
 # A Helm 4 told to merge client-side (`--server-side=false`), or upgrading
-# straight after a Helm 3 did, over a Secret a server-side apply once wrote,
+# straight after a Helm 3 did, over a Secret Helm once applied server-side,
 # is not told apart from one applying server-side: there a key the manifest
 # before stated is deleted. `meridian upgrade-deployment` never passes that
 # flag.
@@ -212,21 +224,30 @@ data:
 # the upgrade ran takes the field from the broker; released, a field with no
 # other owner is deleted, under a plugin that read its credential when its
 # pod started. So it is stated as held, and stays Helm's until the plugin is
-# stopped, when the broker takes the key out.
+# stopped, when the broker takes the key out. Stated from what the Secret
+# held when the upgrade was rendered, so for such a key the revision carries
+# the credential, and one made again between the render and the apply is put
+# back as it was.
 {{- $launched := lookup "v1" "Secret" .Release.Namespace (printf "%s-launched" $name) | default dict }}
 {{- $applied := false }}
 {{- $helms := dict }}
 {{- $others := dict }}
 {{- range (dig "metadata" "managedFields" list $launched) }}
 {{- $owned := dig "fieldsV1" "f:data" dict . }}
-{{- if eq (.operation | default "") "Apply" }}
+{{- $release := hasKey (dig "fieldsV1" "f:metadata" "f:annotations" dict .) "f:meta.helm.sh/release-name" }}
+{{- if and (eq (.operation | default "") "Apply") $release }}
 {{- $applied = true }}
 {{- range $field, $_ := $owned }}{{ $_ := set $helms $field true }}{{ end }}
 {{- else }}
 {{- range $field, $_ := $owned }}{{ $_ := set $others $field true }}{{ end }}
 {{- end }}
 {{- end }}
-{{- $serverSide := and $applied (not (hasPrefix "v3." .Capabilities.HelmVersion.Version)) }}
+{{- $client := .Capabilities.HelmVersion.Version | default "" }}
+{{- $four := false }}
+{{- if regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+" $client }}
+{{- $four = semverCompare ">=4.0.0-0" $client }}
+{{- end }}
+{{- $serverSide := and $applied $four }}
 {{- $stated := dict }}
 {{- range $key, $value := ($launched.data | default dict) }}
 {{- $field := printf "f:%s" $key }}
