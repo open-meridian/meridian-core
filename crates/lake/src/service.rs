@@ -6024,6 +6024,16 @@ impl Lake {
                 "lease_uid: the uid of the Lease the sidecar took",
             ));
         }
+        // A Lease's transitions are an int32: more is no Lease's, and would
+        // number an epoch past the most one is (the review of v31a-core-2,
+        // F1(b)).
+        if request.lease_transitions > meridian_changes::shard_fence::EPOCH_MOST {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["lease_transitions".to_string()],
+                "lease_transitions: a Lease's transitions are an int32, and these are past it",
+            ));
+        }
         if std::time::Instant::now() >= until {
             return Err(late_take());
         }

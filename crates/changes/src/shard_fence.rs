@@ -102,6 +102,13 @@ pub const ASK_EACH: std::time::Duration = std::time::Duration::from_millis(800);
 pub const TAKE_WITHIN: std::time::Duration =
     CONFIRM_WITHIN.saturating_add(std::time::Duration::from_secs(1));
 
+/// The most a shard's epoch is (the review of v31a-core-2, F1(b)): a Lease's
+/// `leaseTransitions` is an int32, so a take is numbered within it, and a
+/// write stamped past it raises nothing and is refused. Every epoch then
+/// keeps its value through the tables' bigint and compares there as it does
+/// here; a take that would number past it is refused, never wrapped.
+pub const EPOCH_MOST: u64 = i32::MAX as u64;
+
 /// The lake's table.
 pub const LAKE: &str = "lake_shard_fence";
 /// The book's table.
@@ -211,6 +218,16 @@ fn durably(tx: &mut postgres::Transaction<'_>) -> Result<(), postgres::Error> {
     tx.batch_execute("SET LOCAL synchronous_commit = on")
 }
 
+/// The stamps among `stamps` that may raise a fence: those within
+/// [`EPOCH_MOST`].
+fn within<'a>(stamps: &'a [Option<&'a ShardStamp>]) -> impl Iterator<Item = &'a ShardStamp> {
+    stamps
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|stamp| stamp.epoch <= EPOCH_MOST)
+}
+
 /// Each shard's highest epoch among `stamps`, in one order: what a batch
 /// checks, once each.
 fn highest<'a>(stamps: impl IntoIterator<Item = &'a ShardStamp>) -> BTreeMap<(String, u32), u64> {
@@ -234,7 +251,7 @@ fn answers(
             None => Ok(()),
             Some(stamp) => {
                 let held = held.get(&stamp.key()).copied().unwrap_or_default();
-                if held.refuses(stamp) {
+                if stamp.epoch > EPOCH_MOST || held.refuses(stamp) {
                     Err(ShardFenced {
                         stamp: (*stamp).clone(),
                         held: held.epoch,
@@ -249,14 +266,15 @@ fn answers(
 
 /// The writes' stamps checked in `tx`, the batch's own transaction, against
 /// `table` ([`LAKE`] or [`BOOK`]): each answered in turn, a write with no
-/// stamp passing. A shard's row is held for the transaction ([module
+/// stamp passing, and one stamped past [`EPOCH_MOST`] refused, raising
+/// nothing. A shard's row is held for the transaction ([module
 /// docs](self)).
 pub fn check(
     tx: &mut postgres::Transaction<'_>,
     table: &'static str,
     stamps: &[Option<&ShardStamp>],
 ) -> Result<Vec<Result<(), ShardFenced>>, postgres::Error> {
-    let wanted = highest(stamps.iter().flatten().copied());
+    let wanted = highest(within(stamps));
     let mut held = BTreeMap::new();
     for ((instance, shard), epoch) in wanted {
         // A write raises the epoch alone: only a take's raise knows the
@@ -323,11 +341,15 @@ fn hold(
     Ok(held(tx.query_one(&read, &[&instance, &shard])?))
 }
 
-/// A take's numbering, refused: the Lease's transitions it was sent with
-/// are below `seen`, the highest a take of the shard was numbered with.
+/// A take's numbering, refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TakeBehind {
-    pub seen: u64,
+pub enum TakeRefused {
+    /// The Lease's transitions it was sent with are below `seen`, the
+    /// highest a take of the shard was numbered with (review c5a M2).
+    Behind { seen: u64 },
+    /// The Lease's transitions, or the epoch the take would number, are
+    /// past [`EPOCH_MOST`] (the review of v31a-core-2, F1(b)).
+    Beyond,
 }
 
 /// What a take is numbered from: the Lease as its sidecar took it, and the
@@ -347,7 +369,8 @@ pub struct Taking {
 /// with the stream's place the control writer found (review c5a3 M1), and
 /// answered; refused where `lease_transitions` is below the highest a take
 /// of it was numbered with on the same Lease (M2; another Lease's uid
-/// starts the floor afresh, c5a2 N5). The row is made first, so a first
+/// starts the floor afresh, c5a2 N5), and where it, or the epoch, would be
+/// past [`EPOCH_MOST`]. The row is made first, so a first
 /// take racing another waits on it (review c5a2 L2), and the transaction
 /// commits on the synchronous standby (N1): the row is the shard's durable
 /// epoch. Only the lake's table keeps the Lease.
@@ -357,7 +380,10 @@ pub fn take(
     instance: &str,
     shard: u32,
     taking: &Taking,
-) -> Result<Result<u64, TakeBehind>, postgres::Error> {
+) -> Result<Result<u64, TakeRefused>, postgres::Error> {
+    if taking.lease_transitions > EPOCH_MOST {
+        return Ok(Err(TakeRefused::Beyond));
+    }
     durably(tx)?;
     let shard = i64::from(shard);
     tx.execute(
@@ -381,9 +407,11 @@ pub fn take(
         &taking.lease_uid,
     );
     if taking.lease_transitions < seen {
-        return Ok(Err(TakeBehind { seen }));
+        return Ok(Err(TakeRefused::Behind { seen }));
     }
-    let epoch = numbered(held, taking.lease_transitions);
+    let Some(epoch) = numbered(held, taking.lease_transitions) else {
+        return Ok(Err(TakeRefused::Beyond));
+    };
     tx.execute(
         &format!(
             "UPDATE {table} SET epoch = $3,
@@ -431,9 +459,12 @@ fn floor(seen: u64, seen_on: &str, lease_uid: &str) -> u64 {
 }
 
 /// A take's epoch: past the one held, at least the Lease's transitions, at
-/// least 1.
-fn numbered(held: u64, lease_transitions: u64) -> u64 {
-    (held + 1).max(lease_transitions).max(1)
+/// least 1; none past [`EPOCH_MOST`], nor where the one held is at the most
+/// a u64 holds.
+fn numbered(held: u64, lease_transitions: u64) -> Option<u64> {
+    held.checked_add(1)
+        .map(|next| next.max(lease_transitions).max(1))
+        .filter(|epoch| *epoch <= EPOCH_MOST)
 }
 
 /// A shard's epoch raised to `epoch` where it is below (a take heard from
@@ -562,7 +593,7 @@ impl Memory {
     /// [`check`], all at once under one lock.
     pub fn check(&self, stamps: &[Option<&ShardStamp>]) -> Vec<Result<(), ShardFenced>> {
         let mut held = self.held.lock().expect("shard fence poisoned");
-        for (key, epoch) in highest(stamps.iter().flatten().copied()) {
+        for (key, epoch) in highest(within(stamps)) {
             let at = held.entry(key).or_insert(Held {
                 epoch,
                 admit: Admit::default(),
@@ -573,21 +604,24 @@ impl Memory {
     }
 
     /// [`take`].
-    pub fn take(&self, instance: &str, shard: u32, taking: &Taking) -> Result<u64, TakeBehind> {
+    pub fn take(&self, instance: &str, shard: u32, taking: &Taking) -> Result<u64, TakeRefused> {
+        if taking.lease_transitions > EPOCH_MOST {
+            return Err(TakeRefused::Beyond);
+        }
         let key = (instance.to_string(), shard);
         let mut seen = self.seen.lock().expect("shard fence poisoned");
         let at_seen = seen.entry(key.clone()).or_default();
         let floor = floor(at_seen.1, &at_seen.0, &taking.lease_uid);
         if taking.lease_transitions < floor {
-            return Err(TakeBehind { seen: floor });
+            return Err(TakeRefused::Behind { seen: floor });
         }
+        let mut held = self.held.lock().expect("shard fence poisoned");
+        let at = held.entry(key).or_default();
+        at.epoch = numbered(at.epoch, taking.lease_transitions).ok_or(TakeRefused::Beyond)?;
         *at_seen = (
             taking.lease_uid.clone(),
             floor.max(taking.lease_transitions),
         );
-        let mut held = self.held.lock().expect("shard fence poisoned");
-        let at = held.entry(key).or_default();
-        at.epoch = numbered(at.epoch, taking.lease_transitions);
         if let Some(admit) = taking.admit {
             at.admit = kept(at.admit, admit);
         }
@@ -679,7 +713,10 @@ mod tests {
             ..again.clone()
         };
         assert_eq!(fence.take("feed-1", 0, &moved), Ok(9));
-        assert_eq!(fence.take("feed-1", 0, &again), Err(TakeBehind { seen: 2 }));
+        assert_eq!(
+            fence.take("feed-1", 0, &again),
+            Err(TakeRefused::Behind { seen: 2 })
+        );
     }
 
     /// Review c5a3 M1: the take's numbering keeps the stream's place the
@@ -746,12 +783,36 @@ mod tests {
         // Below the transitions a take was numbered with: refused (M2).
         assert_eq!(
             fence.take("feed-1", 0, &lease(3)),
-            Err(TakeBehind { seen: 7 })
+            Err(TakeRefused::Behind { seen: 7 })
         );
         assert_eq!(fence.take("feed-1", 0, &lease(7)), Ok(8));
         assert_eq!(fence.take("feed-1", 0, &lease(7)), Ok(9));
         assert_eq!(fence.raise_to("feed-1", 0, 5), 9);
         assert_eq!(fence.epoch("feed-1", 2), 0);
+    }
+
+    /// The review of v31a-core-2, F1(b): no epoch is numbered or raised past
+    /// [`EPOCH_MOST`]. A take past it is refused and keeps no floor that
+    /// refuses the Lease's next; a write stamped past it is refused and
+    /// raises nothing; and at the most, a take is refused, never wrapped.
+    #[test]
+    fn no_epoch_is_numbered_or_raised_past_the_most() {
+        let fence = Memory::default();
+        assert_eq!(
+            fence.take("feed-1", 1, &lease(EPOCH_MOST + 1)),
+            Err(TakeRefused::Beyond)
+        );
+        assert_eq!(fence.take("feed-1", 1, &lease(5)), Ok(5));
+        for epoch in [EPOCH_MOST + 1, 1 << 63, u64::MAX] {
+            let refused = fence.check(&[Some(&stamp(epoch))]);
+            assert_eq!(refused[0].as_ref().unwrap_err().held, 5, "{epoch}");
+        }
+        assert_eq!(fence.epoch("feed-1", 1), 5, "nothing raised it");
+        assert_eq!(fence.check(&[Some(&stamp(EPOCH_MOST))]), vec![Ok(())]);
+        assert_eq!(fence.take("feed-1", 1, &lease(5)), Err(TakeRefused::Beyond));
+        assert_eq!(fence.epoch("feed-1", 1), EPOCH_MOST);
+        assert_eq!(numbered(u64::MAX, 0), None);
+        assert_eq!(numbered(EPOCH_MOST - 1, 0), Some(EPOCH_MOST));
     }
 
     /// A write the stream held before the take reached the group is

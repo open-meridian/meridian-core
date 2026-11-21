@@ -1853,21 +1853,40 @@ fn shards_checked<'a>(
 
 /// A take refused: the Lease's transitions it was sent with are below the
 /// highest a take of the shard was numbered with (review c5a M2), so a
-/// later take holds the Lease. FAILED_PRECONDITION,
-/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits.
-pub(crate) fn take_behind(
+/// later take holds the Lease -- FAILED_PRECONDITION,
+/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits; or it
+/// would number an epoch past the most one is (the review of v31a-core-2,
+/// F1(b)), refused naming `lease_transitions`.
+pub(crate) fn take_refused(
     took: &meridian_domain::v1::ShardTookOver,
     taking: &meridian_changes::shard_fence::Taking,
-    behind: meridian_changes::shard_fence::TakeBehind,
+    refused: meridian_changes::shard_fence::TakeRefused,
 ) -> StoreError {
     let lease_transitions = taking.lease_transitions;
+    let seen = match refused {
+        meridian_changes::shard_fence::TakeRefused::Behind { seen } => seen,
+        meridian_changes::shard_fence::TakeRefused::Beyond => {
+            tracing::warn!(
+                instance = took.instance,
+                shard = took.shard,
+                lease_transitions,
+                "a shard's take refused: it would number an epoch past an int32"
+            );
+            return StoreError::Invalid {
+                field: "lease_transitions",
+                words: "lease_transitions: a shard's epoch is numbered within an int32, the \
+                        Lease's transitions' type, and this take's would be past it"
+                    .into(),
+            };
+        }
+    };
     tracing::warn!(
         instance = took.instance,
         shard = took.shard,
         holder = took.holder,
         lease_transitions,
         lease_uid = taking.lease_uid,
-        seen = behind.seen,
+        seen,
         "a shard's take refused: a later take of its Lease was numbered already"
     );
     StoreError::ShardFenced(ShardFenced {
@@ -1878,7 +1897,7 @@ pub(crate) fn take_behind(
             in_stream: 0,
             stream: 0,
         },
-        held: behind.seen,
+        held: seen,
     })
 }
 
@@ -3211,7 +3230,7 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         took.epoch = match numbered {
             Ok(epoch) => epoch,
-            Err(behind) => return Err(take_behind(&took, taking, behind)),
+            Err(refused) => return Err(take_refused(&took, taking, refused)),
         };
         tx.commit().map_err(unavailable)?;
         Ok(took)

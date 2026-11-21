@@ -210,6 +210,36 @@ async fn a_take_asked_as_another_instance_is_refused() {
     assert!(refused.contains("sent by"), "{refused}");
 }
 
+/// The review of v31a-core-2, F1(b): a Lease's transitions are an int32. A
+/// take sent with more was numbered at them, and every later take of the
+/// Lease refused below it: the shard locked out. Refused now,
+/// INVALID_ARGUMENT naming the field, before anything is numbered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_past_an_int32_of_lease_transitions_is_refused_and_locks_no_take_out() {
+    let (bus, _zero, _one, lake) = two_groups();
+    lake.with_book_groups(1);
+    let _book = book_group(&bus, 0);
+    let extreme = take(&bus, 1, 1 << 63).await;
+    let next = take(&bus, 1, 5).await;
+    assert_eq!(
+        next,
+        Ok(5),
+        "the take past an int32 locked the Lease's next take out: {extreme:?}"
+    );
+    for refused in [extreme, take(&bus, 1, i32::MAX as u64 + 1).await] {
+        let refused = refused.expect_err("past an int32: refused");
+        let at = refused.find("[refusal-status").expect("a refusal's status");
+        let (said, fields, _) =
+            meridian_bus::read_refusal_status(&refused[at..]).expect("readable");
+        assert_eq!(
+            said,
+            meridian_bus::RefusalStatus::InvalidArgument,
+            "{refused}"
+        );
+        assert_eq!(fields, ["lease_transitions"], "{refused}");
+    }
+}
+
 /// Review c5a M3: the lake answers a take -- here refused, a book group
 /// confirming nothing, each ask taking all but its whole window -- inside
 /// the sidecar's wait, one constant shared: it starts no round it cannot

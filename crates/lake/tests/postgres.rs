@@ -12757,6 +12757,121 @@ fn a_lease_made_again_is_taken_past_the_old_lease_s_floor() {
     assert!(matches!(late, Err(StoreError::ShardFenced(_))), "{late:?}");
 }
 
+/// The review of v31a-core-2, F1(b): a Lease's transitions are an int32, and
+/// the fence keeps them as a bigint. A take sent with more -- 2^63 -- was
+/// kept as i64::MIN and read back as 2^63, so every later take of the Lease
+/// was refused below it: the shard locked out. Refused now, before anything
+/// is numbered or kept, and the Lease's next take is numbered.
+#[test]
+fn a_take_past_an_int32_of_lease_transitions_is_refused_and_locks_no_take_out() {
+    let store = store();
+    let instance = unique("feed");
+    let extreme = store.take_shard(took(&instance, 1), &lease(1 << 63));
+    let next = store.take_shard(took(&instance, 1), &lease(5));
+    assert_eq!(
+        next.map(|t| t.epoch).ok(),
+        Some(5),
+        "the take past an int32 locked the Lease's next take out: {extreme:?}"
+    );
+    assert!(extreme.is_err(), "numbered past an int32: {extreme:?}");
+    let past = store.take_shard(took(&instance, 1), &lease(i32::MAX as u64 + 1));
+    assert!(past.is_err(), "numbered past an int32: {past:?}");
+}
+
+/// The review of v31a-core-2, F1(b): a write's shard epoch, its sidecar's to
+/// stamp, raised the fence whatever it was. u64::MAX was kept as -1 and read
+/// back as u64::MAX, so the shard's next take could number nothing past it;
+/// an epoch past i64 compared below every epoch in SQL, and one past an
+/// int32 left the takes nothing to number within the Lease's transitions.
+/// Each is refused now and raises nothing, and the shard's holder writes on.
+#[test]
+fn a_write_stamped_past_an_int32_epoch_is_refused_and_raises_nothing() {
+    use meridian_lake::store::{ShardStamp, StoreError};
+    let store = store();
+    let instance = unique("feed");
+    let dataset = unique("feed:prices");
+    let subject = unique("LCL-BTC");
+    let stamp = |epoch: u64| ShardStamp::of(&instance, 1, epoch);
+    let fenced = |done: &Result<meridian_lake::store::Recorded, StoreError>| {
+        matches!(done, Err(StoreError::ShardFenced(_)))
+    };
+
+    let forged = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "a", &subject, "2026-11-20", 1)]],
+        &[stamp(u64::MAX)],
+        1_000,
+    );
+    let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.take_shard(took(&instance, 1), &lease(0))
+    }));
+    assert!(
+        matches!(&taken, Ok(Ok(t)) if t.epoch == 1),
+        "the shard's take after a write stamped u64::MAX: {:?}, the write {:?}",
+        taken.as_ref().map(|t| t.as_ref().map(|t| t.epoch)),
+        forged[0]
+    );
+    assert!(fenced(&forged[0]), "{:?}", forged[0]);
+
+    for epoch in [i32::MAX as u64 + 1, i64::MAX as u64, 1 << 63, u64::MAX] {
+        let done = store.record_parts(
+            &dataset,
+            vec![vec![close(&dataset, "b", &subject, "2026-11-20", 2)]],
+            &[stamp(epoch)],
+            2_000,
+        );
+        assert!(fenced(&done[0]), "{epoch}: {:?}", done[0]);
+    }
+    let done = store.record_parts(
+        &dataset,
+        vec![vec![close(&dataset, "c", &subject, "2026-11-20", 3)]],
+        &[stamp(1)],
+        3_000,
+    );
+    assert_eq!(
+        done[0].as_ref().map(|recorded| recorded.recorded).ok(),
+        Some(1),
+        "the holder's write at its epoch: {:?}",
+        done[0]
+    );
+    assert_eq!(
+        store
+            .take_shard(took(&instance, 1), &lease(0))
+            .unwrap()
+            .epoch,
+        2,
+        "nothing raised it"
+    );
+}
+
+/// The review of v31a-core-2, F1(b): a shard whose row a forged write raised
+/// past an int32 before the check above -- kept as -1, or as i64::MAX -- is
+/// refused its take, never numbered an epoch that wraps: u64::MAX + 1
+/// overflowed, and 2^63 was kept as i64::MIN, below every epoch in SQL.
+#[test]
+fn a_shard_held_past_an_int32_epoch_refuses_a_take_rather_than_wrap() {
+    let store = store();
+    let instance = unique("feed");
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    for (shard, held) in [(1u32, -1i64), (2, i64::MAX)] {
+        admin
+            .execute(
+                "INSERT INTO lake_shard_fence (instance, shard, epoch) VALUES ($1, $2, $3)",
+                &[&instance, &i64::from(shard), &held],
+            )
+            .unwrap();
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.take_shard(took(&instance, shard), &lease(0))
+        }));
+        assert!(
+            matches!(&taken, Ok(Err(_))),
+            "held {held}: {:?}",
+            taken.as_ref().map(|t| t.as_ref().map(|t| t.epoch))
+        );
+    }
+}
+
 /// PR CI 44283011761 (reconfigure, groups lowered, tolerant): the store's
 /// own raise on a new database timeline is its epoch from the moment the
 /// raise can be read. Its writer's start-up follow raised the epoch while
