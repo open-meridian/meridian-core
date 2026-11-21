@@ -72,6 +72,7 @@ fn inputs(url: &str) -> Inputs {
         max_payload: 1024 * 1024,
         backups: None,
         backup_configured: false,
+        sidecars: None,
         now_ns: 1_792_800_000_000_000_000,
         database_waits_at_most: Duration::from_secs(30),
     }
