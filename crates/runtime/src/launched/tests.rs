@@ -231,6 +231,50 @@ fn the_runtime_answers_a_launched_plugin_on_its_inboxes() {
     assert!(!written.contains("\"_INBOX.>\""), "{written}");
 }
 
+/// A plugin launched after install is answered as a chart's is by each core
+/// credential serving a request it may send (v31a, item 2, as restated
+/// 2026-11-20): the dashboard's, which every sidecar files a ticket with,
+/// and the instrument store's, which custody asks to resolve an identifier
+/// -- so their answers need no reply right a reload would forget. A data
+/// plugin, which asks the dashboard but not first run, is not answered by
+/// first run.
+#[test]
+fn a_launched_plugin_is_answered_on_its_inboxes_by_the_core_credentials_it_may_ask() {
+    let contract = meridian_sidecar::Contract::embedded();
+    let launched = [Launched {
+        instance_id: "snaptrade-2".into(),
+        roles: vec!["custody".into()],
+        datasets: vec![],
+    }];
+    let hashes = BTreeMap::from([("snaptrade-2".to_string(), "$2b$12$def".to_string())]);
+    let chart = [crate::broker::Instance::component(
+        "dashboard-1",
+        "dashboard",
+    )];
+    let (written, _) = configuration("", contract, &chart, &launched, &hashes).unwrap();
+    let publish = |user: &str| {
+        written
+            .lines()
+            .find(|line| line.contains(&format!("user: {user},")))
+            .and_then(|line| line.split("publish: { allow: ").nth(1))
+            .and_then(|rest| rest.split(" }").next())
+            .unwrap_or_else(|| panic!("{user} is admitted"))
+            .to_string()
+    };
+    for answering in ["dashboard-1", "instrument", "runtime"] {
+        assert!(
+            publish(answering).contains("\"_INBOX.snaptrade-2.>\""),
+            "{answering}: {}",
+            publish(answering)
+        );
+    }
+    assert!(
+        !publish("first-run").contains("\"_INBOX.snaptrade-2.>\""),
+        "{}",
+        publish("first-run")
+    );
+}
+
 #[test]
 fn a_launched_plugins_entitled_datasets_are_read_from_its_annotation() {
     let mut entitled = deployment(Some("reporting-1"), Some("reporting"));

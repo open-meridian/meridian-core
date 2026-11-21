@@ -823,57 +823,129 @@ async fn a_credential_cannot_publish_into_another_credentials_inbox() {
     );
 }
 
-/// The second review of v31a-core-2, finding 2 (option A, approved by
-/// consensus 2026-11-20), as the broker carries it: into each of a plugin's,
-/// a component instance's and an own-credential component's inboxes, a
-/// message no request carried is refused from every other credential here --
-/// and carried from the runtime's alone, the stated exception, which answers
-/// every one of them and so leaves no reply entry on its connections.
+/// Every credential this file connects as, for the inbox matrices: the
+/// harness's plugins, its component instances, the own-credential
+/// components and the runtime.
+const CREDENTIALS: [(&str, &str); 8] = [
+    ("custody-test-1", "MERIDIAN_TEST_BROKER_URL_CUSTODY"),
+    ("custody-test-2", "MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO"),
+    ("reference-1", "MERIDIAN_TEST_BROKER_URL_REFERENCE"),
+    ("dashboard-1", "MERIDIAN_TEST_BROKER_URL_DASHBOARD"),
+    ("launcher-1", "MERIDIAN_TEST_BROKER_URL_LAUNCHER"),
+    ("instrument", "MERIDIAN_TEST_BROKER_URL_INSTRUMENT"),
+    ("analytics", "MERIDIAN_TEST_BROKER_URL_ANALYTICS"),
+    ("runtime", "MERIDIAN_TEST_BROKER_URL_RUNTIME"),
+];
+
+/// Into `owner`'s inbox, a message no request carried from each of
+/// `senders`: which of them the broker carried, read in one window.
+async fn carried_into(
+    listening: &async_nats::Client,
+    owner: &str,
+    senders: &[(&str, async_nats::Client)],
+) -> Vec<String> {
+    use futures_util::StreamExt;
+    let theirs = format!("_INBOX.{owner}.unasked");
+    let mut inbox = listening.subscribe(theirs.clone()).await.unwrap();
+    listening.flush().await.unwrap();
+    settle().await;
+    let mut sent = Vec::new();
+    for (name, client) in senders {
+        let said = mark(&format!("{name}-into-{owner}"));
+        client
+            .publish(theirs.clone(), said.clone().into())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        sent.push((*name, said));
+    }
+    let mut arrived = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
+        arrived.push(String::from_utf8_lossy(&message.payload).to_string());
+    }
+    sent.into_iter()
+        .filter(|(_, said)| arrived.contains(said))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// v31a, item 2 as restated 2026-11-20 (the proposal on answers refused
+/// across a broker reload, option A, approved by consensus), as the broker
+/// carries it: into a credential's inbox, a message no request carried is
+/// carried from the runtime's, which answers every credential, and from
+/// each core credential serving a request the owner may send, by the
+/// contract's request rows -- and refused from every other. So:
+///
+/// - custody-test-2's: the dashboard's (every sidecar files a ticket), the
+///   instrument store's (custody computes a date) and the analytics
+///   component's (every sidecar renews its jobs);
+/// - the dashboard's: the instrument store's and the analytics component's,
+///   which it asks;
+/// - the instrument store's: the runtime's alone, as it asks only the
+///   runtime's components;
+/// - the runtime's: the instrument store's, the dashboard's and the
+///   launcher's, which its components ask -- and not the analytics
+///   component's, which holds the lake's change log as the lake does and
+///   answers no request of the runtime's.
 #[tokio::test]
-async fn only_the_runtime_publishes_into_another_credentials_inbox() {
-    const CREDENTIALS: [(&str, &str); 7] = [
-        ("custody-test-1", "MERIDIAN_TEST_BROKER_URL_CUSTODY"),
-        ("custody-test-2", "MERIDIAN_TEST_BROKER_URL_CUSTODY_TWO"),
-        ("reference-1", "MERIDIAN_TEST_BROKER_URL_REFERENCE"),
-        ("dashboard-1", "MERIDIAN_TEST_BROKER_URL_DASHBOARD"),
-        ("instrument", "MERIDIAN_TEST_BROKER_URL_INSTRUMENT"),
-        ("analytics", "MERIDIAN_TEST_BROKER_URL_ANALYTICS"),
-        ("runtime", "MERIDIAN_TEST_BROKER_URL_RUNTIME"),
-    ];
+async fn a_core_credential_publishes_into_another_inbox_only_where_that_one_may_ask_it() {
     let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
     let mut clients = Vec::new();
     for (name, variable) in CREDENTIALS {
         clients.push((name, raw(variable).await));
     }
-    for owner in ["custody-test-2", "dashboard-1", "instrument"] {
-        let theirs = format!("_INBOX.{owner}.unasked");
-        let mut inbox = listening.subscribe(theirs.clone()).await.unwrap();
-        listening.flush().await.unwrap();
-        settle().await;
-        let mut sent = Vec::new();
-        for (name, client) in &clients {
-            let said = mark(&format!("{name}-into-{owner}"));
-            client
-                .publish(theirs.clone(), said.clone().into())
-                .await
-                .unwrap();
-            client.flush().await.unwrap();
-            sent.push((*name, said));
-        }
-        use futures_util::StreamExt;
-        let mut arrived = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while let Ok(Some(message)) = tokio::time::timeout_at(deadline, inbox.next()).await {
-            arrived.push(String::from_utf8_lossy(&message.payload).to_string());
-        }
-        for (name, said) in sent {
-            let carried = arrived.contains(&said);
-            let expected = name == owner || name == "runtime";
-            assert_eq!(
-                carried, expected,
-                "{name} into {owner}'s inbox: carried {carried}, expected {expected}"
-            );
-        }
+    let answering: [(&str, &[&str]); 4] = [
+        (
+            "custody-test-2",
+            &[
+                "custody-test-2",
+                "dashboard-1",
+                "instrument",
+                "analytics",
+                "runtime",
+            ],
+        ),
+        (
+            "dashboard-1",
+            &["dashboard-1", "instrument", "analytics", "runtime"],
+        ),
+        ("instrument", &["instrument", "runtime"]),
+        (
+            "runtime",
+            &["dashboard-1", "launcher-1", "instrument", "runtime"],
+        ),
+    ];
+    for (owner, expected) in answering {
+        let carried = carried_into(&listening, owner, &clients).await;
+        let mut expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        let order = |name: &String| CREDENTIALS.iter().position(|(n, _)| n == name);
+        expected.sort_by_key(order);
+        assert_eq!(carried, expected, "who published into {owner}'s inbox");
+    }
+}
+
+/// v31a, item 2: no plugin credential publishes into any other's inboxes,
+/// the runtime's and the components' among them: each is carried into its
+/// own alone.
+#[tokio::test]
+async fn no_plugin_credential_publishes_into_another_credentials_inbox() {
+    let listening = raw("MERIDIAN_TEST_BROKER_URL").await;
+    let mut plugins = Vec::new();
+    for (name, variable) in &CREDENTIALS[..3] {
+        plugins.push((*name, raw(variable).await));
+    }
+    for (owner, _) in CREDENTIALS {
+        let carried = carried_into(&listening, owner, &plugins).await;
+        let expected: Vec<String> = plugins
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name == owner)
+            .collect();
+        assert_eq!(
+            carried, expected,
+            "which plugins published into {owner}'s inbox"
+        );
     }
 }
 
