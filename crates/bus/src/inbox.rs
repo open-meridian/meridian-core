@@ -27,9 +27,15 @@ pub fn grant(user: &str) -> String {
     format!("{}.>", prefix(user))
 }
 
-/// The user whose inbox `subject` is, by its prefix; none where it is not an
-/// inbox under a user's prefix -- a client's default `_INBOX.<id>`, which no
-/// credential is granted, or no inbox at all.
+/// The user whose inbox `subject` is, by its first token after `_INBOX.`;
+/// none where there is no second token, the first is a pattern, or it is no
+/// inbox at all.
+///
+/// The token is read, not checked against the users: async-nats's own
+/// default request inbox, `_INBOX.<nuid>.<n>`, has two tokens, so it reads
+/// as owned by `<nuid>`, a name no credential has and none is granted. A
+/// request asked on one is asked as nobody's credential: [`asked_as`]
+/// refuses every sender it names. It fails closed.
 pub fn owner(subject: &str) -> Option<&str> {
     let rest = subject.strip_prefix("_INBOX.")?;
     let (user, tail) = rest.split_once('.')?;
@@ -86,9 +92,25 @@ mod tests {
         );
     }
 
+    /// The review of v31a-core-2, F5: async-nats's default request inbox,
+    /// `_INBOX.<nuid>.<n>`, reads as owned by its nuid, which is no
+    /// credential's name, so a request asked on it is asked as no sender it
+    /// names.
+    #[test]
+    fn a_default_request_inbox_reads_as_its_nuid_and_asks_as_nobody() {
+        let default = "_INBOX.Q8w3xXo7Lw2kT5bJ9vRmYc.7";
+        assert_eq!(owner(default), Some("Q8w3xXo7Lw2kT5bJ9vRmYc"));
+        for claimed in ["custody-test-1", "runtime", "dashboard-1", ""] {
+            assert!(
+                !within_asker(owner(default).map(String::from), || asked_as(claimed)),
+                "a request on a default inbox was asked as {claimed:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_default_inbox_or_a_pattern_is_owned_by_nobody() {
-        // A client's own default, `_INBOX.<id>`: one token after the prefix.
+        // A bare `_INBOX.<id>`: one token after the prefix.
         assert_eq!(owner("_INBOX.Zx81kq"), None);
         assert_eq!(owner("_INBOX.>"), None);
         assert_eq!(owner("_INBOX.*.x"), None);
