@@ -1803,6 +1803,10 @@ fn again(failed: &StoreError) -> StoreError {
             words: words.clone(),
         },
         StoreError::ShardFenced(fenced) => StoreError::ShardFenced(fenced.clone()),
+        StoreError::FailedPrecondition { field, words } => StoreError::FailedPrecondition {
+            field,
+            words: words.clone(),
+        },
     }
 }
 
@@ -1854,9 +1858,12 @@ fn shards_checked<'a>(
 /// A take refused: the Lease's transitions it was sent with are below the
 /// highest a take of the shard was numbered with (review c5a M2), so a
 /// later take holds the Lease -- FAILED_PRECONDITION,
-/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits; or it
-/// would number an epoch past the most one is (the review of v31a-core-2,
-/// F1(b)), refused naming `lease_transitions`.
+/// REFUSAL_REASON_SHARD_FENCED, and the sidecar gives up and exits; or its
+/// transitions are past the most an epoch is (the review of v31a-core-2,
+/// F1(b)), refused naming `lease_transitions`; or the shard's epoch is held
+/// at the most already, so no take numbers past it (the second review,
+/// finding 3): FAILED_PRECONDITION naming `shard`, the instance, the shard
+/// and the epoch held, until a person resets the shard's fence.
 pub(crate) fn take_refused(
     took: &meridian_domain::v1::ShardTookOver,
     taking: &meridian_changes::shard_fence::Taking,
@@ -1870,13 +1877,33 @@ pub(crate) fn take_refused(
                 instance = took.instance,
                 shard = took.shard,
                 lease_transitions,
-                "a shard's take refused: it would number an epoch past an int32"
+                "a shard's take refused: its Lease's transitions are past an int32"
             );
             return StoreError::Invalid {
                 field: "lease_transitions",
                 words: "lease_transitions: a shard's epoch is numbered within an int32, the \
-                        Lease's transitions' type, and this take's would be past it"
+                        Lease's transitions' type, and this take's transitions are past it"
                     .into(),
+            };
+        }
+        meridian_changes::shard_fence::TakeRefused::AtTheMost { held } => {
+            tracing::error!(
+                instance = took.instance,
+                shard = took.shard,
+                held,
+                "a shard's take refused: its epoch is held at the most one is, and a person must \
+                 reset its fence"
+            );
+            return StoreError::FailedPrecondition {
+                field: "shard",
+                words: format!(
+                    "shard: instance {} shard {} holds epoch {held}, at or past the most a \
+                     shard's epoch is ({}, an int32), so no take numbers past it; a person must \
+                     reset the shard's fence",
+                    took.instance,
+                    took.shard,
+                    meridian_changes::shard_fence::EPOCH_MOST
+                ),
             };
         }
     };

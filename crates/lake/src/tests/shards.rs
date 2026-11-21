@@ -240,6 +240,50 @@ async fn a_take_past_an_int32_of_lease_transitions_is_refused_and_locks_no_take_
     }
 }
 
+/// The second review of v31a-core-2, finding 3: a write stamped exactly at
+/// the most an epoch is raises the shard's fence there, and no take can
+/// number past it. Every later take is refused FAILED_PRECONDITION naming
+/// the shard, the instance, the shard's number and the epoch held, and saying
+/// a person must reset the fence -- not INVALID_ARGUMENT on
+/// `lease_transitions`, which the take did not get wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_of_a_shard_held_at_the_most_epoch_names_the_epoch_and_the_shard() {
+    use meridian_changes::shard_fence::EPOCH_MOST;
+    let (bus, zero, _one, lake) = two_groups();
+    lake.with_book_groups(1);
+    let _book = book_group(&bus, 0);
+    let done = zero.record_parts(
+        "lake-1:prices",
+        vec![vec![row()]],
+        &[ShardStamp::of(INSTANCE, 1, EPOCH_MOST)],
+        NOW,
+    );
+    assert!(done[0].is_ok(), "stamped at the most: {:?}", done[0]);
+    let refused = take(&bus, 1, 5).await.expect_err("no take numbers past it");
+    let at = refused.find("[refusal-status").expect("a refusal's status");
+    let (said, fields, words) =
+        meridian_bus::read_refusal_status(&refused[at..]).expect("readable");
+    assert_eq!(
+        said,
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        "{refused}"
+    );
+    assert_eq!(fields, ["shard"], "{refused}");
+    for named in [
+        format!("instance {INSTANCE} shard 1"),
+        format!("epoch {EPOCH_MOST}"),
+        "a person must reset the shard's fence".to_string(),
+    ] {
+        assert!(words.contains(&named), "{named} in {words}");
+    }
+    // A take whose transitions are past an int32 is still the take's fault.
+    let past = take(&bus, 1, EPOCH_MOST + 1).await.expect_err("refused");
+    let at = past.find("[refusal-status").expect("a refusal's status");
+    let (said, fields, _) = meridian_bus::read_refusal_status(&past[at..]).expect("readable");
+    assert_eq!(said, meridian_bus::RefusalStatus::InvalidArgument, "{past}");
+    assert_eq!(fields, ["lease_transitions"], "{past}");
+}
+
 /// Review c5a M3: the lake answers a take -- here refused, a book group
 /// confirming nothing, each ask taking all but its whole window -- inside
 /// the sidecar's wait, one constant shared: it starts no round it cannot

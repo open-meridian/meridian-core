@@ -12848,6 +12848,7 @@ fn a_write_stamped_past_an_int32_epoch_is_refused_and_raises_nothing() {
 /// past an int32 before the check above -- kept as -1, or as i64::MAX -- is
 /// refused its take, never numbered an epoch that wraps: u64::MAX + 1
 /// overflowed, and 2^63 was kept as i64::MIN, below every epoch in SQL.
+/// Refused as a shard held at the most (the second review, finding 3).
 #[test]
 fn a_shard_held_past_an_int32_epoch_refuses_a_take_rather_than_wrap() {
     let store = store();
@@ -12865,11 +12866,76 @@ fn a_shard_held_past_an_int32_epoch_refuses_a_take_rather_than_wrap() {
             store.take_shard(took(&instance, shard), &lease(0))
         }));
         assert!(
-            matches!(&taken, Ok(Err(_))),
+            matches!(
+                &taken,
+                Ok(Err(meridian_lake::store::StoreError::FailedPrecondition {
+                    field: "shard",
+                    ..
+                }))
+            ),
             "held {held}: {:?}",
             taken.as_ref().map(|t| t.as_ref().map(|t| t.epoch))
         );
     }
+}
+
+/// The second review of v31a-core-2, finding 3: a shard whose row holds
+/// exactly the most an epoch is -- as a write stamped there leaves it -- is
+/// refused its take FAILED_PRECONDITION naming the shard, the instance, the
+/// shard's number and the epoch held, and saying a person must reset its
+/// fence; a take whose transitions are past an int32 is still refused
+/// naming `lease_transitions`.
+#[test]
+fn a_take_of_a_shard_held_at_the_most_epoch_names_the_epoch_and_the_shard() {
+    use meridian_changes::shard_fence::EPOCH_MOST;
+    use meridian_lake::store::StoreError;
+    let store = store();
+    let instance = unique("feed");
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .execute(
+            "INSERT INTO lake_shard_fence (instance, shard, epoch) VALUES ($1, 1, $2)",
+            &[&instance, &(EPOCH_MOST as i64)],
+        )
+        .unwrap();
+    let refused = store
+        .take_shard(took(&instance, 1), &lease(5))
+        .expect_err("no take numbers past the most");
+    assert!(
+        matches!(
+            &refused,
+            StoreError::FailedPrecondition { field: "shard", .. }
+        ),
+        "{refused:?}"
+    );
+    let detail = refused.on_the_bus();
+    let at = detail.find("[refusal-status").expect("a refusal's status");
+    let (said, fields, words) = meridian_bus::read_refusal_status(&detail[at..]).expect("readable");
+    assert_eq!(
+        said,
+        meridian_bus::RefusalStatus::FailedPrecondition,
+        "{detail}"
+    );
+    assert_eq!(fields, ["shard"], "{detail}");
+    for named in [
+        format!("instance {instance} shard 1"),
+        format!("epoch {EPOCH_MOST}"),
+        "a person must reset the shard's fence".to_string(),
+    ] {
+        assert!(words.contains(&named), "{named} in {words}");
+    }
+    let past = store.take_shard(took(&instance, 1), &lease(EPOCH_MOST + 1));
+    assert!(
+        matches!(
+            &past,
+            Err(StoreError::Invalid {
+                field: "lease_transitions",
+                ..
+            })
+        ),
+        "{past:?}"
+    );
 }
 
 /// PR CI 44283011761 (reconfigure, groups lowered, tolerant): the store's

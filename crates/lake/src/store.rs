@@ -73,6 +73,13 @@ pub enum StoreError {
     /// the part is recorded, and its sidecar exits.
     #[error("{0}")]
     ShardFenced(#[from] ShardFenced),
+
+    /// A well-formed act the store's state refuses until a person changes
+    /// it, naming the field (the second review of v31a-core-2, finding 3):
+    /// a shard's take whose epoch is held at the most one is.
+    /// FAILED_PRECONDITION.
+    #[error("{words}")]
+    FailedPrecondition { field: &'static str, words: String },
 }
 
 impl StoreError {
@@ -81,7 +88,8 @@ impl StoreError {
     /// epoch passed, SHARD_FENCED, and its sidecar exits (step 3d,
     /// checkpoint 5, item 32); this writer fenced, UNAVAILABLE with
     /// retry-after 1, to be asked again (items 110 and 120; review-c5n5
-    /// F1); every other failure as the store said it.
+    /// F1); a precondition, FAILED_PRECONDITION naming its field; every
+    /// other failure as the store said it.
     pub fn on_the_bus(self) -> String {
         match self {
             StoreError::Held(words) => meridian_bus::refusal_retrying(
@@ -93,6 +101,11 @@ impl StoreError {
                 meridian_bus::refusal(meridian_pb::v1::RefusalReason::ShardFenced as i32, fenced)
             }
             StoreError::Fenced(fenced) => fenced.on_the_bus(),
+            StoreError::FailedPrecondition { field, words } => meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::FailedPrecondition,
+                &[field.to_string()],
+                words,
+            ),
             other => other.to_string(),
         }
     }

@@ -347,9 +347,14 @@ pub enum TakeRefused {
     /// The Lease's transitions it was sent with are below `seen`, the
     /// highest a take of the shard was numbered with (review c5a M2).
     Behind { seen: u64 },
-    /// The Lease's transitions, or the epoch the take would number, are
-    /// past [`EPOCH_MOST`] (the review of v31a-core-2, F1(b)).
+    /// The Lease's transitions it was sent with are past [`EPOCH_MOST`]
+    /// (the review of v31a-core-2, F1(b)): no Lease's.
     Beyond,
+    /// The shard's epoch `held` is at [`EPOCH_MOST`] or past it, so no take
+    /// numbers past it (the second review of v31a-core-2, finding 3): only
+    /// a write stamped at the most can have put it there, and a person must
+    /// reset the shard's fence before it is taken again.
+    AtTheMost { held: u64 },
 }
 
 /// What a take is numbered from: the Lease as its sidecar took it, and the
@@ -410,7 +415,7 @@ pub fn take(
         return Ok(Err(TakeRefused::Behind { seen }));
     }
     let Some(epoch) = numbered(held, taking.lease_transitions) else {
-        return Ok(Err(TakeRefused::Beyond));
+        return Ok(Err(TakeRefused::AtTheMost { held }));
     };
     tx.execute(
         &format!(
@@ -617,7 +622,8 @@ impl Memory {
         }
         let mut held = self.held.lock().expect("shard fence poisoned");
         let at = held.entry(key).or_default();
-        at.epoch = numbered(at.epoch, taking.lease_transitions).ok_or(TakeRefused::Beyond)?;
+        at.epoch = numbered(at.epoch, taking.lease_transitions)
+            .ok_or(TakeRefused::AtTheMost { held: at.epoch })?;
         *at_seen = (
             taking.lease_uid.clone(),
             floor.max(taking.lease_transitions),
@@ -809,7 +815,10 @@ mod tests {
         }
         assert_eq!(fence.epoch("feed-1", 1), 5, "nothing raised it");
         assert_eq!(fence.check(&[Some(&stamp(EPOCH_MOST))]), vec![Ok(())]);
-        assert_eq!(fence.take("feed-1", 1, &lease(5)), Err(TakeRefused::Beyond));
+        assert_eq!(
+            fence.take("feed-1", 1, &lease(5)),
+            Err(TakeRefused::AtTheMost { held: EPOCH_MOST })
+        );
         assert_eq!(fence.epoch("feed-1", 1), EPOCH_MOST);
         assert_eq!(numbered(u64::MAX, 0), None);
         assert_eq!(numbered(EPOCH_MOST - 1, 0), Some(EPOCH_MOST));
