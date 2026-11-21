@@ -1526,7 +1526,38 @@ test-broker: network runtime-image tests-image
 		     tail -40 .test-broker-reload.log >&2; exit 1; }
 	@grep -q 'answers_in_flight_across_a_configuration_reload' .test-broker-reload.log \
 		|| { echo "test-broker FAILED: the reload's test did not run (.test-broker-reload.log)" >&2; exit 1; }
-	@echo "test-broker OK: messages cross a process boundary through the broker, and answers in flight across a configuration reload reach their askers"
+	@# No answer rides allow_responses (v31a item 2's condition; review-core-2c,
+	@# finding 6): every answer is granted by name, and allow_responses is
+	@# kept only as the fallback for ha's brokers reloading one after another.
+	@# The suite again on dev.conf with every allow_responses removed, so an
+	@# answer that needs the fallback fails here, on every run, not once by
+	@# hand. dev.conf is generated again and the broker restarted after,
+	@# however the step ends, and a failure to do so fails it.
+	@restore() { \
+		$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+			--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+		&& $(COMPOSE_TEST) restart nats >/dev/null \
+		&& $(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: deploy/nats/dev.conf was not put back and the broker restarted after the no-fallback run" >&2; return 1; }; \
+	}; \
+	trap 'restore || exit 1' EXIT; trap 'exit 130' INT TERM HUP; \
+	granted=$$(grep -c 'allow_responses' deploy/nats/dev.conf); users=$$(grep -c '{ user:' deploy/nats/dev.conf); \
+	sed -E 's/, allow_responses: \{[^}]*\}//g' deploy/nats/dev.conf >.test-broker-no-fallback.conf \
+		&& mv -f .test-broker-no-fallback.conf deploy/nats/dev.conf || exit 1; \
+	[ "$$granted" -gt 0 ] && [ "$$(grep -c 'allow_responses' deploy/nats/dev.conf)" = 0 ] \
+		&& [ "$$(grep -c '{ user:' deploy/nats/dev.conf)" = "$$users" ] \
+		|| { echo "test-broker FAILED: dev.conf's allow_responses ($$granted) were not all removed, its $$users users kept" >&2; exit 1; }; \
+	$(COMPOSE_TEST) restart nats >/dev/null; \
+	$(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+		|| { echo "test-broker FAILED: the broker did not come back without allow_responses" >&2; exit 1; }; \
+	$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-bus --test nats \
+		>.test-broker-no-fallback.log 2>&1 \
+		|| { echo "test-broker FAILED: an answer needs allow_responses, the fallback alone. The last 40 lines, and the whole of it in .test-broker-no-fallback.log:" >&2; \
+		     tail -40 .test-broker-no-fallback.log >&2; exit 1; }; \
+	grep -qE '[1-9][0-9]* tests run: [1-9][0-9]* passed' .test-broker-no-fallback.log \
+		|| { echo "test-broker FAILED: the no-fallback run passed no test (.test-broker-no-fallback.log)" >&2; exit 1; }
+	@echo "test-broker OK: messages cross a process boundary through the broker, answers in flight across a configuration reload reach their askers, and no answer needs allow_responses"
 
 # The analytics units' work queue end to end on three JetStream servers, as
 # `ha` runs them, under the analytics component's own credential and the
