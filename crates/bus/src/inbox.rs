@@ -52,11 +52,22 @@ thread_local! {
 /// the owner of the reply inbox of a request that came by the broker, empty
 /// where that inbox is no user's; none where it did not come by the broker.
 /// Deleted when v32 binds a request's sender at the broker by its subject.
+/// The asker held before, given back as the answer ends, by a panic too.
 pub fn within_asker<R>(asker: Option<String>, answer: impl FnOnce() -> R) -> R {
-    let before = ASKED_BY.with(|held| held.replace(asker));
-    let answered = answer();
-    ASKED_BY.with(|held| *held.borrow_mut() = before);
-    answered
+    let _before = Restore(ASKED_BY.with(|held| held.replace(asker)));
+    answer()
+}
+
+/// INTERIM(v32): gives the thread back the asker it held before an answer,
+/// however the answer ends.
+struct Restore(Option<String>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        // As the thread ends, its own is already gone: nothing to give back.
+        let _ = ASKED_BY.try_with(|held| *held.borrow_mut() = before);
+    }
 }
 
 /// INTERIM(v32): the credential that asked the request this thread answers,
@@ -140,6 +151,35 @@ mod tests {
         )));
         assert!(within_asker(None, || asked_as("custody-test-1")));
         assert_eq!(asked_by(), None, "set only while answering");
+    }
+
+    /// The review of v31a-core-2, F6: an answer that panics leaves the
+    /// asker its thread held before it, not its own, for whatever the thread
+    /// answers next.
+    #[test]
+    fn an_answer_that_panics_leaves_the_asker_as_it_was() {
+        let panicked = std::panic::catch_unwind(|| {
+            within_asker(Some("custody-test-1".into()), || {
+                panic!("the answer failed")
+            })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            asked_by(),
+            None,
+            "the asker outlived an answer that panicked"
+        );
+        let outer = within_asker(Some("custody-test-2".into()), || {
+            let inner = std::panic::catch_unwind(|| {
+                within_asker(Some("custody-test-1".into()), || {
+                    panic!("the answer failed")
+                })
+            });
+            assert!(inner.is_err());
+            asked_by()
+        });
+        assert_eq!(outer.as_deref(), Some("custody-test-2"));
+        assert_eq!(asked_by(), None);
     }
 
     #[test]
