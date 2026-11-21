@@ -872,6 +872,14 @@ jobs:
       # refuses a member count first run's scale owns unless the chart takes
       # it back (--force-conflicts): the newest Helm the CLI meets, and the
       # stricter. The installs keep the version they were proven on.
+      # A Helm 3 beside the upgrade's Helm 4 (E2E_HELM_3, below), set up
+      # first so `helm` stays the one set up after it: what this checkout's
+      # chart renders for a client-side merge over a release Helm 4 applied.
+      - uses: azure/setup-helm@v4
+        id: helm3
+        if: matrix.target == 'e2e-cluster-upgrade'
+        with:
+          version: v3.16.2
       - uses: azure/setup-helm@v4
         with:
           version: ${{ (matrix.target == 'e2e-cluster-upgrade' || matrix.target == 'e2e-cluster-reconfigure') && 'v4.2.3' || 'v3.16.2' }}
@@ -891,6 +899,7 @@ jobs:
           DOCKER_BUILDKIT: "1"
           TARGET: ${{ matrix.target }}
           K3S: ${{ matrix.k3s }}
+          E2E_HELM_3: ${{ steps.helm3.outputs.helm-path }}
           # The desktop footprint's peak, this job's, for footprint-judge.
           E2E_FOOTPRINT_PEAK: .e2e-footprint-peak.txt
           E2E_FOOTPRINT_JOB: ${{ matrix.target }}${{ matrix.k3s && format(' k3s {0}', matrix.k3s) || '' }}

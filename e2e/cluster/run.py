@@ -170,6 +170,13 @@ UPGRADE_VERSION = os.environ.get("E2E_UPGRADE_VERSION", "")
 # --wait waits for every resource a release names to exist, which Helm 3's
 # never did: it is what found a RoleBinding the chart's own Job deletes.
 HELM = os.environ.get("E2E_HELM", "helm")
+# A Helm 3 beside it, where the run is given one (CI gives the upgrade one):
+# the client whose merge is client-side, for what this checkout's chart
+# renders for it over a release Helm 4 applied. Empty leaves that unasked.
+HELM_3 = os.environ.get("E2E_HELM_3", "")
+# The chart the release was installed from, as `helm` is given it: set by the
+# install where the run upgrades from the published one.
+PUBLISHED = []
 
 def free_registry_port():
     """The chart's registry.hostPort for this run: the first from 5000 that no
@@ -673,6 +680,7 @@ def main():
             )
             s.note(f"from {UPGRADE_FROM} {version}")
             chart = [UPGRADE_FROM, "--version", version]
+            PUBLISHED[:] = chart
         elif IMAGE:
             repository, _, tag = IMAGE.rpartition(":")
             values += ["--set", f"image.repository={repository}", "--set", f"image.tag={tag}"]
@@ -893,7 +901,13 @@ def main():
         )
 
     if UPGRADE_FROM:
+        # A plugin as the launcher leaves one, made before the upgrade so the
+        # upgrade's revision is rendered while the broker holds its credential.
+        launched_stand_in(s)
+        held = co_owned(s)
+        told_by_helms_own_entry(s)
         upgraded(s)
+        kept_by_the_first_upgrade(s, held)
         # The lake's rows partitioned by the upgrade's own migration (step
         # 3d, stage T; the resilience spec's section 15, the online
         # conversions): `lake_row` a partitioned table over what the release
@@ -912,6 +926,7 @@ def main():
             status == 303 and ADMIN_HOME in get("/", session),
             f"after the upgrade {who} signs in, and is still a deployment admin: {status}",
         )
+        rolled_back(s)
         return verdict(s)
 
     if WAY_IN["by"] == "password":
@@ -1439,6 +1454,426 @@ def verdict(s):
         return 1
     print("e2e-cluster OK", flush=True)
     return 0
+
+
+# A launched plugin's stand-in: the Deployment the launcher makes for an
+# instance, by its labels, which is all the broker reads to keep the
+# instance's credential in its Secret (spec/the-local-plugin-registry,
+# decision 3). No pod: the credential is the broker's to make either way.
+STAND_IN = "e2e-rollback"
+# A second, whose credential's field Helm is left the only owner of before
+# the first upgrade onto this checkout's chart.
+HELM_ALONE = "e2e-helm-alone"
+LAUNCHED_SECRET = f"{RELEASE}-meridian-runtime-broker-launched"
+
+
+def stand_in(present, instance=STAND_IN):
+    name = f"{RELEASE}-meridian-runtime-plugin-{instance}"
+    if not present:
+        kubectl("delete", "deployment", name, "--ignore-not-found", "--wait")
+        return
+    labels = {"meridian.dev/launched": "true", "meridian.dev/instance": instance}
+    apply(json.dumps({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": name, "labels": labels},
+        # Three old ReplicaSets kept, as every Deployment of the namespace
+        # is held to after an upgrade.
+        "spec": {"replicas": 0, "revisionHistoryLimit": 3, "selector": {"matchLabels": labels},
+                 "template": {"metadata": {"labels": labels},
+                              "spec": {"containers": [{"name": "plugin", "image": "rancher/mirrored-pause:3.6"}]}}},
+    }))
+
+
+def credential(instance=STAND_IN):
+    """A stand-in's credential in the broker's Secret, as a digest: what it
+    is, is never printed. Empty where the Secret holds none for it."""
+    import hashlib
+
+    data = json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "-o", "json")).get("data") or {}
+    held = [data.get(f"{instance}.{key}", "") for key in ("password", "url")]
+    return hashlib.sha256("\n".join(held).encode()).hexdigest() if all(held) else ""
+
+
+def launched_stand_in(s):
+    print("U: plugins launched before the upgrade, their credentials the broker's", flush=True)
+    for instance in (STAND_IN, HELM_ALONE):
+        stand_in(True, instance)
+        s.check(bool(wait_for("the broker's credential for the launched plugin",
+                              lambda: credential(instance), seconds=120)),
+                f"the broker wrote {instance}'s credential to {LAUNCHED_SECRET}")
+
+
+def owners(instance):
+    """Who owns a stand-in's credential, by the Secret's managed fields: each
+    entry naming its password's field, as `<operation>:<manager>`. Server-side
+    apply's entries are `Apply`, and Helm's alone; the broker's merge patch is
+    an `Update`."""
+    fields = json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "--show-managed-fields", "-o", "json"))["metadata"].get("managedFields") or []
+    return sorted(
+        f"{entry.get('operation')}:{entry.get('manager')}"
+        for entry in fields
+        if f"f:{instance}.password" in ((entry.get("fieldsV1") or {}).get("f:data") or {})
+    )
+
+
+def applied(instance):
+    return [owner for owner in owners(instance) if owner.startswith("Apply:")]
+
+
+def digests(data):
+    """Each key of a Secret's data with a digest of its value, never the value."""
+    import hashlib
+
+    return {key: hashlib.sha256(str(value).encode()).hexdigest() for key, value in (data or {}).items()}
+
+
+def rendered_for(helm):
+    """The launched plugins' Secret as this checkout's chart renders it for
+    an upgrade `helm` would make, nothing changed: a server dry run, which
+    reads the cluster as the upgrade does. Each key it states, with a digest
+    of its value; None, and why, where it could not be rendered."""
+    repository, _, tag = IMAGE.rpartition(":")
+    done = subprocess.run(
+        [helm, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+         "--dry-run=server", "-o", "json",
+         "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
+        capture_output=True, text=True, errors="replace",
+    )
+    # Its output holds every Secret the chart renders: read, never printed.
+    if done.returncode != 0:
+        return None, f"exit {done.returncode}: {done.stderr.strip()[-300:]}"
+    try:
+        manifest = json.loads(done.stdout).get("manifest") or ""
+    except ValueError:
+        return None, "its output was not JSON"
+    for document in manifest.split("\n---"):
+        lines = document.splitlines()
+        if "kind: Secret" not in lines or f"  name: {LAUNCHED_SECRET}" not in lines:
+            continue
+        data = {}
+        if "data:" in lines:
+            for line in lines[lines.index("data:") + 1:]:
+                if not line.startswith("  "):
+                    break
+                key, _, value = line.strip().partition(": ")
+                data[key] = value.strip("'\"")
+        return digests(data), ""
+    return None, f"its manifest states no Secret {LAUNCHED_SECRET}"
+
+
+def co_owned(s):
+    """The launched plugins' credentials as a deployment made before this
+    checkout holds them when it first upgrades onto this checkout's chart
+    (review review-134-29, F7, F3 and F2): answers each stand-in's
+    credential, for `kept_by_the_first_upgrade`.
+
+    A chart that rendered the Secret's keys from what it held made Helm an
+    owner of each at the first upgrade after a launch: server-side apply of
+    the value the broker wrote shares the field. So the published chart is
+    upgraded onto once more, over the launched stand-ins, and each credential
+    is then Helm's and the broker's. One is then left Helm's alone, as a
+    plugin stopped and launched again while an upgrade ran leaves it (Helm's
+    forced apply takes the field from the broker): the broker's entry is
+    edited out of the Secret's managed fields, the value untouched.
+
+    Then what this checkout's chart renders for a Helm 3 over that release,
+    whose merge is client-side and deletes what the manifest before stated
+    and the new one does not: every key, as held.
+    """
+    if not run(HELM, "version", "--short").startswith("v4"):
+        s.note("Helm merges client-side here: no field of the launched Secret is Helm's to share or to release")
+        return {}
+    print("U: upgraded on the published chart over the launched plugins, their credentials Helm's too", flush=True)
+    done = subprocess.run(
+        [HELM, "upgrade", RELEASE, *PUBLISHED, "--namespace", NAMESPACE,
+         "--reset-then-reuse-values", "--wait", "--timeout", "10m", "--force-conflicts"],
+        capture_output=True, text=True, errors="replace",
+    )
+    for line in (done.stdout + done.stderr).splitlines():
+        print(f"    | {line[:300]}", flush=True)
+    s.check(done.returncode == 0, f"helm upgrade onto {' '.join(PUBLISHED)} again succeeded: exit {done.returncode}")
+    rolled_out(s, "upgraded on the published chart")
+    held = {instance: credential(instance) for instance in (STAND_IN, HELM_ALONE)}
+
+    if not applied(STAND_IN):
+        # The published chart states no key (this change, once published):
+        # Helm is made the co-owner the charts before it made it, by the
+        # Secret as it is applied server-side under Helm's own name.
+        secret = json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "--show-managed-fields", "-o", "json"))
+        manager = next((entry["manager"] for entry in secret["metadata"].get("managedFields") or []
+                        if entry.get("operation") == "Apply"), "helm")
+        for server_set in ("managedFields", "resourceVersion", "uid", "creationTimestamp"):
+            secret["metadata"].pop(server_set, None)
+        shared = subprocess.run(
+            ["kubectl", "--namespace", NAMESPACE, "apply", "--server-side", "--field-manager", manager, "-f", "-"],
+            input=json.dumps(secret), capture_output=True, text=True, errors="replace",
+        )
+        s.note(f"the published chart states no key: the Secret as held applied as {manager}, "
+               f"as the charts before it did (exit {shared.returncode}: {shared.stderr.strip()[-200:]})")
+    for instance in (STAND_IN, HELM_ALONE):
+        s.check(
+            bool(applied(instance)) and len(owners(instance)) > len(applied(instance)),
+            f"{instance}'s credential is Helm's and the broker's: {owners(instance)}",
+        )
+
+    # Helm's alone: the broker's entry no longer names the field. (kubectl
+    # leaves the managed fields out of what it prints unless asked.)
+    secret = json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "--show-managed-fields", "-o", "json"))
+    edits = []
+    for at, entry in enumerate(secret["metadata"].get("managedFields") or []):
+        if entry.get("operation") == "Apply":
+            continue
+        named = [key for key in ("password", "url")
+                 if f"f:{HELM_ALONE}.{key}" in ((entry.get("fieldsV1") or {}).get("f:data") or {})]
+        if named:
+            edits.append({"op": "test", "path": f"/metadata/managedFields/{at}/manager", "value": entry.get("manager")})
+        edits += [{"op": "remove", "path": f"/metadata/managedFields/{at}/fieldsV1/f:data/f:{HELM_ALONE}.{key}"}
+                  for key in named]
+    s.check(len(edits) == 3, f"the broker's entry names {HELM_ALONE}'s two fields: {len(edits)} edits")
+    if edits:
+        kubectl("patch", "secret", LAUNCHED_SECRET, "--type=json", "-p", json.dumps(edits))
+    s.check(
+        bool(owners(HELM_ALONE)) and owners(HELM_ALONE) == applied(HELM_ALONE)
+        and credential(HELM_ALONE) == held[HELM_ALONE],
+        f"{HELM_ALONE}'s credential is Helm's alone, and as it was: {owners(HELM_ALONE)}",
+    )
+
+    if HELM_3:
+        stated, why = rendered_for(HELM_3)
+        now = digests(json.loads(kubectl("get", "secret", LAUNCHED_SECRET, "-o", "json")).get("data"))
+        s.check(
+            stated is not None and len(now) == 4 and stated == now,
+            f"for {run(HELM_3, 'version', '--short')}, whose merge deletes what a manifest stops stating, "
+            f"this chart states every launched credential as held: "
+            + (f"{sorted(stated)} of {sorted(now)}" if stated is not None else f"not rendered ({why})"),
+        )
+    else:
+        s.note("no Helm 3 here (E2E_HELM_3): what the chart renders for a client-side merge is not asked")
+    return held
+
+
+def stated_over(helm, release, namespace, values):
+    """The launched plugins' Secret of `release` in `namespace` as this
+    checkout's chart renders it for `helm`, by a server dry run of an
+    install over a Secret already there, which reads the cluster as an
+    upgrade does: each key it states, with a digest of its value; None, and
+    why, where it could not be rendered."""
+    done = subprocess.run(
+        [helm, "install", release, CHART, "--namespace", namespace, "--dry-run=server", "-o", "json", *values],
+        capture_output=True, text=True, errors="replace",
+    )
+    # Its output holds every Secret the chart renders: read, never printed.
+    if done.returncode != 0:
+        return None, f"exit {done.returncode}: {done.stderr.strip()[-300:]}"
+    try:
+        manifest = json.loads(done.stdout).get("manifest") or ""
+    except ValueError:
+        return None, "its output was not JSON"
+    name = f"{release}-meridian-runtime-broker-launched"
+    for document in manifest.split("\n---"):
+        lines = document.splitlines()
+        if "kind: Secret" not in lines or f"  name: {name}" not in lines:
+            continue
+        data = {}
+        if "data:" in lines:
+            for line in lines[lines.index("data:") + 1:]:
+                if not line.startswith("  "):
+                    break
+                key, _, value = line.strip().partition(": ")
+                data[key] = value.strip("'\"")
+        return digests(data), ""
+    return None, f"its manifest states no Secret {name}"
+
+
+def told_by_helms_own_entry(s):
+    """Whose server-side apply the chart reads the launched Secret's managed
+    fields for (review review-135, findings 4 and 6): Helm's, by the release
+    annotation Helm states on everything it applies, and no other's.
+
+    A release a Helm 3 installed is merged client-side by a Helm 4 too
+    (`--server-side=auto` follows the revision before), and a client-side
+    merge deletes what the manifest before stated and the new one does not.
+    So over such a release's Secret this checkout's chart must state every
+    key as held, for a Helm 4: as a Helm 3 left it, and still once somebody
+    else's server-side apply has written to it (`kubectl apply
+    --server-side` of a label, say), which leaves an `Apply` entry that is
+    not Helm's. Only Helm's own entry says Helm applies server-side here.
+
+    Rendered, not upgraded: a stand-in Secret in a namespace of its own, as
+    each case leaves one, and the chart's server dry run of an install over
+    it. A whole second deployment, installed by a Helm 3 and upgraded by a
+    Helm 4, is what this stands in for.
+    """
+    import base64
+    import secrets as random
+
+    if not run(HELM, "version", "--short").startswith("v4"):
+        s.note("no Helm 4 here: whose server-side apply the chart reads is asked of a Helm 4's render")
+        return
+    print("U: the chart reads Helm's own server-side apply of the launched Secret, and no other's", flush=True)
+    namespace, release = f"{NAMESPACE}-owners", "owners"
+    name = f"{release}-meridian-runtime-broker-launched"
+    values = ["--set", "deployment.id=DEP-e2e-owners", "--set", "deployment.enrolmentCode=ENR-e2e-owners",
+              "--set", f"platform.address={PLATFORM_FROM_POD}"]
+
+    def there(*args, **kwargs):
+        return subprocess.run(["kubectl", "--namespace", namespace, *args],
+                              capture_output=True, text=True, errors="replace", **kwargs)
+
+    run("kubectl", "create", "namespace", namespace)
+    # As a Helm 3 leaves it: made by a client-side create with the release's
+    # metadata, its keys written by the broker's merge patch. No `Apply`.
+    helms = {
+        "labels": {"app.kubernetes.io/managed-by": "Helm"},
+        "annotations": {"meta.helm.sh/release-name": release, "meta.helm.sh/release-namespace": namespace,
+                        "helm.sh/resource-policy": "keep"},
+    }
+    made = there("create", "-f", "-", input=json.dumps(
+        {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"name": name, **helms}}))
+    held = {f"e2e-owners.{key}": base64.b64encode(random.token_bytes(24)).decode() for key in ("password", "url")}
+    written = there("patch", "secret", name, "--type=merge", "-p", json.dumps({"data": held}))
+    s.check(made.returncode == 0 and written.returncode == 0,
+            f"a launched Secret as a Helm 3's release holds one, in {namespace}: "
+            f"exit {made.returncode} and {written.returncode}")
+
+    def entries():
+        fields = json.loads(there("get", "secret", name, "--show-managed-fields", "-o", "json").stdout or "{}")
+        return sorted(f"{entry.get('operation')}:{entry.get('manager')}"
+                      for entry in (fields.get("metadata") or {}).get("managedFields") or [])
+
+    def asked(case, expected):
+        stated, why = stated_over(HELM, release, namespace, values)
+        s.check(
+            stated is not None and stated == digests(expected),
+            f"{case}, this chart states {'every key as held' if expected else 'no key'} for a Helm 4: "
+            + (f"{sorted(stated)} of {sorted(held)}, the Secret's entries {entries()}"
+               if stated is not None else f"not rendered ({why})"),
+        )
+
+    asked("over a Secret a Helm 3's release holds, no server-side apply ever made", held)
+
+    labelled = there("apply", "--server-side", "--field-manager", "ops", "-f", "-", input=json.dumps(
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "labels": {"e2e.meridian.dev/ops": "true"}}}))
+    s.note(f"a label applied server-side by another manager, ops: exit {labelled.returncode} {labelled.stderr.strip()[-200:]}")
+    asked("over that Secret once another manager's server-side apply has labelled it", held)
+
+    applied_by_helm = there("apply", "--server-side", "--force-conflicts", "--field-manager", "helm", "-f", "-",
+                            input=json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                                              "metadata": {"name": name, **helms}}))
+    s.note(f"and Helm's own server-side apply of it, stating no key: exit {applied_by_helm.returncode} "
+           f"{applied_by_helm.stderr.strip()[-200:]}")
+    asked("over that Secret once Helm's own server-side apply has written it, the keys the broker's", {})
+
+    subprocess.run(["kubectl", "delete", "namespace", namespace, "--wait=false"], capture_output=True)
+
+
+def kept_by_the_first_upgrade(s, held):
+    """After the first upgrade onto this checkout's chart: each launched
+    credential as it was, the one Helm shared now the broker's alone, and
+    the one that was Helm's alone still stated by the chart, so still there.
+    A sidecar reads its credential once, when its pod starts: one deleted
+    and made again leaves a running plugin holding the old one."""
+    if not held:
+        return
+    print("U: the first upgrade onto this chart left every launched credential as it was", flush=True)
+    s.check(credential(STAND_IN) == held[STAND_IN] and not applied(STAND_IN) and bool(owners(STAND_IN)),
+            f"{STAND_IN}'s, which Helm shared, is unchanged and the broker's alone: {owners(STAND_IN)}")
+    # The broker makes a credential again within its five seconds: a
+    # deleted one shows as another, not as none.
+    time.sleep(10)
+    s.check(credential(HELM_ALONE) == held[HELM_ALONE] and bool(applied(HELM_ALONE)),
+            f"{HELM_ALONE}'s, which was Helm's alone, is unchanged, the chart still stating it: {owners(HELM_ALONE)}")
+
+
+def rolled_back(s):
+    """An upgrade stopped at its preflight, rolled back, and made again, over
+    a launched plugin whose credential was made again since the revision the
+    rollback returns to.
+
+    The dev deployment's failure of 2026-11-20: `meridian rollback-deployment`
+    runs `helm rollback`, which applies the stored manifest, and that
+    manifest carried each launched plugin's credential as it was when the
+    revision was rendered. One made again since is the broker's field with
+    another value, so Helm 4's server-side apply refused the Secret, the
+    rollback's revision was failed too, and `meridian upgrade-deployment`
+    refuses a release at a failed revision. Here: the plugin stopped and
+    launched again, so its credential is new; an upgrade whose preflight
+    cannot run; `helm rollback` as the CLI runs it, which must succeed and
+    leave the credential alone; and the upgrade again, the same.
+    """
+    print("U: a preflight stops an upgrade; rolled back and upgraded again, launched credentials kept",
+          flush=True)
+
+    def release():
+        return json.loads(run(HELM, "history", RELEASE, "--namespace", NAMESPACE, "--max", "4", "-o", "json"))[-1]
+
+    def images():
+        return kubectl("get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o",
+                       "jsonpath={range .items[*]}{.metadata.name}={.spec.template.spec.containers[*].image} {end}")
+
+    deployed = release()
+    s.check(deployed["status"] == "deployed", f"the upgrade left revision {deployed['revision']} deployed")
+    # Stopped and launched again: the broker takes the credential out, then
+    # makes another.
+    before = credential()
+    stand_in(False)
+    wait_for("the stopped plugin's credential taken out", lambda: not credential(), seconds=120)
+    stand_in(True)
+    now = wait_for("a credential for the plugin launched again", credential, seconds=120)
+    s.check(bool(before) and now != before, "stopped and launched again, the plugin's credential was made again")
+
+    # The preflight is the first thing an upgrade runs, from the new image:
+    # one that is nowhere cannot run, and the hook fails with nothing changed.
+    repository, _, tag = IMAGE.rpartition(":")
+    conflicts = ["--force-conflicts"] if run(HELM, "version", "--short").startswith("v4") else []
+    running = images()
+    stopped = subprocess.run(
+        [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+         "--timeout", "45s", *conflicts, "--set", "image.tag=e2e-no-such-image"],
+        capture_output=True, text=True, errors="replace",
+    )
+    failed = release()
+    s.check(
+        stopped.returncode != 0 and "pre-upgrade" in stopped.stderr and failed["status"] == "failed"
+        and failed["revision"] == deployed["revision"] + 1,
+        f"an upgrade whose preflight cannot run is stopped at it, revision {failed['revision']} "
+        f"{failed['status']}: {stopped.stderr.strip()[-200:]}",
+    )
+    s.check(images() == running and credential() == now, "and it changed nothing: every image and the credential as they were")
+
+    # As `meridian rollback-deployment` runs it (meridian-cli, rollback.rs):
+    # to the last revision deployed, no flag that lets Helm take a field.
+    back = subprocess.run(
+        [HELM, "rollback", RELEASE, str(deployed["revision"]), "--namespace", NAMESPACE, "--timeout", "10m"],
+        capture_output=True, text=True, errors="replace",
+    )
+    for line in (back.stdout + back.stderr).splitlines():
+        # Field names, as Helm says a conflict; never a value.
+        print(f"    | {line[:300]}", flush=True)
+    after = release()
+    s.check(
+        back.returncode == 0 and after["status"] == "deployed" and after["revision"] == failed["revision"] + 1,
+        f"helm rollback to revision {deployed['revision']} succeeded: exit {back.returncode}, "
+        f"revision {after['revision']} {after['status']}",
+    )
+    s.check(credential() == now, "and the launched plugin's credential is the one the broker made, not the revision's")
+
+    again = subprocess.run(
+        [HELM, "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reset-then-reuse-values",
+         "--timeout", "10m", *conflicts, "--set", f"image.repository={repository}", "--set", f"image.tag={tag}"],
+        capture_output=True, text=True, errors="replace",
+    )
+    for line in (again.stdout + again.stderr).splitlines():
+        print(f"    | {line[:300]}", flush=True)
+    last = release()
+    s.check(
+        again.returncode == 0 and last["status"] == "deployed",
+        f"and the upgrade made again succeeded: exit {again.returncode}, revision {last['revision']} {last['status']}",
+    )
+    rolled_out(s, "upgraded again")
+    s.check(credential() == now, "the credential still the broker's own")
+    stand_in(False)
+    stand_in(False, HELM_ALONE)
 
 
 def upgraded(s):
