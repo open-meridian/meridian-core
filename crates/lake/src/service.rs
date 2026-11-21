@@ -5991,6 +5991,18 @@ impl Lake {
         until: std::time::Instant,
     ) -> Result<meridian_domain::v1::ShardTookOver, String> {
         let meta = envelope.meta.clone().unwrap_or_default();
+        // INTERIM(v32): sent by the instance's own credential -- the owner
+        // of the inbox the take is answered on -- or refused before anything
+        // is numbered (v31a, item 3; the access audit's mismatch 1). Deleted
+        // when v32 binds the sender at the broker by the request's subject.
+        if !meridian_bus::inbox::asked_as(&meta.publisher_instance_id) {
+            return Err(refusal_with_status(
+                RefusalStatus::PermissionDenied,
+                &["instance".to_string()],
+                "instance: a take sent by another instance's credential is refused; a sidecar \
+                 takes its own instance's shards alone",
+            ));
+        }
         if request.instance.is_empty() || request.instance != meta.publisher_instance_id {
             return Err(refusal_with_status(
                 RefusalStatus::PermissionDenied,
@@ -6010,6 +6022,16 @@ impl Lake {
                 RefusalStatus::InvalidArgument,
                 &["lease_uid".to_string()],
                 "lease_uid: the uid of the Lease the sidecar took",
+            ));
+        }
+        // A Lease's transitions are an int32: more is no Lease's, and would
+        // number an epoch past the most one is (the review of v31a-core-2,
+        // F1(b)).
+        if request.lease_transitions > meridian_changes::shard_fence::EPOCH_MOST {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["lease_transitions".to_string()],
+                "lease_transitions: a Lease's transitions are an int32, and these are past it",
             ));
         }
         if std::time::Instant::now() >= until {

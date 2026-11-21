@@ -67,7 +67,7 @@ pub(crate) const TIMEOUT_HEADER: &str = "Meridian-Timeout-Ms";
 /// every message the client sends, so a client that publishes often never
 /// pings at all. Meanwhile its subscriptions, a writer's change log among
 /// them, are served by nobody. The round trip is on an inbox of its own,
-/// which every credential holds (`_INBOX.>`).
+/// under its credential's prefix ([`crate::inbox`]).
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const UNANSWERED: Duration = Duration::from_secs(2);
 
@@ -412,6 +412,9 @@ pub const INTERNAL_TLS_CA: &str = "MERIDIAN_INTERNAL_TLS_CA";
 /// A cluster of servers (step 3b, `broker.replicas: 3`) is every server, by
 /// its name, after the one credential: `nats://user:password@a:4222,b:4222`,
 /// each tried in turn and reconnected to when one is lost.
+///
+/// Its inboxes are made under its user's prefix, the only inboxes the broker
+/// grants that user (v31a, item 2; [`crate::inbox`]).
 fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("nats", url));
 
@@ -423,7 +426,8 @@ fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
                 async_nats::ConnectOptions::with_user_and_password(
                     user.to_string(),
                     password.to_string(),
-                ),
+                )
+                .custom_inbox_prefix(crate::inbox::prefix(user)),
                 hosts,
             )
         }
@@ -1116,7 +1120,16 @@ impl NatsBackend {
                             }
                         }
                     }
-                    let answered = crate::router::admitted(&topic, asked, handler, deadline).await;
+                    // INTERIM(v32): who asked, by the inbox its answer goes
+                    // to, which only its credential hears; empty where that
+                    // inbox is no user's (v31a, item 3).
+                    let asker = Some(
+                        crate::inbox::owner(&reply_to)
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let answered =
+                        crate::router::admitted(&topic, asked, handler, deadline, asker).await;
 
                     let (payload_type, payload, refusal) = match answered {
                         Ok(Ok((payload_type, payload))) => (payload_type, payload, None),
@@ -1268,13 +1281,19 @@ mod bounded_tests {
                 payload: Vec::new(),
             };
             tasks.push(tokio::spawn(async move {
-                crate::router::admitted("platform.lake.query.list-quotes", asked, handler, None)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .parse::<usize>()
-                    .unwrap()
+                crate::router::admitted(
+                    "platform.lake.query.list-quotes",
+                    asked,
+                    handler,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .parse::<usize>()
+                .unwrap()
             }));
         }
         let mut answered = Vec::new();

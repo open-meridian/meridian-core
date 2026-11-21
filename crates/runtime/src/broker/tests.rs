@@ -99,7 +99,7 @@ fn every_plugin_credential_carries_its_sidecars_own_traffic() {
         reference.publish,
         vec![
             "platform.config.query.plugin-configuration".to_string(),
-            INBOX.to_string()
+            "_INBOX.reference-1.>".to_string()
         ]
     );
 }
@@ -230,17 +230,529 @@ fn the_runtime_takes_the_contracts_own_columns() {
         .contains(&"platform.street.command.record-holding".to_string()));
 }
 
+/// v31a, item 2 (the access audit's S1): each credential hears and answers
+/// on its own inboxes, `_INBOX.<user>.`, and on no other's. With `_INBOX.>`
+/// on every credential, any one of them heard every answer in the deployment
+/// -- every account's data, every plugin's secret settings -- and could
+/// answer in another's place.
 #[test]
-fn every_user_carries_its_inbox() {
+fn each_credential_holds_its_own_inboxes_and_no_one_holds_every_inbox() {
     let users = users(
-        &contract(),
-        &[Instance::plugin("custody-test-1", &["custody"])],
+        Contract::embedded(),
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("truefx", &["data"]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
     )
     .expect("generates");
-
+    let named: Vec<&str> = users.iter().map(|u| u.user.as_str()).collect();
+    for name in [
+        "custody-test-1",
+        "truefx",
+        "dashboard-1",
+        "runtime",
+        "first-run",
+        "instrument",
+        "analytics",
+    ] {
+        assert!(named.contains(&name), "{name} is admitted");
+    }
     for user in &users {
-        assert!(user.publish.contains(&INBOX.to_string()), "{}", user.user);
-        assert!(user.subscribe.contains(&INBOX.to_string()), "{}", user.user);
+        let own = format!("_INBOX.{}.>", user.user);
+        for (granted, side) in [(&user.publish, "publish"), (&user.subscribe, "subscribe")] {
+            assert!(
+                granted.contains(&own),
+                "{} {side}s on its own inboxes",
+                user.user
+            );
+            assert!(
+                !granted.iter().any(|g| grants(g, "_INBOX.anybody.x")
+                    || grants(g, "_INBOX.x")
+                    || g == "_INBOX.>"),
+                "{} may {side} on inboxes not its own: {granted:?}",
+                user.user
+            );
+        }
+        // Subscribed to its own alone: no credential hears another's answers.
+        let inboxes: Vec<&String> = user
+            .subscribe
+            .iter()
+            .filter(|g| g.starts_with("_INBOX"))
+            .collect();
+        assert_eq!(inboxes, vec![&own], "{}", user.user);
+    }
+}
+
+/// The second review of v31a-core-2, finding 2 (option A, approved by
+/// consensus 2026-11-20): the runtime's credential publishes on every other
+/// credential's inboxes -- each plugin instance's, the components' with
+/// credentials of their own, the chart's component instances' -- so the
+/// broker keeps no reply entry on its connections for an answer it never
+/// sends, and the lake answers a write-ahead write on its sender's. It
+/// subscribes on its own alone, no grant holds `_INBOX.>`, and no other
+/// credential publishes or subscribes on any inbox but its own.
+#[test]
+fn the_runtime_publishes_on_every_credentials_inboxes_and_hears_its_own_alone() {
+    let users = users(
+        Contract::embedded(),
+        &[
+            Instance::plugin("truefx", &["data"]),
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("reference-1", &[]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
+    )
+    .expect("generates");
+    let runtime = user(&users, "runtime");
+    let mut inboxes: Vec<&str> = runtime
+        .publish
+        .iter()
+        .map(String::as_str)
+        .filter(|g| g.starts_with("_INBOX"))
+        .collect();
+    inboxes.sort_unstable();
+    let mut every: Vec<String> = users
+        .iter()
+        .map(|user| format!("_INBOX.{}.>", user.user))
+        .collect();
+    every.sort_unstable();
+    assert_eq!(inboxes, every);
+    for named in [
+        "_INBOX.truefx.>",
+        "_INBOX.custody-test-1.>",
+        "_INBOX.reference-1.>",
+        "_INBOX.dashboard-1.>",
+        "_INBOX.first-run.>",
+        "_INBOX.instrument.>",
+        "_INBOX.analytics.>",
+    ] {
+        assert!(inboxes.contains(&named), "{named}");
+    }
+    let heard: Vec<&str> = runtime
+        .subscribe
+        .iter()
+        .map(String::as_str)
+        .filter(|g| g.starts_with("_INBOX"))
+        .collect();
+    assert_eq!(heard, vec!["_INBOX.runtime.>"]);
+    for user in &users {
+        assert!(
+            !user
+                .publish
+                .iter()
+                .chain(&user.subscribe)
+                .any(|g| g == "_INBOX.>"),
+            "{} holds every inbox",
+            user.user
+        );
+        if user.user == "runtime" {
+            continue;
+        }
+        // Heard on its own alone; what else each publishes on is
+        // `each_responder_holds_exactly_its_askers_inboxes`'s.
+        let own = format!("_INBOX.{}.>", user.user);
+        let heard: Vec<&String> = user
+            .subscribe
+            .iter()
+            .filter(|g| g.starts_with("_INBOX"))
+            .collect();
+        assert_eq!(heard, vec![&own], "{}", user.user);
+    }
+}
+
+/// A contract of request rows, and events that must grant nothing: who may
+/// send each request is who its answerer may answer.
+const ASKED: &str = "\
+topic\tkind\tpublisher\tsubscriber
+platform.config.command.apply-first-run-configuration\tcommand\tdashboard\tfirst-run
+platform.config.command.file-ticket\tcommand\tsidecar\tdashboard
+platform.reference.query.compute-date\tquery\tcustody,reporting\tinstrument
+platform.reference.query.resolve-instrument\tquery\tstreet,dashboard\tinstrument
+platform.deployment.command.create-plugin\tcommand\tconductor\tlauncher
+platform.analytics.query.run-job\tquery\treporting\tanalytics
+platform.street.command.record-holding\tcommand\tcustody\tstreet
+platform.oms.query.read-working\tquery\toms\tcustody
+platform.custody.*.event.sync-status\tevent\tcustody\tdashboard
+platform.reference.event.instrument-applied\tevent\tinstrument\tdashboard,launcher
+";
+
+const ASKED_ROLES: &str = "\
+name\tkind
+custody\trole
+reporting\trole
+oms\trole
+analytics\tcomponent
+conductor\tcomponent
+dashboard\tcomponent
+first-run\tcomponent
+instrument\tcomponent
+launcher\tcomponent
+sidecar\tcomponent
+street\tcomponent
+";
+
+/// Every inbox a credential may publish on, sorted.
+fn published_inboxes(user: &User) -> Vec<&str> {
+    let mut inboxes: Vec<&str> = user
+        .publish
+        .iter()
+        .map(String::as_str)
+        .filter(|g| g.starts_with("_INBOX"))
+        .collect();
+    inboxes.sort_unstable();
+    inboxes
+}
+
+/// v31a, item 2 as restated 2026-11-20 (the proposal on answers refused
+/// across a broker reload, option A, approved by consensus): a core
+/// credential publishes into another's inboxes exactly where that one may
+/// send it a request, by the request rows' publisher and subscriber columns
+/// -- every plugin for a row its sidecar sends, a plugin of the role for a
+/// role's, the runtime for its components' -- and an event row, which
+/// nobody answers, gives nothing. The runtime answers every credential. A
+/// plugin answers none, even one serving a request.
+#[test]
+fn each_responder_holds_exactly_its_askers_inboxes() {
+    let contract = Contract::parse(ASKED, ASKED_ROLES).expect("parses");
+    let users = users(
+        &contract,
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("reporting-1", &["reporting"]),
+            Instance::plugin("oms-1", &["oms"]),
+            Instance::plugin("reference-1", &[]),
+            Instance::component("dashboard-1", "dashboard"),
+            Instance::component("launcher-1", "launcher"),
+        ],
+    )
+    .expect("generates");
+    let held = |name: &str| published_inboxes(user(&users, name));
+    assert_eq!(
+        held("first-run"),
+        vec!["_INBOX.dashboard-1.>", "_INBOX.first-run.>"]
+    );
+    assert_eq!(
+        held("dashboard-1"),
+        vec![
+            "_INBOX.custody-test-1.>",
+            "_INBOX.dashboard-1.>",
+            "_INBOX.oms-1.>",
+            "_INBOX.reference-1.>",
+            "_INBOX.reporting-1.>",
+        ],
+        "every sidecar files a ticket; the instrument store's event asks nothing"
+    );
+    assert_eq!(
+        held("instrument"),
+        vec![
+            "_INBOX.custody-test-1.>",
+            "_INBOX.dashboard-1.>",
+            "_INBOX.instrument.>",
+            "_INBOX.reporting-1.>",
+            "_INBOX.runtime.>",
+        ],
+        "custody and reporting compute a date; the street and the dashboard resolve"
+    );
+    assert_eq!(
+        held("launcher-1"),
+        vec!["_INBOX.launcher-1.>", "_INBOX.runtime.>"],
+        "the conductor creates a plugin"
+    );
+    assert_eq!(
+        held("analytics"),
+        vec!["_INBOX.analytics.>", "_INBOX.reporting-1.>"]
+    );
+    for plugin in ["custody-test-1", "reporting-1", "oms-1", "reference-1"] {
+        assert_eq!(
+            held(plugin),
+            vec![format!("_INBOX.{plugin}.>").as_str()],
+            "a plugin answers nobody on their inboxes"
+        );
+    }
+    let mut every: Vec<String> = users
+        .iter()
+        .filter(|user| user.user != "runtime")
+        .map(|user| format!("_INBOX.{}.>", user.user))
+        .collect();
+    every.push("_INBOX.runtime.>".to_string());
+    every.sort_unstable();
+    assert_eq!(held("runtime"), every);
+}
+
+/// The same rule on the contract compiled in, where a component topic is
+/// granted publish and subscribe alike: the analytics component holds the
+/// lake's change log as its members do, and answers none of the runtime's
+/// requests, so it holds no inbox of the runtime's. The launcher answers the
+/// conductor alone, first run the dashboard alone.
+#[test]
+fn answers_are_granted_from_the_request_rows_and_never_a_symmetric_grant() {
+    let users = users(
+        Contract::embedded(),
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::plugin("reference-1", &[]),
+            Instance::component("dashboard-1", "dashboard"),
+            Instance::component("launcher-1", "launcher"),
+        ],
+    )
+    .expect("generates");
+    let held = |name: &str| published_inboxes(user(&users, name));
+    let analytics = user(&users, "analytics");
+    assert!(
+        analytics
+            .publish
+            .iter()
+            .any(|g| g == "platform.lake.internal.read-changes"),
+        "{:?}",
+        analytics.publish
+    );
+    assert_eq!(
+        held("analytics"),
+        vec![
+            "_INBOX.analytics.>",
+            "_INBOX.custody-test-1.>",
+            "_INBOX.dashboard-1.>",
+            "_INBOX.reference-1.>",
+        ]
+    );
+    assert_eq!(
+        held("launcher-1"),
+        vec!["_INBOX.launcher-1.>", "_INBOX.runtime.>"]
+    );
+    assert_eq!(
+        held("first-run"),
+        vec!["_INBOX.dashboard-1.>", "_INBOX.first-run.>"]
+    );
+    assert_eq!(
+        held("instrument"),
+        vec![
+            "_INBOX.analytics.>",
+            "_INBOX.custody-test-1.>",
+            "_INBOX.dashboard-1.>",
+            "_INBOX.instrument.>",
+            "_INBOX.runtime.>",
+        ],
+        "a plugin holding no role asks the instrument store nothing"
+    );
+    assert_eq!(
+        held("dashboard-1"),
+        vec![
+            "_INBOX.analytics.>",
+            "_INBOX.custody-test-1.>",
+            "_INBOX.dashboard-1.>",
+            "_INBOX.reference-1.>",
+            "_INBOX.runtime.>",
+        ]
+    );
+}
+
+/// v31a, item 2: no plugin credential publishes into any other's inboxes --
+/// not a plugin of any role, nor one holding every role, nor one launched
+/// after install -- whatever it serves.
+#[test]
+fn no_plugin_credential_publishes_into_another_credentials_inboxes() {
+    let roles: Vec<String> = include_str!("../../../../deploy/roles.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            (fields.next() == Some("role")).then(|| name.to_string())
+        })
+        .collect();
+    assert!(roles.len() > 10, "{roles:?}");
+    let every: Vec<&str> = roles.iter().map(String::as_str).collect();
+    let mut chart: Vec<Instance> = roles
+        .iter()
+        .map(|role| Instance::plugin(format!("{role}-1"), &[role.as_str()]))
+        .collect();
+    chart.push(Instance::plugin("every-role-1", &every));
+    chart.push(Instance::plugin("reference-1", &[]));
+    chart.push(Instance::component("dashboard-1", "dashboard"));
+    chart.push(Instance::component("launcher-1", "launcher"));
+    let launched = [crate::launched::Launched {
+        instance_id: "every-role-2".into(),
+        roles: roles.clone(),
+        datasets: vec![],
+    }];
+    let hashes =
+        std::collections::BTreeMap::from([("every-role-2".to_string(), "$2b$12$abc".to_string())]);
+    let (written, left_out) =
+        crate::launched::configuration("", Contract::embedded(), &chart, &launched, &hashes)
+            .expect("generates");
+    assert!(left_out.is_empty(), "{left_out:?}");
+    let mut plugins: Vec<String> = chart
+        .iter()
+        .filter(|instance| matches!(instance, Instance::Plugin { .. }))
+        .map(|instance| instance.id().to_string())
+        .collect();
+    plugins.push("every-role-2".to_string());
+    for plugin in &plugins {
+        let line = written
+            .lines()
+            .find(|line| line.contains(&format!("user: {plugin},")))
+            .unwrap_or_else(|| panic!("{plugin} is admitted"));
+        let publish = line
+            .split("publish: { allow: [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("a publish list");
+        let inboxes: Vec<&str> = publish
+            .split(", ")
+            .map(|grant| grant.trim_matches('"'))
+            .filter(|grant| grant.starts_with("_INBOX"))
+            .collect();
+        assert_eq!(
+            inboxes,
+            vec![format!("_INBOX.{plugin}.>").as_str()],
+            "{plugin}"
+        );
+    }
+}
+
+/// The conductor's access changes (decision 47; the access audit's
+/// mismatch 7): user groups, account groups, access groups, permissions,
+/// and which connectivity plugins reach an `ems` and its accounts; and the
+/// first admin's -- a claim code redeemed, an enrolment with a code, and the
+/// first run's configuration applied (the second review of v31a-core-2,
+/// finding 6).
+const ACCESS_CHANGES: [&str; 10] = [
+    "platform.config.command.define-user-group",
+    "platform.config.command.define-account-group",
+    "platform.config.command.define-access-group",
+    "platform.config.command.grant-permission",
+    "platform.config.command.withdraw-permission",
+    "platform.config.command.link-connectivity",
+    "platform.config.command.set-linkable-accounts",
+    "platform.config.command.redeem-claim-code",
+    "platform.config.command.enrol-with-code",
+    "platform.config.command.apply-first-run-configuration",
+];
+
+/// The access changes a plugin's own credential publishes (the review of
+/// v31a-core-2, F3), with the role that may: a link naming a new account
+/// creates it and grants it to the custody plugin sending it. The conductor
+/// checks the actor's admin right on it itself (meridian-config's
+/// `a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_admin`).
+const ACCESS_CHANGES_A_PLUGIN_SENDS: [(&str, &str); 1] =
+    [("platform.config.command.link-external-account", "custody")];
+
+/// v31a, item 14 (decision 47), the triage: the conductor checks an access
+/// change's shape, not its actor's admin right, so the question is whether
+/// any credential but the dashboard's may publish one. None may: not a
+/// plugin of any role, nor one holding every role, nor a component -- but
+/// for the ones a plugin sends, which only that role's credentials may, and
+/// on which the conductor checks the actor's right.
+#[test]
+fn only_the_dashboards_credential_may_publish_an_access_change() {
+    let roles: Vec<&str> = include_str!("../../../../deploy/roles.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            (fields.next() == Some("role")).then_some(name)
+        })
+        .collect();
+    assert!(roles.len() > 10, "{roles:?}");
+    let mut instances: Vec<Instance> = roles
+        .iter()
+        .map(|role| Instance::plugin(format!("{role}-1"), &[role]))
+        .collect();
+    instances.push(Instance::plugin("every-role-1", &roles));
+    instances.push(Instance::component("dashboard-1", "dashboard"));
+    instances.push(Instance::component("launcher-1", "launcher"));
+    let users = users(Contract::embedded(), &instances).expect("generates");
+    let mut credentials: Vec<String> = users.iter().map(|user| user.user.clone()).collect();
+    credentials.sort_unstable();
+    let mut every: Vec<String> = roles.iter().map(|role| format!("{role}-1")).collect();
+    every.extend(
+        [
+            "first-run",
+            "instrument",
+            "analytics",
+            "runtime",
+            "every-role-1",
+            "dashboard-1",
+            "launcher-1",
+        ]
+        .map(String::from),
+    );
+    every.sort_unstable();
+    assert_eq!(credentials, every, "every credential is here");
+    for topic in ACCESS_CHANGES {
+        let may: Vec<&str> = users
+            .iter()
+            .filter(|user| user.publish.iter().any(|grant| grants(grant, topic)))
+            .map(|user| user.user.as_str())
+            .collect();
+        assert_eq!(may, vec!["dashboard-1"], "who may publish {topic}");
+    }
+    for (topic, role) in ACCESS_CHANGES_A_PLUGIN_SENDS {
+        let mut may: Vec<&str> = users
+            .iter()
+            .filter(|user| user.publish.iter().any(|grant| grants(grant, topic)))
+            .map(|user| user.user.as_str())
+            .collect();
+        may.sort_unstable();
+        let holding = format!("{role}-1");
+        assert_eq!(
+            may,
+            vec![holding.as_str(), "every-role-1"],
+            "who may publish {topic}"
+        );
+    }
+}
+
+/// `allow_responses` is the fallback alone, at the broker's own two minutes
+/// (v31a, item 2 as restated 2026-11-20; the Fable check's (f)): every
+/// answer is granted by name ([`answer_grants`]), so none rides it, and a
+/// reply entry left on a connection by a request never answered lasts no
+/// longer than the broker's default. It was fifteen minutes for the longest
+/// waits on the bus -- an install or an update of a plugin or a pack, waited
+/// on for INSTALLING, with a registry request within it allowed the OCI
+/// client's whole timeout -- which the conductor, among the runtime's
+/// components, answers on the dashboard's inbox by its grant, however long
+/// it takes.
+#[test]
+fn an_answer_no_grant_names_is_allowed_the_brokers_two_minutes_alone() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.config.command.install-plugin\tcommand\tdashboard\tconductor\n\
+         platform.config.command.update-pack\tcommand\tdashboard\tconductor\n",
+        ROLES,
+    )
+    .expect("parses");
+    let users = users(
+        &contract,
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
+    )
+    .expect("generates");
+    assert!(
+        user(&users, "runtime")
+            .publish
+            .contains(&"_INBOX.dashboard-1.>".to_string()),
+        "the conductor answers an install on the dashboard's inbox by name"
+    );
+    let rendered = rendered("# test\n", &users);
+    let lines: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.trim_start().starts_with("{ user:"))
+        .collect();
+    assert!(lines.len() >= 3, "{rendered}");
+    for line in lines {
+        let said = line
+            .split_once("allow_responses: { max: 1, expires: \"")
+            .and_then(|(_, rest)| rest.split_once("s\" }"))
+            .map(|(secs, _)| secs.parse::<u64>().expect("seconds"))
+            .unwrap_or_else(|| panic!("no expiring answer allowance in {line}"));
+        assert_eq!(said, 120, "{line}");
     }
 }
 

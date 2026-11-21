@@ -496,7 +496,7 @@ impl Store for MemoryStore {
         took.epoch = self
             .shards
             .take(&took.instance, took.shard, taking)
-            .map_err(|behind| crate::postgres::take_behind(&took, taking, behind))?;
+            .map_err(|refused| crate::postgres::take_refused(&took, taking, refused))?;
         Ok(took)
     }
 

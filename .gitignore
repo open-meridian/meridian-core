@@ -25,6 +25,11 @@ target/
 .interop.positions
 .e2e-book.before
 .e2e-book.after
+# Written by `make test-broker`'s reload step: the harness's instances and
+# the one a launch adds.
+.test-broker-launched.json
+# And by its no-fallback step, for the moment before it replaces dev.conf.
+.test-broker-no-fallback.conf
 # Written by `make harness-check`: the harness copied out of the image, and
 # the street store it printed.
 .harness/

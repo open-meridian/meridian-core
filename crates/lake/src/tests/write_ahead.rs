@@ -37,6 +37,146 @@ fn reply(answer: &meridian_bus::HandlerReply) -> RecordObservationsReply {
     RecordObservationsReply::decode(&bytes[..]).unwrap()
 }
 
+/// v31a, item 2 (the access audit's S1, point 10): a write's subject names
+/// the instance whose credential alone may publish it, and the lake answers
+/// it on that credential's own inboxes alone. A reply-to outside them --
+/// another plugin's inbox, a component's, or a client's default -- is
+/// refused: the write is recorded and answered to nobody, so a plugin cannot
+/// have the lake publish into another's inbox as the runtime.
+#[test]
+fn a_reply_to_outside_its_senders_inboxes_is_refused() {
+    use crate::write_ahead::answered_to;
+    use meridian_bus::write_ahead::subject;
+    let truefx = subject("truefx", "eurusd");
+    assert_eq!(
+        answered_to(&truefx, Some("_INBOX.truefx.Ab12.7".into())).as_deref(),
+        Some("_INBOX.truefx.Ab12.7")
+    );
+    for elsewhere in [
+        "_INBOX.kraken-1.Ab12.7",
+        "_INBOX.runtime.Ab12",
+        "_INBOX.dashboard-1.x",
+        "_INBOX.Ab12",
+        "_INBOX.truefx",
+        "platform.config.query.plugin-configuration",
+        "_INBOX.truefxx.Ab12",
+    ] {
+        assert_eq!(
+            answered_to(&truefx, Some(elsewhere.into())),
+            None,
+            "{elsewhere} answered for truefx"
+        );
+    }
+    assert_eq!(answered_to(&truefx, Some(String::new())), None);
+    assert_eq!(answered_to(&truefx, None), None);
+    // A subject of no dataset's names no sender: nobody is answered.
+    assert_eq!(
+        answered_to(
+            "platform.lake.internal.write-ahead",
+            Some("_INBOX.truefx.1".into())
+        ),
+        None
+    );
+}
+
+/// The review of v31a-core-2, F4, against a real JetStream (by hand, as the
+/// test after this one): a write on coinbase-1's subject that names another
+/// instance's inbox, kraken-1's, as its reply-to is recorded and nothing is
+/// delivered to that inbox; the write after it, naming coinbase-1's own,
+/// is answered there -- so the writer ran past the first, and its silence is
+/// a refusal, not a writer that never took it.
+///
+/// Run by `make test-jetstream`, on its three servers under the tests
+/// credential (the second review of v31a-core-2, finding 1); by hand, with
+/// JetStream on: `docker run --rm -d --name js -p 4222:4222
+/// nats:2.10.29-alpine -js`, then `MERIDIAN_TEST_JETSTREAM_URL=
+/// nats://localhost:4222 cargo test -p meridian-lake --lib
+/// a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody --
+/// --ignored`. Connected as the runtime connects, so a credential in the URL
+/// is presented.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
+async fn a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody() {
+    use crate::write_ahead::{stream_config, write_forever, Bounds};
+    use async_nats::jetstream;
+    use futures_util::StreamExt as _;
+    use meridian_bus::write_ahead::{subject, REPLY_HEADER, STREAM, TOPIC_HEADER};
+    use std::time::Duration;
+    let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
+    let context = jetstream::new(client.clone());
+    let _ = context.delete_stream(STREAM).await;
+    let bounds = Bounds {
+        max_age: Duration::from_secs(600),
+        max_bytes: 64 << 20,
+        replicas: 1,
+    };
+    let h = harness();
+    tokio::task::block_in_place(|| gap_configured(&h));
+    let mut recorded = h
+        .bus
+        .subscribe_every("platform.lake.coinbase-1:daily.event.prices-recorded");
+    let tag = std::process::id();
+    let foreign = format!("_INBOX.kraken-1.f4-{tag}");
+    let own = format!("_INBOX.coinbase-1.f4-{tag}");
+    let mut on_foreign = client.subscribe(format!("{foreign}.>")).await.unwrap();
+    let mut on_own = client.subscribe(format!("{own}.>")).await.unwrap();
+    client.flush().await.unwrap();
+    context.create_stream(stream_config(&bounds)).await.unwrap();
+    for (n, reply_to) in [(1u64, format!("{foreign}.1")), (2, format!("{own}.2"))] {
+        let price = at_valid(
+            close("coinbase-1", &format!("F4:{n}"), BTC, "2026-10-07", "1"),
+            NOW - 100_000 + n as i64,
+        );
+        let mut write = written(n, "coinbase-1", vec![price]);
+        write.envelope.meta.as_mut().unwrap().published_at_ns = NOW;
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(TOPIC_HEADER, write.topic.as_str());
+        headers.insert(REPLY_HEADER, reply_to.as_str());
+        context
+            .publish_with_headers(
+                subject("coinbase-1", "daily"),
+                headers,
+                write.envelope.encode_to_vec().into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let writer = {
+        let (lake, client) = (h.lake.clone(), client.clone());
+        tokio::spawn(async move { write_forever(lake, client, bounds, |_| {}).await })
+    };
+    let answered = tokio::time::timeout(Duration::from_secs(30), on_own.next())
+        .await
+        .expect("the write naming its own inbox is answered")
+        .unwrap();
+    assert_eq!(answered.subject.as_str(), format!("{own}.2"));
+    let elsewhere = tokio::time::timeout(Duration::from_secs(3), on_foreign.next()).await;
+    writer.abort();
+    let _ = writer.await;
+    assert!(
+        elsewhere.is_err(),
+        "the lake answered into kraken-1's inbox: {:?}",
+        elsewhere.ok().flatten().map(|message| message.subject)
+    );
+    let mut keys = std::collections::BTreeSet::new();
+    while keys.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(10), recorded.recv())
+            .await
+            .expect("both writes' rows are recorded")
+            .unwrap();
+        let price = meridian_domain::v1::PricesRecordedEvent::decode(&event.envelope.payload[..])
+            .unwrap()
+            .price
+            .unwrap();
+        keys.insert(price.meta.unwrap().row_key);
+    }
+    assert_eq!(keys, ["F4:1".to_string(), "F4:2".to_string()].into());
+    context.delete_stream(STREAM).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_from_the_stream_are_recorded_with_its_position_and_answered_as_the_lake_answers() {
     let h = harness();
@@ -922,7 +1062,7 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
     tokio::task::block_in_place(|| gap_configured(&h));
     let tag = std::process::id();
     let mut answered = client
-        .subscribe(format!("_INBOX.c5o-{tag}.>"))
+        .subscribe(format!("_INBOX.coinbase-1.c5o-{tag}.>"))
         .await
         .unwrap();
     let put = |round: &'static str, n: u64, after: Option<u64>| {
@@ -943,7 +1083,7 @@ async fn a_stream_made_again_under_its_name_is_taken_whole_from_a_real_broker() 
             headers.insert(TOPIC_HEADER, write.topic.as_str());
             headers.insert(
                 REPLY_HEADER,
-                format!("_INBOX.c5o-{tag}.{round}.{n}").as_str(),
+                format!("_INBOX.coinbase-1.c5o-{tag}.{round}.{n}").as_str(),
             );
             if let Some(after) = after {
                 headers.insert(AFTER_HEADER, after.to_string().as_str());

@@ -368,6 +368,65 @@ fn deployment_admin(key: &SigningKey) -> CallerAssertion {
     }
 }
 
+/// The second review of v31a-core-2, finding 5: the conductor's deployment
+/// admin, for a call made through no delegation, is the one the dashboard
+/// derives from the same records (`prepared::access_of`, the person's access
+/// from their logins and the directory groups their latest sign-in stored):
+/// an admin by login, an admin by directory group, and not an admin. Here,
+/// where both crates are seen, so a drift in either derivation fails it.
+#[test]
+fn the_conductor_holds_a_deployment_admin_as_the_dashboard_does() {
+    use meridian_config::Store as _;
+    let store = meridian_config::MemoryStore::new();
+    let group = meridian_domain::v1::UserGroup {
+        user_group_id: "ug-admins".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec!["meridian-admins".into()],
+        logins: vec!["local|ada".into()],
+    };
+    let permission = meridian_domain::v1::Permission {
+        permission_id: "perm-admins".into(),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: meridian_config::DEPLOYMENT_ADMIN.into(),
+    };
+    assert!(store
+        .install_first_admin(
+            &group,
+            &[permission],
+            &meridian_config::Author::default(),
+            NOW
+        )
+        .unwrap());
+    for (subject, groups) in [
+        ("local|grace", vec!["meridian-admins".to_string()]),
+        ("local|someone", vec!["trading-desk".to_string()]),
+    ] {
+        store
+            .record_sign_in(&meridian_domain::v1::SignInRecord {
+                subject: subject.into(),
+                display_name: subject.into(),
+                directory_groups: groups,
+                signed_in_at_ns: NOW,
+            })
+            .unwrap();
+    }
+    let records = store.snapshot().unwrap().records;
+    for (subject, admin) in [
+        ("local|ada", true),
+        ("local|grace", true),
+        ("local|someone", false),
+    ] {
+        let dashboard = meridian_dashboard::prepared::access_of(&records, subject).deployment_admin;
+        assert_eq!(dashboard, admin, "{subject} at the dashboard");
+        assert_eq!(
+            meridian_config::deployment_admin_as_signed_in(&records, subject),
+            dashboard,
+            "{subject}: the conductor and the dashboard differ"
+        );
+    }
+}
+
 /// The conductor's configuration store as it runs, on the bus the plugin's
 /// sidecar is on: a link made through the plugin's own operation, acting for
 /// a deployment admin, reaches that plugin's scope stream with the account's
@@ -401,6 +460,16 @@ async fn a_link_made_through_the_operation_reaches_the_plugins_scope_stream() {
         },
     )
     .unwrap();
+    // Ada is a deployment admin in the conductor's records, as her claims
+    // say: a link naming a new account is checked there too (the review of
+    // v31a-core-2, F3).
+    assert!(meridian_config::install_named_administrator(
+        store.as_ref(),
+        bus.clock().as_ref(),
+        "",
+        "local|ada",
+    )
+    .unwrap());
 
     let key = SigningKey::from_bytes(&[9u8; 32]);
     let sidecar = Sidecar::new(
