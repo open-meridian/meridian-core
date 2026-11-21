@@ -1223,8 +1223,10 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
 /// Whether `subject` is a deployment admin as their claims hold them for a
 /// call made through no delegation: by their logins and the directory groups
 /// their latest sign-in stored, as the dashboard derives a person's access
-/// (`prepared::access_of`).
-fn deployment_admin_as_signed_in(
+/// (`prepared::access_of`; the runtime's
+/// `wiring::the_conductor_holds_a_deployment_admin_as_the_dashboard_does`
+/// compares the two).
+pub fn deployment_admin_as_signed_in(
     records: &meridian_domain::v1::AccessRecords,
     subject: &str,
 ) -> bool {

@@ -1476,12 +1476,13 @@ async fn a_link_naming_a_new_account_is_refused_for_anybody_but_a_deployment_adm
 }
 
 #[tokio::test]
-async fn the_conductor_holds_a_deployment_admin_as_their_claims_do() {
-    // The review of v31a-core-2, F3: for a call made by no delegation, the
-    // conductor's deployment admin is the one the person's claims carry --
-    // their access from their logins and the directory groups their latest
-    // sign-in stored (`prepared::access_of` at the dashboard) -- by login, by
-    // directory group, and not at all.
+async fn a_new_account_link_passes_for_a_deployment_admin_by_login_or_directory_group_alone() {
+    // The review of v31a-core-2, F3: the conductor's check, for a call made
+    // by no delegation, passes a deployment admin by login and one by the
+    // directory groups their latest sign-in stored, and nobody else. Whether
+    // it holds them as the dashboard does is the runtime's
+    // `wiring::the_conductor_holds_a_deployment_admin_as_the_dashboard_does`
+    // (the second review, finding 5), where both crates are seen.
     let h = harness("oms-1");
     ada_is_a_deployment_admin(&h);
     for (subject, groups) in [
@@ -1497,18 +1498,9 @@ async fn the_conductor_holds_a_deployment_admin_as_their_claims_do() {
             })
             .unwrap();
     }
-    let records = h.store.snapshot().unwrap().records;
     for (subject, admin) in [(ADA, true), ("grace", true), ("someone", false)] {
-        let stored = records
-            .people
-            .iter()
-            .find(|person| person.subject == subject)
-            .map(|person| person.directory_groups.clone())
-            .unwrap_or_default();
-        let claims = meridian_access::person_access(&records, subject, &stored).deployment_admin;
-        assert_eq!(claims, admin, "{subject}'s claims");
         let linked = link_for(&h, link_request("oms-1", "", subject), subject).await;
-        assert_eq!(linked.is_ok(), claims, "{subject}: {linked:?}");
+        assert_eq!(linked.is_ok(), admin, "{subject}: {linked:?}");
     }
 }
 

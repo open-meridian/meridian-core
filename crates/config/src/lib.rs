@@ -52,7 +52,7 @@ pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{
     access_records_of, all_accounts, all_plugins_admin, configuration, deployment_admin,
-    install_named_administrator, serve, serve_with, Clock, Upstream,
+    deployment_admin_as_signed_in, install_named_administrator, serve, serve_with, Clock, Upstream,
 };
 pub use store::{
     AccessChangeKind, AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin,
