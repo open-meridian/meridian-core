@@ -7,12 +7,13 @@
 //! credential's client makes its inboxes under its own user's prefix,
 //! `_INBOX.<user>.`, and the broker grants each user that prefix alone.
 //!
-//! A responder still answers whoever asked: the broker lets a client publish
-//! one answer to the reply subject of each request it was delivered
-//! (`allow_responses`), whatever its grants say. The one answer sent to an
-//! inbox no request carried is the lake's to a write it took from its
-//! write-ahead stream, and the lake's credential is granted the inboxes of
-//! the data plugins that write ahead, by name ([`grant`]).
+//! A responder answers whoever asked on the asker's inbox, granted it by
+//! name, publish alone: the runtime's credential every other's, and each
+//! other core credential those of the credentials that may send it a
+//! request (`meridian_runtime::broker::answer_grants`). No plugin's
+//! credential publishes into another's. The broker's `allow_responses`,
+//! one answer to the reply subject of each request delivered whatever the
+//! grants, is the fallback alone: a configuration reload forgets it.
 //!
 //! A user's name is one subject token: a plugin's instance is a host label,
 //! and a component's name has no dot.

@@ -707,26 +707,40 @@ fn only_the_dashboards_credential_may_publish_an_access_change() {
     }
 }
 
-/// The review of v31a-core-2, F2: `allow_responses: true` lets a responder
-/// answer within the broker's default two minutes, and an answer after that
-/// is dropped. An install or an update of a plugin or a pack is waited on for
-/// INSTALLING, and one request to a registry within it may take the OCI
-/// client's whole timeout: every user's one answer is allowed for longer
-/// than either, with a minute's margin.
+/// `allow_responses` is the fallback alone, at the broker's own two minutes
+/// (v31a, item 2 as restated 2026-11-20; the Fable check's (f)): every
+/// answer is granted by name ([`answer_grants`]), so none rides it, and a
+/// reply entry left on a connection by a request never answered lasts no
+/// longer than the broker's default. It was fifteen minutes for the longest
+/// waits on the bus -- an install or an update of a plugin or a pack, waited
+/// on for INSTALLING, with a registry request within it allowed the OCI
+/// client's whole timeout -- which the conductor, among the runtime's
+/// components, answers on the dashboard's inbox by its grant, however long
+/// it takes.
 #[test]
-fn an_answer_is_allowed_for_longer_than_the_longest_wait_for_one() {
-    let rendered = rendered(
-        "# test\n",
-        &users(
-            &contract(),
-            &[
-                Instance::plugin("custody-test-1", &["custody"]),
-                Instance::component("dashboard-1", "dashboard"),
-            ],
-        )
-        .expect("generates"),
+fn an_answer_no_grant_names_is_allowed_the_brokers_two_minutes_alone() {
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.config.command.install-plugin\tcommand\tdashboard\tconductor\n\
+         platform.config.command.update-pack\tcommand\tdashboard\tconductor\n",
+        ROLES,
+    )
+    .expect("parses");
+    let users = users(
+        &contract,
+        &[
+            Instance::plugin("custody-test-1", &["custody"]),
+            Instance::component("dashboard-1", "dashboard"),
+        ],
+    )
+    .expect("generates");
+    assert!(
+        user(&users, "runtime")
+            .publish
+            .contains(&"_INBOX.dashboard-1.>".to_string()),
+        "the conductor answers an install on the dashboard's inbox by name"
     );
-    let margin = std::time::Duration::from_secs(60);
+    let rendered = rendered("# test\n", &users);
     let lines: Vec<&str> = rendered
         .lines()
         .filter(|line| line.trim_start().starts_with("{ user:"))
@@ -738,15 +752,7 @@ fn an_answer_is_allowed_for_longer_than_the_longest_wait_for_one() {
             .and_then(|(_, rest)| rest.split_once("s\" }"))
             .map(|(secs, _)| secs.parse::<u64>().expect("seconds"))
             .unwrap_or_else(|| panic!("no expiring answer allowance in {line}"));
-        let expires = std::time::Duration::from_secs(said);
-        assert!(
-            expires >= meridian_dashboard::registry::INSTALLING + margin,
-            "{line}"
-        );
-        assert!(
-            expires >= meridian_conductor::oci::REQUEST_WITHIN + margin,
-            "{line}"
-        );
+        assert_eq!(said, 120, "{line}");
     }
 }
 

@@ -630,14 +630,17 @@ pub fn instance_user(
 }
 
 /// How long a responder may send its one answer to a request it was
-/// delivered, whatever its grants say (`allow_responses`; the review of
-/// v31a-core-2, F2). The broker's default is two minutes, after which an
-/// answer is dropped. The longest a caller waits on the bus is an install
-/// or an update of a plugin or a pack (the dashboard's `INSTALLING`, five
-/// minutes), and one request to a registry within it may take the OCI
-/// client's ten (the conductor's `oci::REQUEST_WITHIN`): fifteen covers
-/// both, with a margin.
-pub const ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(900);
+/// delivered, whatever its grants say (`allow_responses`): the broker's own
+/// default, two minutes. The fallback alone: every answer is granted by
+/// name ([`answer_grants`]), the longest waits on the bus among them -- an
+/// install or an update of a plugin or a pack, which the conductor answers
+/// on the dashboard's inbox -- so none rides it, as a run of the real-NATS
+/// suite on a broker with no `allow_responses` at all showed (v31a, item 2
+/// as restated 2026-11-20). It stays for `ha`'s brokers, which reload one
+/// after another. A reply entry it leaves on a connection for a request
+/// never answered lasts as long as this; it was fifteen minutes while
+/// answers rode it (the review of v31a-core-2, F2).
+pub const ANSWERED_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The users, as the broker's own configuration.
 pub fn rendered(header: &str, users: &[User]) -> String {
