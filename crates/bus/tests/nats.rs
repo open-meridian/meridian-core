@@ -877,6 +877,81 @@ async fn only_the_runtime_publishes_into_another_credentials_inbox() {
     }
 }
 
+/// The second review of v31a-core-2, option A's amendment (e): a broker
+/// configuration reload -- every plugin launch makes one -- registers each
+/// client's user again, and its permissions with it, which empties the
+/// connection's reply entries. A non-runtime responder (custody-test-1)
+/// delivered a request of the runtime's before a reload and answering after
+/// it then has no right to the runtime's inbox.
+///
+/// Run by hand, alone, with the reload made from outside while it waits: it
+/// says `RELOAD-NOW` and waits for the broker's `config_load_time` to change,
+/// then answers. The configuration the broker reloads must change its users
+/// (a launch adds one); a reload of the same file re-registers nobody.
+///
+/// A known gap, found 2026-11-20 on nats 2.10.29 (`Publish Violation - User
+/// "custody-test-1", Subject "_INBOX.runtime..."` after `Reloaded:
+/// authorization users`): the answer is refused. Its fix goes through the
+/// proposal procedure; until then this stays ignored, and it passes once the
+/// fix is in.
+#[tokio::test]
+#[ignore = "a known gap: a configuration reload drops in-flight reply rights; needs a reload made from outside"]
+async fn an_answer_in_flight_across_a_configuration_reload_reaches_the_runtime() {
+    use futures_util::StreamExt;
+    let runtime = raw("MERIDIAN_TEST_BROKER_URL_RUNTIME").await;
+    let responder = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let topic = "platform.config.event.plugin-configuration-changed";
+    let mut asked = responder.subscribe(topic).await.unwrap();
+    responder.flush().await.unwrap();
+    let reply = format!("_INBOX.runtime.{}", mark("across-a-reload"));
+    let mut answers = runtime.subscribe(reply.clone()).await.unwrap();
+    runtime.flush().await.unwrap();
+    settle().await;
+    let question = mark("asked-before-the-reload");
+    runtime
+        .publish_with_reply(topic, reply.clone(), question.clone().into())
+        .await
+        .unwrap();
+    runtime.flush().await.unwrap();
+    let request = loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), asked.next())
+            .await
+            .expect("the responder was delivered the request")
+            .unwrap();
+        if message.payload.as_ref() == question.as_bytes() {
+            break message;
+        }
+    };
+    let loaded = |varz: &str| said_text(varz, "config_load_time");
+    let before = loaded(&monitored("/varz").await).expect("config_load_time");
+    println!("RELOAD-NOW");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if loaded(&monitored("/varz").await).as_deref() != Some(before.as_str()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the broker did not reload within two minutes"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    settle().await;
+    let answer = mark("answered-after-the-reload");
+    responder
+        .publish(
+            request.reply.clone().expect("a reply subject"),
+            answer.clone().into(),
+        )
+        .await
+        .unwrap();
+    responder.flush().await.unwrap();
+    assert!(
+        heard(&mut answers, &answer).await,
+        "the answer sent after a configuration reload did not reach the runtime"
+    );
+}
+
 #[tokio::test]
 async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
     // Asked as custody-test-1 on what every sidecar asks, answered by the
