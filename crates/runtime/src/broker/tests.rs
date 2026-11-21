@@ -315,8 +315,11 @@ fn the_runtime_answers_on_the_inboxes_of_the_data_plugins_alone() {
 
 /// The conductor's access changes (decision 47; the access audit's
 /// mismatch 7): user groups, account groups, access groups, permissions,
-/// and which connectivity plugins reach an `ems` and its accounts.
-const ACCESS_CHANGES: [&str; 7] = [
+/// and which connectivity plugins reach an `ems` and its accounts; and the
+/// first admin's -- a claim code redeemed, an enrolment with a code, and the
+/// first run's configuration applied (the second review of v31a-core-2,
+/// finding 6).
+const ACCESS_CHANGES: [&str; 10] = [
     "platform.config.command.define-user-group",
     "platform.config.command.define-account-group",
     "platform.config.command.define-access-group",
@@ -324,6 +327,9 @@ const ACCESS_CHANGES: [&str; 7] = [
     "platform.config.command.withdraw-permission",
     "platform.config.command.link-connectivity",
     "platform.config.command.set-linkable-accounts",
+    "platform.config.command.redeem-claim-code",
+    "platform.config.command.enrol-with-code",
+    "platform.config.command.apply-first-run-configuration",
 ];
 
 /// The access changes a plugin's own credential publishes (the review of
