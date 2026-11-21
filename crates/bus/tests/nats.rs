@@ -911,6 +911,69 @@ async fn a_handler_knows_the_credential_that_asked_by_its_inbox() {
     assert_eq!(String::from_utf8_lossy(&payload), "custody-test-1");
 }
 
+/// The review of v31a-core-2, F1(c), a known gap (INTERIM(v32)): the broker
+/// checks no publisher's right on a reply subject, so a credential that names
+/// another's inbox as its reply-to is read as that other. custody-test-1
+/// sends a take-shard naming custody-test-2, answered on custody-test-2's
+/// inbox, and is asked as custody-test-2: the lake would number a new epoch
+/// and fence custody-test-2's live holder, as often as it is sent. Ignored
+/// until v32 binds the sender at the broker (S2) and its ownership record
+/// replaces this take (v32.8); it then passes, and the ignore is removed.
+#[tokio::test]
+#[ignore = "INTERIM(v32): a known gap, the asker read from the reply inbox; v32.8 turns it green"]
+async fn a_take_shard_sent_on_another_credentials_inbox_is_not_asked_as_it() {
+    let forging = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let runtime = NatsBackend::connect(
+        &std::env::var("MERIDIAN_TEST_BROKER_URL_RUNTIME")
+            .expect("MERIDIAN_TEST_BROKER_URL_RUNTIME is not set; run `make test-broker`."),
+    )
+    .await
+    .expect("could not reach the test broker as the runtime");
+    let answering = Bus::single(
+        "lake",
+        Arc::new(runtime),
+        Arc::new(meridian_clock::SystemClock),
+    );
+    // Every sidecar may send it, and the lake answers it; no other test here
+    // serves it.
+    let topic = "platform.lake.command.take-shard";
+    let (told, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    answering.serve(topic, move |_| {
+        let _ = told.send(meridian_bus::inbox::asked_by());
+        Ok(("meridian.test.Taken".to_string(), Vec::new()))
+    });
+    settle().await;
+
+    let take = Envelope {
+        meta: Some(MessageMeta {
+            message_id: mark("forged-take"),
+            publisher_instance_id: "custody-test-2".into(),
+            ..Default::default()
+        }),
+        payload_type: "meridian.v1.TakeShardRequest".into(),
+        payload: b"instance: custody-test-2".to_vec(),
+    };
+    forging
+        .publish_with_reply(
+            topic,
+            "_INBOX.custody-test-2.x",
+            prost::Message::encode_to_vec(&take).into(),
+        )
+        .await
+        .unwrap();
+    forging.flush().await.unwrap();
+
+    let asker = tokio::time::timeout(Duration::from_secs(5), asked.recv())
+        .await
+        .expect("the take reached the lake")
+        .expect("its handler said who asked");
+    assert_ne!(
+        asker.as_deref(),
+        Some("custody-test-2"),
+        "custody-test-1's take was asked as custody-test-2"
+    );
+}
+
 /// v31a, item 14 (decision 47), the triage on a real broker: an access
 /// change sent by every credential this broker admits but the dashboard's is
 /// refused; the dashboard's is carried.
