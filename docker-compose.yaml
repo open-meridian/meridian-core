@@ -586,6 +586,9 @@ services:
       # The three JetStream servers, under the analytics component's own
       # credential (`make test-jetstream`).
       MERIDIAN_TEST_JETSTREAM_CLUSTER_URL_ANALYTICS: nats://analytics:analytics-dev-only@core-test-jetstream-a:4222
+      # The same servers under the tests credential, for the lake's writer
+      # against a real write-ahead stream (`make test-jetstream`).
+      MERIDIAN_TEST_JETSTREAM_URL: nats://tests:tests-dev-only@core-test-jetstream-a:4222
       # The firm's directory, which the dashboard now binds to itself rather
       # than having an identity server broker for it (decisions/018).
       MERIDIAN_TEST_LDAP_URL: ldap://ldap:1389

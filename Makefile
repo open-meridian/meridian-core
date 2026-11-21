@@ -1501,6 +1501,14 @@ test-broker: network runtime-image tests-image
 # and the lake's write-ahead stream not answered to it. As test-broker's
 # cluster: the servers made afresh on the new config, so it is the one in
 # force, and their routes made before the test starts.
+#
+# Then on the same servers, after the queue's test has waited out their
+# group's forming, the lake's writer against a real write-ahead stream (the
+# second review of v31a-core-2, finding 1): a write on one instance's subject
+# naming another instance's inbox is recorded and answered to nobody, and the
+# write after it, naming its own, is answered. Under the tests credential,
+# which may publish anywhere, so the refusal proven is the lake's own and not
+# the broker's.
 test-jetstream: network runtime-image tests-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
@@ -1514,7 +1522,14 @@ test-jetstream: network runtime-image tests-image
 		     tail -40 .test-jetstream.log >&2; exit 1; }
 	@grep -q 'the_queue_runs_end_to_end_under_the_analytics_credential' .test-jetstream.log \
 		|| { echo "test-jetstream FAILED: the queue's test did not run (.test-jetstream.log)" >&2; exit 1; }
-	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential"
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-lake --lib -- --ignored --exact tests::write_ahead::a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody \
+		>>.test-jetstream.log 2>&1 \
+		|| { echo "test-jetstream FAILED. The last 40 lines, and the whole of it in .test-jetstream.log:" >&2; \
+		     tail -40 .test-jetstream.log >&2; exit 1; }
+	@grep -q 'a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody' .test-jetstream.log \
+		|| { echo "test-jetstream FAILED: the lake's write-ahead test did not run (.test-jetstream.log)" >&2; exit 1; }
+	@echo "test-jetstream OK: the units' queue runs on three JetStream servers under the analytics credential, and the lake answers a write on its sender's inboxes alone"
 
 # Signing in against a real directory. Its own target rather than part of
 # `test`, for the reason `test-broker` is: it needs a server standing up, and

@@ -86,11 +86,14 @@ fn a_reply_to_outside_its_senders_inboxes_is_refused() {
 /// is answered there -- so the writer ran past the first, and its silence is
 /// a refusal, not a writer that never took it.
 ///
-/// Run by hand, with JetStream on: `docker run --rm -d --name js -p
-/// 4222:4222 nats:2.10.29-alpine -js`, then `MERIDIAN_TEST_JETSTREAM_URL=
+/// Run by `make test-jetstream`, on its three servers under the tests
+/// credential (the second review of v31a-core-2, finding 1); by hand, with
+/// JetStream on: `docker run --rm -d --name js -p 4222:4222
+/// nats:2.10.29-alpine -js`, then `MERIDIAN_TEST_JETSTREAM_URL=
 /// nats://localhost:4222 cargo test -p meridian-lake --lib
 /// a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody --
-/// --ignored`.
+/// --ignored`. Connected as the runtime connects, so a credential in the URL
+/// is presented.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a JetStream broker: MERIDIAN_TEST_JETSTREAM_URL"]
 async fn a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobody() {
@@ -100,7 +103,7 @@ async fn a_write_naming_another_instances_inbox_is_recorded_and_answered_to_nobo
     use meridian_bus::write_ahead::{subject, REPLY_HEADER, STREAM, TOPIC_HEADER};
     use std::time::Duration;
     let url = std::env::var("MERIDIAN_TEST_JETSTREAM_URL").unwrap();
-    let client = async_nats::connect(&url).await.unwrap();
+    let client = meridian_bus::NatsBackend::client(&url).await.unwrap();
     let context = jetstream::new(client.clone());
     let _ = context.delete_stream(STREAM).await;
     let bounds = Bounds {
