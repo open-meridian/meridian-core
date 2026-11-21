@@ -63,6 +63,8 @@ services:
       MERIDIAN_NATS_REPORTING_TEST_1: reporting-test-1-dev-only
       MERIDIAN_NATS_DASHBOARD_1: dashboard-1-dev-only
       MERIDIAN_NATS_LAUNCHER_1: launcher-1-dev-only
+      # The plugin `make test-broker`'s reload step adds, as a launch does.
+      MERIDIAN_NATS_LAUNCHED_TEST_1: launched-test-1-dev-only
       MERIDIAN_NATS_FIRST_RUN: first-run-dev-only
       MERIDIAN_NATS_TESTS: tests-dev-only
     volumes:

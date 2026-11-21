@@ -949,51 +949,115 @@ async fn no_plugin_credential_publishes_into_another_credentials_inbox() {
     }
 }
 
-/// The second review of v31a-core-2, option A's amendment (e): a broker
-/// configuration reload -- every plugin launch makes one -- registers each
-/// client's user again, and its permissions with it, which empties the
-/// connection's reply entries. A non-runtime responder (custody-test-1)
-/// delivered a request of the runtime's before a reload and answering after
-/// it then has no right to the runtime's inbox.
-///
-/// Run by hand, alone, with the reload made from outside while it waits: it
-/// says `RELOAD-NOW` and waits for the broker's `config_load_time` to change,
-/// then answers. The configuration the broker reloads must change its users
-/// (a launch adds one); a reload of the same file re-registers nobody.
-///
-/// A known gap, found 2026-11-20 on nats 2.10.29 (`Publish Violation - User
-/// "custody-test-1", Subject "_INBOX.runtime..."` after `Reloaded:
-/// authorization users`): the answer is refused. Its fix goes through the
-/// proposal procedure; until then this stays ignored, and it passes once the
-/// fix is in.
-#[tokio::test]
-#[ignore = "a known gap: a configuration reload drops in-flight reply rights; needs a reload made from outside"]
-async fn an_answer_in_flight_across_a_configuration_reload_reaches_the_runtime() {
+/// One request in flight: asked by `asking` on `topic` with a reply subject
+/// in its own inbox, delivered to `answering`, and the subscription its
+/// answer will arrive on.
+struct InFlight {
+    answering: async_nats::Client,
+    request: async_nats::Message,
+    answers: async_nats::Subscriber,
+}
+
+async fn in_flight(
+    asking: &async_nats::Client,
+    asker: &str,
+    answering: async_nats::Client,
+    topic: &str,
+) -> InFlight {
     use futures_util::StreamExt;
-    let runtime = raw("MERIDIAN_TEST_BROKER_URL_RUNTIME").await;
-    let responder = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
-    let topic = "platform.config.event.plugin-configuration-changed";
-    let mut asked = responder.subscribe(topic).await.unwrap();
-    responder.flush().await.unwrap();
-    let reply = format!("_INBOX.runtime.{}", mark("across-a-reload"));
-    let mut answers = runtime.subscribe(reply.clone()).await.unwrap();
-    runtime.flush().await.unwrap();
+    let mut asked = answering.subscribe(topic.to_string()).await.unwrap();
+    answering.flush().await.unwrap();
+    let reply = format!("_INBOX.{asker}.{}", mark("across-a-reload"));
+    let answers = asking.subscribe(reply.clone()).await.unwrap();
+    asking.flush().await.unwrap();
     settle().await;
     let question = mark("asked-before-the-reload");
-    runtime
-        .publish_with_reply(topic, reply.clone(), question.clone().into())
+    asking
+        .publish_with_reply(topic.to_string(), reply, question.clone().into())
         .await
         .unwrap();
-    runtime.flush().await.unwrap();
+    asking.flush().await.unwrap();
     let request = loop {
         let message = tokio::time::timeout(Duration::from_secs(5), asked.next())
             .await
-            .expect("the responder was delivered the request")
+            .unwrap_or_else(|_| panic!("{topic} was not delivered"))
             .unwrap();
         if message.payload.as_ref() == question.as_bytes() {
             break message;
         }
     };
+    InFlight {
+        answering,
+        request,
+        answers,
+    }
+}
+
+impl InFlight {
+    /// Answered now: whether the answer reached the asker.
+    async fn answered(mut self) -> bool {
+        let answer = mark("answered-after-the-reload");
+        self.answering
+            .publish(
+                self.request.reply.clone().expect("a reply subject"),
+                answer.clone().into(),
+            )
+            .await
+            .unwrap();
+        self.answering.flush().await.unwrap();
+        heard(&mut self.answers, &answer).await
+    }
+}
+
+/// v31a, item 2 as restated 2026-11-20 (the proposal on answers refused
+/// across a broker reload, option A, approved by consensus): a broker
+/// configuration reload -- every plugin launch, removal and entitlement
+/// change makes one -- registers each client's user again with its
+/// permissions, which empties the connection's reply entries, the
+/// `allow_responses` rights. An answer granted by name does not need one:
+///
+/// - the dashboard, delivered custody-test-1's ticket before the reload
+///   (every sidecar files one), answers it after;
+/// - the launcher, delivered the conductor's create-plugin before the
+///   reload -- the reload that launch itself makes, which the answer races
+///   -- answers it after, on the runtime's inbox;
+/// - and a plugin's answer is still refused, as documented and expected: no
+///   plugin publishes into another's inboxes, so custody-test-1, delivered
+///   a request of the runtime's on a subject it hears, has no right to
+///   answer it once the reload has emptied its reply entries. No plugin
+///   serves a request in the contract today.
+///
+/// Run by `make test-broker`, alone, with the reload made from outside while
+/// it waits: once the three requests are delivered it says `RELOAD-NOW` and
+/// waits for the broker's `config_load_time` to change, then answers. The
+/// configuration it reloads must change the users (a launch adds one); a
+/// reload of the same file registers nobody again.
+#[tokio::test]
+#[ignore = "run by make test-broker's reload step, which reloads the broker while it waits"]
+async fn answers_in_flight_across_a_configuration_reload() {
+    let runtime = raw("MERIDIAN_TEST_BROKER_URL_RUNTIME").await;
+    let custody = raw("MERIDIAN_TEST_BROKER_URL_CUSTODY").await;
+    let ticket = in_flight(
+        &custody,
+        "custody-test-1",
+        raw("MERIDIAN_TEST_BROKER_URL_DASHBOARD").await,
+        "platform.config.command.file-ticket",
+    )
+    .await;
+    let launch = in_flight(
+        &runtime,
+        "runtime",
+        raw("MERIDIAN_TEST_BROKER_URL_LAUNCHER").await,
+        "platform.deployment.command.create-plugin",
+    )
+    .await;
+    let plugins = in_flight(
+        &runtime,
+        "runtime",
+        custody.clone(),
+        "platform.config.event.plugin-configuration-changed",
+    )
+    .await;
     let loaded = |varz: &str| said_text(varz, "config_load_time");
     let before = loaded(&monitored("/varz").await).expect("config_load_time");
     println!("RELOAD-NOW");
@@ -1009,18 +1073,16 @@ async fn an_answer_in_flight_across_a_configuration_reload_reaches_the_runtime()
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     settle().await;
-    let answer = mark("answered-after-the-reload");
-    responder
-        .publish(
-            request.reply.clone().expect("a reply subject"),
-            answer.clone().into(),
-        )
-        .await
-        .unwrap();
-    responder.flush().await.unwrap();
-    assert!(
-        heard(&mut answers, &answer).await,
-        "the answer sent after a configuration reload did not reach the runtime"
+    let answered = [
+        ticket.answered().await,
+        launch.answered().await,
+        plugins.answered().await,
+    ];
+    assert_eq!(
+        answered,
+        [true, true, false],
+        "after a configuration reload: the dashboard's answer to custody-test-1, the \
+         launcher's create-plugin answer to the runtime, a plugin's answer to the runtime"
     );
 }
 

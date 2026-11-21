@@ -1492,7 +1492,35 @@ test-broker: network runtime-image tests-image
 		>.test-broker.log 2>&1 \
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
 		     tail -40 .test-broker.log >&2; exit 1; }
-	@echo "test-broker OK: messages cross a process boundary through the broker"
+	@# Answers in flight across a configuration reload (v31a, item 2): the
+	@# test, alone, puts its requests in flight and says RELOAD-NOW; the
+	@# broker is then given the configuration a launch would give it -- one
+	@# more custody instance, so its users change -- and reloaded while the
+	@# test waits, and the test answers after. dev.conf is put back after,
+	@# and reloaded again.
+	@sed 's|"instances": \[|"instances": [{"instance_id": "launched-test-1", "roles": ["custody"]},|' \
+		deploy/nats/dev-instances.json >.test-broker-launched.json
+	@grep -q launched-test-1 .test-broker-launched.json \
+		|| { echo "test-broker FAILED: the launched instance was not added for the reload" >&2; exit 1; }
+	@$(COMPOSE_TEST) run --rm -T tests \
+		run-tests -p meridian-bus --test nats -- --ignored --exact answers_in_flight_across_a_configuration_reload --nocapture \
+		>.test-broker-reload.log 2>&1 & asking=$$!; \
+	for i in $$(seq 1 120); do grep -q RELOAD-NOW .test-broker-reload.log && break; sleep 1; done; \
+	if grep -q RELOAD-NOW .test-broker-reload.log; then \
+		$(BROKER_CONFIG) --instances /w/.test-broker-launched.json \
+			--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+		&& $(COMPOSE_TEST) kill -s HUP nats >/dev/null; \
+	fi; \
+	wait $$asking; status=$$?; \
+	$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf \
+	&& $(COMPOSE_TEST) kill -s HUP nats >/dev/null; \
+	[ $$status = 0 ] \
+		|| { echo "test-broker FAILED: answers across a configuration reload. The last 40 lines, and the whole of it in .test-broker-reload.log:" >&2; \
+		     tail -40 .test-broker-reload.log >&2; exit 1; }
+	@grep -q 'answers_in_flight_across_a_configuration_reload' .test-broker-reload.log \
+		|| { echo "test-broker FAILED: the reload's test did not run (.test-broker-reload.log)" >&2; exit 1; }
+	@echo "test-broker OK: messages cross a process boundary through the broker, and answers in flight across a configuration reload reach their askers"
 
 # The analytics units' work queue end to end on three JetStream servers, as
 # `ha` runs them, under the analytics component's own credential and the
