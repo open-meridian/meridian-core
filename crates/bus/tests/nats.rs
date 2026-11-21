@@ -1089,9 +1089,10 @@ async fn answers_in_flight_across_a_configuration_reload() {
 #[tokio::test]
 async fn an_answer_reaches_its_caller_on_the_callers_own_inbox() {
     // Asked as custody-test-1 on what every sidecar asks, answered by the
-    // runtime's credential, which holds no inbox of custody-test-1's: the
-    // caller's client makes its inbox under its own prefix, and the broker
-    // lets the one asked answer once on it.
+    // runtime's credential: the caller's client makes its inbox under its
+    // own prefix, `_INBOX.custody-test-1`, and the runtime answers on it by
+    // name, its grant publishing into every credential's inboxes, not
+    // through the broker's allow_responses.
     let asking = Bus::single(
         "custody-test-1",
         Arc::new(as_custody().await),
