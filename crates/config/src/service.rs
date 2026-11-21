@@ -1220,6 +1220,7 @@ fn admin_acting(envelope: &Envelope, what: &str) -> Result<String, String> {
     Ok(by)
 }
 
+/// INTERIM(v32): v32.8's conductor check, with delegation, replaces it.
 /// Whether `subject` is a deployment admin as their claims hold them for a
 /// call made through no delegation: by their logins and the directory groups
 /// their latest sign-in stored, as the dashboard derives a person's access
@@ -2562,6 +2563,8 @@ pub fn serve_with(
                 ));
             }
             let before = cx.snapshot()?;
+            // INTERIM(v32): replaced by v32.8's conductor check, with
+            // delegation (the second review of v31a-core-2, finding 7).
             // A link naming a new account creates it and grants it to the
             // plugin: an access change, which a plugin's credential may
             // publish, so the conductor checks the right itself (decision 47;
