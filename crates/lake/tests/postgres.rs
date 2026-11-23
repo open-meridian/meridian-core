@@ -14572,25 +14572,113 @@ fn a_long_history_written_under_reads_stays_within_its_lock_budget() {
     }
 }
 
+/// The relation locks the backend of `application` holds while it waits
+/// on a lock, by mode: read from `pg_locks` once it is seen waiting.
+fn locks_held_waiting(
+    raw: &mut postgres::Client,
+    application: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let pid: i32 = loop {
+        let waiting = raw
+            .query_opt(
+                "SELECT pid FROM pg_stat_activity
+                  WHERE application_name = $1 AND wait_event_type = 'Lock' LIMIT 1",
+                &[&application],
+            )
+            .unwrap();
+        if let Some(row) = waiting {
+            break row.get(0);
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "{application} was never seen waiting on a lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    raw.query(
+        "SELECT mode, count(*) FROM pg_locks
+          WHERE pid = $1 AND locktype = 'relation' AND granted GROUP BY mode",
+        &[&pid],
+    )
+    .unwrap()
+    .iter()
+    .map(|row| (row.get(0), row.get(1)))
+    .collect()
+}
+
+/// `url` with its sessions named `application`.
+fn named_store(url: &str, application: &str) -> PostgresStore {
+    let joined = if url.contains('?') { "&" } else { "?" };
+    PostgresStore::connect(&format!("{url}{joined}application_name={application}"), 2).unwrap()
+}
+
+/// The locks only a month's making takes, of those `held` by mode: on its
+/// table, its TOAST table and index and its 13 indexes, ACCESS EXCLUSIVE.
+fn making(held: &std::collections::BTreeMap<String, i64>) -> i64 {
+    held.get("AccessExclusiveLock").copied().unwrap_or(0)
+}
+
 /// A batch spanning more months than one transaction makes has them made
-/// before it, a few a transaction (v31a.17), and is recorded whole.
+/// before it, a few a transaction (v31a.17), and is recorded whole: its
+/// own transaction makes none, and holds no lock of a month's making.
+///
+/// The batch is held at its end -- one of its keys is held already, and
+/// its row of `lake_latest` locked here -- and its backend's locks read
+/// from `pg_locks`. Its 40 months' rows are still written, and its
+/// subject's last sequence read, in the one transaction: 14 relations a
+/// month each, the KNOWN GAPS `insert_all` and `previous_of_each` of the
+/// inventory (`leaves.rs`), so the whole is said and not held to a budget.
 #[test]
 fn a_batch_of_many_months_is_recorded_its_months_made_before_it() {
-    let (url, store) = isolated("manymonths");
+    // A month's table, its TOAST table and index, and its 13 indexes.
+    const A_MONTH_MADE: i64 = 16;
+    let (url, setup) = isolated("manymonths");
+    let store = named_store(&url, "llb_manymonths");
     let dataset = unique("manymonths");
     let month_ns = 2_629_800_i64 * 1_000_000_000;
-    let rows: Vec<Observation> = (0..40)
-        .map(|m| {
-            trade(
-                &dataset,
-                &format!("m{m}"),
-                "INS-1",
-                (240 + m) * month_ns + 14 * 86_400 * 1_000_000_000,
-            )
-        })
-        .collect();
-    assert_eq!(store.record(&dataset, rows, 1).unwrap().recorded, 40);
+    let row = |m: i64| {
+        trade(
+            &dataset,
+            &format!("m{m}"),
+            "INS-1",
+            (240 + m) * month_ns + 14 * 86_400 * 1_000_000_000,
+        )
+    };
+    setup.record(&dataset, vec![row(0)], 1).unwrap();
     let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut held = raw.transaction().unwrap();
+    held.execute(
+        "SELECT 1 FROM lake_latest WHERE dataset = $1 AND row_key = 'm0' FOR UPDATE",
+        &[&dataset],
+    )
+    .unwrap();
+    let rows: Vec<Observation> = std::iter::once(restate(row(0)))
+        .chain((1..40).map(row))
+        .collect();
+    let writing = {
+        let dataset = dataset.clone();
+        std::thread::spawn(move || {
+            let done = store.record(&dataset, rows, 2);
+            (store, done)
+        })
+    };
+    let mut beside = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let locks = locks_held_waiting(&mut beside, "llb_manymonths");
+    held.commit().unwrap();
+    let (store, done) = writing.join().unwrap();
+    let done = done.unwrap();
+    assert_eq!((done.recorded, done.restated), (39, 1));
+    eprintln!(
+        "LOCKS lake: a batch of 40 months held {} at its end: {locks:?}",
+        locks.values().sum::<i64>()
+    );
+    assert!(
+        making(&locks) <= 8 * A_MONTH_MADE,
+        "the batch's own transaction held {} locks of months' making, past the eight months \
+         one makes: {locks:?}",
+        making(&locks)
+    );
     let leaves: i64 = raw
         .query_one(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -14769,12 +14857,25 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
         }),
     ];
     let mut refused = Vec::new();
-    for batch in 0..OWN_MONTHS / 6 {
-        let rows = (batch * 6..batch * 6 + 6)
-            .map(|m| trade(&short, &format!("s{m}"), "INS-1", from_ns + m * month_ns))
-            .collect();
-        if let Err(failed) = writer.record(&short, rows, 1) {
-            refused.push(format!("batch {batch}: {failed:?}"));
+    // The short dataset's keys written, then sent again and again with
+    // their values changed: each a key held, whose latest version is read
+    // from the month it is in (`latest_of_each`'s second statement).
+    for pass in 0..12_i64 {
+        for batch in 0..OWN_MONTHS / 6 {
+            let rows = (batch * 6..batch * 6 + 6)
+                .map(|m| {
+                    let mut row = trade(&short, &format!("s{m}"), "INS-1", from_ns + m * month_ns);
+                    row.meta_mut().valid_until_ns += pass;
+                    row
+                })
+                .collect();
+            match writer.record(&short, rows, 1 + pass) {
+                Ok(done) if pass > 0 && done.restated != 6 => {
+                    refused.push(format!("pass {pass}, batch {batch}: {done:?}"))
+                }
+                Ok(_) => {}
+                Err(failed) => refused.push(format!("pass {pass}, batch {batch}: {failed:?}")),
+            }
         }
     }
     // Each read sampled many times over.
