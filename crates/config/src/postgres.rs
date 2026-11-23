@@ -891,36 +891,54 @@ impl Store for PostgresStore {
     fn put_user_group(&self, group: &UserGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // A new group inserted, or nothing where one stands: of two puts of
+        // one new ID at once, the second waits for the first and finds it,
+        // so one records it defined and the other changed (review-core-3 6).
+        let defined = tx
+            .execute(
+                "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (user_group_id) DO NOTHING",
+                &[
+                    &group.user_group_id,
+                    &group.name,
+                    &group.directory_groups,
+                    &group.logins,
+                ],
+            )
+            .map_err(unavailable)?
+            == 1;
+        if defined {
+            if let Some(record) = user_group_change(None, group, author, at_ns) {
+                insert_group_change(&mut tx, &record)?;
+            }
+            return tx.commit().map_err(unavailable);
+        }
         // The group as it stood, read and held in the transaction that
         // replaces it, so its record says what it was.
         let before = tx
-            .query_opt(
+            .query_one(
                 "SELECT name, directory_groups, logins FROM config_user_group
                   WHERE user_group_id = $1 FOR UPDATE",
                 &[&group.user_group_id],
             )
-            .map_err(unavailable)?
+            .map_err(unavailable)
             .map(|row| UserGroup {
                 user_group_id: group.user_group_id.clone(),
                 name: row.get(0),
                 directory_groups: row.get(1),
                 logins: row.get(2),
-            });
-        if let Some(before) = &before {
-            caught_up(
-                &mut tx,
-                GroupKind::User,
-                &before.user_group_id,
-                &described_user_group(before),
-                at_ns,
-            )?;
-        }
+            })?;
+        caught_up(
+            &mut tx,
+            GroupKind::User,
+            &before.user_group_id,
+            &described_user_group(&before),
+            at_ns,
+        )?;
         tx.execute(
-            "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (user_group_id) DO UPDATE
-                SET name = excluded.name, directory_groups = excluded.directory_groups,
-                    logins = excluded.logins",
+            "UPDATE config_user_group SET name = $2, directory_groups = $3, logins = $4
+              WHERE user_group_id = $1",
             &[
                 &group.user_group_id,
                 &group.name,
@@ -929,7 +947,7 @@ impl Store for PostgresStore {
             ],
         )
         .map_err(unavailable)?;
-        if let Some(record) = user_group_change(before.as_ref(), group, author, at_ns) {
+        if let Some(record) = user_group_change(Some(&before), group, author, at_ns) {
             insert_group_change(&mut tx, &record)?;
         }
         tx.commit().map_err(unavailable)
@@ -938,37 +956,49 @@ impl Store for PostgresStore {
     fn put_account_group(&self, group: &AccountGroup, author: &Author, at_ns: i64) -> Result<()> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // As a user group: inserted new, or held and replaced.
+        let defined = tx
+            .execute(
+                "INSERT INTO config_account_group (account_group_id, name, account_ids)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (account_group_id) DO NOTHING",
+                &[&group.account_group_id, &group.name, &group.account_ids],
+            )
+            .map_err(unavailable)?
+            == 1;
+        if defined {
+            if let Some(record) = account_group_change(None, group, author, at_ns) {
+                insert_group_change(&mut tx, &record)?;
+            }
+            return tx.commit().map_err(unavailable);
+        }
         let before = tx
-            .query_opt(
+            .query_one(
                 "SELECT name, account_ids, built_in FROM config_account_group
                   WHERE account_group_id = $1 FOR UPDATE",
                 &[&group.account_group_id],
             )
-            .map_err(unavailable)?
+            .map_err(unavailable)
             .map(|row| AccountGroup {
                 account_group_id: group.account_group_id.clone(),
                 name: row.get(0),
                 account_ids: row.get(1),
                 built_in: row.get(2),
-            });
-        if let Some(before) = &before {
-            caught_up(
-                &mut tx,
-                GroupKind::Account,
-                &before.account_group_id,
-                &described_account_group(before),
-                at_ns,
-            )?;
-        }
+            })?;
+        caught_up(
+            &mut tx,
+            GroupKind::Account,
+            &before.account_group_id,
+            &described_account_group(&before),
+            at_ns,
+        )?;
         tx.execute(
-            "INSERT INTO config_account_group (account_group_id, name, account_ids)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (account_group_id) DO UPDATE
-                SET name = excluded.name, account_ids = excluded.account_ids",
+            "UPDATE config_account_group SET name = $2, account_ids = $3
+              WHERE account_group_id = $1",
             &[&group.account_group_id, &group.name, &group.account_ids],
         )
         .map_err(unavailable)?;
-        if let Some(record) = account_group_change(before.as_ref(), group, author, at_ns) {
+        if let Some(record) = account_group_change(Some(&before), group, author, at_ns) {
             insert_group_change(&mut tx, &record)?;
         }
         tx.commit().map_err(unavailable)

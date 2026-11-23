@@ -914,9 +914,13 @@ impl DelegationStore for InPostgres {
         if over > 0 {
             let removed = tx
                 .execute(
+                    // NOT consented again outside: a consent committed while
+                    // this waited for the row is seen, and that client, and
+                    // its delegation, kept (review-core-3 5).
                     "DELETE FROM dashboard_oauth_client WHERE client_id IN (
                          SELECT client_id FROM dashboard_oauth_client WHERE NOT consented
-                          ORDER BY registered_at_ns LIMIT $1)",
+                          ORDER BY registered_at_ns LIMIT $1)
+                       AND NOT consented",
                     &[&over],
                 )
                 .map_err(said)?;

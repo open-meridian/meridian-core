@@ -1867,3 +1867,103 @@ fn a_delegation_past_its_expiry_is_recorded_lapsed_once() {
         "a delegation revoked first never lapses"
     );
 }
+
+/// Review-core-3 5: a registration making room at the cap removes only a
+/// client nobody consented to. A consent committed while its removal waited
+/// for the client's row is seen: that client, and the delegation made with
+/// it, are kept, and the registration finds no room.
+#[test]
+fn a_consent_while_a_registration_makes_room_keeps_the_client() {
+    let (url, database) = migrated("consent_race");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    store.register(&client("mdc_old", T0), 1).unwrap();
+    // A consent in flight: the client's row held, consented, not committed.
+    let mut consenting = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut tx = consenting.transaction().unwrap();
+    tx.execute(
+        "UPDATE dashboard_oauth_client SET consented = true WHERE client_id = 'mdc_old'",
+        &[],
+    )
+    .unwrap();
+    let registering = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.register(&client("mdc_new", T0 + 1), 1).unwrap())
+    };
+    // Wait until the registration's removal waits for the held row.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut waited = 0;
+    while watch
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM dashboard_oauth_client%'",
+            &[],
+        )
+        .unwrap()
+        .get::<_, i64>(0)
+        == 0
+    {
+        waited += 1;
+        assert!(waited < 500, "the registration never waited for the row");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    tx.commit().unwrap();
+    assert!(
+        !registering.join().unwrap(),
+        "no room: the only client is consented now"
+    );
+    assert!(store.client("mdc_old").unwrap().is_some(), "kept");
+    assert!(store.client("mdc_new").unwrap().is_none());
+}
+
+/// Review-core-3 7: the one-time rewrite and the fill of a delegation's
+/// tools each leave their record in Postgres, once, the chain whole.
+#[test]
+fn a_rewrite_and_a_fill_each_leave_their_record_once_in_postgres() {
+    use delegation::record::{ChangeKind, ACTING_FILLED, REWRITTEN};
+    let (_url, database) = migrated("rewrite_fill");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store
+        .grant(&granting("mdc_a", old_rows, T0 + 30 * DAY_NS), T0)
+        .unwrap();
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made.id, &made.covers, &rewritten, T0 + 1)
+        .unwrap());
+    assert!(
+        !store
+            .rewrite(&made.id, &made.covers, &rewritten, T0 + 2)
+            .unwrap(),
+        "rewritten already: its rows differ from what was read"
+    );
+    for at in [T0 + 3, T0 + 4] {
+        store
+            .backfill_acting(&made.id, &["place_order".to_string()], at)
+            .unwrap();
+    }
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.note.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (ChangeKind::Made, "local|ada", T0, ""),
+            (ChangeKind::Rewritten, "", T0 + 1, REWRITTEN),
+            (ChangeKind::ActingFilled, "", T0 + 3, ACTING_FILLED),
+        ]
+    );
+    assert!(records[1].was.contains("oms-1 read (unmatched)"));
+    assert!(records[1].became.contains("plugins oms-1 oms read"));
+    assert!(records[2].became.contains("acting place_order"));
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+}

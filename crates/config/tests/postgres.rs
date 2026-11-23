@@ -3591,3 +3591,42 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
         "a group with records is left as it is"
     );
 }
+
+/// Review-core-3 6: two puts of one new group ID at once record it defined
+/// once and changed once, never defined twice.
+#[test]
+fn two_puts_of_one_new_group_at_once_record_it_defined_once() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind};
+    let (_schema, store) = store_at("new_group_race");
+    let store = Arc::new(store);
+    for round in 0..12 {
+        let id = format!("UG-{round}");
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let puts: Vec<_> = ["ada", "bea"]
+            .into_iter()
+            .map(|login| {
+                let (store, start, id) = (Arc::clone(&store), Arc::clone(&start), id.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    store
+                        .put_user_group(&user_group(&id, login), &Author::default(), 1)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for put in puts {
+            put.join().unwrap();
+        }
+        let kinds: Vec<_> = store
+            .group_changes(GroupKind::User, &id)
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [GroupChangeKind::Defined, GroupChangeKind::Changed],
+            "round {round}"
+        );
+    }
+}
