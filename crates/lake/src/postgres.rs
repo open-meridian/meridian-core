@@ -691,6 +691,18 @@ impl PostgresStore {
         }
     }
 
+    /// The group that owns `partition` by what its row's `writer_group`
+    /// names, as just read under the row's lock: that group where the store
+    /// has it, else its dataset's rendezvous owner. What
+    /// [`meridian_changes::groups::Groups::owner_by`] answers from the
+    /// member's view, answered from the row.
+    fn named_owner(&self, partition: &str, named: Option<u32>) -> u32 {
+        let count = self.groups.count();
+        named.filter(|group| *group < count).unwrap_or_else(|| {
+            meridian_changes::groups::owner(crate::range::dataset_of(partition), count)
+        })
+    }
+
     /// Refused where another writer group owns `dataset` (step 3d): its
     /// writes are handed to that group's writer, never committed here.
     fn owned(&self, partition: &str) -> Result<()> {
@@ -785,7 +797,8 @@ impl PostgresStore {
         self.epoch_now()?;
         let held = |tx: &mut Transaction<'_>| {
             tx.query_opt(
-                "SELECT head, epoch, closed_at FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                "SELECT head, epoch, closed_at, writer_group FROM lake_partition
+                  WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
             .map_err(unavailable)
@@ -824,6 +837,22 @@ impl PostgresStore {
                 })?
             }
         };
+        // The group the row names, read under its lock, before its epoch
+        // is checked: another group's epoch is never this writer's fence.
+        // `owned` above read this member's view, which a read of the owners
+        // from before a switch can set back (the review of c503f16d,
+        // finding 1); the write is the group's the row names.
+        if self.groups.several() {
+            let named = row.get::<_, Option<i32>>(3).map(|group| group as u32);
+            let group = self.named_owner(dataset, named);
+            if group != self.groups.mine() {
+                meridian_bus::owners::hand_to(group);
+                return Err(StoreError::NotOwned {
+                    partition: dataset.to_string(),
+                    group,
+                });
+            }
+        }
         // A move's pointer: never written under, never a fence (C3).
         if row.get::<_, i64>(1) == meridian_changes::moves::POINTER_EPOCH {
             return Err(StoreError::Held(format!(
@@ -2190,8 +2219,14 @@ impl PostgresStore {
                     "range {partition} is switching to another writer group: ask again in a moment"
                 ))),
                 Some((named, true, here, pointer)) => {
+                    // The group by the row taken, never by this member's
+                    // view read back: a read of the owners from before a
+                    // switch, written between the two, set it back, and
+                    // the batch went on as the owner to be fenced at the
+                    // head (the review of c503f16d, finding 1). The view
+                    // is only told.
                     self.groups.assign(partition, *named);
-                    let group = self.groups.owner_by(partition, dataset);
+                    let group = self.named_owner(partition, *named);
                     if group != mine || self.headed_elsewhere(partition, *here) {
                         Some(StoreError::NotOwned {
                             partition: partition.clone(),
