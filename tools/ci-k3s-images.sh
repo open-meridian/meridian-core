@@ -7,8 +7,11 @@
 # tools/ci-k3s-images.txt. Cluster jobs died from 2026-11-17 in a `ready`
 # wait on kube-system while those images came from Docker Hub
 # (coordinator-records 2026-11-23-runner-deaths, cause 2): with them here,
-# that cause is ruled in or out. The k3s-images action keeps DIR in GitHub's
-# cache, one entry per k3s and architecture; the Makefile hands the tarball
+# that cause is ruled in or out. The k3s-images action restores DIR from
+# GitHub's cache, where main keeps an entry for the Makefile's k3s alone, one
+# per architecture; every other k3s is fetched from its release each run (the
+# repository's cache is over its 10 GB limit, and an entry per k3s, 176-263 MB
+# each, would push out the Rust build caches). The Makefile hands the tarball
 # to every node (E2E_K3S_AIRGAP), where k3s imports it before it starts a
 # pod, and k3d finds the node image on this host and pulls nothing.
 #
@@ -18,7 +21,8 @@
 #                                    not matching its digest
 #   ci-k3s-images.sh load DIR TAG    the node image into Docker, the tarball
 #                                    checked; prints the tarball's path
-#   ci-k3s-images.sh rows            every row, as a JSON matrix for main's
+#   ci-k3s-images.sh rows            the Makefile's k3s's rows, one per
+#                                    architecture, as a JSON matrix for main's
 #                                    cargo-cache workflow, which keeps each
 #                                    entry where every run reads it
 set -eu
@@ -97,7 +101,8 @@ load)
 	echo "$file"
 	;;
 rows)
-	awk '!/^#/ && NF == 3 {
+	pin="$("$0" tag)"
+	awk -v pin="$pin" '!/^#/ && NF == 3 && $1 == pin {
 		printf "%s{\"k3s\":\"%s\",\"runner\":\"%s\"}", (n++ ? "," : "["), $1, ($2 == "aarch64" ? "ubuntu-24.04-arm" : "ubuntu-24.04")
 	} END { print "]" }' "$here/ci-k3s-images.txt"
 	;;

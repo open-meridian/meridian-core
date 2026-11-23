@@ -26,9 +26,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # k3s's own images for ci's cluster jobs (tools/ci-k3s-images.sh), one
-  # entry per row of tools/ci-k3s-images.txt, kept in main's scope, where
-  # every run reads them: ci's runs only read them.
+  # k3s's own images for ci's cluster jobs (tools/ci-k3s-images.sh), for
+  # the Makefile's k3s alone, one entry per architecture, kept in main's
+  # scope, where every run reads them: ci's runs only read them. The other
+  # k3s versions are fetched from their releases each run: the repository's
+  # cache is over its 10 GB limit, and an entry each would push out the Rust
+  # build caches.
   k3s-images-rows:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
