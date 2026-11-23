@@ -1724,19 +1724,21 @@ fn every_dashboard_change_record_is_kept_as_written() {
         .unwrap()
         .as_nanos() as i64
         - DAY_NS;
-    raw.batch_execute(&format!(
-        "INSERT INTO dashboard_prepared_call
-             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
-              prepared_at_ns, settled_at_ns)
-         VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, 1, NULL),
-                ('PC-SETTLED', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 2),
-                ('PC-AT-90-DAYS', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 3),
-                ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday});
-         INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
-         VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2),
-                ('PC-AT-90-DAYS', 4, 3), ('PC-YESTERDAY', 4, {yesterday});"
-    ))
-    .unwrap();
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, 1, NULL),
+                    ('PC-SETTLED', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 2),
+                    ('PC-AT-90-DAYS', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, 3),
+                    ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday});
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-PENDING', 1, 1), ('PC-SETTLED', 1, 1), ('PC-SETTLED', 4, 2),
+                    ('PC-AT-90-DAYS', 4, 3), ('PC-YESTERDAY', 4, {yesterday});"
+        ),
+    );
     refused(
         &mut raw,
         "UPDATE dashboard_prepared_call_change SET note = 'edited' WHERE prepared_call_id = 'PC-SETTLED'",
@@ -2343,18 +2345,20 @@ fn a_named_time_or_a_settle_dated_back_never_lets_a_step_go_early() {
         .unwrap()
         .as_nanos() as i64;
     let yesterday = now - DAY_NS;
-    raw.batch_execute(&format!(
-        "INSERT INTO dashboard_prepared_call
-             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
-              prepared_at_ns, settled_at_ns)
-         VALUES ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday}),
-                ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
-                ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
-                ('PC-SKEWED', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL);
-         INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
-         VALUES ('PC-YESTERDAY', 4, {yesterday}), ('PC-PENDING', 1, {now});"
-    ))
-    .unwrap();
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday}),
+                    ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                    ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                    ('PC-SKEWED', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL);
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-YESTERDAY', 4, {yesterday}), ('PC-PENDING', 1, {now});"
+        ),
+    );
     // A time far ahead named on the connection: the database's own is
     // earlier, and counts.
     refused(
@@ -2808,4 +2812,37 @@ fn migration_16s_records_meeting_the_release_before_are_tried_again() {
         .unwrap()
         .get(0);
     assert_eq!(made, 2, "each delegation given its records once");
+}
+
+/// Review-core-3d F6: a prepared change added already settled long ago is
+/// refused as one moved there is: its steps would otherwise go at once.
+/// Added pending, or settled now, it is as the dashboard adds and settles
+/// one.
+#[test]
+fn a_prepared_change_added_settled_long_ago_is_refused() {
+    let (url, _database) = migrated("settled_on_insert");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let now = database_now_ns(&mut raw);
+    let failed = raw
+        .batch_execute(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-OLD', 'dashboard__set_hold', '{}', 'local|ada', 4, 1, 1)",
+        )
+        .expect_err("added settled at the start of time");
+    assert_eq!(
+        failed.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "{failed}"
+    );
+    raw.batch_execute(&format!(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+              prepared_at_ns, settled_at_ns)
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 4, {now}, {now})"
+    ))
+    .expect("added pending, or settled now");
+    assert_eq!(count(&url, "dashboard_prepared_call"), 2);
 }

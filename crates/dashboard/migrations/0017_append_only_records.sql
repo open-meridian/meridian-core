@@ -54,24 +54,28 @@ $$;
 -- prepared change's row, then adds its step): with the release before
 -- still serving, the two never deadlock (review-core-3c N1).
 --
--- And it settles when it is settled: set the first time, it is no earlier
--- than the database's own time, less a skew for a replica's clock a little
--- behind and the moments a settle takes, so a pending one is never said to
--- have settled long ago to let its steps go early (review-core-3c N2). A
--- prepared change added already settled needs no such check: its steps are
--- added after it, and one with steps cannot be removed and added again (the
--- steps' foreign key).
+-- And it settles when it is settled: set the first time -- or added
+-- already settled -- it is no earlier than the database's own time, less a
+-- skew for a replica's clock a little behind and the moments a settle
+-- takes, so a prepared change is never said to have settled long ago to let
+-- its steps go early (review-core-3c N2, review-core-3d F6). A restore loads
+-- the rows before it makes this trigger, so what settled long ago comes
+-- back as it was.
 CREATE OR REPLACE FUNCTION dashboard_settled_once() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     -- Five minutes.
     settle_skew_ns CONSTANT bigint := 300000000000;
+    settled_first boolean := TG_OP = 'INSERT';
 BEGIN
-    IF OLD.settled_at_ns IS NOT NULL AND NEW.settled_at_ns IS DISTINCT FROM OLD.settled_at_ns THEN
-        RAISE EXCEPTION 'a prepared change settles once: when it settled is kept as written'
-            USING ERRCODE = 'insufficient_privilege';
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.settled_at_ns IS NOT NULL AND NEW.settled_at_ns IS DISTINCT FROM OLD.settled_at_ns THEN
+            RAISE EXCEPTION 'a prepared change settles once: when it settled is kept as written'
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        settled_first := OLD.settled_at_ns IS NULL;
     END IF;
-    IF OLD.settled_at_ns IS NULL AND NEW.settled_at_ns
+    IF settled_first AND NEW.settled_at_ns
            < (extract(epoch FROM statement_timestamp()) * 1000000000)::bigint - settle_skew_ns THEN
         RAISE EXCEPTION 'a prepared change settles when it is settled: % is before now', NEW.settled_at_ns
             USING ERRCODE = 'insufficient_privilege';
@@ -81,7 +85,7 @@ END
 $$;
 
 DROP TRIGGER IF EXISTS dashboard_settled_once ON dashboard_prepared_call;
-CREATE TRIGGER dashboard_settled_once BEFORE UPDATE ON dashboard_prepared_call
+CREATE TRIGGER dashboard_settled_once BEFORE INSERT OR UPDATE ON dashboard_prepared_call
     FOR EACH ROW EXECUTE FUNCTION dashboard_settled_once();
 
 DO $$
