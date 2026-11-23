@@ -21,9 +21,9 @@ use std::sync::Arc;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessRecords, DatasetEntitlement, DatasetLiveness, DatasetRef,
-    ExternalAccount, ExternalAccountsEvent, KnownPluginRoles, ListDatasetsReply, Permission, PluginCatalogue, PluginLaunch,
-    PluginLaunchState, PluginReport, PluginSettingValue, PluginSettingsRecord, SignInRecord,
-    UserGroup,
+    ExternalAccount, ExternalAccountsEvent, KnownPluginRoles, ListDatasetsReply, Permission,
+    PluginCatalogue, PluginLaunch, PluginLaunchState, PluginReport, PluginSettingValue,
+    PluginSettingsRecord, SignInRecord, UserGroup,
 };
 use meridian_pb::v1::{AccessLevel, DatasetLicence};
 use prost::Message;

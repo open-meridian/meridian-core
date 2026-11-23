@@ -368,7 +368,7 @@ fieldset.access-editor .pager .button{padding-left:.6rem;padding-right:.6rem}\
 table.plugins td>.hint{display:inline;margin:0 0 0 .4rem}\
 form.plugins-show{display:flex;margin:0 0 .5rem}form.plugins-show select{width:auto}.om-search>form.plugins-show{display:contents}\
 table.plugins th.c-plugin{width:25%}table.plugins th.c-instance{width:16%}table.plugins th.c-needs{width:23%}\
-table.plugins td.status{overflow:hidden}\
+table.plugins td.status{overflow:hidden;text-overflow:clip}\
 table.plugins th.c-manage{width:6.5rem}table.plugins td .monogram.small{vertical-align:middle;margin-right:.55rem}\
 table.plugins td.status .badge{margin-left:.35rem}table.plugins td.manage{text-align:right}\
 table.plugins td.manage .button{padding:.22rem .7rem;font-size:.86rem}table.plugins tbody tr[data-href]{cursor:pointer}\
