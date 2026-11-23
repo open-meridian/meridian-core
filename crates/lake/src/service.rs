@@ -4304,7 +4304,7 @@ impl Lake {
     /// Rows past each dataset's retention removed, each removal recorded.
     pub fn apply_retention(&self) {
         for (dataset, rows) in self.rows_per_dataset() {
-            tracing::info!(dataset, lake_rows_per_dataset = rows, "rows kept");
+            tracing::info!(dataset, lake_rows_per_dataset = rows, "rows in force");
         }
         let now = self.clock.now_ns();
         let config = self.config();
@@ -8891,12 +8891,13 @@ impl Lake {
         per_second
     }
 
-    /// Rows kept per dataset: what the `lake_rows_per_dataset` band reads.
+    /// Rows in force per dataset -- its row keys, each at its version in
+    /// force -- from the catalogue's figure: what the `lake_rows_per_dataset`
+    /// band reads, on retention's timer. Not every version kept, which only
+    /// reading every month of every dataset counts (v31a.17, the lake's
+    /// lock budget: that read was the first refused on dev).
     pub fn rows_per_dataset(&self) -> BTreeMap<String, u64> {
-        self.store
-            .counts()
-            .map(|c| c.into_iter().map(|(d, (rows, _))| (d, rows)).collect())
-            .unwrap_or_default()
+        self.store.rows_in_force().unwrap_or_default()
     }
 
     /// The business date a moment falls on in UTC: a convenience for a

@@ -4206,6 +4206,29 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        // The catalogue's own figure, kept as each batch commits: no row
+        // read, no month table locked (v31a.17).
+        let mut conn = self.conn()?;
+        let served = self.served_everywhere(&mut *conn)?;
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for row in conn
+            .query(
+                "SELECT dataset, in_force FROM lake_partition WHERE in_force > 0",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let partition: String = row.get(0);
+            if served.as_ref().is_some_and(|served| !served(&partition)) {
+                continue;
+            }
+            *out.entry(crate::range::dataset_of(&partition).to_string())
+                .or_default() += row.get::<_, i64>(1) as u64;
+        }
+        Ok(out)
+    }
+
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         // Read from lake_row_unconverted, which holds only these rows
         // (migration 6), each counted while it is its row key's version in

@@ -1085,6 +1085,10 @@ impl Store for HotStore {
         self.inner.counts()
     }
 
+    fn rows_in_force(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.rows_in_force()
+    }
+
     fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
         self.inner.lowest_kept(dataset)
     }
