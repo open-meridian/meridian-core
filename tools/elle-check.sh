@@ -63,8 +63,9 @@ verdict() {
 # found by hand in the history). Not --verbose: 0.1.10 deprecated it for
 # --output json, and 0.1.11's main rewrites it to the one argument
 # "--output json", which is no option it knows. Kept whole beside the
-# history, in a .e2e-*.log the job keeps. Said, never decided by: the
-# verdict above it is the check.
+# history, in a .e2e-*.log the job keeps. Of the driver's history, said,
+# never decided by: the verdict above it is the check. Of the planted one,
+# checked below.
 kept="$(dirname "$history")"
 anomalies() {
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
@@ -80,6 +81,18 @@ planted="$(verdict planted.edn)"
 echo "elle-check: the planted anomaly is refused, as it must be"
 # The same question asked of the planted history on every run (the review of
 # 2026-11-23, item 10): --output json is otherwise first run on the day a
-# real history is refused, when it is too late to find it says nothing.
+# real history is refused, when it is too late to find it says nothing. What
+# it says must name the anomaly: elle-cli prints its analysis as JSON, whose
+# "anomaly-types" lists each kind found (elle-cli 0.1.11, cli.clj:
+# json/pprint of the analysis). A usage error, a stack trace or an analysis
+# naming none has no such key, and fails the job here, on a planted history,
+# never first on a real one (the review of that change, finding 5: a file
+# that was not empty passed, whatever it held).
 anomalies planted.edn "$kept/.e2e-elle-planted.log"
-[ -s "$kept/.e2e-elle-planted.log" ] || echo "elle-check: WARNING: --output json said nothing of the planted anomaly" >&2
+grep -q '"anomaly-types"' "$kept/.e2e-elle-planted.log" || {
+	echo "elle-check: what --output json said of the planted history, its first 40 lines:" >&2
+	head -n 40 "$kept/.e2e-elle-planted.log" | cut -c1-4000 >&2
+	echo "elle-check FAILED: --output json named no anomaly in the planted history (no \"anomaly-types\" in .e2e-elle-planted.log): what it would say of a real one is not known" >&2
+	exit 1
+}
+echo "elle-check: --output json names the planted anomaly"
