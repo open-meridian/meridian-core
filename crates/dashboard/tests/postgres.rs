@@ -2695,3 +2695,117 @@ fn the_prepared_sweep_takes_only_what_the_database_lets_go() {
     assert_eq!(left, ["PC-EDGE"]);
     assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
 }
+
+/// Review-core-3d F4: the records a migration owes the past (16's, given
+/// each delegation standing as it runs) are written in the try its SQL is,
+/// under the same lock wait: one that meets the release before's writers --
+/// here a deadlock over two delegations' rows, the migration's to lose -- is
+/// rolled back and tried again, not failed.
+#[test]
+fn migration_16s_records_meeting_the_release_before_are_tried_again() {
+    let url = scratch("then_tried_again");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // The store as the release before left it: at 15, two delegations.
+    raw.batch_execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations() {
+        if version > 15 {
+            continue;
+        }
+        raw.batch_execute(sql).unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_schema_migration VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    for (id, client) in [("DLG-1", "mdc_a"), ("DLG-2", "mdc_b")] {
+        raw.execute(
+            "INSERT INTO dashboard_oauth_client
+                 (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+             VALUES ($1, 'meridian', '{}', 'meridian-cli', $2, true)",
+            &[&client, &T0],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_delegation
+                 (delegation_id, subject, display_name, client_id, covers_everything,
+                  made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+             VALUES ($1, 'local|ada', 'Ada Park', $2, true, $3, $3, $4, $3)",
+            &[&id, &client, &T0, &(T0 + 30 * DAY_NS)],
+        )
+        .unwrap();
+    }
+
+    // The release before holds DLG-2.
+    let mut holding = raw.transaction().unwrap();
+    holding
+        .query(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-2' FOR UPDATE",
+            &[],
+        )
+        .unwrap();
+    let mine: i32 = holding
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let migrating = {
+        let database = Database::connect(&url, 2).expect("connects");
+        std::thread::spawn(move || database.migrate(&meridian_clock::SystemClock))
+    };
+    // Until the migration, holding DLG-1 for its records, waits on DLG-2.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the migration never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Then the release before takes DLG-1: a deadlock, which the migration,
+    // waiting first, finds and loses.
+    holding
+        .query(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-1' FOR UPDATE",
+            &[],
+        )
+        .expect("the release before goes on");
+    holding.commit().unwrap();
+    migrating
+        .join()
+        .unwrap()
+        .expect("the migration is tried again, not failed");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let versions: Vec<i64> = raw
+        .query(
+            "SELECT version FROM dashboard_schema_migration WHERE version > 15 ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(versions, [16, 17]);
+    let made: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM dashboard_delegation_change WHERE kind = 'made' AND backfilled",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(made, 2, "each delegation given its records once");
+}

@@ -37,8 +37,11 @@ pub(crate) type Connection = r2d2::PooledConnection<
 /// a deployment migrating them together does not have one wait on another.
 const SCHEMA_LOCK: i64 = 0x6461_7368_626f_6172_u64 as i64;
 
-/// A migration's record it owes the past, written at the moment it ran.
-type Then = fn(&mut postgres::Transaction<'_>, i64) -> Result<(), String>;
+/// A migration's record it owes the past, written at the moment it ran, in
+/// the migration's try: its error the database's own, so a try that met
+/// the release before's writers is told from one that failed
+/// (review-core-3d F4).
+type Then = fn(&mut postgres::Transaction<'_>, i64) -> Result<(), postgres::Error>;
 
 struct Migration {
     version: i64,
@@ -164,7 +167,10 @@ const MIGRATIONS: &[Migration] = &[
 /// Migration 8's record (W6.29, decisions/031): every act at may make and
 /// every gate off at the upgrade to contract v20, which is what the
 /// deployment allowed before, said once, at the moment it ran.
-fn levels_at_the_upgrade(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Result<(), String> {
+fn levels_at_the_upgrade(
+    tx: &mut postgres::Transaction<'_>,
+    at_ns: i64,
+) -> Result<(), postgres::Error> {
     tx.execute(
         "INSERT INTO dashboard_agents_may_change (act, scope, from_said, to_said, changed_at_ns, note)
          SELECT '*', 'deployment', '', $1, $2, $3
@@ -174,8 +180,7 @@ fn levels_at_the_upgrade(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Resu
             &at_ns,
             &crate::prepared::levels::AT_THE_UPGRADE_NOTE,
         ],
-    )
-    .map_err(said)?;
+    )?;
     Ok(())
 }
 
@@ -322,19 +327,16 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
         if at.is_some_and(|at| at >= migration.version) {
             continue;
         }
-        // Where the release before still serves, each try waits at most a
-        // few seconds for a table's lock, and is rolled back and tried again,
-        // as the change log's install does: a deadlock with its writers, or
-        // their writes queued behind this one's wait, lasts no longer than
-        // that (review-core-3c N1).
+        // Where the release before still serves, each try -- its SQL and
+        // the records it owes the past -- waits at most a few seconds for a
+        // table's or a row's lock, and is rolled back and tried again, as the
+        // change log's install does: a deadlock with its writers, or their
+        // writes queued behind this one's wait, lasts no longer than that
+        // (review-core-3c N1, review-core-3d F4).
         let mut tries = 0u32;
         loop {
             let mut tx = conn.transaction().map_err(said)?;
-            let made = tx
-                .batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAITS_AT_MOST}'"))
-                .and_then(|()| tx.batch_execute(migration.sql))
-                .and_then(|()| tx.batch_execute("SET LOCAL lock_timeout TO DEFAULT"));
-            match made {
+            match tried(&mut tx, migration, clock.now_ns()) {
                 Ok(()) => {}
                 Err(failed) if tries < TRIES && contended(&failed) => {
                     drop(tx);
@@ -343,9 +345,6 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
                     continue;
                 }
                 Err(failed) => return Err(said(failed)),
-            }
-            if let Some(then) = migration.then {
-                then(&mut tx, clock.now_ns())?;
             }
             tx.execute(
                 "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
@@ -358,6 +357,21 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+/// One try of `migration` in `tx`: its SQL, then the records it owes the past
+/// at `at_ns`, each under the try's lock wait, the error the database's own.
+fn tried(
+    tx: &mut postgres::Transaction<'_>,
+    migration: &Migration,
+    at_ns: i64,
+) -> Result<(), postgres::Error> {
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAITS_AT_MOST}'"))?;
+    tx.batch_execute(migration.sql)?;
+    if let Some(then) = migration.then {
+        then(tx, at_ns)?;
+    }
+    tx.batch_execute("SET LOCAL lock_timeout TO DEFAULT")
 }
 
 /// How long a migration's statements wait for a table's lock before the try

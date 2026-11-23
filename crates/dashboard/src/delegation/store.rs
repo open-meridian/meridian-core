@@ -742,6 +742,15 @@ fn record(
     conn: &mut impl postgres::GenericClient,
     change: &DelegationChange,
 ) -> Result<(), String> {
+    recorded(conn, change).map_err(said)
+}
+
+/// [`record`], its error the database's own (for a migration's try, which
+/// tells one that met the release before's writers from one that failed).
+fn recorded(
+    conn: &mut impl postgres::GenericClient,
+    change: &DelegationChange,
+) -> Result<(), postgres::Error> {
     conn.execute(
         "INSERT INTO dashboard_delegation_change
              (delegation_id, subject, client_id, kind, was, became, changed_by, changed_at_ns,
@@ -760,8 +769,7 @@ fn record(
             &change.backfilled,
             &change.note,
         ],
-    )
-    .map_err(said)?;
+    )?;
     Ok(())
 }
 
@@ -771,7 +779,10 @@ fn record(
 /// them to every delegation standing as it runs, revoked or not. Each row is
 /// held and read again before its records are written, so two at once write
 /// them once; a delegation given any record is left as it is.
-pub fn backfill_from_rows(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Result<usize, String> {
+pub fn backfill_from_rows(
+    tx: &mut postgres::Transaction<'_>,
+    at_ns: i64,
+) -> Result<usize, postgres::Error> {
     const NONE_RECORDED: &str = "NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
                                         WHERE r.delegation_id = d.delegation_id)";
     let owed: Vec<String> = tx
@@ -781,24 +792,21 @@ pub fn backfill_from_rows(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Res
                   WHERE {NONE_RECORDED} ORDER BY d.delegation_id"
             ),
             &[],
-        )
-        .map_err(said)?
+        )?
         .iter()
         .map(|row| row.get(0))
         .collect();
     let mut given = 0;
     for id in &owed {
-        let Some(row) = tx
-            .query_opt(
-                &format!(
-                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+        let Some(row) = tx.query_opt(
+            &format!(
+                "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
                        JOIN dashboard_oauth_client c USING (client_id)
                       WHERE d.delegation_id = $1
                         FOR UPDATE OF d"
-                ),
-                &[id],
-            )
-            .map_err(said)?
+            ),
+            &[id],
+        )?
         else {
             continue;
         };
@@ -807,14 +815,13 @@ pub fn backfill_from_rows(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Res
             .query_one(
                 &format!("SELECT {NONE_RECORDED} FROM (SELECT $1::text AS delegation_id) d"),
                 &[id],
-            )
-            .map_err(said)?
+            )?
             .get(0);
         if !none {
             continue;
         }
         for record_owed in backfilled(&delegation_of(&row), at_ns) {
-            record(tx, &record_owed)?;
+            recorded(tx, &record_owed)?;
         }
         given += 1;
     }
@@ -825,7 +832,7 @@ pub fn backfill_from_rows(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Res
 pub(crate) fn held_when_records_began(
     tx: &mut postgres::Transaction<'_>,
     at_ns: i64,
-) -> Result<(), String> {
+) -> Result<(), postgres::Error> {
     backfill_from_rows(tx, at_ns).map(|_| ())
 }
 
