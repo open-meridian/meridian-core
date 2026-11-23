@@ -1,17 +1,18 @@
 //! The home page, "Your plugins", served for a real browser to look at, in
 //! both its views, at a phone's, a narrow pane's and a desktop's width.
 //!
-//! Ten instances shaped like a development deployment's: connectivity
-//! plugins whose cards say where they trade, long plugin names under the
+//! Twenty-four instances shaped like a development deployment's:
+//! connectivity plugins that trade, long plugin names under the
 //! `open-meridian/` prefix, short ones beside them, one not healthy, one
-//! with a setting-up step open, one stopped and one never launched -- each
-//! state of a card's status badge -- behind a stand-in conductor and lake
+//! starting, ones with a setting-up step open, one stopped and one never
+//! launched -- each status Settings › Plugins draws -- behind a stand-in conductor and lake
 //! answering the access records, the catalogue's launches and the datasets
 //! listing the home reads.
 //!
-//! Ignored in the ordinary run: it serves until it is stopped. The person
-//! signed in is a deployment admin; the session it starts is printed for
-//! the browser to present as `meridian_session`. `MERIDIAN_UI_DIR` is the
+//! Ignored in the ordinary run: it serves until it is stopped. Two people
+//! are signed in, a deployment admin and a member reading four; the
+//! sessions it starts are printed for the browser to present as
+//! `meridian_session`. `MERIDIAN_UI_DIR` is the
 //! kit's build, `MERIDIAN_HOME_PORT` the port (8080 by default).
 
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::session::Sessions;
 use crate::web::{router, App};
 
 const ADMIN: &str = "https://directory.example.org|admin";
+const MEMBER: &str = "https://directory.example.org|member";
 const SECOND_NS: i64 = 1_000_000_000;
 
 /// Each instance: its id, the plugin's name (none: installed, not launched
@@ -48,7 +50,161 @@ struct Shaped {
     stale_after_s: i64,
 }
 
-const SHAPED: [Shaped; 10] = [
+const SHAPED: [Shaped; 24] = [
+    Shaped {
+        instance: "coinbase-1",
+        name: "open-meridian/coinbase",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "ecb-1",
+        name: "open-meridian/ecb",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "kalshi-1",
+        name: "open-meridian/kalshi",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "polymarket-1",
+        name: "open-meridian/polymarket",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "pyth-1",
+        name: "open-meridian/pyth",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: None,
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "sample-multi-asset-1",
+        name: "sample-multi-asset",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "sample-operations-1",
+        name: "sample-operations",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "sample-options-1",
+        name: "sample-options",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "sample-pricing-1",
+        name: "sample-pricing",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "sample-reporting-1",
+        name: "sample-reporting",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "tiingo-1",
+        name: "open-meridian/tiingo",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "truefx-1",
+        name: "open-meridian/truefx",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "us-treasury-1",
+        name: "open-meridian/us-treasury",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
+    Shaped {
+        instance: "workspace-1",
+        name: "workspace",
+        roles: &["signal"],
+        state: PluginLaunchState::Launched,
+        healthy: Some(""),
+        environment: "",
+        licensed: false,
+        alive_ago_s: None,
+        stale_after_s: 0,
+    },
     Shaped {
         instance: "alpaca-1",
         name: "open-meridian/alpaca",
@@ -163,12 +319,20 @@ const SHAPED: [Shaped; 10] = [
 
 fn records() -> AccessRecords {
     AccessRecords {
-        user_groups: vec![UserGroup {
-            user_group_id: "UG-1".into(),
-            name: "Admins".into(),
-            directory_groups: vec![],
-            logins: vec![ADMIN.into()],
-        }],
+        user_groups: vec![
+            UserGroup {
+                user_group_id: "UG-1".into(),
+                name: "Admins".into(),
+                directory_groups: vec![],
+                logins: vec![ADMIN.into()],
+            },
+            UserGroup {
+                user_group_id: "UG-2".into(),
+                name: "Desk".into(),
+                directory_groups: vec![],
+                logins: vec![MEMBER.into()],
+            },
+        ],
         permissions: [
             meridian_access::DEPLOYMENT_ADMIN,
             meridian_access::ALL_PLUGINS_ADMIN,
@@ -182,25 +346,59 @@ fn records() -> AccessRecords {
             account_group_id: String::new(),
             access_group_id: (*group).into(),
         })
+        .chain(std::iter::once(Permission {
+            permission_id: "P-member".into(),
+            user_group_id: "UG-2".into(),
+            account_group_id: "AG-ALL".into(),
+            access_group_id: "AX-READ".into(),
+        }))
         .collect(),
         // Ada holds admin on the two not running, through a group of her
-        // own: the home lists only what a person holds or what runs.
-        access_groups: vec![AccessGroup {
-            access_group_id: "AX-DATA".into(),
-            name: "Data".into(),
-            entries: ["kraken-1", "ny-fed-1"]
-                .iter()
-                .map(|instance| AccessEntry {
-                    plugin_instance_id: (*instance).into(),
-                    level: AccessLevel::Admin as i32,
-                    role: "data".into(),
-                })
-                .collect(),
-            built_in: false,
-        }],
-        people: vec![SignInRecord {
-            subject: ADMIN.into(),
-            display_name: "Ada Admin".into(),
+        // own: the home lists only what a person holds or what runs. Max, a
+        // member, reads four.
+        access_groups: vec![
+            AccessGroup {
+                access_group_id: "AX-READ".into(),
+                name: "Desk readers".into(),
+                entries: ["desk-1", "workspace-1", "tradier-1", "kraken-1"]
+                    .iter()
+                    .map(|instance| AccessEntry {
+                        plugin_instance_id: (*instance).into(),
+                        level: AccessLevel::Read as i32,
+                        role: "signal".into(),
+                    })
+                    .collect(),
+                built_in: false,
+            },
+            AccessGroup {
+                access_group_id: "AX-DATA".into(),
+                name: "Data".into(),
+                entries: ["kraken-1", "ny-fed-1"]
+                    .iter()
+                    .map(|instance| AccessEntry {
+                        plugin_instance_id: (*instance).into(),
+                        level: AccessLevel::Admin as i32,
+                        role: "data".into(),
+                    })
+                    .collect(),
+                built_in: false,
+            },
+        ],
+        people: vec![
+            SignInRecord {
+                subject: ADMIN.into(),
+                display_name: "Ada Admin".into(),
+                ..Default::default()
+            },
+            SignInRecord {
+                subject: MEMBER.into(),
+                display_name: "Max Member".into(),
+                ..Default::default()
+            },
+        ],
+        account_groups: vec![meridian_domain::v1::AccountGroup {
+            account_group_id: "AG-ALL".into(),
+            name: "All accounts".into(),
             ..Default::default()
         }],
         known_plugins: SHAPED
@@ -237,7 +435,12 @@ fn catalogue(now: i64) -> PluginCatalogue {
                 version: "0.4.0".into(),
                 roles: shaped.roles.iter().map(|r| r.to_string()).collect(),
                 launched_by: ADMIN.into(),
-                launched_at_ns: now - 86_400 * SECOND_NS,
+                // pyth-1 launched moments ago and not heard from: Starting.
+                launched_at_ns: if shaped.instance == "pyth-1" {
+                    now - 10 * SECOND_NS
+                } else {
+                    now - 86_400 * SECOND_NS
+                },
                 state: shaped.state as i32,
                 stopped_by: if shaped.state == PluginLaunchState::Stopped {
                     ADMIN.into()
@@ -364,6 +567,7 @@ async fn serve_the_home_for_a_browser() {
     cache.store(records(), clock.now_ns());
     let sessions = Arc::new(Sessions::default());
     let session = sessions.start(ADMIN, "Ada Admin", vec![], clock.now_ns());
+    let member = sessions.start(MEMBER, "Max Member", vec![], clock.now_ns());
     let app = Arc::new(App {
         first_run: false,
         wizard: Arc::new(crate::first_run::WizardSession::default()),
@@ -409,6 +613,7 @@ async fn serve_the_home_for_a_browser() {
         .await
         .expect("the port");
     println!("SESSION={session}");
+    println!("MEMBER_SESSION={member}");
     println!("serving the home on port {port}");
     axum::serve(listener, router(app)).await.unwrap();
 }

@@ -546,7 +546,11 @@ async fn people_known(
     )
 }
 
-async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+async fn admin_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(asked): Query<HashMap<String, String>>,
+) -> Response {
     let (session, records) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(response) => return *response,
@@ -560,6 +564,10 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     };
     let custody = app.custody.view();
     let lines = plugin_lines(&app, &records, &custody).await;
+    // Each instance's status as the home page and list_plugins judge it.
+    let instances: Vec<String> = lines.iter().map(|line| line.instance.clone()).collect();
+    let statuses =
+        crate::plugin_status::every(&app, &records, &session.subject, true, &instances).await;
     let people = people_known(&app, &records, &delegating).await;
     let books = books::read(&app.bus).await;
     let levels = app.prepared.levels().await.unwrap_or_default();
@@ -628,7 +636,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     let body = overview::render(
         &records,
         &delegating,
-        &lines,
+        (&lines, &statuses, asked.get("show").map(String::as_str)),
         &people,
         &books,
         agents,

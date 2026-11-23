@@ -649,16 +649,35 @@ async fn a_plugin_session_opens_its_own_instance_alone() {
 async fn home_links_each_plugin_a_person_may_open() {
     let h = harness(&[INSTANCE]).await;
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    // Not launched through the catalogue, so named by its instance alone;
-    // and a button for the one level she holds, View (W6.9). The name is no
-    // link: the button is the way in.
+    // Not launched through the catalogue and not reporting: stopped, so not
+    // on the home page, which says what will bring one there.
+    assert!(
+        !home.body.contains("data-instance=\"snaptrade-1\""),
+        "{}",
+        home.body
+    );
+    assert!(home.body.contains(
+        "<strong>Nothing to open yet</strong><p>A plugin appears here once a deployment admin \
+         sets it up and gives you access.</p>"
+    ));
+    // Reporting, it is set up: one Open, at the one level she holds, View
+    // (W6.9), the whole tile the link and named by its instance alone.
+    h.app.health.hear(
+        INSTANCE,
+        meridian_domain::v1::PluginReport {
+            plugin_instance_id: INSTANCE.into(),
+            registered: true,
+            healthy: true,
+            reported_at_ns: h.app.clock.now_ns(),
+            ..Default::default()
+        },
+    );
+    let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     assert!(
         home.body.contains(
-            "<li class=\"list-row\" data-instance=\"snaptrade-1\"><div class=\"plugin-card\">\
-             <span class=\"plugin-main\"><span class=\"plugin-icon\" aria-hidden=\"true\">s</span>\
-             <span class=\"plugin-text\"><span class=\"plugin-name\" title=\"snaptrade-1\">snaptrade-1</span>\
-             <span class=\"plugin-sub\"><span class=\"plugin-badges\"><button type=\"button\" \
-             data-status=\"stopped\" class=\"badge\""
+            "<li data-instance=\"snaptrade-1\"><a class=\"open-item\" href=\"/plugins/snaptrade-1?level=read\" \
+             aria-label=\"Open snaptrade-1\" title=\"snaptrade-1\"><span class=\"monogram\" aria-hidden=\"true\">s1</span>\
+             <strong>snaptrade-1</strong><span class=\"button\" aria-hidden=\"true\">Open</span></a></li>"
         ),
         "{}",
         home.body
@@ -666,21 +685,13 @@ async fn home_links_each_plugin_a_person_may_open() {
     assert_eq!(
         home.body.matches("href=\"/plugins/snaptrade-1").count(),
         1,
-        "one way in, View's"
+        "one way in"
     );
     assert!(!home.body.contains("/admin/plugins/"));
-    assert!(home.body.contains(
-        "<a class=\"plugin-level\" data-level=\"read\" href=\"/plugins/snaptrade-1?level=read\">View</a>"
-    ));
     assert!(
-        !home.body.contains("data-level=\"write\"") && !home.body.contains("data-level=\"admin\"")
+        !home.body.contains("Manage plugins"),
+        "a deployment admin's link"
     );
-    // Its status badge, one of four, its why on hover: never launched from
-    // the catalogue and not reporting, so not launched.
-    assert!(home.body.contains(">Stopped</button>"), "{}", home.body);
-    assert!(home
-        .body
-        .contains("<span class=\"hint noted\" id=\"status-snaptrade-1\">Not launched</span>"));
 }
 
 #[test]
@@ -1075,50 +1086,43 @@ async fn an_admins_home_links_every_plugin_launched() {
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     let card = home
         .body
-        .split("<li class=\"list-row\" data-instance=\"snaptrade-1\">")
+        .split("<li data-instance=\"snaptrade-1\">")
         .nth(1)
         .unwrap_or_else(|| panic!("{}", home.body))
         .split("</li>")
         .next()
         .unwrap();
-    // Through All plugins (admin): Manage alone, into its area, named by
-    // the plugin and the instance both.
+    // Through All plugins (admin): its one Open goes in at admin, the
+    // highest level held; named by the plugin, the instance not shown.
     assert!(
         card.contains("href=\"/plugins/snaptrade-1?level=admin\""),
         "{card}"
     );
-    assert!(
-        card.contains("data-level=\"admin\" href=\"/plugins/snaptrade-1?level=admin\">Manage</a>")
-    );
-    assert!(
-        !card.contains(">Open</a>") && !card.contains(">View</a>"),
-        "{card}"
-    );
-    assert!(card.contains("<span class=\"plugin-name\" title=\"snaptrade\">snaptrade</span>"));
-    assert!(
-        card.contains("<span class=\"plugin-instance\" title=\"snaptrade-1\">snaptrade-1</span>")
-    );
+    assert_eq!(card.matches("href=").count(), 1, "one Open: {card}");
+    assert!(card.contains("<strong>snaptrade</strong>"), "{card}");
+    assert!(card.contains("title=\"snaptrade\""), "{card}");
+    assert!(!card.contains(">snaptrade-1<"), "no instance shown: {card}");
     assert!(!home.body.contains("stopped-1"), "{}", home.body);
-    // Both views, the list first; the tiles a switch away.
+    // The tiles, paged by whole grid rows, the list a switch away.
+    assert!(home.body.contains(
+        "<om-pager label=\"\"><ul class=\"open-grid\" id=\"home-plugins\" aria-label=\"Your plugins\">"
+    ));
     assert!(home
         .body
-        .contains("<om-pager><ul class=\"plugins list\" id=\"home-plugins\" data-plugins>"));
-    assert!(home.body.contains("data-view=\"tiles\""));
+        .contains("data-view=\"tiles\" aria-pressed=\"true\""));
+    assert!(home.body.contains("data-view=\"list\""));
     assert!(
-        !home.body.contains("data-filter=\"home-plugins\""),
-        "one plugin needs no search box"
+        !home.body.contains("Search your plugins"),
+        "no search box on the home page"
     );
 }
 
-/// The home's cards fit their content (the product owner's dev deployment
-/// at 1262 px: names and "Trading: ... · Data: Live" ran past a tile): a
-/// name carries its whole text on hover, its organisation's prefix faint;
-/// the instance likewise; and the badges sit in a line of their own, which
-/// the stylesheet wraps and cuts, each with its words on hover. Its status
-/// badge is one of four, its why the note; where it trades is a badge of
-/// its own, and its data is said in the status's note.
+/// A home tile is the plugin's mark, its short name and Open (the
+/// 2026-11-23 consensus): its whole name with its publisher on hover; no
+/// status, trading or instance on it -- Settings › Plugins and the area's
+/// head say those.
 #[tokio::test]
-async fn a_home_card_keeps_its_name_and_badges_whole_on_hover() {
+async fn a_home_tile_names_the_plugin_whole_on_hover_and_carries_no_badge() {
     let h = harness(&[]).await;
     let mut held = admin_records();
     held.known_plugins = vec![meridian_domain::v1::KnownPluginRoles {
@@ -1163,38 +1167,25 @@ async fn a_home_card_keeps_its_name_and_badges_whole_on_hover() {
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
     let card = home
         .body
-        .split("<li class=\"list-row\" data-instance=\"snaptrade-1\">")
+        .split("<li data-instance=\"snaptrade-1\">")
         .nth(1)
         .unwrap_or_else(|| panic!("{}", home.body))
         .split("</li>")
         .next()
         .unwrap();
+    // Not healthy stays on the home page, with no badge: its own page says
+    // why. Its short name, whole in the title with its publisher; no trading
+    // marker (the area's head carries it).
     assert!(
         card.contains(
-            "<span class=\"plugin-name\" title=\"open-meridian/polymarket-us\">\
-             <span class=\"faint\">open-meridian/</span>polymarket-us</span>"
+            "aria-label=\"Open polymarket-us\" title=\"open-meridian/polymarket-us\">\
+             <span class=\"monogram\" aria-hidden=\"true\">pu</span><strong>polymarket-us</strong>"
         ),
         "{card}"
     );
-    assert!(card.contains("<span class=\"plugin-icon\" aria-hidden=\"true\">p</span>"));
-    assert!(
-        card.contains("<span class=\"plugin-instance\" title=\"snaptrade-1\">snaptrade-1</span>")
-    );
-    assert!(
-        card.contains(
-            "<span class=\"plugin-badges\"><button type=\"button\" data-status=\"not-healthy\" \
-             class=\"badge bad\" data-note aria-describedby=\"status-snaptrade-1\">Not healthy</button>\
-             <span class=\"badge good\" data-environment=\"Demo\" title=\"Trading: Demo\">Trading: Demo</span></span>"
-        ),
-        "{card}"
-    );
-    assert!(
-        card.contains(
-            "<span class=\"hint noted\" id=\"status-snaptrade-1\">the token was &lt;refused&gt; \u{b7} Data: Live</span>"
-        ),
-        "{card}"
-    );
-    assert!(!card.contains("Trading: Demo \u{b7} Data: Live"), "{card}");
+    for gone in ["badge", "Trading", "Not healthy", "refused", "snaptrade-1<"] {
+        assert!(!card.contains(gone), "{gone}: {card}");
+    }
 }
 
 /// The product owner, 2026-09-30: lists are built for 100 and more. Past a
@@ -1202,7 +1193,7 @@ async fn a_home_card_keeps_its_name_and_badges_whole_on_hover() {
 /// order a person reads them, by name then instance, and says when a search
 /// matches none.
 #[tokio::test]
-async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search() {
+async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_pages_them() {
     let h = harness(&[]).await;
     h.app.records.store(admin_records(), h.app.clock.now_ns());
     h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
@@ -1227,30 +1218,20 @@ async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search
         ))
     });
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    assert_eq!(
-        home.body
-            .matches("<li class=\"list-row\" data-instance=")
-            .count(),
-        150
-    );
+    assert_eq!(home.body.matches("<li data-instance=").count(), 150);
     let order: Vec<&str> = home
         .body
-        .split("<li class=\"list-row\" data-instance=\"")
+        .split("<li data-instance=\"")
         .skip(1)
         .map(|rest| rest.split('"').next().unwrap())
         .collect();
     assert_eq!(order[0], "plugin-149", "Plugin 000 first");
     assert_eq!(order[149], "plugin-000", "Plugin 149 last");
-    let search = home.body.split("<ul class=").next().unwrap();
-    assert!(
-        search.contains("data-filter=\"home-plugins\" hidden")
-            && search.contains("aria-label=\"Search your plugins\"")
-            && search.contains("data-filter-count=\"home-plugins\""),
-        "a search box, hidden until the script shows it"
-    );
-    assert!(home.body.contains(
-        "<p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>"
-    ));
+    // No search box: om-pager pages them, whole grid rows at a time.
+    assert!(!home.body.contains("Search your plugins"));
+    assert!(home
+        .body
+        .contains("<om-pager label=\"\"><ul class=\"open-grid\""));
 }
 
 #[tokio::test]
@@ -1263,11 +1244,7 @@ async fn somebody_who_is_not_an_admin_is_not_shown_what_is_launched() {
         .store(deployment_admin_alone(), h.app.clock.now_ns());
     serving_launched(&h);
     let home = get(&h.app, DASHBOARD, "/", &[dashboard_cookie(&h)]).await;
-    assert!(
-        home.body.contains("No plugins for you yet"),
-        "{}",
-        home.body
-    );
+    assert!(home.body.contains("Nothing to open yet"), "{}", home.body);
     assert!(!home.body.contains("snaptrade-1"), "{}", home.body);
 }
 

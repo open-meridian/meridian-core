@@ -129,7 +129,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "list_plugins",
         "List the plugins",
-        "each plugin instance this person holds any level on through this delegation -- every one for a deployment admin -- with its title, its roles, what the person holds on each role (entries, role and level), and its state as its sidecar last reported it.",
+        "each plugin instance this person holds any level on through this delegation -- every one for a deployment admin -- with its title, its roles, what the person holds on each role (entries, role and level), and its state as its sidecar last reported it; and, as the home page and Settings › Plugins show it, its status (working, setting-up, not-healthy, starting or stopped), the reason, what it needs of a person (needs_you), where a connection trades (trading: Demo or Live) and whether the home page lists it (on_home).",
         true,
         Gate::Anyone,
         nothing_schema,
@@ -1404,24 +1404,22 @@ impl Context<'_> {
         }
         let reports: BTreeMap<String, PluginReport> = self.app.health.view();
         let reached_now = reached(Gate::Anyone, self.access, self.known);
-        // Contract v26 (W11.8), ruling 831: where a connectivity plugin
-        // trades, as its card on the home page says it.
-        let mut environments: BTreeMap<String, &'static str> = BTreeMap::new();
-        if let Ok(records) = self.app.records.current(self.app.clock.now_ns()) {
-            for instance in &reached_now {
-                let connection = self
-                    .access
-                    .known_roles
-                    .get(instance)
-                    .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
-                if connection {
-                    environments.insert(
-                        instance.clone(),
-                        crate::admin::connectivity::trading(self.app, &records, instance).await,
-                    );
-                }
+        // Each instance's status, its reason, what it needs of a person,
+        // where it trades and whether the home page lists it: judged by the
+        // one function the home page and Settings › Plugins use (PARITY).
+        let statuses = match self.app.records.current(self.app.clock.now_ns()) {
+            Ok(records) => {
+                crate::plugin_status::every(
+                    self.app,
+                    &records,
+                    &self.caller.subject,
+                    self.access.deployment_admin,
+                    &reached_now.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await
             }
-        }
+            Err(_) => BTreeMap::new(),
+        };
         let plugins: Vec<Value> = reached_now
             .into_iter()
             .map(|instance| {
@@ -1460,8 +1458,15 @@ impl Context<'_> {
                     "health_detail": if state.detail.is_empty() { state.word.to_string() } else { format!("{}: {}", state.word, others_words(&state.detail)) },
                     "reported_at_ns": report.map_or(0, |r| r.reported_at_ns),
                 });
-                if let Some(environment) = environments.get(&instance) {
-                    said["environment"] = json!(environment);
+                if let Some(status) = statuses.get(&instance) {
+                    if let Some(trading) = &status.trading {
+                        said["environment"] = json!(trading);
+                    }
+                    if let (Some(said), Value::Object(judged)) =
+                        (said.as_object_mut(), status.as_json(others_words))
+                    {
+                        said.extend(judged);
+                    }
                 }
                 said
             })
@@ -3520,6 +3525,9 @@ fn no_settings(instance: &str) -> Value {
 pub const PARITY: &[(&str, &str)] = &[
     // The home's plugin entries, and the admin portal's Plugins tab.
     ("home plugins", "list_plugins"),
+    // Each instance's status, reason, needs, trading and place on the home
+    // page, judged once for the home, Settings › Plugins and the tool.
+    ("plugin status", "list_plugins"),
     // The area under Manage: its tabs, the Summary's parts.
     ("tab summary", "read_plugin_summary"),
     ("tab settings", "read_plugin_settings set_plugin_settings"),
