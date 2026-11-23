@@ -2064,3 +2064,101 @@ fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first() {
         }
     }
 }
+
+/// Review-core-3b G: the sweep holds every delegation it lapses or removes
+/// in one pass, in order, so it never holds a later one while waiting for
+/// an earlier one another holder (revoke_person, in the same order) has.
+/// Here a holder has DLG-B, which the sweep removes, and then asks for
+/// DLG-C, which the sweep lapses: both finish, neither is deadlocked.
+#[test]
+fn the_sweep_and_another_holder_in_id_order_never_deadlock() {
+    use delegation::record::ChangeKind;
+    let (url, database) = migrated("sweep_order");
+    let store = std::sync::Arc::new(delegation::InPostgres::on(database));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_oauth_client
+             (client_id, name, redirect_uris, software_id, registered_at_ns, consented)
+         VALUES ('mdc_a', 'a', '{}', '', $1, true), ('mdc_b', 'b', '{}', '', $1, true)",
+        &[&T0],
+    )
+    .unwrap();
+    // DLG-B revoked long ago (removed by the sweep below), DLG-C past its
+    // expiry, unrevoked (lapsed by it).
+    raw.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns,
+              revoked_at_ns, revoked_by, revoked_why)
+         VALUES ('DLG-B', 'local|ada', 'Ada', 'mdc_a', true, $1, $1, $2, $1, $1, 'local|ada', 'x'),
+                ('DLG-C', 'local|bea', 'Bea', 'mdc_b', true, $1, $1, $3, $1, NULL, NULL, NULL)",
+        &[&T0, &(T0 + DAY_NS), &(T0 + 40 * DAY_NS)],
+    )
+    .unwrap();
+    // Given their records first, so the sweep below only lapses and removes.
+    store.sweep(T0 + 1).unwrap();
+
+    let mut holder = raw.transaction().unwrap();
+    holder
+        .batch_execute(
+            "SET LOCAL lock_timeout = '20s';
+             SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-B' FOR UPDATE",
+        )
+        .unwrap();
+    let mine: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let sweeping = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || store.sweep(T0 + 41 * DAY_NS))
+    };
+    // Until the sweep waits on the holder.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweep never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    holder
+        .batch_execute(
+            "SELECT 1 FROM dashboard_delegation WHERE delegation_id = 'DLG-C' FOR UPDATE",
+        )
+        .expect("the holder is not deadlocked");
+    holder.commit().unwrap();
+    sweeping
+        .join()
+        .unwrap()
+        .expect("the sweep is not deadlocked");
+    assert_eq!(
+        store
+            .changes("DLG-C")
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Lapsed]
+    );
+    assert_eq!(
+        store
+            .changes("DLG-B")
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked, ChangeKind::Removed]
+    );
+}

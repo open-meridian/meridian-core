@@ -1427,52 +1427,29 @@ impl DelegationStore for InPostgres {
             &[&now_ns, &TOKEN_KEPT_NS],
         )
         .map_err(said)?;
-        // Each delegation removed, its record written with the removal; and
-        // first, each with no record at all -- one the release before made
-        // while the upgrade ran -- given those its row holds the facts of.
+        // Each delegation the sweep records or removes held in one pass, in
+        // order, so it never holds a later one while it waits for an earlier
+        // one (revoke_person holds them in the same order; review-core-3b
+        // G): each with no record at all -- one the release before made
+        // while the upgrade ran -- given those its row holds the facts of;
+        // each past its expiry, unrevoked, recorded lapsed once (by its
+        // expiry: a renewal since lapses again); each ended longer than it
+        // is listed removed, its record written with the removal. Each is
+        // read again under its lock before its records are written.
         let mut tx = conn.transaction().map_err(said)?;
-        backfill_from_rows(&mut tx, now_ns)?;
-        // Each one past its expiry, unrevoked, recorded lapsed once (by its
-        // expiry: a renewal since lapses again), held and read again first.
-        const NOT_LAPSED: &str = "NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
-                                     WHERE r.delegation_id = d.delegation_id
-                                       AND r.kind = 'lapsed'
-                                       AND r.valid_at_ns = d.expires_at_ns)";
-        let lapsing = tx
+        let held = tx
             .query(
                 &format!(
                     "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
                        JOIN dashboard_oauth_client c USING (client_id)
-                      WHERE d.revoked_at_ns IS NULL AND d.expires_at_ns < $1 AND {NOT_LAPSED}
-                      ORDER BY d.delegation_id
-                        FOR UPDATE OF d"
-                ),
-                &[&now_ns],
-            )
-            .map_err(said)?;
-        for row in &lapsing {
-            let delegation = delegation_of(row);
-            let still: bool = tx
-                .query_one(
-                    &format!(
-                        "SELECT {NOT_LAPSED} FROM (SELECT $1::text AS delegation_id,
-                                                          $2::bigint AS expires_at_ns) d"
-                    ),
-                    &[&delegation.id, &delegation.expires_at_ns],
-                )
-                .map_err(said)?
-                .get(0);
-            if still {
-                Self::caught_up(&mut tx, &delegation, now_ns)?;
-                record(&mut tx, &lapsed(&delegation, now_ns))?;
-            }
-        }
-        let ended = tx
-            .query(
-                &format!(
-                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
-                       JOIN dashboard_oauth_client c USING (client_id)
-                      WHERE least(coalesce(d.revoked_at_ns, d.expires_at_ns), d.expires_at_ns)
+                      WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
+                                         WHERE r.delegation_id = d.delegation_id)
+                         OR (d.revoked_at_ns IS NULL AND d.expires_at_ns < $1
+                             AND NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
+                                              WHERE r.delegation_id = d.delegation_id
+                                                AND r.kind = 'lapsed'
+                                                AND r.valid_at_ns = d.expires_at_ns))
+                         OR least(coalesce(d.revoked_at_ns, d.expires_at_ns), d.expires_at_ns)
                             + $2::bigint < $1::bigint
                       ORDER BY d.delegation_id
                         FOR UPDATE OF d"
@@ -1480,18 +1457,33 @@ impl DelegationStore for InPostgres {
                 &[&now_ns, &KEPT_NS],
             )
             .map_err(said)?;
-        for row in &ended {
-            let gone = delegation_of(row);
-            Self::caught_up(&mut tx, &gone, now_ns)?;
-            tx.execute(
-                "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
-                &[&gone.id],
-            )
-            .map_err(said)?;
-            record(
-                &mut tx,
-                &change(ChangeKind::Removed, Some(&gone), None, "", now_ns, REMOVED),
-            )?;
+        for row in &held {
+            let delegation = delegation_of(row);
+            Self::caught_up(&mut tx, &delegation, now_ns)?;
+            Self::lapsed_first(&mut tx, &delegation, now_ns)?;
+            let ended = delegation
+                .revoked
+                .as_ref()
+                .map_or(delegation.expires_at_ns, |revoked| revoked.at_ns)
+                .min(delegation.expires_at_ns);
+            if ended + KEPT_NS < now_ns {
+                tx.execute(
+                    "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
+                    &[&delegation.id],
+                )
+                .map_err(said)?;
+                record(
+                    &mut tx,
+                    &change(
+                        ChangeKind::Removed,
+                        Some(&delegation),
+                        None,
+                        "",
+                        now_ns,
+                        REMOVED,
+                    ),
+                )?;
+            }
         }
         tx.commit().map_err(said)?;
         conn.execute(
