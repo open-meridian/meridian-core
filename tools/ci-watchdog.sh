@@ -10,7 +10,11 @@
 # show it, to a file outside the job's log, which the next steps print and
 # upload before anything else is uploaded:
 #
-#   ci-watchdog.sh start <file>   start the sampler, detached, and return
+#   ci-watchdog.sh start <file>   start the sampler, detached, and return;
+#                                 a notice names the runner's image, kernel
+#                                 and host, and GitHub's API's address is
+#                                 kept in <file>.api, which the evidence
+#                                 and the beacon give curl (--resolve)
 #   ci-watchdog.sh tail <file>    the file's last 40 lines
 #   ci-watchdog.sh make-tail <make-log> <out>
 #                                 the make's last 200 lines and the e2e's
@@ -40,14 +44,35 @@
 #                                 45139152927 every probe ran to its limit
 #                                 and nothing reached GitHub. The probes'
 #                                 results are added to it after
+#   ci-watchdog.sh proof <which> <make-log>
+#                                 after a failed make and before anything
+#                                 touches the network: one fact from file
+#                                 reads and local commands alone, as an
+#                                 ::error:: annotation where it does not
+#                                 hold and a ::notice:: where it does, and
+#                                 as the step's result. gave-up: which of
+#                                 the make's `ready` waits gave up; kernel:
+#                                 the kernel's blocked-task, hung-task,
+#                                 netlink and unregister_netdevice lines;
+#                                 answers: whether `ip -o link` and `docker
+#                                 ps` each answer within 3 s, said to the
+#                                 step's outputs as stalled=true|false.
+#                                 Each is also appended to proof.log beside
+#                                 the make's log, the annotations' source,
+#                                 and to the step summary. A command is
+#                                 asked in a detached child that is never
+#                                 waited for: a process stuck in the kernel
+#                                 ignores every signal, and `timeout` waits
+#                                 for its child, so on the runs that died
+#                                 `timeout 3 ip ...` would hang itself
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
-#                                 when nothing else does: gave-up, names,
-#                                 hub, blob, subnet. Each writes ok or
+#                                 when nothing else does: names, hub, blob,
+#                                 subnet. Each writes ok or
 #                                 failed, with its output's last line, to
-#                                 the step summary too: the steps are
+#                                 the step summary too. The steps are not
 #                                 continue-on-error, so the API shows each
-#                                 as passed whatever it found
+#                                 as passed, failed or timed out
 #
 # Each sample: the time and load; `free -m`; `df -h` of / and of Docker's
 # root; the five processes holding the most memory; `docker stats
@@ -65,9 +90,9 @@
 
 set -euo pipefail
 
-usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | probe <which> <make-log>" >&2; exit 2; }
+usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | proof|probe <which> <make-log>" >&2; exit 2; }
 case ${1:-}:$# in
-  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|probe:3|probe-one:3) ;;
+  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|proof:3|probe:3|probe-one:3) ;;
   *) usage ;;
 esac
 cmd=$1 file=$2
@@ -84,6 +109,27 @@ bounded() {
     124) echo "$1: no answer in $secs s" ;;
     *) [ -n "$out" ] || echo "$1: exit $rc" ;;
   esac
+}
+
+# Whether a command answers within $1 s: asked in a detached child, in its
+# own session, that is never waited for, so one stuck in the kernel is left
+# behind rather than holding this script. Its output is then in $within_out
+# and its exit in $within_rc; 1 when it did not answer in time.
+within() {
+  local secs=$1 dir i=0 detach=""
+  shift
+  dir=$(mktemp -d)
+  if command -v setsid >/dev/null 2>&1; then detach=setsid; fi
+  $detach sh -c 'd=$1; shift; "$@" >"$d/out" 2>&1; echo $? >"$d/rc.part"; mv "$d/rc.part" "$d/rc"' sh "$dir" "$@" \
+    </dev/null >/dev/null 2>&1 &
+  while [ ! -f "$dir/rc" ] && [ "$i" -lt "$((secs * 10))" ]; do sleep 0.1; i=$((i + 1)); done
+  if [ -f "$dir/rc" ]; then
+    within_rc=$(cat "$dir/rc") within_out=$(cat "$dir/out" 2>/dev/null || true)
+    rm -rf "$dir"
+    return 0
+  fi
+  within_rc="" within_out=""
+  return 1
 }
 
 # The hosts a cluster job needs after its start: the images' registry, the
@@ -228,14 +274,34 @@ check_send() {
     | jq -Rs --arg name "watchdog: ${CHECK_NAME:-a cluster job}" --arg sha "$CHECK_SHA" \
         '{name: $name, head_sha: $sha, status: "completed", conclusion: "neutral",
           output: {title: "What a failed cluster job knew", summary: "tools/ci-watchdog.sh evidence: the make and the sampler from its files first, then the network and the cluster, then a beacon.", text: .}}')
-  curl -sS -m 10 -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+  # The API's address as the watchdog's start found it, where it did: no
+  # name is looked up after a failure.
+  local resolve=()
+  if [ -s "${watch:-}.api" ]; then resolve=(--resolve "$(api_host):443:$(head -n 1 "$watch.api")"); fi
+  curl -sS -m 10 ${resolve[@]+"${resolve[@]}"} -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' -d "$body"
 }
 check_api() { echo "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/check-runs"; }
+api_host() { local h=${GITHUB_API_URL:-https://api.github.com}; h=${h#*://}; echo "${h%%/*}"; }
 
 case $cmd in
   start)
+    # Which runner this is, as an annotation, which arrives when the job's
+    # log does not: the runs that died since 2026-11-17 came from two image
+    # versions, and their kernel and host were never known.
+    echo "::notice title=the runner::image ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r 2>/dev/null || echo '?'), host $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
     mkdir -p "$(dirname "$file")"
+    # The API's address, looked up now while names resolve, kept beside the
+    # sampler's file for the failure's check run (curl --resolve): on the
+    # runs that died every new process touching the network hung after the
+    # make, and a lookup then is one more chance to.
+    addr=$(timeout 4 getent ahostsv4 "$(api_host)" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+    if [ -n "$addr" ]; then
+      echo "$addr" >"$file.api"
+      echo "ci-watchdog: $(api_host) is $addr, kept in $file.api for the failure's check run"
+    else
+      echo "::warning::ci-watchdog: $(api_host) did not resolve in 4 s; the failure's check run will look it up"
+    fi
     # Made by this user, so the upload after it can read what root appends.
     : >"$file"
     sudo_=""
@@ -368,12 +434,83 @@ case $cmd in
       sleep "${BEACON_EVERY:-15}"
     done
     ;;
+  proof)
+    # $file names the fact, $3 is the make's log. Nothing here touches the
+    # network, and no fact waits on its children for more than 8 s in all.
+    make=$3 proof="$(dirname "$3")/proof.log"
+    say() {
+      # $1 error or notice, $2 the title, the text on stdin: the annotation,
+      # the proof file and the step summary.
+      local level=$1 title=$2 text
+      text=$(cat)
+      { echo "== $(date -u +%H:%M:%SZ) $level: $title"; printf '%s\n' "$text"; } >>"$proof" 2>/dev/null || true
+      echo "::$level title=$title::$(printf '%s' "$text" | tail -c 3500 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}')"
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        printf -- '- proof `%s`: **%s**, %s\n' "$file" "$level" "$title" >>"$GITHUB_STEP_SUMMARY" || true
+      fi
+    }
+    case $file in
+      gave-up)
+        # The Makefile's ready(): "waiting for <what>, at most <n>s", then
+        # "gave up on <what> after <n>s" where it gives up.
+        gave=$(grep -h -E 'gave up on |could not be made' "$make" 2>/dev/null | head -n 3 || true)
+        last=$(grep -h -E 'waiting for .*, at most ' "$make" 2>/dev/null | tail -n 1 || true)
+        if [ -n "$gave" ]; then
+          printf '%s\n' "$gave" | say error "the make gave up: $(printf '%s' "$gave" | head -n 1 | sed -e 's/^e2e-cluster-k3d: //' -e 's/\. It said:$//' | cut -c1-120)"
+          exit 1
+        fi
+        echo "the last wait the make began: ${last:-none}" | say notice "no ready wait gave up"
+        ;;
+      kernel)
+        # As root where it can be, since dmesg is root's on GitHub's runners;
+        # the journal's kernel lines where dmesg says nothing.
+        pattern='blocked for more than|hung_task|INFO: task |netlink|unregister_netdevice'
+        read_by=""
+        # Each try's seconds first, 8 in all, inside the step's 10: sudo can
+        # itself wait on a name lookup.
+        for how in "4 sudo -n dmesg" "2 dmesg" "2 journalctl -k -q --no-pager"; do
+          # shellcheck disable=SC2086 # the words are the seconds and the command
+          if within $how && [ "$within_rc" = 0 ] && [ -n "$within_out" ]; then read_by=${how#* }; break; fi
+        done
+        if [ -z "$read_by" ]; then
+          echo "sudo -n dmesg (4 s), dmesg (2 s) and journalctl -k (2 s) gave nothing" | say error "the kernel's log could not be read"
+          exit 1
+        fi
+        found=$(printf '%s\n' "$within_out" | grep -i -E "$pattern" | tail -n 30 || true)
+        if [ -n "$found" ]; then
+          printf '%s\n' "$found" | say error "the kernel logged $(printf '%s\n' "$found" | grep -c .) blocked-task, hung-task, netlink or unregister_netdevice lines"
+          exit 1
+        fi
+        echo "$(printf '%s\n' "$within_out" | grep -c .) lines read by $read_by" | say notice "the kernel logged no blocked task, hung task, netlink or unregister_netdevice line"
+        ;;
+      answers)
+        stalled=false
+        report=""
+        for how in "ip -o link" "docker ps"; do
+          # shellcheck disable=SC2086 # the words are the command
+          if within 3 $how; then
+            report="$report$how: answered in 3 s (exit $within_rc, $(printf '%s\n' "$within_out" | grep -c .) lines)
+"
+          else
+            stalled=true
+            report="$report$how: no answer in 3 s, left running
+"
+          fi
+        done
+        [ -z "${GITHUB_OUTPUT:-}" ] || echo "stalled=$stalled" >>"$GITHUB_OUTPUT"
+        if [ "$stalled" = true ]; then
+          printf '%s' "$report" | say error "the runner is stalled: $(printf '%s' "$report" | grep 'no answer' | cut -d: -f1 | paste -sd, - | sed 's/,/ and /') did not answer in 3 s"
+          exit 1
+        fi
+        printf '%s' "$report" | say notice "ip and docker each answered within 3 s"
+        ;;
+      *) usage ;;
+    esac
+    ;;
   probe)
     # $file names the fact, $3 is the make's log. A step that fails says the
     # fact does not hold. The fact is asked in a bounded child, so its
-    # result reaches the step summary even when the asking hangs: the steps
-    # are continue-on-error, and the API shows each as passed whatever it
-    # found.
+    # result reaches the step summary even when the asking hangs.
     self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     rc=0
     said=$(timeout "${PROBE_SECONDS:-15}" "$self" probe-one "$file" "$3" 2>&1) || rc=$?
@@ -391,7 +528,6 @@ case $cmd in
     ;;
   probe-one)
     case $file in
-      gave-up) if grep -E 'gave up on|could not be made' "$3"; then false; else echo "no 'gave up on' or 'could not be made' line in $3"; fi ;;
       names) if names; then echo "registry-1.docker.io resolves"; else echo "registry-1.docker.io does not resolve"; false; fi ;;
       hub) r=$(answers "$HUB"); echo "$HUB: $r"; [ "${r%%/*}" != 000 ] ;;
       blob) r=$(answers "$BLOB"); echo "$BLOB: $r"; [ "${r%%/*}" != 000 ] ;;

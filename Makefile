@@ -968,6 +968,13 @@ K3D ?= k3d
 # E2E_K3S_IMAGE (.github/workflows/ci.yaml).
 KUBERNETES_VERSION := 1.36.5
 E2E_K3S_IMAGE ?= rancher/k3s:v$(KUBERNETES_VERSION)-k3s1
+# The k3s release's airgap tarball of its system images, for E2E_K3S_IMAGE's
+# version and this machine's architecture, handed to every node, where k3s
+# imports it before it starts a pod, so nothing in kube-system is pulled
+# from Docker Hub. CI's cluster jobs set it (.github/actions/k3s-images,
+# tools/ci-k3s-images.sh), with the node image loaded beside it; empty, the
+# system images are pulled as k3s pulls them.
+E2E_K3S_AIRGAP ?=
 E2E_K3D_CLUSTER ?= meridian-e2e
 E2E_K3D_NETWORK ?= meridian-k3d
 E2E_K3D_SUBNET ?= 172.28.0.0/16
@@ -1036,7 +1043,8 @@ e2e-cluster-k3d:
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
 	@$(if $(E2E_K3D_SHARED),docker volume rm -f $(E2E_K3D_SHARED) >/dev/null && docker volume create $(E2E_K3D_SHARED) >/dev/null,:)
-	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
+	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)$(if $(E2E_K3S_AIRGAP), with its system images from $(E2E_K3S_AIRGAP))"
+	@$(if $(E2E_K3S_AIRGAP),test -s "$(E2E_K3S_AIRGAP)" || { echo "e2e-cluster-k3d: E2E_K3S_AIRGAP names $(E2E_K3S_AIRGAP): it is not there" >&2; exit 1; },:)
 	@: >.e2e-k3d.log; made=; nodes=; at=0; \
 	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
 	$(if $(E2E_K3D_SHARED),nodes="$$nodes --volume $(E2E_K3D_SHARED):$(E2E_K3D_SHARED_PATH)@server:*;agent:*";) \
@@ -1046,6 +1054,7 @@ e2e-cluster-k3d:
 	for attempt in 1 2; do \
 	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) $$nodes \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
+		$(if $(E2E_K3S_AIRGAP),--volume "$(abspath $(E2E_K3S_AIRGAP)):/var/lib/rancher/k3s/agent/images/$(notdir $(E2E_K3S_AIRGAP))@server:*;agent:*") \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
 		--wait --timeout $(E2E_K3D_READY_SECONDS)s >>.e2e-k3d.log 2>&1; then made=yes; break; fi; \
@@ -1063,7 +1072,10 @@ e2e-cluster-k3d:
 	&& ready "every API group to be discoverable" kubectl api-resources \
 	&& kubectl -n kube-system rollout restart deploy/coredns >/dev/null \
 	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
-	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made"
+	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made" \
+	&& pulled=$$(kubectl get events -A --field-selector reason=Pulling \
+		-o jsonpath='{range .items[*]}{.message}{"; "}{end}' 2>/dev/null | sed 's/Pulling image //g'; true) \
+	&& echo "e2e-cluster-k3d: images pulled while it was made: $${pulled:-none}"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
 		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)" E2E_CLUSTER_HTTP_PORT=$(E2E_K3D_HTTP); \
 	  held=$$?; \
