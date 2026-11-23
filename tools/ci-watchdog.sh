@@ -43,7 +43,11 @@
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
 #                                 when nothing else does: gave-up, names,
-#                                 hub, blob, subnet
+#                                 hub, blob, subnet. Each writes ok or
+#                                 failed, with its output's last line, to
+#                                 the step summary too: the steps are
+#                                 continue-on-error, so the API shows each
+#                                 as passed whatever it found
 #
 # Each sample: the time and load; `free -m`; `df -h` of / and of Docker's
 # root; the five processes holding the most memory; `docker stats
@@ -63,7 +67,7 @@ set -euo pipefail
 
 usage() { echo "usage: $0 start|tail <file> | make-tail <make-log> <out> | evidence <make-log> <file> | probe <which> <make-log>" >&2; exit 2; }
 case ${1:-}:$# in
-  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|probe:3) ;;
+  start:2|loop:2|tail:2|make-tail:3|evidence:3|beacon:3|probe:3|probe-one:3) ;;
   *) usage ;;
 esac
 cmd=$1 file=$2
@@ -366,10 +370,29 @@ case $cmd in
     ;;
   probe)
     # $file names the fact, $3 is the make's log. A step that fails says the
-    # fact does not hold.
+    # fact does not hold. The fact is asked in a bounded child, so its
+    # result reaches the step summary even when the asking hangs: the steps
+    # are continue-on-error, and the API shows each as passed whatever it
+    # found.
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    rc=0
+    said=$(timeout "${PROBE_SECONDS:-15}" "$self" probe-one "$file" "$3" 2>&1) || rc=$?
+    case $rc in
+      0) result=ok ;;
+      124) result=failed said=$(printf '%s\n%s' "$said" "no answer in ${PROBE_SECONDS:-15} s") ;;
+      *) result=failed ;;
+    esac
+    [ -z "$said" ] || printf '%s\n' "$said"
+    line=$(printf '%s\n' "$said" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-300 || true)
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      printf -- '- probe `%s`: **%s**, %s\n' "$file" "$result" "${line:-no output}" >>"$GITHUB_STEP_SUMMARY" || true
+    fi
+    exit "$rc"
+    ;;
+  probe-one)
     case $file in
-      gave-up) ! grep -E 'gave up on|could not be made' "$3" ;;
-      names) names ;;
+      gave-up) if grep -E 'gave up on|could not be made' "$3"; then false; else echo "no 'gave up on' or 'could not be made' line in $3"; fi ;;
+      names) if names; then echo "registry-1.docker.io resolves"; else echo "registry-1.docker.io does not resolve"; false; fi ;;
       hub) r=$(answers "$HUB"); echo "$HUB: $r"; [ "${r%%/*}" != 000 ] ;;
       blob) r=$(answers "$BLOB"); echo "$BLOB: $r"; [ "${r%%/*}" != 000 ] ;;
       subnet) rc=0; overlaps || rc=$?; [ "$rc" -eq 1 ] ;;
