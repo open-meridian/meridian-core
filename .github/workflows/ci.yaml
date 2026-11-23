@@ -930,17 +930,18 @@ jobs:
       # died since 2026-11-17 gave up in one of the make's `ready` waits, and
       # then every new process touching an interface or Docker hung, and
       # every upload; their steps' results still arrived. So these come
-      # first, each bounded at 10 s, each an ::error:: or ::notice::
-      # annotation and the step's own result, and each appended to
-      # proof.log, the one upload a stalled runner keeps
-      # (tools/ci-watchdog.sh proof).
+      # first, each bounded at 10 s, each an ::error::, ::warning:: or
+      # ::notice:: annotation and the step's own result, and each appended to
+      # proof.log, which the failure's check run opens with
+      # (tools/ci-watchdog.sh proof, evidence).
       - name: "Proof: no ready wait gave up"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core
         run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
 
-      - name: "Proof: the kernel logged no blocked task or netlink fault"
+      # Red only where it matched a stall line; unreadable is a warning.
+      - name: "Proof: the kernel logged no stall"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core
@@ -1032,20 +1033,10 @@ jobs:
       # files, its evidence and its beacon's lines among them.
       # A runner whose ip or docker did not answer (the proof above) is
       # stalled: on those runs the cluster's removal ran to its limit and
-      # every upload hung to the job's. So it keeps one small upload alone,
-      # the proofs' own file, bounded at a minute, and skips the removal and
-      # every other upload. The job's and each step's limits are unchanged.
-      - name: Keep the proof alone, from a stalled runner
-        if: always() && steps.answers.outputs.stalled == 'true'
-        timeout-minutes: 1
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-proof
-          path: ${{ runner.temp }}/proof.log
-          if-no-files-found: warn
-          retention-days: 14
-
+      # every upload hung to the job's, the proof's own one-minute upload
+      # among them. So it skips the removal and every upload; the check
+      # run the step above made, which opens with the proofs, is what
+      # leaves. The job's and each step's limits are unchanged.
       - name: Keep the make's log and what the watchdog saw
         if: always() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
@@ -1151,7 +1142,7 @@ jobs:
 
       - name: Keep what the cluster said
         # And when the job's limit ends it, as the step above; never from a
-        # stalled runner (the proof's upload above).
+        # stalled runner (the check run above is its one channel).
         if: (failure() || cancelled()) && steps.answers.outputs.stalled != 'true'
         # A slow artifact service held a failed run open to the job's limit
         # (2026-10-06); the step above has put what failed in the job's log,
@@ -1381,17 +1372,18 @@ jobs:
       # died since 2026-11-17 gave up in one of the make's `ready` waits, and
       # then every new process touching an interface or Docker hung, and
       # every upload; their steps' results still arrived. So these come
-      # first, each bounded at 10 s, each an ::error:: or ::notice::
-      # annotation and the step's own result, and each appended to
-      # proof.log, the one upload a stalled runner keeps
-      # (tools/ci-watchdog.sh proof).
+      # first, each bounded at 10 s, each an ::error::, ::warning:: or
+      # ::notice:: annotation and the step's own result, and each appended to
+      # proof.log, which the failure's check run opens with
+      # (tools/ci-watchdog.sh proof, evidence).
       - name: "Proof: no ready wait gave up"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core
         run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
 
-      - name: "Proof: the kernel logged no blocked task or netlink fault"
+      # Red only where it matched a stall line; unreadable is a warning.
+      - name: "Proof: the kernel logged no stall"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
         working-directory: workspace/meridian-core
@@ -1447,20 +1439,10 @@ jobs:
       # files, its evidence and its beacon's lines among them.
       # A runner whose ip or docker did not answer (the proof above) is
       # stalled: on those runs the cluster's removal ran to its limit and
-      # every upload hung to the job's. So it keeps one small upload alone,
-      # the proofs' own file, bounded at a minute, and skips the removal and
-      # every other upload. The job's and each step's limits are unchanged.
-      - name: Keep the proof alone, from a stalled runner
-        if: always() && steps.answers.outputs.stalled == 'true'
-        timeout-minutes: 1
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-cluster-arm64-proof
-          path: ${{ runner.temp }}/proof.log
-          if-no-files-found: warn
-          retention-days: 14
-
+      # every upload hung to the job's, the proof's own one-minute upload
+      # among them. So it skips the removal and every upload; the check
+      # run the step above made, which opens with the proofs, is what
+      # leaves. The job's and each step's limits are unchanged.
       - name: Keep the make's log and what the watchdog saw
         if: always() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
@@ -1492,7 +1474,7 @@ jobs:
 
       - name: Keep what the cluster said
         # And when the job's limit ends it, as the step above; never from a
-        # stalled runner (the proof's upload above).
+        # stalled runner (the check run above is its one channel).
         if: (failure() || cancelled()) && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
