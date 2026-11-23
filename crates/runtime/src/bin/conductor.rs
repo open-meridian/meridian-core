@@ -265,6 +265,13 @@ fn run() -> Result<(), String> {
                 )
             })?;
             tracing::info!(epoch, "the configuration store writes under its epoch");
+            // A group the release before defined while the upgrade ran has
+            // no record: given its backfilled one (decisions/031).
+            if let Err(failed) =
+                tokio::task::block_in_place(|| postgres.backfill_group_records(now_ns()))
+            {
+                tracing::warn!(%failed, "the groups with no record could not be given one");
+            }
             let watched = Arc::clone(postgres);
             let writing = Arc::clone(postgres);
             holding.keep(

@@ -24,7 +24,8 @@ use meridian_pb::v1::{PluginDeclaration, RecordMoveRequest, SettingDeclaration, 
 use prost::Message;
 
 use crate::groups::{
-    account_group_change, user_group_change, GroupChangeKind, GroupChangeRecord, GroupKind,
+    account_group_change, described_account_group, described_user_group, owed_before_change,
+    user_group_change, GroupChangeKind, GroupChangeRecord, GroupKind,
 };
 use crate::migrations;
 use crate::store::{
@@ -161,6 +162,17 @@ impl PostgresStore {
         let mut conn = self.conn()?;
         let epoch = CHANGES.adopt(&mut *conn).map_err(unavailable)?;
         Ok(self.fence.adopt_once(epoch))
+    }
+
+    /// Each user group and account group with no record at all given its
+    /// backfilled record at `at_ns` (decision 47, decisions/031): one the
+    /// release before defined while the upgrade ran. Run by a conductor as
+    /// it starts to write; a group with any record is left as it is.
+    pub fn backfill_group_records(&self, at_ns: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        migrations::groups_held_when_records_began(&mut tx, at_ns)?;
+        tx.commit().map_err(unavailable)
     }
 
     /// Take the store over: raise its epoch, record who took it over and
@@ -894,6 +906,15 @@ impl Store for PostgresStore {
                 directory_groups: row.get(1),
                 logins: row.get(2),
             });
+        if let Some(before) = &before {
+            caught_up(
+                &mut tx,
+                GroupKind::User,
+                &before.user_group_id,
+                &described_user_group(before),
+                at_ns,
+            )?;
+        }
         tx.execute(
             "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
              VALUES ($1, $2, $3, $4)
@@ -930,6 +951,15 @@ impl Store for PostgresStore {
                 account_ids: row.get(1),
                 built_in: row.get(2),
             });
+        if let Some(before) = &before {
+            caught_up(
+                &mut tx,
+                GroupKind::Account,
+                &before.account_group_id,
+                &described_account_group(before),
+                at_ns,
+            )?;
+        }
         tx.execute(
             "INSERT INTO config_account_group (account_group_id, name, account_ids)
              VALUES ($1, $2, $3)
@@ -3407,6 +3437,35 @@ pub(crate) fn read_access_group(
         entries,
         built_in: group.get(1),
     }))
+}
+
+/// Before a group's change is recorded, the record it is owed for what
+/// changed it unrecorded (decisions/031; review-core-3 1): the release
+/// before, still serving as the upgrade ran, writes no record. Compared with
+/// the group's latest record, the group as it stands, held in `tx`, is
+/// given one -- held when its records began, or changed by an earlier
+/// release -- where they differ, so each record's `was` is the one before's
+/// `became`.
+fn caught_up(
+    tx: &mut postgres::Transaction<'_>,
+    group: GroupKind,
+    group_id: &str,
+    standing: &str,
+    at_ns: i64,
+) -> Result<()> {
+    let latest: Option<String> = tx
+        .query_opt(
+            "SELECT became FROM config_group_change
+              WHERE group_kind = $1 AND group_id = $2
+              ORDER BY change_id DESC LIMIT 1",
+            &[&group.code(), &group_id],
+        )
+        .map_err(unavailable)?
+        .map(|row| row.get(0));
+    if let Some(owed) = owed_before_change(group, group_id, standing, latest.as_deref(), at_ns) {
+        insert_group_change(tx, &owed)?;
+    }
+    Ok(())
 }
 
 /// One user-group or account-group change's record (decision 47).

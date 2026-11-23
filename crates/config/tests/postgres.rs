@@ -3491,3 +3491,103 @@ fn groups_standing_before_their_records_began_are_backfilled_once() {
     );
     assert!(!records[1].backfilled);
 }
+
+/// Review-core-3 1 (decisions/031): the release before keeps serving while
+/// migration 35 runs, and its changes write no record. A group it changed is
+/// given a record saying so before the next change is recorded, and one it
+/// defined is given its backfilled record, at start or at its next change;
+/// each record's `was` is the one before's `became`.
+#[test]
+fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
+    use meridian_config::groups::{
+        GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE, HELD_WHEN_RECORDS_BEGAN,
+    };
+    let (schema, store) = store_at("earlier_release");
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    let mut group = user_group("UG-1", "ada");
+    store.put_user_group(&group, &ada, 10).unwrap();
+    // The release before, as v15 writes: the row replaced, no record.
+    let mut raw = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    raw.batch_execute(
+        "UPDATE config_user_group SET logins = '{ada,bea}' WHERE user_group_id = 'UG-1';
+         INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-2', 'Ops', '{ops}', '{cy}'), ('UG-3', 'Risk', '{risk}', '{dee}');
+         INSERT INTO config_account_group (account_group_id, name, account_ids)
+         VALUES ('AG-9', 'Old', '{ACC-9}');",
+    )
+    .unwrap();
+
+    group.logins = vec!["grace".into()];
+    store.put_user_group(&group, &ada, 20).unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (GroupChangeKind::Defined, "local|ada", false, Some(10)),
+            (GroupChangeKind::ChangedByAnEarlierRelease, "", true, None),
+            (GroupChangeKind::Changed, "local|ada", false, Some(20)),
+        ]
+    );
+    assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(
+        records[1].at_ns, 20,
+        "recorded when found, never back-dated"
+    );
+    assert_eq!(
+        records[1].became,
+        "\"UG-1\": directory groups desk; logins ada, bea"
+    );
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // One the release before defined: its backfilled record first.
+    let mut ops = UserGroup {
+        user_group_id: "UG-2".into(),
+        name: "Ops".into(),
+        directory_groups: vec!["ops".into()],
+        logins: vec![],
+    };
+    store.put_user_group(&ops, &ada, 30).unwrap();
+    ops.logins.push("eve".into());
+    store.put_user_group(&ops, &ada, 40).unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-2").unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [
+            GroupChangeKind::HeldWhenRecordsBegan,
+            GroupChangeKind::Changed,
+            GroupChangeKind::Changed
+        ]
+    );
+    assert_eq!(records[0].note, HELD_WHEN_RECORDS_BEGAN);
+    assert_eq!(
+        records[0].became,
+        "\"Ops\": directory groups ops; logins cy"
+    );
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // At start, each one with no record at all, once: run twice, directly.
+    store.backfill_group_records(50).unwrap();
+    store.backfill_group_records(60).unwrap();
+    for (kind, id) in [(GroupKind::User, "UG-3"), (GroupKind::Account, "AG-9")] {
+        let records = store.group_changes(kind, id).unwrap();
+        assert_eq!(records.len(), 1, "{id}: {records:?}");
+        assert_eq!(records[0].kind, GroupChangeKind::HeldWhenRecordsBegan);
+        assert_eq!(records[0].at_ns, 50);
+    }
+    assert_eq!(
+        store.group_changes(GroupKind::User, "UG-1").unwrap().len(),
+        3,
+        "a group with records is left as it is"
+    );
+}

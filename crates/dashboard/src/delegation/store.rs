@@ -11,7 +11,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
-use super::record::{backfilled, change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN};
+use super::record::{
+    backfilled, change, owed_before_change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN,
+};
 use super::{
     Client, Covers, Delegation, DelegationChange, Grant, Kind, Revoked, Token, ToolCall,
     CALLS_KEPT_NS, KEPT_NS, UNCONSENTED_NS,
@@ -754,6 +756,29 @@ pub(crate) fn held_when_records_began(
 }
 
 impl InPostgres {
+    /// Before a change to `standing`, held in `tx`, is recorded: the
+    /// records it is owed for what changed it unrecorded
+    /// ([`super::record::owed_before_change`]), so each record's `was` is
+    /// the one before's `became`.
+    fn caught_up(
+        tx: &mut postgres::Transaction<'_>,
+        standing: &Delegation,
+        at_ns: i64,
+    ) -> Result<(), String> {
+        let latest: Option<String> = tx
+            .query_opt(
+                "SELECT became FROM dashboard_delegation_change
+                  WHERE delegation_id = $1 ORDER BY change_id DESC LIMIT 1",
+                &[&standing.id],
+            )
+            .map_err(said)?
+            .map(|row| row.get(0));
+        for owed in owed_before_change(standing, latest.as_deref(), at_ns) {
+            record(tx, &owed)?;
+        }
+        Ok(())
+    }
+
     /// One delegation, its row held until the transaction ends, so the
     /// record of a change to it says what it was.
     fn held(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Option<Delegation>, String> {
@@ -792,6 +817,7 @@ impl InPostgres {
         )
         .map_err(said)?;
         let after = Self::find(tx, id)?.ok_or("the delegation just revoked is gone")?;
+        Self::caught_up(tx, &before, now_ns)?;
         record(
             tx,
             &change(
@@ -977,8 +1003,11 @@ impl DelegationStore for InPostgres {
         .map_err(said)?;
         let delegation = Self::find(&mut tx, &id)?.ok_or("the delegation just made is gone")?;
         let before = before.filter(|before| before.id == delegation.id);
-        let kind = match before {
-            Some(_) => ChangeKind::Renewed,
+        let kind = match &before {
+            Some(before) => {
+                Self::caught_up(&mut tx, before, now_ns)?;
+                ChangeKind::Renewed
+            }
             None => ChangeKind::Made,
         };
         record(
@@ -1165,6 +1194,9 @@ impl DelegationStore for InPostgres {
             .map_err(said)?;
         if filled == 1 {
             let after = Self::find(&mut tx, id)?.ok_or("the delegation just filled is gone")?;
+            if let Some(before) = &before {
+                Self::caught_up(&mut tx, before, now_ns)?;
+            }
             record(
                 &mut tx,
                 &change(
@@ -1243,6 +1275,7 @@ impl DelegationStore for InPostgres {
         .map_err(said)?;
         let after = Self::find(&mut tx, id)?.ok_or("the delegation just rewritten is gone")?;
         if after != before {
+            Self::caught_up(&mut tx, &before, now_ns)?;
             record(
                 &mut tx,
                 &change(
@@ -1289,8 +1322,11 @@ impl DelegationStore for InPostgres {
             &[&now_ns, &TOKEN_KEPT_NS],
         )
         .map_err(said)?;
-        // Each delegation removed, its record written with the removal.
+        // Each delegation removed, its record written with the removal; and
+        // first, each with no record at all -- one the release before made
+        // while the upgrade ran -- given those its row holds the facts of.
         let mut tx = conn.transaction().map_err(said)?;
+        backfill_from_rows(&mut tx, now_ns)?;
         let ended = tx
             .query(
                 &format!(
@@ -1306,6 +1342,7 @@ impl DelegationStore for InPostgres {
             .map_err(said)?;
         for row in &ended {
             let gone = delegation_of(row);
+            Self::caught_up(&mut tx, &gone, now_ns)?;
             tx.execute(
                 "DELETE FROM dashboard_delegation WHERE delegation_id = $1",
                 &[&gone.id],

@@ -39,13 +39,18 @@ impl GroupKind {
     }
 }
 
-/// A group defined anew, changed, or held when its records began
-/// (backfilled, decisions/031).
+/// A group defined anew, changed, held when its records began, or changed
+/// by an earlier release as an upgrade ran (the last two backfilled,
+/// decisions/031).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupChangeKind {
     Defined,
     Changed,
     HeldWhenRecordsBegan,
+    /// Found changed since its last record, by a copy of the release before
+    /// still serving as the upgrade ran: what it was and became are known,
+    /// who changed it and when are not.
+    ChangedByAnEarlierRelease,
 }
 
 impl GroupChangeKind {
@@ -55,6 +60,7 @@ impl GroupChangeKind {
             GroupChangeKind::Defined => 1,
             GroupChangeKind::Changed => 2,
             GroupChangeKind::HeldWhenRecordsBegan => 3,
+            GroupChangeKind::ChangedByAnEarlierRelease => 4,
         }
     }
 
@@ -63,6 +69,7 @@ impl GroupChangeKind {
             1 => Some(GroupChangeKind::Defined),
             2 => Some(GroupChangeKind::Changed),
             3 => Some(GroupChangeKind::HeldWhenRecordsBegan),
+            4 => Some(GroupChangeKind::ChangedByAnEarlierRelease),
             _ => None,
         }
     }
@@ -94,10 +101,17 @@ pub struct GroupChangeRecord {
     pub note: String,
 }
 
-/// What the backfilled record says (migration 35).
-pub const HELD_WHEN_RECORDS_BEGAN: &str = "backfilled by migration 35: the group as it stood \
-     when each user-group and account-group change began to be its own record; who defined it \
-     or last changed it, and when, is not known";
+/// What a group found with no record is given (migration 35, and again
+/// for one an earlier release defined as the upgrade ran).
+pub const HELD_WHEN_RECORDS_BEGAN: &str = "backfilled: the group as it stood when it was first \
+     found with no record, each user-group and account-group change its own record from \
+     migration 35; who defined it or last changed it, and when, is not known";
+
+/// What a gap record says: the group changed since its last record by a copy
+/// of the release before, still serving while the upgrade ran.
+pub const CHANGED_BY_AN_EARLIER_RELEASE: &str = "backfilled: changed by an earlier release \
+     still serving as the upgrade ran, so no record was written with it; who changed it, and \
+     when, are not known";
 
 /// A user group as a record says it: its name, its directory groups and its
 /// logins.
@@ -173,6 +187,46 @@ pub fn account_group_change(
         author,
         at_ns,
     ))
+}
+
+/// The record a group is owed before its change is recorded, found as it
+/// stands as `standing` (decisions/031): held when its records began where
+/// it has none, `latest` being None; changed by an earlier release where it
+/// stands otherwise than its latest record became; None where the records
+/// are whole.
+pub fn owed_before_change(
+    group: GroupKind,
+    group_id: &str,
+    standing: &str,
+    latest: Option<&str>,
+    at_ns: i64,
+) -> Option<GroupChangeRecord> {
+    let (kind, was, note) = match latest {
+        None => (
+            GroupChangeKind::HeldWhenRecordsBegan,
+            String::new(),
+            HELD_WHEN_RECORDS_BEGAN,
+        ),
+        Some(became) if became == standing => return None,
+        Some(became) => (
+            GroupChangeKind::ChangedByAnEarlierRelease,
+            became.to_string(),
+            CHANGED_BY_AN_EARLIER_RELEASE,
+        ),
+    };
+    Some(GroupChangeRecord {
+        group,
+        group_id: group_id.to_string(),
+        kind,
+        was,
+        became: standing.to_string(),
+        by: String::new(),
+        delegation: String::new(),
+        at_ns,
+        valid_at_ns: None,
+        backfilled: true,
+        note: note.to_string(),
+    })
 }
 
 fn record(

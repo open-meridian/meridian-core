@@ -1574,3 +1574,91 @@ fn delegations_standing_before_their_records_began_keep_the_facts_their_rows_hol
         }
     }
 }
+
+/// Review-core-3 1 (decisions/031): the release before keeps serving while
+/// migration 16 runs, and its changes write no record. A delegation it
+/// changed is given a record saying so before the next change is recorded,
+/// and one it made is given the records its row holds the facts of, by the
+/// sweep or at its next change; each record's `was` is the one before's
+/// `became`.
+#[test]
+fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
+    use delegation::record::{ChangeKind, CHANGED_BY_AN_EARLIER_RELEASE};
+    let (url, database) = migrated("earlier_release");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let made = store
+        .grant(
+            &granting("mdc_a", Covers::everything(), T0 + 30 * DAY_NS),
+            T0,
+        )
+        .unwrap();
+    // The release before, as v15 writes: a renewal in place and a
+    // delegation made, neither recorded.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let renewed = T0 + DAY_NS;
+    raw.execute(
+        "UPDATE dashboard_delegation SET renewed_at_ns = $2, expires_at_ns = $3
+          WHERE delegation_id = $1",
+        &[&made.id, &renewed, &(renewed + 30 * DAY_NS)],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_delegation
+             (delegation_id, subject, display_name, client_id, covers_everything,
+              made_at_ns, renewed_at_ns, expires_at_ns, groups_read_at_ns)
+         VALUES ('DLG-OLD', 'local|ada', 'Ada Park', 'mdc_b', true, $1, $1, $2, $1)",
+        &[&renewed, &(renewed + 30 * DAY_NS)],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE dashboard_oauth_client SET consented = true WHERE client_id = 'mdc_b'",
+        &[],
+    )
+    .unwrap();
+
+    assert!(store
+        .revoke(&made.id, "local|root", "left", renewed + 1)
+        .unwrap());
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", false, Some(T0)),
+            (ChangeKind::ChangedByAnEarlierRelease, "", true, None),
+            (ChangeKind::Revoked, "local|root", false, Some(renewed + 1)),
+        ]
+    );
+    assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[1].at_ns, renewed + 1, "recorded when found");
+    assert!(records[1].became.contains("renewed 2026-09-27T00:00:00Z"));
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // The sweep gives the one it made its records, once.
+    store.sweep(renewed + 2).unwrap();
+    store.sweep(renewed + 3).unwrap();
+    let records = store.changes("DLG-OLD").unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.backfilled, r.at_ns, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [(ChangeKind::Made, true, renewed + 2, Some(renewed))]
+    );
+    assert!(store
+        .revoke("DLG-OLD", "local|ada", "done", renewed + 4)
+        .unwrap());
+    let records = store.changes("DLG-OLD").unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked]
+    );
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+}

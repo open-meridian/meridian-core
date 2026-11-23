@@ -240,10 +240,12 @@ pub const MIGRATIONS: &[Migration] = &[
 ];
 
 /// Migration 35 (decision 47, decisions/031): each user group and account
-/// group standing as it runs given one backfilled record, the group as it
-/// stood, who made it not known, at `at_ns`, the moment it ran. A group given
-/// one already is left as it is, so it runs once.
-fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
+/// group with no record at all given one backfilled record, the group as it
+/// stood, who made it not known, at `at_ns`, the moment it ran. A group with
+/// any record is left as it is, so it may run again: the conductor runs it
+/// each time it starts to write, for a group the release before defined
+/// while the upgrade ran ([`crate::PostgresStore::backfill_group_records`]).
+pub fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Result<()> {
     use crate::groups::{
         described_account_group, described_user_group, GroupChangeKind, GroupKind,
         HELD_WHEN_RECORDS_BEGAN,
@@ -251,7 +253,9 @@ fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Resul
     let unavailable = |failed: postgres::Error| StoreError::Unavailable(failed.to_string());
     let mut held: Vec<(GroupKind, String, String)> = tx
         .query(
-            "SELECT user_group_id, name, directory_groups, logins FROM config_user_group
+            "SELECT user_group_id, name, directory_groups, logins FROM config_user_group g
+              WHERE NOT EXISTS (SELECT 1 FROM config_group_change c
+                                 WHERE c.group_kind = 1 AND c.group_id = g.user_group_id)
               ORDER BY user_group_id",
             &[],
         )
@@ -273,7 +277,9 @@ fn groups_held_when_records_began(tx: &mut Transaction<'_>, at_ns: i64) -> Resul
         .collect();
     held.extend(
         tx.query(
-            "SELECT account_group_id, name, account_ids, built_in FROM config_account_group
+            "SELECT account_group_id, name, account_ids, built_in FROM config_account_group g
+              WHERE NOT EXISTS (SELECT 1 FROM config_group_change c
+                                 WHERE c.group_kind = 2 AND c.group_id = g.account_group_id)
               ORDER BY account_group_id",
             &[],
         )

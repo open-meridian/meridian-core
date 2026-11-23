@@ -38,6 +38,10 @@ pub enum ChangeKind {
     ActingFilled,
     /// Removed from the list a month after it ended.
     Removed,
+    /// Found changed since its last record, by a copy of the release before
+    /// still serving as the upgrade ran (backfilled): what it was and
+    /// became are known, who changed it and when are not.
+    ChangedByAnEarlierRelease,
 }
 
 impl ChangeKind {
@@ -50,6 +54,7 @@ impl ChangeKind {
             ChangeKind::Rewritten => "rewritten",
             ChangeKind::ActingFilled => "acting_filled",
             ChangeKind::Removed => "removed",
+            ChangeKind::ChangedByAnEarlierRelease => "changed_by_an_earlier_release",
         }
     }
 
@@ -61,6 +66,7 @@ impl ChangeKind {
             ChangeKind::Rewritten,
             ChangeKind::ActingFilled,
             ChangeKind::Removed,
+            ChangeKind::ChangedByAnEarlierRelease,
         ]
         .into_iter()
         .find(|kind| kind.name() == name)
@@ -122,6 +128,12 @@ pub const RENEWED_BACKFILLED: &str = "backfilled from the delegation's row, whic
 /// What a backfilled fill's record says.
 pub const ACTING_FILLED_BACKFILLED: &str = "backfilled from the delegation's row, which holds \
      when its consented tools were filled in once, no person (contract v18)";
+
+/// What a gap record says: the delegation changed since its last record by
+/// a copy of the release before, still serving while the upgrade ran.
+pub const CHANGED_BY_AN_EARLIER_RELEASE: &str = "backfilled: changed by an earlier release \
+     still serving as the upgrade ran, so no record was written with it; who changed it, and \
+     when, are not known beyond what it became says";
 
 /// What a backfilled revocation's record says.
 pub const REVOKED_BACKFILLED: &str = "backfilled from the delegation's row, which holds when \
@@ -303,4 +315,35 @@ pub fn backfilled(delegation: &Delegation, at_ns: i64) -> Vec<DelegationChange> 
         ));
     }
     records
+}
+
+/// The records a delegation is owed before its change is recorded, found as
+/// it stands as `standing` (decisions/031; review-core-3 1), recorded at
+/// `at_ns`: those its row holds the facts of where it has none, `latest`
+/// being None ([`backfilled`]); one saying it was changed by an earlier
+/// release where it stands otherwise than its latest record became; none
+/// where its records are whole.
+pub fn owed_before_change(
+    standing: &Delegation,
+    latest: Option<&str>,
+    at_ns: i64,
+) -> Vec<DelegationChange> {
+    let now = described(standing);
+    match latest {
+        None => backfilled(standing, at_ns),
+        Some(became) if became == now => Vec::new(),
+        Some(became) => vec![DelegationChange {
+            delegation_id: standing.id.clone(),
+            subject: standing.subject.clone(),
+            client_id: standing.client_id.clone(),
+            kind: ChangeKind::ChangedByAnEarlierRelease,
+            was: became.to_string(),
+            became: now,
+            by: String::new(),
+            at_ns,
+            valid_at_ns: None,
+            backfilled: true,
+            note: CHANGED_BY_AN_EARLIER_RELEASE.to_string(),
+        }],
+    }
 }

@@ -19,6 +19,14 @@
 -- recorded at the deployment's time as the migration runs (database.rs),
 -- never back-dated; what the row does not hold -- what a renewal replaced,
 -- any renewal before its last -- is said to be not known.
+--
+-- The release before keeps serving while this runs, and its changes write
+-- no record. So the sweep gives the same records to any delegation with
+-- none (one it made), and before each change is recorded the delegation as
+-- it stands is compared with its latest record: one found otherwise is
+-- first given a record saying it was changed by an earlier release, from
+-- what the last record said to what it is, who and when not known. Each
+-- record's `was` is the one before's `became`.
 CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     change_id     bigserial PRIMARY KEY,
     delegation_id text      NOT NULL,
@@ -26,7 +34,8 @@ CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     subject       text      NOT NULL,
     client_id     text      NOT NULL,
     kind          text      NOT NULL CHECK (kind IN ('made', 'renewed', 'revoked', 'rewritten',
-                                                     'acting_filled', 'removed')),
+                                                     'acting_filled', 'removed',
+                                                     'changed_by_an_earlier_release')),
     was           text      NOT NULL DEFAULT '',
     became        text      NOT NULL DEFAULT '',
     -- The person consenting, the subject revoking (or `client`, or
@@ -40,7 +49,9 @@ CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     -- Written after the change, from what the delegation's row held.
     backfilled    boolean   NOT NULL DEFAULT false,
     note          text      NOT NULL DEFAULT '',
-    CHECK (NOT backfilled OR kind IN ('made', 'renewed', 'acting_filled', 'revoked'))
+    CHECK (NOT backfilled OR kind IN ('made', 'renewed', 'acting_filled', 'revoked',
+                                      'changed_by_an_earlier_release')),
+    CHECK (backfilled OR kind <> 'changed_by_an_earlier_release')
 );
 
 CREATE INDEX IF NOT EXISTS dashboard_delegation_change_by_delegation

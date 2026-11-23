@@ -12,13 +12,22 @@
 -- known, written by the conductor in the same transaction at the
 -- deployment's time as the migration runs (migrations.rs), never back-dated,
 -- its valid time not known.
+--
+-- The release before keeps serving while this runs, and its changes write
+-- no record. So the backfill runs again whenever the conductor starts to
+-- write (a group with no record at all), and before each change is
+-- recorded the group as it stands is compared with its latest record: one
+-- found otherwise is first given a record (kind 4) saying it was changed by
+-- an earlier release, from what the last record said to what it is, who and
+-- when not known. Each record's `was` is the one before's `became`.
 CREATE TABLE IF NOT EXISTS config_group_change (
     change_id          bigserial PRIMARY KEY,
     -- 1 a user group, 2 an account group.
     group_kind         smallint  NOT NULL CHECK (group_kind IN (1, 2)),
     group_id           text      NOT NULL,
-    -- 1 defined, 2 changed, 3 held when the records began (backfilled).
-    kind               smallint  NOT NULL CHECK (kind BETWEEN 1 AND 3),
+    -- 1 defined, 2 changed, 3 held when the records began, 4 changed by an
+    -- earlier release as the upgrade ran (3 and 4 backfilled).
+    kind               smallint  NOT NULL CHECK (kind BETWEEN 1 AND 4),
     was                text      NOT NULL DEFAULT '',
     became             text      NOT NULL DEFAULT '',
     -- Empty where who made it is not known.
@@ -31,7 +40,7 @@ CREATE TABLE IF NOT EXISTS config_group_change (
     valid_at_ns        bigint,
     backfilled         boolean   NOT NULL DEFAULT false,
     note               text      NOT NULL DEFAULT '',
-    CHECK (backfilled = (kind = 3))
+    CHECK (backfilled = (kind IN (3, 4)))
 );
 
 CREATE INDEX IF NOT EXISTS config_group_change_by_group
