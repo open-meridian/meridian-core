@@ -470,12 +470,13 @@ def signed_in(seconds=120):
 
 
 def plugin_line(page):
-    """The plugin's row in the admin portal's list of plugins, or None."""
-    table = re.search(r'<table class="list plugins"[^>]*>(.*?)</table>', page.body, re.S)
+    """The plugin's row on Settings › Plugins, which lists every instance
+    with its status and what it needs of a person, or None."""
+    table = re.search(r'<table [^>]*\bid="plugins-table"[^>]*>(.*?)</table>', page.body, re.S)
     if table is None:
         return None
     rows = table.group(1)
-    found = re.search(r'<tr data-id="' + re.escape(INSTANCE) + r'">(.*?)</tr>', rows, re.S)
+    found = re.search(r'<tr data-id="' + re.escape(INSTANCE) + r'"[^>]*>(.*?)</tr>', rows, re.S)
     return found.group(1) if found else None
 
 
@@ -487,9 +488,15 @@ def ready(args):
         line = plugin_line(admin.get("/admin"))
         if line is None:
             raise Failed(f"{INSTANCE} is not listed: its sidecar has not reported")
-        if ">Healthy<" in line or ">Not healthy<" in line:
-            return "healthy" if ">Healthy<" in line else "not healthy"
-        state = re.search(r'class="badge[^"]*">([^<]+)<', line)
+        # Settings › Plugins says where it stands, and Setting up wins there
+        # whatever its sidecar said (the 2026-11-23 consensus); whether the
+        # sidecar registered it is its Summary's status.
+        page = admin.get(f"/plugins/{INSTANCE}?level=admin&tab=summary")
+        status = page.body.split('id="status"', 1)[-1].split("</section>", 1)[0] \
+            if page.status == 200 and 'id="status"' in page.body else ""
+        if ">Healthy<" in status or ">Not healthy<" in status:
+            return "healthy" if ">Healthy<" in status else "not healthy"
+        state = re.search(r'class="badge[^"]*"[^>]*>([^<]+)<', status)
         raise Failed(f"{INSTANCE} is listed, {state.group(1) if state else 'and not registered'}")
 
     said = until(seconds, registered, f"{INSTANCE} did not register")
@@ -855,7 +862,8 @@ def unlinked(args):
         line = plugin_line(admin.get("/admin"))
         if line is None:
             raise Failed(f"{INSTANCE} is not listed")
-        found = re.search(r'data-flag="unlinked" data-count="(\d+)"', line)
+        # Its Needs you on Settings › Plugins: "2 external accounts not linked".
+        found = re.search(r'(\d+) external accounts? not linked', line)
         count = int(found.group(1)) if found else 0
         if wanted is not None and count != int(wanted):
             raise Failed(f"the dashboard counts {count}")
