@@ -2418,6 +2418,37 @@ def acks_again(began_ms, seconds=90):
                                for kind in ("price", "order")), seconds, every=2)
 
 
+BOOK_SAID = ".e2e-failover-book.log"
+
+
+def book_said():
+    """The book's members' logs -- its writers, standbys and readers, each
+    container's and its previous one's, timestamped -- kept beside the
+    driver's history (.e2e-failover-book.log, which CI keeps with
+    .e2e-cluster.log when any step fails). Elle checks the history after
+    the run has passed and its cluster is gone, and a read it refuses was
+    answered by a member whose log went with the cluster (merge-queue run
+    45104369464: which member answered was inferred, never shown). Never
+    decides the run: a log that cannot be read is said so in its place."""
+    parts = [f"== the book's members at the run's end, {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+    listed = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json",
+                            check=False) or "{}").get("items", [])
+    for pod in listed:
+        if not pod["metadata"].get("labels", {}).get("meridian.dev/component", "").startswith("bor"):
+            continue
+        pod_name = pod["metadata"]["name"]
+        spec = pod.get("spec", {})
+        for container in [c["name"] for c in spec.get("initContainers", []) + spec.get("containers", [])]:
+            for previous in ((), ("--previous",)):
+                said = kubectl("logs", pod_name, "-c", container, "--timestamps", f"--tail={SAID_LINES}",
+                               *previous, check=False, quiet=True)
+                parts.append(f"== {pod_name}, {container}{', before, if it restarted' if previous else ''}")
+                parts.append((said.stdout or said.stderr).decode(errors="replace"))
+    with open(BOOK_SAID, "w", encoding="utf-8") as kept:
+        kept.write("\n".join(parts))
+    print(f"R: the book's members' logs, kept in {BOOK_SAID}", flush=True)
+
+
 def driver_history(s):
     """The driver stopped, within its calls' bound, and the oms instance's
     history kept for Elle (the ha failover CI job checks it)."""
@@ -2436,6 +2467,7 @@ def driver_history(s):
     history = driver_file("drive-oms", "/tmp/history.edn")
     with open(HISTORY, "w", encoding="utf-8") as kept:
         kept.write(history)
+    book_said()
     counts = {}
     for line in history.splitlines():
         kind = line.split(":type :", 1)[-1].split(",", 1)[0]
