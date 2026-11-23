@@ -40,7 +40,7 @@
 //! | a read by its window (`EVERY_VERSION`, `EVERY_VERSION_BY_KEY`, `IN_FORCE`, `IN_FORCE_PUBLISHED`) | 6 | bounded | 14 a month of the window; with no window, range |
 //! | a batch's rows written (`insert_all`) | 1 | KNOWN GAP, range | 16 a month written, to commit: a batch is not held to a number of months |
 //! | a legacy page converted (`convert_page`) | 1 | KNOWN GAP, range | 16 a month of the page's rows, 4,096 rows at most |
-//! | a subject's last sequence (`previous_of_each`) | 1 | KNOWN GAP, range | every write; M4's subject head |
+//! | a subject's last sequence (`previous_of_each`) | 1 | KNOWN GAP, range | every write; M4's subject head. `lake_latest` cannot give it: it keeps a row a key, under the subject of the key's version in force, so a subject's last row is not there once its key is restated under another subject (a merge's alias), nor is a row of the range's lineage before a split told from one after; and it has no index by sequence |
 //! | a batch's keys' latest versions before `lake_latest` holds every key | 1 | KNOWN GAP, range | until the conversion ends |
 //! | the latest read (`LATEST`, `LATEST_BY_PUBLISHED`, `LATEST_NOW`) | 7 | KNOWN GAP, range | a row naming the subject after its first is found in the rows alone: `lake_latest` keeps no later subject |
 //! | a series listing (`LISTING`) | 2 | KNOWN GAP, range | |
@@ -65,6 +65,19 @@
 //!
 //! A statement split in two inside one transaction holds both halves'
 //! locks: only a transaction of its own, or a month named, bounds them.
+//!
+//! KNOWN GAP, months left empty: a month made before a batch stays when
+//! the batch is then refused or fenced, and one is made where no row will
+//! be written when a row's range is not the one its subject's hash names
+//! (a key anchored by a subject merged into it; a range split since the
+//! dataset's last batch). An empty month adds its 14 relations to every
+//! statement of its range that names no month. None is removed.
+//!
+//! KNOWN GAP, range tables made together: a batch's new datasets' range
+//! tables are all made in one transaction before it (`prepare`,
+//! [`ensure_ranges`]), each one's relations locked until it commits. It
+//! is not held to a number of ranges: a write-ahead batch of many
+//! datasets never written before makes every one's there.
 
 use std::collections::BTreeSet;
 
