@@ -905,6 +905,34 @@ jobs:
           make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"} \
             PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones" 2>&1 | tee "$RUNNER_TEMP/make.log"
 
+      # What the runner can say from its own files and commands alone, after
+      # a failed make and before any step touches the network: the runs that
+      # died since 2026-11-17 gave up in one of the make's `ready` waits, and
+      # then every new process touching an interface or Docker hung, and
+      # every upload; their steps' results still arrived. So these come
+      # first, each bounded at 10 s, each an ::error:: or ::notice::
+      # annotation and the step's own result, and each appended to
+      # proof.log, the one upload a stalled runner keeps
+      # (tools/ci-watchdog.sh proof).
+      - name: "Proof: no ready wait gave up"
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
+
+      - name: "Proof: the kernel logged no blocked task or netlink fault"
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof kernel "$RUNNER_TEMP/make.log"
+
+      - name: "Proof: ip and docker answer"
+        id: answers
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof answers "$RUNNER_TEMP/make.log"
+
       # The watchdog's last samples in the job's log, and the make's last
       # lines and FAILED lines in the step summary, each kept in an upload
       # of its own before any other, so a hang in a later upload cannot lose
@@ -934,7 +962,8 @@ jobs:
             timeout 90 tools/ci-watchdog.sh evidence "$RUNNER_TEMP/make.log" "$RUNNER_TEMP/watchdog.log" || true
           fi
 
-      # One fact a step, after a failed make and before any upload: a step's
+      # One fact a step, after a failed make and before any upload (which
+      # ready wait gave up is said above, from the make's log): a step's
       # result arrives when its log does not. A red one says its name does
       # not hold, and a hung one shows as timed out: none is
       # continue-on-error, so the API shows what each found (as
@@ -942,12 +971,6 @@ jobs:
       # has failed already, so none changes its result, and every step after
       # runs on always(), failure() or !cancelled() as before. Each also
       # writes ok or failed, and its output's last line, to the step summary.
-      - name: "Probe: the make did not give up on making the cluster"
-        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
-        timeout-minutes: 1
-        working-directory: workspace/meridian-core
-        run: tools/ci-watchdog.sh probe gave-up "$RUNNER_TEMP/make.log"
-
       - name: "Probe: names resolve"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
@@ -1295,6 +1318,34 @@ jobs:
         run: |
           set -o pipefail
           make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster IMAGES=pulled 2>&1 | tee "$RUNNER_TEMP/make.log"
+
+      # What the runner can say from its own files and commands alone, after
+      # a failed make and before any step touches the network: the runs that
+      # died since 2026-11-17 gave up in one of the make's `ready` waits, and
+      # then every new process touching an interface or Docker hung, and
+      # every upload; their steps' results still arrived. So these come
+      # first, each bounded at 10 s, each an ::error:: or ::notice::
+      # annotation and the step's own result, and each appended to
+      # proof.log, the one upload a stalled runner keeps
+      # (tools/ci-watchdog.sh proof).
+      - name: "Proof: no ready wait gave up"
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof gave-up "$RUNNER_TEMP/make.log"
+
+      - name: "Proof: the kernel logged no blocked task or netlink fault"
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof kernel "$RUNNER_TEMP/make.log"
+
+      - name: "Proof: ip and docker answer"
+        id: answers
+        if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
+        timeout-minutes: 1
+        working-directory: workspace/meridian-core
+        run: timeout 10 tools/ci-watchdog.sh proof answers "$RUNNER_TEMP/make.log"
 
       # The watchdog's last samples in the job's log, and the make's last
       # lines and FAILED lines in the step summary, each kept in an upload
