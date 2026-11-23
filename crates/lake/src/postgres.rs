@@ -170,6 +170,9 @@ pub struct PostgresStore {
     /// The month tables this store's batches first wrote, to be analysed
     /// once their batch commits (migration 24; step 3d).
     unanalysed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// The month tables a batch was refused for, more than its transaction
+    /// makes (v31a.17): made before the next batch's begins.
+    owed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
     /// When this store last let go of its group's parts of writes kept
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
@@ -430,6 +433,7 @@ impl PostgresStore {
             made: std::sync::Mutex::new(std::collections::HashSet::new()),
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            owed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
             stream: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2011,6 +2015,7 @@ impl PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         self.prepare(&mut conn, &[dataset])?;
+        self.months_first(&mut conn, dataset, &parts)?;
         // How long the dataset's lane was busy (step 3d; the profile's
         // advice on writer groups, approved 2026-11-14).
         let began = std::time::Instant::now();
@@ -2302,9 +2307,84 @@ impl PostgresStore {
                 "range {partition}'s table is not made yet: ask again"
             )));
         }
-        let made = crate::leaves::ensure_months(tx, &needed).map_err(unavailable)?;
+        // At most a few made in the batch's own transaction, which holds
+        // each one's locks until it commits (v31a.17): more are owed, made
+        // before the batch that asks again ([`Self::months_first`]).
+        let missing = crate::leaves::months_missing(tx, &needed).map_err(unavailable)?;
+        if missing.len() > crate::leaves::MONTHS_A_TRANSACTION {
+            let owed = missing.len();
+            self.owed.lock().expect("owed poisoned").extend(missing);
+            return Err(StoreError::Unavailable(format!(
+                "range {partition} needs {owed} month tables not made yet, more than one \
+                 transaction makes: they are made before the batch, ask again"
+            )));
+        }
+        let made = crate::leaves::ensure_months(tx, &missing).map_err(unavailable)?;
         if made > 0 {
             tracing::info!(partition, made, "the lake made its range's month tables");
+        }
+        self.unanalysed
+            .lock()
+            .expect("unanalysed poisoned")
+            .extend(needed.iter().cloned());
+        self.made.lock().expect("made poisoned").extend(needed);
+        Ok(())
+    }
+
+    /// The month tables `parts` need made before their batch's transaction
+    /// begins, a few a transaction (v31a.17; [`crate::leaves::make_months`]):
+    /// those a batch refused for was owed, and, where `parts` span more
+    /// months than one transaction makes, each row's month in the open
+    /// range its first subject's hash is placed in -- a new key's range. A
+    /// key held keeps its valid time (the lake's rule 5), so its month was
+    /// made with its first version; one whose range split since, or whose
+    /// key is anchored by another subject, is found by the batch itself,
+    /// which makes the few and is refused for more, owed to the next.
+    /// Only in ranges whose table is made here and this member's group owns.
+    fn months_first(
+        &self,
+        conn: &mut Connection,
+        dataset: &str,
+        parts: &[Vec<Observation>],
+    ) -> Result<()> {
+        use crate::leaves::Month;
+        let mut needed: std::collections::BTreeSet<(String, Month)> =
+            std::mem::take(&mut *self.owed.lock().expect("owed poisoned"));
+        let months: std::collections::BTreeSet<Month> = parts
+            .iter()
+            .flatten()
+            .map(|row| Month::of(row.meta().valid_from_ns))
+            .collect();
+        if months.len() > crate::leaves::MONTHS_A_TRANSACTION {
+            let ranges = open_ranges(&mut **conn, dataset)?;
+            let mine = self.groups.mine();
+            for row in parts.iter().flatten() {
+                let partition =
+                    crate::range::placed(dataset, &ranges, crate::range::hash(row.subject()));
+                if self.groups.several() && self.groups.owner_by(&partition, dataset) != mine {
+                    continue;
+                }
+                needed.insert((
+                    partition.into_owned(),
+                    Month::of(row.meta().valid_from_ns),
+                ));
+            }
+        }
+        needed.retain(|need| !self.made.lock().expect("made poisoned").contains(need));
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let mut made_ranges = std::collections::BTreeMap::new();
+        for (partition, _) in &needed {
+            if !made_ranges.contains_key(partition) {
+                let made = crate::leaves::range_made(&mut **conn, partition).map_err(unavailable)?;
+                made_ranges.insert(partition.clone(), made);
+            }
+        }
+        needed.retain(|(partition, _)| made_ranges[partition]);
+        let made = crate::leaves::make_months(&mut **conn, &needed).map_err(unavailable)?;
+        if made > 0 {
+            tracing::info!(dataset, made, "the lake made month tables before their batch");
         }
         self.unanalysed
             .lock()
@@ -2507,8 +2587,9 @@ impl PostgresStore {
         let mut tx = conn.transaction().map_err(unavailable)?;
         crate::leaves::ensure_ranges(&mut tx, &ranges).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        // A few months a transaction, before the page's own (v31a.17).
+        crate::leaves::make_months(&mut *conn, &needed).map_err(unavailable)?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        crate::leaves::ensure_months(&mut tx, &needed).map_err(unavailable)?;
         let columns: String = tx
             .query_one(
                 "SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
@@ -2779,6 +2860,9 @@ impl PostgresStore {
             .map(|(dataset, _)| dataset.as_str())
             .collect();
         self.prepare(&mut conn, &datasets.into_iter().collect::<Vec<_>>())?;
+        for (dataset, rows) in &batch.parts {
+            self.months_first(&mut conn, dataset, std::slice::from_ref(rows))?;
+        }
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The stream's batch is written whatever its size, and waits on its
         // position's lock: without the serving session's statement_timeout

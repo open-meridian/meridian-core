@@ -14391,3 +14391,31 @@ fn a_view_read_again_under_a_read_refuses_nothing() {
         "a read whose member's view was read again under it was refused"
     );
 }
+
+/// A batch spanning more months than one transaction makes has them made
+/// before it, a few a transaction (v31a.17), and is recorded whole.
+#[test]
+fn a_batch_of_many_months_is_recorded_its_months_made_before_it() {
+    let (url, store) = isolated("manymonths");
+    let dataset = unique("manymonths");
+    let month_ns = 2_629_800_i64 * 1_000_000_000;
+    let rows: Vec<Observation> = (0..40)
+        .map(|m| trade(&dataset, &format!("m{m}"), "INS-1", (240 + m) * month_ns + 14 * 86_400 * 1_000_000_000))
+        .collect();
+    assert_eq!(store.record(&dataset, rows, 1).unwrap().recorded, 40);
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let leaves: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = current_schema() AND c.relkind = 'r'
+                AND c.relname ~ '^lake_row_[0-9a-f]{16}_'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(leaves >= 39, "{leaves} months made for 40 rows a month apart");
+    assert_eq!(
+        store.read(&latest_query(&dataset, "INS-1", false)).unwrap().len(),
+        40
+    );
+}

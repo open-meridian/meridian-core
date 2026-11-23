@@ -230,6 +230,49 @@ pub fn ensure_months(
     Ok(made)
 }
 
+/// The most month tables one transaction makes (v31a.17, the lake's lock
+/// budget): making one takes a lock on each of its relations -- the table,
+/// its TOAST table and its 13 indexes, about 19 with its range's -- held
+/// until the transaction commits, and the lock table is the whole
+/// cluster's. So a history's months are made a few a transaction, before
+/// the rows that need them, and never as many as the history is long.
+pub const MONTHS_A_TRANSACTION: usize = 8;
+
+/// Those of `needed`'s month tables not yet made.
+pub fn months_missing(
+    client: &mut impl GenericClient,
+    needed: &BTreeSet<(String, Month)>,
+) -> Result<BTreeSet<(String, Month)>, postgres::Error> {
+    let mut missing = BTreeSet::new();
+    for need in needed {
+        if !exists(client, &month_table(&need.0, need.1))? {
+            missing.insert(need.clone());
+        }
+    }
+    Ok(missing)
+}
+
+/// Make each of `needed`'s month tables not yet made, at most
+/// [`MONTHS_A_TRANSACTION`] a transaction of `client`'s own, each
+/// committed before the next begins: `client` is in no transaction, and
+/// holds no lock from one month's making while it makes the next eight. A
+/// month another made meanwhile -- a release before this one, making it in
+/// its batch's transaction during a rolling upgrade -- is found made under
+/// its range's lock and left. Answers how many it made.
+pub fn make_months(
+    client: &mut impl GenericClient,
+    needed: &BTreeSet<(String, Month)>,
+) -> Result<usize, postgres::Error> {
+    let missing: Vec<(String, Month)> = months_missing(client, needed)?.into_iter().collect();
+    let mut made = 0;
+    for some in missing.chunks(MONTHS_A_TRANSACTION) {
+        let mut tx = client.transaction()?;
+        made += ensure_months(&mut tx, &some.iter().cloned().collect())?;
+        tx.commit()?;
+    }
+    Ok(made)
+}
+
 /// `partition`'s `month` table analysed by lake_row's owner (migration 24),
 /// where it holds rows and was never analysed: whether it was.
 pub fn analyse_month(
