@@ -1026,7 +1026,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target == 'e2e-cluster-reconfigure' && 'reconfigure-history' || format('failover-history-{0}', matrix.profile) }}
-          path: workspace/meridian-core/.e2e-failover-history.edn
+          # And what Elle found in it and in its planted copy, whole
+          # (tools/elle-check.sh, --output json).
+          path: |
+            workspace/meridian-core/.e2e-failover-history.edn
+            workspace/meridian-core/.e2e-elle-*.log
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14

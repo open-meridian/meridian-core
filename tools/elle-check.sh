@@ -62,17 +62,24 @@ verdict() {
 # (merge-queue run 45104369464: the read and the appends it missed were
 # found by hand in the history). Not --verbose: 0.1.10 deprecated it for
 # --output json, and 0.1.11's main rewrites it to the one argument
-# "--output json", which is no option it knows. Said, never decided by: the
+# "--output json", which is no option it knows. Kept whole beside the
+# history, in a .e2e-*.log the job keeps. Said, never decided by: the
 # verdict above it is the check.
+kept="$(dirname "$history")"
 anomalies() {
-	echo "elle-check: what elle-cli found in $1, its first 200 lines:" >&2
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
 		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
-		--output json "/w/$1" 2>&1 | head -n 200 | cut -c1-4000 >&2 || true
+		--output json "/w/$1" >"$2" 2>&1 || true
+	echo "elle-check: what elle-cli found in $1 is kept whole in $2 ($(wc -c <"$2" | tr -d ' ') bytes)" >&2
 }
 said="$(verdict history.edn)"
-[ "$said" = true ] || { anomalies history.edn; echo "elle-check FAILED: the driver's history is not strict-serializable per key ($said)" >&2; exit 1; }
+[ "$said" = true ] || { anomalies history.edn "$kept/.e2e-elle-history.log"; echo "elle-check: its first 200 lines:" >&2; head -n 200 "$kept/.e2e-elle-history.log" | cut -c1-4000 >&2; echo "elle-check FAILED: the driver's history is not strict-serializable per key ($said)" >&2; exit 1; }
 echo "elle-check: the driver's history is valid: list-append, strict-serializable, per key"
 planted="$(verdict planted.edn)"
 [ "$planted" = false ] || { echo "elle-check FAILED: the planted anomaly was not refused ($planted): the check cannot fail" >&2; exit 1; }
 echo "elle-check: the planted anomaly is refused, as it must be"
+# The same question asked of the planted history on every run (the review of
+# 2026-11-23, item 10): --output json is otherwise first run on the day a
+# real history is refused, when it is too late to find it says nothing.
+anomalies planted.edn "$kept/.e2e-elle-planted.log"
+[ -s "$kept/.e2e-elle-planted.log" ] || echo "elle-check: WARNING: --output json said nothing of the planted anomaly" >&2
