@@ -14284,3 +14284,110 @@ fn a_dataset_never_written_is_answered_empty_by_its_home() {
         "it waited {took:?} on another database"
     );
 }
+
+/// A range two of a read's databases would both answer is refused
+/// UNAVAILABLE, never answered twice (the review of 2026-11-23 of the
+/// lake's routing, finding 3; its probe P2; on main too). Between a
+/// switch's pointing the range in at its target and its source's letting it
+/// go, the source's row is written and the target's a pointer to its own
+/// group: each database answers the range, and a mover that dies there
+/// leaves it so. Planted here as that window stands.
+#[test]
+fn a_range_two_databases_would_both_answer_is_refused_never_doubled() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let m = members(&urls);
+    let dataset = owned_by_zero("coinbase-1:w");
+    let (low, high) = halves_of("lake-window");
+    let lower = halved(&m, &dataset, &low, &high);
+    let upper = format!("{dataset}/8000-ffff");
+    moved_to_one(&m, &upper);
+    moved_to_one(&m, &lower);
+    let mut c0 = postgres::Client::connect(&urls[0], postgres::NoTls).unwrap();
+    let mut c1 = postgres::Client::connect(&urls[1], postgres::NoTls).unwrap();
+    let g0_epoch: i64 = c0
+        .query_one(
+            "SELECT max(epoch) FROM lake_partition WHERE epoch >= 0",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c0.execute(
+        "UPDATE lake_partition SET epoch = $2, writer_group = 0 WHERE dataset = $1",
+        &[&lower, &g0_epoch],
+    )
+    .unwrap();
+    c1.execute(
+        "UPDATE lake_partition SET epoch = -1 WHERE dataset = $1",
+        &[&lower],
+    )
+    .unwrap();
+    let groups = Groups::new(0, 2).unwrap();
+    let reader = meridian_lake::spread::Spread::new(stores_of(&urls, groups, 2), groups);
+    reader.read_owners_again().unwrap();
+    let read = range_keys(&reader, &dataset, &[&low, &high]);
+    assert!(
+        matches!(read, Err(meridian_lake::store::StoreError::Unavailable(_))),
+        "a range read in two databases was answered: {read:?}"
+    );
+}
+
+/// A member's view of the writer groups read again under a read refuses
+/// nothing (the review of 2026-11-23 of the lake's routing, finding 5). A
+/// range gone on from the database it first moved to leaves a pointer
+/// there; a read by a view from before either move finds that database
+/// only by following the first pointer, and reads nothing from it. Looked
+/// at again after its rows by the view read since, the read was not sent
+/// there, so the ranges let go differed and it was refused though nothing
+/// moved. What a read is held to is what the databases it read answered.
+#[test]
+fn a_view_read_again_under_a_read_refuses_nothing() {
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::points;
+    let urls = databases(3);
+    let m = members(&urls);
+    let dataset = owned_by_zero_of("coinbase-1:v", 3);
+    let (low, high) = halves_of("lake-view-again");
+    let lower = halved(&m, &dataset, &low, &high);
+    // A member whose view was read before the range moved.
+    let groups = Groups::new(0, 3).unwrap();
+    let reader = Arc::new(meridian_lake::spread::Spread::new(
+        stores_of(&urls, groups, 2),
+        groups,
+    ));
+    reader.read_owners_again().unwrap();
+    moved_to_one(&m, &lower);
+    // What a move on from database 2, long ago, left there: its pointer.
+    postgres::Client::connect(&urls[2], postgres::NoTls)
+        .unwrap()
+        .execute(
+            "INSERT INTO lake_partition (dataset, head, epoch, lo, hi, writer_group)
+             VALUES ($1, 1, -1, 0, 32767, 1)",
+            &[&lower],
+        )
+        .unwrap();
+    assert_eq!(
+        groups.owner_by(&lower, &dataset),
+        0,
+        "the view, from before"
+    );
+    let again = reader.clone();
+    points::arm(
+        "lake.read.routed",
+        &dataset,
+        Arc::new(move |_| {
+            again
+                .read_owners_again()
+                .map_err(|failed| failed.to_string())?;
+            Ok(())
+        }),
+    );
+    let read = latest_keys(&reader, &dataset, &low);
+    points::disarm("lake.read.routed", &dataset);
+    assert_eq!(groups.owner_by(&lower, &dataset), 1, "the view, read again");
+    assert_eq!(
+        read.ok(),
+        Some(vec!["l0".to_string(), "l1".to_string()]),
+        "a read whose member's view was read again under it was refused"
+    );
+}

@@ -60,16 +60,26 @@ pub enum Switched {
     LetGo { closing: u64, epoch: u64 },
 }
 
-/// A range's row in one database, as a read of its dataset finds it
-/// ([`PostgresStore::standing_of`]): its head, whether it is written (not
-/// a move's pointer), the group it names and whether a split closed it.
+/// A range's row in one database, as a read of its dataset finds it: the
+/// database, its head, whether it is written (not a move's pointer), the
+/// group it names, whether a split closed it, and whether a read there
+/// answers the range.
+///
+/// - In a look before the read's rows ([`PostgresStore::standing_of`]),
+///   `served` is by the row alone: written here, or a move's pointer to a
+///   group whose home this is (its target, not opened yet). No other
+///   database is asked.
+/// - In the read's own rows ([`super::standing_during`]), it is what the
+///   read answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standing {
+    pub database: u32,
     pub partition: String,
     pub head: u64,
     pub written: bool,
     pub group: Option<u32>,
     pub closed: bool,
+    pub served: bool,
 }
 
 /// How long a read waits for a connection to ask a database a move's
@@ -272,15 +282,31 @@ impl PostgresStore {
             )
             .map_err(unavailable)?
             .iter()
-            .map(|row| Standing {
-                partition: row.get(0),
-                head: row.get::<_, i64>(1).max(0) as u64,
-                written: row.get(2),
-                group: row.get::<_, Option<i32>>(3).map(|group| group as u32),
-                closed: row.get(4),
-            })
+            .map(|row| self.standing_from(row))
             .filter(|row| crate::range::is_of(&row.partition, dataset))
             .collect())
+    }
+
+    /// A row of `lake_partition` read as `dataset, head, epoch <> pointer,
+    /// writer_group, closed_at IS NOT NULL`, with whether it is answered
+    /// here by the row alone ([`Standing`]).
+    pub(super) fn standing_from(&self, row: &postgres::Row) -> Standing {
+        let partition: String = row.get(0);
+        let written: bool = row.get(2);
+        let group: Option<i32> = row.get(3);
+        let home = meridian_changes::databases::of_group(
+            self.group_named(&partition, group),
+            self.databases,
+        );
+        Standing {
+            database: self.database,
+            head: row.get::<_, i64>(1).max(0) as u64,
+            written,
+            group: group.map(|group| group as u32),
+            closed: row.get(4),
+            served: written || home == self.database,
+            partition,
+        }
     }
 
     /// Whether a range's row here is a move's pointer naming writer group

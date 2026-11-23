@@ -51,14 +51,10 @@ pub struct Spread {
     settled: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
 }
 
-/// What one read of a dataset goes by ([`Spread::follow_owners`]): the
-/// databases it asks, and each range a database among those it read had
-/// let go to another's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Followed {
-    databases: std::collections::BTreeSet<u32>,
-    let_go: std::collections::BTreeSet<(u32, String)>,
-}
+/// What the databases one read asked answered of its datasets' ranges,
+/// each from the snapshot its rows came from ([`Spread::asked`]).
+#[derive(Default)]
+struct Answered(std::cell::RefCell<Vec<Standing>>);
 
 /// How many times a write's rows are routed again to the database their
 /// range's head is in: once moved home, it is there.
@@ -91,6 +87,59 @@ pub struct Repaired {
 impl Repaired {
     pub fn any(&self) -> bool {
         self.aliases + self.amendments + self.assessments > 0
+    }
+}
+
+impl Answered {
+    /// Whether the databases read answered each range once: every range
+    /// open in one of them was answered by exactly one, from a row at or
+    /// past every move's pointer of it the others hold.
+    ///
+    /// - **A pointer** is an open row its database did not answer and is
+    ///   not written in: where a move let the range go.
+    /// - **Behind a pointer**, a row answers nothing that counts: a
+    ///   written row a failed move left stands for nothing.
+    /// - **Answered by none**: let go under the read, to a database it was
+    ///   not sent to; or split where it moved to, which a closed row there
+    ///   at or past the pointer says, its halves answered in its place.
+    /// - **Answered by two**: read between a switch's pointing it in at
+    ///   its target and its source's letting it go, where both hold it.
+    fn whole(&self) -> Result<()> {
+        let rows = self.0.borrow();
+        let mut pointed: BTreeMap<&str, u64> = BTreeMap::new();
+        for row in rows
+            .iter()
+            .filter(|row| !row.closed && !row.written && !row.served)
+        {
+            let at = pointed.entry(row.partition.as_str()).or_insert(row.head);
+            *at = (*at).max(row.head);
+        }
+        let past = |row: &Standing| {
+            row.served && row.head >= pointed.get(row.partition.as_str()).copied().unwrap_or(0)
+        };
+        let mut open: BTreeMap<&str, std::collections::BTreeSet<u32>> = BTreeMap::new();
+        for row in rows.iter().filter(|row| !row.closed) {
+            let by = open.entry(row.partition.as_str()).or_default();
+            if past(row) {
+                by.insert(row.database);
+            }
+        }
+        for (partition, by) in open {
+            let split = || {
+                rows.iter()
+                    .any(|row| row.closed && row.partition == partition && past(row))
+            };
+            let how = match by.len() {
+                1 => continue,
+                0 if split() => continue,
+                0 => "none",
+                _ => "more than one",
+            };
+            return Err(StoreError::Unavailable(format!(
+                "range {partition} was answered by {how} of the databases read, a move of it under way or gone by under the read: ask again"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -422,30 +471,16 @@ impl Spread {
     /// gone when v32's ownership record says where a range is read, and a
     /// read with `read_after` is never answered without a range a move
     /// took elsewhere.
-    fn follow_owners(&self, dataset: &str) -> Result<Followed> {
+    fn follow_owners(&self, dataset: &str) -> Result<std::collections::BTreeSet<u32>> {
         let mut databases = self.homes(dataset);
         if self.stores.len() == 1 || dataset == meridian_changes::CONTROL {
-            return Ok(Followed {
-                databases,
-                let_go: Default::default(),
-            });
+            return Ok(databases);
         }
-        let count = self.groups.count();
-        // Whether `row`, in database `d`, is of a range read there: written
-        // there, or a move's pointer to a group whose home it is (its
-        // target, not opened yet).
-        let here = |d: u32, row: &Standing| {
-            let group = row
-                .group
-                .filter(|group| *group < count)
-                .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count));
-            row.written || meridian_changes::databases::of_group(group, self.count()) == d
-        };
-        let mut rows: Vec<(u32, Standing)> = Vec::new();
+        // Each row read where it is: written there, or a move's pointer to
+        // a group whose home it is (its target, not opened yet).
+        let mut rows: Vec<Standing> = Vec::new();
         for d in &databases {
-            for row in self.database(*d).standing_of(dataset, false)? {
-                rows.push((*d, row));
-            }
+            rows.extend(self.database(*d).standing_of(dataset, false)?);
         }
         // Each range's row furthest on among those read where they are: a
         // written row a failed move left behind a pointer stands for
@@ -454,14 +489,14 @@ impl Spread {
         // or past its source's pointer (the review of 2026-11-23 of this
         // routing, finding 4).
         let mut held: BTreeMap<&str, u64> = BTreeMap::new();
-        for (_, row) in rows.iter().filter(|(d, row)| here(*d, row)) {
+        for row in rows.iter().filter(|row| row.served) {
             let at = held.entry(row.partition.as_str()).or_insert(row.head);
             *at = (*at).max(row.head);
         }
-        let begun = rows.iter().any(|(d, row)| row.head > 0 && here(*d, row));
-        let astray = rows.iter().any(|(d, row)| {
+        let begun = rows.iter().any(|row| row.head > 0 && row.served);
+        let astray = rows.iter().any(|row| {
             !row.closed
-                && !here(*d, row)
+                && !row.served
                 && held
                     .get(row.partition.as_str())
                     .is_none_or(|at| *at < row.head)
@@ -486,69 +521,58 @@ impl Spread {
                         "dataset {dataset}'s ranges in database {d}, which may hold one, could not be read ({failed}): ask again"
                     ))
                 })?;
-                if asked.iter().any(|row| !row.closed && here(d, row)) {
+                if asked.iter().any(|row| !row.closed && row.served) {
                     databases.insert(d);
                 }
-                rows.extend(asked.into_iter().map(|row| (d, row)));
+                rows.extend(asked);
             }
         }
         if rows.is_empty() {
             self.settled.lock().expect("settled poisoned").insert(key);
         }
-        let let_go = rows
-            .iter()
-            .filter(|(d, row)| !row.closed && !here(*d, row))
-            .map(|(d, row)| (*d, row.partition.clone()))
-            .collect();
-        Ok(Followed { databases, let_go })
+        Ok(databases)
     }
 
-    /// `read` of `datasets`, by what each is followed to
-    /// ([`Self::follow_owners`]), refused UNAVAILABLE where a range of one
-    /// moved between databases under it (the review of 2026-11-23, finding
-    /// 1): each database answers from its own snapshot the ranges its rows
-    /// say are read there, so a range let go between this read's routing
-    /// and a database's snapshot was answered by neither -- its rows from
-    /// long before lost -- and one taken between two databases' snapshots
-    /// by both. Followed again once the rows are read: where the databases
-    /// or the ranges let go differ, the answer is not given, and the read
-    /// is asked again. Nothing is held back to say so: a caller handed
-    /// rows before the refusal drops them with it, as on any failed read.
+    /// `read` of `datasets`, each in the databases it is followed to
+    /// ([`Self::follow_owners`]), refused UNAVAILABLE where what those
+    /// databases answered is not each range once (the review of
+    /// 2026-11-23, finding 1; of this routing, findings 3, 5 and 6). Each
+    /// database answers from its own snapshot the ranges its rows say are
+    /// read there, so a range let go between this read's routing and a
+    /// database's snapshot was answered by neither -- its rows from long
+    /// before lost -- and one taken between two databases' snapshots, or
+    /// standing between a switch's two commits, by both. Each database
+    /// says, from that same snapshot, each range's row and whether it
+    /// answered it ([`Self::asked`]), and the read is held to them
+    /// together ([`Answered::whole`]): no second look, which another
+    /// snapshot again could not hold the rows to. Nothing is held back to
+    /// say so: a caller handed rows before the refusal drops them with it,
+    /// as on any failed read.
     ///
     /// INTERIM(v32): gone with [`Self::follow_owners`], when v32's
     /// ownership record refuses a read a move went by or reads it again.
     fn standing<T>(
         &self,
         datasets: &[String],
-        read: impl FnOnce(&BTreeMap<String, Followed>) -> Result<T>,
+        read: impl FnOnce(&BTreeMap<String, std::collections::BTreeSet<u32>>, &Answered) -> Result<T>,
     ) -> Result<T> {
-        let follow = || -> Result<BTreeMap<String, Followed>> {
-            let mut followed = BTreeMap::new();
-            for dataset in datasets {
-                if !followed.contains_key(dataset) {
-                    followed.insert(dataset.clone(), self.follow_owners(dataset)?);
-                }
+        let mut followed = BTreeMap::new();
+        for dataset in datasets {
+            if !followed.contains_key(dataset) {
+                followed.insert(dataset.clone(), self.follow_owners(dataset)?);
             }
-            Ok(followed)
-        };
-        let before = follow()?;
-        if self.stores.len() == 1 {
-            return read(&before);
         }
-        for dataset in before.keys() {
+        let answered = Answered::default();
+        if self.stores.len() == 1 {
+            return read(&followed, &answered);
+        }
+        for dataset in followed.keys() {
             // What a test arms to move a range between the two.
             meridian_changes::moves::points::reached("lake.read.routed", dataset)
                 .map_err(StoreError::Unavailable)?;
         }
-        let answer = read(&before)?;
-        if let Some((dataset, _)) = follow()?
-            .iter()
-            .find(|(dataset, after)| before.get(*dataset) != Some(after))
-        {
-            return Err(StoreError::Unavailable(format!(
-                "a range of dataset {dataset} moved between databases under the read: ask again"
-            )));
-        }
+        let answer = read(&followed, &answered)?;
+        answered.whole()?;
         Ok(answer)
     }
 
@@ -556,11 +580,29 @@ impl Spread {
     fn standing_one<T>(
         &self,
         dataset: &str,
-        read: impl FnOnce(&std::collections::BTreeSet<u32>) -> Result<T>,
+        read: impl FnOnce(&std::collections::BTreeSet<u32>, &Answered) -> Result<T>,
     ) -> Result<T> {
-        self.standing(&[dataset.to_string()], |followed| {
-            read(&followed[dataset].databases)
+        self.standing(&[dataset.to_string()], |followed, answered| {
+            read(&followed[dataset], answered)
         })
+    }
+
+    /// `read` of database `d`, what it answered of each range kept in
+    /// `answered`: its rows of the read's datasets in `lake_partition`,
+    /// from the snapshot the read's rows came from.
+    fn asked<T>(
+        &self,
+        d: u32,
+        answered: &Answered,
+        read: impl FnOnce(&PostgresStore) -> Result<T>,
+    ) -> Result<T> {
+        let store = self.database(d);
+        let (answer, noted) = crate::postgres::standing_during(|| read(store));
+        answered
+            .0
+            .borrow_mut()
+            .extend(noted.into_iter().filter(|row| row.database == d));
+        answer
     }
 
     fn holding(&self, partition: &str) -> &Arc<PostgresStore> {
@@ -581,12 +623,14 @@ impl Spread {
 
     /// `datasets` in order, in runs of one database each: a read answering
     /// them in order reads each run from its database in turn.
-    fn runs(followed: &BTreeMap<String, Followed>) -> Vec<(u32, Vec<String>)> {
+    fn runs(
+        followed: &BTreeMap<String, std::collections::BTreeSet<u32>>,
+    ) -> Vec<(u32, Vec<String>)> {
         let mut runs: Vec<(u32, Vec<String>)> = Vec::new();
-        for (dataset, followed) in followed {
+        for (dataset, databases) in followed {
             // A dataset whose ranges are in several databases is read from
             // each, each answering its own ranges (step 3d).
-            for d in &followed.databases {
+            for d in databases {
                 match runs.last_mut() {
                     Some((at, run)) if at == d => run.push(dataset.clone()),
                     _ => runs.push((*d, vec![dataset.clone()])),
@@ -700,8 +744,8 @@ impl Spread {
         query: &Query,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        self.standing(&query.datasets, |followed| {
-            self.read_routed(query, Self::runs(followed), each)
+        self.standing(&query.datasets, |followed, answered| {
+            self.read_routed(query, Self::runs(followed), answered, each)
         })
     }
 
@@ -710,11 +754,12 @@ impl Spread {
         &self,
         query: &Query,
         runs: Vec<(u32, Vec<String>)>,
+        answered: &Answered,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
         if runs.len() <= 1 {
             let d = runs.first().map_or(0, |(d, _)| *d);
-            return self.database(d).read_each(query, each);
+            return self.asked(d, answered, |store| store.read_each(query, each));
         }
         // A dataset read from several databases (step 3d): a key last
         // written before its range moved may be answered by the source's
@@ -731,7 +776,7 @@ impl Spread {
             for (d, datasets) in runs {
                 let mut part = query.clone();
                 part.datasets = datasets;
-                self.database(d).read_each(&part, &mut |row| {
+                let mut later = |row: Observation| {
                     let key = (
                         row.dataset().to_string(),
                         row.data_type().code(),
@@ -744,7 +789,8 @@ impl Spread {
                         }
                     }
                     Ok(())
-                })?;
+                };
+                self.asked(d, answered, |store| store.read_each(&part, &mut later))?;
             }
             for row in latest.into_values() {
                 each(row)?;
@@ -754,7 +800,7 @@ impl Spread {
         for (d, datasets) in runs {
             let mut part = query.clone();
             part.datasets = datasets;
-            self.database(d).read_each(&part, each)?;
+            self.asked(d, answered, |store| store.read_each(&part, each))?;
         }
         Ok(())
     }
@@ -1361,10 +1407,12 @@ impl Store for Spread {
         after: u64,
         most: usize,
     ) -> Result<Vec<Observation>> {
-        self.standing_one(dataset, |databases| {
+        self.standing_one(dataset, |databases, answered| {
             let mut out = Vec::new();
             for d in databases {
-                out.extend(self.database(*d).dated_on(dataset, dates, after, most)?);
+                out.extend(self.asked(*d, answered, |store| {
+                    store.dated_on(dataset, dates, after, most)
+                })?);
             }
             if databases.len() > 1 {
                 out.sort_by_key(|row| row.meta().sequence);
@@ -1426,15 +1474,12 @@ impl Store for Spread {
         as_of_ns: i64,
         published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
-        self.standing_one(dataset, |databases| {
+        self.standing_one(dataset, |databases, answered| {
             let mut out = Vec::new();
             for d in databases {
-                out.extend(self.database(*d).read_dataset(
-                    dataset,
-                    data_type,
-                    as_of_ns,
-                    published_as_of_ns,
-                )?);
+                out.extend(self.asked(*d, answered, |store| {
+                    store.read_dataset(dataset, data_type, as_of_ns, published_as_of_ns)
+                })?);
             }
             Ok(out)
         })
@@ -1447,10 +1492,11 @@ impl Store for Spread {
         as_of_ns: i64,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        self.standing_one(dataset, |databases| {
+        self.standing_one(dataset, |databases, answered| {
             for d in databases {
-                self.database(*d)
-                    .read_dataset_each(dataset, data_type, as_of_ns, each)?;
+                self.asked(*d, answered, |store| {
+                    store.read_dataset_each(dataset, data_type, as_of_ns, each)
+                })?;
             }
             Ok(())
         })
@@ -1461,28 +1507,31 @@ impl Store for Spread {
         dataset: &str,
         data_type: DataType,
     ) -> Result<Vec<Observation>> {
-        self.standing_one(dataset, |databases| {
+        self.standing_one(dataset, |databases, answered| {
             let mut out = Vec::new();
             for d in databases {
-                out.extend(
-                    self.database(*d)
-                        .read_dataset_versions(dataset, data_type)?,
-                );
+                out.extend(self.asked(*d, answered, |store| {
+                    store.read_dataset_versions(dataset, data_type)
+                })?);
             }
             Ok(out)
         })
     }
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
-        // The key's range is in one of them.
-        self.standing_one(dataset, |databases| {
+        // The key's range is in one of them; each is asked, so the answer
+        // is held to what they all say of the dataset's ranges.
+        self.standing_one(dataset, |databases, answered| {
+            let mut out = Vec::new();
             for d in databases {
-                let found = self.database(*d).row_version(dataset, row_key, version)?;
-                if !found.is_empty() {
-                    return Ok(found);
+                let found = self.asked(*d, answered, |store| {
+                    store.row_version(dataset, row_key, version)
+                })?;
+                if out.is_empty() {
+                    out = found;
                 }
             }
-            Ok(Vec::new())
+            Ok(out)
         })
     }
 
