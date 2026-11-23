@@ -156,6 +156,9 @@ pub struct Writer {
     /// and not again as each act returns.
     batched: bool,
     stamped: StampedHeld,
+    /// The member's view of the writer groups its books are held under
+    /// ([`Store::owner_changes`]): every book is dropped when it changes.
+    owners: std::sync::atomic::AtomicU64,
 }
 
 /// Whether a book writer holds back commands stamped with a plugin shard's
@@ -246,6 +249,7 @@ impl Writer {
             let after = first.entry.first_sequence.saturating_sub(1);
             meridian_changes::publish(&telling, DOMAIN, after, &changes);
         }));
+        let owners = inner.owner_changes().into();
         Self {
             inner,
             bus,
@@ -253,6 +257,7 @@ impl Writer {
             bound,
             batched,
             stamped: StampedHeld::default(),
+            owners,
         }
     }
 
@@ -426,6 +431,18 @@ impl Store for Writer {
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
+        // Its view of the writer groups changed (the review of 2026-11-23,
+        // finding 5): a partition moved away and back was another group's
+        // to write meanwhile, so no book held before is kept, as none is
+        // past a new database timeline; each is read again from the record.
+        let owners = self.inner.owner_changes();
+        if self
+            .owners
+            .swap(owners, std::sync::atomic::Ordering::SeqCst)
+            != owners
+        {
+            *self.books() = Books::default();
+        }
         // Another writer group's account (step 3d): read from the record,
         // never held, since its commits are never this member's.
         if !self.inner.writes(account_id) {
@@ -435,7 +452,10 @@ impl Store for Writer {
             return Ok(held);
         }
         let book = self.inner.book(account_id)?;
-        self.books().put(book.clone(), self.bound);
+        // Held only if the view stood while it was read.
+        if self.inner.owner_changes() == owners {
+            self.books().put(book.clone(), self.bound);
+        }
         Ok(book)
     }
 

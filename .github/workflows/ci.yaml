@@ -1063,6 +1063,10 @@ jobs:
       # each one fenced log -- checked by elle-cli on a pinned JVM image, in
       # this job alone and never in an image; and a copy with one read
       # reordered refused (tools/elle-check.sh says why the lake is left out).
+      # A history it refuses fails this step after a make that passed, its
+      # cluster gone: the book's members' logs the run kept at its end
+      # (.e2e-failover-book.log) are then said and kept by the two steps
+      # below that keep every .e2e-*.log of a failed job.
       - name: Elle
         if: matrix.target == 'e2e-cluster-failover' && matrix.profile == 'ha' && !cancelled()
         working-directory: workspace/meridian-core
@@ -1075,7 +1079,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target == 'e2e-cluster-reconfigure' && 'reconfigure-history' || format('failover-history-{0}', matrix.profile) }}
-          path: workspace/meridian-core/.e2e-failover-history.edn
+          # And what Elle found in it and in its planted copy, whole
+          # (tools/elle-check.sh, --output json).
+          path: |
+            workspace/meridian-core/.e2e-failover-history.edn
+            workspace/meridian-core/.e2e-elle-*.log
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
