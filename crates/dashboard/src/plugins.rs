@@ -1226,7 +1226,7 @@ pub(crate) async fn frame(
         shown,
         health: (level == AccessLevel::Admin).then_some(&health),
         opens_data_sources: access.deployment_admin,
-        trading: trading.as_deref(),
+        trading,
     });
     let crumbs = format!(
         "{}{}",

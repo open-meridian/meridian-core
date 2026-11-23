@@ -1414,7 +1414,7 @@ impl Context<'_> {
                     &records,
                     &self.caller.subject,
                     self.access.deployment_admin,
-                    &reached_now.iter().cloned().collect::<Vec<_>>(),
+                    &reached_now.to_vec(),
                 )
                 .await
             }

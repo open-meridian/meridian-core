@@ -129,7 +129,7 @@ fn a_step_from_the_records_open_is_setting_up_and_off_the_home_page() {
     assert_eq!(said.standing, Standing::SettingUp);
     assert_eq!(said.reason, "Next step: license and entitle its datasets.");
     assert!(!said.on_home());
-    assert_eq!(badge(&said).contains("state=\"warn\""), true);
+    assert!(badge(&said).contains("state=\"warn\""));
 }
 
 #[test]
