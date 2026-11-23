@@ -1523,8 +1523,16 @@ SELECT r.body FROM (SELECT DISTINCT dataset, partition, sequence, row_key, valid
      WHERE f.dataset = c.dataset AND f.sequence = c.sequence
        AND f.row_key = c.row_key AND f.valid_from_ns = c.valid_from_ns
        AND coalesce(f.partition, f.dataset) = c.partition
-       AND (f.partition = ANY($11) OR f.partition IS NULL)) r
+       AND (f.partition = ANY($11) OR f.partition IS NULL){within}) r
  ORDER BY r.dataset, r.sequence",
+        within = if from_latest {
+            // Chosen from `lake_latest`, now and unwindowed.
+            ""
+        } else {
+            // Every row chosen is within the read's window: named to the
+            // fetch too, so the months after it are not locked (v31a.17).
+            " AND f.valid_from_ns >= $8 AND f.valid_from_ns < $9 AND f.valid_from_ns <= $10"
+        },
         first = next_key("d.dataset", "s.subject", "r.latest_key IS NOT NULL"),
         next = next_key(
             "k.dataset",
@@ -1799,6 +1807,11 @@ SELECT body FROM lake_row
 /// force (found on dev 2026-11-09: a chain's statistics over its dates, 49,412
 /// rows in force of 358,688 versions, every version read and decoded to
 /// choose them, a page at a time, took the lake past its 1 GiB twice).
+/// Each row in force is chosen within the read's window and fetched by its
+/// own place. The window is named to the fetch too (v31a.17, the lake's
+/// lock budget): every row chosen is within it, and named only by the rows
+/// chosen, the fetch ruled no month out before it ran and locked every
+/// month its datasets keep -- 5,043 locks to read one month of thirty years.
 const IN_FORCE: &str = "
 SELECT r.body FROM lake_row r
   JOIN (SELECT DISTINCT ON (dataset, row_key) dataset, sequence, row_key, valid_from_ns
@@ -1814,6 +1827,7 @@ SELECT r.body FROM lake_row r
     ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
    AND r.valid_from_ns = f.valid_from_ns
  WHERE (r.partition = ANY($11) OR r.partition IS NULL)
+   AND r.valid_from_ns >= $8 AND r.valid_from_ns < $9 AND r.valid_from_ns <= $10
  ORDER BY r.dataset, r.sequence";
 
 /// [`IN_FORCE`] as published by a time (contract v27, W10.6): a rate's row
@@ -1841,6 +1855,7 @@ SELECT r.body FROM lake_row r
     ON r.dataset = f.dataset AND r.sequence = f.sequence AND r.row_key = f.row_key
    AND r.valid_from_ns = f.valid_from_ns
  WHERE (r.partition = ANY($11) OR r.partition IS NULL)
+   AND r.valid_from_ns >= $8 AND r.valid_from_ns < $9 AND r.valid_from_ns <= $10
  ORDER BY r.dataset, r.sequence";
 
 /// [`EVERY_VERSION`] a row key at a time, each key's versions together:
