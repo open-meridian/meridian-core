@@ -3430,9 +3430,11 @@ fn groups_standing_before_their_records_began_are_backfilled_once() {
 
     let store = PostgresStore::connect(&url, 2).unwrap();
     store.migrate(&At(1_000)).unwrap();
-    store
-        .migrate(&At(2_000))
-        .expect("migrating twice is a no-op");
+    // The migration's backfill run again, directly (migrating again would
+    // not run it): a group with a record is left as it is (review-core-3b F).
+    let mut tx = db.transaction().unwrap();
+    meridian_config::migrations::groups_held_when_records_began(&mut tx, 2_000).unwrap();
+    tx.commit().unwrap();
 
     for (group, id, became) in [
         (
@@ -3599,42 +3601,68 @@ fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
 }
 
 /// Review-core-3 6: two puts of one new group ID at once record it defined
-/// once and changed once, never defined twice.
+/// once and changed once, never defined twice. Deterministic
+/// (review-core-3b F): the first put is held open after it inserted the
+/// group, until the second waits on it.
 #[test]
 fn two_puts_of_one_new_group_at_once_record_it_defined_once() {
     use meridian_config::groups::{GroupChangeKind, GroupKind};
-    let (_schema, store) = store_at("new_group_race");
+    let (schema, store) = store_at("new_group_race");
     let store = Arc::new(store);
-    for round in 0..12 {
-        let id = format!("UG-{round}");
-        let start = Arc::new(std::sync::Barrier::new(2));
-        let puts: Vec<_> = ["ada", "bea"]
-            .into_iter()
-            .map(|login| {
-                let (store, start, id) = (Arc::clone(&store), Arc::clone(&start), id.clone());
-                std::thread::spawn(move || {
-                    start.wait();
-                    store
-                        .put_user_group(&user_group(&id, login), &Author::default(), 1)
-                        .unwrap();
-                })
-            })
-            .collect();
-        for put in puts {
-            put.join().unwrap();
+    let mut raw = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    let mut watch = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    // The pid each waiter waits on: `waits_on(pid)` is the one blocked by it.
+    let mut waits_on = |blocker: i32| -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(row) = watch
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                    &[&blocker],
+                )
+                .unwrap()
+            {
+                return row.get(0);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing waited on {blocker}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let kinds: Vec<_> = store
-            .group_changes(GroupKind::User, &id)
-            .unwrap()
-            .iter()
-            .map(|r| r.kind)
-            .collect();
-        assert_eq!(
-            kinds,
-            [GroupChangeKind::Defined, GroupChangeKind::Changed],
-            "round {round}"
-        );
-    }
+    };
+    let put = |login: &'static str| {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            store
+                .put_user_group(&user_group("UG-1", login), &Author::default(), 1)
+                .unwrap();
+        })
+    };
+    // The first put inserts the group, then waits to write its record:
+    // held open, its insert not yet committed.
+    let mut gate = raw.transaction().unwrap();
+    gate.batch_execute("LOCK TABLE config_group_change IN SHARE MODE")
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let first = put("ada");
+    let first_pid = waits_on(gate_pid);
+    // The second meets the first's insert, and waits on it.
+    let second = put("bea");
+    waits_on(first_pid);
+    gate.rollback().unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    let kinds: Vec<_> = store
+        .group_changes(GroupKind::User, "UG-1")
+        .unwrap()
+        .iter()
+        .map(|r| r.kind)
+        .collect();
+    assert_eq!(kinds, [GroupChangeKind::Defined, GroupChangeKind::Changed]);
 }
 
 /// Review-core-3b B (decisions/031): a group the release before changed as
