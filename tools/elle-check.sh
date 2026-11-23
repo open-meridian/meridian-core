@@ -65,12 +65,13 @@ verdict() {
 # "--output json", which is no option it knows. Kept whole beside the
 # history, in a .e2e-*.log the job keeps. Of the driver's history, said,
 # never decided by: the verdict above it is the check. Of the planted one,
-# checked below.
+# checked below, with the status it ended with, kept in $ended.
 kept="$(dirname "$history")"
 anomalies() {
+	ended=0
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
 		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
-		--output json "/w/$1" >"$2" 2>&1 || true
+		--output json "/w/$1" >"$2" 2>&1 || ended=$?
 	echo "elle-check: what elle-cli found in $1 is kept whole in $2 ($(wc -c <"$2" | tr -d ' ') bytes)" >&2
 }
 said="$(verdict history.edn)"
@@ -87,8 +88,19 @@ echo "elle-check: the planted anomaly is refused, as it must be"
 # json/pprint of the analysis). A usage error, a stack trace or an analysis
 # naming none has no such key, and fails the job here, on a planted history,
 # never first on a real one (the review of that change, finding 5: a file
-# that was not empty passed, whatever it held).
+# that was not empty passed, whatever it held). And it must end as a history
+# refused does, with status 1 (cli.clj: 1 where any history is not valid, 0
+# where each is, 255 where it threw): an analysis printed and then an
+# exception, or any other end, fails the job too (the review of 2026-11-23
+# of that check, N4: its status was dropped, so a stack trace after the key
+# passed).
 anomalies planted.edn "$kept/.e2e-elle-planted.log"
+[ "$ended" = 1 ] || {
+	echo "elle-check: what --output json said of the planted history, its first 40 lines:" >&2
+	head -n 40 "$kept/.e2e-elle-planted.log" | cut -c1-4000 >&2
+	echo "elle-check FAILED: --output json of the planted history ended with status $ended, not the 1 of a history refused: what it would say of a real one is not known" >&2
+	exit 1
+}
 grep -q '"anomaly-types"' "$kept/.e2e-elle-planted.log" || {
 	echo "elle-check: what --output json said of the planted history, its first 40 lines:" >&2
 	head -n 40 "$kept/.e2e-elle-planted.log" | cut -c1-4000 >&2
