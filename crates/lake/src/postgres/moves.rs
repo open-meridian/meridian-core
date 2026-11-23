@@ -60,6 +60,34 @@ pub enum Switched {
     LetGo { closing: u64, epoch: u64 },
 }
 
+/// A range's row in one database, as a read of its dataset finds it: the
+/// database, its head, whether it is written (not a move's pointer), the
+/// group it names, whether a split closed it, and whether a read there
+/// answers the range.
+///
+/// - In a look before the read's rows ([`PostgresStore::standing_of`]),
+///   `served` is by the row alone: written here, or a move's pointer to a
+///   group whose home this is (its target, not opened yet). No other
+///   database is asked.
+/// - In the read's own rows ([`super::standing_during`]), it is what the
+///   read answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standing {
+    pub database: u32,
+    pub partition: String,
+    pub head: u64,
+    pub written: bool,
+    pub group: Option<u32>,
+    pub closed: bool,
+    pub served: bool,
+}
+
+/// How long a read waits for a connection to ask a database a move's
+/// pointer sent it to ([`PostgresStore::standing_of`]): a constant,
+/// short beside the pool's own 30 s, so a database out of reach holds no
+/// read that long (the review of 2026-11-23, finding 4).
+const STANDING_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn range_tip_of(client: &mut impl GenericClient, partition: &str) -> Result<Option<RangeTip>> {
     let Some(row) = client
         .query_opt(
@@ -225,6 +253,60 @@ impl PostgresStore {
             .iter()
             .map(|row| (row.get(0), row.get::<_, i64>(1).max(0) as u64, row.get(2)))
             .collect())
+    }
+
+    /// `dataset`'s rows here as a read of it finds them
+    /// ([`crate::spread::Spread`]), its own and each range's. On a
+    /// connection waited for [`STANDING_CHECKOUT`] at most where `bounded`:
+    /// a database only a move's pointer sent the read to holds it no
+    /// longer. It commits nothing, so follows no timeline first.
+    ///
+    /// INTERIM(v32): read before every read of a dataset over several
+    /// databases only because a member's view of the writer groups is read
+    /// on a timer; gone when v32's ownership record says where a range is
+    /// read.
+    pub fn standing_of(&self, dataset: &str, bounded: bool) -> Result<Vec<Standing>> {
+        let mut conn = if bounded {
+            self.pool
+                .get_timeout(STANDING_CHECKOUT)
+                .map_err(unavailable)?
+        } else {
+            self.pool.get().map_err(unavailable)?
+        };
+        Ok(conn
+            .query(
+                "SELECT dataset, head, epoch <> $2, writer_group, closed_at IS NOT NULL
+                   FROM lake_partition
+                  WHERE dataset = $1 OR starts_with(dataset, $1 || '/')",
+                &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| self.standing_from(row))
+            .filter(|row| crate::range::is_of(&row.partition, dataset))
+            .collect())
+    }
+
+    /// A row of `lake_partition` read as `dataset, head, epoch <> pointer,
+    /// writer_group, closed_at IS NOT NULL`, with whether it is answered
+    /// here by the row alone ([`Standing`]).
+    pub(super) fn standing_from(&self, row: &postgres::Row) -> Standing {
+        let partition: String = row.get(0);
+        let written: bool = row.get(2);
+        let group: Option<i32> = row.get(3);
+        let home = meridian_changes::databases::of_group(
+            self.group_named(&partition, group),
+            self.databases,
+        );
+        Standing {
+            database: self.database,
+            head: row.get::<_, i64>(1).max(0) as u64,
+            written,
+            group: group.map(|group| group as u32),
+            closed: row.get(4),
+            served: written || home == self.database,
+            partition,
+        }
     }
 
     /// Whether a range's row here is a move's pointer naming writer group

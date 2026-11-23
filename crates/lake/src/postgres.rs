@@ -23,7 +23,7 @@ use meridian_domain::v1::{
 };
 
 mod moves;
-pub use moves::{RangeTip, SwitchTimes, Switched};
+pub use moves::{RangeTip, Standing, SwitchTimes, Switched};
 
 use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;
@@ -48,6 +48,28 @@ thread_local! {
     /// than one.
     static SNAPSHOT_HEADS: std::cell::RefCell<Option<BTreeMap<String, u64>>> =
         const { std::cell::RefCell::new(None) };
+    /// The rows of the partitions the reads on this thread chose what they
+    /// answer by, where one asked ([`standing_during`]).
+    static STANDING: std::cell::RefCell<Option<Vec<Standing>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `read`, with each of its datasets' rows in `lake_partition` as its reads
+/// on this thread found them, and whether each answered the range: from
+/// the look each read chose what it answers by, in its own transaction, so
+/// the snapshot its rows came from (step 3d; the review of 2026-11-23 of
+/// the lake's routing, findings 3, 5 and 6). For a lake over several
+/// databases ([`crate::spread::Spread`]), which holds what its databases
+/// answered together; with one, nothing is noted. A read made inside
+/// another's notes its own.
+///
+/// INTERIM(v32): gone when v32's ownership record says where a range is
+/// read.
+pub(crate) fn standing_during<T>(read: impl FnOnce() -> T) -> (T, Vec<Standing>) {
+    let outer = STANDING.with(|noted| noted.borrow_mut().replace(Vec::new()));
+    let answer = read();
+    let noted = STANDING.with(|noted| std::mem::replace(&mut *noted.borrow_mut(), outer));
+    (answer, noted.unwrap_or_default())
 }
 
 /// The next reads on this thread say the heads of the snapshot each answers
@@ -64,6 +86,15 @@ pub fn stamp_from_snapshot() {
 pub fn snapshot_heads() -> Option<BTreeMap<String, u64>> {
     STAMPING.with(|stamping| stamping.set(false));
     SNAPSHOT_HEADS.with(|heads| heads.borrow_mut().take())
+}
+
+/// A read's own transaction on `conn`: one snapshot, nothing written.
+fn read_only(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(unavailable)
 }
 
 /// In a read's repeatable-read transaction, where its thread asked: the
@@ -4601,8 +4632,11 @@ impl Store for PostgresStore {
             as_assessed(&mut out, &assessments, as_of_ns);
             return Ok(out);
         }
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        // One snapshot, as every other read of a dataset's rows has: what
+        // it answers is chosen from the rows it reads beside them.
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
@@ -4617,7 +4651,8 @@ impl Store for PostgresStore {
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
         let mut out = as_of(out, as_of_ns);
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, as_of_ns);
         Ok(out)
     }
@@ -4682,8 +4717,9 @@ impl Store for PostgresStore {
         data_type: crate::row::DataType,
     ) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2
@@ -4697,7 +4733,8 @@ impl Store for PostgresStore {
             let body: Vec<u8> = row.get(0);
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, 0);
         Ok(out)
     }
@@ -4975,8 +5012,9 @@ impl Store for PostgresStore {
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
-        let partitions = self.served_partitions(&mut *conn, &[dataset.to_string()])?;
-        let rows = conn
+        let mut tx = read_only(&mut conn)?;
+        let partitions = self.served_partitions(&mut tx, &[dataset.to_string()])?;
+        let rows = tx
             .query(
                 "SELECT data_type, body FROM lake_row
                   WHERE dataset = $1 AND row_key = $2 AND version = $3
@@ -4993,7 +5031,8 @@ impl Store for PostgresStore {
                 .ok_or_else(|| StoreError::Unavailable(format!("data type {code} unknown")))?;
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
-        let assessments = assessments_of(&mut *conn, &out)?;
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_assessed(&mut out, &assessments, 0);
         Ok(out)
     }
@@ -5986,19 +6025,42 @@ impl PostgresStore {
         if self.databases <= 1 {
             return Ok(every);
         }
-        let named: BTreeMap<String, Option<i32>> = client
+        // Each one's row, and whether it is answered here: what a read
+        // over several databases is held to ([`standing_during`]).
+        let mut rows: Vec<Standing> = client
             .query(
-                "SELECT dataset, writer_group FROM lake_partition WHERE dataset = ANY($1)",
-                &[&every],
+                "SELECT dataset, head, epoch <> $2, writer_group, closed_at IS NOT NULL
+                   FROM lake_partition WHERE dataset = ANY($1)",
+                &[&every, &meridian_changes::moves::POINTER_EPOCH],
             )
             .map_err(unavailable)?
             .iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| self.standing_from(row))
             .collect();
-        Ok(every
-            .into_iter()
-            .filter(|partition| self.serves(partition, named.get(partition).copied().flatten()))
-            .collect())
+        for row in &mut rows {
+            row.served = self.serves(&row.partition, row.group.map(|group| group as i32));
+        }
+        // One with no row here is its group's by its dataset, as before.
+        let answered: BTreeMap<&str, bool> = rows
+            .iter()
+            .map(|row| (row.partition.as_str(), row.served))
+            .collect();
+        let served = every
+            .iter()
+            .filter(|partition| {
+                answered
+                    .get(partition.as_str())
+                    .copied()
+                    .unwrap_or_else(|| self.serves(partition, None))
+            })
+            .cloned()
+            .collect();
+        STANDING.with(|noted| {
+            if let Some(noted) = noted.borrow_mut().as_mut() {
+                noted.extend(rows);
+            }
+        });
+        Ok(served)
     }
 
     /// The writer group of `partition` as this database's row names it
