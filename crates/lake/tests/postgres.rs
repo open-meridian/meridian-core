@@ -15137,3 +15137,72 @@ fn months_made_before_a_batch_hold_one_ranges_lock_at_a_time() {
         "{done:?}"
     );
 }
+
+/// The review's F5 (v31a.17): the write-ahead stream's batch waits without
+/// the serving session's `statement_timeout`, and so do the months made
+/// before it. A range's months' lock held six seconds by another session
+/// -- past the five a serving session's statement is given -- is waited
+/// for, and the part, spanning more months than a transaction makes, is
+/// recorded.
+#[test]
+fn months_made_before_a_write_ahead_batch_wait_as_long_as_it_does() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    let made = databases(1);
+    let mut raw = postgres::Client::connect(&made[0], postgres::NoTls).unwrap();
+    let database: String = raw
+        .query_one("SELECT quote_ident(current_database())", &[])
+        .unwrap()
+        .get(0);
+    // Every session of this database a serving session's, from here on.
+    raw.batch_execute(&format!(
+        "ALTER DATABASE {database} SET statement_timeout = '5s'"
+    ))
+    .unwrap();
+    let store = PostgresStore::connect(&made[0], 2).unwrap();
+    let dataset = unique("streamwait");
+    store
+        .record(&dataset, vec![trade(&dataset, "first", "INS-1", 10)], 1_000)
+        .unwrap();
+    let mut other = raw.transaction().unwrap();
+    other
+        .batch_execute("SET LOCAL statement_timeout = 0")
+        .unwrap();
+    other
+        .execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&months_lock(&dataset)],
+        )
+        .unwrap();
+    let month_ns = 2_629_800_i64 * 1_000_000_000;
+    let rows: Vec<Observation> = (0..10)
+        .map(|m| trade(&dataset, &format!("k{m}"), "INS-1", (300 + m) * month_ns))
+        .collect();
+    let writing = {
+        let (dataset, stream) = (dataset.clone(), unique("STREAM"));
+        std::thread::spawn(move || {
+            store.record_write_ahead(
+                WriteAheadBatch {
+                    stream,
+                    after: None,
+                    through: WriteAheadPosition {
+                        sequence: 1,
+                        at_ns: 1_000,
+                    },
+                    parts: vec![(dataset, rows)],
+                    ..Default::default()
+                },
+                5_000,
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    other.commit().unwrap();
+    let done = writing.join().unwrap();
+    assert_eq!(
+        done.as_ref()
+            .ok()
+            .and_then(|done| done[0].as_ref().map(|part| part.recorded).ok()),
+        Some(10),
+        "{done:?}"
+    );
+}

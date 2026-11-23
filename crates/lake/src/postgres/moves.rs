@@ -1186,7 +1186,7 @@ impl PostgresStore {
         }
         // A few months a transaction, never the range's whole history in
         // the copy's (v31a.17).
-        crate::leaves::make_months(&mut *conn, &needed).map_err(unavailable)?;
+        crate::leaves::make_months(&mut *conn, &needed, false).map_err(unavailable)?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(
             "INSERT INTO lake_partition SELECT * FROM moving_ranges ON CONFLICT (dataset) DO NOTHING;

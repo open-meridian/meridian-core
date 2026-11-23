@@ -319,10 +319,14 @@ pub fn months_missing(
 /// making its own ranges' months in its own order would wait on it. A
 /// month another made meanwhile -- a release before this one, making it
 /// in its batch's transaction during a rolling upgrade -- is found made
-/// under its range's lock and left. Answers how many it made.
+/// under its range's lock and left. `unbounded` for the write-ahead
+/// stream's batch, whose statements wait without the serving session's
+/// `statement_timeout`: its months' making waits on a range's lock as it
+/// does. Answers how many it made.
 pub fn make_months(
     client: &mut impl GenericClient,
     needed: &BTreeSet<(String, Month)>,
+    unbounded: bool,
 ) -> Result<usize, postgres::Error> {
     // In each range's order, the ranges in theirs.
     let missing: Vec<(String, Month)> = months_missing(client, needed)?.into_iter().collect();
@@ -330,6 +334,9 @@ pub fn make_months(
     for of_one in missing.chunk_by(|a, b| a.0 == b.0) {
         for some in of_one.chunks(MONTHS_A_TRANSACTION) {
             let mut tx = client.transaction()?;
+            if unbounded {
+                meridian_changes::serving::unbounded(&mut tx)?;
+            }
             made += ensure_months(&mut tx, &some.iter().cloned().collect())?;
             tx.commit()?;
         }

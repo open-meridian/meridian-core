@@ -2136,7 +2136,7 @@ impl PostgresStore {
         now_ns: i64,
     ) -> (Result<Vec<Result<Recorded>>>, bool) {
         let rows = parts.iter().map(|rows| (dataset, rows.as_slice()));
-        if let Err(failed) = self.months_first(conn, rows) {
+        if let Err(failed) = self.months_first(conn, rows, false) {
             return (Err(failed), false);
         }
         let mut tx = match conn.transaction().map_err(unavailable) {
@@ -2504,11 +2504,14 @@ impl PostgresStore {
     /// version; one whose range split since, or whose key is anchored by
     /// another subject, is found by the batch itself, which makes the few
     /// and is refused for more, owed to the next. Only in ranges whose
-    /// table is made here and this member's group owns.
+    /// table is made here and this member's group owns. `unbounded` for
+    /// the write-ahead stream's batch, which waits without the serving
+    /// session's `statement_timeout`.
     fn months_first<'a>(
         &self,
         conn: &mut Connection,
         parts: impl Iterator<Item = (&'a str, &'a [Observation])> + Clone,
+        unbounded: bool,
     ) -> Result<()> {
         use crate::leaves::Month;
         let mut needed: std::collections::BTreeSet<(String, Month)> =
@@ -2559,7 +2562,8 @@ impl PostgresStore {
             }
         }
         needed.retain(|(partition, _)| made_ranges[partition]);
-        let made = crate::leaves::make_months(&mut **conn, &needed).map_err(unavailable)?;
+        let made =
+            crate::leaves::make_months(&mut **conn, &needed, unbounded).map_err(unavailable)?;
         if made > 0 {
             tracing::info!(made, "the lake made month tables before their batch");
         }
@@ -2786,7 +2790,7 @@ impl PostgresStore {
         crate::leaves::ensure_ranges(&mut tx, &ranges).map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         // A few months a transaction, before the page's own (v31a.17).
-        crate::leaves::make_months(&mut *conn, &needed).map_err(unavailable)?;
+        crate::leaves::make_months(&mut *conn, &needed, false).map_err(unavailable)?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let columns: String = tx
             .query_one(
@@ -3068,13 +3072,14 @@ impl PostgresStore {
             .collect();
         self.prepare(&mut conn, &datasets.into_iter().collect::<Vec<_>>())?;
         // The whole batch's months, every dataset's, before its one
-        // transaction (v31a.17).
+        // transaction, and as unbounded as it is (v31a.17).
         self.months_first(
             &mut conn,
             batch
                 .parts
                 .iter()
                 .map(|(dataset, rows)| (dataset.as_str(), rows.as_slice())),
+            true,
         )?;
         let mut months = MonthsMade::default();
         let mut tx = conn.transaction().map_err(unavailable)?;
