@@ -1002,7 +1002,7 @@ jobs:
       # the make gave it (E2E_K3D_CLUSTER, meridian-e2e unless set), never
       # every cluster on the runner.
       - name: Remove a cluster the make left
-        if: always() && steps.make.outcome != 'success'
+        if: always() && steps.make.outcome != 'success' && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
         continue-on-error: true
         run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
@@ -1010,8 +1010,24 @@ jobs:
       # The first upload, and the one that matters most after a failure:
       # the make's own log, which no other upload holds, and the watchdog's
       # files, its evidence and its beacon's lines among them.
+      # A runner whose ip or docker did not answer (the proof above) is
+      # stalled: on those runs the cluster's removal ran to its limit and
+      # every upload hung to the job's. So it keeps one small upload alone,
+      # the proofs' own file, bounded at a minute, and skips the removal and
+      # every other upload. The job's and each step's limits are unchanged.
+      - name: Keep the proof alone, from a stalled runner
+        if: always() && steps.answers.outputs.stalled == 'true'
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-proof
+          path: ${{ runner.temp }}/proof.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Keep the make's log and what the watchdog saw
-        if: always()
+        if: always() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1019,6 +1035,7 @@ jobs:
           name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-watchdog
           path: |
             ${{ runner.temp }}/make.log
+            ${{ runner.temp }}/proof.log
             ${{ runner.temp }}/watchdog.log
             ${{ runner.temp }}/watchdog.log.evidence
             ${{ runner.temp }}/watchdog.log.after
@@ -1027,7 +1044,7 @@ jobs:
           retention-days: 14
 
       - name: Keep the failure classes' measurements
-        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
+        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1050,7 +1067,7 @@ jobs:
         run: tools/elle-check.sh .e2e-failover-history.edn "$CI_TOOLS"
 
       - name: Keep the driver's history
-        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
+        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1064,7 +1081,7 @@ jobs:
       # The restore to a time and the checksum step's measurements (step 3b
       # part 3), kept for the claims ledger as the failover runs' are.
       - name: Keep the backup run's measurements
-        if: matrix.target == 'e2e-cluster-backup' && !cancelled()
+        if: matrix.target == 'e2e-cluster-backup' && !cancelled() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1076,7 +1093,7 @@ jobs:
           retention-days: 90
 
       - name: Keep this job's footprint peak
-        if: matrix.target == 'e2e-cluster' && !cancelled()
+        if: matrix.target == 'e2e-cluster' && !cancelled() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1105,8 +1122,9 @@ jobs:
           done
 
       - name: Keep what the cluster said
-        # And when the job's limit ends it, as the step above.
-        if: failure() || cancelled()
+        # And when the job's limit ends it, as the step above; never from a
+        # stalled runner (the proof's upload above).
+        if: (failure() || cancelled()) && steps.answers.outputs.stalled != 'true'
         # A slow artifact service held a failed run open to the job's limit
         # (2026-10-06); the step above has put what failed in the job's log,
         # so an upload that fails or times out never decides the run.
@@ -1380,7 +1398,7 @@ jobs:
       # the make gave it (E2E_K3D_CLUSTER, meridian-e2e unless set), never
       # every cluster on the runner.
       - name: Remove a cluster the make left
-        if: always() && steps.make.outcome != 'success'
+        if: always() && steps.make.outcome != 'success' && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
         continue-on-error: true
         run: timeout 90 k3d cluster delete "${E2E_K3D_CLUSTER:-meridian-e2e}" || true
@@ -1388,8 +1406,24 @@ jobs:
       # The first upload, and the one that matters most after a failure:
       # the make's own log, which no other upload holds, and the watchdog's
       # files, its evidence and its beacon's lines among them.
+      # A runner whose ip or docker did not answer (the proof above) is
+      # stalled: on those runs the cluster's removal ran to its limit and
+      # every upload hung to the job's. So it keeps one small upload alone,
+      # the proofs' own file, bounded at a minute, and skips the removal and
+      # every other upload. The job's and each step's limits are unchanged.
+      - name: Keep the proof alone, from a stalled runner
+        if: always() && steps.answers.outputs.stalled == 'true'
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cluster-arm64-proof
+          path: ${{ runner.temp }}/proof.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Keep the make's log and what the watchdog saw
-        if: always()
+        if: always() && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 2
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -1397,6 +1431,7 @@ jobs:
           name: e2e-cluster-arm64-watchdog
           path: |
             ${{ runner.temp }}/make.log
+            ${{ runner.temp }}/proof.log
             ${{ runner.temp }}/watchdog.log
             ${{ runner.temp }}/watchdog.log.evidence
             ${{ runner.temp }}/watchdog.log.after
@@ -1417,8 +1452,9 @@ jobs:
           done
 
       - name: Keep what the cluster said
-        # And when the job's limit ends it, as the step above.
-        if: failure() || cancelled()
+        # And when the job's limit ends it, as the step above; never from a
+        # stalled runner (the proof's upload above).
+        if: (failure() || cancelled()) && steps.answers.outputs.stalled != 'true'
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
