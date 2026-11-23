@@ -673,6 +673,93 @@ async fn registrations_are_capped_making_room_from_the_oldest_unconsented() {
     );
 }
 
+/// Decision 47 (roadmap v31a item 13): in memory as in Postgres, each change
+/// to a delegation is its own record -- made, renewed with what it replaced,
+/// its rows rewritten and its tools filled in by an upgrade, revoked, and
+/// removed by the sweep -- and the records outlive it.
+#[tokio::test]
+async fn every_delegation_change_is_its_own_record_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    store
+        .register(
+            &Client {
+                client_id: "mdc_a".into(),
+                name: "client a".into(),
+                redirect_uris: vec![BACK.into()],
+                software_id: String::new(),
+                registered_at_ns: T0,
+                consented: false,
+            },
+            10,
+        )
+        .unwrap();
+    let grant = |covers: Covers, until: i64| Grant {
+        subject: "local|ada".into(),
+        display_name: "Ada Park".into(),
+        client_id: "mdc_a".into(),
+        covers,
+        directory_groups: vec![],
+        expires_at_ns: until,
+    };
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let made = store.grant(&grant(old_rows, T0 + DAY_NS), T0).unwrap();
+    let renewed_at = T0 + 1_000;
+    store
+        .grant(&grant(made.covers.clone(), T0 + 2 * DAY_NS), renewed_at)
+        .unwrap();
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made.id, &made.covers, &rewritten, T0 + 2_000)
+        .unwrap());
+    store
+        .backfill_acting(&made.id, &["place_order".to_string()], T0 + 3_000)
+        .unwrap();
+    store
+        .backfill_acting(&made.id, &["place_order".to_string()], T0 + 3_500)
+        .unwrap();
+    assert!(store
+        .revoke(&made.id, "local|ada", "done", T0 + 4_000)
+        .unwrap());
+    store.sweep(T0 + 2 * DAY_NS + KEPT_NS + 1).unwrap();
+    assert!(store.delegation(&made.id).unwrap().is_none());
+
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (Made, "local|ada", T0),
+            (Renewed, "local|ada", renewed_at),
+            (Rewritten, "", T0 + 2_000),
+            (ActingFilled, "", T0 + 3_000),
+            (Revoked, "local|ada", T0 + 4_000),
+            (Removed, "", T0 + 2 * DAY_NS + KEPT_NS + 1),
+        ]
+    );
+    assert!(records[1].was.contains("expires 2026-09-27T00:00:00Z"));
+    assert!(records[1].became.contains("expires 2026-09-28T00:00:00Z"));
+    assert!(records[2].was.contains("oms-1 read (unmatched)"));
+    assert!(records[2].became.contains("plugins oms-1 oms read"));
+    assert!(records[3].became.contains("acting place_order"));
+    for pair in records.windows(2) {
+        assert_eq!(
+            pair[1].was, pair[0].became,
+            "{:?} follows {:?}",
+            pair[1].kind, pair[0].kind
+        );
+    }
+}
+
 // ── Narrowing ────────────────────────────────────────────────────────────
 
 fn records() -> AccessRecords {
@@ -1021,4 +1108,181 @@ fn the_rows_as_kept_read_back_whichever_shape_they_were_written_in() {
         unmatched,
         BTreeSet::from([("oms-1".into(), "admin".into())])
     );
+}
+
+/// A delegation past its expiry, unrevoked, is recorded lapsed by the sweep
+/// once, valid when it expired: as the Postgres store does it.
+#[tokio::test]
+async fn a_delegation_past_its_expiry_is_recorded_lapsed_once_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    store
+        .register(
+            &Client {
+                client_id: "mdc_a".into(),
+                name: "client a".into(),
+                redirect_uris: vec![BACK.into()],
+                software_id: String::new(),
+                registered_at_ns: T0,
+                consented: false,
+            },
+            10,
+        )
+        .unwrap();
+    let made = store
+        .grant(
+            &Grant {
+                subject: "local|ada".into(),
+                display_name: "Ada Park".into(),
+                client_id: "mdc_a".into(),
+                covers: Covers::everything(),
+                directory_groups: vec![],
+                expires_at_ns: T0 + DAY_NS,
+            },
+            T0,
+        )
+        .unwrap();
+    store.sweep(T0 + DAY_NS + 1).unwrap();
+    store.sweep(T0 + DAY_NS + 2).unwrap();
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [
+            (Made, T0, Some(T0)),
+            (Lapsed, T0 + DAY_NS + 1, Some(T0 + DAY_NS))
+        ]
+    );
+    assert_eq!(records[1].was, records[0].became);
+}
+
+/// Review-core-3b C: a revocation or a renewal after the expiry, before any
+/// sweep, records the lapse first, valid when it expired: as the Postgres
+/// store does it.
+#[tokio::test]
+async fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    let expires = T0 + DAY_NS;
+    let mut made = Vec::new();
+    for id in ["mdc_a", "mdc_b"] {
+        store
+            .register(
+                &Client {
+                    client_id: id.into(),
+                    name: id.into(),
+                    redirect_uris: vec![BACK.into()],
+                    software_id: String::new(),
+                    registered_at_ns: T0,
+                    consented: false,
+                },
+                10,
+            )
+            .unwrap();
+        let grant = Grant {
+            subject: "local|ada".into(),
+            display_name: "Ada Park".into(),
+            client_id: id.into(),
+            covers: Covers::everything(),
+            directory_groups: vec![],
+            expires_at_ns: expires,
+        };
+        made.push((grant.clone(), store.grant(&grant, T0).unwrap()));
+    }
+    assert!(store
+        .revoke(&made[0].1.id, "local|ada", "done", expires + 1)
+        .unwrap());
+    let renewal = Grant {
+        expires_at_ns: expires + 30 * DAY_NS,
+        ..made[1].0.clone()
+    };
+    store.grant(&renewal, expires + 1).unwrap();
+    store.sweep(expires + 2).unwrap();
+    for ((_, delegation), last) in made.iter().zip([Revoked, Renewed]) {
+        let records = store.changes(&delegation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (Made, T0, Some(T0)),
+                (Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}
+
+/// Review-core-3c N6: the one-time rewrite and the fill of a delegation's
+/// tools, landing after its expiry before any sweep, record the lapse
+/// first, valid when it expired: as the Postgres store does it.
+#[tokio::test]
+async fn a_rewrite_or_a_fill_after_the_expiry_records_the_lapse_first_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    let expires = T0 + DAY_NS;
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let mut made = Vec::new();
+    for id in ["mdc_a", "mdc_b"] {
+        store
+            .register(
+                &Client {
+                    client_id: id.into(),
+                    name: id.into(),
+                    redirect_uris: vec![BACK.into()],
+                    software_id: String::new(),
+                    registered_at_ns: T0,
+                    consented: false,
+                },
+                10,
+            )
+            .unwrap();
+        let grant = Grant {
+            subject: "local|ada".into(),
+            display_name: "Ada Park".into(),
+            client_id: id.into(),
+            covers: old_rows.clone(),
+            directory_groups: vec![],
+            expires_at_ns: expires,
+        };
+        made.push(store.grant(&grant, T0).unwrap());
+    }
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made[0].id, &made[0].covers, &rewritten, expires + 1)
+        .unwrap());
+    store
+        .backfill_acting(&made[1].id, &["place_order".to_string()], expires + 1)
+        .unwrap();
+    for (delegation, last) in made.iter().zip([Rewritten, ActingFilled]) {
+        let records = store.changes(&delegation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (Made, T0, Some(T0)),
+                (Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
 }

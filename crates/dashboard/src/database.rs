@@ -7,8 +7,9 @@
 //!
 //! - the accounts this deployment holds itself ([`crate::accounts`]), used
 //!   only where the firm has no directory of its own;
-//! - clients, the delegations people make to them, and their tokens by
-//!   fingerprint ([`crate::delegation`], decisions/029), for the same reason;
+//! - clients, the delegations people make to them, their tokens by
+//!   fingerprint, and each delegation change's record ([`crate::delegation`],
+//!   decisions/029, decision 47), for the same reason;
 //! - tickets, their references and notes, notices and each reader's place
 //!   in a person's inbox ([`crate::tickets`], contract v13);
 //! - prepared changes, the admins' levels and a person's own settings
@@ -36,8 +37,11 @@ pub(crate) type Connection = r2d2::PooledConnection<
 /// a deployment migrating them together does not have one wait on another.
 const SCHEMA_LOCK: i64 = 0x6461_7368_626f_6172_u64 as i64;
 
-/// A migration's record it owes the past, written at the moment it ran.
-type Then = fn(&mut postgres::Transaction<'_>, i64) -> Result<(), String>;
+/// A migration's record it owes the past, written at the moment it ran, in
+/// the migration's try: its error the database's own, so a try that met
+/// the release before's writers is told from one that failed
+/// (review-core-3d F4).
+type Then = fn(&mut postgres::Transaction<'_>, i64) -> Result<(), postgres::Error>;
 
 struct Migration {
     version: i64,
@@ -146,12 +150,27 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0015_the_inbox_in_commit_order.sql"),
         then: None,
     },
+    Migration {
+        version: 16,
+        name: "each_delegation_change_its_own_record",
+        sql: include_str!("../migrations/0016_each_delegation_change_its_own_record.sql"),
+        then: Some(crate::delegation::held_when_records_began),
+    },
+    Migration {
+        version: 17,
+        name: "append_only_records",
+        sql: include_str!("../migrations/0017_append_only_records.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and
 /// every gate off at the upgrade to contract v20, which is what the
 /// deployment allowed before, said once, at the moment it ran.
-fn levels_at_the_upgrade(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Result<(), String> {
+fn levels_at_the_upgrade(
+    tx: &mut postgres::Transaction<'_>,
+    at_ns: i64,
+) -> Result<(), postgres::Error> {
     tx.execute(
         "INSERT INTO dashboard_agents_may_change (act, scope, from_said, to_said, changed_at_ns, note)
          SELECT '*', 'deployment', '', $1, $2, $3
@@ -161,8 +180,7 @@ fn levels_at_the_upgrade(tx: &mut postgres::Transaction<'_>, at_ns: i64) -> Resu
             &at_ns,
             &crate::prepared::levels::AT_THE_UPGRADE_NOTE,
         ],
-    )
-    .map_err(said)?;
+    )?;
     Ok(())
 }
 
@@ -309,20 +327,65 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
         if at.is_some_and(|at| at >= migration.version) {
             continue;
         }
-        let mut tx = conn.transaction().map_err(said)?;
-        tx.batch_execute(migration.sql).map_err(said)?;
-        if let Some(then) = migration.then {
-            then(&mut tx, clock.now_ns())?;
+        // Where the release before still serves, each try -- its SQL and
+        // the records it owes the past -- waits at most a few seconds for a
+        // table's or a row's lock, and is rolled back and tried again, as the
+        // change log's install does: a deadlock with its writers, or their
+        // writes queued behind this one's wait, lasts no longer than that
+        // (review-core-3c N1, review-core-3d F4).
+        let mut tries = 0u32;
+        loop {
+            let mut tx = conn.transaction().map_err(said)?;
+            match tried(&mut tx, migration, clock.now_ns()) {
+                Ok(()) => {}
+                Err(failed) if tries < TRIES && contended(&failed) => {
+                    drop(tx);
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(tries)));
+                    continue;
+                }
+                Err(failed) => return Err(said(failed)),
+            }
+            tx.execute(
+                "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
+                 VALUES ($1, $2, $3)",
+                &[&migration.version, &migration.name, &clock.now_ns()],
+            )
+            .map_err(said)?;
+            tx.commit().map_err(said)?;
+            break;
         }
-        tx.execute(
-            "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
-             VALUES ($1, $2, $3)",
-            &[&migration.version, &migration.name, &clock.now_ns()],
-        )
-        .map_err(said)?;
-        tx.commit().map_err(said)?;
     }
     Ok(())
+}
+
+/// One try of `migration` in `tx`: its SQL, then the records it owes the past
+/// at `at_ns`, each under the try's lock wait, the error the database's own.
+fn tried(
+    tx: &mut postgres::Transaction<'_>,
+    migration: &Migration,
+    at_ns: i64,
+) -> Result<(), postgres::Error> {
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAITS_AT_MOST}'"))?;
+    tx.batch_execute(migration.sql)?;
+    if let Some(then) = migration.then {
+        then(tx, at_ns)?;
+    }
+    tx.batch_execute("SET LOCAL lock_timeout TO DEFAULT")
+}
+
+/// How long a migration's statements wait for a table's lock before the try
+/// is rolled back, and how many times it is tried: as the change log's
+/// install (meridian_changes::captured::Spec::install).
+const LOCK_WAITS_AT_MOST: &str = "3s";
+const TRIES: u32 = 30;
+
+/// A try that met its writers: a deadlock, or a lock not had in time.
+fn contended(failed: &postgres::Error) -> bool {
+    failed.code().is_some_and(|code| {
+        *code == postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+            || *code == postgres::error::SqlState::LOCK_NOT_AVAILABLE
+    })
 }
 
 fn applied(conn: &mut Connection) -> Result<Option<i64>, String> {

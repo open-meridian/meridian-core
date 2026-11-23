@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use meridian_changes::scratch::Scratch;
 use meridian_config::store::{
-    ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
+    Author, ChangeKind, Ending, Held, KnownPlugin, SettingChange, SettingsAuthor, Store, Withdrawal,
 };
 use meridian_config::{PostgresStore, SettingsKey, DEPLOYMENT_ADMIN};
 use meridian_domain::v1::{
@@ -130,14 +130,16 @@ fn what_is_written_is_what_a_snapshot_reads_back() {
         })
         .unwrap();
     let group = user_group("UG-1", "ada");
-    store.put_user_group(&group).unwrap();
+    store.put_user_group(&group, &Author::default(), 1).unwrap();
     let accounts = AccountGroup {
         account_group_id: "AG-1".into(),
         name: "Growth".into(),
         account_ids: vec!["ACC-1".into()],
         built_in: false,
     };
-    store.put_account_group(&accounts).unwrap();
+    store
+        .put_account_group(&accounts, &Author::default(), 1)
+        .unwrap();
     let access = AccessGroup {
         access_group_id: "AX-1".into(),
         name: "Trading".into(),
@@ -251,14 +253,20 @@ fn a_new_account_and_its_link_are_written_together_or_not_at_all() {
 #[test]
 fn the_table_refuses_a_permission_shaped_wrong_whoever_writes_it() {
     let (_schema, store) = store_at("shape");
-    store.put_user_group(&user_group("UG-1", "ada")).unwrap();
     store
-        .put_account_group(&AccountGroup {
-            account_group_id: "AG-1".into(),
-            name: "g".into(),
-            account_ids: vec![],
-            built_in: false,
-        })
+        .put_user_group(&user_group("UG-1", "ada"), &Author::default(), 1)
+        .unwrap();
+    store
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "g".into(),
+                account_ids: vec![],
+                built_in: false,
+            },
+            &Author::default(),
+            1,
+        )
         .unwrap();
     let with_accounts = Permission {
         account_group_id: "AG-1".into(),
@@ -392,7 +400,7 @@ fn two_concurrent_withdrawals_cannot_leave_no_admin() {
     let store = Arc::new(store);
     for n in 0..2 {
         let group = user_group(&format!("UG-{n}"), &format!("person-{n}"));
-        store.put_user_group(&group).unwrap();
+        store.put_user_group(&group, &Author::default(), 1).unwrap();
         store
             .add_permission(
                 &admin_permission(&format!("PRM-{n}"), &group.user_group_id),
@@ -1602,12 +1610,16 @@ fn upgrading_links_the_deployment_admins_to_all_plugins_admin() {
     // Its level column takes admin now, and either built-in access group
     // still names no account group, whoever writes it.
     store
-        .put_account_group(&AccountGroup {
-            account_group_id: "AG-1".into(),
-            name: "g".into(),
-            account_ids: vec![],
-            built_in: false,
-        })
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "g".into(),
+                account_ids: vec![],
+                built_in: false,
+            },
+            &Author::default(),
+            1,
+        )
         .unwrap();
     let naming = Permission {
         permission_id: "PRM-2".into(),
@@ -2797,7 +2809,11 @@ fn a_follower_that_reloaded_and_is_given_the_log_in_any_page_split_builds_the_st
             })
             .unwrap();
         store
-            .put_user_group(&user_group(&format!("UG-{n}"), "ada"))
+            .put_user_group(
+                &user_group(&format!("UG-{n}"), "ada"),
+                &Author::default(),
+                1,
+            )
             .unwrap();
     }
     let followed = meridian_config::postgres::CHANGES
@@ -3286,4 +3302,503 @@ fn only_a_later_launch_on_its_own_claim_keeps_a_copy_unrecorded_in_postgres() {
 fn the_storage_copy_is_recorded_once_in_postgres() {
     let (_schema, store) = store_with_version("storage_copied");
     a_copy_is_recorded_once_a_pod_is_heard_registered_after_the_launcher_answered(&store);
+}
+
+/// Decision 47 (roadmap v31a item 13, decisions/031): each user-group and
+/// account-group change is its own record in the store, written with the
+/// change, and kept when the group changes again.
+#[test]
+fn each_user_group_and_account_group_change_is_its_own_record() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind};
+    let (_schema, store) = store_at("group_changes");
+    let ada = Author {
+        by: "local|ada".into(),
+        delegation: "DLG-7".into(),
+        ..Author::default()
+    };
+    let mut group = user_group("UG-1", "ada");
+    store.put_user_group(&group, &ada, 10).unwrap();
+    group.logins.push("grace".into());
+    store.put_user_group(&group, &ada, 20).unwrap();
+    store
+        .put_user_group(&group, &ada, 30)
+        .expect("saved unchanged");
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| {
+            (
+                r.kind,
+                r.by.as_str(),
+                r.delegation.as_str(),
+                r.at_ns,
+                r.backfilled,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (GroupChangeKind::Defined, "local|ada", "DLG-7", 10, false),
+            (GroupChangeKind::Changed, "local|ada", "DLG-7", 20, false),
+        ]
+    );
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records.iter().map(|r| r.valid_at_ns).collect::<Vec<_>>(),
+        [Some(10), Some(20)],
+        "valid when made, as recorded"
+    );
+    assert_eq!(
+        records[0].became,
+        "\"UG-1\": directory groups desk; logins ada"
+    );
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"UG-1\": directory groups desk; logins ada, grace"
+    );
+
+    let mut accounts = AccountGroup {
+        account_group_id: "AG-1".into(),
+        name: "Growth".into(),
+        account_ids: vec!["ACC-1".into()],
+        built_in: false,
+    };
+    store.put_account_group(&accounts, &ada, 40).unwrap();
+    accounts.account_ids.clear();
+    store.put_account_group(&accounts, &ada, 50).unwrap();
+    let records = store.group_changes(GroupKind::Account, "AG-1").unwrap();
+    let said: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.was.as_str(), r.became.as_str(), r.at_ns))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                GroupChangeKind::Defined,
+                "",
+                "\"Growth\": accounts ACC-1",
+                40
+            ),
+            (
+                GroupChangeKind::Changed,
+                "\"Growth\": accounts ACC-1",
+                "\"Growth\": accounts none",
+                50
+            ),
+        ]
+    );
+    assert!(store
+        .group_changes(GroupKind::User, "AG-1")
+        .unwrap()
+        .is_empty());
+}
+
+/// Migration 35 (decision 47, decisions/031): each user group and account
+/// group standing before it gets one backfilled record, at the moment the
+/// migration ran, saying it as it stood and that who made it is not known;
+/// run again, nothing more; a change since is recorded from what it held.
+#[test]
+fn groups_standing_before_their_records_began_are_backfilled_once() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind, HELD_WHEN_RECORDS_BEGAN};
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_group_backfill_{seq}_{}", unique());
+    let url = Scratch::schema(&base_url(), &name);
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 34)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    db.batch_execute(
+        "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-1', 'Admins', '{admins}', '{ada}');
+         INSERT INTO config_account_group (account_group_id, name, account_ids)
+         VALUES ('AG-1', 'Growth', '{ACC-1,ACC-2}');",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    // The migration's backfill run again, directly (migrating again would
+    // not run it): a group with a record is left as it is (review-core-3b F).
+    let mut tx = db.transaction().unwrap();
+    meridian_config::migrations::groups_held_when_records_began(&mut tx, 2_000).unwrap();
+    tx.commit().unwrap();
+
+    for (group, id, became) in [
+        (
+            GroupKind::User,
+            "UG-1",
+            "\"Admins\": directory groups admins; logins ada",
+        ),
+        (
+            GroupKind::Account,
+            "AG-1",
+            "\"Growth\": accounts ACC-1, ACC-2",
+        ),
+        (
+            GroupKind::Account,
+            "all-accounts",
+            "\"All accounts\": every account (built in)",
+        ),
+    ] {
+        let records = store.group_changes(group, id).unwrap();
+        assert_eq!(records.len(), 1, "{id}: {records:?}");
+        let held = &records[0];
+        assert_eq!(held.kind, GroupChangeKind::HeldWhenRecordsBegan, "{id}");
+        assert_eq!(held.became, became);
+        assert_eq!(held.was, "");
+        assert_eq!(held.by, "", "{id}: who made it is not known");
+        assert!(held.backfilled, "{id}");
+        assert_eq!(held.at_ns, 1_000, "{id}: the migration's own time");
+        assert_eq!(held.valid_at_ns, None, "{id}: a group's row holds no date");
+        assert_eq!(held.note, HELD_WHEN_RECORDS_BEGAN);
+    }
+
+    // A change since: recorded whole, from what the group held.
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    store
+        .put_user_group(
+            &UserGroup {
+                user_group_id: "UG-1".into(),
+                name: "Admins".into(),
+                directory_groups: vec!["admins".into()],
+                logins: vec![],
+            },
+            &ada,
+            3_000,
+        )
+        .unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].kind, GroupChangeKind::Changed);
+    assert_eq!(records[1].was, records[0].became);
+    assert_eq!(
+        records[1].became,
+        "\"Admins\": directory groups admins; logins none"
+    );
+    assert!(!records[1].backfilled);
+}
+
+/// Review-core-3 1 (decisions/031): the release before keeps serving while
+/// migration 35 runs, and its changes write no record. A group it changed is
+/// given a record saying so before the next change is recorded, and one it
+/// defined is given one saying it was defined by an earlier release, at
+/// start or at its next change; each record's `was` is the one before's
+/// `became`.
+#[test]
+fn a_change_the_release_before_made_while_upgrading_keeps_the_chain_whole() {
+    use meridian_config::groups::{
+        GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE, DEFINED_BY_AN_EARLIER_RELEASE,
+    };
+    let (schema, store) = store_at("earlier_release");
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    let mut group = user_group("UG-1", "ada");
+    store.put_user_group(&group, &ada, 10).unwrap();
+    // The release before, as v15 writes: the row replaced, no record.
+    let mut raw = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    raw.batch_execute(
+        "UPDATE config_user_group SET logins = '{ada,bea}' WHERE user_group_id = 'UG-1';
+         INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-2', 'Ops', '{ops}', '{cy}'), ('UG-3', 'Risk', '{risk}', '{dee}');
+         INSERT INTO config_account_group (account_group_id, name, account_ids)
+         VALUES ('AG-9', 'Old', '{ACC-9}');",
+    )
+    .unwrap();
+
+    group.logins = vec!["grace".into()];
+    store.put_user_group(&group, &ada, 20).unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-1").unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (GroupChangeKind::Defined, "local|ada", false, Some(10)),
+            (GroupChangeKind::ChangedByAnEarlierRelease, "", true, None),
+            (GroupChangeKind::Changed, "local|ada", false, Some(20)),
+        ]
+    );
+    assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(
+        records[1].at_ns, 20,
+        "recorded when found, never back-dated"
+    );
+    assert_eq!(
+        records[1].became,
+        "\"UG-1\": directory groups desk; logins ada, bea"
+    );
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // One the release before defined: its gap record first, defined by an
+    // earlier release (kind 4, its `was` empty; review-core-3b D). Kind 3 is
+    // the migration's own run only.
+    let mut ops = UserGroup {
+        user_group_id: "UG-2".into(),
+        name: "Ops".into(),
+        directory_groups: vec!["ops".into()],
+        logins: vec![],
+    };
+    store.put_user_group(&ops, &ada, 30).unwrap();
+    ops.logins.push("eve".into());
+    store.put_user_group(&ops, &ada, 40).unwrap();
+    let records = store.group_changes(GroupKind::User, "UG-2").unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [
+            GroupChangeKind::ChangedByAnEarlierRelease,
+            GroupChangeKind::Changed,
+            GroupChangeKind::Changed
+        ]
+    );
+    assert_eq!(records[0].note, DEFINED_BY_AN_EARLIER_RELEASE);
+    assert_eq!(records[0].was, "");
+    assert_eq!(
+        records[0].became,
+        "\"Ops\": directory groups ops; logins cy"
+    );
+    for pair in records.windows(2) {
+        assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+    }
+
+    // At start, each one with no record at all, once: run twice, directly.
+    store.backfill_group_records(50).unwrap();
+    store.backfill_group_records(60).unwrap();
+    for (kind, id) in [(GroupKind::User, "UG-3"), (GroupKind::Account, "AG-9")] {
+        let records = store.group_changes(kind, id).unwrap();
+        assert_eq!(records.len(), 1, "{id}: {records:?}");
+        assert_eq!(records[0].kind, GroupChangeKind::ChangedByAnEarlierRelease);
+        assert_eq!(records[0].was, "", "{id}");
+        assert_eq!(records[0].note, DEFINED_BY_AN_EARLIER_RELEASE);
+        assert_eq!(records[0].at_ns, 50);
+    }
+    assert_eq!(
+        store.group_changes(GroupKind::User, "UG-1").unwrap().len(),
+        3,
+        "a group with records is left as it is"
+    );
+}
+
+/// Review-core-3 6: two puts of one new group ID at once record it defined
+/// once and changed once, never defined twice. Deterministic
+/// (review-core-3b F): the first put is held open after it inserted the
+/// group, until the second waits on it.
+#[test]
+fn two_puts_of_one_new_group_at_once_record_it_defined_once() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind};
+    let (schema, store) = store_at("new_group_race");
+    let store = Arc::new(store);
+    let mut raw = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    let mut watch = postgres::Client::connect(&schema, postgres::NoTls).unwrap();
+    // The pid each waiter waits on: `waits_on(pid)` is the one blocked by it.
+    let mut waits_on = |blocker: i32| -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(row) = watch
+                .query_opt(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                    &[&blocker],
+                )
+                .unwrap()
+            {
+                return row.get(0);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing waited on {blocker}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let put = |login: &'static str| {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            store
+                .put_user_group(&user_group("UG-1", login), &Author::default(), 1)
+                .unwrap();
+        })
+    };
+    // The first put inserts the group, then waits to write its record:
+    // held open, its insert not yet committed.
+    let mut gate = raw.transaction().unwrap();
+    gate.batch_execute("LOCK TABLE config_group_change IN SHARE MODE")
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let first = put("ada");
+    let first_pid = waits_on(gate_pid);
+    // The second meets the first's insert, and waits on it.
+    let second = put("bea");
+    waits_on(first_pid);
+    gate.rollback().unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    let kinds: Vec<_> = store
+        .group_changes(GroupKind::User, "UG-1")
+        .unwrap()
+        .iter()
+        .map(|r| r.kind)
+        .collect();
+    assert_eq!(kinds, [GroupChangeKind::Defined, GroupChangeKind::Changed]);
+}
+
+/// Review-core-3b B (decisions/031): a group the release before changed as
+/// the upgrade ran, and nobody changed again, is found at start: compared
+/// with its latest record, it is given one saying it was changed by an
+/// earlier release, once.
+#[test]
+fn a_group_the_release_before_changed_and_nobody_changed_again_is_found_at_start() {
+    use meridian_config::groups::{GroupChangeKind, GroupKind, CHANGED_BY_AN_EARLIER_RELEASE};
+    let (schema, store) = store_at("found_at_start");
+    let ada = Author {
+        by: "local|ada".into(),
+        ..Author::default()
+    };
+    store
+        .put_user_group(&user_group("UG-1", "ada"), &ada, 10)
+        .unwrap();
+    store
+        .put_account_group(
+            &AccountGroup {
+                account_group_id: "AG-1".into(),
+                name: "Growth".into(),
+                account_ids: vec!["ACC-1".into()],
+                built_in: false,
+            },
+            &ada,
+            10,
+        )
+        .unwrap();
+    postgres::Client::connect(&schema, postgres::NoTls)
+        .unwrap()
+        .batch_execute(
+            "UPDATE config_user_group SET logins = '{ada,bea}' WHERE user_group_id = 'UG-1';
+             UPDATE config_account_group SET account_ids = '{ACC-1,ACC-2}'
+              WHERE account_group_id = 'AG-1';",
+        )
+        .unwrap();
+    store.backfill_group_records(50).unwrap();
+    store.backfill_group_records(60).unwrap();
+    for (kind, id, became) in [
+        (
+            GroupKind::User,
+            "UG-1",
+            "\"UG-1\": directory groups desk; logins ada, bea",
+        ),
+        (
+            GroupKind::Account,
+            "AG-1",
+            "\"Growth\": accounts ACC-1, ACC-2",
+        ),
+    ] {
+        let records = store.group_changes(kind, id).unwrap();
+        let seen: Vec<_> = records
+            .iter()
+            .map(|r| (r.kind, r.by.as_str(), r.backfilled, r.at_ns, r.valid_at_ns))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (GroupChangeKind::Defined, "local|ada", false, 10, Some(10)),
+                (
+                    GroupChangeKind::ChangedByAnEarlierRelease,
+                    "",
+                    true,
+                    50,
+                    None
+                ),
+            ],
+            "{id}"
+        );
+        assert_eq!(records[1].note, CHANGED_BY_AN_EARLIER_RELEASE);
+        assert_eq!(records[1].was, records[0].became, "{id}: the chain holds");
+        assert_eq!(records[1].became, became);
+    }
+    assert_eq!(
+        store
+            .group_changes(GroupKind::Account, "all-accounts")
+            .unwrap()
+            .len(),
+        1,
+        "a group as its records say is left as it is"
+    );
+}
+
+/// Review-core-3 8: on a store whose change log was installed by the release
+/// before, migration 35's backfilled records are written as it runs, before
+/// the log is installed again over the new table. Each is in the log, so a
+/// follower reading on from its place has them.
+#[test]
+fn a_migrations_backfilled_records_are_in_the_change_log() {
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_backfill_logged_{seq}_{}", unique());
+    let url = Scratch::schema(&base_url(), &name);
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 34)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    // The release before installed its log, then kept a group in it.
+    meridian_config::postgres::CHANGES.install(&mut db).unwrap();
+    db.batch_execute(
+        "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-1', 'Admins', '{admins}', '{ada}')",
+    )
+    .unwrap();
+    let before = meridian_config::postgres::CHANGES
+        .snapshot(&mut db)
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    // A replay of the log from where the release before stood equals the
+    // tables after migrating (review-core-3b E).
+    meridian_config::postgres::CHANGES
+        .check_follows(&mut db, &before)
+        .unwrap();
+    let recorded: i64 = db
+        .query_one("SELECT count(*) FROM config_group_change", &[])
+        .unwrap()
+        .get(0);
+    assert!(recorded >= 2, "UG-1 and All accounts: {recorded}");
+    let logged: i64 = db
+        .query_one(
+            "SELECT count(*) FROM config_change WHERE kind = 'config_group_change.insert'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(logged, recorded, "every backfilled record is in the log");
 }

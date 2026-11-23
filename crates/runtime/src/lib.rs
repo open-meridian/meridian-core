@@ -544,6 +544,77 @@ where
     }));
 }
 
+/// `attempt` tried until it succeeds: a failure said, and tried again after a
+/// pause that doubles from `first` to at most `most` (review-core-3c N7: a
+/// start's one-off work that failed was only warned of, and never done).
+/// Answers how many tries it took.
+pub async fn until_it_succeeds<F, A>(
+    what: &str,
+    first: Duration,
+    most: Duration,
+    mut attempt: F,
+) -> u32
+where
+    F: FnMut() -> A,
+    A: std::future::Future<Output = Result<(), String>>,
+{
+    let mut pause = first;
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match attempt().await {
+            Ok(()) => return tries,
+            Err(failed) => {
+                tracing::warn!(%failed, tries, retry_in_s = pause.as_secs_f64(), "{what}: tried again");
+            }
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(most);
+    }
+}
+
+/// The pause before work that failed is first tried again, and the most a
+/// pause grows to, for a component's own work in the background
+/// ([`until_it_succeeds`], [`again_every`]).
+pub const TRIED_AGAIN_FIRST: Duration = Duration::from_secs(1);
+pub const TRIED_AGAIN_AT_MOST: Duration = Duration::from_secs(60);
+
+/// `attempt` asked for now and every `every` after, for as long as the
+/// component runs: each ask tried until it succeeds ([`until_it_succeeds`],
+/// from [`TRIED_AGAIN_FIRST`] to [`TRIED_AGAIN_AT_MOST`]), the next `every`
+/// after it did (review-core-3d F1: the dashboard's removals owed, which the
+/// release before goes on making after this release starts).
+pub async fn again_every<F, A>(what: &str, every: Duration, mut attempt: F)
+where
+    F: FnMut() -> A,
+    A: std::future::Future<Output = Result<(), String>>,
+{
+    loop {
+        until_it_succeeds(what, TRIED_AGAIN_FIRST, TRIED_AGAIN_AT_MOST, &mut attempt).await;
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Blocking start-up work -- a store's, on a thread of its own -- tried until
+/// it succeeds ([`until_it_succeeds`], from [`TRIED_AGAIN_FIRST`] to
+/// [`TRIED_AGAIN_AT_MOST`]): the conductor's comparison of every group with
+/// its latest record (review-core-3c N7). Answers how many tries it took.
+pub async fn blocking_until_it_succeeds<W>(what: &str, work: W) -> u32
+where
+    W: Fn() -> Result<(), String> + Send + Sync + 'static,
+{
+    let work = std::sync::Arc::new(work);
+    until_it_succeeds(what, TRIED_AGAIN_FIRST, TRIED_AGAIN_AT_MOST, || {
+        let work = std::sync::Arc::clone(&work);
+        async move {
+            tokio::task::spawn_blocking(move || work())
+                .await
+                .map_err(|failed| failed.to_string())?
+        }
+    })
+    .await
+}
+
 /// A task a library started, kept to be ended with the component's own.
 pub fn keep(task: tokio::task::JoinHandle<()>) {
     let mut held = BACKGROUND
@@ -1694,6 +1765,92 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    /// Review-core-3c N7: a start's one-off work that fails is tried again,
+    /// each pause twice the last up to its most, until it succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn work_that_fails_is_tried_again_with_a_growing_pause() {
+        use std::time::Duration;
+        let started = tokio::time::Instant::now();
+        let mut failing = 4;
+        let tries = super::until_it_succeeds(
+            "the work",
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            || {
+                failing -= 1;
+                let left = failing;
+                async move {
+                    if left >= 0 {
+                        Err("not yet".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(tries, 5);
+        // 1 + 2 + 4 + 4 seconds of pauses.
+        assert_eq!(started.elapsed(), Duration::from_secs(11));
+    }
+
+    /// Review-core-3d F1: work asked for again and again is asked now,
+    /// tried again after a failure with the first pause, and asked again
+    /// each period after it succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn work_asked_again_and_again_is_retried_then_asked_each_period() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let started = tokio::time::Instant::now();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::clone(&asked);
+        let every = Duration::from_secs(15 * 60);
+        let task = tokio::spawn(super::again_every("the work", every, move || {
+            let mut noted = noted.lock().unwrap();
+            noted.push(started.elapsed());
+            let first = noted.len() == 1;
+            async move {
+                if first {
+                    Err("not yet".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        tokio::time::sleep(Duration::from_secs(1) + every * 2 + Duration::from_millis(1)).await;
+        task.abort();
+        let one = Duration::from_secs(1);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [Duration::ZERO, one, one + every, one + every * 2]
+        );
+    }
+
+    /// Review-core-3d (N7's residual): the conductor's start-up comparison,
+    /// against a store that fails once and then answers, is tried again
+    /// after the first pause and done.
+    #[tokio::test]
+    async fn blocking_work_against_a_store_that_fails_once_is_tried_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let asked = Arc::new(AtomicU32::new(0));
+        let store = Arc::clone(&asked);
+        let tries = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::blocking_until_it_succeeds("the groups could not be compared", move || {
+                if store.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("the store is not answering yet".to_string())
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .expect("done after one pause");
+        assert_eq!(tries, 2);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
     /// Review finding 6, shown both ways: a SIGTERM that lands while
     /// nothing waits is heard by [`stopping`], asked once before; a
     /// [`shutdown`] first asked after it never hears it.

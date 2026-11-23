@@ -2046,11 +2046,111 @@ async fn an_account_moves_by_continuation_and_replays_the_same() {
         .any(|entry| entry.idempotency_key == crate::moves::control_key(&moved)));
 }
 
+/// Roadmap v31a item 16: a service account known by its `SA-` ID or by an
+/// owner stamped beside it is refused an approval, an override and an
+/// alert's acknowledgement whatever kind it is stamped with -- unset, its
+/// own, or a value this book does not know (as the person kind contract 31
+/// adds will be to it) -- and nothing is journalled. An unset kind on a
+/// subject that is neither stays a person's until v32.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_account_known_by_its_id_or_owner_is_no_person_whatever_its_kind() {
+    const SA: &str = "SA-01JAD000000000000000000002";
+    let w = wired();
+    waits(&w, ACC, false).await;
+    let order = propose(&w, &buy("10")).await.unwrap();
+    send_from(
+        &w.bus,
+        RAISE_ALERT,
+        "meridian.v1.RaiseAlertRequest",
+        &RaiseAlertRequest {
+            account_id: ACC.into(),
+            kind: AlertKind::Compliance as i32,
+            reason: "a name on the restricted list".into(),
+            subject: None,
+        },
+        &anywhere(PM),
+    )
+    .await
+    .unwrap();
+    let alert = alerts_in(&w, ACC)[0].alert_id.clone();
+    let before = w.store.journal(ACC).unwrap().len();
+    let unknown_kind = 7;
+    let service_account = meridian_pb::v1::SubjectKind::ServiceAccount as i32;
+    let senders = [
+        ("its ID, kind unset", SA, None, 0),
+        ("its ID, its own kind", SA, None, service_account),
+        ("its ID, an unknown kind", SA, None, unknown_kind),
+        ("its owner, kind unset", "local|nightly-bot", Some(PM), 0),
+        (
+            "its owner, an unknown kind",
+            "local|nightly-bot",
+            Some(PM),
+            unknown_kind,
+        ),
+    ];
+    for (said, subject, owner, kind) in senders {
+        let from = As {
+            person: Some(subject),
+            scope: Some(vec![ACC]),
+            allowed: true,
+            kind,
+            owner,
+            ..Default::default()
+        };
+        for decision in [ApprovalDecision::Approve, ApprovalDecision::Override] {
+            let refused = order_command(
+                &w,
+                DECIDE_APPROVAL,
+                "meridian.v1.DecideApprovalRequest",
+                &DecideApprovalRequest {
+                    order_id: order.order_id.clone(),
+                    decision: decision as i32,
+                    reason: "within the desk's limit".into(),
+                    ..Default::default()
+                },
+                &from,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                code(&refused),
+                Some(RefusalReason::ActorRequired),
+                "{said}, {decision:?}: {refused}"
+            );
+        }
+        let refused = send_from(
+            &w.bus,
+            ACKNOWLEDGE_ALERT,
+            "meridian.v1.AcknowledgeAlertRequest",
+            &AcknowledgeAlertRequest {
+                alert_id: alert.clone(),
+                reason: "reviewed".into(),
+            },
+            &As {
+                scope: None,
+                ..from
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            Some(RefusalReason::ActorRequired),
+            "{said}, acknowledging: {refused}"
+        );
+    }
+    assert_eq!(
+        w.store.journal(ACC).unwrap().len(),
+        before,
+        "nothing recorded"
+    );
+}
+
 /// An approval, an override and acknowledging an alert are a person's
 /// (W11.5, W11.34), and the agents' guard is never an agent's to set
 /// (W11.38). A service account's subject sent with its kind left unset is
 /// no person, and no person's own act, as one sent with its kind is not
-/// (v31a.16: the unset kind fails closed): each refused, nothing recorded.
+/// (v31a.16: known by its `SA-` ID): each refused, nothing recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_service_account_sent_with_no_kind_is_no_person() {
     use crate::booking_service::SET_AGENT_ORDERS_DEMO_ONLY;
