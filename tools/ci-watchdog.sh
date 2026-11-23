@@ -31,7 +31,15 @@
 #                                 (PR 125's own) lost its log and every
 #                                 upload again, the sampler's among them: its
 #                                 steps' results did arrive, so what is known
-#                                 leaves by the API and never by an upload
+#                                 leaves by the API and never by an upload.
+#                                 The check run is made first, from file
+#                                 reads alone (the make's FAILED and last
+#                                 lines, the sampler's last load, memory
+#                                 and disk lines), before any network or
+#                                 Docker probe: on runs 45130110944 and
+#                                 45139152927 every probe ran to its limit
+#                                 and nothing reached GitHub. The probes'
+#                                 results are added to it after
 #   ci-watchdog.sh probe <which> <make-log>
 #                                 one fact as a step's result, which arrives
 #                                 when nothing else does: gave-up, names,
@@ -187,6 +195,40 @@ loop() {
   done
 }
 
+# What a failed make left on disk, from file reads alone: no network and no
+# Docker, so it is ready to send before anything is probed. $1 is the make's
+# log, $2 the sampler's file.
+known() {
+  local make=$1 watch=$2
+  echo "== $(date -u +%Y-%m-%dT%H:%M:%SZ) ${CHECK_NAME:-a cluster job} on $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
+  echo "== FAILED and gave-up lines: the make's, then the e2e's own logs'"
+  grep -h -E 'FAILED|gave up|could not be made' "$make" .e2e-*.log 2>/dev/null | tail -n 40 || true
+  echo "== the make's last 60 lines"
+  if [ -s "$make" ]; then tail -n 60 "$make"; else echo "(no make output at $make)"; fi
+  echo "== the sampler's last load, memory and disk lines"
+  if [ -s "$watch" ]; then
+    # Its last two samples, the last perhaps cut short by the make's end.
+    awk '/^=== 20/{n++} {l[NR]=$0; s[NR]=n} END{for(i=1;i<=NR;i++) if(n && s[i]>=n-1) print l[i]}' "$watch" \
+      | grep -E '^=== 20|^Mem:|^Swap:|^Filesystem|^/dev/|^overlay' || echo "(no sample in $watch yet)"
+  else
+    echo "(no sampler file at $watch)"
+  fi
+}
+
+# The evidence check run, made (POST) or brought up to date (PATCH): $3 is
+# the evidence so far, $4 what the beacon added after the step. Bounded by
+# curl's own limit; its answer on stdout.
+check_send() {
+  local method=$1 url=$2 ev=$3 after=$4 body
+  body=$( { head -c 40000 "$ev"; echo; echo "== after the step, every ${BEACON_EVERY:-15} s"; tail -c 20000 "$after" 2>/dev/null || true; } \
+    | jq -Rs --arg name "watchdog: ${CHECK_NAME:-a cluster job}" --arg sha "$CHECK_SHA" \
+        '{name: $name, head_sha: $sha, status: "completed", conclusion: "neutral",
+          output: {title: "What a failed cluster job knew", summary: "tools/ci-watchdog.sh evidence: the make and the sampler from its files first, then the network and the cluster, then a beacon.", text: .}}')
+  curl -sS -m 10 -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' -d "$body"
+}
+check_api() { echo "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/check-runs"; }
+
 case $cmd in
   start)
     mkdir -p "$(dirname "$file")"
@@ -232,22 +274,24 @@ case $cmd in
     # $file is the make's log, $3 the sampler's file; what is gathered goes
     # beside the sampler's file, where the beacon reads it.
     watch=$3 ev="$3.evidence"
-    : >"$ev"
-    # By the API first, from a beacon that outlives this step and sends what
-    # has been gathered so far each time: whether it goes on saying anything
-    # is evidence too, and a command below that hangs loses nothing.
+    # What the files hold, first and alone: runs 45130110944 and 45139152927
+    # probed the network before their first POST, every probe ran to its
+    # limit, and nothing reached GitHub.
+    known "$file" "$watch" 2>&1 | sed -u -e 's/\x1b\[[0-9;]*[A-Za-z]//g' >"$ev"
+    # By the API next, before any probe: the check run made from those
+    # reads, then a beacon that outlives this step and sends what has been
+    # gathered so far each time, so a command below that hangs loses
+    # nothing, and whether it goes on saying anything is evidence too.
     posting=""
     if [ -n "${GH_TOKEN:-}" ] && [ -n "${CHECK_SHA:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+      posting=yes
+      id=$(check_send POST "$(check_api)" "$ev" "$watch.after" 2>"$watch.post.err" | jq -r '.id // empty' 2>/dev/null || true)
+      if [ -n "$id" ]; then echo "$id" >"$watch.check"; fi
       self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
       setsid nohup "$self" beacon "$file" "$watch" </dev/null >"$watch.beacon.out" 2>&1 &
-      posting=yes
     fi
+    # Then the probes, added to what the check run holds.
     {
-      echo "== $(date -u +%Y-%m-%dT%H:%M:%SZ) ${CHECK_NAME:-a cluster job} on $(hostname), runner ${RUNNER_NAME:-?}"
-      echo "== FAILED and gave-up lines: the make's, then the e2e's own logs'"
-      grep -h -E 'FAILED|gave up|could not be made' "$file" .e2e-*.log 2>/dev/null | tail -n 40 || true
-      echo "== the make's last 60 lines"
-      if [ -s "$file" ]; then tail -n 60 "$file"; else echo "(no make output at $file)"; fi
       echo "== the network now"
       net_line
       echo "-- the cluster's subnet $SUBNET against the runner's own"
@@ -285,11 +329,10 @@ case $cmd in
     section 'the cluster, if it was left' | annotate warning "the cluster the make left"
     section "the sampler's file" | grep -E '^=== |^net: |^Mem:|^/dev/|[Oo]ut of memory|oom' | tail -n 30 | annotate warning "the watchdog's last samples"
     if [ -n "$posting" ]; then
-      for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$watch.check" ] && break; sleep 1; done
       if [ -s "$watch.check" ]; then
-        echo "ci-watchdog: the evidence is check run $(cat "$watch.check") on $CHECK_SHA, and a beacon adds to it"
+        echo "ci-watchdog: the evidence is check run $(cat "$watch.check") on $CHECK_SHA, made before any probe; a beacon adds the probes' results to it"
       else
-        echo "::warning::ci-watchdog: no check run was made yet; the beacon keeps trying. It said: $(tail -c 300 "$watch.beacon.out" 2>/dev/null | tr '\n' ' ')"
+        echo "::warning::ci-watchdog: the first check run was not made; the beacon keeps trying. It said: $(tail -c 300 "$watch.post.err" 2>/dev/null | tr '\n' ' ')"
       fi
     else
       echo "ci-watchdog: no GH_TOKEN, CHECK_SHA or GITHUB_REPOSITORY; annotations only"
@@ -297,34 +340,27 @@ case $cmd in
     ;;
   beacon)
     # Every 15 s for BEACON_MINUTES (default 30) or until the sampler's
-    # directory goes: a line of what the runner can reach and what its
-    # worker is doing, and the check run made or brought up to date.
-    watch=$3 ev="$3.evidence" after="$3.after" id=""
-    api="${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/check-runs"
+    # directory goes: the check run made, if the evidence step's POST did
+    # not make it, or brought up to date, and only then a line of what the
+    # runner can reach and what its worker is doing.
+    watch=$3 ev="$3.evidence" after="$3.after"
+    id=$(cat "$watch.check" 2>/dev/null || true)
+    api=$(check_api)
     deadline=$((SECONDS + ${BEACON_MINUTES:-30} * 60))
-    send() {
-      local method=$1 url=$2 body
-      body=$( { head -c 40000 "$ev"; echo; echo "== after the step, every ${BEACON_EVERY:-15} s"; tail -c 20000 "$after"; } \
-        | jq -Rs --arg name "watchdog: ${CHECK_NAME:-a cluster job}" --arg sha "$CHECK_SHA" \
-            '{name: $name, head_sha: $sha, status: "completed", conclusion: "neutral",
-              output: {title: "What a failed cluster job knew", summary: "tools/ci-watchdog.sh evidence: the make, the network, the sampler, then a beacon.", text: .}}')
-      curl -sS -m 10 -X "$method" "$url" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' -d "$body"
-    }
-    : >"$after"
+    : >>"$after"
     sleep "${BEACON_FIRST:-3}"
     while [ -d "$(dirname "$watch")" ] && [ "$SECONDS" -lt "$deadline" ]; do
+      if [ -z "$id" ]; then
+        id=$(check_send POST "$api" "$ev" "$after" | jq -r '.id // empty' 2>/dev/null || true)
+        if [ -n "$id" ]; then echo "$id" >"$watch.check"; else echo "--- no check run yet" >>"$after"; fi
+      else
+        check_send PATCH "$api/$id" "$ev" "$after" >/dev/null 2>&1 || echo "--- the update did not go" >>"$after"
+      fi
       {
         echo "--- $(date -u +%H:%M:%SZ) load $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?') $(net_line)"
         # The worker, the listener and what the worker runs: age and state.
         bounded 3 ps -eo pid,ppid,etimes,stat,pcpu,args --sort=pid | grep -E 'Runner\.(Worker|Listener)|externals/node|upload' | grep -v grep | cut -c1-160 || true
       } >>"$after" 2>&1
-      if [ -z "$id" ]; then
-        id=$(send POST "$api" | jq -r '.id // empty' 2>/dev/null || true)
-        if [ -n "$id" ]; then echo "$id" >"$watch.check"; else echo "--- no check run yet" >>"$after"; fi
-      else
-        send PATCH "$api/$id" >/dev/null 2>&1 || echo "--- the update did not go" >>"$after"
-      fi
       sleep "${BEACON_EVERY:-15}"
     done
     ;;
