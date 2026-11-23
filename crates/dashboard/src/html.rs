@@ -361,7 +361,7 @@ fieldset.access-editor om-pager{display:block;max-width:100%}fieldset.access-edi
 fieldset.access-editor .pager .button{padding-left:.6rem;padding-right:.6rem}\
 .home:not(.js) .segmented{display:none}.home .page-head .actions{gap:var(--space-4)}\
 .home .page-head .actions a.muted{font-size:.9rem;font-weight:550}.home .page-head .actions a.muted:hover{color:var(--ink)}\
-.home om-pager>.pager{margin-top:var(--space-3)}.home #agent-orders-demo-only{margin:.25rem 0;font-size:.84rem;line-height:1.35}.plugin-area .badge.trading{flex:none}\
+.home om-pager>.pager{margin-top:var(--space-3)}.home .facts-line{margin:.25rem 0;font-size:.84rem;line-height:1.35}.plugin-area .badge.trading{flex:none}\
 .segmented button{margin:0;border:0;background:none;padding:.3rem .6rem;font-size:.86rem;font-weight:500;color:var(--ink-soft)}\
 .segmented button:hover{background:none;color:var(--ink)}.segmented button[aria-pressed=true],.segmented button[aria-pressed=true]:hover{background:var(--card);color:var(--ink)}\
 @media (max-width:40rem){.segmented button{padding:.45rem .55rem}}a.open-item,a.open-item:hover{color:var(--ink);text-decoration:none}\
