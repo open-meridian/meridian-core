@@ -8992,6 +8992,97 @@ async fn a_database_out_of_reach_slows_no_first_read_of_a_partition_written_in_a
     blocking(move || drop(h));
 }
 
+/// A partition's first naming in a member's view of the writer groups is a
+/// change of its owner, as any other is (the review of 2026-11-23 of this
+/// routing, finding 4): a partition no group was named for, its rendezvous
+/// owner's, is named by its first move. Moved to another group, written
+/// there and moved back between two of a writer's looks, its view went
+/// from no name to its own group's, counted as no change, and the book it
+/// held from before the move was answered without what the other group
+/// wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_writers_held_book_is_dropped_when_its_partition_is_first_named_an_owner() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    let partition = partition_of(0, 2);
+    let account = accounts_in("ACC-NAMED", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in(
+        "ACC-NAMED-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    let (writer, stores, groups) = blocking(|| {
+        // No group named for it yet, as before any start pinned its
+        // owners: its rendezvous owner's, group 0's.
+        for url in &h.urls {
+            postgres::Client::connect(url, postgres::NoTls)
+                .unwrap()
+                .execute(
+                    "UPDATE book_partition_head SET writer_group = NULL WHERE partition = $1",
+                    &[&partition],
+                )
+                .unwrap();
+        }
+        // A member of group 0, its view read at its start.
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        assert_eq!(groups.assigned(&partition), None);
+        let spread = Arc::new(meridian_bor::spread::Spread::new(stores.clone(), groups));
+        let writer = meridian_bor::writer::Writer::new(spread as Arc<dyn Store>, h.zero.0.clone());
+        assert_eq!(Store::book(&writer, &account).unwrap().entries.len(), 1);
+        assert_eq!(writer.held().0, 1, "held from here on");
+        (writer, stores, groups)
+    });
+    let moved = |to: u32| {
+        blocking(|| {
+            h.mover.begin(&partition);
+            let ended = h.mover.run(
+                &partition,
+                to,
+                &Asked {
+                    by_hand: true,
+                    moved_by: PERSON.into(),
+                    reason: "there and back".into(),
+                },
+            );
+            // The harness's members' looks; the writer's own is below.
+            for member in [&h.zero.1, &h.one.1] {
+                PostgresStore::read_owners_from(&[
+                    member.database(0).clone(),
+                    member.database(1).clone(),
+                ])
+                .unwrap();
+            }
+            ended
+        })
+    };
+    let away = moved(1);
+    assert!(matches!(away, Ok(Ended::Moved(..))), "{away:?}");
+    write_once(&h.one.0, &account, 1).await.unwrap();
+    let back = moved(0);
+    assert!(matches!(back, Ok(Ended::Moved(..))), "{back:?}");
+    blocking(|| {
+        // The writer's next look: the partition named, for the first time
+        // in its view, and its own group's as before.
+        PostgresStore::read_owners_from(&stores).unwrap();
+        assert_eq!(groups.assigned(&partition), Some(0));
+        assert!(Store::writes(&writer, &account));
+        assert_eq!(
+            Store::book(&writer, &account).unwrap().entries.len(),
+            2,
+            "the book held from before its partition was first named, without what was written meanwhile"
+        );
+    });
+    blocking(move || drop((writer, stores, h)));
+}
+
 /// A write that finds its partition between two databases -- its source
 /// let go, its target not yet opened -- longer than its caller waits is
 /// answered OVERLOADED with a retry-after while the caller still waits
