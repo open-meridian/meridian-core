@@ -14903,3 +14903,155 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
         );
     }
 }
+
+/// The lake's lock budget (v31a.17; the review's F1): a transaction makes
+/// at most eight months whatever its datasets and ranges, not eight a
+/// range. One write-ahead batch of 20 datasets, each with one row in a
+/// month not made yet, has every one made before it, and its own
+/// transaction makes none.
+///
+/// The batch is held at its end -- on the head of a 21st dataset, the last
+/// by name, locked here -- and its backend's locks read from `pg_locks`.
+/// Its 20 months' rows are still written in the one transaction, 14
+/// relations a month and as many again read (the KNOWN GAPS `insert_all`
+/// and `previous_of_each`), so the whole is said and not held to a budget.
+#[test]
+fn a_write_ahead_batch_of_many_datasets_has_its_months_made_before_it() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    // A month's table, its TOAST table and index, and its 13 indexes.
+    const A_MONTH_MADE: i64 = 16;
+    let made = databases(1);
+    let store = named_store(&made[0], "llb_stream");
+    let stream = unique("STREAM");
+    let last = unique("lockbudget-z");
+    store
+        .record(&last, vec![trade(&last, "z", "INS-1", 10)], 1)
+        .unwrap();
+    let mut raw = postgres::Client::connect(&made[0], postgres::NoTls).unwrap();
+    let mut held = raw.transaction().unwrap();
+    held.execute(
+        "SELECT 1 FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+        &[&last],
+    )
+    .unwrap();
+    let mut parts: Vec<(String, Vec<Observation>)> = (0..20)
+        .map(|n| {
+            let dataset = unique(&format!("lockbudget-a{n:02}"));
+            let rows = vec![trade(&dataset, "k", "INS-1", 10)];
+            (dataset, rows)
+        })
+        .collect();
+    parts.push((last.clone(), vec![restate(trade(&last, "z", "INS-1", 10))]));
+    let writing = std::thread::spawn(move || {
+        store.record_write_ahead(
+            WriteAheadBatch {
+                stream,
+                after: None,
+                through: WriteAheadPosition {
+                    sequence: 1,
+                    at_ns: 1_000,
+                },
+                parts,
+                ..Default::default()
+            },
+            5_000,
+        )
+    });
+    let mut beside = postgres::Client::connect(&made[0], postgres::NoTls).unwrap();
+    let locks = locks_held_waiting(&mut beside, "llb_stream");
+    held.commit().unwrap();
+    let done = writing.join().unwrap().unwrap();
+    assert_eq!(
+        done.iter()
+            .map(|part| part.as_ref().map(|part| part.recorded + part.restated).ok())
+            .collect::<Vec<_>>(),
+        vec![Some(1); 21],
+        "every part is recorded"
+    );
+    eprintln!(
+        "LOCKS lake: a write-ahead batch of 20 datasets held {} at its end: {locks:?}",
+        locks.values().sum::<i64>()
+    );
+    assert!(
+        making(&locks) <= 8 * A_MONTH_MADE,
+        "the batch's own transaction held {} locks of months' making, past the eight months \
+         one makes: {locks:?}",
+        making(&locks)
+    );
+}
+
+/// `months` keys of a new dataset recorded under a subject across as many
+/// months, the dataset then split so that subject's hash and another's
+/// fall in different children, and the first subject merged into the
+/// other: the dataset, and the keys restated under the subject that
+/// stays. Each is anchored by the first subject, so it is written in that
+/// subject's child, where no month is made yet -- and placed by the hash
+/// of the subject it now names, in the other, before its batch.
+fn keys_anchored_by_a_merged_subject(
+    store: &PostgresStore,
+    tag: &str,
+    months: i64,
+) -> (String, Vec<Observation>) {
+    let dataset = unique(tag);
+    let (merged, stays) = halves_of(&format!("LCL-{tag}"));
+    let month_ns = 2_629_800_i64 * 1_000_000_000;
+    let rows = |subject: &str| -> Vec<Observation> {
+        (0..months)
+            .map(|m| trade(&dataset, &format!("k{m}"), subject, (300 + m) * month_ns))
+            .collect()
+    };
+    assert_eq!(
+        store
+            .record(&dataset, rows(&merged), 1_000)
+            .unwrap()
+            .recorded as i64,
+        months
+    );
+    store
+        .split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    store.keep_alias(&merged, &stays, 1_200).unwrap();
+    let again = rows(&stays).into_iter().map(restate).collect();
+    (dataset, again)
+}
+
+/// The review's F1 (v31a.17), the bound itself: the months a transaction
+/// makes are counted across its datasets. A write-ahead batch of two
+/// datasets, five months of each not made where its keys are anchored (as
+/// [`keys_anchored_by_a_merged_subject`]: six keys' months, the first two
+/// in one), is refused whole -- ten in one transaction, five a range --
+/// and recorded when taken again, the months it was refused for made
+/// before it.
+#[test]
+fn a_write_ahead_batch_is_refused_past_eight_months_made_across_its_datasets() {
+    use meridian_lake::store::{WriteAheadBatch, WriteAheadPosition};
+    let (_url, store) = isolated("acrossdatasets");
+    let stream = unique("STREAM");
+    let parts: Vec<(String, Vec<Observation>)> = ["across-a", "across-b"]
+        .into_iter()
+        .map(|tag| keys_anchored_by_a_merged_subject(&store, tag, 6))
+        .collect();
+    let batch = || WriteAheadBatch {
+        stream: stream.clone(),
+        after: None,
+        through: WriteAheadPosition {
+            sequence: 1,
+            at_ns: 1_000,
+        },
+        parts: parts.clone(),
+        ..Default::default()
+    };
+    let refused = store.record_write_ahead(batch(), 5_000);
+    assert!(
+        matches!(&refused, Err(meridian_lake::StoreError::Unavailable(said)) if said.contains("month tables")),
+        "ten months made in one transaction: {refused:?}"
+    );
+    assert_eq!(store.write_ahead_position(&stream).unwrap(), None);
+    let done = store.record_write_ahead(batch(), 5_001).unwrap();
+    assert_eq!(
+        done.iter()
+            .map(|part| part.as_ref().map(|part| part.restated).ok())
+            .collect::<Vec<_>>(),
+        vec![Some(6), Some(6)]
+    );
+}

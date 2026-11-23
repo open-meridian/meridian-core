@@ -173,6 +173,12 @@ pub struct PostgresStore {
     /// The month tables a batch was refused for, more than its transaction
     /// makes (v31a.17): made before the next batch's begins.
     owed: std::sync::Mutex<std::collections::BTreeSet<(String, crate::leaves::Month)>>,
+    /// Each dataset's open ranges as its last batch here read them, under
+    /// its lock: where [`Self::months_first`] places the next batch's rows
+    /// to make their months before it. Only ever a prediction -- a range
+    /// split since is found by the batch itself -- and let go whenever a
+    /// batch fails.
+    ranges_seen: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::range::Open>>>,
     /// When this store last let go of its group's parts of writes kept
     /// past their time (`lake_write_ahead_part`): once a minute at most.
     parts_let_go_at: std::sync::atomic::AtomicI64,
@@ -434,6 +440,7 @@ impl PostgresStore {
             ranges_made: std::sync::Mutex::new(std::collections::HashSet::new()),
             unanalysed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             owed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ranges_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
             parts_let_go_at: std::sync::atomic::AtomicI64::new(0),
             stream: std::sync::atomic::AtomicI64::new(0),
             datasets_made: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2080,16 +2087,10 @@ impl PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         self.prepare(&mut conn, &[dataset])?;
-        self.months_first(&mut conn, dataset, &parts)?;
         // How long the dataset's lane was busy (step 3d; the profile's
         // advice on writer groups, approved 2026-11-14).
         let began = std::time::Instant::now();
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        // Each part's plugin shard's epoch checked first, its row held for
-        // the transaction (step 3d, checkpoint 5, item 32).
-        let done = shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
-            .and_then(|fenced| self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns))
-            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        let done = self.record_once(&mut conn, dataset, parts, shards, now_ns);
         meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
@@ -2097,6 +2098,29 @@ impl PostgresStore {
             self.analyse_months(&mut *conn);
         }
         done
+    }
+
+    /// [`Self::record_together`]'s batch, its months made first and then
+    /// its one transaction.
+    fn record_once(
+        &self,
+        conn: &mut Connection,
+        dataset: &str,
+        parts: Vec<Vec<Observation>>,
+        shards: &[Option<ShardStamp>],
+        now_ns: i64,
+    ) -> Result<Vec<Result<Recorded>>> {
+        let rows = parts.iter().map(|rows| (dataset, rows.as_slice()));
+        self.months_first(conn, rows)?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut months = MonthsMade::default();
+        // Each part's plugin shard's epoch checked first, its row held for
+        // the transaction (step 3d, checkpoint 5, item 32).
+        shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
+            .and_then(|fenced| {
+                self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns, &mut months)
+            })
+            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done))
     }
 
     /// One dataset's parts recorded in `tx` (step 3d; sections 6.1 and 6.5):
@@ -2117,6 +2141,7 @@ impl PostgresStore {
         parts: Vec<Vec<Observation>>,
         fenced: &[Option<ShardFenced>],
         now_ns: i64,
+        months: &mut MonthsMade,
     ) -> Result<Vec<Result<Recorded>>> {
         lock_dataset_to_record(tx, dataset)?;
         // With several groups, each open range's row taken for the batch
@@ -2128,6 +2153,7 @@ impl PostgresStore {
         } else {
             (open_ranges(tx, dataset)?, BTreeMap::new())
         };
+        self.ranges_seen_are(dataset, &ranges);
         let from_latest = self.latest_all(tx)?;
         let latest = latest_of_each(tx, dataset, parts.iter().flatten(), from_latest)?;
         // The aliases, read only where a key held names another subject.
@@ -2218,7 +2244,7 @@ impl PostgresStore {
                 .iter()
                 .flat_map(|part| part.rows.iter().cloned())
                 .collect();
-            self.leaves_for(tx, &partition, &numbered)?;
+            self.leaves_for(tx, &partition, &numbered, months)?;
             insert_all(tx, dataset, &partition, &anchors, &numbered, epoch)?;
             // A key `lake_latest` held no version of, read under the
             // dataset's lock, is new to it: inserted, never upserted.
@@ -2339,12 +2365,16 @@ impl PostgresStore {
     }
 
     /// The month tables `rows` need in `partition`, made where they are not
-    /// (step 3d; section 6.2), in `tx`.
+    /// (step 3d; section 6.2), in `tx`: with those `months` counts made in
+    /// it already -- in its other ranges, and its other datasets -- at most
+    /// [`crate::leaves::MONTHS_A_TRANSACTION`] (v31a.17). Past that the
+    /// batch is refused, and these are owed.
     fn leaves_for(
         &self,
         tx: &mut Transaction<'_>,
         partition: &str,
         rows: &[Observation],
+        months: &mut MonthsMade,
     ) -> Result<()> {
         let needed: std::collections::BTreeSet<(String, crate::leaves::Month)> = rows
             .iter()
@@ -2372,19 +2402,22 @@ impl PostgresStore {
                 "range {partition}'s table is not made yet: ask again"
             )));
         }
-        // At most a few made in the batch's own transaction, which holds
-        // each one's locks until it commits (v31a.17): more are owed, made
-        // before the batch that asks again ([`Self::months_first`]).
+        // At most a few made in the batch's own transaction, whatever its
+        // ranges and datasets, which holds each one's locks until it
+        // commits (v31a.17): more are owed, made before the batch that asks
+        // again ([`Self::months_first`]).
         let missing = crate::leaves::months_missing(tx, &needed).map_err(unavailable)?;
-        if missing.len() > crate::leaves::MONTHS_A_TRANSACTION {
-            let owed = missing.len();
+        if months.made + missing.len() > crate::leaves::MONTHS_A_TRANSACTION {
+            let (owed, made) = (missing.len(), months.made);
             self.owed.lock().expect("owed poisoned").extend(missing);
             return Err(StoreError::Unavailable(format!(
-                "range {partition} needs {owed} month tables not made yet, more than one \
-                 transaction makes: they are made before the batch, ask again"
+                "range {partition} needs {owed} month tables not made yet, with the {made} \
+                 its batch's transaction has made more than one transaction makes: they are \
+                 made before the batch, ask again"
             )));
         }
         let made = crate::leaves::ensure_months(tx, &missing).map_err(unavailable)?;
+        months.made += made;
         if made > 0 {
             tracing::info!(partition, made, "the lake made its range's month tables");
         }
@@ -2396,40 +2429,59 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// The month tables `parts` need made before their batch's transaction
-    /// begins, a few a transaction (v31a.17; [`crate::leaves::make_months`]):
-    /// those a batch refused for was owed, and, where `parts` span more
-    /// months than one transaction makes, each row's month in the open
-    /// range its first subject's hash is placed in -- a new key's range. A
-    /// key held keeps its valid time (the lake's rule 5), so its month was
-    /// made with its first version; one whose range split since, or whose
-    /// key is anchored by another subject, is found by the batch itself,
-    /// which makes the few and is refused for more, owed to the next.
-    /// Only in ranges whose table is made here and this member's group owns.
-    fn months_first(
+    /// The month tables a batch's `parts` -- each a dataset and its rows,
+    /// the whole batch's, whatever its datasets -- need made before its
+    /// transaction begins, a few a transaction of their own (v31a.17;
+    /// [`crate::leaves::make_months`]): those a batch refused for was owed,
+    /// and each row's month in the open range its first subject's hash is
+    /// placed in -- a new key's range -- by the ranges its dataset's last
+    /// batch here read open ([`Self::ranges_now`]). A batch of no more
+    /// rows than a transaction makes months is not looked at: its own
+    /// transaction makes them within its bound. A key held keeps its valid
+    /// time (the lake's rule 5), so its month was made with its first
+    /// version; one whose range split since, or whose key is anchored by
+    /// another subject, is found by the batch itself, which makes the few
+    /// and is refused for more, owed to the next. Only in ranges whose
+    /// table is made here and this member's group owns.
+    fn months_first<'a>(
         &self,
         conn: &mut Connection,
-        dataset: &str,
-        parts: &[Vec<Observation>],
+        parts: impl Iterator<Item = (&'a str, &'a [Observation])> + Clone,
     ) -> Result<()> {
         use crate::leaves::Month;
         let mut needed: std::collections::BTreeSet<(String, Month)> =
             std::mem::take(&mut *self.owed.lock().expect("owed poisoned"));
-        let months: std::collections::BTreeSet<Month> = parts
-            .iter()
-            .flatten()
-            .map(|row| Month::of(row.meta().valid_from_ns))
-            .collect();
-        if months.len() > crate::leaves::MONTHS_A_TRANSACTION {
-            let ranges = open_ranges(&mut **conn, dataset)?;
-            let mine = self.groups.mine();
-            for row in parts.iter().flatten() {
-                let partition =
-                    crate::range::placed(dataset, &ranges, crate::range::hash(row.subject()));
-                if self.groups.several() && self.groups.owner_by(&partition, dataset) != mine {
-                    continue;
+        let rows: usize = parts.clone().map(|(_, rows)| rows.len()).sum();
+        if rows > crate::leaves::MONTHS_A_TRANSACTION {
+            // Each dataset's parts together; a subject's month looked at
+            // once.
+            let mut by_dataset: BTreeMap<&str, std::collections::HashSet<(&str, Month)>> =
+                BTreeMap::new();
+            for (dataset, rows) in parts {
+                let months = by_dataset.entry(dataset).or_default();
+                for row in rows {
+                    months.insert((row.subject(), Month::of(row.meta().valid_from_ns)));
                 }
-                needed.insert((partition.into_owned(), Month::of(row.meta().valid_from_ns)));
+            }
+            let mine = self.groups.mine();
+            for (dataset, months) in by_dataset {
+                let ranges = self.ranges_now(conn, dataset)?;
+                let mut hashed: std::collections::HashMap<&str, u16> =
+                    std::collections::HashMap::new();
+                let made = self.made.lock().expect("made poisoned");
+                for (subject, month) in months {
+                    let hash = *hashed
+                        .entry(subject)
+                        .or_insert_with(|| crate::range::hash(subject));
+                    let partition = crate::range::placed(dataset, &ranges, hash);
+                    let need = (partition.into_owned(), month);
+                    if made.contains(&need)
+                        || self.groups.several() && self.groups.owner_by(&need.0, dataset) != mine
+                    {
+                        continue;
+                    }
+                    needed.insert(need);
+                }
             }
         }
         needed.retain(|need| !self.made.lock().expect("made poisoned").contains(need));
@@ -2447,11 +2499,7 @@ impl PostgresStore {
         needed.retain(|(partition, _)| made_ranges[partition]);
         let made = crate::leaves::make_months(&mut **conn, &needed).map_err(unavailable)?;
         if made > 0 {
-            tracing::info!(
-                dataset,
-                made,
-                "the lake made month tables before their batch"
-            );
+            tracing::info!(made, "the lake made month tables before their batch");
         }
         self.unanalysed
             .lock()
@@ -2459,6 +2507,26 @@ impl PostgresStore {
             .extend(needed.iter().cloned());
         self.made.lock().expect("made poisoned").extend(needed);
         Ok(())
+    }
+
+    /// `dataset`'s open ranges as its last batch here read them, read now
+    /// where none has: a prediction's, for [`Self::months_first`].
+    fn ranges_now(&self, conn: &mut Connection, dataset: &str) -> Result<Vec<crate::range::Open>> {
+        if let Some(seen) = self.ranges_seen.lock().expect("seen poisoned").get(dataset) {
+            return Ok(seen.clone());
+        }
+        let ranges = open_ranges(&mut **conn, dataset)?;
+        self.ranges_seen_are(dataset, &ranges);
+        Ok(ranges)
+    }
+
+    /// `dataset`'s open ranges as a batch just read them, kept for the
+    /// next's months ([`Self::ranges_now`]).
+    fn ranges_seen_are(&self, dataset: &str, ranges: &[crate::range::Open]) {
+        let mut seen = self.ranges_seen.lock().expect("seen poisoned");
+        if seen.get(dataset).map(Vec::as_slice) != Some(ranges) {
+            seen.insert(dataset.to_string(), ranges.to_vec());
+        }
     }
 
     /// Each month table a committed batch first wrote analysed, where it
@@ -2505,6 +2573,7 @@ impl PostgresStore {
     fn forget_made(&self) {
         self.made.lock().expect("made poisoned").clear();
         self.ranges_made.lock().expect("ranges poisoned").clear();
+        self.ranges_seen.lock().expect("seen poisoned").clear();
         self.datasets_made
             .lock()
             .expect("datasets poisoned")
@@ -2899,6 +2968,13 @@ fn offer_latest(
     Ok(())
 }
 
+/// The month tables one batch's transaction has made, across its ranges
+/// and its datasets ([`crate::leaves::MONTHS_A_TRANSACTION`]; v31a.17).
+#[derive(Default)]
+struct MonthsMade {
+    made: usize,
+}
+
 /// What refuses a write-ahead batch whole (step 3d): a part held by a
 /// move's switch, or a part with a range another writer group owns.
 pub(crate) fn write_ahead_refusal<'a>(
@@ -2927,9 +3003,16 @@ impl PostgresStore {
             .map(|(dataset, _)| dataset.as_str())
             .collect();
         self.prepare(&mut conn, &datasets.into_iter().collect::<Vec<_>>())?;
-        for (dataset, rows) in &batch.parts {
-            self.months_first(&mut conn, dataset, std::slice::from_ref(rows))?;
-        }
+        // The whole batch's months, every dataset's, before its one
+        // transaction (v31a.17).
+        self.months_first(
+            &mut conn,
+            batch
+                .parts
+                .iter()
+                .map(|(dataset, rows)| (dataset.as_str(), rows.as_slice())),
+        )?;
+        let mut months = MonthsMade::default();
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The stream's batch is written whatever its size, and waits on its
         // position's lock: without the serving session's statement_timeout
@@ -2984,7 +3067,8 @@ impl PostgresStore {
                 .iter()
                 .map(|place| fenced.get(*place).cloned().flatten())
                 .collect();
-            let done = self.record_dataset(&mut tx, &dataset, rows, &theirs, now_ns)?;
+            let done =
+                self.record_dataset(&mut tx, &dataset, rows, &theirs, now_ns, &mut months)?;
             for (place, part) in places.into_iter().zip(done) {
                 answered[place] = part;
             }

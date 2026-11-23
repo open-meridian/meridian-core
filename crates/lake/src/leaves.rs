@@ -33,7 +33,8 @@
 //!
 //! | Statement of `lake_row` (`postgres.rs`) | Statements | Class | Locks |
 //! |---|---|---|---|
-//! | months made (`make_months`: write, move, legacy conversion) | by function | bounded | eight a transaction, about 19 each, before the rows |
+//! | months made before the rows (`make_months`: write, move, legacy conversion) | by function | bounded | eight a transaction, about 19 each |
+//! | months made in a batch's own transaction (`leaves_for`) | by function | bounded | eight a transaction across its ranges and datasets; refused past that, and they are made before it is taken again |
 //! | rows per dataset on retention's timer (`rows_in_force`) | none | latest | the catalogue's, 2 |
 //! | a batch's keys' latest versions (`latest_of_each`, every key held) | 1 | latest | 14 a month those versions are in |
 //! | a read by its window (`EVERY_VERSION`, `EVERY_VERSION_BY_KEY`, `IN_FORCE`, `IN_FORCE_PUBLISHED`) | 6 | bounded | 14 a month of the window; with no window, range |
@@ -285,11 +286,14 @@ pub fn ensure_months(
 }
 
 /// The most month tables one transaction makes (v31a.17, the lake's lock
-/// budget): making one takes a lock on each of its relations -- the table,
-/// its TOAST table and its 13 indexes, about 19 with its range's -- held
-/// until the transaction commits, and the lock table is the whole
-/// cluster's. So a history's months are made a few a transaction, before
-/// the rows that need them, and never as many as the history is long.
+/// budget), across every range and dataset it writes: making one takes a
+/// lock on each of its relations -- the table, its TOAST table and its 13
+/// indexes, about 19 with its range's -- held until the transaction
+/// commits, and the lock table is the whole cluster's. So a history's
+/// months are made a few a transaction, before the rows that need them,
+/// and never as many as the history is long; a batch whose own
+/// transaction would make more is refused, and they are made before it is
+/// taken again.
 pub const MONTHS_A_TRANSACTION: usize = 8;
 
 /// Those of `needed`'s month tables not yet made.
