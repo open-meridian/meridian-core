@@ -6968,9 +6968,15 @@ fn two_databases() -> TwoDatabases {
 /// `interval` entries of an account where one is given: a large partition
 /// built quickly, each act replaying a short tail.
 fn two_databases_snapshotting(interval: Option<u64>) -> TwoDatabases {
+    databases(2, interval)
+}
+
+/// [`two_databases_snapshotting`] over `count` databases: the two groups'
+/// own, and past them databases neither group's home is in.
+fn databases(count: usize, interval: Option<u64>) -> TwoDatabases {
     use meridian_bor::writer::{is_command, INTERNAL_COMMAND};
     use meridian_changes::groups::Groups;
-    let urls: Vec<Scratch> = (0..2)
+    let urls: Vec<Scratch> = (0..count)
         .map(|_| {
             let (url, migrated) = isolated();
             migrated.make_partitions(8).unwrap();
@@ -7013,7 +7019,9 @@ fn two_databases_snapshotting(interval: Option<u64>) -> TwoDatabases {
     };
     let (zero, one) = (member(0), member(1));
     let mover = meridian_bor::partition_moves::Mover::new(
-        vec![zero.1.database(0).clone(), zero.1.database(1).clone()],
+        (0..count as u32)
+            .map(|d| zero.1.database(d).clone())
+            .collect(),
         zero.1.database(0).groups(),
         meridian_bor::partition_moves::Settings {
             switch: std::time::Duration::from_secs(10),
@@ -8760,6 +8768,91 @@ async fn a_writers_held_book_is_dropped_when_its_view_of_the_owners_changes() {
         );
     });
     blocking(move || drop((writer, h)));
+}
+
+/// A head left written behind a move's pointers is never read as the
+/// partition's (the review of 2026-11-23 of this routing, finding 1). A
+/// move home within one group whose source's commit failed leaves that
+/// source's head written for good, at the sequence it closed at. Moved on
+/// to another group's database and stopped between its two heads -- the
+/// source let go at M, a pointer; the target a pointer until it is opened
+/// -- the partition's only written head is that one, behind M, and the
+/// read went to it as the written head furthest on: answered without
+/// everything written since. A written head is the partition's only at or
+/// past every pointer read with it; else the read goes as where every head
+/// is a pointer, by the view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_head_left_written_behind_a_moves_pointers_is_never_read_as_the_partitions() {
+    use meridian_bor::postgres::Switched;
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::points;
+    // Group 0's database, group 1's, and one neither's home is in.
+    let h = blocking(|| databases(3, None));
+    let partition = partition_of(0, 3);
+    let account = accounts_in("ACC-LEFT", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in(
+        "ACC-LEFT-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    for n in 0..2 {
+        write_once(&h.zero.0, &account, n).await.unwrap();
+    }
+    blocking(|| {
+        // Database 2's head of it left written at 1, as a move home that
+        // failed at its source leaves one.
+        let mut admin = postgres::Client::connect(&h.urls[2], postgres::NoTls).unwrap();
+        let left = admin
+            .execute(
+                "UPDATE book_partition_head SET sequence = 1 WHERE partition = $1 AND epoch <> -1",
+                &[&partition],
+            )
+            .unwrap();
+        assert_eq!(left, 1);
+        // Its move to group 1's database, stopped between its two heads.
+        points::arm(
+            "book.switch.between",
+            &partition,
+            Arc::new(|_| Err("stopped between the two databases".into())),
+        );
+        let (source, to) = (h.zero.1.database(0), h.zero.1.database(1));
+        let warmed = to.copy_partition_from(source, &partition, 0).unwrap();
+        let switched = source.switch_partition(
+            to,
+            &partition,
+            1,
+            std::time::Duration::from_secs(10),
+            false,
+            warmed,
+        );
+        points::disarm("book.switch.between", &partition);
+        assert!(
+            matches!(switched, Ok(Switched::LetGo { .. })),
+            "{switched:?}"
+        );
+        let tips = heads_of(&h.urls, &partition);
+        let pointer = meridian_changes::moves::POINTER;
+        assert!(tips[0].epoch == pointer && tips[0].head >= 3, "{tips:?}");
+        assert_eq!(tips[1].epoch, pointer, "{tips:?}");
+        assert!(tips[2].epoch != pointer && tips[2].head == 1, "{tips:?}");
+        // A member started now: its view read from these heads.
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores, groups);
+        assert_eq!(
+            Store::journal(&view, &account).unwrap().len(),
+            3,
+            "its journal, read where a head was left written behind the move's pointers"
+        );
+        assert_eq!(Store::book(&view, &account).unwrap().entries.len(), 3);
+    });
+    blocking(move || drop(h));
 }
 
 /// A write that finds its partition between two databases -- its source

@@ -326,8 +326,12 @@ impl Spread {
     /// - **One head asked** where the database the view names writes the
     ///   partition: there.
     /// - **Every other's** only where that head is a move's pointer, or the
-    ///   database holds nothing of the partition: the written head furthest
-    ///   on, else the view's.
+    ///   database has not begun the partition: the written head furthest
+    ///   on, where it is at or past every pointer read with it; else the
+    ///   view's. A head left written behind a move's pointers -- a move
+    ///   home whose source's commit failed leaves one for good -- is never
+    ///   the partition's (the review of 2026-11-23 of this routing,
+    ///   finding 1).
     /// - **Refused UNAVAILABLE** where a database that may write it cannot
     ///   be asked within [`crate::postgres::PostgresStore::head_at`]'s
     ///   bound: never answered from a copy a move let go, nor held for a
@@ -353,18 +357,28 @@ impl Spread {
                 ))
             })
         };
-        if matches!(head(sent)?, Some((at, true)) if at > 0) {
-            return Ok(sent);
-        }
+        // The furthest pointer read: where a move let the partition go.
+        let mut pointed = match head(sent)? {
+            Some((at, true)) if at > 0 => return Ok(sent),
+            Some((at, false)) => at,
+            _ => 0,
+        };
         let mut furthest: Option<(u64, u32)> = None;
         for d in (0..self.count()).filter(|d| *d != sent) {
-            if let Some((at, true)) = head(d)? {
-                if at > 0 && furthest.is_none_or(|(held, _)| at > held) {
-                    furthest = Some((at, d));
+            match head(d)? {
+                Some((at, true)) => {
+                    if at > 0 && furthest.is_none_or(|(held, _)| at > held) {
+                        furthest = Some((at, d));
+                    }
                 }
+                Some((at, false)) => pointed = pointed.max(at),
+                None => {}
             }
         }
-        Ok(furthest.map_or(sent, |(_, d)| d))
+        Ok(match furthest {
+            Some((at, d)) if at >= pointed => d,
+            _ => sent,
+        })
     }
 
     /// The partition `account_id` is placed in, else its first.
