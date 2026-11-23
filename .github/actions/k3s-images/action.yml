@@ -1,0 +1,64 @@
+# k3s's own images for a cluster job (tools/ci-k3s-images.sh): the node
+# image and the release's airgap tarball of its system images, from GitHub's
+# cache for the Makefile's k3s, or fetched and checked where the cache has
+# none (every other k3s, each run). The node image is loaded into Docker, and E2E_K3S_AIRGAP
+# names the tarball after this step, which the Makefile hands to every node:
+# making the cluster then pulls nothing from Docker Hub.
+#
+# Only main's cargo-cache workflow keeps an entry (save: true), for the
+# Makefile's k3s alone, one per architecture, where every run reads it: an
+# entry a pull request or the merge queue kept is read by no other ref, and
+# the repository's cache is over its 10 GB limit already, so an entry per k3s
+# (176-263 MB each) would push out the Rust build caches. A miss costs a fetch
+# from the k3s release, never a Docker Hub pull at bring-up.
+name: k3s-images
+description: k3s's node and system images, from GitHub's cache or fetched and checked.
+inputs:
+  k3s:
+    description: The k3s tag (rancher/k3s's); the Makefile's pin when empty.
+    default: ""
+  save:
+    description: Keep the entry in GitHub's cache where it was missing (main's cargo-cache workflow).
+    default: "false"
+  core:
+    description: Where core is checked out.
+    default: workspace/meridian-core
+runs:
+  using: composite
+  steps:
+    - name: The k3s images' cache key
+      id: key
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        K3S: ${{ inputs.k3s }}
+      run: |
+        tag="$(tools/ci-k3s-images.sh tag "$K3S")"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "key=$(tools/ci-k3s-images.sh key "$tag")" >> "$GITHUB_OUTPUT"
+    - name: The k3s images, as kept
+      id: restore
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/k3s-images
+        key: ${{ steps.key.outputs.key }}
+    - name: Each checked, and fetched where missing
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        TAG: ${{ steps.key.outputs.tag }}
+      run: tools/ci-k3s-images.sh fetch "$RUNNER_TEMP/k3s-images" "$TAG"
+    - name: Kept for the next run
+      if: inputs.save == 'true' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/k3s-images
+        key: ${{ steps.key.outputs.key }}
+    - name: Loaded
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        TAG: ${{ steps.key.outputs.tag }}
+      run: echo "E2E_K3S_AIRGAP=$(tools/ci-k3s-images.sh load "$RUNNER_TEMP/k3s-images" "$TAG")" >> "$GITHUB_ENV"

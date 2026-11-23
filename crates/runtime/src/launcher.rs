@@ -7,7 +7,9 @@
 //! differ from a configured one but in its instance, image and roles -- and
 //! each of those is checked here before it goes into the template: an
 //! instance that is a host label, an image from the deployment's own
-//! registry by digest and nothing else, roles that are names. It
+//! registry by digest and nothing else -- plugins/{name} for a local
+//! version, plugins/{organisation}/{plugin} for one installed from a
+//! registry (W8.10) -- roles that are names. It
 //! removes only Deployments carrying its label, and makes none for an
 //! instance that already has one.
 //!
@@ -58,6 +60,15 @@ pub fn is_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
+/// A plugin's name as its image's repository carries it under plugins/: a
+/// local version's bare name, or a registry version's listing,
+/// `organisation/plugin`, as the catalogue takes one (W8.10). Either way
+/// lowercase letters, digits and hyphens, with at most the one slash, so
+/// nothing in it climbs out of plugins/ or closes a quote in the template.
+pub fn is_plugin(name: &str) -> bool {
+    is_name(name) || meridian_config::registries::wire::is_listing(name)
+}
+
 /// Why a request is refused before anything is made, or nothing.
 pub fn checked(request: &CreatePluginRequest, registry: &str) -> Result<(), String> {
     if !is_name(&request.instance_id) {
@@ -75,8 +86,10 @@ pub fn checked(request: &CreatePluginRequest, registry: &str) -> Result<(), Stri
     let (name, digest) = from_here
         .split_once("@sha256:")
         .ok_or_else(|| format!("{} is not named by digest; a tag can move", request.image))?;
-    if !is_name(name) {
-        return Err(format!("`{name}` is not a plugin's name"));
+    if !is_plugin(name) {
+        return Err(format!(
+            "`{name}` is not a plugin's name, nor a registry's organisation/plugin"
+        ));
     }
     if digest.len() != 64
         || !digest
@@ -185,6 +198,11 @@ pub fn template_for<'a>(
         .as_ref()
         .filter(|storage| asks && at_the_edge(&request.roles, &storage.edge_roles));
     let claim = storage.map(|storage| storage.claim.as_str());
+    // Refused here, before anything is made, where its storage could not
+    // be labelled with its plugin.
+    if let Some(plugin) = plugin_of(&request.image).filter(|_| claim.is_some()) {
+        label_holds(plugin, &request.instance_id)?;
+    }
     if !request.live {
         let workload = storage.map_or(shapes.plain.as_str(), |storage| storage.plain.as_str());
         return Ok(Chosen { workload, claim });
@@ -219,14 +237,44 @@ fn plugin_of(image: &str) -> Option<&str> {
 /// The label a claim carries naming the plugin whose records it holds.
 pub const PLUGIN_LABEL: &str = "meridian.dev/plugin";
 
+/// The most a label's value holds.
+const LABEL_MOST: usize = 63;
+
+/// The plugin as a claim's label names it. A label's value takes no slash,
+/// so a listing's is written as a full stop, which no name and no listing
+/// carries: `organisation.plugin` is one listing and never a local plugin.
+fn labelled(plugin: &str) -> String {
+    plugin.replace('/', ".")
+}
+
+/// Why a plugin's storage cannot be labelled with it, or nothing: a
+/// listing's two parts may together pass what a label's value holds.
+fn label_holds(plugin: &str, instance: &str) -> Result<(), String> {
+    if plugin.len() <= LABEL_MOST {
+        return Ok(());
+    }
+    Err(format!(
+        "{plugin} is {} characters, and the label naming whose records {instance}'s storage \
+         holds takes at most {LABEL_MOST}, so it cannot be launched with storage of its own",
+        plugin.len()
+    ))
+}
+
+/// The plugin a claim's label names, as the catalogue names it.
+fn named_by(label: &str) -> String {
+    label.replace('.', "/")
+}
+
 /// The claim template, filled in for a checked request: the instance's
 /// storage, labelled with the plugin it belongs to.
 pub fn claim(template: &str, request: &CreatePluginRequest) -> Result<serde_json::Value, String> {
     let plugin =
         plugin_of(&request.image).ok_or_else(|| format!("{} names no plugin", request.image))?;
+    let label = labelled(plugin);
+    label_holds(plugin, &request.instance_id)?;
     let filled = template
         .replace("__INSTANCE__", &request.instance_id)
-        .replace("__PLUGIN__", plugin);
+        .replace("__PLUGIN__", &label);
     if let Some(left) = placeholder(&filled) {
         return Err(format!(
             "the claim template has a placeholder this does not fill: {left}"
@@ -235,7 +283,7 @@ pub fn claim(template: &str, request: &CreatePluginRequest) -> Result<serde_json
     let claim: serde_json::Value = serde_json::from_str(&filled)
         .map_err(|failed| format!("the claim template is not JSON: {failed}"))?;
     let labels = &claim["metadata"]["labels"];
-    if labels["meridian.dev/launched"] != "true" || labels[PLUGIN_LABEL] != plugin {
+    if labels["meridian.dev/launched"] != "true" || labels[PLUGIN_LABEL] != label.as_str() {
         return Err(
             "the claim template does not mark what it makes as the launcher's, \
                     for its plugin"
@@ -262,12 +310,12 @@ pub fn reusable(existing: &serde_json::Value, request: &CreatePluginRequest) -> 
         ));
     }
     match labels[PLUGIN_LABEL].as_str() {
-        Some(held) if held == plugin => Ok(()),
+        Some(held) if held == labelled(plugin) => Ok(()),
         held => Err(format!(
             "{name}, {}'s storage, holds the records of {}, not {plugin}; it is kept, \
              so launch {} as another instance, or have an administrator remove the storage",
             request.instance_id,
-            held.unwrap_or("another plugin"),
+            held.map_or_else(|| "another plugin".to_string(), named_by),
             plugin,
         )),
     }
