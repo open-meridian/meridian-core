@@ -5849,8 +5849,12 @@ fn lake_rows_are_partitioned_online_under_write_load_with_equal_answers() {
 /// a failed test's too, and one made before the other failed (m9 and PO 65:
 /// runs left their `lake2_*` databases behind).
 fn two_databases() -> Vec<Scratch> {
+    databases(2)
+}
+
+fn databases(count: usize) -> Vec<Scratch> {
     let tag = unique("lake2").replace([':', '-'], "_");
-    (0..2)
+    (0..count)
         .map(|d| {
             let made = Scratch::database(&test_database(), &format!("{tag}_{d}"));
             PostgresStore::connect(&made, 2)
@@ -6979,8 +6983,9 @@ fn stores_of(
 
 fn members(urls: &[Scratch]) -> Members {
     use meridian_changes::groups::Groups;
-    let zeros = stores_of(urls, Groups::new(0, 2).unwrap(), 4);
-    let ones = stores_of(urls, Groups::new(1, 2).unwrap(), 4);
+    let count = urls.len() as u32;
+    let zeros = stores_of(urls, Groups::new(0, count).unwrap(), 4);
+    let ones = stores_of(urls, Groups::new(1, count).unwrap(), 4);
     let zero = meridian_lake::spread::Spread::new(zeros.clone(), zeros[0].groups());
     let one = meridian_lake::spread::Spread::new(ones.clone(), ones[0].groups());
     zero.adopt().unwrap();
@@ -6995,9 +7000,14 @@ fn members(urls: &[Scratch]) -> Members {
 
 /// A dataset group 0 of two owns, named from `tag`.
 fn owned_by_zero(tag: &str) -> String {
+    owned_by_zero_of(tag, 2)
+}
+
+/// A dataset group 0 of `count` owns, named from `tag`.
+fn owned_by_zero_of(tag: &str, count: u32) -> String {
     (0..)
         .map(|n| unique(&format!("{tag}{n}")))
-        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .find(|dataset| meridian_changes::groups::owner(dataset, count) == 0)
         .unwrap()
 }
 
@@ -7145,6 +7155,10 @@ fn a_database_out_of_reach_slows_no_read_of_a_dataset_written_in_another() {
     for dataset in [&stays, &moves] {
         assert_eq!(latest_keys(&reader, dataset, &low).unwrap(), ["l0", "l1"]);
     }
+    // Another, which has read nothing yet: where each range is, it has not
+    // found (the review of the book's fix, finding 3).
+    let fresh_stores = stores_of(&urls, groups, 2);
+    let fresh = meridian_lake::spread::Spread::new(fresh_stores.clone(), groups);
     moved_to_one(&m, &gone);
     // Database 1 out of this member's reach: both connections of its pool
     // taken, each waiting on a lock held here.
@@ -7152,13 +7166,24 @@ fn a_database_out_of_reach_slows_no_read_of_a_dataset_written_in_another() {
     admin
         .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
         .unwrap();
-    let held: Vec<_> = (0..2)
-        .map(|_| {
-            let (store, range) = (stores[1].clone(), gone.clone());
+    let held: Vec<_> = [&stores[1], &stores[1], &fresh_stores[1], &fresh_stores[1]]
+        .into_iter()
+        .map(|store| {
+            let (store, range) = (store.clone(), gone.clone());
             std::thread::spawn(move || drop(store.range_tip(&range)))
         })
         .collect();
     std::thread::sleep(std::time::Duration::from_millis(500));
+    // With no read before it: database 1 is asked where each range is for
+    // 1 s at most, once a look, never on its pool's 30 s.
+    let started = std::time::Instant::now();
+    let read = latest_keys(&fresh, &stays, &low);
+    let took = started.elapsed();
+    assert_eq!(read.ok(), Some(vec!["l0".to_string(), "l1".to_string()]));
+    assert!(
+        took < std::time::Duration::from_secs(4),
+        "a member's first read of a dataset database 0 writes waited {took:?} on database 1"
+    );
     let started = std::time::Instant::now();
     let read = latest_keys(&reader, &stays, &low);
     let took = started.elapsed();
@@ -13906,4 +13931,84 @@ fn a_range_moved_under_a_read_is_never_answered_without_its_rows() {
     }
     assert_eq!(latest_keys(&reader, &dataset, &low).unwrap(), ["l0", "l1"]);
     assert_eq!(groups.owner_by(&lower, &dataset), 0, "the view, as it was");
+}
+
+/// A written row a failed move left behind never stands for a range past
+/// a move's pointer of it (the review of the book's fix, finding 1): the
+/// databases a read's view names hold a pointer of the range at its close
+/// and, in another, a row written long before and never taken away. The
+/// leftover is behind the pointer, so the range is looked for in every
+/// database, and read where it went.
+#[test]
+fn a_leftover_written_row_behind_a_moves_pointer_sends_the_read_on() {
+    use meridian_changes::groups::Groups;
+    let urls = databases(3);
+    let m = members(&urls);
+    let dataset = owned_by_zero_of("coinbase-1:o", 3);
+    let (low, high) = halves_of("lake-leftover");
+    let lower = halved(&m, &dataset, &low, &high);
+    moved_to_one(&m, &lower);
+    // Left in database 2 by a move that failed, long ago: written, behind.
+    postgres::Client::connect(&urls[2], postgres::NoTls)
+        .unwrap()
+        .execute(
+            "INSERT INTO lake_partition (dataset, head, epoch, lo, hi, writer_group)
+             VALUES ($1, 1, 1, 0, 32767, 2)",
+            &[&lower],
+        )
+        .unwrap();
+    // A member whose view names database 2's group for the range.
+    let groups = Groups::new(0, 3).unwrap();
+    let reader = meridian_lake::spread::Spread::new(stores_of(&urls, groups, 2), groups);
+    reader.read_owners_again().unwrap();
+    groups.assign(&lower, Some(2));
+    assert_eq!(
+        latest_keys(&reader, &dataset, &low).unwrap(),
+        ["l0", "l1"],
+        "a leftover row behind the move's pointer stood for the range"
+    );
+}
+
+/// A read waits for its own database's pool as it always has (the review
+/// of the book's fix, finding 2): the short bound is for a database the
+/// read may not need, so its own under load refuses nothing it answered
+/// before.
+#[test]
+fn a_read_waits_for_its_own_databases_pool_as_before() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let m = members(&urls);
+    let dataset = owned_by_zero("coinbase-1:p");
+    let (low, high) = halves_of("lake-pool");
+    let lower = halved(&m, &dataset, &low, &high);
+    let groups = Groups::new(0, 2).unwrap();
+    let stores = stores_of(&urls, groups, 2);
+    let reader = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    reader.read_owners_again().unwrap();
+    assert_eq!(latest_keys(&reader, &dataset, &low).unwrap(), ["l0", "l1"]);
+    // Database 0's pool taken whole for a second and a half.
+    let mut admin = postgres::Client::connect(&urls[0], postgres::NoTls).unwrap();
+    admin
+        .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (store, range) = (stores[0].clone(), lower.clone());
+            std::thread::spawn(move || drop(store.range_tip(&range)))
+        })
+        .collect();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        admin.batch_execute("ROLLBACK").unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        latest_keys(&reader, &dataset, &low).unwrap(),
+        ["l0", "l1"],
+        "a read its own database's pool held for a moment was refused"
+    );
+    release.join().unwrap();
+    for holder in held {
+        holder.join().unwrap();
+    }
 }

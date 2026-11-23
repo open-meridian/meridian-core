@@ -309,6 +309,22 @@ impl Spread {
     /// -- or none has begun it. Once there, it is there until its owner
     /// changes.
     pub fn of(&self, partition: &str) -> u32 {
+        self.of_within(partition, None)
+    }
+
+    /// [`Self::of`]; for a read, with the databases it has found
+    /// `out_of_reach`, each database past the partition's owner's home is
+    /// asked on a connection waited for 1 s at most
+    /// ([`PostgresStore::range_tip_within`]) and, once out of reach, not
+    /// again in this look: a read's first of a partition never waits a
+    /// pool's 30 s on a database it may not need (the review of the book's
+    /// fix, finding 3). Nothing is settled by a look that could not ask
+    /// every database.
+    fn of_within(
+        &self,
+        partition: &str,
+        out_of_reach: Option<&std::cell::RefCell<std::collections::BTreeSet<u32>>>,
+    ) -> u32 {
         if partition == meridian_changes::CONTROL {
             return 0;
         }
@@ -327,8 +343,24 @@ impl Spread {
         }
         let count = self.groups.count();
         let mut best = (0u64, home);
+        let mut every = true;
         for (d, store) in self.stores.iter().enumerate() {
-            let Ok(Some(tip)) = store.range_tip(partition) else {
+            let tip = match out_of_reach.filter(|_| d as u32 != home) {
+                Some(out) if out.borrow().contains(&(d as u32)) => {
+                    every = false;
+                    continue;
+                }
+                Some(out) => match store.range_tip_within(partition) {
+                    Ok(tip) => tip,
+                    Err(_) => {
+                        out.borrow_mut().insert(d as u32);
+                        every = false;
+                        continue;
+                    }
+                },
+                None => store.range_tip(partition).ok().flatten(),
+            };
+            let Some(tip) = tip else {
                 continue;
             };
             // A move's pointer is where it let go, never where it is
@@ -355,7 +387,7 @@ impl Spread {
         {
             best.1 = home;
         }
-        if best.1 == home {
+        if best.1 == home && every {
             self.settled.lock().expect("settled poisoned").insert(key);
         }
         best.1
@@ -364,9 +396,11 @@ impl Spread {
     /// The databases a read of `dataset` asks, by the view: its own, and
     /// each its ranges' groups write, as this member last read them.
     fn sent(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
-        let mut out = std::collections::BTreeSet::from([self.of(dataset)]);
+        let out_of_reach = Default::default();
+        let mut out =
+            std::collections::BTreeSet::from([self.of_within(dataset, Some(&out_of_reach))]);
         for (range, _) in self.groups.ranges_of(dataset) {
-            out.insert(self.of(&range));
+            out.insert(self.of_within(&range, Some(&out_of_reach)));
         }
         out
     }
@@ -382,8 +416,10 @@ impl Spread {
     /// target's head. Each database answers the ranges its own rows say
     /// are read there, so a read needs only the right databases.
     ///
-    /// - **The view's databases asked**, one read of each: theirs where
-    ///   each range one of them let go is held by another of them.
+    /// - **The view's databases asked**, one read of each, on the pool's
+    ///   own wait as the read's rows are: theirs where each range one of
+    ///   them let go is held by another of them, at or past where it was
+    ///   let go.
     /// - **Every other's** only where one holds a move's pointer of a
     ///   range none of them holds, or they have begun nothing of the
     ///   dataset: each holding a range of it is asked as well. A range a
@@ -426,14 +462,21 @@ impl Spread {
                 rows.push((*d, row));
             }
         }
-        let held: std::collections::BTreeSet<&str> = rows
-            .iter()
-            .filter(|(d, row)| !row.closed && here(*d, row))
-            .map(|(_, row)| row.partition.as_str())
-            .collect();
+        // Each range's row furthest on among those read where they are: a
+        // written row a failed move left behind a pointer stands for
+        // nothing (the review of the book's fix, finding 1).
+        let mut held: BTreeMap<&str, u64> = BTreeMap::new();
+        for (_, row) in rows.iter().filter(|(d, row)| !row.closed && here(*d, row)) {
+            let at = held.entry(row.partition.as_str()).or_insert(row.head);
+            *at = (*at).max(row.head);
+        }
         let begun = rows.iter().any(|(d, row)| row.head > 0 && here(*d, row));
         let astray = rows.iter().any(|(d, row)| {
-            !row.closed && !here(*d, row) && !held.contains(row.partition.as_str())
+            !row.closed
+                && !here(*d, row)
+                && held
+                    .get(row.partition.as_str())
+                    .is_none_or(|at| *at < row.head)
         });
         if !begun || astray {
             let others: Vec<u32> = (0..self.count())

@@ -177,6 +177,17 @@ impl PostgresStore {
         range_tip_of(&mut *conn, partition)
     }
 
+    /// [`Self::range_tip`] on a connection waited for
+    /// [`STANDING_CHECKOUT`] at most: for a read finding where a range is,
+    /// in a database it may not need.
+    pub fn range_tip_within(&self, partition: &str) -> Result<Option<RangeTip>> {
+        let mut conn = self
+            .pool
+            .get_timeout(STANDING_CHECKOUT)
+            .map_err(unavailable)?;
+        range_tip_of(&mut *conn, partition)
+    }
+
     /// The last row of `partition`'s own this database holds: its sequence
     /// and recording time (a move's target, warming).
     pub fn range_tip_held(&self, partition: &str) -> Result<(u64, i64)> {
