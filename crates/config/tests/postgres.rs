@@ -3630,3 +3630,51 @@ fn two_puts_of_one_new_group_at_once_record_it_defined_once() {
         );
     }
 }
+
+/// Review-core-3 8: on a store whose change log was installed by the release
+/// before, migration 35's backfilled records are written as it runs, before
+/// the log is installed again over the new table. Each is in the log, so a
+/// follower reading on from its place has them.
+#[test]
+fn a_migrations_backfilled_records_are_in_the_change_log() {
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("config_backfill_logged_{seq}_{}", unique());
+    let url = Scratch::schema(&base_url(), &name);
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    db.batch_execute(meridian_config::migrations::HISTORY)
+        .unwrap();
+    for migration in meridian_config::migrations::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= 34)
+    {
+        db.batch_execute(migration.sql).unwrap();
+        db.execute(
+            "INSERT INTO config_schema_migration (version, name, applied_at_ns) VALUES ($1, $2, 1)",
+            &[&migration.version, &migration.name],
+        )
+        .unwrap();
+    }
+    // The release before installed its log, then kept a group in it.
+    meridian_config::postgres::CHANGES.install(&mut db).unwrap();
+    db.batch_execute(
+        "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+         VALUES ('UG-1', 'Admins', '{admins}', '{ada}')",
+    )
+    .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&At(1_000)).unwrap();
+    let recorded: i64 = db
+        .query_one("SELECT count(*) FROM config_group_change", &[])
+        .unwrap()
+        .get(0);
+    assert!(recorded >= 2, "UG-1 and All accounts: {recorded}");
+    let logged: i64 = db
+        .query_one(
+            "SELECT count(*) FROM config_change WHERE kind = 'config_group_change.insert'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(logged, recorded, "every backfilled record is in the log");
+}

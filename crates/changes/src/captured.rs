@@ -256,21 +256,71 @@ impl Spec {
             "
         );
         for table in tables {
-            sql.push_str(&format!(
-                "DROP TRIGGER IF EXISTS {prefix}_captured ON {table};
-                CREATE TRIGGER {prefix}_captured AFTER INSERT OR DELETE ON {table}
-                    FOR EACH ROW EXECUTE FUNCTION {prefix}_capture();
-                DROP TRIGGER IF EXISTS {prefix}_captured_update ON {table};
-                CREATE TRIGGER {prefix}_captured_update AFTER UPDATE ON {table}
-                    FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
-                    EXECUTE FUNCTION {prefix}_capture();
-                DROP TRIGGER IF EXISTS {prefix}_captured_truncate ON {table};
-                CREATE TRIGGER {prefix}_captured_truncate AFTER TRUNCATE ON {table}
-                    FOR EACH STATEMENT EXECUTE FUNCTION {prefix}_capture();
-                "
-            ));
+            sql.push_str(&self.triggers_sql(table));
         }
         sql
+    }
+
+    /// The triggers that capture one table's rows.
+    fn triggers_sql(&self, table: &str) -> String {
+        let prefix = self.prefix;
+        format!(
+            "DROP TRIGGER IF EXISTS {prefix}_captured ON {table};
+            CREATE TRIGGER {prefix}_captured AFTER INSERT OR DELETE ON {table}
+                FOR EACH ROW EXECUTE FUNCTION {prefix}_capture();
+            DROP TRIGGER IF EXISTS {prefix}_captured_update ON {table};
+            CREATE TRIGGER {prefix}_captured_update AFTER UPDATE ON {table}
+                FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
+                EXECUTE FUNCTION {prefix}_capture();
+            DROP TRIGGER IF EXISTS {prefix}_captured_truncate ON {table};
+            CREATE TRIGGER {prefix}_captured_truncate AFTER TRUNCATE ON {table}
+                FOR EACH STATEMENT EXECUTE FUNCTION {prefix}_capture();
+            "
+        )
+    }
+
+    /// In a migration's own transaction, after its SQL and before it writes
+    /// rows of its own (a backfill): each of the store's tables the schema
+    /// holds that is not captured yet -- one the migration just made --
+    /// given its capture triggers, so those rows are in the log. Where no
+    /// log is installed yet, nothing: the log, installed after, starts from
+    /// what the store holds (`kept_from`). [`Spec::install`], run after the
+    /// migrations, installs every table's again as it always does.
+    pub fn capture_new_tables(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<(), postgres::Error> {
+        let logged: bool = client
+            .query_one(
+                "SELECT to_regprocedure($1) IS NOT NULL",
+                &[&format!("{}_capture()", self.prefix)],
+            )?
+            .get(0);
+        if !logged {
+            return Ok(());
+        }
+        let bare: Vec<String> = client
+            .query(
+                "SELECT name FROM unnest($1::text[]) AS name
+                  WHERE to_regclass(name) IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM pg_trigger
+                                     WHERE tgrelid = to_regclass(name) AND tgname = $2)",
+                &[
+                    &self
+                        .tables
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>(),
+                    &format!("{}_captured", self.prefix),
+                ],
+            )?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        for table in &bare {
+            client.batch_execute(&self.triggers_sql(table))?;
+        }
+        Ok(())
     }
 
     /// Install the log; see [`Spec::install_sql`]. Done once per version of
