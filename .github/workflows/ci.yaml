@@ -936,41 +936,39 @@ jobs:
 
       # One fact a step, after a failed make and before any upload: a step's
       # result arrives when its log does not. A red one says its name does
-      # not hold; none of them changes the job's result. Being
-      # continue-on-error, each shows as passed in the API, so each also
+      # not hold, and a hung one shows as timed out: none is
+      # continue-on-error, so the API shows what each found (as
+      # continue-on-error each showed as passed whatever it found). The job
+      # has failed already, so none changes its result, and every step after
+      # runs on always(), failure() or !cancelled() as before. Each also
       # writes ok or failed, and its output's last line, to the step summary.
       - name: "Probe: the make did not give up on making the cluster"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
-        continue-on-error: true
         working-directory: workspace/meridian-core
         run: tools/ci-watchdog.sh probe gave-up "$RUNNER_TEMP/make.log"
 
       - name: "Probe: names resolve"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
-        continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe names "$RUNNER_TEMP/make.log"
 
       - name: "Probe: Docker Hub answers"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
-        continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe hub "$RUNNER_TEMP/make.log"
 
       - name: "Probe: the results' blob store answers"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
-        continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe blob "$RUNNER_TEMP/make.log"
 
       - name: "Probe: the runner's network is clear of the cluster's subnet"
         if: (failure() || cancelled()) && (steps.make.outcome == 'failure' || steps.make.outcome == 'cancelled')
         timeout-minutes: 1
-        continue-on-error: true
         working-directory: workspace/meridian-core
         run: timeout 20 tools/ci-watchdog.sh probe subnet "$RUNNER_TEMP/make.log"
 

@@ -45,9 +45,9 @@
 #                                 when nothing else does: gave-up, names,
 #                                 hub, blob, subnet. Each writes ok or
 #                                 failed, with its output's last line, to
-#                                 the step summary too: the steps are
+#                                 the step summary too. The steps are not
 #                                 continue-on-error, so the API shows each
-#                                 as passed whatever it found
+#                                 as passed, failed or timed out
 #
 # Each sample: the time and load; `free -m`; `df -h` of / and of Docker's
 # root; the five processes holding the most memory; `docker stats
@@ -371,9 +371,7 @@ case $cmd in
   probe)
     # $file names the fact, $3 is the make's log. A step that fails says the
     # fact does not hold. The fact is asked in a bounded child, so its
-    # result reaches the step summary even when the asking hangs: the steps
-    # are continue-on-error, and the API shows each as passed whatever it
-    # found.
+    # result reaches the step summary even when the asking hangs.
     self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     rc=0
     said=$(timeout "${PROBE_SECONDS:-15}" "$self" probe-one "$file" "$3" 2>&1) || rc=$?
