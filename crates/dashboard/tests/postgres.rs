@@ -2312,3 +2312,72 @@ fn migration_17_and_a_settle_of_the_release_before_never_deadlock() {
     assert_eq!(at, 17);
     assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
 }
+
+/// Review-core-3c N2: the 90 days a settled prepared change's steps are
+/// kept are counted to the database's own time. A time named on the
+/// connection only tightens it, and a change said to have settled long
+/// before it was settled is refused, so neither lets a step go early.
+#[test]
+fn a_named_time_or_a_settle_dated_back_never_lets_a_step_go_early() {
+    let (url, _database) = migrated("named_time");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let refused = |raw: &mut postgres::Client, sql: &str| {
+        let failed = raw.batch_execute(sql).expect_err(sql);
+        assert_eq!(
+            failed.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{sql}: {failed}"
+        );
+        let _ = raw.batch_execute("ROLLBACK");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let yesterday = now - DAY_NS;
+    raw.batch_execute(&format!(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+              prepared_at_ns, settled_at_ns)
+         VALUES ('PC-YESTERDAY', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {yesterday}),
+                ('PC-PENDING', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                ('PC-NOW', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL),
+                ('PC-SKEWED', 'dashboard__set_hold', '{{}}', 'local|ada', 1, {now}, NULL);
+         INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+         VALUES ('PC-YESTERDAY', 4, {yesterday}), ('PC-PENDING', 1, {now});"
+    ))
+    .unwrap();
+    // A time far ahead named on the connection: the database's own is
+    // earlier, and counts.
+    refused(
+        &mut raw,
+        "BEGIN;
+         SELECT set_config('meridian.dashboard_now_ns', '9000000000000000000', true);
+         DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-YESTERDAY';",
+    );
+    // A pending one said to have settled at the start of time: refused, and
+    // its steps stay.
+    refused(
+        &mut raw,
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = 1
+          WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    refused(
+        &mut raw,
+        "DELETE FROM dashboard_prepared_call_change WHERE prepared_call_id = 'PC-PENDING'",
+    );
+    // Settled now, or a minute behind the database's clock: as a settle is.
+    raw.execute(
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+          WHERE prepared_call_id = 'PC-NOW'",
+        &[&now],
+    )
+    .expect("a settle now");
+    raw.execute(
+        "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+          WHERE prepared_call_id = 'PC-SKEWED'",
+        &[&(now - MINUTE_NS)],
+    )
+    .expect("a settle by a clock a minute behind");
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
+}
