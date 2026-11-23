@@ -15015,6 +15015,20 @@ fn keys_anchored_by_a_merged_subject(
     (dataset, again)
 }
 
+/// The review's F2 (v31a.17): a batch refused for more month tables than
+/// its transaction makes -- its keys anchored by a subject merged into the
+/// one they now name, so their months were not those made before it -- is
+/// recorded all the same: the months it was refused for are made and it is
+/// recorded again, once, inside the store. Its caller is not answered the
+/// refusal as words with no retry-after.
+#[test]
+fn a_batch_whose_keys_a_merged_subject_anchors_is_recorded_its_months_owed_made() {
+    let (_url, store) = isolated("owedmonths");
+    let (dataset, again) = keys_anchored_by_a_merged_subject(&store, "owed", 10);
+    let done = store.record(&dataset, again, 1_300).unwrap();
+    assert_eq!((done.recorded, done.restated), (0, 10));
+}
+
 /// The review's F1 (v31a.17), the bound itself: the months a transaction
 /// makes are counted across its datasets. A write-ahead batch of two
 /// datasets, five months of each not made where its keys are anchored (as

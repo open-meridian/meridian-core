@@ -46,6 +46,8 @@ pub enum StoreError {
     /// A write to a range a move is switching (step 3d; section 6.8, the
     /// hold): tried again until the switch ends, at most
     /// `moves.holdSeconds`, then refused OVERLOADED with a retry-after.
+    /// And a batch refused twice for more month tables than its
+    /// transaction makes (v31a.17): they are made before it is asked again.
     #[error("{0}")]
     Held(String),
 

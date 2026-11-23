@@ -2087,10 +2087,33 @@ impl PostgresStore {
         self.epoch_now()?;
         let mut conn = self.conn()?;
         self.prepare(&mut conn, &[dataset])?;
+        // Kept to be recorded again where its transaction can be refused
+        // for the months it would make (v31a.17).
+        let kept = self.may_owe_months(dataset, &parts).then(|| parts.clone());
         // How long the dataset's lane was busy (step 3d; the profile's
         // advice on writer groups, approved 2026-11-14).
         let began = std::time::Instant::now();
-        let done = self.record_once(&mut conn, dataset, parts, shards, now_ns);
+        let (mut done, mut owed) = self.record_once(&mut conn, dataset, parts, shards, now_ns);
+        if owed {
+            // Refused for more month tables than its transaction makes:
+            // those its rows were not placed in before it (a key anchored
+            // by a subject merged into the one it now names; a range split
+            // since its ranges were read). They are owed: made, a few a
+            // transaction, and the batch recorded again, once, here.
+            self.forget_made();
+            if let Some(parts) = kept {
+                (done, owed) = self.record_once(&mut conn, dataset, parts, shards, now_ns);
+            }
+            if owed {
+                // Refused again, or not kept: for load, with a retry-after
+                // ([`StoreError::on_the_bus`]). What it was owed is made
+                // before the batch that asks again.
+                done = Err(StoreError::Held(format!(
+                    "dataset {dataset}'s batch needs more month tables than one transaction \
+                     makes: they are made before it; ask again in a moment"
+                )));
+            }
+        }
         meridian_changes::busy::record(dataset, began.elapsed(), meridian_changes::now_ns());
         if done.is_err() {
             self.forget_made();
@@ -2101,7 +2124,9 @@ impl PostgresStore {
     }
 
     /// [`Self::record_together`]'s batch, its months made first and then
-    /// its one transaction.
+    /// its one transaction: what it did, and whether it was refused for
+    /// more month tables than its transaction makes ([`Self::leaves_for`]),
+    /// nothing committed.
     fn record_once(
         &self,
         conn: &mut Connection,
@@ -2109,18 +2134,54 @@ impl PostgresStore {
         parts: Vec<Vec<Observation>>,
         shards: &[Option<ShardStamp>],
         now_ns: i64,
-    ) -> Result<Vec<Result<Recorded>>> {
+    ) -> (Result<Vec<Result<Recorded>>>, bool) {
         let rows = parts.iter().map(|rows| (dataset, rows.as_slice()));
-        self.months_first(conn, rows)?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
+        if let Err(failed) = self.months_first(conn, rows) {
+            return (Err(failed), false);
+        }
+        let mut tx = match conn.transaction().map_err(unavailable) {
+            Ok(tx) => tx,
+            Err(failed) => return (Err(failed), false),
+        };
         let mut months = MonthsMade::default();
         // Each part's plugin shard's epoch checked first, its row held for
         // the transaction (step 3d, checkpoint 5, item 32).
-        shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
+        let done = shards_checked(&mut tx, (0..parts.len()).map(|at| shard_at(shards, at)))
             .and_then(|fenced| {
                 self.record_dataset(&mut tx, dataset, parts, &fenced, now_ns, &mut months)
             })
-            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done))
+            .and_then(|done| tx.commit().map_err(unavailable).map(|()| done));
+        let owed = done.is_err() && months.refused;
+        (done, owed)
+    }
+
+    /// Whether `parts`' transaction could be refused for the month tables
+    /// it would make: its rows' months, one in each range the dataset's
+    /// last batch here read open, more than a transaction makes. Where no
+    /// batch of the dataset has been seen, by its rows' number.
+    fn may_owe_months(&self, dataset: &str, parts: &[Vec<Observation>]) -> bool {
+        let most = crate::leaves::MONTHS_A_TRANSACTION;
+        let rows: usize = parts.iter().map(Vec::len).sum();
+        if rows <= most {
+            return false;
+        }
+        let Some(ranges) = self
+            .ranges_seen
+            .lock()
+            .expect("seen poisoned")
+            .get(dataset)
+            .map(Vec::len)
+        else {
+            return true;
+        };
+        let mut months = std::collections::BTreeSet::new();
+        for row in parts.iter().flatten() {
+            months.insert(crate::leaves::Month::of(row.meta().valid_from_ns));
+            if months.len() * ranges.max(1) > most {
+                return true;
+            }
+        }
+        false
     }
 
     /// One dataset's parts recorded in `tx` (step 3d; sections 6.1 and 6.5):
@@ -2368,7 +2429,7 @@ impl PostgresStore {
     /// (step 3d; section 6.2), in `tx`: with those `months` counts made in
     /// it already -- in its other ranges, and its other datasets -- at most
     /// [`crate::leaves::MONTHS_A_TRANSACTION`] (v31a.17). Past that the
-    /// batch is refused, and these are owed.
+    /// batch is refused, `months` saying so, and these are owed.
     fn leaves_for(
         &self,
         tx: &mut Transaction<'_>,
@@ -2409,6 +2470,7 @@ impl PostgresStore {
         let missing = crate::leaves::months_missing(tx, &needed).map_err(unavailable)?;
         if months.made + missing.len() > crate::leaves::MONTHS_A_TRANSACTION {
             let (owed, made) = (missing.len(), months.made);
+            months.refused = true;
             self.owed.lock().expect("owed poisoned").extend(missing);
             return Err(StoreError::Unavailable(format!(
                 "range {partition} needs {owed} month tables not made yet, with the {made} \
@@ -2969,10 +3031,12 @@ fn offer_latest(
 }
 
 /// The month tables one batch's transaction has made, across its ranges
-/// and its datasets ([`crate::leaves::MONTHS_A_TRANSACTION`]; v31a.17).
+/// and its datasets, and whether it was refused for more than a
+/// transaction makes ([`crate::leaves::MONTHS_A_TRANSACTION`]; v31a.17).
 #[derive(Default)]
 struct MonthsMade {
     made: usize,
+    refused: bool,
 }
 
 /// What refuses a write-ahead batch whole (step 3d): a part held by a
