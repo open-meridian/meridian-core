@@ -262,6 +262,21 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
     Ok(open)
 }
 
+/// [`open_ranges_taken`]'s statement: a dataset's open ranges ($1), each
+/// with the group, the head and whether the epoch is a move's pointer ($2)
+/// of the row taken, and whether it was taken. Named for the test that
+/// reads it across a switch committing between its snapshot and its take.
+pub const OPEN_RANGES_TAKEN: &str =
+    "SELECT p.dataset, p.lo, p.hi, l.writer_group, l.taken IS NOT NULL,
+            coalesce(l.head, p.head), coalesce(l.epoch = $2, false)
+       FROM lake_partition p
+       LEFT JOIN LATERAL (SELECT true AS taken, q.writer_group, q.head, q.epoch
+                            FROM lake_partition q
+                           WHERE q.dataset = p.dataset
+                             FOR UPDATE SKIP LOCKED) AS l ON true
+      WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+        AND p.closed_at IS NULL";
+
 /// [`open_ranges`], each range's row taken for the rest of `tx` where no
 /// move's switch holds it (step 3d; section 6.8), skipped where one does:
 /// with the group each names and whether `tx` holds it. Under the
@@ -275,8 +290,9 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
 /// on as the range's owner to the head's epoch check, and its write was
 /// refused as fenced by a newer writer where it is the other group's to
 /// commit (main's ha range-move flake: "this writer's 2, the partition's
-/// 1"). A row not taken is held by a switch, and its parts wait whatever
-/// it names.
+/// 1"). A row not taken is held by a switch, or was deleted since the
+/// snapshot by a move between databases (`moved_in`), and its parts wait
+/// whatever it named.
 #[allow(clippy::type_complexity)]
 fn open_ranges_taken(
     client: &mut impl GenericClient,
@@ -287,15 +303,7 @@ fn open_ranges_taken(
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, l.writer_group, l.taken IS NOT NULL,
-                    coalesce(l.head, p.head), coalesce(l.epoch = $2, false)
-               FROM lake_partition p
-               LEFT JOIN LATERAL (SELECT true AS taken, q.writer_group, q.head, q.epoch
-                                    FROM lake_partition q
-                                   WHERE q.dataset = p.dataset
-                                     FOR UPDATE SKIP LOCKED) AS l ON true
-              WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
-                AND p.closed_at IS NULL",
+            OPEN_RANGES_TAKEN,
             &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
         )
         .map_err(unavailable)?;
@@ -752,6 +760,16 @@ impl PostgresStore {
         )
         .map_err(unavailable)?;
         Ok(())
+    }
+
+    /// The head a batch would number `partition` from, taken in a
+    /// transaction of its own and let go: for the tests of what
+    /// [`Self::head`] refuses, and as what.
+    #[doc(hidden)]
+    pub fn head_taken(&self, partition: &str) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        self.head(&mut tx, partition)
     }
 
     /// The partition's head, taken under its lock, its epoch checked against

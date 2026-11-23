@@ -6551,6 +6551,181 @@ fn a_range_switched_as_a_batch_reads_it_is_handed_on_never_fenced() {
     );
 }
 
+/// The statement a batch takes its ranges with, read across a switch that
+/// commits between its snapshot and its take (step 3d; section 6.8; the
+/// review of c503f16d, finding 2), each step in turn: a cursor over it is
+/// declared in a READ COMMITTED transaction -- its snapshot --, the range is
+/// switched and committed from another session, and the cursor is fetched --
+/// its take. The row is taken, and the group is the one the row taken
+/// names. The statement as it was (1fb33efd's) names the group the range
+/// was, beside the same row taken: main's ha range-move flake.
+#[test]
+fn the_ranges_a_batch_takes_name_the_group_of_the_row_taken_across_a_switch() {
+    use meridian_lake::postgres::Switched;
+    const BEFORE: &str =
+        "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head,
+                p.epoch = $2
+           FROM lake_partition p
+           LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
+                               WHERE q.dataset = p.dataset
+                                 FOR UPDATE SKIP LOCKED) AS l ON true
+          WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
+            AND p.closed_at IS NULL";
+    let (url, zero, _one, dataset, _lower, upper, _low, _high) =
+        two_groups_and_a_split_of("lake-sq", 0);
+    // What `statement` says of the upper range, switched to `target` between
+    // its snapshot and its take: the group, and whether the row was taken.
+    let across = |statement: &str, target: u32| -> (Option<i32>, bool) {
+        let mut session = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let mut tx = session
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .unwrap();
+        tx.execute(
+            &format!("DECLARE taken NO SCROLL CURSOR FOR {statement}"),
+            &[&dataset, &meridian_changes::moves::POINTER_EPOCH],
+        )
+        .unwrap();
+        let ended = zero
+            .switch_range(
+                &zero,
+                &upper,
+                target,
+                std::time::Duration::from_secs(5),
+                false,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(ended, Switched::Moved { .. }), "{ended:?}");
+        let rows = tx.query("FETCH ALL FROM taken", &[]).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get::<_, String>(0) == upper)
+            .expect("the upper range is open");
+        (row.get(3), row.get(4))
+    };
+    assert_eq!(
+        across(BEFORE, 1),
+        (Some(0), true),
+        "as it was: the row taken names group 1, and the batch is told group 0"
+    );
+    assert_eq!(
+        across(meridian_lake::postgres::OPEN_RANGES_TAKEN, 0),
+        (Some(0), true),
+        "switched to group 0 under the statement"
+    );
+    assert_eq!(
+        across(meridian_lake::postgres::OPEN_RANGES_TAKEN, 1),
+        (Some(1), true),
+        "switched to group 1 under the statement"
+    );
+}
+
+/// A range's head taken where its row names another group (step 3d; section
+/// 6.8; the review of c503f16d, finding 1): handed on to the group the row
+/// names, read under the row's lock, whatever this member's view of the
+/// assignments says -- a view another thread's read of the owners can set
+/// back between a batch's look and its head. Never a fence: the row's
+/// epoch is the other group's, and no member steps down for it. A writer of
+/// the range's own group that was deposed is fenced still.
+#[test]
+fn a_head_whose_row_names_another_group_is_handed_on_never_fenced() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::postgres::Switched;
+    use meridian_lake::store::StoreError;
+    let (url, zero, _one, _dataset, lower, upper, _low, _high) =
+        two_groups_and_a_split_of("lake-hd", 0);
+    let ended = zero
+        .switch_range(
+            &zero,
+            &upper,
+            1,
+            std::time::Duration::from_secs(5),
+            false,
+            0,
+        )
+        .unwrap();
+    assert!(matches!(ended, Switched::Moved { .. }), "{ended:?}");
+    // The member's view set back, as a read of the owners from before the
+    // switch leaves it.
+    zero.groups().assign(&upper, Some(0));
+    match zero.head_taken(&upper) {
+        Err(StoreError::NotOwned { partition, group }) => {
+            assert_eq!((partition.as_str(), group), (upper.as_str(), 1));
+        }
+        other => panic!("the row names group 1: {other:?}"),
+    }
+    assert!(
+        !meridian_changes::fenced_seen(),
+        "another group's range is never a fence"
+    );
+    // Its own group's range, its writer deposed: fenced, and said so.
+    let standby = PostgresStore::connect(&url, 1)
+        .unwrap()
+        .with_groups(Groups::new(0, 2).unwrap());
+    standby
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    match zero.head_taken(&lower) {
+        Err(StoreError::Fenced(_)) => {}
+        other => panic!("group 0's deposed writer is fenced: {other:?}"),
+    }
+    assert!(
+        meridian_changes::fenced_seen(),
+        "a deposed writer steps down"
+    );
+}
+
+/// A batch for a range another group owns, as another thread sets this
+/// member's view of the range back (step 3d; section 6.8; the review of
+/// c503f16d, finding 1): a read of the owners made before a switch, written
+/// after the batch's own look. The batch decides by the row it took, so
+/// every one is handed on to the group the row names; none goes on to the
+/// head's epoch check, and no member steps down.
+#[test]
+fn a_batch_decides_its_ranges_group_by_the_row_taken_whatever_the_view_says() {
+    use meridian_lake::postgres::Switched;
+    use meridian_lake::store::StoreError;
+    let (_url, zero, _one, dataset, _lower, upper, _low, high) =
+        two_groups_and_a_split_of("lake-vw", 0);
+    let ended = zero
+        .switch_range(
+            &zero,
+            &upper,
+            1,
+            std::time::Duration::from_secs(5),
+            false,
+            0,
+        )
+        .unwrap();
+    assert!(matches!(ended, Switched::Moved { .. }), "{ended:?}");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stale = {
+        let (groups, upper, stop) = (zero.groups(), upper.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                groups.assign(&upper, Some(0));
+            }
+        })
+    };
+    let mut answered = Vec::new();
+    for n in 0..2_000i64 {
+        let rows = vec![trade(&dataset, &format!("v{n}"), &high, 100 + n)];
+        match zero.record(&dataset, rows, 2_000 + n) {
+            Err(StoreError::NotOwned { group: 1, .. }) => {}
+            other => answered.push(format!("write v{n}: {other:?}")),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    stale.join().unwrap();
+    assert!(answered.is_empty(), "{answered:?}");
+    assert!(
+        !meridian_changes::fenced_seen(),
+        "another group's range is never a fence"
+    );
+}
+
 /// Every cause a range's move aborts for (section 6.8; MoveAbortCause): the
 /// injected lag before anything is held, a switch that cannot finish
 /// within moves.switchSeconds (a batch holds the range's row), and the
