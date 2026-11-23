@@ -26,6 +26,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # k3s's own images for ci's cluster jobs (tools/ci-k3s-images.sh), one
+  # entry per row of tools/ci-k3s-images.txt, kept in main's scope, where
+  # every run reads them: ci's runs only read them.
+  k3s-images-rows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rows: ${{ steps.rows.outputs.rows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - id: rows
+        working-directory: workspace/meridian-core
+        run: echo "rows=$(tools/ci-k3s-images.sh rows)" >> "$GITHUB_OUTPUT"
+
+  k3s-images:
+    needs: k3s-images-rows
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.k3s-images-rows.outputs.rows) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - uses: ./workspace/meridian-core/.github/actions/k3s-images
+        with:
+          k3s: ${{ matrix.k3s }}
+          save: "true"
+
   cargo-cache:
     # Each architecture's own (ruling 1071): ci builds the release candidate
     # on both.

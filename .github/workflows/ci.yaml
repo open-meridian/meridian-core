@@ -876,6 +876,17 @@ jobs:
         with:
           version: ${{ (matrix.target == 'e2e-cluster-upgrade' || matrix.target == 'e2e-cluster-reconfigure') && 'v4.2.3' || 'v3.16.2' }}
 
+      # k3s's own images, so making the cluster pulls nothing from Docker
+      # Hub: the node image loaded into Docker and the release's airgap
+      # tarball of its system images, which the Makefile hands to every node
+      # (E2E_K3S_AIRGAP), from GitHub's cache where main's cargo-cache
+      # workflow kept them (tools/ci-k3s-images.sh). The runs that died from
+      # 2026-11-17 gave up waiting on kube-system while its images came from
+      # Docker Hub.
+      - uses: ./workspace/meridian-core/.github/actions/k3s-images
+        with:
+          k3s: ${{ matrix.k3s }}
+
       # What the runner had left, every five seconds, to a file outside the
       # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
       # runner six minutes into the make below, with no log text at all.
@@ -1314,6 +1325,17 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.2
+
+      # k3s's own images, so making the cluster pulls nothing from Docker
+      # Hub: the node image loaded into Docker and the release's airgap
+      # tarball of its system images, which the Makefile hands to every node
+      # (E2E_K3S_AIRGAP), from GitHub's cache where main's cargo-cache
+      # workflow kept them (tools/ci-k3s-images.sh). The runs that died from
+      # 2026-11-17 gave up waiting on kube-system while its images came from
+      # Docker Hub.
+      - uses: ./workspace/meridian-core/.github/actions/k3s-images
+        with:
+          k3s: ''
 
       # What the runner had left, every five seconds, to a file outside the
       # job's log (tools/ci-watchdog.sh): three runs on 2026-11-19 lost a
