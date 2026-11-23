@@ -2014,10 +2014,11 @@ fn a_rewrite_and_a_fill_each_leave_their_record_once_in_postgres() {
 }
 
 /// Review-core-3b B (decisions/031): the release before, still serving as
-/// the upgrade ran, removes a delegation and writes no record. The sweep
-/// finds a delegation whose latest record is not its removal and which has
-/// no row, and gives it a backfilled removal: what it was, as its last
-/// record said; who and when not known; once.
+/// the upgrade ran, removes a delegation and writes no record. As the
+/// dashboard starts, a delegation whose latest record is not its removal
+/// and which has no row is given a backfilled removal: what it was, as its
+/// last record said; who and when not known; once. Not by the sweep, which
+/// would read every record each minute for it (review-core-3c N4).
 #[test]
 fn a_delegation_the_release_before_removed_is_given_its_removal_once() {
     use delegation::record::{ChangeKind, REMOVED_BY_AN_EARLIER_RELEASE};
@@ -2037,6 +2038,13 @@ fn a_delegation_the_release_before_removed_is_given_its_removal_once() {
         .unwrap();
     store.sweep(T0 + 2).unwrap();
     store.sweep(T0 + 3).unwrap();
+    assert_eq!(
+        store.changes(&made.id).unwrap().len(),
+        1,
+        "the sweep gives no removal"
+    );
+    assert_eq!(store.removals_owed(T0 + 4).unwrap(), 1);
+    assert_eq!(store.removals_owed(T0 + 5).unwrap(), 0, "once");
     let records = store.changes(&made.id).unwrap();
     let seen: Vec<_> = records
         .iter()
@@ -2046,7 +2054,7 @@ fn a_delegation_the_release_before_removed_is_given_its_removal_once() {
         seen,
         [
             (ChangeKind::Made, "local|ada", false, T0, Some(T0)),
-            (ChangeKind::Removed, "", true, T0 + 2, None),
+            (ChangeKind::Removed, "", true, T0 + 4, None),
         ]
     );
     assert_eq!(records[1].note, REMOVED_BY_AN_EARLIER_RELEASE);

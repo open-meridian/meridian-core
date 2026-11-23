@@ -478,6 +478,12 @@ fn run() -> Result<(), String> {
                 clock.clone(),
             ),
         );
+        // The delegations the release before removed with no record, given
+        // theirs once (review-core-3c N4).
+        meridian_runtime::background(meridian_dashboard::delegation::removals_owed_once(
+            Arc::clone(&delegations),
+            clock.clone(),
+        ));
 
         // What custody connectors say about their accounts and connections,
         // heard from now on (W2.1, W2.8, W4.8). Subscribed before anything

@@ -104,6 +104,11 @@ pub trait DelegationStore: Send + Sync {
     /// longer than they stay listed, and clients nobody consented to within
     /// a day.
     fn sweep(&self, now_ns: i64) -> Result<(), String>;
+    /// Each delegation the release before removed, still serving as the
+    /// upgrade ran, with no record of it, given its backfilled removal once
+    /// (review-core-3b B): run once as the dashboard starts, not by the
+    /// sweep (review-core-3c N4). Answers how many.
+    fn removals_owed(&self, now_ns: i64) -> Result<usize, String>;
 
     /// Record one call through the deployment's MCP surface (W6.20,
     /// contract v12): never an argument or an answer.
@@ -565,6 +570,11 @@ impl DelegationStore for InMemory {
         kept.calls
             .retain(|call| now_ns - call.called_at_ns <= CALLS_KEPT_NS);
         Ok(())
+    }
+
+    /// None: nothing the release before did is held in memory.
+    fn removals_owed(&self, _now_ns: i64) -> Result<usize, String> {
+        Ok(0)
     }
 
     fn record_call(&self, call: &ToolCall) -> Result<(), String> {
@@ -1496,29 +1506,6 @@ impl DelegationStore for InPostgres {
                 )?;
             }
         }
-        // Each the release before removed, still serving as the upgrade ran,
-        // with no record of it (review-core-3b B, decisions/031): whose
-        // latest record is not its removal and which has no row, given a
-        // backfilled removal -- what it was, as its last record said; who
-        // and when not known -- once.
-        tx.execute(
-            "INSERT INTO dashboard_delegation_change
-                 (delegation_id, subject, client_id, kind, was, became, changed_by,
-                  changed_at_ns, valid_at_ns, backfilled, note)
-             SELECT latest.delegation_id, latest.subject, latest.client_id, 'removed',
-                    latest.became, '', '', $1, NULL, true, $2
-               FROM (SELECT DISTINCT ON (r.delegation_id)
-                            r.delegation_id, r.subject, r.client_id, r.kind, r.became
-                       FROM dashboard_delegation_change r
-                      WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation d
-                                         WHERE d.delegation_id = r.delegation_id)
-                      ORDER BY r.delegation_id, r.change_id DESC) latest
-              WHERE latest.kind <> 'removed'
-              ORDER BY latest.delegation_id
-             ON CONFLICT (delegation_id) WHERE kind = 'removed' DO NOTHING",
-            &[&now_ns, &REMOVED_BY_AN_EARLIER_RELEASE],
-        )
-        .map_err(said)?;
         tx.commit().map_err(said)?;
         conn.execute(
             "DELETE FROM dashboard_oauth_client
@@ -1532,6 +1519,37 @@ impl DelegationStore for InPostgres {
         )
         .map_err(said)?;
         Ok(())
+    }
+
+    fn removals_owed(&self, now_ns: i64) -> Result<usize, String> {
+        // Whose latest record is not its removal and which has no row: what
+        // it was, as its last record said; who and when not known. One
+        // statement, in no transaction holding anything else: two replicas
+        // starting at once write each once (removed_once). The release
+        // before is the only source of these, so once as a dashboard starts
+        // finds them; read each minute it scanned every record.
+        let given = self
+            .database
+            .conn()?
+            .execute(
+                "INSERT INTO dashboard_delegation_change
+                     (delegation_id, subject, client_id, kind, was, became, changed_by,
+                      changed_at_ns, valid_at_ns, backfilled, note)
+                 SELECT latest.delegation_id, latest.subject, latest.client_id, 'removed',
+                        latest.became, '', '', $1, NULL, true, $2
+                   FROM (SELECT DISTINCT ON (r.delegation_id)
+                                r.delegation_id, r.subject, r.client_id, r.kind, r.became
+                           FROM dashboard_delegation_change r
+                          WHERE NOT EXISTS (SELECT 1 FROM dashboard_delegation d
+                                             WHERE d.delegation_id = r.delegation_id)
+                          ORDER BY r.delegation_id, r.change_id DESC) latest
+                  WHERE latest.kind <> 'removed'
+                  ORDER BY latest.delegation_id
+                 ON CONFLICT (delegation_id) WHERE kind = 'removed' DO NOTHING",
+                &[&now_ns, &REMOVED_BY_AN_EARLIER_RELEASE],
+            )
+            .map_err(said)?;
+        Ok(given as usize)
     }
 
     fn record_call(&self, call: &ToolCall) -> Result<(), String> {

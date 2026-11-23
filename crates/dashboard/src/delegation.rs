@@ -373,6 +373,32 @@ pub async fn rewrite_once_records_are_read(
     }
 }
 
+/// The removals the release before made, still serving as the upgrade ran,
+/// given their records once as the dashboard starts (review-core-3b B,
+/// review-core-3c N4): tried every five seconds until the store answers.
+/// Spawned by the dashboard at start.
+pub async fn removals_owed_once(
+    delegations: Arc<Delegations>,
+    clock: Arc<dyn crate::clock::Clock>,
+) {
+    loop {
+        match delegations.removals_owed(clock.now_ns()).await {
+            Ok(0) => return,
+            Ok(given) => {
+                tracing::info!(
+                    given,
+                    "delegations the release before removed given their removal records"
+                );
+                return;
+            }
+            Err(unavailable) => {
+                tracing::warn!(%unavailable, "the release before's removals were not recorded yet");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
 /// The rows rewrite: every delegation recorded with rows from before v15,
 /// once the records are first read at v15 (W6.17), each rewrite logged.
 /// Returns how many delegations it rewrote.
@@ -1547,6 +1573,12 @@ impl Delegations {
     /// The latest calls on a delegation, or of a person, newest first.
     pub async fn calls(&self, of: CallsOf, limit: usize) -> Result<Vec<ToolCall>, Unavailable> {
         self.stored(move |store| store.calls(&of, limit)).await
+    }
+
+    /// Each delegation the release before removed with no record, given
+    /// its backfilled removal once (review-core-3c N4). Answers how many.
+    pub async fn removals_owed(&self, now_ns: i64) -> Result<usize, Unavailable> {
+        self.stored(move |store| store.removals_owed(now_ns)).await
     }
 
     pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
