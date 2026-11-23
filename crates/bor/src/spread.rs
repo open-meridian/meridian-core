@@ -329,10 +329,17 @@ impl Spread {
     ///   finding 2).
     /// - **Every other's** only where that head is a move's pointer, or the
     ///   database has not begun the partition: the written head furthest
-    ///   on, where it is at or past every pointer read with it; else the
-    ///   owner's home. A head left written behind a move's pointers -- a
-    ///   move home whose source's commit failed leaves one for good -- is
-    ///   never the partition's (the same review, finding 1).
+    ///   on, where it is at or past every pointer read with it. A head
+    ///   left written behind a move's pointers -- a move home whose
+    ///   source's commit failed leaves one for good -- is never the
+    ///   partition's (the same review, finding 1).
+    /// - **No written head at or past every pointer**: the database of the
+    ///   pointer furthest on, which holds what the partition closed with
+    ///   there until its accounts are let go; the owner's home where its
+    ///   own pointer is as far on, or none is. Two moves between two of a
+    ///   member's looks, the second not yet opened, leave the owner's home
+    ///   by the view with the first's pointer, behind what the first's
+    ///   target wrote (the second review of 2026-11-23, N3).
     /// - **Never by [`Self::of`]**, which asks every database where the
     ///   partition stands, each on its pool's 30 s, until it is found at
     ///   its owner's home: a member's first read of a partition waited
@@ -365,11 +372,12 @@ impl Spread {
                     ))
                 })
         };
-        // The furthest pointer read: where a move let the partition go.
+        // The furthest pointer read, and its database: where a move let
+        // the partition go. The owner's home's first, so its own on a tie.
         let mut pointed = match head(sent)? {
             Some((at, true)) if at > 0 => return Ok(sent),
-            Some((at, false)) => at,
-            _ => 0,
+            Some((at, false)) => (at, sent),
+            _ => (0, sent),
         };
         let mut furthest: Option<(u64, u32)> = None;
         for d in (0..self.count()).filter(|d| *d != sent) {
@@ -379,13 +387,17 @@ impl Spread {
                         furthest = Some((at, d));
                     }
                 }
-                Some((at, false)) => pointed = pointed.max(at),
+                Some((at, false)) => {
+                    if at > pointed.0 {
+                        pointed = (at, d);
+                    }
+                }
                 None => {}
             }
         }
         Ok(match furthest {
-            Some((at, d)) if at >= pointed => d,
-            _ => sent,
+            Some((at, d)) if at >= pointed.0 => d,
+            _ => pointed.1,
         })
     }
 
