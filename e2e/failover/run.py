@@ -1342,8 +1342,11 @@ def served_between(since, until=None):
 
 def served_once(s, when, seconds=120):
     """Each subject served by one shard alone: within `seconds`, a moment
-    at which the pods' served sets of the last SERVING_S cover all of the
-    subjects, and none of them twice; then each held."""
+    at which SHARDS pods served in the last SERVING_S, their sets cover all
+    of the subjects, and none of them twice; then each held. The wait asks
+    what the checks ask (PR 147's CI, after the scale back: the pod that
+    stayed still covered all of them within the window, the wait passed
+    on its first look, and the check then found one pod serving)."""
     now = {}
 
     def once():
@@ -1351,7 +1354,8 @@ def served_once(s, when, seconds=120):
         now.clear()
         now.update(served_between(time.time() - SERVING_S))
         sets = list(now.values())
-        return (set().union(*sets) >= set(SHARD_SUBJECTS)
+        return (len(now) == SHARDS
+                and set().union(*sets) >= set(SHARD_SUBJECTS)
                 and all(sum(subject in held for held in sets) == 1 for subject in SHARD_SUBJECTS))
     happens(once, seconds, every=1.0)
     sets = list(now.values())

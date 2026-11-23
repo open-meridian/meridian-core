@@ -375,5 +375,52 @@ class CommittedBefore(unittest.TestCase):
                 self.assertFalse(ok, what)
 
 
+# PR 147's CI, the failover run at the scale back (clock 1795462287.0): what
+# each pod's served log held from four seconds before, trimmed to a pod's
+# first acknowledgement in each second and the subjects it served in it.
+# The pod that stayed served all 32 until the second before, then its 18;
+# the pod scaled up served the other 14 from 0.074 s after.
+SCALE_BACK_AT = 1795462287.0
+SCALE_BACK_SERVED = {
+    "shard-proof-ztzs2": ("1", [
+        (1795462283.062, range(32)),
+        (1795462284.070, range(32)),
+        (1795462285.063, range(32)),
+        (1795462286.064, (0, 4, 5, 6, 7, 8, 9, 11, 12, 13, 16, 17, 18, 19, 20, 23, 26, 28)),
+        (1795462287.074, (0, 4, 5, 6, 7, 8, 9, 11, 12, 13, 16, 17, 18, 19, 20, 23, 26, 28))]),
+    "shard-proof-jmsrs": ("0", [
+        (1795462287.074, (1, 2, 3, 10, 14, 15, 21, 22, 24, 25, 27, 29, 30, 31))]),
+}
+
+
+class ServedOnce(unittest.TestCase):
+    def test_the_wait_after_a_scale_back_waits_for_both_shards_serving(self):
+        # The pod that stayed still covers all 32 inside the window when the
+        # wait begins: a wait that does not ask for SHARDS pods serving
+        # returns at once, and its check then finds one.
+        clock = [SCALE_BACK_AT]
+
+        def served_read():
+            # Each pod records its subjects once a second: past the
+            # trimmed log, each goes on serving its last second's.
+            run.SERVED.clear()
+            for pod, (shard, seconds) in SCALE_BACK_SERVED.items():
+                last, subjects = seconds[-1]
+                seconds = seconds + [(last + n, subjects) for n in range(1, 200)]
+                run.SERVED[pod] = [(shard, run.SHARD_SUBJECTS[i], int(at), at)
+                                   for at, held in seconds if at <= clock[0] for i in held]
+            return run.SERVED
+
+        def sleep(seconds):
+            clock[0] += seconds
+        said = Checks()
+        with mock.patch.object(run, "SERVED", {}), \
+                mock.patch.object(run, "served_read", served_read), \
+                mock.patch.object(run.time, "time", lambda: clock[0]), \
+                mock.patch.object(run.time, "sleep", sleep):
+            run.served_once(said, "after the scale back")
+        self.assertEqual([ok for ok, _ in said.said], [True, True], said.said)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
