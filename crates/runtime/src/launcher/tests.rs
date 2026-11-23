@@ -440,6 +440,14 @@ fn a_listing_longer_than_a_label_holds_is_refused_its_storage_and_said_why() {
     let refused = claim(CLAIM, &asked).unwrap_err();
     assert!(refused.contains("63"), "{refused}");
     assert!(refused.contains(&long), "{refused}");
+    // Refused where its template is chosen, before anything is made; and
+    // launched where it keeps no storage.
+    let refused = template_for(&asked, false, &shapes(true)).unwrap_err();
+    assert!(refused.contains("63"), "{refused}");
+    assert_eq!(
+        template_for(&asked, false, &shapes(false)),
+        chosen("plain", None)
+    );
 }
 
 const LOCAL_ARCHIVE: &str = r#"{"env":[{"name":"MERIDIAN_ARCHIVE_DIR","value":"/var/lib/meridian/archive"}],"volumeMounts":[{"mountPath":"/var/lib/meridian/archive","name":"archive","subPath":"__INSTANCE__"}],"volumes":[{"name":"archive","persistentVolumeClaim":{"claimName":"check-meridian-runtime-archive"}}]}"#;
