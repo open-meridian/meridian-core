@@ -14244,3 +14244,43 @@ fn a_member_that_has_read_nothing_waits_on_no_database_out_of_reach() {
         "each read of a dataset database 0 writes waited on database 1: {took:?}"
     );
 }
+
+/// A dataset no database has begun is answered by its home, empty, and
+/// once every database has been asked and holds nothing of it, by its home
+/// alone (the review of 2026-11-23 of the lake's routing, finding 6; main
+/// answered so once it had looked). Its home having begun nothing of it,
+/// every other database is asked once, on its pool's own wait, for a
+/// dataset held there away from home; none holding any, the member keeps
+/// that, as a write's routing does, and another database out of reach
+/// afterwards neither slows nor refuses the read.
+#[test]
+fn a_dataset_never_written_is_answered_empty_by_its_home() {
+    use meridian_changes::groups::Groups;
+    let urls = two_databases();
+    let m = members(&urls);
+    let (written, never) = (owned_by_zero("coinbase-1:n"), owned_by_zero("coinbase-1:e"));
+    let (low, high) = halves_of("lake-never");
+    halved(&m, &written, &low, &high);
+    let groups = Groups::new(0, 2).unwrap();
+    let stores = stores_of(&urls, groups, 2);
+    let reader = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    reader.read_owners_again().unwrap();
+    assert_eq!(latest_keys(&reader, &never, &low).unwrap(), [""; 0]);
+    let (mut admin, held) = out_of_reach(&urls[1], &[&stores[1]], &never);
+    let started = std::time::Instant::now();
+    let read = latest_keys(&reader, &never, &low);
+    let took = started.elapsed();
+    admin.batch_execute("ROLLBACK").unwrap();
+    for holder in held {
+        holder.join().unwrap();
+    }
+    assert_eq!(
+        read.ok(),
+        Some(Vec::new()),
+        "a dataset no database has begun was not answered by its home"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "it waited {took:?} on another database"
+    );
+}

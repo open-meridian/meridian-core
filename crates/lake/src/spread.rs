@@ -397,6 +397,12 @@ impl Spread {
     ///   raised, the dataset not moved home yet -- it is read where it is
     ///   held, a database the read needs as it needs its home (the review
     ///   of 2026-11-23 of this routing, finding 1).
+    /// - **A dataset no database has begun** is its home's to answer,
+    ///   empty: asked of every other once, none holding a row of it, the
+    ///   member keeps that as a write's routing does ([`Self::of`]), and
+    ///   asks its home alone until its home begins it or its owner
+    ///   changes. Main answered so once it had looked (the same review,
+    ///   finding 6).
     /// - **Every other's for 1 s at most** only where a home holds a
     ///   move's pointer of a range none of them holds: each holding a
     ///   range of the dataset is asked as well. A range a split closed
@@ -460,7 +466,16 @@ impl Spread {
                     .get(row.partition.as_str())
                     .is_none_or(|at| *at < row.head)
         });
-        if !begun || astray {
+        // Begun nowhere when every database was last asked: its home's
+        // answer is the read's, as a write's routing has it (`of`).
+        let key = (dataset.to_string(), self.groups.owner_by(dataset, dataset));
+        let nowhere = rows.is_empty()
+            && self
+                .settled
+                .lock()
+                .expect("settled poisoned")
+                .contains(&key);
+        if (!begun && !nowhere) || astray {
             let others: Vec<u32> = (0..self.count())
                 .filter(|d| !databases.contains(d))
                 .collect();
@@ -476,6 +491,9 @@ impl Spread {
                 }
                 rows.extend(asked.into_iter().map(|row| (d, row)));
             }
+        }
+        if rows.is_empty() {
+            self.settled.lock().expect("settled poisoned").insert(key);
         }
         let let_go = rows
             .iter()
