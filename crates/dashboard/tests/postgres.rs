@@ -2012,3 +2012,55 @@ fn a_rewrite_and_a_fill_each_leave_their_record_once_in_postgres() {
         assert_eq!(pair[1].was, pair[0].became, "the chain holds");
     }
 }
+
+/// Review-core-3b C (decisions/031): a delegation past its expiry is no
+/// longer live whether or not the sweep has run. A revocation or a renewal
+/// landing after its expiry, before any sweep, first records the lapse,
+/// valid when it expired, under the same lock.
+#[test]
+fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first() {
+    use delegation::record::ChangeKind;
+    let (_url, database) = migrated("lapse_first");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let expires = T0 + DAY_NS;
+    let revoked = store
+        .grant(&granting("mdc_a", Covers::everything(), expires), T0)
+        .unwrap();
+    let renewed = store
+        .grant(&granting("mdc_b", Covers::everything(), expires), T0)
+        .unwrap();
+    assert!(store
+        .revoke(&revoked.id, "local|ada", "done", expires + 1)
+        .unwrap());
+    let again = store
+        .grant(
+            &granting("mdc_b", Covers::everything(), expires + 30 * DAY_NS),
+            expires + 1,
+        )
+        .unwrap();
+    assert_eq!(again.id, renewed.id, "renewed in place");
+    store.sweep(expires + 2).unwrap();
+    for (id, last) in [
+        (&revoked.id, ChangeKind::Revoked),
+        (&renewed.id, ChangeKind::Renewed),
+    ] {
+        let records = store.changes(id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (ChangeKind::Made, T0, Some(T0)),
+                (ChangeKind::Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}

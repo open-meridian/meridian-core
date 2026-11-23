@@ -1157,3 +1157,65 @@ async fn a_delegation_past_its_expiry_is_recorded_lapsed_once_in_memory_too() {
     );
     assert_eq!(records[1].was, records[0].became);
 }
+
+/// Review-core-3b C: a revocation or a renewal after the expiry, before any
+/// sweep, records the lapse first, valid when it expired: as the Postgres
+/// store does it.
+#[tokio::test]
+async fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    let expires = T0 + DAY_NS;
+    let mut made = Vec::new();
+    for id in ["mdc_a", "mdc_b"] {
+        store
+            .register(
+                &Client {
+                    client_id: id.into(),
+                    name: id.into(),
+                    redirect_uris: vec![BACK.into()],
+                    software_id: String::new(),
+                    registered_at_ns: T0,
+                    consented: false,
+                },
+                10,
+            )
+            .unwrap();
+        let grant = Grant {
+            subject: "local|ada".into(),
+            display_name: "Ada Park".into(),
+            client_id: id.into(),
+            covers: Covers::everything(),
+            directory_groups: vec![],
+            expires_at_ns: expires,
+        };
+        made.push((grant.clone(), store.grant(&grant, T0).unwrap()));
+    }
+    assert!(store
+        .revoke(&made[0].1.id, "local|ada", "done", expires + 1)
+        .unwrap());
+    let renewal = Grant {
+        expires_at_ns: expires + 30 * DAY_NS,
+        ..made[1].0.clone()
+    };
+    store.grant(&renewal, expires + 1).unwrap();
+    store.sweep(expires + 2).unwrap();
+    for ((_, delegation), last) in made.iter().zip([Revoked, Renewed]) {
+        let records = store.changes(&delegation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (Made, T0, Some(T0)),
+                (Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}

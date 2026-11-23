@@ -129,6 +129,20 @@ fn same_rows(held: &Covers, read: &Covers) -> bool {
     held.plugins == read.plugins && held.unmatched == read.unmatched
 }
 
+/// Before a change to `standing` at `now_ns`: where it is past its expiry,
+/// unrevoked, and its lapse not yet recorded (the sweep not yet run), the
+/// lapse, valid when it expired, first (review-core-3b C).
+fn lapse_first(changes: &mut Vec<DelegationChange>, standing: &Delegation, now_ns: i64) {
+    let recorded = changes.iter().any(|c| {
+        c.delegation_id == standing.id
+            && c.kind == ChangeKind::Lapsed
+            && c.valid_at_ns == Some(standing.expires_at_ns)
+    });
+    if standing.revoked.is_none() && standing.expires_at_ns < now_ns && !recorded {
+        changes.push(lapsed(standing, now_ns));
+    }
+}
+
 fn order(delegations: &mut [Delegation], now_ns: i64) {
     delegations.sort_by(|a, b| {
         b.live(now_ns)
@@ -171,6 +185,7 @@ impl Kept {
                     why: why.to_string(),
                 });
                 let after = delegation.clone();
+                lapse_first(&mut self.changes, &before, now_ns);
                 self.changes.push(change(
                     ChangeKind::Revoked,
                     Some(&before),
@@ -257,6 +272,7 @@ impl DelegationStore for InMemory {
                 delegation.groups_read_at_ns = now_ns;
                 delegation.acting_backfilled_at_ns = None;
                 let after = delegation.clone();
+                lapse_first(&mut kept.changes, &before, now_ns);
                 kept.changes.push(change(
                     ChangeKind::Renewed,
                     Some(&before),
@@ -823,6 +839,34 @@ impl InPostgres {
         Ok(())
     }
 
+    /// Before a change to `standing`, held in `tx` and caught up, at
+    /// `now_ns`: where it is past its expiry, unrevoked, and its lapse not
+    /// yet recorded, the lapse, valid when it expired, first (review-core-3b
+    /// C): a revocation or a renewal after the expiry, before any sweep, and
+    /// the sweep itself.
+    fn lapsed_first(
+        tx: &mut postgres::Transaction<'_>,
+        standing: &Delegation,
+        now_ns: i64,
+    ) -> Result<(), String> {
+        if standing.revoked.is_some() || standing.expires_at_ns >= now_ns {
+            return Ok(());
+        }
+        let recorded: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM dashboard_delegation_change
+                                 WHERE delegation_id = $1 AND kind = 'lapsed'
+                                   AND valid_at_ns = $2)",
+                &[&standing.id, &standing.expires_at_ns],
+            )
+            .map_err(said)?
+            .get(0);
+        if !recorded {
+            record(tx, &lapsed(standing, now_ns))?;
+        }
+        Ok(())
+    }
+
     /// One delegation, its row held until the transaction ends, so the
     /// record of a change to it says what it was.
     fn held(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Option<Delegation>, String> {
@@ -862,6 +906,7 @@ impl InPostgres {
         .map_err(said)?;
         let after = Self::find(tx, id)?.ok_or("the delegation just revoked is gone")?;
         Self::caught_up(tx, &before, now_ns)?;
+        Self::lapsed_first(tx, &before, now_ns)?;
         record(
             tx,
             &change(
@@ -1054,6 +1099,7 @@ impl DelegationStore for InPostgres {
         let kind = match &before {
             Some(before) => {
                 Self::caught_up(&mut tx, before, now_ns)?;
+                Self::lapsed_first(&mut tx, before, now_ns)?;
                 ChangeKind::Renewed
             }
             None => ChangeKind::Made,
