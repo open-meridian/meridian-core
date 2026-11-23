@@ -3749,9 +3749,17 @@ fn a_migrations_backfilled_records_are_in_the_change_log() {
          VALUES ('UG-1', 'Admins', '{admins}', '{ada}')",
     )
     .unwrap();
+    let before = meridian_config::postgres::CHANGES
+        .snapshot(&mut db)
+        .unwrap();
 
     let store = PostgresStore::connect(&url, 2).unwrap();
     store.migrate(&At(1_000)).unwrap();
+    // A replay of the log from where the release before stood equals the
+    // tables after migrating (review-core-3b E).
+    meridian_config::postgres::CHANGES
+        .check_follows(&mut db, &before)
+        .unwrap();
     let recorded: i64 = db
         .query_one("SELECT count(*) FROM config_group_change", &[])
         .unwrap()

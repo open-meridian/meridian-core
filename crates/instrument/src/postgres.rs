@@ -87,6 +87,12 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0017_writer_took_over.sql"),
 ];
 
+/// The schema's files, in the order `migrate` applies them: for a test
+/// that stands a store where the release before left it.
+pub fn schema_files() -> &'static [&'static str] {
+    SCHEMA
+}
+
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
@@ -331,9 +337,15 @@ impl PostgresStore {
         meridian_changes::take_schema_lock(&mut *conn, SCHEMA_LOCK, lock_waits)
             .map_err(unavailable)?;
 
+        // Each table a file made captured before anything after writes to
+        // it, where the log is installed (review-core-3b E, as the
+        // configuration store's).
         let created = SCHEMA
             .iter()
-            .try_for_each(|file| conn.batch_execute(file).map_err(unavailable))
+            .try_for_each(|file| {
+                conn.batch_execute(file).map_err(unavailable)?;
+                CHANGES.capture_new_tables(&mut *conn).map_err(unavailable)
+            })
             .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable))
             .and_then(|()| Self::classes_to_the_enum(&mut conn))
             .and_then(|()| Self::sources_from_before_v10(&mut conn));

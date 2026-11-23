@@ -933,11 +933,19 @@ impl Spec {
         Ok(keys)
     }
 
-    /// What the captured tables hold now, as a [`State`].
+    /// What the captured tables hold now, as a [`State`]: none of a table
+    /// the schema does not hold yet (a store a release before left, whose
+    /// next migration makes it).
     pub fn state(&self, client: &mut impl GenericClient) -> Result<State, postgres::Error> {
         let keys = self.keys(client)?;
         let mut state = State::new();
         for table in self.tables {
+            let held: bool = client
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])?
+                .get(0);
+            if !held {
+                continue;
+            }
             for row in client.query(&format!("SELECT to_jsonb(t)::text FROM {table} t"), &[])? {
                 let row: String = row.get(0);
                 // Through jsonb's own text, as the log keeps it.

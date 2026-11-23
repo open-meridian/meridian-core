@@ -2735,6 +2735,10 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         // repeats.
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
+        // A table it made captured before anything after writes to it, where
+        // the log is installed (review-core-3b E, as the configuration
+        // store's).
+        CHANGES.capture_new_tables(&mut tx).map_err(unavailable)?;
         migrations::record(&mut tx, migration, clock.now_ns())?;
         tx.commit().map_err(unavailable)?;
     }

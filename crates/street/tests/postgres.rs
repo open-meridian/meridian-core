@@ -2416,3 +2416,31 @@ fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() 
     assert_eq!(page.changes.last().map(|c| c.epoch), Some(2));
     assert_eq!(page.epoch, 2);
 }
+
+/// Review-core-3b E: on a store whose log the release before installed, a
+/// replay of the log from where it stood equals the captured tables once
+/// this release has migrated: every row a migration writes is in the log.
+#[test]
+fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
+    use meridian_street::migrations::{record, HISTORY, MIGRATIONS};
+    use meridian_street::postgres::CHANGES;
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let url = Scratch::schema(
+        &url,
+        &unique("street_logged").replace('-', "_").to_lowercase(),
+    );
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client.batch_execute(HISTORY).unwrap();
+    let last = MIGRATIONS.last().unwrap().version;
+    for migration in MIGRATIONS.iter().filter(|m| m.version < last) {
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    CHANGES.install(&mut client).unwrap();
+    let before = CHANGES.snapshot(&mut client).unwrap();
+    let store = PostgresStore::connect(&url, 2).unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    CHANGES.check_follows(&mut client, &before).unwrap();
+}
