@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use super::record::{
-    backfilled, change, owed_before_change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN,
+    backfilled, change, lapsed, owed_before_change, ChangeKind, ACTING_FILLED, REMOVED, REWRITTEN,
 };
 use super::{
     Client, Covers, Delegation, DelegationChange, Grant, Kind, Revoked, Token, ToolCall,
@@ -504,6 +504,24 @@ impl DelegationStore for InMemory {
                 .unwrap_or(d.expires_at_ns)
                 .min(d.expires_at_ns)
         };
+        // Each one past its expiry, unrevoked, recorded lapsed once.
+        let mut lapsing: Vec<Delegation> = kept
+            .delegations
+            .values()
+            .filter(|d| d.revoked.is_none() && d.expires_at_ns < now_ns)
+            .filter(|d| {
+                !kept.changes.iter().any(|c| {
+                    c.delegation_id == d.id
+                        && c.kind == ChangeKind::Lapsed
+                        && c.valid_at_ns == Some(d.expires_at_ns)
+                })
+            })
+            .cloned()
+            .collect();
+        lapsing.sort_by(|a, b| a.id.cmp(&b.id));
+        for delegation in &lapsing {
+            kept.changes.push(lapsed(delegation, now_ns));
+        }
         let mut removed: Vec<Delegation> = kept
             .delegations
             .values()
@@ -1364,6 +1382,41 @@ impl DelegationStore for InPostgres {
         // while the upgrade ran -- given those its row holds the facts of.
         let mut tx = conn.transaction().map_err(said)?;
         backfill_from_rows(&mut tx, now_ns)?;
+        // Each one past its expiry, unrevoked, recorded lapsed once (by its
+        // expiry: a renewal since lapses again), held and read again first.
+        const NOT_LAPSED: &str = "NOT EXISTS (SELECT 1 FROM dashboard_delegation_change r
+                                     WHERE r.delegation_id = d.delegation_id
+                                       AND r.kind = 'lapsed'
+                                       AND r.valid_at_ns = d.expires_at_ns)";
+        let lapsing = tx
+            .query(
+                &format!(
+                    "SELECT {DELEGATION_COLUMNS} FROM dashboard_delegation d
+                       JOIN dashboard_oauth_client c USING (client_id)
+                      WHERE d.revoked_at_ns IS NULL AND d.expires_at_ns < $1 AND {NOT_LAPSED}
+                      ORDER BY d.delegation_id
+                        FOR UPDATE OF d"
+                ),
+                &[&now_ns],
+            )
+            .map_err(said)?;
+        for row in &lapsing {
+            let delegation = delegation_of(row);
+            let still: bool = tx
+                .query_one(
+                    &format!(
+                        "SELECT {NOT_LAPSED} FROM (SELECT $1::text AS delegation_id,
+                                                          $2::bigint AS expires_at_ns) d"
+                    ),
+                    &[&delegation.id, &delegation.expires_at_ns],
+                )
+                .map_err(said)?
+                .get(0);
+            if still {
+                Self::caught_up(&mut tx, &delegation, now_ns)?;
+                record(&mut tx, &lapsed(&delegation, now_ns))?;
+            }
+        }
         let ended = tx
             .query(
                 &format!(

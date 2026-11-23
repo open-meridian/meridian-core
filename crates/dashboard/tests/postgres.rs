@@ -1791,3 +1791,79 @@ fn a_stale_rewrite_after_a_renewal_keeps_the_renewals_rows() {
         "no rewritten record"
     );
 }
+
+/// Interpretations check, miss 1 (decisions/031 names "lapsed"): a
+/// delegation past its expiry, unrevoked, is recorded lapsed by the sweep,
+/// once, valid when it expired; renewed after, it lapses again at its new
+/// expiry; one revoked first never lapses.
+#[test]
+fn a_delegation_past_its_expiry_is_recorded_lapsed_once() {
+    use delegation::record::{ChangeKind, LAPSED};
+    let (_url, database) = migrated("lapsed");
+    let store = delegation::InPostgres::on(database);
+    store.register(&client("mdc_a", T0), 10).unwrap();
+    store.register(&client("mdc_b", T0), 10).unwrap();
+    let expires = T0 + DAY_NS;
+    let made = store
+        .grant(&granting("mdc_a", Covers::everything(), expires), T0)
+        .unwrap();
+    let revoked = store
+        .grant(&granting("mdc_b", Covers::everything(), expires), T0)
+        .unwrap();
+    assert!(store
+        .revoke(&revoked.id, "local|ada", "done", T0 + 1)
+        .unwrap());
+    store.sweep(expires).unwrap();
+    assert_eq!(store.changes(&made.id).unwrap().len(), 1, "not past it yet");
+    store.sweep(expires + 1).unwrap();
+    store.sweep(expires + 2).unwrap();
+    let records = store.changes(&made.id).unwrap();
+    let seen: Vec<_> = records
+        .iter()
+        .map(|r| (r.kind, r.by.as_str(), r.at_ns, r.valid_at_ns))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (ChangeKind::Made, "local|ada", T0, Some(T0)),
+            (ChangeKind::Lapsed, "", expires + 1, Some(expires)),
+        ]
+    );
+    assert_eq!(records[1].note, LAPSED);
+    assert_eq!(records[1].was, records[0].became, "the chain holds");
+    assert_eq!(
+        records[1].became, records[1].was,
+        "the row itself unchanged"
+    );
+
+    let again = expires + 10 * DAY_NS;
+    store
+        .grant(&granting("mdc_a", Covers::everything(), again), expires + 3)
+        .unwrap();
+    store.sweep(again + 1).unwrap();
+    store.sweep(again + 2).unwrap();
+    assert_eq!(
+        store
+            .changes(&made.id)
+            .unwrap()
+            .iter()
+            .map(|r| (r.kind, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [
+            (ChangeKind::Made, Some(T0)),
+            (ChangeKind::Lapsed, Some(expires)),
+            (ChangeKind::Renewed, Some(expires + 3)),
+            (ChangeKind::Lapsed, Some(again)),
+        ]
+    );
+    assert_eq!(
+        store
+            .changes(&revoked.id)
+            .unwrap()
+            .iter()
+            .map(|r| r.kind)
+            .collect::<Vec<_>>(),
+        [ChangeKind::Made, ChangeKind::Revoked],
+        "a delegation revoked first never lapses"
+    );
+}

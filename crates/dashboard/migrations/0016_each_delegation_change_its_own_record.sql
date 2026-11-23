@@ -5,7 +5,8 @@
 -- covers and its dates in place, a revocation marks it, and the sweep
 -- removes it a month after it ended. From here each of those -- made,
 -- renewed, revoked, its rows rewritten or its tools filled in by an
--- upgrade, removed -- is also a row here, written in the transaction that
+-- upgrade, lapsed at its expiry (found by the sweep, once, valid when it
+-- expired), removed -- is also a row here, written in the transaction that
 -- made the change: what it was, what it became (the dates a renewal
 -- replaced among them), who made it, when it was made and when it was
 -- recorded. No key names the delegation row, so the records outlive it; the
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS dashboard_delegation_change (
     subject       text      NOT NULL,
     client_id     text      NOT NULL,
     kind          text      NOT NULL CHECK (kind IN ('made', 'renewed', 'revoked', 'rewritten',
-                                                     'acting_filled', 'removed',
+                                                     'acting_filled', 'lapsed', 'removed',
                                                      'changed_by_an_earlier_release')),
     was           text      NOT NULL DEFAULT '',
     became        text      NOT NULL DEFAULT '',
@@ -60,3 +61,7 @@ CREATE INDEX IF NOT EXISTS dashboard_delegation_change_by_delegation
 -- A delegation's records backfilled once.
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_backfill_once
     ON dashboard_delegation_change (delegation_id) WHERE backfilled AND kind = 'made';
+
+-- A delegation lapses once at each expiry.
+CREATE UNIQUE INDEX IF NOT EXISTS dashboard_delegation_change_lapsed_once
+    ON dashboard_delegation_change (delegation_id, valid_at_ns) WHERE kind = 'lapsed';

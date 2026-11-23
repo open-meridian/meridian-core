@@ -36,6 +36,9 @@ pub enum ChangeKind {
     /// Its consented tools filled in once from what it reached (contract
     /// v18).
     ActingFilled,
+    /// Lapsed at its expiry, unrevoked: found by the sweep, valid when it
+    /// expired.
+    Lapsed,
     /// Removed from the list a month after it ended.
     Removed,
     /// Found changed since its last record, by a copy of the release before
@@ -53,6 +56,7 @@ impl ChangeKind {
             ChangeKind::Revoked => "revoked",
             ChangeKind::Rewritten => "rewritten",
             ChangeKind::ActingFilled => "acting_filled",
+            ChangeKind::Lapsed => "lapsed",
             ChangeKind::Removed => "removed",
             ChangeKind::ChangedByAnEarlierRelease => "changed_by_an_earlier_release",
         }
@@ -65,6 +69,7 @@ impl ChangeKind {
             ChangeKind::Revoked,
             ChangeKind::Rewritten,
             ChangeKind::ActingFilled,
+            ChangeKind::Lapsed,
             ChangeKind::Removed,
             ChangeKind::ChangedByAnEarlierRelease,
         ]
@@ -110,6 +115,27 @@ pub const REWRITTEN: &str = "the one-time rewrite at contract v15, no person: ea
 /// What a fill's record says (contract v18).
 pub const ACTING_FILLED: &str = "filled in once, no person: a delegation narrowed before \
      contract v18 given the tools that change something it reached when first evaluated";
+
+/// What a lapse's record says (decisions/031 names it).
+pub const LAPSED: &str = "lapsed at its expiry, no person: found by the sweep, valid when it \
+     expired; what it covered is unchanged, and it is no longer live";
+
+/// The record of a delegation lapsing at its expiry, found by the sweep at
+/// `at_ns`: valid when it expired, by no person, the delegation itself
+/// unchanged.
+pub fn lapsed(delegation: &Delegation, at_ns: i64) -> DelegationChange {
+    DelegationChange {
+        valid_at_ns: Some(delegation.expires_at_ns),
+        ..change(
+            ChangeKind::Lapsed,
+            Some(delegation),
+            Some(delegation),
+            "",
+            at_ns,
+            LAPSED,
+        )
+    }
+}
 
 /// What a removal's record says.
 pub const REMOVED: &str = "removed from the list by the sweep, no person: it ended more than \

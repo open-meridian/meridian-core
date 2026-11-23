@@ -1109,3 +1109,51 @@ fn the_rows_as_kept_read_back_whichever_shape_they_were_written_in() {
         BTreeSet::from([("oms-1".into(), "admin".into())])
     );
 }
+
+/// A delegation past its expiry, unrevoked, is recorded lapsed by the sweep
+/// once, valid when it expired: as the Postgres store does it.
+#[tokio::test]
+async fn a_delegation_past_its_expiry_is_recorded_lapsed_once_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    store
+        .register(
+            &Client {
+                client_id: "mdc_a".into(),
+                name: "client a".into(),
+                redirect_uris: vec![BACK.into()],
+                software_id: String::new(),
+                registered_at_ns: T0,
+                consented: false,
+            },
+            10,
+        )
+        .unwrap();
+    let made = store
+        .grant(
+            &Grant {
+                subject: "local|ada".into(),
+                display_name: "Ada Park".into(),
+                client_id: "mdc_a".into(),
+                covers: Covers::everything(),
+                directory_groups: vec![],
+                expires_at_ns: T0 + DAY_NS,
+            },
+            T0,
+        )
+        .unwrap();
+    store.sweep(T0 + DAY_NS + 1).unwrap();
+    store.sweep(T0 + DAY_NS + 2).unwrap();
+    let records = store.changes(&made.id).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+            .collect::<Vec<_>>(),
+        [
+            (Made, T0, Some(T0)),
+            (Lapsed, T0 + DAY_NS + 1, Some(T0 + DAY_NS))
+        ]
+    );
+    assert_eq!(records[1].was, records[0].became);
+}
