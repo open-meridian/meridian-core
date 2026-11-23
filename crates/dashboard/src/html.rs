@@ -367,12 +367,11 @@ fieldset.access-editor .pager .button{padding-left:.6rem;padding-right:.6rem}\
 ul.plugins{list-style:none;margin:1.25rem 0 0;padding:0}\
 ul.plugins.list{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow)}\
 ul.plugins.list li+li{border-top:1px solid var(--line-soft)}\
-ul.plugins.list li.list-row{display:block;padding:0;min-height:0;border-bottom:0}\
+ul.plugins li.list-row{display:block;padding:0;min-height:0;border-bottom:0}\
 form.complete .fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.35rem 1rem;align-items:end}\
 form.complete .fields>label{margin:0}form.complete .fields>label.check{grid-column:1/-1}\
 @media (max-width:40rem){form.complete .fields{grid-template-columns:repeat(2,minmax(0,1fr));gap:.3rem .6rem}}\
 .plugin-card{display:flex;align-items:center;gap:.9rem;padding:.85rem 1.1rem;color:var(--ink);min-width:0}\
-a.plugin-card:hover{background:var(--hover);text-decoration:none}\
 ul.plugins.list li:first-child .plugin-card{border-radius:var(--radius-lg) var(--radius-lg) 0 0}\
 ul.plugins.list li:last-child .plugin-card{border-radius:0 0 var(--radius-lg) var(--radius-lg)}\
 ul.plugins.list li:only-child .plugin-card{border-radius:var(--radius-lg)}\
@@ -380,26 +379,29 @@ ul.plugins.list li:only-child .plugin-card{border-radius:var(--radius-lg)}\
 background:var(--accent-wash);color:var(--accent);font-weight:700;font-size:1.05rem;text-transform:uppercase}\
 .plugin-text{display:flex;flex-direction:column;min-width:0;flex:1 1 auto}\
 .plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
-.plugin-instance{font:.8rem var(--mono);color:var(--ink-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
-.plugin-sub{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-sub .badge{flex:none;margin:0}\
+.plugin-instance{font:.8rem var(--mono);color:var(--ink-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;\
+flex:0 100 auto;min-width:0}\
+.plugin-sub{display:flex;align-items:center;gap:.45rem;min-width:0}\
+.plugin-badges{display:flex;align-items:center;gap:.35rem;min-width:0}\
+.plugin-badges .badge{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}\
+.badge[data-status]{flex:none}\
 .names-narrow{display:none}@media (max-width:40rem){.names-wide{display:none}.names-narrow{display:inline}}\
-.plugin-meta{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
-.plugin-open{color:var(--accent);font-weight:550;white-space:nowrap}\
-.plugin-card:not(a) .plugin-open{color:var(--ink-faint);font-weight:400}\
+.plugin-open{color:var(--ink-faint);white-space:nowrap}\
 .plugin-main{display:flex;align-items:center;gap:.9rem;min-width:0;flex:1 1 auto;color:inherit}\
-.plugin-levels{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
+.plugin-levels{display:flex;gap:.35rem;flex:none;justify-content:flex-end}\
 a.plugin-level{padding:.28rem .7rem;border:1px solid var(--line-strong);border-radius:var(--radius);\
 font-size:.86rem;font-weight:550;color:var(--accent);background:var(--card);white-space:nowrap}\
 a.plugin-level:hover{text-decoration:none;background:var(--accent-wash);border-color:var(--accent)}\
-ul.plugins.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:.9rem}\
-ul.plugins.tiles .plugin-card{flex-direction:column;align-items:flex-start;gap:.75rem;height:100%;padding:1.1rem;\
+.plugins.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));grid-auto-rows:1fr;gap:.9rem}\
+.plugins.tiles .plugin-card{flex-direction:column;align-items:stretch;gap:.75rem;height:100%;padding:1.1rem;\
 background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow)}\
-ul.plugins.tiles a.plugin-card:hover{border-color:var(--accent);background:var(--card)}\
-ul.plugins.tiles .plugin-icon{width:48px;height:48px;font-size:1.3rem}\
-ul.plugins.tiles .plugin-text{flex:0 0 auto;width:100%}ul.plugins.tiles .plugin-meta{justify-content:flex-start}\
-ul.plugins.tiles .plugin-open{margin-top:auto}\
-@media (max-width:30rem){.plugin-card .plugin-meta{display:none}ul.plugins.tiles{grid-template-columns:1fr 1fr;gap:.6rem}\
-ul.plugins.tiles .plugin-card{padding:.85rem}}\
+.plugins.tiles .plugin-icon{width:48px;height:48px;font-size:1.3rem}\
+.plugins.tiles .plugin-main{align-items:flex-start}\
+.plugins.tiles .plugin-sub{flex-wrap:wrap;row-gap:.35rem}.plugins.tiles .plugin-instance{flex:1 1 100%}\
+.plugins.tiles .plugin-badges{flex:1 1 100%;flex-wrap:wrap}\
+.plugins.tiles :is(.plugin-levels,.plugin-open){margin-top:auto;justify-content:flex-start}\
+@media (max-width:30rem){.plugins.tiles{grid-template-columns:repeat(2,minmax(0,1fr));gap:.6rem}\
+.plugins.tiles .plugin-main{flex-direction:column;gap:.6rem}.plugins.tiles .plugin-main>.plugin-text{align-self:stretch}}\
 .view-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,22rem);gap:1.25rem;align-items:start}\
 .view-grid>*+*{margin-top:0!important}.view-grid .stack>*+*{margin-top:1.25rem}\
 @media (max-width:60rem){.view-grid{grid-template-columns:minmax(0,1fr)}}\
