@@ -567,7 +567,6 @@ async fn serve_the_home_for_a_browser() {
                 venue_account_type: "Individual".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         },
     );
     let kit = crate::kit::Kit::at(
