@@ -45,6 +45,26 @@ BEGIN
 END
 $$;
 
+-- When a prepared change settled, kept as written once set. Its trigger is
+-- made before any change table's, so this takes the prepared change's table
+-- first and a change table after, as the runtime does (a settle holds the
+-- prepared change's row, then adds its step): with the release before
+-- still serving, the two never deadlock (review-core-3c N1).
+CREATE OR REPLACE FUNCTION dashboard_settled_once() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.settled_at_ns IS NOT NULL AND NEW.settled_at_ns IS DISTINCT FROM OLD.settled_at_ns THEN
+        RAISE EXCEPTION 'a prepared change settles once: when it settled is kept as written'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS dashboard_settled_once ON dashboard_prepared_call;
+CREATE TRIGGER dashboard_settled_once BEFORE UPDATE ON dashboard_prepared_call
+    FOR EACH ROW EXECUTE FUNCTION dashboard_settled_once();
+
 DO $$
 DECLARE
     kept text;
@@ -60,18 +80,3 @@ BEGIN
     END LOOP;
 END
 $$;
-
-CREATE OR REPLACE FUNCTION dashboard_settled_once() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF OLD.settled_at_ns IS NOT NULL AND NEW.settled_at_ns IS DISTINCT FROM OLD.settled_at_ns THEN
-        RAISE EXCEPTION 'a prepared change settles once: when it settled is kept as written'
-            USING ERRCODE = 'insufficient_privilege';
-    END IF;
-    RETURN NEW;
-END
-$$;
-
-DROP TRIGGER IF EXISTS dashboard_settled_once ON dashboard_prepared_call;
-CREATE TRIGGER dashboard_settled_once BEFORE UPDATE ON dashboard_prepared_call
-    FOR EACH ROW EXECUTE FUNCTION dashboard_settled_once();

@@ -2207,3 +2207,108 @@ fn the_sweep_and_another_holder_in_id_order_never_deadlock() {
         [ChangeKind::Made, ChangeKind::Revoked, ChangeKind::Removed]
     );
 }
+
+/// Review-core-3c N1: migration 17 runs while the release before still
+/// serves. Its settle holds a prepared change's row and then adds its step;
+/// the migration takes the prepared change's table before any change
+/// table, in the runtime's order, so the two never deadlock: here a settle
+/// holds the row as the migration starts, and both finish.
+#[test]
+fn migration_17_and_a_settle_of_the_release_before_never_deadlock() {
+    let url = scratch("settle_while_migrating");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // The store as the release before left it: at 16.
+    raw.batch_execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
+             version bigint PRIMARY KEY, name text NOT NULL, applied_at_ns bigint NOT NULL)",
+    )
+    .unwrap();
+    for (version, name, sql) in meridian_dashboard::database::migrations() {
+        if version > 16 {
+            continue;
+        }
+        raw.batch_execute(sql).unwrap();
+        raw.execute(
+            "INSERT INTO dashboard_schema_migration VALUES ($1, $2, 1)",
+            &[&version, &name],
+        )
+        .unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    raw.execute(
+        "INSERT INTO dashboard_prepared_call
+             (prepared_call_id, tool_name, arguments_json, preparer_subject, state, prepared_at_ns)
+         VALUES ('PC-PENDING', 'dashboard__set_hold', '{}', 'local|ada', 1, $1)",
+        &[&now],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+         VALUES ('PC-PENDING', 1, $1)",
+        &[&now],
+    )
+    .unwrap();
+
+    // The release before settles it: the row first (transition).
+    let mut settling = raw.transaction().unwrap();
+    settling
+        .batch_execute("SET LOCAL lock_timeout = '20s'")
+        .unwrap();
+    settling
+        .execute(
+            "UPDATE dashboard_prepared_call SET state = 4, settled_at_ns = $1
+              WHERE prepared_call_id = 'PC-PENDING' AND state = 1",
+            &[&now],
+        )
+        .unwrap();
+    let mine: i32 = settling
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let migrating = {
+        let database = Database::connect(&url, 2).expect("connects");
+        std::thread::spawn(move || database.migrate(&meridian_clock::SystemClock))
+    };
+    // Until the migration waits on the settle.
+    let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = watch
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&mine],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the migration never waited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Then its step, as transition writes it.
+    settling
+        .execute(
+            "INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-PENDING', 4, $1)",
+            &[&now],
+        )
+        .expect("the settle is not deadlocked");
+    settling.commit().unwrap();
+    migrating
+        .join()
+        .unwrap()
+        .expect("the migration is not deadlocked");
+    let at: i64 = raw
+        .query_one("SELECT max(version) FROM dashboard_schema_migration", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(at, 17);
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 2);
+}

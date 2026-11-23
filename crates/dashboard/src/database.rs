@@ -322,20 +322,56 @@ fn apply(conn: &mut Connection, clock: &dyn crate::Clock) -> Result<(), String> 
         if at.is_some_and(|at| at >= migration.version) {
             continue;
         }
-        let mut tx = conn.transaction().map_err(said)?;
-        tx.batch_execute(migration.sql).map_err(said)?;
-        if let Some(then) = migration.then {
-            then(&mut tx, clock.now_ns())?;
+        // Where the release before still serves, each try waits at most a
+        // few seconds for a table's lock, and is rolled back and tried again,
+        // as the change log's install does: a deadlock with its writers, or
+        // their writes queued behind this one's wait, lasts no longer than
+        // that (review-core-3c N1).
+        let mut tries = 0u32;
+        loop {
+            let mut tx = conn.transaction().map_err(said)?;
+            let made = tx
+                .batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAITS_AT_MOST}'"))
+                .and_then(|()| tx.batch_execute(migration.sql))
+                .and_then(|()| tx.batch_execute("SET LOCAL lock_timeout TO DEFAULT"));
+            match made {
+                Ok(()) => {}
+                Err(failed) if tries < TRIES && contended(&failed) => {
+                    drop(tx);
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(tries)));
+                    continue;
+                }
+                Err(failed) => return Err(said(failed)),
+            }
+            if let Some(then) = migration.then {
+                then(&mut tx, clock.now_ns())?;
+            }
+            tx.execute(
+                "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
+                 VALUES ($1, $2, $3)",
+                &[&migration.version, &migration.name, &clock.now_ns()],
+            )
+            .map_err(said)?;
+            tx.commit().map_err(said)?;
+            break;
         }
-        tx.execute(
-            "INSERT INTO dashboard_schema_migration (version, name, applied_at_ns)
-             VALUES ($1, $2, $3)",
-            &[&migration.version, &migration.name, &clock.now_ns()],
-        )
-        .map_err(said)?;
-        tx.commit().map_err(said)?;
     }
     Ok(())
+}
+
+/// How long a migration's statements wait for a table's lock before the try
+/// is rolled back, and how many times it is tried: as the change log's
+/// install (meridian_changes::captured::Spec::install).
+const LOCK_WAITS_AT_MOST: &str = "3s";
+const TRIES: u32 = 30;
+
+/// A try that met its writers: a deadlock, or a lock not had in time.
+fn contended(failed: &postgres::Error) -> bool {
+    failed.code().is_some_and(|code| {
+        *code == postgres::error::SqlState::T_R_DEADLOCK_DETECTED
+            || *code == postgres::error::SqlState::LOCK_NOT_AVAILABLE
+    })
 }
 
 fn applied(conn: &mut Connection) -> Result<Option<i64>, String> {
