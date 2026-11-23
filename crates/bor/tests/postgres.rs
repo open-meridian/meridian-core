@@ -8337,6 +8337,144 @@ async fn m12_a_partition_the_size_ci_moves_switches_between_databases_inside_a_s
     blocking(move || drop(h));
 }
 
+/// A read naming an account, made through a member whose view of the
+/// writer groups was read before its partition moved to another group's
+/// database and not since, is answered where the partition is written now
+/// (step 3d; sections 5 and 6.4; merge-queue run 45104369464, Elle: a read
+/// 250 ms after two acknowledged appends answered without them, just after
+/// its partition moved from database 0 to database 1). A reader reads the
+/// writer groups at its start and every few seconds; its `read_after` is
+/// held to every database's heads, so it passed on the target's, while the
+/// read went by the view to the source, whose head is the move's pointer
+/// and whose copy closed at the switch. Read here as CI's was: after the
+/// switch and before the source let its accounts go, which a move does
+/// next, and the sweep where that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_naming_an_account_follows_its_partition_past_a_stale_view_of_its_owner() {
+    use meridian_bor::order_service::*;
+    use meridian_bor::postgres::Switched;
+    use meridian_bor::store::OrdersRead;
+    use meridian_changes::groups::Groups;
+    let h = blocking(two_databases);
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    // Group 0's, in database 0, as CI's P0 was.
+    let partition = partition_of(0, 1);
+    let account = accounts_in("ACC-STALE", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    // Group 1's writer has written in its own database: a move to it waits
+    // for that.
+    accounts_in(
+        "ACC-STALE-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    let propose = |n: u32| ProposeOrderRequest {
+        account_id: account.clone(),
+        instrument_id: "INS-AAPL".into(),
+        sleeve: "core".into(),
+        side: Side::Buy as i32,
+        quantity: d("1"),
+        order_type: OrderType::Limit as i32,
+        limit_price: usd("227.50"),
+        time_in_force: TimeInForce::Day as i32,
+        idempotency_key: unique(&format!("stale-{n}")),
+        ..Default::default()
+    };
+    send_order(&h.zero.0, PROPOSE_ORDER, &propose(0), Some(PERSON), None)
+        .await
+        .unwrap();
+    // A reader member: its own view of the writer groups, read once.
+    let (reader, view) = blocking(|| {
+        let groups = Groups::new(0, 2).unwrap();
+        let stores: Vec<Arc<PostgresStore>> = h
+            .urls
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    PostgresStore::connect(url, 2)
+                        .unwrap()
+                        .with_groups(groups)
+                        .with_partitions(8),
+                )
+            })
+            .collect();
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let spread = Arc::new(meridian_bor::spread::Spread::new(stores, groups));
+        let reader = meridian_bor::reader::ReaderStore::new(
+            spread.clone(),
+            None,
+            1 << 20,
+            Arc::new(meridian_bor::store::Mark::new),
+        );
+        (reader, spread)
+    });
+    let read = OrdersRead {
+        scope: Scope::Everything,
+        account_id: account.clone(),
+        since: None,
+        limit: 100,
+        cursor: String::new(),
+        execution_state: 0,
+    };
+    let orders = |reader: &meridian_bor::reader::ReaderStore| {
+        meridian_bus::read_after::begin_read();
+        Store::orders(reader, &read).unwrap().orders.len()
+    };
+    // Read where its owner's home is, database 0, from here on.
+    assert_eq!(blocking(|| orders(&reader)), 1);
+    assert_eq!(view.of(&partition), 0);
+    // A move's warm and switch, as the mover makes them; the source's
+    // accounts not let go yet.
+    let switched = blocking(|| {
+        let (source, to) = (h.zero.1.database(0), h.zero.1.database(1));
+        let warmed = to.copy_partition_from(source, &partition, 0).unwrap();
+        source.switch_partition(
+            to,
+            &partition,
+            1,
+            std::time::Duration::from_secs(10),
+            false,
+            warmed,
+        )
+    });
+    assert!(
+        matches!(switched, Ok(Switched::Moved { .. })),
+        "{switched:?}"
+    );
+    send_order(&h.one.0, PROPOSE_ORDER, &propose(1), Some(PERSON), None)
+        .await
+        .unwrap();
+    blocking(|| {
+        // What the read names: the head its order was committed at, in
+        // database 1, past the source's close.
+        let written = h.one.1.database(1).tip(&partition).unwrap().unwrap();
+        assert_eq!(written.writer_group, Some(1));
+        let closed = h.one.1.database(0).tip(&partition).unwrap().unwrap();
+        assert_eq!(closed.epoch, meridian_changes::moves::POINTER);
+        assert!(written.head > closed.head, "{written:?} {closed:?}");
+        // The reader's `read_after` passes: every database's heads.
+        assert!(Store::heads(view.as_ref()).unwrap()[&partition] >= written.head);
+        // Its view of the owner is not read again by any timer here.
+        assert_eq!(
+            orders(&reader),
+            2,
+            "a read after the order was acknowledged answered without it"
+        );
+        assert_eq!(view.of(&partition), 1);
+        let journal = Store::journal(view.as_ref(), &account).unwrap();
+        assert_eq!(
+            journal.last().map(|entry| entry.last_sequence),
+            Some(written.head),
+            "its journal, to the head it is written at"
+        );
+    });
+    blocking(move || drop((reader, view, h)));
+}
+
 /// A write that finds its partition between two databases -- its source
 /// let go, its target not yet opened -- longer than its caller waits is
 /// answered OVERLOADED with a retry-after while the caller still waits
