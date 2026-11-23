@@ -7,7 +7,8 @@
 //! starting, ones with a setting-up step open, one stopped and one never
 //! launched -- each status Settings › Plugins draws -- behind a stand-in conductor and lake
 //! answering the access records, the catalogue's launches and the datasets
-//! listing the home reads.
+//! listing the home reads. snaptrade-1 is Working with an account it
+//! reported that nothing links: a row with something in Needs you.
 //!
 //! Ignored in the ordinary run: it serves until it is stopped. Two people
 //! are signed in, a deployment admin and a member reading four; the
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessRecords, DatasetEntitlement, DatasetLiveness, DatasetRef,
-    KnownPluginRoles, ListDatasetsReply, Permission, PluginCatalogue, PluginLaunch,
+    ExternalAccount, ExternalAccountsEvent, KnownPluginRoles, ListDatasetsReply, Permission, PluginCatalogue, PluginLaunch,
     PluginLaunchState, PluginReport, PluginSettingValue, PluginSettingsRecord, SignInRecord,
     UserGroup,
 };
@@ -554,6 +555,21 @@ async fn serve_the_home_for_a_browser() {
             hear();
         }
     });
+    // An account snaptrade-1 reported that nothing links: Working, and
+    // something in Needs you (`tr.attention`).
+    let custody: Arc<crate::custody::Custody> = Arc::default();
+    custody.hear_accounts(
+        "snaptrade-1",
+        ExternalAccountsEvent {
+            accounts: vec![ExternalAccount {
+                external_account_id: "SNAP-1".into(),
+                name: "Individual Brokerage 1234".into(),
+                venue_account_type: "Individual".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
     let kit = crate::kit::Kit::at(
         std::env::var("MERIDIAN_UI_DIR").unwrap_or_else(|_| crate::kit::IN_IMAGE.into()),
     )
@@ -595,7 +611,7 @@ async fn serve_the_home_for_a_browser() {
             .unwrap(),
         )),
         registry: None,
-        custody: Arc::default(),
+        custody,
         health,
         kit: Some(Arc::new(kit)),
         bounds: Arc::default(),
