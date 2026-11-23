@@ -266,6 +266,17 @@ fn open_ranges(client: &mut impl GenericClient, dataset: &str) -> Result<Vec<cra
 /// move's switch holds it (step 3d; section 6.8), skipped where one does:
 /// with the group each names and whether `tx` holds it. Under the
 /// dataset's lock, so the ranges stand still.
+///
+/// The group, the head and the epoch are the taken row's own (`l`), never
+/// the statement's snapshot's (`p`): a switch takes the row alone, not the
+/// dataset's lock, and one that commits between this statement's snapshot
+/// and its take leaves the snapshot naming the group the range was, on a
+/// row taken that names the other. Read from the snapshot, the batch went
+/// on as the range's owner to the head's epoch check, and its write was
+/// refused as fenced by a newer writer where it is the other group's to
+/// commit (main's ha range-move flake: "this writer's 2, the partition's
+/// 1"). A row not taken is held by a switch, and its parts wait whatever
+/// it names.
 #[allow(clippy::type_complexity)]
 fn open_ranges_taken(
     client: &mut impl GenericClient,
@@ -276,10 +287,11 @@ fn open_ranges_taken(
 )> {
     let rows = client
         .query(
-            "SELECT p.dataset, p.lo, p.hi, p.writer_group, l.taken IS NOT NULL, p.head,
-                    p.epoch = $2
+            "SELECT p.dataset, p.lo, p.hi, l.writer_group, l.taken IS NOT NULL,
+                    coalesce(l.head, p.head), coalesce(l.epoch = $2, false)
                FROM lake_partition p
-               LEFT JOIN LATERAL (SELECT true AS taken FROM lake_partition q
+               LEFT JOIN LATERAL (SELECT true AS taken, q.writer_group, q.head, q.epoch
+                                    FROM lake_partition q
                                    WHERE q.dataset = p.dataset
                                      FOR UPDATE SKIP LOCKED) AS l ON true
               WHERE (p.dataset = $1 OR starts_with(p.dataset, $1 || '/'))
