@@ -1445,9 +1445,13 @@ fn a_record_read_answers_from_one_snapshot_and_says_its_heads() {
 /// Review-core-3b E: on a store whose log the release before installed, a
 /// replay of the log from where it stood equals the captured tables once
 /// this release has migrated: every row a migration writes is in the log.
+/// Review-core-3c N5: the release's own files make no captured table after
+/// the log's, so two of the test's own follow: one makes a captured table
+/// (here instrument_licence_list, missing as the log was installed), the
+/// next fills it, as the store applies its files.
 #[test]
 fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
-    use meridian_instrument::postgres::{schema_files, CHANGES};
+    use meridian_instrument::postgres::{apply_schema, schema_files, CHANGES};
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
     let url = Scratch::schema(&url, &unique("ins_logged").replace('-', "_").to_lowercase());
     let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
@@ -1459,5 +1463,26 @@ fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
     let before = CHANGES.snapshot(&mut client).unwrap();
     let store = PostgresStore::connect(&url, 2).unwrap();
     store.migrate(&meridian_clock::SystemClock).unwrap();
+    CHANGES.check_follows(&mut client, &before).unwrap();
+
+    // A captured table missing as the log was installed, then made by one
+    // file and filled by the next.
+    client
+        .batch_execute("DROP TABLE instrument_licence_list")
+        .unwrap();
+    CHANGES.install(&mut client).unwrap();
+    let before = CHANGES.snapshot(&mut client).unwrap();
+    apply_schema(
+        &mut client,
+        &[
+            "CREATE TABLE IF NOT EXISTS instrument_licence_list (
+                 version    bigint PRIMARY KEY,
+                 record     bytea  NOT NULL,
+                 kept_at_ns bigint NOT NULL)",
+            "INSERT INTO instrument_licence_list VALUES (1, '\\x00', 1)",
+        ],
+    )
+    .unwrap();
+    CHANGES.install(&mut client).unwrap();
     CHANGES.check_follows(&mut client, &before).unwrap();
 }

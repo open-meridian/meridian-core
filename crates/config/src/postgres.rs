@@ -3666,7 +3666,10 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         let mut tx = conn.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
         // A table it made captured before it writes rows of its own, so a
-        // backfill is in the change log (review-core-3 8).
+        // backfill is in the change log (review-core-3 8). Not rows its SQL
+        // writes into a table that SQL also makes: those escape the log, so
+        // a migration that makes a captured table and fills it fills it in
+        // its `then`, or in a migration after it (review-core-3c N5).
         CHANGES.capture_new_tables(&mut tx).map_err(unavailable)?;
         let at_ns = clock.now_ns();
         if let Some(then) = migration.then {

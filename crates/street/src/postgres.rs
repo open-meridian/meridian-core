@@ -2724,7 +2724,22 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
     adopt_existing_schema(conn, clock)?;
 
     let applied = applied_version(conn)?;
-    for migration in migrations::MIGRATIONS {
+    apply_each(conn, migrations::MIGRATIONS, applied, clock)
+}
+
+/// Each migration of `migrations` after `applied`, in its own transaction
+/// with the row recording it. A table one makes is captured before anything
+/// after it writes rows (review-core-3b E), where the log is installed. Not
+/// rows the same file writes into a table it also makes: those escape the
+/// log, so a migration that makes a captured table and fills it is two
+/// files. Public for a test that runs migrations of its own this way.
+pub fn apply_each(
+    client: &mut postgres::Client,
+    migrations: &[migrations::Migration],
+    applied: Option<i64>,
+    clock: &dyn meridian_clock::Clock,
+) -> Result<()> {
+    for migration in migrations {
         if applied.is_some_and(|at| at >= migration.version) {
             continue;
         }
@@ -2733,11 +2748,8 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         // part way leaves everything before it applied and recorded, and the
         // one that failed neither, so running again resumes rather than
         // repeats.
-        let mut tx = conn.transaction().map_err(unavailable)?;
+        let mut tx = client.transaction().map_err(unavailable)?;
         tx.batch_execute(migration.sql).map_err(unavailable)?;
-        // A table it made captured before anything after writes to it, where
-        // the log is installed (review-core-3b E, as the configuration
-        // store's).
         CHANGES.capture_new_tables(&mut tx).map_err(unavailable)?;
         migrations::record(&mut tx, migration, clock.now_ns())?;
         tx.commit().map_err(unavailable)?;

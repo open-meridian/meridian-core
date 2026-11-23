@@ -2420,10 +2420,14 @@ fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() 
 /// Review-core-3b E: on a store whose log the release before installed, a
 /// replay of the log from where it stood equals the captured tables once
 /// this release has migrated: every row a migration writes is in the log.
+/// Review-core-3c N5: the release's own migrations make no captured table
+/// after the log's, so two of the test's own follow: one makes a captured
+/// table (here street_cash_instrument, missing as the log was installed),
+/// the next fills it, through the store's own migration loop.
 #[test]
 fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
-    use meridian_street::migrations::{record, HISTORY, MIGRATIONS};
-    use meridian_street::postgres::CHANGES;
+    use meridian_street::migrations::{record, Migration, HISTORY, MIGRATIONS};
+    use meridian_street::postgres::{apply_each, CHANGES};
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
     let url = Scratch::schema(
         &url,
@@ -2442,5 +2446,33 @@ fn a_migration_on_a_logged_store_leaves_its_rows_in_the_log() {
     let before = CHANGES.snapshot(&mut client).unwrap();
     let store = PostgresStore::connect(&url, 2).unwrap();
     store.migrate(&meridian_clock::SystemClock).unwrap();
+    CHANGES.check_follows(&mut client, &before).unwrap();
+
+    // A captured table missing as the log was installed, then made by one
+    // migration and filled by the next.
+    client
+        .batch_execute("DROP TABLE street_cash_instrument")
+        .unwrap();
+    CHANGES.install(&mut client).unwrap();
+    let before = CHANGES.snapshot(&mut client).unwrap();
+    let ours = [
+        Migration {
+            version: 1001,
+            name: "makes_a_captured_table",
+            sql: "CREATE TABLE IF NOT EXISTS street_cash_instrument (
+                      currency_code  text    PRIMARY KEY CHECK (currency_code ~ '^[A-Z]{3}$'),
+                      instrument_id  text    NOT NULL CHECK (instrument_id <> ''),
+                      resolved_at_ns bigint  NOT NULL,
+                      backfilled     boolean NOT NULL)",
+        },
+        Migration {
+            version: 1002,
+            name: "fills_it",
+            sql: "INSERT INTO street_cash_instrument
+                  VALUES ('USD', 'INS-01JAD000000000000000000001', 1, true)",
+        },
+    ];
+    apply_each(&mut client, &ours, Some(last), &meridian_clock::SystemClock).unwrap();
+    CHANGES.install(&mut client).unwrap();
     CHANGES.check_follows(&mut client, &before).unwrap();
 }
