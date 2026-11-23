@@ -517,11 +517,14 @@ impl Spread {
         // groups: by its heads, not the view, for this read alone.
         let partition = self.partition_or_first(account_id);
         let routed = self.follow_owner(&partition)?;
+        // And the partition its row names, where that is another: placed
+        // there since this member last found it (the review of 2026-11-23
+        // of this routing, finding 6).
         let of = |named: &str| {
             if named == partition {
-                routed
+                Ok(routed)
             } else {
-                self.of(named)
+                self.follow_owner(named)
             }
         };
         let mut store = self.held_from(account_id, self.database(routed));
@@ -541,7 +544,7 @@ impl Spread {
             let now = match store.account_row(account_id) {
                 Err(_) => return Ok(answer),
                 Ok(Some(named)) => {
-                    let placed = self.database(of(&named));
+                    let placed = self.database(of(&named)?);
                     if Arc::ptr_eq(placed, store)
                         || !matches!(placed.account_row(account_id), Ok(Some(_)))
                     {

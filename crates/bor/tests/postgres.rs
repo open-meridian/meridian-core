@@ -9083,6 +9083,96 @@ async fn a_writers_held_book_is_dropped_when_its_partition_is_first_named_an_own
     blocking(move || drop((writer, stores, h)));
 }
 
+/// A read that finds its account in another partition than this member
+/// last found it in follows that partition by its heads too (the review of
+/// 2026-11-23 of this routing, finding 6). An account moved to another
+/// partition, and that partition then moved to another group's database,
+/// both since this member last looked: the read went by the placement it
+/// held to the account's old partition's database, which still holds the
+/// account's row -- its new partition's source, not let go yet -- and that
+/// row's partition was then routed by the view, to the same database: the
+/// copy the move closed, answered without what was written after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_follows_the_partition_its_account_went_to_past_a_stale_view_of_its_owner() {
+    use meridian_bor::decide::Context;
+    use meridian_bor::moves::move_account_with;
+    use meridian_changes::groups::Groups;
+    use meridian_changes::moves::Settings;
+    use meridian_domain::v1::MoveAccountRequest;
+    let h = blocking(two_databases);
+    let (first, second) = (partition_of(0, 0), partition_of(0, 1));
+    assert_ne!(first, second);
+    let account = accounts_in("ACC-WENT", &first, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in("ACC-WENT-TWO", &second, 1, &h.zero.0, h.zero.1.as_ref()).await;
+    accounts_in(
+        "ACC-WENT-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    // A reader member: its view of the writer groups read once, and the
+    // account found in its first partition.
+    let (view, groups) = blocking(|| {
+        let groups = Groups::new(0, 2).unwrap();
+        let stores = reading(&h.urls, groups);
+        PostgresStore::read_owners_from(&stores).unwrap();
+        let view = meridian_bor::spread::Spread::new(stores, groups);
+        assert_eq!(Store::book(&view, &account).unwrap().entries.len(), 1);
+        assert_eq!(Store::partition_of(&view, &account), Some(first.clone()));
+        (view, groups)
+    });
+    // The account to its second partition, group 0's too, in database 0.
+    let moved = blocking(|| {
+        move_account_with(
+            &h.zero.0,
+            h.zero.1.as_ref(),
+            &Context {
+                acting_for: PERSON.into(),
+                received_at_ns: 5_000,
+                message_id: unique("msg-went"),
+                ..Default::default()
+            },
+            &MoveAccountRequest {
+                account_id: account.clone(),
+                target_partition: second.clone(),
+                reason: "to its second partition".into(),
+            },
+            &Settings::default(),
+        )
+    })
+    .unwrap();
+    assert_eq!(moved.to_partition, second, "{moved:?}");
+    // That partition to group 1's database, its source's accounts not let
+    // go; and a write there.
+    blocking(|| switched_to_one(&h, &second));
+    write_once(&h.one.0, &account, 1).await.unwrap();
+    blocking(|| {
+        let written = Store::book(h.one.1.as_ref(), &account)
+            .unwrap()
+            .entries
+            .len();
+        let closed = Store::book(&**h.zero.1.database(0), &account)
+            .unwrap()
+            .entries
+            .len();
+        assert!(written > closed, "{written} against {closed}");
+        // The reader's placement of it and its view, both from before.
+        assert_eq!(Store::partition_of(&view, &account), Some(first.clone()));
+        assert_eq!(groups.owner(&second), 0);
+        assert_eq!(
+            Store::book(&view, &account).unwrap().entries.len(),
+            written,
+            "a read after the write was acknowledged answered from the copy its partition's move closed"
+        );
+        assert_eq!(groups.owner(&second), 0, "the view, as it was");
+    });
+    blocking(move || drop((view, h)));
+}
+
 /// A write that finds its partition between two databases -- its source
 /// let go, its target not yet opened -- longer than its caller waits is
 /// answered OVERLOADED with a retry-after while the caller still waits
