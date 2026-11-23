@@ -919,21 +919,69 @@ fn latest_of_each<'a>(
         partitions_of(client, &[dataset.to_string()])?
     };
     let found = if from_latest {
-        client.query(
-            "SELECT k.data_type, k.row_key, r.body, l.anchor
-               FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
-              CROSS JOIN LATERAL (
-                    SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
-                     WHERE row_key = k.row_key AND (dataset || '') = $1
-                       AND data_type = k.data_type
-                     LIMIT 1) AS l
-              CROSS JOIN LATERAL (
-                    SELECT body FROM lake_row
-                     WHERE partition = l.partition AND valid_from_ns = l.valid_from_ns
-                       AND dataset = $1 AND sequence = l.sequence AND row_key = k.row_key
-                     LIMIT 1) AS r",
-            &[&dataset, &types, &keys],
-        )
+        // In two statements, both under the dataset's lock (v31a.17, the
+        // lake's lock budget): where each key's latest version is, then
+        // its row, the ranges and valid times found named to the second as
+        // values. Named only by the first's rows, in one statement, no
+        // month was ruled out before it ran, and it locked every month
+        // table of every dataset the lake keeps -- 14 relations each, held
+        // until the batch committed -- to read one row a key.
+        let at = client
+            .query(
+                "SELECT k.data_type, k.row_key, l.partition, l.sequence, l.valid_from_ns, l.anchor
+                   FROM unnest($2::smallint[], $3::text[]) AS k(data_type, row_key)
+                  CROSS JOIN LATERAL (
+                        SELECT partition, sequence, valid_from_ns, anchor FROM lake_latest
+                         WHERE row_key = k.row_key AND (dataset || '') = $1
+                           AND data_type = k.data_type
+                         LIMIT 1) AS l",
+                &[&dataset, &types, &keys],
+            )
+            .map_err(unavailable)?;
+        if at.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let column = |n: usize| at.iter().map(|row| row.get::<_, i64>(n)).collect::<Vec<i64>>();
+            let (types, keys): (Vec<i16>, Vec<String>) =
+                at
+                .iter()
+                .map(|row| (row.get::<_, i16>(0), row.get::<_, String>(1)))
+                .unzip();
+            let (ranges, anchors): (Vec<String>, Vec<i32>) =
+                at
+                .iter()
+                .map(|row| (row.get::<_, String>(2), row.get::<_, i32>(5)))
+                .unzip();
+            let (sequences, valid) = (column(3), column(4));
+            let in_ranges: Vec<String> = ranges
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let at_times: Vec<i64> = valid
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            client.query(
+                "SELECT k.data_type, k.row_key, r.body, k.anchor
+                   FROM unnest($2::smallint[], $3::text[], $4::text[], $5::bigint[], $6::bigint[],
+                               $7::integer[])
+                        AS k(data_type, row_key, partition, sequence, valid_from_ns, anchor)
+                  CROSS JOIN LATERAL (
+                        SELECT body FROM lake_row
+                         WHERE partition = k.partition AND valid_from_ns = k.valid_from_ns
+                           AND partition = ANY($8::text[]) AND valid_from_ns = ANY($9::bigint[])
+                           AND dataset = $1 AND sequence = k.sequence AND row_key = k.row_key
+                         LIMIT 1) AS r",
+                &[
+                    &dataset, &types, &keys, &ranges, &sequences, &valid, &anchors, &in_ranges,
+                    &at_times,
+                ],
+            )
+        }
     } else {
         client.query(
             "SELECT k.data_type, k.row_key, r.body, r.anchor
