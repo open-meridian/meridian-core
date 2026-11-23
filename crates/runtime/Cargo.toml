@@ -103,9 +103,8 @@ meridian-changes = { path = "../changes", features = ["scratch"] }
 prost.workspace = true
 # The lease's election over a simulated network, in virtual time, with
 # links cut and held on a seeded schedule (ruling 1105).
-turmoil = "0.6"
-# turmoil's network seeded per run, so a seed is the same run every time.
-rand = { version = "0.8", features = ["small_rng"] }
+# 0.7 seeds the network and tokio's scheduler from one seed (`rng_seed`).
+turmoil = "0.7.2"
 # Signing a deployment admin's assertion, as the dashboard does, and reading
 # the plugin's scope stream, in the wiring test.
 ed25519-dalek.workspace = true

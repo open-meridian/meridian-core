@@ -1,0 +1,23 @@
+[package]
+name = "meridian-sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Simulation models of the failover protocols, for the architecture review (item 102, layer A): test-only"
+
+# Nothing. The models are protocol models: small state machines of today's
+# design and the review's candidates, run as turmoil hosts against fakes of
+# their own. They read no production crate, and nothing reads them; every
+# line is compiled only for this crate's own tests (src/lib.rs).
+[dependencies]
+
+[dev-dependencies]
+# The harness (ruling 1105; the simulation plan of 2026-11-19, section 2):
+# hosts on one current-thread runtime each, in virtual time, crashed and
+# bounced on a seeded schedule; 0.7 seeds tokio's own scheduler with the
+# world's seed, so task order within a host is part of the seed too. The
+# barriers suspend a model at a named point for the directed cases.
+turmoil = { version = "0.7.2", features = ["unstable-barriers"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
