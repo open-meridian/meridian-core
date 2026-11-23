@@ -2623,3 +2623,75 @@ fn a_removal_by_the_release_before_after_the_first_ask_is_given_by_the_next() {
         [(ChangeKind::Made, false), (ChangeKind::Removed, true)]
     );
 }
+
+/// Rows a store left long ago -- prepared changes settled long since -- put
+/// in as the tables' owner may, migration 17's `dashboard_settled_once` set
+/// aside while they go in (review-core-3d F6: it refuses them otherwise).
+fn settled_long_ago(raw: &mut postgres::Client, rows: &str) {
+    raw.batch_execute(&format!(
+        "BEGIN;
+         ALTER TABLE dashboard_prepared_call DISABLE TRIGGER dashboard_settled_once;
+         {rows}
+         ALTER TABLE dashboard_prepared_call ENABLE TRIGGER dashboard_settled_once;
+         COMMIT;"
+    ))
+    .unwrap();
+}
+
+/// The database's own time, as migration 17's guard reads it.
+fn database_now_ns(raw: &mut postgres::Client) -> i64 {
+    raw.query_one(
+        "SELECT (extract(epoch FROM statement_timestamp()) * 1000000000)::bigint",
+        &[],
+    )
+    .unwrap()
+    .get(0)
+}
+
+/// Review-core-3d F3: the prepared sweep picks only what migration 17's
+/// guard lets go -- settled 90 days before the deployment's time and the
+/// database's both -- so a deployment clock ahead of the database's never
+/// has a step refused and the whole sweep rolled back. One settled 90 days
+/// before the deployment's time but not the database's is left for a later
+/// sweep; the older is swept.
+#[test]
+fn the_prepared_sweep_takes_only_what_the_database_lets_go() {
+    use meridian_dashboard::prepared::store::PreparedStore as _;
+    let (url, database) = migrated("sweep_clock_ahead");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let kept = meridian_dashboard::prepared::KEPT_AFTER_SETTLING_NS;
+    let now = database_now_ns(&mut raw);
+    let old = now - kept - DAY_NS;
+    let edge = now - kept + 30_000_000_000;
+    settled_long_ago(
+        &mut raw,
+        &format!(
+            "INSERT INTO dashboard_prepared_call
+                 (prepared_call_id, tool_name, arguments_json, preparer_subject, state,
+                  prepared_at_ns, settled_at_ns)
+             VALUES ('PC-OLD', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {old}),
+                    ('PC-EDGE', 'dashboard__set_hold', '{{}}', 'local|ada', 4, 1, {edge});
+             INSERT INTO dashboard_prepared_call_change (prepared_call_id, kind, at_ns)
+             VALUES ('PC-OLD', 4, {old}), ('PC-EDGE', 4, {edge});"
+        ),
+    );
+    let prepared = meridian_dashboard::prepared::store::InPostgres::on(database);
+    // The deployment's clock a minute ahead of the database's.
+    assert_eq!(
+        prepared
+            .sweep(now - kept + 60_000_000_000)
+            .expect("swept, not refused"),
+        1
+    );
+    let left: Vec<String> = raw
+        .query(
+            "SELECT prepared_call_id FROM dashboard_prepared_call ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(left, ["PC-EDGE"]);
+    assert_eq!(count(&url, "dashboard_prepared_call_change"), 1);
+}

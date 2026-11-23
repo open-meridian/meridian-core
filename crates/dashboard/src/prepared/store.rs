@@ -790,11 +790,19 @@ impl PreparedStore for InPostgres {
             &[&(before_ns + super::KEPT_AFTER_SETTLING_NS).to_string()],
         )
         .map_err(said)?;
+        // And only what that guard lets go: settled before `before_ns` and
+        // kept its 90 days by the database's own time too, as the guard
+        // counts them, so a deployment clock ahead of the database's never
+        // has a step refused and the whole sweep rolled back; the rest is
+        // the next sweep's (review-core-3d F3). The guard reads its time at
+        // each statement after this one, never earlier.
         let gone: Vec<String> = tx
             .query(
                 "SELECT prepared_call_id FROM dashboard_prepared_call
-                  WHERE settled_at_ns IS NOT NULL AND settled_at_ns < $1",
-                &[&before_ns],
+                  WHERE settled_at_ns IS NOT NULL
+                    AND settled_at_ns < least($1,
+                            (extract(epoch FROM statement_timestamp()) * 1000000000)::bigint - $2)",
+                &[&before_ns, &super::KEPT_AFTER_SETTLING_NS],
             )
             .map_err(said)?
             .iter()
