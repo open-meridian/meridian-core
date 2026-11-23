@@ -14904,6 +14904,14 @@ fn a_statement_holds_its_own_months_locks_beside_a_long_history() {
     }
 }
 
+/// A range's months' lock, as `leaves.rs` takes it to make one.
+fn months_lock(partition: &str) -> i64 {
+    let digest = meridian_changes::integrity::digest(partition.as_bytes());
+    i64::from_be_bytes([
+        0x6c, 0x61, 0x6b, 0x66, digest[0], digest[1], digest[2], digest[3],
+    ])
+}
+
 /// The lake's lock budget (v31a.17; the review's F1): a transaction makes
 /// at most eight months whatever its datasets and ranges, not eight a
 /// range. One write-ahead batch of 20 datasets, each with one row in a
@@ -15067,5 +15075,65 @@ fn a_write_ahead_batch_is_refused_past_eight_months_made_across_its_datasets() {
             .map(|part| part.as_ref().map(|part| part.restated).ok())
             .collect::<Vec<_>>(),
         vec![Some(6), Some(6)]
+    );
+}
+
+/// The review's F4 (v31a.17): months made before a batch are made a range
+/// a transaction, so their making holds one range's months' lock at a
+/// time. Holding two, taken in the locks' own order, it waited on the
+/// second while a session holding that one -- a batch making its ranges'
+/// months in its ranges' order -- waited on the first: a deadlock, one of
+/// the two ended by the database.
+///
+/// Here another session holds the greater of two ranges' locks; a batch of
+/// ten months across both ranges makes them first and waits on it; the
+/// session then takes the lesser. Both are given, and the batch recorded.
+#[test]
+fn months_made_before_a_batch_hold_one_ranges_lock_at_a_time() {
+    let (url, setup) = isolated("onerange");
+    let store = named_store(&url, "llb_onerange");
+    let dataset = unique("onerange");
+    let (low, high) = halves_of("LCL-ONERANGE");
+    setup
+        .record(&dataset, vec![trade(&dataset, "first", &low, 10)], 1_000)
+        .unwrap();
+    setup
+        .split_partition(&dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    let mut locks = [
+        months_lock(&format!("{dataset}/0000-7fff")),
+        months_lock(&format!("{dataset}/8000-ffff")),
+    ];
+    locks.sort_unstable();
+    let [lesser, greater] = locks;
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut other = raw.transaction().unwrap();
+    other
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&greater])
+        .unwrap();
+    let month_ns = 2_629_800_i64 * 1_000_000_000;
+    let rows: Vec<Observation> = (0..10)
+        .map(|m| {
+            let subject = if m % 2 == 0 { &low } else { &high };
+            trade(&dataset, &format!("k{m}"), subject, (300 + m) * month_ns)
+        })
+        .collect();
+    let writing = {
+        let dataset = dataset.clone();
+        std::thread::spawn(move || store.record(&dataset, rows, 1_200))
+    };
+    let mut beside = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    locks_held_waiting(&mut beside, "llb_onerange");
+    let taken = other.execute("SELECT pg_advisory_xact_lock($1)", &[&lesser]);
+    assert!(
+        taken.is_ok(),
+        "the session holding one range's lock was not given the other's: {taken:?}"
+    );
+    other.commit().unwrap();
+    let done = writing.join().unwrap();
+    assert_eq!(
+        done.as_ref().map(|done| done.recorded).ok(),
+        Some(10),
+        "{done:?}"
     );
 }

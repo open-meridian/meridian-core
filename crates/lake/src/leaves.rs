@@ -33,7 +33,7 @@
 //!
 //! | Statement of `lake_row` (`postgres.rs`) | Statements | Class | Locks |
 //! |---|---|---|---|
-//! | months made before the rows (`make_months`: write, move, legacy conversion) | by function | bounded | eight a transaction, about 19 each |
+//! | months made before the rows (`make_months`: write, move, legacy conversion) | by function | bounded | eight a transaction, of one range, about 19 each |
 //! | months made in a batch's own transaction (`leaves_for`) | by function | bounded | eight a transaction across its ranges and datasets; refused past that, and they are made before it is taken again |
 //! | rows per dataset on retention's timer (`rows_in_force`) | none | latest | the catalogue's, 2 |
 //! | a batch's keys' latest versions (`latest_of_each`, every key held) | 1 | latest | 14 a month those versions are in |
@@ -310,23 +310,29 @@ pub fn months_missing(
     Ok(missing)
 }
 
-/// Make each of `needed`'s month tables not yet made, at most
-/// [`MONTHS_A_TRANSACTION`] a transaction of `client`'s own, each
-/// committed before the next begins: `client` is in no transaction, and
-/// holds no lock from one month's making while it makes the next eight. A
-/// month another made meanwhile -- a release before this one, making it in
-/// its batch's transaction during a rolling upgrade -- is found made under
-/// its range's lock and left. Answers how many it made.
+/// Make each of `needed`'s month tables not yet made, in transactions of
+/// `client`'s own, each committed before the next begins: `client` is in
+/// no transaction, and holds no lock from one's making while it makes the
+/// next. Each transaction makes at most [`MONTHS_A_TRANSACTION`] months,
+/// of one range: it holds that range's months' lock and no other's, so it
+/// never waits on a second range's while holding a first's, as a batch
+/// making its own ranges' months in its own order would wait on it. A
+/// month another made meanwhile -- a release before this one, making it
+/// in its batch's transaction during a rolling upgrade -- is found made
+/// under its range's lock and left. Answers how many it made.
 pub fn make_months(
     client: &mut impl GenericClient,
     needed: &BTreeSet<(String, Month)>,
 ) -> Result<usize, postgres::Error> {
+    // In each range's order, the ranges in theirs.
     let missing: Vec<(String, Month)> = months_missing(client, needed)?.into_iter().collect();
     let mut made = 0;
-    for some in missing.chunks(MONTHS_A_TRANSACTION) {
-        let mut tx = client.transaction()?;
-        made += ensure_months(&mut tx, &some.iter().cloned().collect())?;
-        tx.commit()?;
+    for of_one in missing.chunk_by(|a, b| a.0 == b.0) {
+        for some in of_one.chunks(MONTHS_A_TRANSACTION) {
+            let mut tx = client.transaction()?;
+            made += ensure_months(&mut tx, &some.iter().cloned().collect())?;
+            tx.commit()?;
+        }
     }
     Ok(made)
 }
