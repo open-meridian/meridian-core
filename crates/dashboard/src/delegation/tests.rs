@@ -1219,3 +1219,70 @@ async fn a_revocation_or_a_renewal_after_the_expiry_records_the_lapse_first_in_m
         }
     }
 }
+
+/// Review-core-3c N6: the one-time rewrite and the fill of a delegation's
+/// tools, landing after its expiry before any sweep, record the lapse
+/// first, valid when it expired: as the Postgres store does it.
+#[tokio::test]
+async fn a_rewrite_or_a_fill_after_the_expiry_records_the_lapse_first_in_memory_too() {
+    use super::record::ChangeKind::*;
+    let store = InMemory::default();
+    let expires = T0 + DAY_NS;
+    let old_rows = Covers {
+        unmatched: [("oms-1".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    let mut made = Vec::new();
+    for id in ["mdc_a", "mdc_b"] {
+        store
+            .register(
+                &Client {
+                    client_id: id.into(),
+                    name: id.into(),
+                    redirect_uris: vec![BACK.into()],
+                    software_id: String::new(),
+                    registered_at_ns: T0,
+                    consented: false,
+                },
+                10,
+            )
+            .unwrap();
+        let grant = Grant {
+            subject: "local|ada".into(),
+            display_name: "Ada Park".into(),
+            client_id: id.into(),
+            covers: old_rows.clone(),
+            directory_groups: vec![],
+            expires_at_ns: expires,
+        };
+        made.push(store.grant(&grant, T0).unwrap());
+    }
+    let rewritten = Covers {
+        plugins: [("oms-1".to_string(), "oms".to_string(), "read".to_string())].into(),
+        ..Covers::default()
+    };
+    assert!(store
+        .rewrite(&made[0].id, &made[0].covers, &rewritten, expires + 1)
+        .unwrap());
+    store
+        .backfill_acting(&made[1].id, &["place_order".to_string()], expires + 1)
+        .unwrap();
+    for (delegation, last) in made.iter().zip([Rewritten, ActingFilled]) {
+        let records = store.changes(&delegation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind, r.at_ns, r.valid_at_ns))
+                .collect::<Vec<_>>(),
+            [
+                (Made, T0, Some(T0)),
+                (Lapsed, expires + 1, Some(expires)),
+                (last, expires + 1, Some(expires + 1)),
+            ],
+            "{last:?}"
+        );
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].was, pair[0].became, "the chain holds");
+        }
+    }
+}

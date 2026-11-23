@@ -426,6 +426,7 @@ impl DelegationStore for InMemory {
                 delegation.covers.acting = Some(acting.iter().cloned().collect());
                 delegation.acting_backfilled_at_ns = Some(now_ns);
                 let after = delegation.clone();
+                lapse_first(&mut kept.changes, &before, now_ns);
                 kept.changes.push(change(
                     ChangeKind::ActingFilled,
                     Some(&before),
@@ -480,6 +481,7 @@ impl DelegationStore for InMemory {
             delegation.covers.unmatched = covers.unmatched.clone();
             let after = delegation.clone();
             if before != after {
+                lapse_first(&mut kept.changes, &before, now_ns);
                 kept.changes.push(change(
                     ChangeKind::Rewritten,
                     Some(&before),
@@ -1301,6 +1303,9 @@ impl DelegationStore for InPostgres {
             let after = Self::find(&mut tx, id)?.ok_or("the delegation just filled is gone")?;
             if let Some(before) = &before {
                 Self::caught_up(&mut tx, before, now_ns)?;
+                // Past its expiry and its lapse not recorded: the lapse
+                // first (review-core-3c N6).
+                Self::lapsed_first(&mut tx, before, now_ns)?;
             }
             record(
                 &mut tx,
@@ -1391,6 +1396,7 @@ impl DelegationStore for InPostgres {
         let rewrote = after != before;
         if rewrote {
             Self::caught_up(&mut tx, &before, now_ns)?;
+            Self::lapsed_first(&mut tx, &before, now_ns)?;
             record(
                 &mut tx,
                 &change(
