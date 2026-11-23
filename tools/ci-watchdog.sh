@@ -10,7 +10,9 @@
 # show it, to a file outside the job's log, which the next steps print and
 # upload before anything else is uploaded:
 #
-#   ci-watchdog.sh start <file>   start the sampler, detached, and return
+#   ci-watchdog.sh start <file>   start the sampler, detached, and return;
+#                                 a notice names the runner's image, kernel
+#                                 and host
 #   ci-watchdog.sh tail <file>    the file's last 40 lines
 #   ci-watchdog.sh make-tail <make-log> <out>
 #                                 the make's last 200 lines and the e2e's
@@ -277,6 +279,10 @@ check_api() { echo "${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPO
 
 case $cmd in
   start)
+    # Which runner this is, as an annotation, which arrives when the job's
+    # log does not: the runs that died since 2026-11-17 came from two image
+    # versions, and their kernel and host were never known.
+    echo "::notice title=the runner::image ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r 2>/dev/null || echo '?'), host $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
     mkdir -p "$(dirname "$file")"
     # Made by this user, so the upload after it can read what root appends.
     : >"$file"
