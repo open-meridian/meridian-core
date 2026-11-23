@@ -23,6 +23,9 @@ use crate::web::{router, SESSION_COOKIE};
 /// A plugin's Settings pages served for a real browser (make e2e-settings-page).
 mod served;
 
+/// The home page served for a real browser, both its views.
+mod home_served;
+
 struct At(i64);
 impl Clock for At {
     fn now_ns(&self) -> i64 {
@@ -319,10 +322,10 @@ async fn the_dashboard_lists_and_links_no_external_accounts_and_counts_them() {
     assert!(!body.contains("/admin/links"));
     let listed = table(&body, "plugins");
     assert!(
-        listed.contains(&format!(
-            "<a href=\"{VIEW}\">2 external accounts not linked</a>"
-        )),
-        "{listed}"
+        listed.contains("class=\"attention\"")
+            && listed.contains("<span title=\"2 external accounts not linked\">2 external accounts not linked</span>")
+            && listed.contains(&format!("data-href=\"{VIEW}\"")),
+        "in Needs you, the row marked and opening the view: {listed}"
     );
 
     // Nor does it take a link any more: nothing reaches the conductor.
@@ -1716,11 +1719,10 @@ async fn the_view_shows_the_plugins_health_who_has_access_and_its_unlinked_accou
     // The same flag on the overview, leading to the view (W6.10).
     let (_, overview) = send(&h, get(&h, "/admin", true)).await;
     let listed = table(&overview, "plugins");
-    assert!(listed.contains("Not healthy"));
+    assert!(listed.contains("<om-status badge"), "{listed}");
     assert!(
-        listed.contains(&format!(
-            "<a href=\"{VIEW}\">5 external accounts not linked</a>"
-        )),
+        listed.contains("5 external accounts not linked")
+            && listed.contains(&format!("href=\"{VIEW}\"")),
         "{listed}"
     );
 }
@@ -1915,12 +1917,17 @@ async fn a_health_badge_carries_its_detail_as_its_note() {
             ..declaring(&[])
         },
     );
-    let silent = "<button type=\"button\" class=\"badge warn\" data-note \
-                  aria-describedby=\"plugin-health-0\">Silent</button>\
-                  <span class=\"hint noted\" id=\"plugin-health-0\">Its sidecar has stopped reporting.</span>";
+    // On Settings › Plugins, one status and its reason in the kit's note:
+    // a setting still to fill in holds it setting up, silent or not.
     let (_, overview) = send(&h, get(&h, "/admin", true)).await;
     let listed = table(&overview, "plugins");
-    assert!(listed.contains(silent), "{listed}");
+    assert!(
+        listed.contains(
+            "<om-status badge state=\"warn\" label=\"Setting up\" detail=\"Next step: choose its settings. \
+             Needs you: Settings: needs Consumer key.\" data-status=\"setting-up\">Setting up</om-status>"
+        ),
+        "{listed}"
+    );
     // The note is not also a line of its own once the script runs, and the
     // one bubble is drawn by the chrome's script, as text.
     assert!(overview.contains("html[data-script] .noted{display:none}"));
@@ -2210,15 +2217,18 @@ async fn the_plugins_tab_names_the_instance_apart_and_offers_a_search() {
     );
     let (_, body) = send(&h, get(&h, "/admin", true)).await;
     assert!(
-        body.contains("<th>Plugin</th><th>Instance</th><th>Health</th>"),
+        body.contains(
+            "<th class=\"c-plugin\">Plugin</th><th class=\"c-instance wide-only\">Instance</th><th>Status</th>"
+        ),
         "the instance its own column"
     );
     assert!(
-        body.contains("data-filter=\"plugins-table\"") && body.contains("id=\"plugins-table\""),
+        body.contains("<om-pager search=\"Search plugins\">")
+            && body.contains("id=\"plugins-table\""),
         "a search box narrowing the plugins' table"
     );
     assert!(
-        table(&body, "plugins").contains("<td><code>snaptrade-1</code></td>"),
+        table(&body, "plugins").contains("<td class=\"wide-only\"><code>snaptrade-1</code></td>"),
         "the instance in its own cell"
     );
 }

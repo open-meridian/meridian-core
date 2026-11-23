@@ -478,6 +478,16 @@ pub(crate) async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
 /// them all. None, said in the log, when the catalogue cannot be read in
 /// time, since a page that waits on the conductor is a page that hangs.
 pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
+    every_launch(app)
+        .await
+        .into_iter()
+        .filter(|launch| launch.state == PluginLaunchState::Launched as i32)
+        .collect()
+}
+
+/// Every launch, live or ended, the same way: for the home page, whose
+/// status badges say an instance stopped, when and by whom.
+pub(crate) async fn every_launch(app: &App) -> Vec<PluginLaunch> {
     // The launches alone (contract v28's amendment, ruling 696): no page
     // here needs a version's declaration.
     let asked = PluginCatalogueRequest {
@@ -485,11 +495,7 @@ pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
         ..Default::default()
     };
     match pages_within(app, asked, Duration::from_secs(3)).await {
-        Ok(held) => held
-            .launches
-            .into_iter()
-            .filter(|launch| launch.state == PluginLaunchState::Launched as i32)
-            .collect(),
+        Ok(held) => held.launches,
         Err(failed) => {
             tracing::warn!("the launched plugins could not be read: {failed}");
             Vec::new()

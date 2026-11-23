@@ -3367,3 +3367,90 @@ async fn a_lake_query_is_asked_as_the_instance_named_and_the_dictionary_answers_
     .await;
     assert_eq!(structured(&said)["data"]["since"], "v26", "{said}");
 }
+
+/// PARITY's "plugin status": list_plugins says of each instance what
+/// Settings › Plugins draws for it -- its status and its reason -- and
+/// whether the home page lists it, from the one judgement both use.
+#[tokio::test]
+async fn list_plugins_says_each_status_as_settings_plugins_draws_it() {
+    let h = harness(true).await;
+    let now = h.app.clock.now_ns();
+    h.app.health.hear(
+        "ops-2",
+        PluginReport {
+            plugin_instance_id: "ops-2".into(),
+            registered: true,
+            healthy: false,
+            health_detail: "The venue refused the key.".into(),
+            reported_at_ns: now,
+            ..Default::default()
+        },
+    );
+    let bearer = token(&h.app, covering(&["write"], true), Resource::Mcp).await;
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&bearer),
+        &[],
+        call("dashboard__list_plugins", json!({})),
+    )
+    .await;
+    let plugins = structured(&said)["data"]["plugins"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{said}"))
+        .clone();
+    let session = h.app.sessions.start(ADA, "Ada", vec![], now);
+    let response = router(Arc::clone(&h.app))
+        .oneshot(
+            HttpRequest::get("/admin")
+                .header(
+                    COOKIE,
+                    format!("__Host-{}={session}", crate::web::SESSION_COOKIE),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let ids: Vec<&str> = plugins
+        .iter()
+        .map(|p| p["plugin_instance_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&INSTANCE) && ids.contains(&"ops-2"), "{ids:?}");
+    for plugin in &plugins {
+        let id = plugin["plugin_instance_id"].as_str().unwrap();
+        let status = plugin["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{plugin}"));
+        let row = page
+            .split(&format!("<tr data-id=\"{id}\""))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{id} is on Settings › Plugins"))
+            .split("</tr>")
+            .next()
+            .unwrap();
+        assert!(
+            row.contains(&format!("data-status=\"{status}\"")),
+            "{id} is {status}: {row}"
+        );
+        let reason = crate::html::escape(plugin["reason"].as_str().unwrap());
+        assert!(row.contains(&format!("detail=\"{reason}")), "{id}: {row}");
+        assert_eq!(
+            plugin["on_home"],
+            json!(!matches!(status, "stopped" | "setting-up")),
+            "{plugin}"
+        );
+    }
+    let ops2 = plugins
+        .iter()
+        .find(|p| p["plugin_instance_id"] == "ops-2")
+        .unwrap();
+    assert_eq!(ops2["status"], "not-healthy");
+    assert_eq!(ops2["reason"], "The venue refused the key.");
+}
