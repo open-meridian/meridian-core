@@ -6943,7 +6943,250 @@ fn a_read_follows_a_range_past_a_stale_view_of_its_owner() {
         ["l0", "l1", "l2"],
         "a read after the row was acknowledged answered without it"
     );
-    assert_eq!(reader.of(&lower), 1);
+    // For that read alone: a read writes no view of the owners (the review
+    // of 2026-11-23, finding 3).
+    assert_eq!(reader.of(&lower), 0);
+}
+
+/// Both writer groups' members over two databases, each with its own view
+/// of the writer groups.
+struct Members {
+    zeros: Vec<Arc<PostgresStore>>,
+    ones: Vec<Arc<PostgresStore>>,
+    zero: meridian_lake::spread::Spread,
+    one: meridian_lake::spread::Spread,
+}
+
+/// A member's stores of both databases, sharing `groups`.
+fn stores_of(
+    urls: &[Scratch],
+    groups: meridian_changes::groups::Groups,
+    pool: u32,
+) -> Vec<Arc<PostgresStore>> {
+    urls.iter()
+        .enumerate()
+        .map(|(d, url)| {
+            Arc::new(
+                PostgresStore::connect(url, pool)
+                    .unwrap()
+                    .with_groups(groups)
+                    .with_databases(urls.len() as u32)
+                    .in_database(d as u32),
+            )
+        })
+        .collect()
+}
+
+fn members(urls: &[Scratch]) -> Members {
+    use meridian_changes::groups::Groups;
+    let zeros = stores_of(urls, Groups::new(0, 2).unwrap(), 4);
+    let ones = stores_of(urls, Groups::new(1, 2).unwrap(), 4);
+    let zero = meridian_lake::spread::Spread::new(zeros.clone(), zeros[0].groups());
+    let one = meridian_lake::spread::Spread::new(ones.clone(), ones[0].groups());
+    zero.adopt().unwrap();
+    one.adopt().unwrap();
+    Members {
+        zeros,
+        ones,
+        zero,
+        one,
+    }
+}
+
+/// A dataset group 0 of two owns, named from `tag`.
+fn owned_by_zero(tag: &str) -> String {
+    (0..)
+        .map(|n| unique(&format!("{tag}{n}")))
+        .find(|dataset| meridian_changes::groups::owner(dataset, 2) == 0)
+        .unwrap()
+}
+
+/// `dataset` written and split in two halves in database 0, `l0` and `l1`
+/// in its lower: answers the lower range.
+fn halved(m: &Members, dataset: &str, low: &str, high: &str) -> String {
+    m.zero
+        .record(
+            dataset,
+            vec![
+                trade(dataset, "l0", low, 10),
+                trade(dataset, "h0", high, 11),
+            ],
+            1_000,
+        )
+        .unwrap();
+    m.zero
+        .split_partition(dataset, "admin-1", "two halves", 1_100)
+        .unwrap();
+    m.zero
+        .record(dataset, vec![trade(dataset, "l1", low, 12)], 1_200)
+        .unwrap();
+    m.zeros[0].pin_owners().unwrap();
+    for store in m.zeros.iter().chain(&m.ones) {
+        store.read_owners().unwrap();
+    }
+    format!("{dataset}/0000-7fff")
+}
+
+/// `range` moved from group 0 to group 1, so from database 0 to 1.
+fn moved_to_one(m: &Members, range: &str) {
+    use meridian_lake::partition_moves::{Asked, Ended, Mover, Settings};
+    let mover = Mover::new(
+        m.zeros.clone(),
+        m.zeros[0].groups(),
+        Settings {
+            switch: std::time::Duration::from_secs(5),
+            ..Default::default()
+        },
+        Arc::new(SystemClock),
+    );
+    assert!(mover.begin(range));
+    let ended = mover.run(range, 1, &Asked::default()).unwrap();
+    assert!(matches!(ended, Ended::Moved(..)), "{ended:?}");
+    for store in m.ones.iter() {
+        store.read_owners().unwrap();
+    }
+}
+
+/// The keys a latest read of `dataset`'s `subject` answers through `member`.
+fn latest_keys(
+    member: &meridian_lake::spread::Spread,
+    dataset: &str,
+    subject: &str,
+) -> meridian_lake::store::Result<Vec<String>> {
+    let mut keys: Vec<String> = member
+        .read(&Query {
+            datasets: vec![dataset.to_string()],
+            data_type: DataType::Trade,
+            subjects: vec![subject.to_string()],
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Latest { at_ns: 0 },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: false,
+        })?
+        .iter()
+        .map(|row| row.meta().row_key.clone())
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// A read answered from a reader's replicas never writes the member's view
+/// of the writer groups (the review of 2026-11-23, finding 3): the replicas
+/// share that view with the member's own stores, and one behind a move
+/// holds the ranges' rows as they were before it. Following a range there
+/// by reading the owners again wrote the owner before the move into the
+/// view every read and write of the member's goes by. A read is routed by
+/// the rows it just read, for itself alone: the replica's answer is its own
+/// state, and the view still names the owner the record does.
+#[test]
+fn a_read_from_a_replica_behind_a_move_never_writes_the_members_view_of_the_owner() {
+    use meridian_changes::groups::Groups;
+    // The record, and what its replicas hold: the state before the move.
+    let (urls, behind) = (two_databases(), two_databases());
+    let dataset = owned_by_zero("coinbase-1:b");
+    let (low, high) = halves_of("lake-behind");
+    let record = members(&urls);
+    let lower = halved(&record, &dataset, &low, &high);
+    halved(&members(&behind), &dataset, &low, &high);
+    moved_to_one(&record, &lower);
+    record
+        .one
+        .record(&dataset, vec![trade(&dataset, "l2", &low, 13)], 1_300)
+        .unwrap();
+    // A reader member: one view, its own stores' and its replicas'.
+    let groups = Groups::new(0, 2).unwrap();
+    let primary = meridian_lake::spread::Spread::new(stores_of(&urls, groups, 2), groups);
+    let replica = meridian_lake::spread::Spread::new(stores_of(&behind, groups, 2), groups);
+    primary.read_owners_again().unwrap();
+    assert_eq!(groups.owner_by(&lower, &dataset), 1, "the view, read after");
+    assert_eq!(
+        latest_keys(&replica, &dataset, &low).unwrap(),
+        ["l0", "l1"],
+        "the replica's own state, the range as it was before the move"
+    );
+    assert_eq!(
+        groups.owner_by(&lower, &dataset),
+        1,
+        "a read from a replica behind the move wrote the owner before it into the member's view"
+    );
+    // And the record's, where the range is written now.
+    assert_eq!(
+        latest_keys(&primary, &dataset, &low).unwrap(),
+        ["l0", "l1", "l2"]
+    );
+}
+
+/// A database that cannot be reached slows no read of a dataset written in
+/// another, split or not, and a read of a dataset one of whose ranges it
+/// may hold is refused UNAVAILABLE at once, never answered without the
+/// range (the review of 2026-11-23, findings 4 and 7: every database's
+/// rows were read before every read of a dataset, so one database's outage
+/// held each for its pool's 30 s and then answered it by the view).
+/// Unreachable here as a pool finds it: every connection held, the next
+/// checkout waiting.
+#[test]
+fn a_database_out_of_reach_slows_no_read_of_a_dataset_written_in_another() {
+    use meridian_changes::groups::Groups;
+    use meridian_lake::store::StoreError;
+    let urls = two_databases();
+    let m = members(&urls);
+    let (stays, moves) = (owned_by_zero("coinbase-1:r"), owned_by_zero("coinbase-1:m"));
+    let (low, high) = halves_of("lake-reach");
+    halved(&m, &stays, &low, &high);
+    let gone = halved(&m, &moves, &low, &high);
+    // A reader member: its view of the writer groups read once, before the
+    // move.
+    let groups = Groups::new(0, 2).unwrap();
+    let stores = stores_of(&urls, groups, 2);
+    let reader = meridian_lake::spread::Spread::new(stores.clone(), groups);
+    reader.read_owners_again().unwrap();
+    for dataset in [&stays, &moves] {
+        assert_eq!(latest_keys(&reader, dataset, &low).unwrap(), ["l0", "l1"]);
+    }
+    moved_to_one(&m, &gone);
+    // Database 1 out of this member's reach: both connections of its pool
+    // taken, each waiting on a lock held here.
+    let mut admin = postgres::Client::connect(&urls[1], postgres::NoTls).unwrap();
+    admin
+        .batch_execute("BEGIN; LOCK TABLE lake_partition IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (store, range) = (stores[1].clone(), gone.clone());
+            std::thread::spawn(move || drop(store.range_tip(&range)))
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let read = latest_keys(&reader, &stays, &low);
+    let took = started.elapsed();
+    assert_eq!(read.ok(), Some(vec!["l0".to_string(), "l1".to_string()]));
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "a read of a dataset database 0 writes waited {took:?} on database 1"
+    );
+    // Its range's row in database 0 a move's pointer, and the database it
+    // may have gone to not read: refused, within the bound.
+    let started = std::time::Instant::now();
+    let refused = latest_keys(&reader, &moves, &low);
+    let took = started.elapsed();
+    assert!(
+        matches!(refused, Err(StoreError::Unavailable(_))),
+        "{refused:?}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "refused only after {took:?}"
+    );
+    admin.batch_execute("ROLLBACK").unwrap();
+    for holder in held {
+        holder.join().unwrap();
+    }
+    // In reach again: read where it is written, the view as it was.
+    assert_eq!(latest_keys(&reader, &moves, &low).unwrap(), ["l0", "l1"]);
+    assert_eq!(groups.owner_by(&gone, &moves), 0);
 }
 
 /// A dataset whose ranges sit in two groups and two databases (step 3d;

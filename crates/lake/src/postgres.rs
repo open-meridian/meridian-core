@@ -23,7 +23,7 @@ use meridian_domain::v1::{
 };
 
 mod moves;
-pub use moves::{RangeTip, SwitchTimes, Switched};
+pub use moves::{RangeTip, Standing, SwitchTimes, Switched};
 
 use crate::memory::{as_of, number, number_parts, served_of};
 use crate::migrations;

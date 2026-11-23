@@ -33,7 +33,7 @@ use meridian_changes::groups::Groups;
 use meridian_changes::{ReadChangesReply, ReadError};
 use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
-use crate::postgres::PostgresStore;
+use crate::postgres::{PostgresStore, Standing};
 use crate::row::{DataType, Observation};
 use crate::store::{shard_at, ShardStamp};
 use crate::store::{
@@ -49,6 +49,15 @@ pub struct Spread {
     /// read there from then on, as only a move takes it away -- to another
     /// group, so another owner (step 3d; ruled 2026-11-14).
     settled: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>>,
+}
+
+/// What one read of a dataset goes by ([`Spread::follow_owners`]): the
+/// databases it asks, and each range a database among those it read had
+/// let go to another's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Followed {
+    databases: std::collections::BTreeSet<u32>,
+    let_go: std::collections::BTreeSet<(u32, String)>,
 }
 
 /// How many times a write's rows are routed again to the database their
@@ -352,64 +361,109 @@ impl Spread {
         best.1
     }
 
-    /// The ranges' owners read again from their rows, and `dataset`'s
-    /// routed again, where this member's view of it was read before a move
-    /// (step 3d; sections 5 and 6.4; the book's stale read of merge-queue
-    /// run 45104369464, the same shape here): the database the view sends
-    /// a read of the dataset, or of one of its ranges, to holds a move's
-    /// pointer of it, or another's row of it is further on. A member reads
-    /// the writer groups at its start, every few seconds and on a write
-    /// routed again, and a reader writes nothing: until its next look, a
-    /// read went by the view to the range's source, which answers nothing
-    /// of a range it let go, while the read's `read_after` had passed on
-    /// the target's head. So a read of a dataset asks first: its rows in
-    /// each database, one read of each. A row that cannot be read changes
-    /// nothing: the read says so itself.
-    fn follow_owners(&self, dataset: &str) {
-        if self.stores.len() == 1 || dataset == meridian_changes::CONTROL {
-            return;
-        }
-        // Each partition's head in each database, and whether written.
-        let mut rows: BTreeMap<String, Vec<Option<(u64, bool)>>> = BTreeMap::new();
-        for (d, store) in self.stores.iter().enumerate() {
-            let Ok(held) = store.rows_of(dataset) else {
-                return;
-            };
-            for (partition, head, written) in held {
-                rows.entry(partition)
-                    .or_insert_with(|| vec![None; self.stores.len()])[d] = Some((head, written));
-            }
-        }
-        let moved: Vec<&String> =
-            rows.iter()
-                .filter(|(partition, heads)| {
-                    let sent = self.of(partition) as usize;
-                    let (here, written) = heads[sent].unwrap_or((0, true));
-                    !written
-                        || heads.iter().enumerate().any(|(d, head)| {
-                            d != sent && head.is_some_and(|(there, _)| there > here)
-                        })
-                })
-                .map(|(partition, _)| partition)
-                .collect();
-        if moved.is_empty() || self.read_owners_again().is_err() {
-            return;
-        }
-        for partition in moved {
-            self.route_again(partition);
-        }
-    }
-
-    /// Every database a read of `dataset` asks (step 3d): its own, and each
-    /// its ranges' groups write, as this member last read them -- read
-    /// again first where a move has gone by ([`Self::follow_owners`]).
-    fn databases_of(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
-        self.follow_owners(dataset);
+    /// The databases a read of `dataset` asks, by the view: its own, and
+    /// each its ranges' groups write, as this member last read them.
+    fn sent(&self, dataset: &str) -> std::collections::BTreeSet<u32> {
         let mut out = std::collections::BTreeSet::from([self.of(dataset)]);
         for (range, _) in self.groups.ranges_of(dataset) {
             out.insert(self.of(&range));
         }
         out
+    }
+
+    /// The databases one read of `dataset` asks, by the rows of it just
+    /// read, where this member's view of its ranges' owners was read
+    /// before a move (step 3d; sections 5 and 6.4; the book's stale read of
+    /// merge-queue run 45104369464, the same shape here). A member reads
+    /// the writer groups at its start, every few seconds and on a write
+    /// routed again, and a reader writes nothing: until its next look, a
+    /// read went by the view to a range's source, which answers nothing of
+    /// a range it let go, while the read's `read_after` had passed on the
+    /// target's head. Each database answers the ranges its own rows say
+    /// are read there, so a read needs only the right databases.
+    ///
+    /// - **The view's databases asked**, one read of each: theirs where
+    ///   each range one of them let go is held by another of them.
+    /// - **Every other's** only where one holds a move's pointer of a
+    ///   range none of them holds, or they have begun nothing of the
+    ///   dataset: each holding a range of it is asked as well. A range a
+    ///   split closed sends no read on: it moves nowhere.
+    /// - **Refused UNAVAILABLE** where such a database cannot be asked
+    ///   within [`crate::postgres::PostgresStore::standing_of`]'s bound:
+    ///   never answered without a range a move took there, nor held for a
+    ///   pool's 30 s by another database's outage (the review of
+    ///   2026-11-23, finding 4).
+    /// - **This read's alone**: the view is never written here (the same
+    ///   review, finding 3). A reader's replicas share it with its own
+    ///   stores, and one behind a move would write the owner before it.
+    ///
+    /// INTERIM(v32): a stop-gap for a view of the owners read on a timer;
+    /// gone when v32's ownership record says where a range is read, and a
+    /// read with `read_after` is never answered without a range a move
+    /// took elsewhere.
+    fn follow_owners(&self, dataset: &str) -> Result<Followed> {
+        let mut databases = self.sent(dataset);
+        if self.stores.len() == 1 || dataset == meridian_changes::CONTROL {
+            return Ok(Followed {
+                databases,
+                let_go: Default::default(),
+            });
+        }
+        let count = self.groups.count();
+        // Whether `row`, in database `d`, is of a range read there: written
+        // there, or a move's pointer to a group whose home it is (its
+        // target, not opened yet).
+        let here = |d: u32, row: &Standing| {
+            let group = row
+                .group
+                .filter(|group| *group < count)
+                .unwrap_or_else(|| meridian_changes::groups::owner(dataset, count));
+            row.written || meridian_changes::databases::of_group(group, self.count()) == d
+        };
+        let mut rows: Vec<(u32, Standing)> = Vec::new();
+        for d in &databases {
+            for row in self.database(*d).standing_of(dataset, false)? {
+                rows.push((*d, row));
+            }
+        }
+        let held: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter(|(d, row)| !row.closed && here(*d, row))
+            .map(|(_, row)| row.partition.as_str())
+            .collect();
+        let begun = rows.iter().any(|(d, row)| row.head > 0 && here(*d, row));
+        let astray = rows.iter().any(|(d, row)| {
+            !row.closed && !here(*d, row) && !held.contains(row.partition.as_str())
+        });
+        if !begun || astray {
+            let others: Vec<u32> = (0..self.count())
+                .filter(|d| !databases.contains(d))
+                .collect();
+            for d in others {
+                let asked = self.database(d).standing_of(dataset, true).map_err(|failed| {
+                    StoreError::Unavailable(format!(
+                        "dataset {dataset}'s ranges in database {d}, which may hold one, could not be read ({failed}): ask again"
+                    ))
+                })?;
+                if asked.iter().any(|row| !row.closed && here(d, row)) {
+                    databases.insert(d);
+                }
+                rows.extend(asked.into_iter().map(|row| (d, row)));
+            }
+        }
+        let let_go = rows
+            .iter()
+            .filter(|(d, row)| !row.closed && !here(*d, row))
+            .map(|(d, row)| (*d, row.partition.clone()))
+            .collect();
+        Ok(Followed { databases, let_go })
+    }
+
+    /// Every database a read of `dataset` asks (step 3d): its own, and each
+    /// its ranges are read in, by the rows this read found
+    /// ([`Self::follow_owners`]).
+    fn databases_of(&self, dataset: &str) -> Result<std::collections::BTreeSet<u32>> {
+        Ok(self.follow_owners(dataset)?.databases)
     }
 
     fn holding(&self, partition: &str) -> &Arc<PostgresStore> {
@@ -430,7 +484,7 @@ impl Spread {
 
     /// `datasets` in order, in runs of one database each: a read answering
     /// them in order reads each run from its database in turn.
-    fn runs(&self, datasets: &[String]) -> Vec<(u32, Vec<String>)> {
+    fn runs(&self, datasets: &[String]) -> Result<Vec<(u32, Vec<String>)>> {
         let mut sorted: Vec<String> = datasets.to_vec();
         sorted.sort();
         sorted.dedup();
@@ -438,14 +492,14 @@ impl Spread {
         for dataset in sorted {
             // A dataset whose ranges are in several databases is read from
             // each, each answering its own ranges (step 3d).
-            for d in self.databases_of(&dataset) {
+            for d in self.databases_of(&dataset)? {
                 match runs.last_mut() {
                     Some((at, run)) if *at == d => run.push(dataset.clone()),
                     _ => runs.push((d, vec![dataset.clone()])),
                 }
             }
         }
-        runs
+        Ok(runs)
     }
 
     /// Each database's counts, a dataset's summed across them (step 3d):
@@ -552,7 +606,7 @@ impl Spread {
         query: &Query,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        let runs = self.runs(&query.datasets);
+        let runs = self.runs(&query.datasets)?;
         if runs.len() <= 1 {
             let d = runs.first().map_or(0, |(d, _)| *d);
             return self.database(d).read_each(query, each);
@@ -1202,7 +1256,7 @@ impl Store for Spread {
         after: u64,
         most: usize,
     ) -> Result<Vec<Observation>> {
-        let databases = self.databases_of(dataset);
+        let databases = self.databases_of(dataset)?;
         if databases.len() <= 1 {
             return self.holding(dataset).dated_on(dataset, dates, after, most);
         }
@@ -1268,7 +1322,7 @@ impl Store for Spread {
         published_as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let mut out = Vec::new();
-        for d in self.databases_of(dataset) {
+        for d in self.databases_of(dataset)? {
             out.extend(self.database(d).read_dataset(
                 dataset,
                 data_type,
@@ -1286,7 +1340,7 @@ impl Store for Spread {
         as_of_ns: i64,
         each: &mut dyn FnMut(Observation) -> Result<()>,
     ) -> Result<()> {
-        for d in self.databases_of(dataset) {
+        for d in self.databases_of(dataset)? {
             self.database(d)
                 .read_dataset_each(dataset, data_type, as_of_ns, each)?;
         }
@@ -1299,7 +1353,7 @@ impl Store for Spread {
         data_type: DataType,
     ) -> Result<Vec<Observation>> {
         let mut out = Vec::new();
-        for d in self.databases_of(dataset) {
+        for d in self.databases_of(dataset)? {
             out.extend(self.database(d).read_dataset_versions(dataset, data_type)?);
         }
         Ok(out)
@@ -1307,7 +1361,7 @@ impl Store for Spread {
 
     fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
         // The key's range is in one of them.
-        for d in self.databases_of(dataset) {
+        for d in self.databases_of(dataset)? {
             let found = self.database(d).row_version(dataset, row_key, version)?;
             if !found.is_empty() {
                 return Ok(found);
