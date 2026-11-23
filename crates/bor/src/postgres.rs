@@ -2424,6 +2424,12 @@ impl Store for PostgresStore {
         self.groups.owns(&self.placed(account_id))
     }
 
+    fn owner_changes(&self) -> u64 {
+        (0..self.partitions)
+            .map(|n| self.groups.changes_of(&crate::store::partition_named(n)))
+            .sum()
+    }
+
     fn owe_control(&self, record: &crate::control::Owed, kept_at_ns: i64) -> Result<()> {
         self.conn()?
             .execute(

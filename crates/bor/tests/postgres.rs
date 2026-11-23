@@ -8695,6 +8695,73 @@ async fn a_database_out_of_reach_slows_no_read_of_a_partition_written_in_another
     blocking(move || drop(h));
 }
 
+/// A writer's books held in memory are dropped when its view of the writer
+/// groups changes (the review of 2026-11-23, finding 5): a partition moved
+/// to another group, written there, and moved back is this member's to
+/// write again, and the book it held from before the move is not the
+/// account's any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_writers_held_book_is_dropped_when_its_view_of_the_owners_changes() {
+    use meridian_bor::partition_moves::{Asked, Ended};
+    let h = blocking(two_databases);
+    let partition = partition_of(0, 0);
+    let account = accounts_in("ACC-HELD", &partition, 1, &h.zero.0, h.zero.1.as_ref())
+        .await
+        .remove(0);
+    accounts_in(
+        "ACC-HELD-ONE",
+        &partition_of(1, 0),
+        1,
+        &h.one.0,
+        h.one.1.as_ref(),
+    )
+    .await;
+    let writer = blocking(|| {
+        let writer =
+            meridian_bor::writer::Writer::new(h.zero.1.clone() as Arc<dyn Store>, h.zero.0.clone());
+        assert_eq!(Store::book(&writer, &account).unwrap().entries.len(), 1);
+        assert_eq!(writer.held().0, 1, "held from here on");
+        writer
+    });
+    let moved = |to: u32| {
+        blocking(|| {
+            h.mover.begin(&partition);
+            let ended = h.mover.run(
+                &partition,
+                to,
+                &Asked {
+                    by_hand: true,
+                    moved_by: PERSON.into(),
+                    reason: "there and back".into(),
+                },
+            );
+            // Each member's look at the writer groups, as its sweep makes it.
+            for member in [&h.zero.1, &h.one.1] {
+                PostgresStore::read_owners_from(&[
+                    member.database(0).clone(),
+                    member.database(1).clone(),
+                ])
+                .unwrap();
+            }
+            ended
+        })
+    };
+    let away = moved(1);
+    assert!(matches!(away, Ok(Ended::Moved(..))), "{away:?}");
+    write_once(&h.one.0, &account, 1).await.unwrap();
+    let back = moved(0);
+    assert!(matches!(back, Ok(Ended::Moved(..))), "{back:?}");
+    blocking(|| {
+        assert!(Store::writes(&writer, &account));
+        assert_eq!(
+            Store::book(&writer, &account).unwrap().entries.len(),
+            2,
+            "the book held from before its partition moved away, without what was written there"
+        );
+    });
+    blocking(move || drop((writer, h)));
+}
+
 /// A write that finds its partition between two databases -- its source
 /// let go, its target not yet opened -- longer than its caller waits is
 /// answered OVERLOADED with a retry-after while the caller still waits

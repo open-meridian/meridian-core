@@ -750,6 +750,11 @@ impl Store for Spread {
         }
     }
 
+    fn owner_changes(&self) -> u64 {
+        // One view, shared by every database's store.
+        self.own().owner_changes()
+    }
+
     fn writer_group_of(&self, account_id: &str) -> Option<u32> {
         if !self.groups.several() {
             return None;
