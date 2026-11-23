@@ -37,9 +37,13 @@
 #                                 steps' results did arrive, so what is known
 #                                 leaves by the API and never by an upload.
 #                                 The check run is made first, from file
-#                                 reads alone (the make's FAILED and last
-#                                 lines, the sampler's last load, memory
-#                                 and disk lines), before any network or
+#                                 reads alone (at its top the runner's
+#                                 image, kernel and host, the proofs'
+#                                 results from proof.log and a stuck
+#                                 sandbox's report from the make; then the
+#                                 make's FAILED and last lines, the
+#                                 sampler's last load, memory and disk
+#                                 lines), before any network or
 #                                 Docker probe: on runs 45130110944 and
 #                                 45139152927 every probe ran to its limit
 #                                 and nothing reached GitHub. The probes'
@@ -250,10 +254,24 @@ loop() {
 
 # What a failed make left on disk, from file reads alone: no network and no
 # Docker, so it is ready to send before anything is probed. $1 is the make's
-# log, $2 the sampler's file.
+# log, $2 the sampler's file. Evidence first: the runner, the proofs'
+# results (proof.log beside the make's log: which wait gave up, the kernel's
+# matched, clean or unreadable, whether ip and docker answered) and a stuck
+# sandbox's report from the make (e2e/cluster/stuck-sandbox.sh), each
+# indented so none of their lines reads as a section here. On the runs that
+# hung, the check run's text ended at the first probe below these reads.
 known() {
-  local make=$1 watch=$2
+  local make=$1 watch=$2 proof stuck
+  proof="$(dirname "$make")/proof.log"
   echo "== $(date -u +%Y-%m-%dT%H:%M:%SZ) ${CHECK_NAME:-a cluster job} on $(hostname 2>/dev/null || echo '?'), runner ${RUNNER_NAME:-?}"
+  echo "== the runner: image ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r 2>/dev/null || echo '?'), host $(hostname 2>/dev/null || echo '?')"
+  echo "== the proofs, from local reads before any network call"
+  if [ -s "$proof" ]; then awk 'NR <= 80 { print "  " $0 }' "$proof" || true; else echo "  (no proof.log at $proof: the proof steps did not run or wrote nothing)"; fi
+  echo "== a stuck sandbox, as the make's ready wait found it"
+  stuck=$(awk '/^e2e-cluster-k3d: gave up on .* in ContainerCreating for /{on=1}
+    on && n++ < 200 { print "  " $0 }
+    on && /^e2e-cluster-k3d: the cluster is left/ { exit }' "$make" 2>/dev/null || true)
+  if [ -n "$stuck" ]; then printf '%s\n' "$stuck"; else echo "  (none: no ready wait gave up on a stuck sandbox)"; fi
   echo "== FAILED and gave-up lines: the make's, then the e2e's own logs'"
   grep -h -E 'FAILED|gave up|could not be made' "$make" .e2e-*.log 2>/dev/null | tail -n 40 || true
   echo "== the make's last 60 lines"
