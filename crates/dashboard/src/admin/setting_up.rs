@@ -47,6 +47,12 @@ pub struct Step {
     /// A deployment admin's step, said as "Ask a deployment admin to ..." to
     /// anyone else.
     pub deployment_admins: bool,
+    /// Judged from the plugin's reports (its health, its connection, its
+    /// accounts linked, its data arriving) rather than from the records a
+    /// person writes. Only a step from the records holds a plugin in
+    /// "Setting up" and off the home page; a live one open is the plugin
+    /// not healthy, or something it needs of a person.
+    pub live: bool,
 }
 
 fn settings_href(instance: &str) -> String {
@@ -126,24 +132,28 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done,
             href: Some(settings_href(instance)),
             deployment_admins: false,
+            live: false,
         });
         steps.push(Step {
             words: "Check the connection".into(),
             done: Some(facts.healthy),
             href: None,
             deployment_admins: false,
+            live: true,
         });
         steps.push(Step {
             words: "License and entitle its datasets".into(),
             done: facts.datasets_ready,
             href: Some("/admin/data-sources".into()),
             deployment_admins: true,
+            live: false,
         });
         steps.push(Step {
             words: "See data arrive".into(),
             done: None,
             href: None,
             deployment_admins: false,
+            live: true,
         });
     } else if has("custody") {
         let (_, done) = keys_set(facts);
@@ -152,12 +162,14 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done,
             href: Some(settings_href(instance)),
             deployment_admins: false,
+            live: false,
         });
         steps.push(Step {
             words: "Connect".into(),
             done: Some(facts.connected),
             href: None,
             deployment_admins: false,
+            live: true,
         });
         let granted = facts.records.map(|records| {
             records
@@ -170,12 +182,14 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done: granted,
             href: Some(view_href(super::view::ACCOUNTS)),
             deployment_admins: true,
+            live: false,
         });
         steps.push(Step {
             words: "Link accounts".into(),
             done: Some(facts.connected && facts.unlinked == 0),
             href: None,
             deployment_admins: false,
+            live: true,
         });
     } else if has("operations") {
         steps.push(Step {
@@ -183,12 +197,14 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done: settings_set(facts),
             href: Some(settings_href(instance)),
             deployment_admins: false,
+            live: false,
         });
         steps.push(Step {
             words: "Have access and a street source".into(),
             done: group_holds(facts, &[AccessLevel::Write]),
             href: Some(view_href(super::view::ACCESS)),
             deployment_admins: true,
+            live: false,
         });
     } else if has("reporting") {
         steps.push(Step {
@@ -196,18 +212,21 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done: settings_set(facts),
             href: Some(settings_href(instance)),
             deployment_admins: false,
+            live: false,
         });
         steps.push(Step {
             words: "Have it entitled to the data it reads".into(),
             done: facts.entitled,
             href: Some("/admin/data-sources".into()),
             deployment_admins: true,
+            live: false,
         });
         steps.push(Step {
             words: "Grant people read".into(),
             done: group_holds(facts, &[AccessLevel::Read, AccessLevel::Write]),
             href: Some(view_href(super::view::ACCESS)),
             deployment_admins: true,
+            live: false,
         });
     } else {
         steps.push(Step {
@@ -215,12 +234,14 @@ pub fn steps(facts: &Facts) -> Vec<Step> {
             done: settings_set(facts),
             href: Some(settings_href(instance)),
             deployment_admins: false,
+            live: false,
         });
         steps.push(Step {
             words: "Check the connection".into(),
             done: Some(facts.healthy),
             href: None,
             deployment_admins: false,
+            live: true,
         });
     }
     steps

@@ -376,7 +376,19 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     // W6.9: the instances the person holds any level on, `admin` included;
     // through All plugins (admin), every one running -- launched from the
     // catalogue, or reporting.
-    let launches = crate::catalogue::launches(&app).await;
+    let every_launch = crate::catalogue::every_launch(&app).await;
+    let launches: Vec<&meridian_domain::v1::PluginLaunch> = every_launch
+        .iter()
+        .filter(|launch| launch.state == meridian_domain::v1::PluginLaunchState::Launched as i32)
+        .collect();
+    // An instance's latest launch, live or ended: for its name, and its
+    // status badge's Stopped.
+    let latest = |instance: &str| {
+        every_launch
+            .iter()
+            .filter(|launch| launch.instance_id == instance)
+            .max_by_key(|launch| launch.launched_at_ns)
+    };
     let mut listed: std::collections::BTreeSet<String> = access
         .plugins
         .iter()
@@ -388,17 +400,23 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         listed.extend(app.health.view().into_keys());
     }
     let name_of = |instance: &str| {
-        launches
-            .iter()
-            .find(|launch| launch.instance_id == instance)
+        latest(instance)
             .map(|launch| launch.name.clone())
+            .filter(|name| !name.is_empty())
     };
-    let mut body = String::from(
-        "<div class=\"page-head\"><div><h1>Your plugins</h1>\
-         <p>Open one to work in it. What each shows you is what you hold on it.</p></div>\
-         <div class=\"view-switch\" role=\"group\" aria-label=\"Show plugins as\">\
-         <button type=\"button\" data-view=\"list\" aria-pressed=\"true\">List</button>\
-         <button type=\"button\" data-view=\"tiles\" aria-pressed=\"false\">Tiles</button></div></div>",
+    // The page's head: the heading, Manage plugins for an admin on a wide
+    // screen (the header's gear does it on a phone), and the view switch.
+    let manage = if access.deployment_admin {
+        "<a class=\"muted wide-only\" href=\"/admin#plugins\">Manage plugins</a>"
+    } else {
+        ""
+    };
+    let mut body = format!(
+        "<div class=\"page-head\"><div><h1>Your plugins</h1></div><div class=\"actions\">{manage}\
+         <div class=\"segmented\" role=\"group\" aria-label=\"View\">\
+         <button type=\"button\" data-view=\"tiles\" aria-pressed=\"true\">{TILES_ICON}<span>Tiles</span></button>\
+         <button type=\"button\" data-view=\"list\" aria-pressed=\"false\">{LIST_ICON}<span>List</span></button>\
+         </div></div></div>",
     );
     if !access.deployment_admin
         && !records
@@ -465,64 +483,56 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             }
         }
     }
-    if listed.is_empty() {
-        body.push_str(
-            "<div class=\"panel empty-state\"><strong>No plugins for you yet</strong>\
-             <p>A deployment admin grants access to a plugin; it is listed here once they do.</p></div>",
-        );
+    // The instances the person may open, set up and not stopped (the
+    // 2026-11-23 consensus): one Open each, at the highest data level held.
+    // Their status is judged as Settings › Plugins and list_plugins judge it.
+    let listed: Vec<String> = listed.into_iter().collect();
+    let statuses = crate::plugin_status::every(
+        &app,
+        &records,
+        &session.subject,
+        access.deployment_admin,
+        &listed,
+    )
+    .await;
+    let mut items: Vec<Item> = listed
+        .iter()
+        .filter(|instance| statuses.get(*instance).is_some_and(|s| s.on_home()))
+        .filter(|instance| app.plugins.is_some() && crate::plugins::is_instance(instance))
+        .filter_map(|instance| {
+            let level = open_level(&access.plugin(instance).union().levels())?;
+            let full = name_of(instance).unwrap_or_else(|| instance.clone());
+            Some(Item {
+                instance: instance.clone(),
+                href: crate::area::href(instance, level, None),
+                name: full.rsplit('/').next().unwrap_or(&full).to_string(),
+                publisher: full
+                    .rsplit_once('/')
+                    .map(|(publisher, _)| publisher.to_string())
+                    .unwrap_or_default(),
+                full,
+            })
+        })
+        .collect();
+    items.sort_by_key(|item| (item.name.to_lowercase(), item.instance.clone()));
+    if items.is_empty() {
+        let line = if access.deployment_admin {
+            "A plugin appears here once it is set up. See where each one stands in \
+             <a href=\"/admin#plugins\">Settings › Plugins</a>."
+        } else {
+            "A plugin appears here once a deployment admin sets it up and gives you access."
+        };
+        body.push_str(&format!(
+            "<section class=\"panel\"><div class=\"empty-state\">\
+             <span class=\"empty-icon\" aria-hidden=\"true\">{TILES_ICON}</span>\
+             <strong>Nothing to open yet</strong><p>{line}</p></div></section>"
+        ));
     } else {
-        // By name, then instance: what a person reads the list by. Past a
-        // screenful, a search box narrows it, in the browser.
-        let mut listed: Vec<&String> = listed.iter().collect();
-        let called = |instance: &str| name_of(instance).unwrap_or_else(|| instance.to_string());
-        listed.sort_by_key(|instance| (called(instance).to_lowercase(), instance.to_string()));
-        if listed.len() > SEARCH_FROM {
-            body.push_str(
-                "<div class=\"filter-row\"><input class=\"filter\" type=\"search\" data-filter=\"home-plugins\" \
-                 hidden placeholder=\"Search your plugins\" aria-label=\"Search your plugins\">\
-                 <span class=\"filter-count\" data-filter-count=\"home-plugins\" aria-live=\"polite\" hidden></span></div>",
-            );
-        }
-        // Paged by the kit's om-pager, as many as fit (kit 0.11.0): each card
-        // a row of it.
-        body.push_str("<om-pager><ul class=\"plugins list\" id=\"home-plugins\" data-plugins>");
-        for instance in listed.iter().map(|i| i.as_str()) {
-            // A button per level held (W6.9), where a page can be opened.
-            let openable = app.plugins.is_some() && crate::plugins::is_instance(instance);
-            let held = access.plugin(instance);
-            let levels = if openable {
-                held.union().levels()
-            } else {
-                Vec::new()
-            };
-            // Contract v26 (W11.8), ruling 831 (its item 177): a connection
-            // shows where it trades and, beside it, its data, each on its
-            // own: "Trading: Demo · Data: Live".
-            let roles = access.known_roles.get(instance);
-            let holds = |wanted: &str| roles.is_some_and(|roles| roles.iter().any(|r| r == wanted));
-            let badge = if holds("connectivity") {
-                Some(Badge {
-                    trading: crate::admin::connectivity::trading(&app, &records, instance).await,
-                    data: holds("data"),
-                })
-            } else {
-                None
-            };
-            body.push_str(&plugin_card(
-                instance,
-                name_of(instance).as_deref(),
-                &levels,
-                &held,
-                access
-                    .known_roles
-                    .get(instance)
-                    .is_some_and(|roles| roles.len() > 1),
-                badge,
-            ));
-        }
-        body.push_str(
-            "</ul></om-pager><p class=\"empty\" data-filter-none=\"home-plugins\" hidden>No plugin matches that search.</p>",
-        );
+        let tiles: String = items.iter().map(|item| open_item(item, &items)).collect();
+        body.push_str(&format!(
+            "<om-pager label=\"\"><ul class=\"open-grid\" id=\"home-plugins\" aria-label=\"Your plugins\">\
+             {tiles}</ul></om-pager>"
+        ));
     }
     body.push_str(&format!("<script>{HOME_SCRIPT}</script>"));
     let viewer = Viewer {
@@ -535,159 +545,100 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         &format!("<div class=\"home\">{body}</div>"),
         &Chrome {
             viewer: Some(viewer),
-            main: "page",
+            main: "page wide",
             ..Default::default()
         },
     ))
     .into_response()
 }
 
-/// More plugins than this on the home page, and it offers a search box.
-const SEARCH_FROM: usize = 8;
-
-/// One plugin instance on the home page: the plugin's name and the
-/// instance's, and a button per level the person holds on it, each opening
-/// its area at that level (W6.9; the product owner, 2026-09-30: "manage for
-/// admin, open for write, view for read"). The name is only the plugin's:
-/// the buttons are the ways in (the product owner, 2026-09-30: "the plugin
-/// name is linked to the admin page (it shouldn't)").
-/// A connectivity plugin's badge on its card (ruling 831): where it trades,
-/// and whether it holds the data role, whose data is the vendor's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Badge {
-    trading: &'static str,
-    data: bool,
+/// One thing to open on the home page.
+struct Item {
+    instance: String,
+    href: String,
+    /// The plugin's short name ("alpaca"), its whole ("open-meridian/alpaca")
+    /// and its publisher; an instance not from the catalogue is its id.
+    name: String,
+    full: String,
+    publisher: String,
 }
 
-impl Badge {
-    fn words(self) -> String {
-        if self.data {
-            format!("Trading: {} \u{b7} Data: Live", self.trading)
-        } else {
-            format!("Trading: {}", self.trading)
-        }
-    }
+/// The level a tile opens: the highest data level held (write, else read),
+/// else admin; the area's level switch reaches the rest. None where the
+/// person holds none.
+fn open_level(levels: &[meridian_access::AccessLevel]) -> Option<meridian_access::AccessLevel> {
+    use meridian_access::AccessLevel::{Admin, Read, Write};
+    [Write, Read, Admin]
+        .into_iter()
+        .find(|wanted| levels.contains(wanted))
 }
 
-fn plugin_card(
-    instance: &str,
-    name: Option<&str>,
-    levels: &[meridian_access::AccessLevel],
-    held: &meridian_access::PluginHeld,
-    several: bool,
-    badge: Option<Badge>,
-) -> String {
-    // The plugin's name where the catalogue launched it; one installed
-    // otherwise is known by its instance alone.
-    let (title, sub) = match name {
-        Some(name) => (
-            name,
-            format!(
-                "<span class=\"plugin-instance\">{}</span>",
-                escape(instance)
-            ),
-        ),
-        None => (instance, String::new()),
-    };
-    let initial: String = title
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .map(String::from)
-        .unwrap_or_default();
-    // Contract v26 (W11.8), ruling 831: where a connectivity plugin trades,
-    // and its data beside it, each said on its own.
-    let badge = match badge {
-        Some(badge) => {
-            let said = badge.words();
-            format!(
-                " <span class=\"badge {kind}\" data-environment=\"{trading}\" title=\"{said}\">{said}</span>",
-                kind = match badge.trading {
-                    "Demo" => "good",
-                    "Live" => "warn",
-                    _ => "plain",
-                },
-                trading = escape(badge.trading),
-                said = escape(&said),
-            )
-        }
-        None => String::new(),
-    };
-    // On the line under the name, beside the instance, which gives way
-    // first: a narrow card never cuts the badge off (ruling 831).
-    let sub = if badge.is_empty() {
-        sub
-    } else {
-        format!("<span class=\"plugin-sub\">{sub}{badge}</span>")
-    };
-    let text = format!(
-        "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
-        initial = escape(&initial),
-        title = escape(title),
-    );
-    if levels.is_empty() {
-        return format!(
-            "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\">{text}\
-             <span class=\"plugin-open\">Not open to you yet</span></div></li>",
-            id = escape(instance)
-        );
-    }
-    let buttons: String =
-        levels
-            .iter()
-            .map(|level| {
-                format!(
-                "<a class=\"plugin-level\" data-level=\"{name}\" href=\"{href}\"{title}>{said}</a>",
-                name = meridian_access::level_name(*level),
-                href = escape(&crate::area::href(instance, *level, None)),
-                title = if several { roles_title(held, *level) } else { String::new() },
-                said = meridian_access::button(*level),
-            )
-            })
-            .collect();
-    format!(
-        "<li class=\"list-row\" data-instance=\"{id}\"><div class=\"plugin-card\"><span class=\"plugin-main\">{text}</span>\
-         <span class=\"plugin-levels\" role=\"group\" aria-label=\"Open {label} as\">{buttons}</span></div></li>",
-        id = escape(instance),
-        label = escape(title),
-    )
+/// A mark's initials: the first letters of a name's first two
+/// hyphen-separated words, or of a one-word name ("fed-board" FB, "alpaca"
+/// A); upper-cased by the kit.
+pub(crate) fn monogram(name: &str) -> String {
+    name.split(['-', '_', ' '])
+        .filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
+        .take(2)
+        .collect()
 }
 
-/// A button's title on a plugin holding several roles, naming each role it
-/// reaches at its level ("Open: operations write, custody read"; W6.9,
-/// contract v15); nothing on a plugin holding one role or none, drawn exactly
-/// as before.
-fn roles_title(held: &meridian_access::PluginHeld, level: meridian_access::AccessLevel) -> String {
-    let Some(session) = held.session(level) else {
-        return String::new();
-    };
-    let said: Vec<String> = session
-        .roles
+/// One tile (or list row): the whole of it a link, its mark, its short name
+/// whole in its title, and Open, the link's look. Where another item reads
+/// the same, a second line tells them apart: the publisher where theirs
+/// differ, else the instance.
+fn open_item(item: &Item, all: &[Item]) -> String {
+    let twins: Vec<&Item> = all
         .iter()
-        .map(|role| format!("{} {}", role.role, meridian_access::level_name(role.level)))
+        .filter(|other| other.name.eq_ignore_ascii_case(&item.name))
         .collect();
+    let by = if twins.len() < 2 {
+        String::new()
+    } else if twins.iter().any(|other| other.publisher != item.publisher) {
+        format!("<span class=\"hint\">{}</span>", escape(&item.publisher))
+    } else {
+        format!("<span class=\"hint\">{}</span>", escape(&item.instance))
+    };
     format!(
-        " title=\"{}: {}\"",
-        meridian_access::button(level),
-        escape(&said.join(", "))
+        "<li data-instance=\"{id}\"><a class=\"open-item\" href=\"{href}\" aria-label=\"Open {name}\" title=\"{full}\">\
+         <span class=\"monogram\" aria-hidden=\"true\">{mark}</span><strong>{name}</strong>{by}\
+         <span class=\"button\" aria-hidden=\"true\">Open</span></a></li>",
+        id = escape(&item.instance),
+        href = escape(&item.href),
+        name = escape(&item.name),
+        full = escape(&item.full),
+        mark = escape(&monogram(&item.name)),
     )
 }
 
-/// The list and the tiles, and the person's choice between them remembered
-/// in this browser. Without it the list is shown.
+/// The kit's grid and list icons, for the view switch and the empty state.
+const TILES_ICON: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" \
+    stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"4\" y=\"4\" width=\"6\" height=\"6\" rx=\"1\"/>\
+    <rect x=\"14\" y=\"4\" width=\"6\" height=\"6\" rx=\"1\"/><rect x=\"4\" y=\"14\" width=\"6\" height=\"6\" rx=\"1\"/>\
+    <rect x=\"14\" y=\"14\" width=\"6\" height=\"6\" rx=\"1\"/></svg>";
+const LIST_ICON: &str =
+    "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" \
+    stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">\
+    <path d=\"M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01\"/></svg>";
+
+/// The tiles and the list, and the person's choice between them remembered
+/// in this browser; until they choose, tiles from 40rem up and the list
+/// below. Without script the tiles are shown and the switch is not.
 const HOME_SCRIPT: &str = r#"(function () {
   var home = document.querySelector(".home");
   if (!home) return;
   home.classList.add("js");
-  var plugins = home.querySelector("ul.plugins");
-  var buttons = Array.prototype.slice.call(home.querySelectorAll("[data-view]"));
+  var grid = home.querySelector("ul.open-grid");
+  var pager = home.querySelector("om-pager");
+  var buttons = Array.prototype.slice.call(home.querySelectorAll(".segmented [data-view]"));
   function show(view) {
-    if (view !== "tiles") view = "list";
-    if (plugins) plugins.className = "plugins " + view;
+    if (grid) grid.classList.toggle("list", view === "list");
     buttons.forEach(function (b) { b.setAttribute("aria-pressed", b.getAttribute("data-view") === view ? "true" : "false"); });
+    if (pager && pager.refit) pager.refit();
   }
-  var saved = "list";
-  try { saved = localStorage.getItem("meridian.home.view") || "list"; } catch (e) {}
+  var saved = null;
+  try { saved = localStorage.getItem("meridian.home.view"); } catch (e) {}
+  if (saved !== "list" && saved !== "tiles") saved = window.matchMedia("(min-width: 40rem)").matches ? "tiles" : "list";
   show(saved);
   buttons.forEach(function (b) {
     b.addEventListener("click", function () {

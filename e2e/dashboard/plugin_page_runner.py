@@ -9,12 +9,13 @@ every request at that level alone, cut to it; the plugin's sidecar verifies
 it and forwards it on loopback to a stand-in that says what reached it.
 
 Ada signs in with the account first run made and claims the deployment,
-which links her to All plugins (admin) too: she finds the plugin on the home
-with Manage alone, and a Manage session carries no account. She grants
-herself read on one account through the plugin, and finds View beside it,
-whose session carries that account and no write set. The plugin says which
+which links her to All plugins (admin) too: the plugin's level switch offers
+her Manage alone, and a Manage session carries no account; setting up, the
+plugin is on Settings › Plugins and not yet on the home. She grants herself
+read on one account through the plugin, and finds View beside Manage, whose
+session carries that account and no write set. The plugin says which
 accounts its connection reaches, and the dashboard counts those nothing links
-on the plugin's health. She links them on the plugin's admin page, under
+in the plugin's Needs you on Settings › Plugins. She links them on the plugin's admin page, under
 Manage, which reads the deployment's accounts and sends each link acting for
 her: to her account, to a new one it creates, since she is a deployment
 admin, and one removed again; the sidecar refuses the plugin as itself, an
@@ -26,7 +27,7 @@ The stand-in is a plugin built before contract v5, declaring two admin pages
 in the list v5 retired: the sidecar reads them as pages at `admin`, which the
 plugin area opens under Manage, and the plugin serves them there alone.
 
-Granted write, she finds Manage, Open and View; a command sent for her is
+Granted write, she finds Manage, Open and View on the switch; a command sent for her is
 admitted under Open alone. The plugin declares a required secret, which she
 sets on its Settings tab as its admin, and the report turns healthy with the
 plugin never restarted (W6.11, W4.7, W4.8). The plugin reports SnapTrade's
@@ -35,11 +36,13 @@ on its Summary under Manage, below the status; a heartbeat with nine is
 refused naming the bound, and the plugin is then reported alive, not healthy
 with the refusal as the reason, and with no figures (W4.5, W4.8, W6.9).
 Bea, in a user group granted the
-plugin's `admin` alone, finds Manage alone, sets its settings, links an
+plugin's `admin` alone, finds Manage alone, the home's one Open going there
+once the plugin is set up, sets its settings, links an
 external account to an existing account and is refused naming a new one, and
 sees no account data; granted read on All accounts, the built-in group, her
-View reaches an account no other group lists. Ada's link to All plugins
-(admin) withdrawn, she configures the plugin no more. An access group naming
+View reaches an account no other group lists, and her home's Open goes to
+View. Ada's link to All plugins (admin) withdrawn, she configures the plugin
+no more, and her home's Open goes to Open. An access group naming
 the plugin at read and write is refused.
 
 The secret is looked for everywhere it must not be: every page fetched in the
@@ -287,12 +290,34 @@ def post_on_plugin_host(browser, path, sent=None):
 VIEW = f"/admin/plugins/{INSTANCE}"
 
 
-def unlinked_said(page):
-    """What the plugin's line on the admin portal says of its unlinked
-    external accounts, if anything."""
-    plugins = page.body.split('<table class="list plugins">', 1)[-1].split("</table>", 1)[0]
-    found = re.search(r'data-flag="unlinked"[^>]*>(.*?)</p>', plugins, re.S)
+def plugin_row(page):
+    """The plugin's row on Settings › Plugins, or "" when it is not listed."""
+    table = re.search(r'<table [^>]*\bid="plugins-table"[^>]*>(.*?)</table>', page.body, re.S)
+    found = re.search(r'<tr data-id="' + re.escape(INSTANCE) + r'"[^>]*>.*?</tr>', table.group(1), re.S) \
+        if table else None
+    return found.group(0) if found else ""
+
+
+def standing_of(page):
+    """The plugin's status on Settings › Plugins, by its name for a script."""
+    found = re.search(r'<tr data-id="[^"]+" data-href="[^"]*" data-status="([a-z-]+)"', plugin_row(page))
     return found.group(1) if found else ""
+
+
+def unlinked_said(page):
+    """What the plugin's Needs you on Settings › Plugins says, where it says
+    what a person must do: its unlinked external accounts among them."""
+    found = re.search(r'<td class="wide-only"><span title="[^"]*">(.*?)</span></td>', plugin_row(page), re.S)
+    return found.group(1) if found else ""
+
+
+def row_leads_to(page):
+    """Where the plugin's row on Settings › Plugins leads: the row, and its
+    Manage."""
+    row = plugin_row(page)
+    href = re.search(r'<tr data-id="[^"]+" data-href="([^"]*)"', row)
+    manage = re.search(r'<a class="button" href="([^"]*)">Manage</a>', row)
+    return (href.group(1) if href else None, manage.group(1) if manage else None)
 
 
 def sync_on(page):
@@ -530,21 +555,48 @@ def figures_are_drawn_on_summary(ada, manager, reports):
           f"Last read, a time as every moment here is shown: {drawn[:600]}")
 
 
-def buttons(browser, instance=INSTANCE, seconds=45):
-    """The levels the home offers on a plugin, as its buttons name them, once
-    it lists the plugin: a plugin reached through All plugins (admin) is
-    listed once its sidecar has reported."""
+def levels(browser, instance=INSTANCE, seconds=45):
+    """The levels the plugin area's level switch reaches, as it names them,
+    once the area opens: the levels held, each a way into the area (the
+    2026-11-23 consensus: the home has one Open, the switch the rest). A
+    request naming no level opens the area at the first held."""
     deadline = time.monotonic() + seconds
     while True:
-        page = browser.get(dash("/"))
-        card = re.split(r'<li[^>]*\bdata-instance="' + re.escape(instance) + '">', page.body, maxsplit=1)
-        if len(card) > 1 or time.monotonic() > deadline:
-            break
+        page = browser.get(dash(f"/plugins/{instance}"))
+        head = page.body.split('<div class="page-head">', 1)[-1].split('<nav class="tabs', 1)[0] \
+            if page.status == 200 else ""
+        switch = re.search(r'<nav class="level-switch"[^>]*>(.*?)</nav>', head, re.S)
+        if switch:
+            return re.findall(r'<a href="[^"]+" data-level="[a-z]+"[^>]*>([A-Za-z]+)</a>', switch.group(1))
+        alone = re.search(r'<span class="badge accent" data-level="[a-z]+">([A-Za-z]+)</span>', head)
+        if alone:
+            return [alone.group(1)]
+        if time.monotonic() > deadline:
+            return []
         time.sleep(2)
-    if len(card) < 2:
+
+
+def home_opens(browser, instance=INSTANCE):
+    """Where the home's tile for the plugin opens it, each Open's link (one,
+    at the highest level held); none while it is setting up or stopped."""
+    page = browser.get(dash("/"))
+    tile = re.split(r'<li data-instance="' + re.escape(instance) + '">', page.body, maxsplit=1)
+    if len(tile) < 2:
         return []
-    card = card[1].split("</li>", 1)[0]
-    return re.findall(r'<a class="plugin-level" data-level="[a-z]+" href="[^"]+">([A-Za-z]+)</a>', card)
+    tile = tile[1].split("</li>", 1)[0]
+    return [href.replace("&amp;", "&") for href in re.findall(r'<a class="open-item" href="([^"]+)"', tile)]
+
+
+def home_opens_at(browser, level, seconds=45):
+    """The home's Opens for the plugin, read again until its one Open goes to
+    `level` or `seconds` pass: the home lists a plugin once it is set up."""
+    wanted = [f"/plugins/{INSTANCE}?level={level}"]
+    deadline = time.monotonic() + seconds
+    opens = home_opens(browser)
+    while opens != wanted and time.monotonic() < deadline:
+        time.sleep(2)
+        opens = home_opens(browser)
+    return opens
 
 
 def session_at(browser, level):
@@ -586,8 +638,15 @@ def main():
     say("B: a deployment admin is admin on the plugin through All plugins (admin), and reaches no account")
     # The product owner, 2026-09-30, superseding ruling 19: the claim links
     # her to All plugins (admin) as first run would; she holds no data grant.
-    offered = buttons(ada)
-    check(offered == ["Manage"], f"the home offers Manage alone: {offered}")
+    offered = levels(ada)
+    check(offered == ["Manage"], f"the area's level switch offers Manage alone: {offered}")
+    # The home lists a plugin once it is set up (the 2026-11-23 consensus):
+    # its key not entered nor accounts granted, it is setting up, and
+    # Settings › Plugins says so.
+    page = admin_until(ada, lambda page: standing_of(page) == "setting-up", seconds=45)
+    check(standing_of(page) == "setting-up" and home_opens(ada) == [],
+          f"setting up, it is on Settings › Plugins and not on the home: "
+          f"{standing_of(page)!r} {home_opens(ada)}")
     manager, why = session_at(ada, "admin")
     check(manager is not None, f"a Manage session: {why}")
     status, caller, _ = claims_on(manager) if manager else (0, {}, {})
@@ -640,8 +699,8 @@ def main():
           f"an access group naming the plugin at read and write is refused: {both.status} {sentence(both)}")
 
     say("D: she finds Manage and View, and each opens the plugin's area at its level")
-    offered = buttons(ada)
-    check(offered == ["Manage", "View"], f"the home offers Manage and View: {offered}")
+    offered = levels(ada)
+    check(offered == ["Manage", "View"], f"the area's level switch offers Manage and View: {offered}")
     # This dashboard is at http://dashboard:8080, a host with no domain, so a
     # browser would keep no framed page's session (plugins.frames): the area
     # sends her to its first page's way in, at the level, in a window of its
@@ -727,8 +786,9 @@ def main():
     check(said.get("sync") == "published",
           f"and its sync state, though nobody linked it, since it describes the connection: {said}")
     page = admin_until(ada, lambda page: "2 external accounts not linked" in unlinked_said(page))
-    check(f'<a href="{VIEW}">2 external accounts not linked</a>' in unlinked_said(page),
-          f"the dashboard counts both on the plugin's line, leading to its view: {unlinked_said(page)!r}")
+    check("2 external accounts not linked" in unlinked_said(page) and row_leads_to(page) == (VIEW, VIEW),
+          f"the dashboard counts both in the plugin's Needs you on Settings › Plugins, its row leading "
+          f"to its view: {unlinked_said(page)!r} {row_leads_to(page)}")
     check("External accounts" not in page.body and "/admin/links" not in page.body
           and 'name="external_account_id"' not in page.body,
           "and lists and links none itself")
@@ -813,8 +873,9 @@ def main():
     administer(ada, "/admin/access-groups",
                {"access_group_id": access_group, "name": "Plugin page readers",
                 "entries": f"{INSTANCE} write"})
-    offered = buttons(ada)
-    check(offered == ["Manage", "Open", "View"], f"holding admin and write, the home offers three: {offered}")
+    offered = levels(ada)
+    check(offered == ["Manage", "Open", "View"],
+          f"holding admin and write, the area's level switch offers three: {offered}")
     opener, why = session_at(ada, "write")
     check(opener is not None, f"an Open session: {why}")
     status, caller, _ = claims_on(opener) if opener else (0, {}, {})
@@ -857,8 +918,12 @@ def main():
     bea = Browser()
     signed = sign_in(bea, BEA, PASSWORD)
     check(signed.status == 303, f"Bea signs in: {signed.status}")
-    offered = buttons(bea)
-    check(offered == ["Manage"], f"her home offers Manage alone: {offered}")
+    offered = levels(bea)
+    check(offered == ["Manage"], f"the area's level switch offers her Manage alone: {offered}")
+    # Its key entered and accounts granted, it is set up: on the home, its
+    # one Open going to the highest level she holds, admin.
+    opens = home_opens_at(bea, "admin")
+    check(opens == [f"/plugins/{INSTANCE}?level=admin"], f"her home's one Open goes to Manage: {opens}")
     check(bea.get(dash("/admin")).status == 403, "the deployment's settings are not hers")
     tabs_page = bea.get(dash(f"{VIEW}?tab=settings"))
     check(tabs_page.status == 200 and 'data-setting="poll_minutes"' in tabs_page.body,
@@ -892,8 +957,11 @@ def main():
     administer(ada, "/admin/permissions",
                {"user_group_id": bea_group, "account_group_id": "all-accounts",
                 "access_group_id": everything})
-    offered = buttons(bea)
-    check(offered == ["Manage", "View"], f"Bea finds View beside Manage: {offered}")
+    offered = levels(bea)
+    check(offered == ["Manage", "View"], f"Bea finds View beside Manage on the level switch: {offered}")
+    opens = home_opens_at(bea, "read")
+    check(opens == [f"/plugins/{INSTANCE}?level=read"],
+          f"and her home's one Open goes to View, the highest data level she holds: {opens}")
     beaview, why = session_at(bea, "read")
     status, caller, _ = claims_on(beaview) if beaview else (0, {}, {})
     check(ungrouped is not None and ungrouped in caller.get("access", {}).get("read", []),
@@ -904,8 +972,14 @@ def main():
     linked_to_all = permission_of(page, "all-plugins-admin")
     check(linked_to_all is not None, "the claim linked her group to All plugins (admin)")
     administer(ada, "/admin/permissions/withdraw", {"permission_id": linked_to_all or "", "note": "the plugin no longer reaches every account"})
-    offered = buttons(ada)
-    check(offered == ["Open", "View"], f"her home offers Open and View, and no Manage: {offered}")
+    opens = home_opens_at(ada, "write")
+    check(opens == [f"/plugins/{INSTANCE}?level=write"], f"her home's one Open goes to Open: {opens}")
+    # Her first level is one the plugin's own page serves, which this
+    # dashboard opens in a window of its own (see D), so the area's switch
+    # is read where the area refuses the level she no longer holds.
+    manage = ada.get(dash(f"/plugins/{INSTANCE}?level=admin"))
+    check(manage.status == 403 and "you hold Open (write), View (read)" in manage.body,
+          f"she holds Open and View, and no Manage: {manage.status} {sentence(manage)}")
     check(session_at(ada, "admin")[0] is None, "a Manage session is refused")
     status, _, _, _ = on_plugin_host(manager, "/admin/accounts")
     check(status == 403, f"and the one she held ends at its next request: {status}")

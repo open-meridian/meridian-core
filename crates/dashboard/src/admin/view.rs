@@ -143,14 +143,7 @@ pub fn lines(
             instance: instance.to_string(),
             name: names.get(instance).cloned(),
             state: health::state(reports.get(instance), now),
-            missing: record_of(records, instance)
-                .map(|record| {
-                    settings::missing(record, development)
-                        .into_iter()
-                        .map(|d| settings::label(d).to_string())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            missing: missing_settings(records, instance, development),
             unlinked: unlinked
                 .iter()
                 .filter(|u| u.plugin_instance_id == instance)
@@ -158,6 +151,18 @@ pub fn lines(
             failed: custody.failed_conversions(instance),
         })
         .collect()
+}
+
+/// The required settings an instance still needs filled in, by label.
+pub fn missing_settings(records: &AccessRecords, instance: &str, development: bool) -> Vec<String> {
+    record_of(records, instance)
+        .map(|record| {
+            settings::missing(record, development)
+                .into_iter()
+                .map(|d| settings::label(d).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn record_of<'a>(

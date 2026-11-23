@@ -44,6 +44,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod notice;
 pub mod oidc;
+pub mod plugin_status;
 pub mod plugins;
 pub mod prepared;
 pub mod records;

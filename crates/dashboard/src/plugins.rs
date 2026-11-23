@@ -1194,6 +1194,18 @@ pub(crate) async fn frame(
         }
     };
     let held = access.held(&instance);
+    // Where a connectivity plugin trades, in the head at every level and
+    // width (the 2026-11-23 consensus moved it here from the home card).
+    let connectivity = access
+        .known_roles
+        .get(&instance)
+        .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
+    let trading = match app.records.current(app.clock.now_ns()) {
+        Ok(records) if connectivity => {
+            Some(crate::admin::connectivity::trading(&app, &records, &instance).await)
+        }
+        _ => None,
+    };
     // Under Manage, the plugin's health is the dot on every tab where no page
     // tells its own (the product owner, 2026-10-01: "yes, dot on every tab").
     let health = crate::health::state(
@@ -1214,6 +1226,7 @@ pub(crate) async fn frame(
         shown,
         health: (level == AccessLevel::Admin).then_some(&health),
         opens_data_sources: access.deployment_admin,
+        trading,
     });
     let crumbs = format!(
         "{}{}",

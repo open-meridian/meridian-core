@@ -150,6 +150,173 @@ pub(crate) fn listing(
     )
 }
 
+/// What Show offers on Settings › Plugins, by its `?show=` value: every
+/// instance, those needing a person, and each status.
+fn shown_by(show: &str, status: &crate::plugin_status::Status) -> bool {
+    match show {
+        "needs-you" => !status.needs_you.is_empty(),
+        "" | "all" => true,
+        named => crate::plugin_status::Standing::named(named) == Some(status.standing),
+    }
+}
+
+/// Settings › Plugins: what needs a person first (not healthy, setting up,
+/// starting, working with something in Needs you), then working, then
+/// stopped, A to Z within each; a Show choice narrowing it on the server,
+/// and om-pager's search in the browser.
+fn plugins_table(
+    plugins: &[Line],
+    statuses: &std::collections::BTreeMap<String, crate::plugin_status::Status>,
+    show: Option<&str>,
+) -> String {
+    use crate::plugin_status::Standing;
+    let show = show.unwrap_or_default();
+    let show = if show == "needs-you" || show == "all" || Standing::named(show).is_some() {
+        show
+    } else {
+        ""
+    };
+    let judged: Vec<(&Line, &crate::plugin_status::Status)> = plugins
+        .iter()
+        .filter_map(|line| statuses.get(&line.instance).map(|status| (line, status)))
+        .collect();
+    let short = |line: &Line| -> String {
+        let full = line.name.as_deref().unwrap_or(&line.instance);
+        full.rsplit('/').next().unwrap_or(full).to_string()
+    };
+    let mut rows: Vec<&(&Line, &crate::plugin_status::Status)> = judged
+        .iter()
+        .filter(|(_, status)| shown_by(show, status))
+        .collect();
+    rows.sort_by_key(|(line, status)| {
+        (
+            status.standing,
+            status.needs_you.is_empty(),
+            short(line).to_lowercase(),
+            line.instance.clone(),
+        )
+    });
+    let count = |wanted: &dyn Fn(&crate::plugin_status::Status) -> bool| {
+        judged.iter().filter(|(_, status)| wanted(status)).count()
+    };
+    let mut options = vec![
+        ("all", "All plugins".to_string(), judged.len()),
+        (
+            "needs-you",
+            "Needs you".to_string(),
+            count(&|s| !s.needs_you.is_empty()),
+        ),
+    ];
+    for standing in Standing::ALL {
+        options.push((
+            standing.name(),
+            standing.word().to_string(),
+            count(&|s| s.standing == standing),
+        ));
+    }
+    let options: String = options
+        .iter()
+        .map(|(value, said, n)| {
+            format!(
+                "<option value=\"{value}\"{chosen}>{said} ({n})</option>",
+                chosen = if *value == show || (show.is_empty() && *value == "all") {
+                    " selected"
+                } else {
+                    ""
+                },
+                said = escape(said),
+            )
+        })
+        .collect();
+    let body: String = if rows.is_empty() {
+        "<tr class=\"none\"><td colspan=\"5\"><div class=\"empty-state\"><strong>No plugins match</strong>\
+         <p>Try other words, or show all plugins.</p></div></td></tr>"
+            .to_string()
+    } else {
+        rows.iter()
+            .map(|(line, status)| {
+                let name = short(line);
+                let plugin = match &line.name {
+                    Some(full) => format!(
+                        "<span class=\"monogram small\" aria-hidden=\"true\">{mark}</span><strong title=\"{full}\">{name}</strong>{publisher}",
+                        mark = escape(&crate::web::monogram(&name)),
+                        full = escape(full),
+                        name = escape(&name),
+                        publisher = full
+                            .rsplit_once('/')
+                            .map(|(publisher, _)| format!(
+                                " <span class=\"hint wide-only\">{}</span>",
+                                escape(publisher)
+                            ))
+                            .unwrap_or_default(),
+                    ),
+                    None => format!(
+                        "<span class=\"monogram small\" aria-hidden=\"true\">{mark}</span><strong>{name}</strong> \
+                         <span class=\"hint wide-only\">not from the catalogue</span>",
+                        mark = escape(&crate::web::monogram(&name)),
+                        name = escape(&name),
+                    ),
+                };
+                let needs = status.needs_you.join("; ");
+                let trading = status
+                    .trading
+                    .as_deref()
+                    .map(|word| crate::area::trading_badge(word).replacen("class=\"badge", "class=\"wide-only badge", 1))
+                    .unwrap_or_default();
+                format!(
+                    "<tr data-id=\"{id}\" data-href=\"{href}\" data-status=\"{state}\"{attention}>\
+                     <td>{plugin}</td><td class=\"wide-only\"><code>{id}</code></td>\
+                     <td class=\"status\">{badge}{trading}</td>\
+                     <td class=\"wide-only\"><span title=\"{needs}\">{needs}</span></td>\
+                     <td class=\"manage\"><a class=\"button\" href=\"{href}\">Manage</a></td></tr>",
+                    id = escape(&line.instance),
+                    href = escape(&view::path(&line.instance)),
+                    state = status.standing.name(),
+                    attention = if status.needs_you.is_empty() { "" } else { " class=\"attention\"" },
+                    badge = crate::plugin_status::badge(status),
+                    needs = escape(&needs),
+                )
+            })
+            .collect()
+    };
+    format!(
+        "<form class=\"plugins-show\" method=\"get\" action=\"/admin#plugins\"><label>\
+         <span class=\"visually-hidden\">Show</span><select name=\"show\" aria-label=\"Show\">{options}</select></label>\
+         <noscript><button type=\"submit\">Show</button></noscript></form>\
+         <om-pager search=\"Search plugins\"><div class=\"table-wrap\"><table class=\"list one-line plugins\" id=\"plugins-table\">\
+         <thead><tr><th class=\"c-plugin\">Plugin</th><th class=\"c-instance wide-only\">Instance</th><th>Status</th>\
+         <th class=\"c-needs wide-only\">Needs you</th><th class=\"c-manage\"><span class=\"visually-hidden\">Manage</span></th></tr></thead>\
+         <tbody>{body}</tbody></table></div></om-pager>\
+         <script>{PLUGINS_SCRIPT}</script>"
+    )
+}
+
+/// Show's choice asks the server at once, and sits in the search's bar; a
+/// click anywhere on a row opens its Manage (its button stays the
+/// keyboard's way).
+const PLUGINS_SCRIPT: &str = r#"(function () {
+  var form = document.querySelector("form.plugins-show");
+  var table = document.getElementById("plugins-table");
+  if (!form || !table) return;
+  var select = form.querySelector("select");
+  select.addEventListener("change", function () { form.submit(); });
+  var pager = table.closest("om-pager");
+  function place() {
+    var bar = pager && pager.querySelector(".om-search");
+    if (!bar) return false;
+    bar.insertBefore(form, bar.querySelector(".om-search-said"));
+    return true;
+  }
+  if (window.customElements && pager) customElements.whenDefined("om-pager").then(function () {
+    requestAnimationFrame(function () { if (!place()) setTimeout(place, 50); });
+  });
+  table.addEventListener("click", function (e) {
+    var row = e.target.closest("tr[data-href]");
+    if (!row || e.target.closest("a, button, om-status")) return;
+    window.location.href = row.getAttribute("data-href");
+  });
+})();"#;
+
 /// The first few of `items`, and how many more: a cell stays a line however
 /// big the group. The rest are in the cell, hidden, so a search finds a row
 /// by any of them.
@@ -180,7 +347,11 @@ fn by_name<'a>(name: &'a str, id: &'a str) -> (String, &'a str) {
 pub fn render(
     records: &AccessRecords,
     delegating: &[(String, String, usize)],
-    plugins: &[Line],
+    (plugins, statuses, show): (
+        &[Line],
+        &std::collections::BTreeMap<String, crate::plugin_status::Status>,
+        Option<&str>,
+    ),
     people: &[Person],
     books: &super::books::Books,
     agents: (String, String),
@@ -239,62 +410,18 @@ pub fn render(
     let mut sections = Vec::new();
 
     // ── Plugins ─────────────────────────────────────────────────────────────
-    // W6.10, and the way to each instance's admin view: its health, what its
-    // settings still need, and its external accounts nothing links.
+    // W6.10, and the way to each instance's admin view: one status each,
+    // its reason a tap away, and what it needs of a person (the 2026-11-23
+    // consensus); what needs a person first.
     let body = if plugins.is_empty() {
         "<p class=\"empty\">No plugin has reported or been launched yet.</p>".to_string()
     } else {
-        let mut sorted: Vec<&Line> = plugins.iter().collect();
-        sorted.sort_by(|a, b| {
-            by_name(a.name.as_deref().unwrap_or(&a.instance), &a.instance).cmp(&by_name(
-                b.name.as_deref().unwrap_or(&b.instance),
-                &b.instance,
-            ))
-        });
-        let rows: String = sorted
-            .iter()
-            .enumerate()
-            .map(|(row, line)| {
-                // Why it is as it is, the badge's note on hover (the product
-                // owner, 2026-09-30), a line under it without script.
-                let (state, detail) =
-                    view::state_badge(&line.state, &format!("plugin-health-{row}"));
-                let settings = if line.missing.is_empty() {
-                    "<span class=\"badge good\">ready</span>".to_string()
-                } else {
-                    format!(
-                        "<span class=\"badge warn\">needs {}</span>",
-                        escape(&line.missing.join(", "))
-                    )
-                };
-                format!(
-                    "<tr data-id=\"{id}\"><td>{plugin}</td><td><code>{id}</code></td>\
-                     <td>{state}{detail}</td>\
-                     <td>{settings}</td><td class=\"flags\">{flags}</td>\
-                     <td class=\"actions\"><a class=\"button\" href=\"{href}\">Manage</a></td></tr>",
-                    id = escape(&line.instance),
-                    plugin = match &line.name {
-                        Some(name) => format!("<span class=\"name\">{}</span>", escape(name)),
-                        None => "<span class=\"faint\">not from the catalogue</span>".to_string(),
-                    },
-                    flags = view::flags(line, None),
-                    href = escape(&view::path(&line.instance)),
-                )
-            })
-            .collect();
-        listing(
-            "plugins-table",
-            " plugins",
-            "plugins",
-            "Search by plugin, instance, health or what it needs",
-            "<th>Plugin</th><th>Instance</th><th>Health</th><th>Settings</th><th>Needs you</th><th></th>",
-            &rows,
-        )
+        plugins_table(plugins, statuses, show)
     };
     sections.push(section(
         "plugins",
         "Plugins",
-        "Every plugin instance in this deployment: its health, and what it needs of you. \
+        "Every plugin instance in this deployment: how it is, and what it needs of you. \
          Manage one for its settings, who has access and its own admin page.",
         "",
         body,

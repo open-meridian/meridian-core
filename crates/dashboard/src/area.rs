@@ -281,6 +281,9 @@ pub struct Area<'a> {
     /// Whether a next step may open Data sources (kit 0.12.0's
     /// `meridian:open`): a deployment admin's alone.
     pub opens_data_sources: bool,
+    /// Where a connectivity plugin trades ("Demo", "Live"; ruling 831, the
+    /// 2026-11-23 consensus): its marker beside the status, at every width.
+    pub trading: Option<&'a str>,
 }
 
 /// The plugin's health as a status dot, drawn as the chrome's script draws a
@@ -391,6 +394,17 @@ pub fn report_problem(instance: &str) -> String {
     )
 }
 
+/// Where a connectivity plugin trades, as a badge: "Trading: Demo"
+/// neutral, "Trading: Live" in the accent (never warn, so it is never read
+/// as setting up), another word neutral.
+pub fn trading_badge(trading: &str) -> String {
+    format!(
+        "<span class=\"badge{tone} trading\" data-trading=\"{word}\">Trading: {word}</span>",
+        tone = if trading == "Live" { " accent" } else { "" },
+        word = escape(trading),
+    )
+}
+
 pub fn render(area: &Area) -> String {
     let framed = matches!(area.shown, Shown::Framed { .. });
     // The page's actions, left of the switch: a framed page's, which it tells.
@@ -403,8 +417,9 @@ pub fn render(area: &Area) -> String {
         String::new()
     };
     let status = format!(
-        "<span class=\"title-status\" id=\"{PAGE_STATUS}\">{}</span>",
-        area.health.map(health_dot).unwrap_or_default()
+        "<span class=\"title-status\" id=\"{PAGE_STATUS}\">{}</span>{}",
+        area.health.map(health_dot).unwrap_or_default(),
+        area.trading.map(trading_badge).unwrap_or_default()
     );
     let body = match &area.shown {
         Shown::Framed { src, origin } => {
@@ -699,6 +714,7 @@ mod tests {
             },
             health: None,
             opens_data_sources: false,
+            trading: None,
         });
         assert!(page.contains("data-seamless"));
         assert!(page.contains(&format!("data-actions=\"{PAGE_ACTIONS}\"")));
@@ -745,6 +761,7 @@ mod tests {
             },
             health: None,
             opens_data_sources: false,
+            trading: None,
         });
         let head = page.split("<nav class=\"tabs").next().expect("the heading");
         assert_eq!(
@@ -854,6 +871,7 @@ mod tests {
             shown: Shown::Drawn("<section id=\"status\">the status</section>".into()),
             health: None,
             opens_data_sources: false,
+            trading: None,
         });
         let nav = page
             .split("<nav class=\"tabs view-tabs\"")
@@ -918,6 +936,7 @@ mod tests {
         let at = |tab: &Tab| {
             render(&Area {
                 opens_data_sources: Default::default(),
+                trading: None,
                 instance: "snaptrade",
                 name: "SnapTrade",
                 held: &held,
@@ -997,6 +1016,7 @@ mod tests {
         };
         let page = render(&Area {
             opens_data_sources: Default::default(),
+            trading: None,
             instance: "snaptrade",
             name: "SnapTrade",
             held: &held,
